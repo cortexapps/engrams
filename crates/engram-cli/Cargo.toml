@@ -1,0 +1,22 @@
+[package]
+name = "engram-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ops/admin CLI for Engram. Talks to the coordinator's HTTP API."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-image-builder.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

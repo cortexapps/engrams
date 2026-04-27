@@ -1,0 +1,19 @@
+[package]
+name = "engram-storage-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "S3 / S3-compatible (MinIO) BlobStorage implementation (Phase 2 stub)."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true

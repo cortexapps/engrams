@@ -1,0 +1,110 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engram-core",
+    "crates/engram-protocol",
+    "crates/engram-coordinator",
+    "crates/engram-host-agent",
+    "crates/engram-image-builder",
+    "crates/engram-cli",
+    "crates/engram-sandbox-firecracker",
+    "crates/engram-sandbox-process",
+    "crates/engram-cloud-gcp",
+    "crates/engram-cloud-static",
+    "crates/engram-cloud-mock",
+    "crates/engram-storage-gcs",
+    "crates/engram-storage-s3",
+    "crates/engram-storage-local",
+    "crates/engram-secrets-dev",
+    "crates/engram-secrets-gcp",
+    "crates/engram-postgres",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cortex/engram"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+# internal
+engram-core = { path = "crates/engram-core" }
+engram-protocol = { path = "crates/engram-protocol" }
+engram-postgres = { path = "crates/engram-postgres" }
+engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
+engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
+engram-cloud-static = { path = "crates/engram-cloud-static" }
+engram-cloud-mock = { path = "crates/engram-cloud-mock" }
+engram-storage-gcs = { path = "crates/engram-storage-gcs" }
+engram-storage-s3 = { path = "crates/engram-storage-s3" }
+engram-storage-local = { path = "crates/engram-storage-local" }
+engram-host-agent = { path = "crates/engram-host-agent" }
+engram-sandbox-process = { path = "crates/engram-sandbox-process" }
+engram-secrets-dev = { path = "crates/engram-secrets-dev" }
+engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
+engram-image-builder = { path = "crates/engram-image-builder" }
+
+# async / runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+bytes = "1"
+pin-project-lite = "0.2"
+
+# http / api
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+hyper = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+http = "1"
+
+# grpc
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# storage
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+
+# cloud sdks (optional / per-crate)
+aws-config = "1"
+aws-sdk-s3 = "1"
+google-cloud-storage = "0.24"
+google-cloud-auth = "0.20"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+
+# misc
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+once_cell = "1"
+parking_lot = "0.12"
+dashmap = "6"
+url = "2"
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

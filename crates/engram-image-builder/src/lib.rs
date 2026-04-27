@@ -1,0 +1,279 @@
+//! Image baker.
+//!
+//! Source of truth for an image is a repo containing two files:
+//!
+//! ```text
+//!   <repo>/
+//!     Dockerfile          # WHAT'S in the image — universal Docker syntax
+//!     engram.toml         # HOW the image is USED — secrets, network, resources
+//! ```
+//!
+//! `engram-image-builder build` reads both, runs `docker build`, exports
+//! the resulting OCI image's filesystem to the registry layout the
+//! coordinator reads:
+//!
+//! ```text
+//!   <images_dir>/<repo>/<tag>/
+//!     manifest.toml       # rendered ImageManifest (engram.toml minus [build])
+//!     rootfs/             # ProcessBackend dev path
+//!     rootfs.ext4         # FirecrackerBackend prod path (Phase 2)
+//! ```
+//!
+//! For ProcessBackend dev, we extract via `docker create + docker
+//! export | tar -x`. For Firecracker prod (Phase 2), the same pipe
+//! continues into `mkfs.ext4` and bakes in `engram-agentd` + an init
+//! unit. Out of scope this round.
+
+pub mod config;
+pub mod docker;
+
+use std::path::{Path, PathBuf};
+
+use chrono::Utc;
+use engram_core::traits::MetadataStore;
+use engram_core::types::{ImageStatus, ImageVersion};
+use engram_core::ImageVersionId;
+
+pub use config::{BuildConfig, EngramRepoConfig};
+pub use docker::{DockerCli, DockerRunner};
+
+/// What the user wants the baker to do.
+#[derive(Clone, Debug)]
+pub struct BuildRequest {
+    /// Path to the source repo (containing `Dockerfile` and `engram.toml`).
+    pub source: PathBuf,
+    /// Repo identifier in the registry — typically `<org>/<name>`.
+    pub repo: String,
+    /// Tag for the produced image. Convention: `warm-<rfc3339>` so the
+    /// coordinator's "latest ready" lookup picks it up by created_at.
+    pub tag: String,
+    /// Where the registry lives (the same root the coordinator reads).
+    pub images_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildOutcome {
+    pub image_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub rootfs_path: PathBuf,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum BuildError {
+    Config(String),
+    Io(std::io::Error),
+    Docker(String),
+    Persist(engram_core::MetaError),
+    InvalidPath(String),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(m) => write!(f, "engram.toml: {m}"),
+            Self::Io(e) => write!(f, "io: {e}"),
+            Self::Docker(m) => write!(f, "docker: {m}"),
+            Self::Persist(e) => write!(f, "metadata: {e}"),
+            Self::InvalidPath(p) => write!(f, "invalid path: {p}"),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Persist(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for BuildError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// The baker. Composed of a [`DockerRunner`] (mockable) and an
+/// optional [`MetadataStore`] for recording the produced row.
+pub struct Builder<D: DockerRunner> {
+    docker: D,
+}
+
+impl<D: DockerRunner> Builder<D> {
+    pub fn new(docker: D) -> Self {
+        Self { docker }
+    }
+
+    /// Run a single bake. Steps:
+    ///
+    /// 1. Validate paths in `req`.
+    /// 2. Read `<source>/engram.toml`, split into manifest + build.
+    /// 3. `docker build` against the source.
+    /// 4. `docker create` a throwaway container; `docker export` its
+    ///    filesystem to the staging tarball.
+    /// 5. Extract the tarball into `<images_dir>/<repo>/<tag>/rootfs/`.
+    /// 6. Write `manifest.toml`.
+    /// 7. Best-effort `docker rm <container>` + remove the temporary tag.
+    ///
+    /// Idempotent on the registry side — overwrites any existing
+    /// `<repo>/<tag>` directory. Postgres recording is delegated to
+    /// [`Self::record_in_metadata`].
+    pub async fn build(&self, req: &BuildRequest) -> Result<BuildOutcome, BuildError> {
+        // 1. Path safety — reject `..` segments in repo / tag so a
+        //    typo can't escape the registry root.
+        for component in [req.repo.as_str(), req.tag.as_str()] {
+            if component.is_empty() || component.contains("..") || component.starts_with('/') {
+                return Err(BuildError::InvalidPath(component.to_string()));
+            }
+        }
+        let source = req.source.canonicalize().map_err(|e| {
+            BuildError::InvalidPath(format!("source {}: {e}", req.source.display()))
+        })?;
+        let image_dir = req.images_dir.join(&req.repo).join(&req.tag);
+
+        // 2. Read engram.toml.
+        let cfg_path = source.join("engram.toml");
+        let cfg = EngramRepoConfig::read_from(&cfg_path)?;
+
+        // 3. Pick a unique throwaway tag for the docker build artefact
+        //    so concurrent bakes don't trample each other.
+        let docker_tag = format!("engram-bake-{}", uuid::Uuid::new_v4().simple());
+        let dockerfile = source.join(&cfg.build.dockerfile);
+        if !dockerfile.exists() {
+            return Err(BuildError::Config(format!(
+                "Dockerfile not found at {}",
+                dockerfile.display()
+            )));
+        }
+        let context = source.join(&cfg.build.context);
+
+        tracing::info!(repo = %req.repo, tag = %req.tag, ?dockerfile, "running docker build");
+        self.docker
+            .build(docker::BuildArgs {
+                context: context.clone(),
+                dockerfile: dockerfile.clone(),
+                tag: docker_tag.clone(),
+                build_args: cfg.build.args.clone(),
+            })
+            .await
+            .map_err(|e| BuildError::Docker(format!("build: {e}")))?;
+
+        // 4. Create container. If create fails the only artefact is
+        //    the build-tagged image, so just rmi that and bail.
+        let container_id = match self.docker.create(&docker_tag).await {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.docker.rmi(&docker_tag).await;
+                return Err(BuildError::Docker(format!("create: {e}")));
+            }
+        };
+
+        // 5. Everything from here owns both the container and the
+        //    image — guarantee cleanup runs whether export succeeds
+        //    or fails. We don't surface cleanup errors; the bake's
+        //    outcome is what matters.
+        let outcome = self
+            .build_after_container(req, &cfg, &image_dir, &container_id)
+            .await;
+        let _ = self.docker.rm_container(&container_id).await;
+        let _ = self.docker.rmi(&docker_tag).await;
+
+        outcome.inspect(|o| {
+            tracing::info!(
+                repo = %req.repo,
+                tag = %req.tag,
+                size_bytes = o.size_bytes,
+                "bake complete",
+            );
+        })
+    }
+
+    /// Steps 5–6 of `build`: export, write manifest, compute size.
+    /// Factored out so the unconditional cleanup at the bottom of
+    /// `build` is symmetrical regardless of where this fails.
+    async fn build_after_container(
+        &self,
+        req: &BuildRequest,
+        cfg: &EngramRepoConfig,
+        image_dir: &Path,
+        container_id: &str,
+    ) -> Result<BuildOutcome, BuildError> {
+        tokio::fs::create_dir_all(image_dir).await?;
+        let rootfs_dir = image_dir.join("rootfs");
+        // Wipe any prior contents — bake is overwrite-semantics.
+        let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
+        tokio::fs::create_dir_all(&rootfs_dir).await?;
+
+        self.docker
+            .export_to_dir(container_id, &rootfs_dir)
+            .await
+            .map_err(|e| BuildError::Docker(format!("export: {e}")))?;
+
+        let manifest_path = image_dir.join("manifest.toml");
+        let manifest_str = render_manifest(cfg)?;
+        tokio::fs::write(&manifest_path, manifest_str).await?;
+
+        let size_bytes = recursive_size(&rootfs_dir).await?;
+
+        let _ = req; // outcome shape only carries paths + size
+        Ok(BuildOutcome {
+            image_dir: image_dir.to_path_buf(),
+            manifest_path,
+            rootfs_path: rootfs_dir,
+            size_bytes,
+        })
+    }
+
+    /// Record (or refresh) a `image_versions` row marking the bake as
+    /// `Ready`. Callers that don't want a Postgres write skip this.
+    pub async fn record_in_metadata(
+        &self,
+        meta: &dyn MetadataStore,
+        req: &BuildRequest,
+        outcome: &BuildOutcome,
+    ) -> Result<(), BuildError> {
+        let _ = outcome; // size_bytes / blob_url will be persisted later
+        meta.upsert_image_version(ImageVersion {
+            id: ImageVersionId::new(),
+            repo: req.repo.clone(),
+            tag: req.tag.clone(),
+            blob_url: None,
+            status: ImageStatus::Ready,
+            created_at: Utc::now(),
+        })
+        .await
+        .map_err(BuildError::Persist)
+    }
+}
+
+/// Render the rendered manifest.toml from the source EngramRepoConfig.
+/// Strips the `[build]` section since runtime doesn't need it.
+fn render_manifest(cfg: &EngramRepoConfig) -> Result<String, BuildError> {
+    let manifest = cfg.to_manifest();
+    toml::to_string_pretty(&manifest)
+        .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
+}
+
+async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&d).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let meta = entry.metadata().await?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total)
+}

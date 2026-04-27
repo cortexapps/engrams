@@ -1,0 +1,79 @@
+use async_trait::async_trait;
+
+use crate::error::MetaError;
+use crate::types::event::PersistedEvent;
+use crate::types::host::{HostRecord, HostStatus};
+use crate::types::ids::{HostId, SessionId};
+use crate::types::image::ImageVersion;
+use crate::types::session::{Session, SessionSpec, SessionStatus};
+use crate::types::snapshot::SnapshotRecord;
+
+/// Authoritative source of truth. Postgres-backed in v1; trait exists so
+/// we can support SQLite for embedded deployments later.
+#[async_trait]
+pub trait MetadataStore: Send + Sync {
+    // ---- sessions ----
+    async fn create_session(
+        &self,
+        spec: SessionSpec,
+        image_version: String,
+    ) -> Result<SessionId, MetaError>;
+    async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
+    async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
+    async fn set_session_status(
+        &self,
+        id: SessionId,
+        status: SessionStatus,
+    ) -> Result<(), MetaError>;
+    async fn assign_session_host(
+        &self,
+        id: SessionId,
+        host_id: Option<HostId>,
+    ) -> Result<(), MetaError>;
+
+    // ---- hosts ----
+    async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError>;
+    async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
+    async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
+
+    // ---- snapshots ----
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;
+    async fn list_snapshots_for_session(
+        &self,
+        sid: SessionId,
+    ) -> Result<Vec<SnapshotRecord>, MetaError>;
+    async fn latest_snapshot_for_session(
+        &self,
+        sid: SessionId,
+    ) -> Result<Option<SnapshotRecord>, MetaError>;
+
+    // ---- images ----
+    async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError>;
+    async fn latest_ready_image(&self, repo: &str) -> Result<Option<ImageVersion>, MetaError>;
+
+    // ---- session event log ----
+
+    /// Append an event to a session's persistent log. Returns the
+    /// monotonic per-session `idx` assigned to this event. Allocation
+    /// is atomic — concurrent appends to the same session never
+    /// collide and never leave gaps. `kind` is the event discriminant
+    /// (e.g. "stdout", "snapshot_taken"); `payload` is the wire JSON.
+    async fn append_session_event(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<i64, MetaError>;
+
+    /// Return events with `idx > since`, in idx order, capped at
+    /// `limit`. Used by `GET /sessions/:id/events?since=N` (and by
+    /// EventSource auto-reconnect via `Last-Event-ID`) to replay the
+    /// log before tailing the live bus. Pass `since = -1` to start
+    /// from the very first event.
+    async fn list_session_events_since(
+        &self,
+        session_id: SessionId,
+        since: i64,
+        limit: i64,
+    ) -> Result<Vec<PersistedEvent>, MetaError>;
+}

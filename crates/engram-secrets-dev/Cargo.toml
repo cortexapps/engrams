@@ -1,0 +1,21 @@
+[package]
+name = "engram-secrets-dev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev SecretStore implementations: in-memory + env-var-backed. Not for production."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }

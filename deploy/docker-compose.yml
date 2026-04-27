@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: engram
+      POSTGRES_PASSWORD: engram
+      POSTGRES_DB: engram
+    ports:
+      # Host-side port shifted off the default 5432 so it doesn't
+      # collide with a system Postgres a developer may already run.
+      # Container-internal port stays at 5432.
+      - "5435:5432"
+    volumes:
+      - engram-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  coordinator:
+    build:
+      context: ..
+      dockerfile: docker/coordinator.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Container-to-container DB hop stays on Postgres' default port.
+      DATABASE_URL: postgres://engram:engram@postgres:5432/engram
+      # Coordinator listens on 8090 inside its container; the host-side
+      # mapping below exposes it on 8090 too, matching `just dev`.
+      ENGRAM_BIND_ADDR: 0.0.0.0:8090
+      ENGRAM_MODE: all
+      ENGRAM_CLOUD_BACKEND: static
+      ENGRAM_STORAGE_BACKEND: local
+      ENGRAM_STORAGE_LOCAL_PATH: /var/engram/snapshots
+      RUST_LOG: info,engram=debug
+    ports:
+      - "8090:8090"
+    volumes:
+      - engram-snap-data:/var/engram/snapshots
+
+volumes:
+  engram-pg-data:
+  engram-snap-data:

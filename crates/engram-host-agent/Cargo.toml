@@ -1,0 +1,40 @@
+[package]
+name = "engram-host-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-host daemon: warm pool, snapshot manager, resource governor."
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "engram-host-agent"
+path = "src/main.rs"
+
+[dependencies]
+engram-core.workspace = true
+engram-protocol.workspace = true
+engram-sandbox-process.workspace = true
+engram-cloud-static.workspace = true
+engram-storage-local.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
