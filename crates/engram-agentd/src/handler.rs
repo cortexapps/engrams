@@ -17,7 +17,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::proto::{
-    read_msg, write_msg, WireExecEvent, WireExecRequest, WireHandshake, WireHandshakeAck,
+    read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireHandshake, WireHandshakeAck,
+    WireRequest, WireResponse, WireStatResponse,
 };
 
 /// Channel buffer between the stdout/stderr readers and the writer.
@@ -81,7 +82,43 @@ where
         );
     }
 
-    let req: WireExecRequest = read_msg(&mut reader).await?;
+    let req: WireRequest = read_msg(&mut reader).await?;
+    let exec_req = match req {
+        WireRequest::Exec(e) => e,
+        WireRequest::Stat { path } => {
+            let resp = stat_path(&path).await;
+            write_msg(&mut writer, &WireResponse::Stat(resp)).await?;
+            return Ok(());
+        }
+        WireRequest::Upload { path, bytes, mode } => {
+            let resp = upload_path(&path, &bytes, mode).await;
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
+        WireRequest::Download { path } => {
+            let resp = download_path(&path).await;
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
+        WireRequest::Ping => {
+            write_msg(&mut writer, &WireResponse::Pong).await?;
+            return Ok(());
+        }
+        WireRequest::Shutdown => {
+            // Acknowledge and close the connection. The agent
+            // process keeps running — the host pairs this verb
+            // with `PUT /actions SendCtrlAltDel` on Firecracker
+            // to actually stop the VM (the SendCtrlAltDel piece
+            // is in Phase 6's deferred list). For now, Shutdown
+            // is the agent-side handshake that says "I've
+            // flushed any in-flight work and you can power me
+            // down whenever".
+            write_msg(&mut writer, &WireResponse::ShutdownAck).await?;
+            return Ok(());
+        }
+    };
+
+    let req = exec_req;
     if req.command.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -213,6 +250,101 @@ async fn drop_send(tx: &mpsc::Sender<WireExecEvent>, ev: WireExecEvent) {
     let _ = tx.send(ev).await;
 }
 
+// ---- Non-streaming verb implementations -------------------------------
+
+async fn stat_path(path: &str) -> WireStatResponse {
+    match tokio::fs::metadata(path).await {
+        Ok(m) => {
+            let mtime_unix = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            WireStatResponse {
+                exists: true,
+                size: m.len(),
+                mtime_unix,
+                is_dir: m.is_dir(),
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => WireStatResponse {
+            exists: false,
+            size: 0,
+            mtime_unix: 0,
+            is_dir: false,
+        },
+        Err(e) => {
+            // Permission denied / IO errors collapse into "exists =
+            // false" to keep the wire shape simple — the host can
+            // upload-and-retry to discover the real story. We log
+            // so an operator can still see the underlying issue.
+            tracing::warn!(path, error = %e, "stat fell back to not-found");
+            WireStatResponse {
+                exists: false,
+                size: 0,
+                mtime_unix: 0,
+                is_dir: false,
+            }
+        }
+    }
+}
+
+async fn upload_path(path: &str, bytes: &[u8], mode: Option<u32>) -> WireResponse {
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return wire_io_err("create parent dir", e);
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(path, bytes).await {
+        return wire_io_err("write", e);
+    }
+    if let Some(_mode) = mode {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(_mode);
+            if let Err(e) = tokio::fs::set_permissions(path, perm).await {
+                return wire_io_err("chmod", e);
+            }
+        }
+    }
+    WireResponse::UploadOk
+}
+
+async fn download_path(path: &str) -> WireResponse {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            // Hard-cap at the framing limit so we don't emit a
+            // frame the peer is required to reject. The host can
+            // chunk via separate Download requests over different
+            // ranges once we add a range-aware verb.
+            if bytes.len() > crate::proto::MAX_MSG_BYTES {
+                return WireResponse::Error {
+                    kind: format!("{:?}", io::ErrorKind::InvalidData),
+                    message: format!(
+                        "file is {} bytes; exceeds {} MiB single-frame cap",
+                        bytes.len(),
+                        crate::proto::MAX_MSG_BYTES / (1024 * 1024)
+                    ),
+                };
+            }
+            WireResponse::Download(WireDownloadResponse { bytes })
+        }
+        Err(e) => wire_io_err("read", e),
+    }
+}
+
+fn wire_io_err(op: &str, err: io::Error) -> WireResponse {
+    WireResponse::Error {
+        kind: format!("{:?}", err.kind()),
+        message: format!("{op}: {err}"),
+    }
+}
+
 /// Constant-time byte comparison. Mirrors
 /// `engram-coordinator::api::auth::ct_eq` so a deployment can audit
 /// "where do we compare secrets" by grepping the same name across
@@ -233,6 +365,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::WireExecRequest;
     use std::collections::HashMap;
     use tokio::io::duplex;
 
@@ -245,8 +378,9 @@ mod tests {
         // Server side: handler reads request, runs cmd, writes events.
         let server_task = tokio::spawn(async move { serve_connection(server, None).await });
 
-        // Client side: send request, then read events until EOF.
-        write_msg(&mut client, &req).await.unwrap();
+        // Client side: wrap the exec request in the multi-verb
+        // envelope, then read events until EOF.
+        write_msg(&mut client, &WireRequest::Exec(req)).await.unwrap();
         let mut events = Vec::new();
         loop {
             match read_msg::<_, WireExecEvent>(&mut client).await {
@@ -390,13 +524,13 @@ mod tests {
         let server_task = tokio::spawn(async move { serve_connection(server, None).await });
         write_msg(
             &mut client,
-            &WireExecRequest {
+            &WireRequest::Exec(WireExecRequest {
                 command: Vec::new(),
                 stdin: None,
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -411,13 +545,13 @@ mod tests {
         let server_task = tokio::spawn(async move { serve_connection(server, None).await });
         write_msg(
             &mut client,
-            &WireExecRequest {
+            &WireRequest::Exec(WireExecRequest {
                 command: vec!["/this/binary/does/not/exist".into()],
                 stdin: None,
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -449,13 +583,13 @@ mod tests {
 
         write_msg(
             &mut client,
-            &WireExecRequest {
+            &WireRequest::Exec(WireExecRequest {
                 command: vec!["sh".into(), "-c".into(), "printf hi".into()],
                 stdin: None,
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -522,13 +656,13 @@ mod tests {
         let server_task = tokio::spawn(async move { serve_connection(server, None).await });
         write_msg(
             &mut client,
-            &WireExecRequest {
+            &WireRequest::Exec(WireExecRequest {
                 command: vec!["sh".into(), "-c".into(), "printf x".into()],
                 stdin: None,
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -572,5 +706,142 @@ mod tests {
         assert_eq!(total_out, b"out");
         assert_eq!(total_err, b"err");
         assert!(matches!(evs.last(), Some(WireExecEvent::Exit(Some(0)))));
+    }
+
+    // ---- New-verb tests ------------------------------------------
+
+    /// One-shot helper: send a non-streaming WireRequest and read
+    /// back the single WireResponse. Used by the verb tests below.
+    async fn round_trip(req: WireRequest) -> WireResponse {
+        let (mut client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        write_msg(&mut client, &req).await.unwrap();
+        let resp: WireResponse = read_msg(&mut client).await.unwrap();
+        let _ = server_task.await.unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn ping_returns_pong() {
+        let resp = round_trip(WireRequest::Ping).await;
+        assert!(matches!(resp, WireResponse::Pong));
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_ack() {
+        let resp = round_trip(WireRequest::Shutdown).await;
+        assert!(matches!(resp, WireResponse::ShutdownAck));
+    }
+
+    #[tokio::test]
+    async fn stat_existing_file_returns_size_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello-stat").unwrap();
+        let resp = round_trip(WireRequest::Stat {
+            path: path.to_string_lossy().into_owned(),
+        })
+        .await;
+        match resp {
+            WireResponse::Stat(s) => {
+                assert!(s.exists);
+                assert_eq!(s.size, b"hello-stat".len() as u64);
+                assert!(!s.is_dir);
+                assert!(s.mtime_unix > 0, "mtime should be a real Unix epoch");
+            }
+            other => panic!("expected Stat response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_missing_file_reports_exists_false() {
+        let resp = round_trip(WireRequest::Stat {
+            path: "/this/path/does/not/exist".into(),
+        })
+        .await;
+        match resp {
+            WireResponse::Stat(s) => assert!(!s.exists),
+            other => panic!("expected Stat response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_directory_reports_is_dir_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = round_trip(WireRequest::Stat {
+            path: dir.path().to_string_lossy().into_owned(),
+        })
+        .await;
+        match resp {
+            WireResponse::Stat(s) => {
+                assert!(s.exists);
+                assert!(s.is_dir);
+            }
+            other => panic!("expected Stat response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_writes_bytes_creating_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/deeper/file.txt");
+        let resp = round_trip(WireRequest::Upload {
+            path: path.to_string_lossy().into_owned(),
+            bytes: b"uploaded-content".to_vec(),
+            mode: None,
+        })
+        .await;
+        assert!(matches!(resp, WireResponse::UploadOk));
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, b"uploaded-content");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn upload_with_mode_chmods_to_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.sh");
+        let resp = round_trip(WireRequest::Upload {
+            path: path.to_string_lossy().into_owned(),
+            bytes: b"#!/bin/sh\necho hi\n".to_vec(),
+            mode: Some(0o755),
+        })
+        .await;
+        assert!(matches!(resp, WireResponse::UploadOk));
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        // Compare just the user/group/other bits — type bits vary.
+        assert_eq!(perms.mode() & 0o777, 0o755);
+    }
+
+    #[tokio::test]
+    async fn download_returns_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let payload: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+        let resp = round_trip(WireRequest::Download {
+            path: path.to_string_lossy().into_owned(),
+        })
+        .await;
+        match resp {
+            WireResponse::Download(d) => assert_eq!(d.bytes, payload),
+            other => panic!("expected Download response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_missing_file_returns_error_response() {
+        let resp = round_trip(WireRequest::Download {
+            path: "/this/file/does/not/exist".into(),
+        })
+        .await;
+        match resp {
+            WireResponse::Error { kind, message } => {
+                assert!(kind.contains("NotFound"), "expected NotFound kind, got {kind}");
+                assert!(message.contains("read"), "message should name the op");
+            }
+            other => panic!("expected Error response, got {other:?}"),
+        }
     }
 }

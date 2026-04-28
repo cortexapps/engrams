@@ -80,7 +80,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest};
+use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{ExecEvent, ExecRequest, ExecStream, SandboxSpec};
@@ -627,16 +627,16 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let req = WireExecRequest {
+    let req = WireRequest::Exec(WireExecRequest {
         command: cmd.command,
         stdin: cmd.stdin,
         env: cmd.env,
         workdir: cmd.workdir,
         timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
-    };
+    });
     write_msg(&mut writer, &req)
         .await
-        .map_err(|e| vm_err(format!("send WireExecRequest: {e}")))?;
+        .map_err(|e| vm_err(format!("send WireRequest::Exec: {e}")))?;
 
     let exec_id = format!("fc-{}", uuid::Uuid::new_v4().simple());
     // 64 events of buffer is enough that a slow consumer doesn't

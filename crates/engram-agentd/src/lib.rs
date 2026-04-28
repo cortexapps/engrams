@@ -18,4 +18,7 @@ pub mod handler;
 pub mod proto;
 
 pub use handler::serve_connection;
-pub use proto::{read_msg, write_msg, WireExecEvent, WireExecRequest, MAX_MSG_BYTES};
+pub use proto::{
+    read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireExecRequest, WireHandshake,
+    WireHandshakeAck, WireRequest, WireResponse, WireStatResponse, MAX_MSG_BYTES,
+};

@@ -673,15 +673,15 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 
 - ✅ **First-frame token auth on `engram-agentd`** (server side) — new `WireHandshake { token, agent_version }` + `WireHandshakeAck { ok, message }` wire types. `serve_connection(stream, expected_token: Option<String>)` reads the handshake first when a token is configured, replies with a typed ack, and only then accepts the `WireExecRequest`; mismatch surfaces as `io::ErrorKind::PermissionDenied` after writing the rejection. Token resolution chain: `--token <T>` CLI arg → `ENGRAM_AGENT_TOKEN` env → `engram_token=<T>` on `/proc/cmdline` (Linux only — the production injection path uses Firecracker's `BootSource.boot_args`). Constant-time compare via the same `ct_eq` shape used in `engram-coordinator::api::auth`. Fully back-compat: `expected_token = None` (the default) skips the handshake entirely so older hosts that don't know about it keep working. Host-side wiring (`FirecrackerBackend` sending `WireHandshake` from `BootSource.boot_args`-derived per-VM tokens before `WireExecRequest`) is the next follow-up — it touches per-sandbox state plumbing in the backend that's better landed alongside the broader Firecracker production hardening.
 
+- ✅ **Full agentd verb set** — `WireRequest` envelope wraps the original `WireExecRequest` (`WireRequest::Exec(req)`) and adds `Stat { path }`, `Upload { path, bytes, mode? }`, `Download { path }`, `Ping`, and `Shutdown`. Each non-streaming verb gets exactly one `WireResponse` reply (`Stat`, `UploadOk`, `Download`, `Pong`, `ShutdownAck`, or typed `Error { kind, message }` mirroring `io::ErrorKind`); Exec keeps its existing streaming-`WireExecEvent` shape. Single-frame body cap is the existing `MAX_MSG_BYTES` (16 MiB) — Upload/Download bigger than that errors instead of silently truncating; multi-frame chunked transfer is a follow-up if anyone hits the limit. Wire-format change for the Exec path (callers wrap in `WireRequest::Exec`); `engram-sandbox-firecracker::drive_exec_protocol` updated alongside, and the Phase 6-deferred `SendCtrlAltDel` graceful shutdown will pair with `WireRequest::Shutdown` (agent currently acks then leaves; pairing with `PUT /actions SendCtrlAltDel` actually stops the VM).
+
 **Still deferred** (rolled into Phase 6 production hardening, since they're orthogonal to "the trait surface works"):
 
 - `firecracker-jailer` integration (drop privileges, chroot, cgroups, seccomp, `/dev/kvm` fd passing)
 - TAP networking + per-VM IP allocation
 - Broker-mode HTTPS proxy (secret value substitution at the network boundary)
 - Network policy enforcement via iptables/nftables at the TAP boundary
-- `SendCtrlAltDel` graceful shutdown; agent-side shutdown handshake
-- First-frame token auth on the in-guest agent
-- The full agent verb set (`Stat` / `Upload` / `Download` / `Ping` / `Shutdown` — exec-only today)
+- `SendCtrlAltDel` graceful shutdown (agent-side shutdown handshake is done — the host's pairing piece lives here)
 
 ### Phase 3 — Multi-host coordinator ✅
 

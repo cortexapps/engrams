@@ -8,25 +8,43 @@
 //!
 //! ## Conversation shape
 //!
-//! Without auth (development, default for back-compat):
+//! After the optional handshake (see below), the host sends one
+//! [`WireRequest`] per connection. The verb's response shape
+//! depends on the variant:
+//!
+//! - `WireRequest::Exec(req)` — agent streams [`WireExecEvent`]s
+//!   ending with `Exit`. Same as the original exec-only protocol;
+//!   the new envelope just wraps it.
+//! - `WireRequest::Stat | Upload | Download | Ping | Shutdown` —
+//!   agent sends exactly one [`WireResponse`] and closes.
+//!
+//! ### Without auth (development, default for back-compat):
 //!
 //! ```text
-//!   host ──[ WireExecRequest ]──► agent
+//!   host ──[ WireRequest::Exec(WireExecRequest) ]──► agent
 //!   agent ──[ WireExecEvent::Stdout(bytes) ]──► host    (0+ times)
 //!   agent ──[ WireExecEvent::Stderr(bytes) ]──► host    (0+ times)
 //!   agent ──[ WireExecEvent::Exit(status)  ]──► host    (exactly once)
 //!   <connection closed>
 //! ```
 //!
-//! With first-frame token auth (production, when the agent is started
-//! with `--token <T>` or finds `engram_token=<T>` on the kernel
-//! cmdline):
+//! For non-streaming verbs:
+//!
+//! ```text
+//!   host ──[ WireRequest::Stat { path } ]──► agent
+//!   agent ──[ WireResponse::Stat(WireStatResponse) ]──► host
+//!   <connection closed>
+//! ```
+//!
+//! ### With first-frame token auth (production, when the agent is
+//! started with `--token <T>` or finds `engram_token=<T>` on the
+//! kernel cmdline):
 //!
 //! ```text
 //!   host ──[ WireHandshake { token, agent_version } ]──► agent
 //!   agent ──[ WireHandshakeAck { ok, message } ]──► host
 //!     (if !ok, agent closes; host treats as auth failure)
-//!   host ──[ WireExecRequest ]──► agent
+//!   host ──[ WireRequest::* ]──► agent
 //!     ... same as above ...
 //! ```
 //!
@@ -89,16 +107,94 @@ pub struct WireHandshake {
 }
 
 /// Agent's response to [`WireHandshake`]. On `ok = true` the agent
-/// continues to read the [`WireExecRequest`] frame as in the
-/// no-auth flow. On `ok = false` the agent closes the connection
-/// after sending the ack — `message` carries a single short reason
-/// the host can surface in logs (NEVER include the expected token
-/// or any guess at the supplied one — the message is plaintext on
+/// continues to read the [`WireRequest`] frame as in the no-auth
+/// flow. On `ok = false` the agent closes the connection after
+/// sending the ack — `message` carries a single short reason the
+/// host can surface in logs (NEVER include the expected token or
+/// any guess at the supplied one — the message is plaintext on
 /// the vsock, not a secrets channel).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireHandshakeAck {
     pub ok: bool,
     pub message: Option<String>,
+}
+
+/// Multi-verb request envelope. The host sends exactly one of these
+/// per connection after the (optional) handshake; the agent
+/// dispatches and either streams (Exec) or sends a single
+/// [`WireResponse`] (everything else). Single-frame size cap is
+/// [`MAX_MSG_BYTES`] (16 MiB) per the existing framing layer; for
+/// Upload / Download that bounds payload size at 16 MiB. Multi-
+/// frame chunked uploads are a follow-up.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WireRequest {
+    /// Run a command in the sandbox and stream its output. Wraps
+    /// the original [`WireExecRequest`] one-to-one — back-compat
+    /// preserved by callers updating to `WireRequest::Exec(req)`.
+    Exec(WireExecRequest),
+    /// Read filesystem metadata for `path` inside the sandbox.
+    /// Returns [`WireResponse::Stat`] always — `exists = false`
+    /// instead of an error if the path is missing, to keep
+    /// "does this exist" cheap to ask.
+    Stat { path: String },
+    /// Write `bytes` to `path` inside the sandbox, creating parent
+    /// directories as needed. `mode` is the unix file mode to
+    /// `chmod` to after the write (mostly for `+x` on uploaded
+    /// scripts); `None` keeps the OS default.
+    Upload {
+        path: String,
+        bytes: Vec<u8>,
+        mode: Option<u32>,
+    },
+    /// Read the entire contents of `path` from the sandbox into
+    /// the response. Errors with `WireResponse::Error` if the
+    /// file doesn't exist or exceeds the framing cap.
+    Download { path: String },
+    /// Liveness probe. Agent replies [`WireResponse::Pong`].
+    Ping,
+    /// Ask the agent to exit cleanly after replying. The agent
+    /// sends [`WireResponse::ShutdownAck`] then closes; main.rs's
+    /// accept loop notices the agent task ended and exits the
+    /// process. Used for graceful VM shutdown coordination.
+    Shutdown,
+}
+
+/// Single-shot response for non-streaming [`WireRequest`] verbs.
+/// `Exec` doesn't get one — its response is the stream of
+/// [`WireExecEvent`]s.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WireResponse {
+    Stat(WireStatResponse),
+    /// Successful upload. No payload — the host knows what it
+    /// sent.
+    UploadOk,
+    Download(WireDownloadResponse),
+    Pong,
+    ShutdownAck,
+    /// Anything the agent couldn't fulfil. `message` is a short
+    /// human-readable reason; `kind` mirrors the std `io::ErrorKind`
+    /// stringly so the host can map back to a typed error
+    /// without a wire-format tied to the unstable enum.
+    Error {
+        kind: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireStatResponse {
+    pub exists: bool,
+    pub size: u64,
+    /// Modification time in seconds since the Unix epoch, or 0
+    /// when the platform doesn't expose one. Useful for "did this
+    /// file change since I last looked".
+    pub mtime_unix: i64,
+    pub is_dir: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireDownloadResponse {
+    pub bytes: Vec<u8>,
 }
 
 // ---- Framing -----------------------------------------------------------
