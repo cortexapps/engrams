@@ -160,6 +160,37 @@ impl MetadataStore for MockMetadataStore {
         Ok(())
     }
 
+    async fn list_stale_hosts(
+        &self,
+        _threshold_secs: u64,
+    ) -> Result<Vec<HostRecord>, MetaError> {
+        // Mock doesn't track heartbeat timestamps; existing tests
+        // don't exercise the dead-host detector path.
+        Ok(Vec::new())
+    }
+
+    async fn mark_host_dead_and_reassign_sessions(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        let mut g = self.sessions.lock();
+        let mut affected = Vec::new();
+        for s in g.values_mut() {
+            if s.host_id == Some(host_id)
+                && !matches!(
+                    s.status,
+                    SessionStatus::Completed | SessionStatus::Failed
+                )
+            {
+                s.host_id = None;
+                s.status = SessionStatus::PendingReassign;
+                s.last_active_at = Utc::now();
+                affected.push(s.id);
+            }
+        }
+        Ok(affected)
+    }
+
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
         self.snapshots
             .lock()

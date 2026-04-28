@@ -696,16 +696,19 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 - ✅ **`engram host list/get/drain`** CLI commands.
 - ✅ 322 workspace tests pass (up from 292), with new wire-loopback (5), AppState-via-wire integration (4), and scheduler-ranking (4) suites.
 
-**Deferred** (rolled into later phases or follow-up PRs — operator-initiated migration works today; the deliverable below requires the dead-host detector):
+**Done in follow-up PRs:**
 
-- **Dead-host auto-detector** — background task that polls `hosts.last_heartbeat_at`, takes a Postgres advisory lock per dead host (so only one replica wins the transition), marks the row Dead, clears `host_id` on its sessions, transitions to `PendingReassign`, and synthesises `SessionEvent::ExecCompleted{exit_status: None}` for any active execs so SSE clients see a clean termination instead of hanging. Without this, automatic migration on `kill -9 host` doesn't fire — operators must `POST /sessions/:id/migrate` by hand.
+- ✅ **Dead-host auto-detector** — `crates/engram-coordinator/src/dead_host.rs`. Polls `MetadataStore::list_stale_hosts(threshold)` every ~10s, races other replicas via `pg_try_advisory_lock(hashtext('dead-host:' || host_id))`, atomically marks the host `Dead` + transitions its sessions to `PendingReassign` with `host_id` cleared (`MetadataStore::mark_host_dead_and_reassign_sessions`), emits `pg_notify('host_dead', host_id)` so other replicas drop their `HostRegistry` entry via `pg_listener`, and emits `SessionEvent::StatusChanged{Active → PendingReassign}` for SSE subscribers. **`ExecCompleted` synthesis turned out to be unnecessary**: dropping the host's `RemoteSandboxBackend` cascades through the WS demuxer's close path → per-exec stream channel drops → SSE handler's event loop ends naturally and emits `ExecCompleted{exit_status: None}` from its existing tail logic. `0003_hosts_heartbeat_index.sql` adds a partial index on `(status, last_heartbeat_at) WHERE status IN ('ready','draining')` for the polling query. 6 Mock-based unit tests in `tests/dead_host_mock.rs` lock down the trait-layer semantics; the detector loop's advisory-lock dance is Postgres-specific and falls back to the live-Postgres integration test below.
+
+**Still deferred:**
+
 - **W3C tracing context on the wire** — `Frame::Request` should carry `trace_id`/`span_id` so coordinator-side spans stitch with host-side spans. ~30 LOC; deferred to keep 3a focused.
 - **Real Pool-state population in heartbeats** — `HostAgent` doesn't run a warm `Pool` of its own yet (the Pool is still coordinator-side); the dialer's `heartbeat_provider` is `None`, so `warm_pools` ships empty. The scheduler falls through to capacity ranking instead of warm-pool affinity. Real reporting needs the Pool to move host-side and be threaded into `HostAgent::run`.
 - **`0003_host_assignments` migration** — host-facing analogue of `session_events` for assignment reconciliation when a host reconnects. Deferred until an actual reconcile path needs it (with the dead-host detector).
 - **Real `tests/ha_listener.rs` against live Postgres** — proves the cross-replica SSE fan-out end-to-end. Currently `#[ignore]`'d concept; the SQL change is implicitly covered by the existing `append_session_event` tests since any breakage there would break all 100+ tests that emit events.
 - **Production hardening** — TLS for the WS channel, `HostStatus::Disconnected` (network blip vs. dead distinction), backpressure tuning past the default 64-frame mpsc capacity. Lands with Phase 6.
 
-**Deliverable** (pending the dead-host detector): stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.
+**Deliverable**: stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.
 
 ### Phase 4 — Cloud abstraction & spot tolerance
 

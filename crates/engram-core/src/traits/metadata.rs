@@ -36,6 +36,29 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
+    /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
+    /// AND whose status is `Ready` or `Draining`. The dead-host detector
+    /// polls this every ~10s and races other coordinator replicas via
+    /// `pg_try_advisory_lock` for the right to evacuate each candidate.
+    /// `Dead` rows are filtered out so a still-running coordinator
+    /// replica's detector doesn't keep trying to re-kill them.
+    async fn list_stale_hosts(
+        &self,
+        threshold_secs: u64,
+    ) -> Result<Vec<HostRecord>, MetaError>;
+
+    /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id` on
+    /// every session pointed at it, (c) transition those sessions to
+    /// `PendingReassign`. Returns the affected SessionIds so the caller
+    /// can emit per-session `StatusChanged` events. Postgres uses a
+    /// single transaction; the Mock takes its sessions mutex once.
+    /// Idempotent on a host already marked Dead — returns an empty
+    /// vec since no sessions still point at it.
+    async fn mark_host_dead_and_reassign_sessions(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<SessionId>, MetaError>;
+
     // ---- snapshots ----
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;
     async fn list_snapshots_for_session(

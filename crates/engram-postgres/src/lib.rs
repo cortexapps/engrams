@@ -221,6 +221,77 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn list_stale_hosts(
+        &self,
+        threshold_secs: u64,
+    ) -> Result<Vec<HostRecord>, MetaError> {
+        // `make_interval` keeps the threshold parameterised without
+        // string-templating an INTERVAL literal. Cast to BIGINT so a
+        // very-large threshold (well past i32::MAX) doesn't overflow.
+        let rows = sqlx::query(
+            r#"
+            SELECT id, hostname, cloud_metadata,
+                   capacity_total_gb, capacity_used_gb,
+                   last_heartbeat_at, status
+              FROM hosts
+             WHERE status IN ('ready','draining')
+               AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint)
+            "#,
+        )
+        .bind(threshold_secs as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::host_from_row).collect()
+    }
+
+    async fn mark_host_dead_and_reassign_sessions(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        // Single transaction: hosts.status -> dead, every session row
+        // pointing at this host gets host_id cleared and status flipped
+        // to pending_reassign. Returning the affected session ids lets
+        // the caller emit per-session StatusChanged events without a
+        // second query. The hosts UPDATE deliberately omits a rows-
+        // affected check — calling this on a host already marked dead
+        // is a benign no-op (the sessions UPDATE returns an empty list).
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        sqlx::query(r#"UPDATE hosts SET status = 'dead', updated_at = NOW() WHERE id = $1"#)
+            .bind(host_id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        let rows = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET host_id = NULL,
+                   status = 'pending_reassign',
+                   last_active_at = NOW()
+             WHERE host_id = $1
+               AND status NOT IN ('completed','failed')
+            RETURNING id
+            "#,
+        )
+        .bind(host_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+
+        let ids = rows
+            .iter()
+            .map(|r| {
+                let uuid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
+                Ok(SessionId::from(uuid))
+            })
+            .collect::<Result<Vec<SessionId>, MetaError>>()?;
+        Ok(ids)
+    }
+
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
         sqlx::query(
             r#"

@@ -11,6 +11,7 @@ use engram_core::traits::{BlobStorage, CloudBackend, MetadataStore, SandboxBacke
 
 pub mod api;
 pub mod config;
+pub mod dead_host;
 pub mod error;
 pub mod host_registry;
 pub mod image_registry;
@@ -56,14 +57,41 @@ pub async fn run_with_registry(
 
     // Phase 3c HA: every replica subscribes to the shared
     // `session_events` channel so SSE clients connected to any one
-    // replica see events emitted via any other. Drops the JoinHandle —
+    // replica see events emitted via any other. The same listener
+    // also handles `host_dead` notifications (Phase 3d follow-up) so
+    // every replica drops its in-memory `HostRegistry` entry when
+    // any replica wins the dead-host race. Drops the JoinHandle —
     // the task lives for the coordinator's lifetime and exits when
     // axum::serve returns (process shutdown).
     let _pg_listener = pg_listener::spawn(
         cfg.database_url.clone(),
-        meta_for_listener,
+        meta_for_listener.clone(),
         state.events.clone(),
+        state.host_registry.clone(),
     );
+
+    // Phase 3d follow-up: dead-host auto-detector. Opens its own
+    // PgPool for advisory locks (the trait doesn't expose one;
+    // sharing a connection between the trait and lock-holding code
+    // would tangle the abstraction). On Postgres-backed deployments
+    // a stale heartbeat triggers eviction within ~poll_interval +
+    // stale_threshold; deployments using a non-Postgres MetadataStore
+    // will see this task fail to connect and log the error — they
+    // can still use `POST /sessions/:id/migrate` for operator-
+    // initiated transitions.
+    let _dead_host = match sqlx::postgres::PgPool::connect(&cfg.database_url).await {
+        Ok(pool) => Some(dead_host::spawn(
+            dead_host::DeadHostConfig::default(),
+            pool,
+            meta_for_listener,
+            state.host_registry.clone(),
+            state.events.clone(),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "dead-host detector disabled — couldn't open PgPool");
+            None
+        }
+    };
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())

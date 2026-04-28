@@ -17,10 +17,11 @@
 use std::sync::Arc;
 
 use engram_core::traits::MetadataStore;
-use engram_core::SessionId;
+use engram_core::{HostId, SessionId};
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
 
+use crate::host_registry::HostRegistry;
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
 
 #[derive(Debug, Deserialize)]
@@ -38,9 +39,10 @@ pub fn spawn(
     database_url: String,
     meta: Arc<dyn MetadataStore>,
     events: Arc<SessionEventBus>,
+    host_registry: Arc<HostRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(&database_url, meta, events).await {
+        if let Err(e) = run(&database_url, meta, events, host_registry).await {
             tracing::error!(error = %e, "pg listener task exited");
         }
     })
@@ -50,13 +52,43 @@ async fn run(
     database_url: &str,
     meta: Arc<dyn MetadataStore>,
     events: Arc<SessionEventBus>,
+    host_registry: Arc<HostRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
-    tracing::info!("pg_listener subscribed to session_events");
+    listener.listen("host_dead").await?;
+    tracing::info!("pg_listener subscribed to session_events + host_dead");
 
     loop {
         let notification = listener.recv().await?;
+        match notification.channel() {
+            "host_dead" => {
+                // Payload is just `<uuid>` (no JSON wrapper) — the
+                // detector emits it as a plain text NOTIFY.
+                match notification.payload().parse::<HostId>() {
+                    Ok(host_id) => {
+                        host_registry.unregister(host_id);
+                        tracing::debug!(
+                            %host_id,
+                            "pg_listener dropped host_registry entry on host_dead",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            payload = notification.payload(),
+                            "malformed host_dead notification; skipping",
+                        );
+                    }
+                }
+                continue;
+            }
+            "session_events" => {}
+            other => {
+                tracing::debug!(channel = other, "unexpected NOTIFY channel; ignoring");
+                continue;
+            }
+        }
         let payload: NotifyPayload = match serde_json::from_str(notification.payload()) {
             Ok(p) => p,
             Err(e) => {
