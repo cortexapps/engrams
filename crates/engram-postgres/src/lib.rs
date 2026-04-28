@@ -346,6 +346,15 @@ impl MetadataStore for PostgresStore {
         // thing is a single statement → one round-trip, no locking
         // dance needed beyond the row-level lock Postgres takes for
         // the UPDATE.
+        // Phase 3c HA: the same statement also fires `NOTIFY
+        // session_events <payload>` so other coordinator replicas
+        // (subscribed via `PgListener`) can re-broadcast the event to
+        // their local SSE subscribers. Notifications fire at commit;
+        // because the whole statement is one autocommit unit, the
+        // NOTIFY arrives only after the INSERT is durable. Replicas
+        // that LISTEN before this statement runs see the notification;
+        // replicas that subscribe later catch up via the persistent
+        // log + `?since=N`.
         let row = sqlx::query(
             r#"
             WITH next AS (
@@ -360,7 +369,12 @@ impl MetadataStore for PostgresStore {
                 SELECT $1, allocated_idx, $2, $3 FROM next
                 RETURNING idx
             )
-            SELECT idx FROM inserted
+            SELECT i.idx,
+                   pg_notify(
+                       'session_events',
+                       json_build_object('session_id', $1::text, 'idx', i.idx)::text
+                   )
+              FROM inserted i
             "#,
         )
         .bind(session_id.as_uuid())

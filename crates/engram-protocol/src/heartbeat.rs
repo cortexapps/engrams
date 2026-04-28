@@ -14,7 +14,7 @@ pub struct Heartbeat {
     pub draining: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,

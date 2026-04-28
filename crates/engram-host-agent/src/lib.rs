@@ -15,6 +15,7 @@ use std::sync::Arc;
 use engram_core::traits::{CloudBackend, SandboxBackend};
 
 pub mod config;
+pub mod dialer;
 pub mod heartbeat;
 pub mod pool;
 pub mod resource;
@@ -42,13 +43,48 @@ impl HostAgent {
     }
 
     /// Run the host agent's background loops until shutdown.
+    ///
+    /// Phase 3a: if `coordinator_endpoint` is set, runs the WS dialer
+    /// against that coordinator until ctrl-c (reconnecting on drops).
+    /// Otherwise stays idle until ctrl-c — useful for `engram-host-agent`
+    /// in standalone dev where the binary just hosts a local backend
+    /// without phoning home.
     pub async fn run(self) -> Result<(), HostAgentError> {
         tracing::info!(?self.cfg.work_dir, "host-agent starting");
         let _ = self.cloud.host_metadata().await;
-        // TODO(phase-1): kick off pool warmer, snapshot manager,
-        // heartbeat loop on tokio::spawn handles. For now we wait for
-        // ctrl-c so the binary stays alive in dev.
-        tokio::signal::ctrl_c().await.map_err(HostAgentError::Io)?;
+
+        if let Some(coord_url) = self.cfg.coordinator_endpoint.clone() {
+            let host_id = engram_core::HostId::new();
+            tracing::info!(
+                host_id = %host_id,
+                coordinator = %coord_url,
+                "dialing coordinator",
+            );
+            // No real Pool wiring yet — for 3b the host-agent doesn't
+            // run a warm pool of its own (the coordinator's pool was
+            // historically owned in-process). The heartbeat reports
+            // empty pools/snapshots; the scheduler falls through to
+            // capacity-based ranking. Real pool reporting lands once
+            // the Pool moves host-side in a follow-up.
+            let dialer_cfg = dialer::DialerConfig {
+                coordinator_url: coord_url,
+                auth_token: self.cfg.coordinator_token.clone(),
+                heartbeat_interval: self.cfg.heartbeat_interval,
+                heartbeat_provider: None,
+            };
+            let backend = self.sandbox.clone();
+            let dialer_task = tokio::spawn(async move {
+                if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, backend).await {
+                    tracing::error!(error = %e, "dialer terminated with error");
+                }
+            });
+            tokio::signal::ctrl_c().await.map_err(HostAgentError::Io)?;
+            dialer_task.abort();
+        } else {
+            tracing::info!("no coordinator_endpoint set; standalone dev mode (ctrl-c to exit)");
+            tokio::signal::ctrl_c().await.map_err(HostAgentError::Io)?;
+        }
+
         tracing::info!("host-agent received ctrl-c, shutting down");
         Ok(())
     }

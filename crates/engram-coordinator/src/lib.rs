@@ -12,12 +12,15 @@ use engram_core::traits::{BlobStorage, CloudBackend, MetadataStore, SandboxBacke
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod host_registry;
 pub mod image_registry;
+pub mod pg_listener;
 pub mod scheduler;
 pub mod state;
 
 pub use config::CoordinatorConfig;
 pub use error::ApiError;
+pub use host_registry::HostRegistry;
 pub use state::AppState;
 
 /// Container for the wired-up dependencies. Built once at startup;
@@ -33,7 +36,35 @@ pub struct Services {
 
 /// Bootstrap the axum server. Returns once the bind future yields.
 pub async fn run(cfg: CoordinatorConfig, services: Services) -> Result<(), CoordinatorError> {
-    let state = Arc::new(AppState::new(cfg.clone(), services));
+    run_with_registry(cfg, services, Arc::new(HostRegistry::new())).await
+}
+
+/// Variant of [`run`] that takes an externally-built [`HostRegistry`].
+/// `main.rs` uses this so it can pre-register a local backend in
+/// `--mode=all` before any HTTP routes accept traffic.
+pub async fn run_with_registry(
+    cfg: CoordinatorConfig,
+    services: Services,
+    host_registry: Arc<HostRegistry>,
+) -> Result<(), CoordinatorError> {
+    let meta_for_listener = services.meta.clone();
+    let state = Arc::new(AppState::new_with_registry(
+        cfg.clone(),
+        services,
+        host_registry,
+    ));
+
+    // Phase 3c HA: every replica subscribes to the shared
+    // `session_events` channel so SSE clients connected to any one
+    // replica see events emitted via any other. Drops the JoinHandle —
+    // the task lives for the coordinator's lifetime and exits when
+    // axum::serve returns (process shutdown).
+    let _pg_listener = pg_listener::spawn(
+        cfg.database_url.clone(),
+        meta_for_listener,
+        state.events.clone(),
+    );
+
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
         .await

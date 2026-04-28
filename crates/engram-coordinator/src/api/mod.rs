@@ -8,6 +8,7 @@ pub mod auth;
 mod events;
 mod exec;
 mod health;
+mod hosts;
 mod sessions;
 mod snapshot;
 
@@ -32,6 +33,11 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/snapshot", post(snapshot::snapshot))
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
+        .route("/sessions/:id/migrate", post(sessions::migrate))
+        .route("/api/hosts/connect", get(hosts::connect))
+        .route("/api/hosts", get(hosts::list))
+        .route("/api/hosts/:id", get(hosts::get))
+        .route("/api/hosts/:id/drain", post(hosts::drain))
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

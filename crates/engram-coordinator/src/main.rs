@@ -8,8 +8,9 @@ use engram_cloud_static::StaticCloud;
 use engram_coordinator::{
     config::{CloudBackendChoice, RunMode, SandboxBackendChoice, StorageBackendChoice},
     image_registry::ImageRegistry,
-    run, CoordinatorConfig, CoordinatorError, Services,
+    CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
+use engram_core::HostId;
 use engram_core::traits::{BlobStorage, CloudBackend, SandboxBackend, SecretStore};
 use engram_postgres::PostgresStore;
 use engram_sandbox_firecracker::FirecrackerBackend;
@@ -174,26 +175,51 @@ async fn main() -> Result<(), CoordinatorError> {
         }
     };
 
-    let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
-        SandboxBackendChoice::Firecracker => {
-            let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
-                CoordinatorError::Config(
-                    "ENGRAM_KERNEL_IMAGE_PATH (or --kernel-image-path) is required when \
-                     --sandbox-backend=firecracker"
-                        .into(),
-                )
-            })?;
-            let fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-            Arc::new(FirecrackerBackend::new(cli.sandbox_work_dir, fc_cfg))
-        }
-        SandboxBackendChoice::Process => {
-            tracing::warn!(
-                "starting with --sandbox-backend=process: commands will run as host \
-                 subprocesses with NO isolation. Dev only — production uses --sandbox-backend=firecracker."
-            );
-            Arc::new(ProcessBackend::new(cli.sandbox_work_dir))
-        }
-    };
+    if matches!(cli.mode, RunMode::Host) {
+        // Pure host-agent mode is served by the engram-host-agent binary.
+        return Err(CoordinatorError::Config(
+            "use `engram-host-agent` for --mode=host; this binary serves coordinator/all".into(),
+        ));
+    }
+
+    // Phase 3a: every coordinator-side SandboxBackend call routes
+    // through HostRegistry. For --mode=all we register a local backend
+    // synchronously at startup; for --mode=coordinator the registry
+    // starts empty and hosts dial in via /api/hosts/connect.
+    let host_registry = Arc::new(HostRegistry::new());
+
+    if matches!(cli.mode, RunMode::All) {
+        let local_backend: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
+            SandboxBackendChoice::Firecracker => {
+                let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
+                    CoordinatorError::Config(
+                        "ENGRAM_KERNEL_IMAGE_PATH (or --kernel-image-path) is required when \
+                         --sandbox-backend=firecracker"
+                            .into(),
+                    )
+                })?;
+                let fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
+                Arc::new(FirecrackerBackend::new(cli.sandbox_work_dir.clone(), fc_cfg))
+            }
+            SandboxBackendChoice::Process => {
+                tracing::warn!(
+                    "starting with --sandbox-backend=process: commands will run as host \
+                     subprocesses with NO isolation. Dev only — production uses --sandbox-backend=firecracker."
+                );
+                Arc::new(ProcessBackend::new(cli.sandbox_work_dir.clone()))
+            }
+        };
+        let in_proc_host = HostId::new();
+        host_registry.register(in_proc_host, local_backend);
+        tracing::info!(
+            host_id = %in_proc_host,
+            "registered in-process host (--mode=all bypasses the WS path)",
+        );
+    } else {
+        tracing::info!(
+            "coordinator started without a local backend; waiting for hosts on /api/hosts/connect"
+        );
+    }
 
     // Default dev wiring: env-var-backed SecretStore (pulls
     // `$GITHUB_TOKEN` etc. from the host shell), filesystem-backed
@@ -207,19 +233,10 @@ async fn main() -> Result<(), CoordinatorError> {
         meta: Arc::new(pg),
         blob,
         cloud,
-        sandbox,
+        sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets,
         images,
     };
 
-    if matches!(cli.mode, RunMode::Host) {
-        // Pure host-agent mode is served by the engram-host-agent binary.
-        return Err(CoordinatorError::Config(
-            "use `engram-host-agent` for --mode=host; this binary serves coordinator/all".into(),
-        ));
-    }
-
-    // TODO(phase-3): when mode == All, also spawn engram_host_agent::HostAgent
-    // on the same process so single-binary single-host dev works.
-    run(cfg, services).await
+    engram_coordinator::run_with_registry(cfg, services, host_registry).await
 }

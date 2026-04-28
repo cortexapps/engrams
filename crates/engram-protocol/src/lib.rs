@@ -1,13 +1,23 @@
-//! Wire types for the coordinator<->host channel.
+//! Wire types for the coordinator <-> host channel.
 //!
-//! v1 (Phase 1+2) the coordinator and host run in the same process and
-//! talk in-memory; these types are still used as the public contract.
-//! Phase 3 will add a tonic+protobuf transport that serialises the same
-//! shapes — at which point this crate gains a `build.rs` and a `.proto`
-//! file. Wire-format-stable changes should land here first.
+//! Phase 3 transport: bincode-encoded [`Frame`]s carried inside binary
+//! WebSocket messages. The [`wire`] module defines the frame schema;
+//! [`codec`] handles encode/decode against `tokio_tungstenite::Message`;
+//! [`client`] holds the request-id demuxer and the [`RemoteSandboxBackend`]
+//! impl; [`server`] is the host-side accept loop.
+//!
+//! Phase 1+2 also defined `Heartbeat` / `AssignSession` / `RevokeSession`
+//! shapes used in-process before any wire was needed; those still live
+//! in [`heartbeat`] / [`scheduling`] and are now embedded in the [`wire`]
+//! frame schema.
 
+pub mod client;
+pub mod codec;
 pub mod heartbeat;
 pub mod scheduling;
+pub mod server;
+pub mod wire;
 
 pub use heartbeat::*;
 pub use scheduling::*;
+pub use wire::{Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, WireExecRequest};

@@ -12,8 +12,14 @@ pub struct HostAgentConfig {
     pub heartbeat_interval: Duration,
     /// Local snapshot disk cap, in bytes. Eviction kicks in beyond this.
     pub local_snapshot_cap_bytes: u64,
-    /// Coordinator endpoint for gRPC heartbeat (Phase 3+).
+    /// Coordinator endpoint to dial via WebSocket. The dialer appends
+    /// `/api/hosts/connect`. `None` keeps the agent in standalone-dev
+    /// mode (no outbound connection; ctrl-c shuts down).
     pub coordinator_endpoint: Option<String>,
+    /// Bearer token sent to the coordinator on the WS upgrade. Must
+    /// match an entry in the coordinator's `ENGRAM_AUTH_TOKENS`. `None`
+    /// is acceptable when the coordinator is in dev (auth disabled).
+    pub coordinator_token: Option<String>,
 }
 
 impl Default for HostAgentConfig {
@@ -24,6 +30,7 @@ impl Default for HostAgentConfig {
             heartbeat_interval: Duration::from_secs(5),
             local_snapshot_cap_bytes: 500 * 1024 * 1024 * 1024, // 500 GiB
             coordinator_endpoint: None,
+            coordinator_token: None,
         }
     }
 }

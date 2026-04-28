@@ -1,0 +1,308 @@
+//! Host-agent WebSocket endpoint. Each host dials
+//! `GET /api/hosts/connect` (with `Authorization: Bearer <token>` so
+//! the existing auth middleware applies). After the upgrade the host's
+//! first frame must be a [`NotifyKind::Hello`] carrying its `HostId`;
+//! the coordinator then registers a [`RemoteSandboxBackend`] in
+//! [`HostRegistry`] so all subsequent SandboxBackend calls route over
+//! the wire.
+//!
+//! `--mode=all` skips this path entirely (the local backend is
+//! registered directly at startup), so `just dev` keeps working.
+
+use std::sync::Arc;
+
+use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::Json;
+use chrono::Utc;
+use engram_core::HostId;
+use serde::Serialize;
+use engram_core::types::host::{HostCapacity, HostMetadata, HostRecord, HostStatus};
+use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
+use engram_protocol::wire::NotifyKind;
+use engram_protocol::HeartbeatAck;
+
+use crate::host_registry::HostState;
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use tokio_tungstenite::tungstenite::{
+    protocol::CloseFrame as TungsteniteCloseFrame, Error as TungsteniteError, Message as TungMessage,
+};
+
+use crate::error::ApiError;
+use crate::state::SharedState;
+
+pub async fn connect(
+    State(state): State<SharedState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_connection(state, socket))
+}
+
+/// `GET /api/hosts` — list all hosts the coordinator knows about,
+/// merging the persisted Postgres rows with the live in-memory
+/// scheduler state (capacity, warm pools, local snapshots, draining).
+pub async fn list(
+    State(state): State<SharedState>,
+) -> Result<Json<ListHostsResponse>, ApiError> {
+    let rows = state.services.meta.list_active_hosts().await?;
+    let hosts = rows
+        .into_iter()
+        .map(|row| {
+            let live = state.host_registry.snapshot_state(row.id);
+            HostView::from_row_and_live(row, live)
+        })
+        .collect();
+    Ok(Json(ListHostsResponse { hosts }))
+}
+
+/// `GET /api/hosts/:id`. NotFound if the row isn't in Postgres.
+pub async fn get(
+    State(state): State<SharedState>,
+    Path(host_id): Path<HostId>,
+) -> Result<Json<HostView>, ApiError> {
+    let rows = state.services.meta.list_active_hosts().await?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.id == host_id)
+        .ok_or_else(|| ApiError::NotFound("host not found".into()))?;
+    let live = state.host_registry.snapshot_state(host_id);
+    Ok(Json(HostView::from_row_and_live(row, live)))
+}
+
+/// `POST /api/hosts/:id/drain`. Flips the host to Draining in both
+/// the Postgres row and the in-memory scheduler view; new sessions
+/// won't be assigned to it. In-flight sessions stay put — evacuation
+/// lands in 3d.
+pub async fn drain(
+    State(state): State<SharedState>,
+    Path(host_id): Path<HostId>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .services
+        .meta
+        .set_host_status(host_id, HostStatus::Draining)
+        .await?;
+    if let Some(mut s) = state.host_registry.snapshot_state(host_id) {
+        s.draining = true;
+        state.host_registry.update_state(host_id, s);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+pub struct ListHostsResponse {
+    pub hosts: Vec<HostView>,
+}
+
+#[derive(Serialize)]
+pub struct HostView {
+    pub id: HostId,
+    pub hostname: String,
+    pub status: &'static str,
+    pub capacity_total_mib: u64,
+    pub capacity_used_mib: u64,
+    pub running_sandboxes: u32,
+    pub warm_pools: Vec<WarmPoolView>,
+    pub local_snapshots: usize,
+    pub last_heartbeat_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+pub struct WarmPoolView {
+    pub repo: String,
+    pub image_version: String,
+    pub ready: u32,
+    pub target: u32,
+}
+
+impl HostView {
+    fn from_row_and_live(
+        row: engram_core::types::HostRecord,
+        live: Option<crate::host_registry::HostState>,
+    ) -> Self {
+        let live = live.unwrap_or_default();
+        Self {
+            id: row.id,
+            hostname: row.hostname,
+            status: row.status.as_str(),
+            capacity_total_mib: live.capacity.total_mib,
+            capacity_used_mib: live.capacity.used_mib,
+            running_sandboxes: live.capacity.running_sandboxes,
+            warm_pools: live
+                .warm_pools
+                .into_iter()
+                .map(|p| WarmPoolView {
+                    repo: p.repo,
+                    image_version: p.image_version,
+                    ready: p.ready,
+                    target: p.target,
+                })
+                .collect(),
+            local_snapshots: live.local_snapshots.len(),
+            last_heartbeat_at: row.last_heartbeat_at,
+        }
+    }
+}
+
+async fn handle_connection(state: SharedState, socket: WebSocket) {
+    // Adapt axum::ws::Message ↔ tungstenite::Message at the boundary so
+    // engram_protocol can stay axum-agnostic. We only ever encode/decode
+    // Binary frames; the Text/Ping/Pong/Close paths just round-trip
+    // the variant.
+    let (axum_sink, axum_stream) = socket.split();
+
+    let tung_sink = axum_sink
+        .sink_map_err(|e| TungsteniteError::Io(std::io::Error::other(e.to_string())))
+        .with(|m: TungMessage| async move { Ok::<AxumMessage, TungsteniteError>(tung_to_axum(m)) });
+    let tung_stream = axum_stream.map(|res| {
+        res.map(axum_to_tung)
+            .map_err(|e| TungsteniteError::Io(std::io::Error::other(e.to_string())))
+    });
+
+    let (host, mut notify_rx, _demux_handle) =
+        ConnectedHost::spawn(Box::pin(tung_sink), Box::pin(tung_stream));
+
+    // Wait for Hello before registering. If the host disconnects or
+    // sends garbage instead, give up and log.
+    let host_id = match tokio::time::timeout(std::time::Duration::from_secs(10), notify_rx.recv())
+        .await
+    {
+        Ok(Some(NotifyKind::Hello {
+            host_id,
+            agent_version,
+        })) => {
+            tracing::info!(host_id = %host_id, %agent_version, "host registered via /api/hosts/connect");
+            host_id
+        }
+        Ok(Some(other)) => {
+            tracing::warn!(?other, "host's first frame was not Hello; refusing");
+            return;
+        }
+        Ok(None) => {
+            tracing::warn!("host disconnected before sending Hello");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("host did not send Hello within 10s; closing");
+            return;
+        }
+    };
+
+    // Register: the RemoteSandboxBackend is a thin SandboxBackend impl
+    // wrapping the ConnectedHost demuxer. Cloning `host` lets the
+    // supervisor task keep a handle for ack'ing heartbeats while the
+    // backend trait object owns its own copy.
+    let backend: Arc<dyn engram_core::traits::SandboxBackend> =
+        Arc::new(RemoteSandboxBackend::new(host.clone()));
+    state.host_registry.register(host_id, backend);
+
+    // Persist the row in Postgres so future scheduler queries see this
+    // host. Phase 3a: capacity is unknown yet (heartbeats will populate
+    // it in 3b); record an initial Ready entry with zero capacity.
+    let initial_record = HostRecord {
+        id: host_id,
+        hostname: format!("host-{host_id}"),
+        cloud_metadata: HostMetadata::default(),
+        capacity: HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+        },
+        status: HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+    };
+    if let Err(e) = state.services.meta.upsert_host(initial_record).await {
+        tracing::warn!(host_id = %host_id, error = %e, "host upsert failed; in-memory registration still active");
+    }
+
+    // Supervisor: drain Notifies until the connection closes. Phase 3a
+    // just acks heartbeats so the host's keepalive timer doesn't fire
+    // a reconnect; capacity is recorded in 3b.
+    while let Some(notify) = notify_rx.recv().await {
+        match notify {
+            NotifyKind::Heartbeat(hb) => {
+                // Refresh the in-memory scheduler view first so the
+                // next session creation sees the updated capacity /
+                // warm pools / local snapshots.
+                state.host_registry.update_state(
+                    host_id,
+                    HostState {
+                        capacity: hb.capacity.clone(),
+                        warm_pools: hb.warm_pools.clone(),
+                        local_snapshots: hb.local_snapshots.clone(),
+                        draining: hb.draining,
+                    },
+                );
+
+                let ack = HeartbeatAck {
+                    server_time: Utc::now(),
+                    revoked_sessions: Vec::new(),
+                };
+                if let Err(e) = host.notify(NotifyKind::HeartbeatAck(ack)).await {
+                    tracing::debug!(host_id = %host_id, error = %e, "heartbeat ack failed; supervisor will exit");
+                    break;
+                }
+                let row_status = if hb.draining {
+                    HostStatus::Draining
+                } else {
+                    HostStatus::Ready
+                };
+                if let Err(e) = state
+                    .services
+                    .meta
+                    .set_host_status(host_id, row_status)
+                    .await
+                {
+                    tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");
+                }
+            }
+            NotifyKind::Hello { .. } => {
+                tracing::debug!(host_id = %host_id, "duplicate Hello; ignoring");
+            }
+            NotifyKind::HeartbeatAck(_) => {
+                tracing::debug!(host_id = %host_id, "host sent unexpected HeartbeatAck; ignoring");
+            }
+        }
+    }
+
+    tracing::info!(host_id = %host_id, "host disconnected; unregistering");
+    state.host_registry.unregister(host_id);
+}
+
+// ---- axum::Message <-> tungstenite::Message bridges -------------------
+
+fn axum_to_tung(m: AxumMessage) -> TungMessage {
+    match m {
+        AxumMessage::Text(t) => TungMessage::Text(t),
+        AxumMessage::Binary(b) => TungMessage::Binary(b),
+        AxumMessage::Ping(b) => TungMessage::Ping(b),
+        AxumMessage::Pong(b) => TungMessage::Pong(b),
+        AxumMessage::Close(Some(cf)) => TungMessage::Close(Some(TungsteniteCloseFrame {
+            code: cf.code.into(),
+            reason: cf.reason,
+        })),
+        AxumMessage::Close(None) => TungMessage::Close(None),
+    }
+}
+
+fn tung_to_axum(m: TungMessage) -> AxumMessage {
+    use axum::extract::ws::CloseFrame as AxumCloseFrame;
+    match m {
+        TungMessage::Text(t) => AxumMessage::Text(t),
+        TungMessage::Binary(b) => AxumMessage::Binary(b),
+        TungMessage::Ping(b) => AxumMessage::Ping(b),
+        TungMessage::Pong(b) => AxumMessage::Pong(b),
+        TungMessage::Close(Some(cf)) => AxumMessage::Close(Some(AxumCloseFrame {
+            code: cf.code.into(),
+            reason: cf.reason,
+        })),
+        TungMessage::Close(None) => AxumMessage::Close(None),
+        TungMessage::Frame(_) => {
+            // Raw frames don't appear in normal flow; treat as a Close
+            // so the peer cleans up.
+            AxumMessage::Close(None)
+        }
+    }
+}

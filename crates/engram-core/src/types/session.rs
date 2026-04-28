@@ -4,13 +4,19 @@ use serde::{Deserialize, Serialize};
 use super::ids::{HostId, SessionId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Pending,
     Active,
     Idle,
     Completed,
     Failed,
+    /// Phase 3d: the host that owned this session went dark and
+    /// the dead-host detector cleared `host_id`. Next access picks
+    /// a new host (snapshot affinity if any other host has the
+    /// snapshot, else cold-tier blob restore) and transitions to
+    /// `Active`.
+    PendingReassign,
 }
 
 impl SessionStatus {
@@ -21,6 +27,7 @@ impl SessionStatus {
             Self::Idle => "idle",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::PendingReassign => "pending_reassign",
         }
     }
 }

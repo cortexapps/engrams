@@ -3,12 +3,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionStatus};
-use engram_core::{SandboxId, SessionId, SnapshotId};
+use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
 use engram_host_agent::pool::Pool;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::config::CoordinatorConfig;
+use crate::host_registry::HostRegistry;
 use crate::Services;
 
 // ---------------------------------------------------------------------
@@ -23,7 +24,7 @@ use crate::Services;
 /// the persistent log is total: every event has a unique per-session
 /// `idx` allocated atomically by `MetadataStore::append_session_event`.
 /// In-memory bus delivery is best-effort under load (broadcast lag).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     /// Session moved between lifecycle states.
@@ -203,19 +204,49 @@ pub struct AppState {
     pub cfg: CoordinatorConfig,
     pub services: Services,
     pub registry: SandboxRegistry,
-    pub events: SessionEventBus,
+    /// Shared with the `pg_listener` task so cross-replica events
+    /// land on the same broadcast bus as locally-emitted ones. Cheap
+    /// to clone (`Arc` clone), so handlers freely take a reference and
+    /// the listener task takes its own.
+    pub events: Arc<SessionEventBus>,
     pub pool: Pool,
+    /// Multi-host routing layer. In Phase 3a single-host or `--mode=all`
+    /// this has exactly one entry registered at startup; `--mode=coordinator`
+    /// fills it in as hosts dial `/api/hosts/connect`. `services.sandbox`
+    /// is this same object cast to `Arc<dyn SandboxBackend>` so existing
+    /// call sites route through it transparently.
+    pub host_registry: Arc<HostRegistry>,
 }
 
 impl AppState {
+    /// Convenience constructor for tests and `--mode=all`-flavoured
+    /// embeddings: builds a fresh `HostRegistry` and pre-registers
+    /// `services.sandbox` as the sole host. Production
+    /// `--mode=coordinator` should use [`AppState::new_with_registry`]
+    /// to thread a registry that hosts dial into via WS.
     pub fn new(cfg: CoordinatorConfig, services: Services) -> Self {
+        let registry = Arc::new(HostRegistry::new());
+        registry.register(HostId::new(), services.sandbox.clone());
+        Self::new_with_registry(cfg, services, registry)
+    }
+
+    /// Construct an AppState whose `services.sandbox` already routes via
+    /// the supplied `HostRegistry`. The pool reuses the same registry
+    /// so `replenish()` calls fan out to whichever host the registry's
+    /// scheduler picks.
+    pub fn new_with_registry(
+        cfg: CoordinatorConfig,
+        services: Services,
+        host_registry: Arc<HostRegistry>,
+    ) -> Self {
         let pool = Pool::new(services.sandbox.clone());
         Self {
             cfg,
             services,
             registry: SandboxRegistry::new(),
-            events: SessionEventBus::default(),
+            events: Arc::new(SessionEventBus::default()),
             pool,
+            host_registry,
         }
     }
 

@@ -18,9 +18,15 @@ struct Cli {
     )]
     work_dir: PathBuf,
 
-    /// Coordinator endpoint to heartbeat to (Phase 3).
+    /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
+
+    /// Bearer token sent on the WS upgrade. Match the coordinator's
+    /// `ENGRAM_AUTH_TOKENS`. Omit when the coordinator is in dev mode
+    /// (auth disabled).
+    #[arg(long, env = "ENGRAM_COORDINATOR_TOKEN")]
+    coordinator_token: Option<String>,
 
     /// Default warm-pool size per active repo.
     #[arg(long, env = "ENGRAM_WARM_POOL_SIZE", default_value_t = 2)]
@@ -41,6 +47,7 @@ async fn main() -> Result<(), HostAgentError> {
         work_dir: cli.work_dir.clone(),
         warm_pool_size: cli.warm_pool_size,
         coordinator_endpoint: cli.coordinator,
+        coordinator_token: cli.coordinator_token,
         ..HostAgentConfig::default()
     };
 

@@ -10,6 +10,7 @@ use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::host_registry::ScheduleContext;
 use crate::image_registry::{ImageError, Rootfs};
 use crate::state::{SessionEvent, SharedState};
 use engram_host_agent::pool::PoolKey;
@@ -236,22 +237,58 @@ pub async fn create_session(
                 sandbox_id = %id,
                 "session served from warm pool",
             );
-            id
-        }
-        None => match state.services.sandbox.create(vm_spec).await {
-            Ok(id) => id,
-            Err(e) => {
-                // Best-effort: mark the row failed and bubble the error.
-                // We don't tear down the row — Postgres remains the
-                // audit trail for the failure.
+            // The pool's checkout returned a sandbox_id; HostRegistry
+            // recorded its host_id when `replenish` originally created
+            // it. Surface that to the metadata row so the next access
+            // can route directly without re-running the scheduler.
+            if let Some(host_id) = state.host_registry.host_of(id) {
                 let _ = state
                     .services
                     .meta
-                    .set_session_status(session_id, SessionStatus::Failed)
+                    .assign_session_host(session_id, Some(host_id))
                     .await;
-                return Err(e.into());
             }
-        },
+            id
+        }
+        None => {
+            // Cold path: scheduler picks a host based on heartbeat-
+            // derived state, then we create the sandbox on that host.
+            let ctx = ScheduleContext {
+                repo: &req.repo,
+                image_version: &image_version,
+                prefer_snapshot_id: None,
+                memory_mib: Some(vm_spec.memory.max_mib),
+            };
+            match state.host_registry.create_for_session(&ctx, vm_spec).await {
+                Ok((host_id, id)) => {
+                    if let Err(e) = state
+                        .services
+                        .meta
+                        .assign_session_host(session_id, Some(host_id))
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            host_id = %host_id,
+                            error = %e,
+                            "assign_session_host failed; routing still works via HostRegistry"
+                        );
+                    }
+                    id
+                }
+                Err(e) => {
+                    // Best-effort: mark the row failed and bubble the error.
+                    // We don't tear down the row — Postgres remains the
+                    // audit trail for the failure.
+                    let _ = state
+                        .services
+                        .meta
+                        .set_session_status(session_id, SessionStatus::Failed)
+                        .await;
+                    return Err(e.into());
+                }
+            }
+        }
     };
 
     // 4. Top the pool back up in the background. We don't await — the
@@ -322,6 +359,127 @@ pub async fn list_sessions(
 ) -> Result<Json<ListSessionsResponse>, ApiError> {
     let sessions = state.services.meta.list_active_sessions().await?;
     Ok(Json(ListSessionsResponse { sessions }))
+}
+
+/// `POST /sessions/:id/migrate { host_id? }`. Operator-initiated
+/// migration. Clears the session's `host_id`, transitions it to
+/// `PendingReassign`, and tears down its live sandbox if any.
+/// The actual restore happens on the next call to `/resume` (or any
+/// access that ends up rescheduling — Phase 3d kept this lazy to
+/// keep the coordinator off the data path).
+///
+/// Pre-condition: a snapshot must exist for the session — otherwise
+/// the next `/resume` will fail. Migrate refuses to transition a
+/// session that has no snapshot so the operator notices early.
+#[derive(Deserialize)]
+pub struct MigrateRequest {
+    #[serde(default)]
+    pub host_id: Option<engram_core::HostId>,
+}
+
+#[derive(Serialize)]
+pub struct MigrateResponse {
+    pub session_id: SessionId,
+    pub status: &'static str,
+    pub note: &'static str,
+}
+
+pub async fn migrate(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+    Json(req): Json<MigrateRequest>,
+) -> Result<Json<MigrateResponse>, ApiError> {
+    let session = state.services.meta.get_session(id).await?;
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ) {
+        return Err(ApiError::Conflict(format!(
+            "session is {} — terminal sessions can't migrate",
+            session.status.as_str()
+        )));
+    }
+
+    if state
+        .services
+        .meta
+        .latest_snapshot_for_session(id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::Conflict(
+            "no snapshot exists for this session — take a snapshot before migrating".into(),
+        ));
+    }
+
+    // Optional target host validation. The actual host is picked by
+    // the scheduler on next access; we just sanity-check that the
+    // hint refers to a ready host so a typo errors immediately.
+    if let Some(target) = req.host_id {
+        let hosts = state.services.meta.list_active_hosts().await?;
+        let target_row = hosts.iter().find(|h| h.id == target);
+        match target_row {
+            Some(h) if h.status == engram_core::types::HostStatus::Ready => {}
+            Some(h) => {
+                return Err(ApiError::BadRequest(format!(
+                    "target host {target} is in {} state, not ready",
+                    h.status.as_str()
+                )));
+            }
+            None => {
+                return Err(ApiError::NotFound(format!("host {target} not registered")));
+            }
+        }
+    }
+
+    // Tear down the live sandbox if any. Best-effort — the migration
+    // proceeds even if destroy errors.
+    if let Some(sandbox_id) = state.registry.unbind(id) {
+        if let Err(e) = state.services.sandbox.destroy(sandbox_id).await {
+            tracing::warn!(
+                session_id = %id,
+                sandbox_id = %sandbox_id,
+                error = %e,
+                "destroy during migrate failed; continuing",
+            );
+        }
+    }
+
+    let from_host = session.host_id;
+    state
+        .services
+        .meta
+        .assign_session_host(id, None)
+        .await?;
+    state
+        .services
+        .meta
+        .set_session_status(id, SessionStatus::PendingReassign)
+        .await?;
+    let now = chrono::Utc::now();
+    state
+        .emit(
+            id,
+            SessionEvent::StatusChanged {
+                from: session.status,
+                to: SessionStatus::PendingReassign,
+                at: now,
+            },
+        )
+        .await?;
+    if let Some(from_host) = from_host {
+        tracing::info!(
+            session_id = %id,
+            from_host = %from_host,
+            "session migrated; awaiting reassignment on next /resume"
+        );
+    }
+
+    Ok(Json(MigrateResponse {
+        session_id: id,
+        status: SessionStatus::PendingReassign.as_str(),
+        note: "session marked for reassignment; call /resume to land it on a new host",
+    }))
 }
 
 pub async fn delete_session(

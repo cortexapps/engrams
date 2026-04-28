@@ -72,7 +72,13 @@ enum SessionCmd {
 
 #[derive(Subcommand, Debug)]
 enum HostCmd {
+    /// List hosts the coordinator knows about (Postgres rows + live
+    /// scheduler view).
     List,
+    /// Print one host's row + capacity / warm-pool view.
+    Get { id: String },
+    /// Flip a host to `draining`. New sessions won't be assigned to
+    /// it; in-flight sessions stay (evacuation lands in 3d).
     Drain { id: String },
 }
 
@@ -200,9 +206,11 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 "image list — coordinator endpoint not yet exposed".into(),
             )),
         },
-        Cmd::Host { cmd } => Err(CliError::NotImplemented(format!(
-            "host {cmd:?} — multi-host scheduling lands in Phase 3"
-        ))),
+        Cmd::Host { cmd } => match cmd {
+            HostCmd::List => host_list(&client, &cli.endpoint, cli.json).await,
+            HostCmd::Get { id } => host_get(&client, &cli.endpoint, id, cli.json).await,
+            HostCmd::Drain { id } => host_drain(&client, &cli.endpoint, id).await,
+        },
     }
 }
 
@@ -287,6 +295,111 @@ async fn session_delete(
         return Err(CliError::Http(status.as_u16(), body));
     }
     println!("deleted");
+    Ok(())
+}
+
+// ---- host subcommands ---------------------------------------------------
+
+async fn host_list(
+    client: &reqwest::Client,
+    endpoint: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let body = get_json(client, &format!("{endpoint}/api/hosts")).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let empty = Vec::new();
+    let hosts = body["hosts"].as_array().unwrap_or(&empty);
+    if hosts.is_empty() {
+        println!("(no hosts registered)");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<10}  {:<10}  {:<10}  {}",
+        "ID", "STATUS", "USED_MIB", "TOTAL_MIB", "WARM_POOLS"
+    );
+    for h in hosts {
+        let warm_count = h["warm_pools"].as_array().map(|v| v.len()).unwrap_or(0);
+        println!(
+            "{:<36}  {:<10}  {:<10}  {:<10}  {}",
+            h["id"].as_str().unwrap_or(""),
+            h["status"].as_str().unwrap_or(""),
+            h["capacity_used_mib"].as_u64().unwrap_or(0),
+            h["capacity_total_mib"].as_u64().unwrap_or(0),
+            warm_count,
+        );
+    }
+    Ok(())
+}
+
+async fn host_get(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let body = get_json(client, &format!("{endpoint}/api/hosts/{id}")).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    println!("id              : {}", body["id"].as_str().unwrap_or(""));
+    println!(
+        "hostname        : {}",
+        body["hostname"].as_str().unwrap_or("")
+    );
+    println!(
+        "status          : {}",
+        body["status"].as_str().unwrap_or("")
+    );
+    println!(
+        "capacity_used   : {} MiB",
+        body["capacity_used_mib"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "capacity_total  : {} MiB",
+        body["capacity_total_mib"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "running_sandboxes: {}",
+        body["running_sandboxes"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "local_snapshots : {}",
+        body["local_snapshots"].as_u64().unwrap_or(0)
+    );
+    if let Some(pools) = body["warm_pools"].as_array() {
+        println!("warm_pools      :");
+        for p in pools {
+            println!(
+                "  - {repo} {tag}: {ready}/{target}",
+                repo = p["repo"].as_str().unwrap_or(""),
+                tag = p["image_version"].as_str().unwrap_or(""),
+                ready = p["ready"].as_u64().unwrap_or(0),
+                target = p["target"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn host_drain(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/api/hosts/{id}/drain"))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    println!("draining");
     Ok(())
 }
 
