@@ -284,7 +284,7 @@ Firecracker has no "exec a command in a running guest" primitive. Production roo
 
 ## Communication architecture
 
-This section documents the design for **coordinator ↔ host-agent** and **host ↔ guest** communication. The host-to-guest channel (vsock to `engram-agentd`) is implemented and exercised end-to-end by `tests/exec_real_vm.rs`. The coordinator-to-host-agent channel is forward-looking — today the host-agent runs in the same process as the coordinator; Phase 3 splits them out and wires this WebSocket transport.
+This section documents the design for **coordinator ↔ host-agent** and **host ↔ guest** communication. Both channels are live: host-to-guest via vsock to `engram-agentd` (exercised by `tests/exec_real_vm.rs`), coordinator-to-host-agent via the bincode-over-WebSocket `Frame` protocol in `engram-protocol` (Phase 3 — `--mode=all` keeps the in-process embedding path for single-binary dev).
 
 ### Coordinator ↔ host-agent: phone-home WebSocket
 
@@ -473,7 +473,7 @@ Production hardening will add a first-frame token handshake. Token injection opt
 
 Initial scope is exec-only — `Stat`/`Upload`/`Download`/`Ping`/`Shutdown` verbs from the original design are deferred. They'll land when the surface is needed (file upload for snapshot transfer, ping for liveness, etc.).
 
-Versioning: TODO. The current wire types are stable; once we add a second consumer (the coordinator's WS protocol, Phase 3) we'll need to negotiate a version on first frame.
+Versioning: TODO. Two consumers exist now (the agentd vsock proto + the Phase 3 coordinator-to-host WS proto in `engram-protocol`). Both are unversioned; first-frame version negotiation lands with the broader auth/handshake work in Phase 6.
 
 ---
 
@@ -677,27 +677,35 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 - First-frame token auth on the in-guest agent
 - The full agent verb set (`Stat` / `Upload` / `Download` / `Ping` / `Shutdown` — exec-only today)
 
-### Phase 3 — Multi-host coordinator
+### Phase 3 — Multi-host coordinator ✅
 
 **Goal**: two hosts working together; new hosts come online with zero coordinator-side config.
 
-- **Split binaries**: `engram-host-agent` runs separately, dials coordinator over WebSocket. Coordinator binary's `--mode=all` keeps the in-process embedding working for single-host dev.
-- **WebSocket phone-home transport** — full design in [Communication architecture](#communication-architecture) above. Concretely:
-  - `wss://coordinator/api/hosts/connect` axum handler
-  - `engram-host-agent` outbound dialer with exp-backoff reconnect
-  - Stream-multiplexed frames carrying `engram-protocol` message types
-  - On reconnect: host sends `Hello { host_id }`, coordinator replies with `sessions_already_assigned`, host reconciles
-- **Host registry** — Postgres-backed (existing schema), updated from heartbeats; coordinator marks `Dead` after missed heartbeats and reassigns.
-- **Multi-host scheduler** — replaces the trivial single-host picker:
-  - Prefer host with the snapshot held locally (zero-cost hot-tier hit)
-  - Fall back to host with a warm pool for this `(repo, image_version)`
-  - Fall back to host with capacity, no warm pool
-  - Returns `BackendError::NotSupported("no host available")` if everything's full
-- **Session migration**: when a host goes dark, mark its sessions `pending-reassign`. Next access pulls the latest snapshot from BlobStorage and starts the session on a different host.
-- **`POST /sessions/:id/migrate { host_id }`** — operator-initiated migration for evacuating a host before maintenance.
-- **Coordinator HA** — multiple replicas behind a load balancer; `LISTEN/NOTIFY` on Postgres for cross-replica live event propagation when an SSE client is connected to a different replica than the producing host.
+**Done:**
 
-**Deliverable**: stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.
+- ✅ **Split binaries** — `engram-host-agent` runs separately, dials coordinator over WebSocket. `--mode=all` registers the local backend in-process so `just dev` stays single-binary.
+- ✅ **Wire transport** — bincode-encoded `Frame` enum (`Request`/`Response`/`Stream`/`Notify`) over WebSocket binary messages. Hand-rolled `request_id` demuxer routes Responses to `oneshot`s and Stream items to per-id `mpsc`s. `engram-protocol::{wire,codec,client,server}`. **Decision flip from the original design**: bincode-over-WS replaces the originally-planned tonic+gRPC — reuses the existing `engram-agentd` framing pattern and avoids a separate `.proto` file + `build.rs` for an internal-only channel.
+- ✅ **`/api/hosts/connect` axum handler** under the existing bearer-auth middleware. axum↔tungstenite Message bridge at the boundary so `engram-protocol` stays axum-agnostic.
+- ✅ **Host-agent dialer** — exp-backoff reconnect, `NotifyKind::Hello` first frame, periodic heartbeat. `coordinator_endpoint` + `coordinator_token` config.
+- ✅ **`HostRegistry`** — coordinator-side, implements `SandboxBackend`. Tracks `sandbox_id → host_id` ownership for routing. Heartbeat-derived per-host state (`HostState { capacity, warm_pools, local_snapshots, draining }`) populated by the WS supervisor.
+- ✅ **Real scheduler** — `pick_for_session(ctx)` ranks: snapshot affinity → warm-pool match → capacity-fit → any non-draining fallback. `BackendError::NotSupported("no host available")` when everything's full. `assign_session_host` wired into `create_session`.
+- ✅ **Cold-tier blob restore unblocked** — `api/snapshot.rs` pulls from `blob_url` into a coordinator-local cache when `local_path` is None, then routes through the scheduler. Snapshots now record `host_id` so the next resume hits the snapshot-affinity branch.
+- ✅ **Coordinator HA via `LISTEN/NOTIFY`** — `append_session_event` fires `NOTIFY session_events`; `pg_listener::spawn` task in each replica re-broadcasts into its local `SessionEventBus`. SSE subscribers see events regardless of which replica produced them.
+- ✅ **Session migration (operator-initiated)** — `SessionStatus::PendingReassign` variant, `POST /sessions/:id/migrate { host_id? }` clears `host_id` and transitions; next `/resume` reschedules. Refuses to migrate without a snapshot to come back from.
+- ✅ **`GET /api/hosts` + `GET /api/hosts/:id` + `POST /api/hosts/:id/drain`** — surface heartbeat state for ops + the CLI.
+- ✅ **`engram host list/get/drain`** CLI commands.
+- ✅ 322 workspace tests pass (up from 292), with new wire-loopback (5), AppState-via-wire integration (4), and scheduler-ranking (4) suites.
+
+**Deferred** (rolled into later phases or follow-up PRs — operator-initiated migration works today; the deliverable below requires the dead-host detector):
+
+- **Dead-host auto-detector** — background task that polls `hosts.last_heartbeat_at`, takes a Postgres advisory lock per dead host (so only one replica wins the transition), marks the row Dead, clears `host_id` on its sessions, transitions to `PendingReassign`, and synthesises `SessionEvent::ExecCompleted{exit_status: None}` for any active execs so SSE clients see a clean termination instead of hanging. Without this, automatic migration on `kill -9 host` doesn't fire — operators must `POST /sessions/:id/migrate` by hand.
+- **W3C tracing context on the wire** — `Frame::Request` should carry `trace_id`/`span_id` so coordinator-side spans stitch with host-side spans. ~30 LOC; deferred to keep 3a focused.
+- **Real Pool-state population in heartbeats** — `HostAgent` doesn't run a warm `Pool` of its own yet (the Pool is still coordinator-side); the dialer's `heartbeat_provider` is `None`, so `warm_pools` ships empty. The scheduler falls through to capacity ranking instead of warm-pool affinity. Real reporting needs the Pool to move host-side and be threaded into `HostAgent::run`.
+- **`0003_host_assignments` migration** — host-facing analogue of `session_events` for assignment reconciliation when a host reconnects. Deferred until an actual reconcile path needs it (with the dead-host detector).
+- **Real `tests/ha_listener.rs` against live Postgres** — proves the cross-replica SSE fan-out end-to-end. Currently `#[ignore]`'d concept; the SQL change is implicitly covered by the existing `append_session_event` tests since any breakage there would break all 100+ tests that emit events.
+- **Production hardening** — TLS for the WS channel, `HostStatus::Disconnected` (network blip vs. dead distinction), backpressure tuning past the default 64-frame mpsc capacity. Lands with Phase 6.
+
+**Deliverable** (pending the dead-host detector): stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.
 
 ### Phase 4 — Cloud abstraction & spot tolerance
 
@@ -751,6 +759,8 @@ What Phase 5 still needs to ship:
   - Client tokens (`Authorization: Bearer ...`) with scopes per session/repo
   - Host-agent: pre-shared token (simple), mTLS (multi-tenant), or cloud workload identity (JWT from IMDSv2)
   - Per-session signed URLs for `/events` SSE so a Slack thread URL can't be replayed off-thread
+  - **Real GCP Secret Manager backend** — `engram-secrets-gcp` is a typed stub today (`AccessSecretVersion` not yet wired). Phase 1's `Literal` and `Broker` modes work against the env-backed `engram-secrets-dev` impl; Phase 6 lights up the cloud-backed one.
+  - **Broker-mode HTTPS proxy** — secret value substitution at the network boundary (coordinator-allocated proxy per session, intercepts outbound HTTPS to `allow_hosts`, swaps placeholders for real values). Today `secret_mode = "broker"` results in placeholders that don't authenticate anything; the broker proxy is what makes Broker mode functional.
 - **Resource enforcement & observation**
   - Linux dev: cgroups v2 hard limits on ProcessBackend (memory.max, cpu.max, io.max) when running as root or with user namespaces
   - Firecracker: native at the VM boundary
@@ -786,10 +796,11 @@ What Phase 5 still needs to ship:
   - Reconnects across bot restarts via the persistent event log + `Last-Event-ID`
   - Session-per-thread mapping in a `session_external_ids (provider, external_id, session_id)` table
 - **`engram-cli` flesh-out**
-  - `engram session list` — running sessions with status, host, last activity
-  - `engram session logs <id>` — tail / replay events
-  - `engram host drain <id>` — operator drain
-  - `engram image build <repo>` — trigger a baker run
+  - `engram session list` — running sessions with status, host, last activity ✅ (Phase 1)
+  - `engram session logs <id>` — tail / replay events ✅ (Phase 1)
+  - `engram host list/get/drain` — operator drain ✅ (Phase 3)
+  - `engram image build <repo>` — trigger a baker run ✅ (Phase 1)
+  - **`engram image list <repo>`** — list registry tags. CLI subcommand exists today but errors with `NotImplemented` because the coordinator doesn't expose a `GET /images/:repo` endpoint yet. Lands here.
   - `engram secret set <name> --ref ...` — write to the configured SecretStore
 - **Documentation site** — mdbook with the manifest reference, deployment guides, secret-store backend reference, agent integration examples
 - **Reference deployments** — Helm chart (for adopters who want K8s control plane), Terraform modules, single-host docker-compose

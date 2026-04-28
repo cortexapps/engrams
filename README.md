@@ -12,14 +12,16 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 
 **Phase 2 — done.** `engram-sandbox-firecracker` drives real Firecracker microVMs end-to-end: typed HTTP client over the FC unix socket; `create`/`destroy`/`list`/`snapshot`/`restore`/`exec_stream` all wired and exercised by integration tests on a Linux dev VM. `restore` supports both `File` mode (synchronous read of `memory.bin`) and `Uffd` mode (lazy paging via the new `engram-uffd-handler` companion process — sub-100ms resume). `exec_stream` reaches an in-guest `engram-agentd` over Firecracker's vsock proxy; the image baker injects a static-musl agent + init shim into ext4 rootfs images. 292 tests pass on macOS, plus 5 microVM integration tests on the dev VM.
 
-**Phase 3 — multi-host scheduling.** Next.
+**Phase 3 — done.** Multi-host coordinator: host-agents run as a separate binary that dials the coordinator over WebSocket (bincode-over-WS with hand-rolled `request_id` demuxer; `--mode=all` keeps single-binary `just dev` working by registering the local backend in-process). `HostRegistry` ranks hosts by snapshot affinity → warm pool → capacity; create/restore call `assign_session_host` so subsequent access routes directly. Cold-tier blob restore unblocked. `LISTEN/NOTIFY` on `session_events` lets coordinator replicas re-broadcast events into local SSE subscribers. `SessionStatus::PendingReassign` + `POST /sessions/:id/migrate` transitions a session for re-scheduling on next access. New `GET /api/hosts` + `engram host list/get/drain` CLI. 322 tests pass on macOS (up from 292). Deferred items (dead-host auto-detector with `pg_try_advisory_lock`, W3C trace context on the wire, host-side Pool relocation so heartbeats carry real warm-pool data) are listed under Phase 3 in `DESIGN.md`.
+
+**Phase 4 — cloud abstraction & spot tolerance.** Next.
 
 ## Workspace
 
 ```
 crates/
   engram-core                       # types, traits, errors. No I/O.
-  engram-protocol                   # gRPC defs (coordinator <-> host)
+  engram-protocol                   # wire types: bincode-over-WS Frame protocol (coordinator <-> host)
   engram-coordinator                # binary: HTTP API + scheduler
   engram-host-agent                 # binary: per-host daemon
   engram-image-builder              # binary: warm-image baker (Directory + Ext4 modes)
