@@ -38,7 +38,7 @@ async fn spawn_test_agent(socket: PathBuf) -> JoinHandle<()> {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     tokio::spawn(async move {
-                        let _ = serve_connection(stream).await;
+                        let _ = serve_connection(stream, None).await;
                     });
                 }
                 Err(_) => return,

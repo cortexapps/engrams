@@ -8,12 +8,26 @@
 //!
 //! ## Conversation shape
 //!
+//! Without auth (development, default for back-compat):
+//!
 //! ```text
 //!   host ──[ WireExecRequest ]──► agent
 //!   agent ──[ WireExecEvent::Stdout(bytes) ]──► host    (0+ times)
 //!   agent ──[ WireExecEvent::Stderr(bytes) ]──► host    (0+ times)
 //!   agent ──[ WireExecEvent::Exit(status)  ]──► host    (exactly once)
 //!   <connection closed>
+//! ```
+//!
+//! With first-frame token auth (production, when the agent is started
+//! with `--token <T>` or finds `engram_token=<T>` on the kernel
+//! cmdline):
+//!
+//! ```text
+//!   host ──[ WireHandshake { token, agent_version } ]──► agent
+//!   agent ──[ WireHandshakeAck { ok, message } ]──► host
+//!     (if !ok, agent closes; host treats as auth failure)
+//!   host ──[ WireExecRequest ]──► agent
+//!     ... same as above ...
 //! ```
 //!
 //! Ordering across stdout/stderr is best-effort: the agent fans out
@@ -60,6 +74,31 @@ pub enum WireExecEvent {
     Stderr(Vec<u8>),
     /// `None` = signalled / timed out. `Some(0)` = clean exit 0.
     Exit(Option<i32>),
+}
+
+/// First frame the host sends when auth is enabled. The agent
+/// validates `token` against the value it loaded at startup
+/// (`--token <T>` CLI arg or `engram_token=<T>` on the kernel
+/// cmdline) and replies with [`WireHandshakeAck`]. `agent_version`
+/// is purely informational — the agent logs it so a deployment-
+/// version skew between host and guest is visible in agent logs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireHandshake {
+    pub token: String,
+    pub agent_version: String,
+}
+
+/// Agent's response to [`WireHandshake`]. On `ok = true` the agent
+/// continues to read the [`WireExecRequest`] frame as in the
+/// no-auth flow. On `ok = false` the agent closes the connection
+/// after sending the ack — `message` carries a single short reason
+/// the host can surface in logs (NEVER include the expected token
+/// or any guess at the supplied one — the message is plaintext on
+/// the vsock, not a secrets channel).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireHandshakeAck {
+    pub ok: bool,
+    pub message: Option<String>,
 }
 
 // ---- Framing -----------------------------------------------------------

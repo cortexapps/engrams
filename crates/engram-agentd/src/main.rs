@@ -67,10 +67,18 @@ enum Listen {
 #[derive(Debug)]
 struct Args {
     listen: Listen,
+    /// Optional first-frame token. When `Some`, the agent requires
+    /// every connecting host to present it via [`WireHandshake`]
+    /// before it'll accept a [`WireExecRequest`]. Resolved at startup
+    /// from `--token <T>`, then `ENGRAM_AGENT_TOKEN`, then
+    /// `engram_token=<T>` on `/proc/cmdline` (Linux only). `None` =
+    /// dev/back-compat path with no auth.
+    token: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut listen: Option<Listen> = None;
+    let mut token: Option<String> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -98,11 +106,22 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--vsock-port must be a u32: {e}"))?;
                 listen = Some(Listen::Vsock(port));
             }
+            "--token" => {
+                let v = argv
+                    .next()
+                    .ok_or_else(|| "--token requires a value".to_string())?;
+                token = Some(v);
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "engram-agentd [--listen unix:///path/to/sock | --vsock-port <PORT>]\n\n\
+                    "engram-agentd [--listen unix:///path/to/sock | --vsock-port <PORT>] \\\n  \
+                     [--token <T>]\n\n\
                      In-guest exec daemon. Accepts WireExecRequest frames,\n\
-                     runs commands, streams stdout/stderr/exit back."
+                     runs commands, streams stdout/stderr/exit back.\n\n\
+                     With --token, the host must send a WireHandshake with\n\
+                     the matching token before WireExecRequest is accepted.\n\
+                     Falls back to ENGRAM_AGENT_TOKEN, then engram_token=<T>\n\
+                     on /proc/cmdline (Linux only)."
                 );
                 std::process::exit(0);
             }
@@ -110,14 +129,41 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let listen = listen.ok_or_else(|| "one of --listen or --vsock-port is required".to_string())?;
-    Ok(Args { listen })
+    let token = token
+        .or_else(|| std::env::var("ENGRAM_AGENT_TOKEN").ok())
+        .or_else(token_from_kernel_cmdline);
+    Ok(Args { listen, token })
+}
+
+/// Read `/proc/cmdline` (Linux only) and pull the value of an
+/// `engram_token=<T>` token-arg if present. Whitespace-delimited per
+/// the kernel's own parser. Returns `None` on non-Linux, on read
+/// failure, or if the arg isn't there. The host injects this via
+/// Firecracker's `BootSource.boot_args` so production guests don't
+/// need an explicit `--token` CLI arg.
+fn token_from_kernel_cmdline() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let raw = std::fs::read_to_string("/proc/cmdline").ok()?;
+    raw.split_ascii_whitespace()
+        .find_map(|part| part.strip_prefix("engram_token=").map(|t| t.to_string()))
 }
 
 async fn run(args: Args) -> std::io::Result<()> {
+    let token = args.token.clone();
+    if token.is_some() {
+        tracing::info!("first-frame token auth enabled");
+    } else {
+        tracing::warn!(
+            "no token configured (--token / ENGRAM_AGENT_TOKEN / engram_token=); \
+             accepting any host that can reach the listener"
+        );
+    }
     match args.listen {
-        Listen::Unix(path) => run_unix(path).await,
+        Listen::Unix(path) => run_unix(path, token).await,
         #[cfg(target_os = "linux")]
-        Listen::Vsock(port) => run_vsock(port).await,
+        Listen::Vsock(port) => run_vsock(port, token).await,
         #[cfg(not(target_os = "linux"))]
         Listen::Vsock(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -126,7 +172,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     }
 }
 
-async fn run_unix(listen_path: PathBuf) -> std::io::Result<()> {
+async fn run_unix(listen_path: PathBuf, token: Option<String>) -> std::io::Result<()> {
     use tokio::net::UnixListener;
     if listen_path.exists() {
         let _ = tokio::fs::remove_file(&listen_path).await;
@@ -138,7 +184,7 @@ async fn run_unix(listen_path: PathBuf) -> std::io::Result<()> {
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _addr)) => spawn_serve(stream),
+                Ok((stream, _addr)) => spawn_serve(stream, token.clone()),
                 Err(e) => tracing::warn!(error = %e, "accept failed"),
             },
             _ = &mut shutdown => {
@@ -150,7 +196,7 @@ async fn run_unix(listen_path: PathBuf) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn run_vsock(port: u32) -> std::io::Result<()> {
+async fn run_vsock(port: u32, token: Option<String>) -> std::io::Result<()> {
     use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
@@ -160,7 +206,7 @@ async fn run_vsock(port: u32) -> std::io::Result<()> {
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _addr)) => spawn_serve(stream),
+                Ok((stream, _addr)) => spawn_serve(stream, token.clone()),
                 Err(e) => tracing::warn!(error = %e, "vsock accept failed"),
             },
             _ = &mut shutdown => {
@@ -173,12 +219,12 @@ async fn run_vsock(port: u32) -> std::io::Result<()> {
 
 /// Hand an accepted stream to [`serve_connection`] on its own task,
 /// logging any per-connection error without tearing the listener down.
-fn spawn_serve<S>(stream: S)
+fn spawn_serve<S>(stream: S, token: Option<String>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        if let Err(e) = serve_connection(stream).await {
+        if let Err(e) = serve_connection(stream, token).await {
             tracing::warn!(error = %e, "connection ended with error");
         }
     });

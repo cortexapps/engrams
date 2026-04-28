@@ -16,7 +16,9 @@ use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::proto::{read_msg, write_msg, WireExecEvent, WireExecRequest};
+use crate::proto::{
+    read_msg, write_msg, WireExecEvent, WireExecRequest, WireHandshake, WireHandshakeAck,
+};
 
 /// Channel buffer between the stdout/stderr readers and the writer.
 /// Modest depth: under backpressure we'd rather slow the child than
@@ -32,11 +34,53 @@ const READ_BUF_BYTES: usize = 8 * 1024;
 /// stream events, close. All errors are surfaced as `io::Error` —
 /// the caller decides whether to log them and move on (the agent's
 /// accept loop) or treat them as fatal (a test).
-pub async fn serve_connection<S>(stream: S) -> io::Result<()>
+///
+/// `expected_token = None` skips the handshake entirely (back-compat
+/// with the no-auth path; tests use this). `expected_token = Some(t)`
+/// requires the host to send a [`WireHandshake`] with `token == t`
+/// before it gets to send a [`WireExecRequest`]; mismatch returns
+/// an `Unauthorized`-flavoured `io::Error` after writing the
+/// rejection ack.
+pub async fn serve_connection<S>(stream: S, expected_token: Option<String>) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (mut reader, writer) = split(stream);
+    let (mut reader, mut writer) = split(stream);
+
+    if let Some(expected) = expected_token.as_deref() {
+        let hs: WireHandshake = read_msg(&mut reader).await?;
+        if !ct_eq(hs.token.as_bytes(), expected.as_bytes()) {
+            // Send a typed rejection so the host sees a clean reason
+            // rather than a connection drop. The message is
+            // intentionally generic — never echo what the bad token
+            // looked like.
+            let ack = WireHandshakeAck {
+                ok: false,
+                message: Some("token mismatch".into()),
+            };
+            // Best-effort write; the host may have already torn the
+            // connection down on its end.
+            let _ = write_msg(&mut writer, &ack).await;
+            tracing::warn!(
+                agent_version = %hs.agent_version,
+                "rejected handshake — token mismatch",
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "handshake token mismatch",
+            ));
+        }
+        let ack = WireHandshakeAck {
+            ok: true,
+            message: None,
+        };
+        write_msg(&mut writer, &ack).await?;
+        tracing::debug!(
+            agent_version = %hs.agent_version,
+            "handshake accepted",
+        );
+    }
+
     let req: WireExecRequest = read_msg(&mut reader).await?;
     if req.command.is_empty() {
         return Err(io::Error::new(
@@ -169,6 +213,23 @@ async fn drop_send(tx: &mpsc::Sender<WireExecEvent>, ev: WireExecEvent) {
     let _ = tx.send(ev).await;
 }
 
+/// Constant-time byte comparison. Mirrors
+/// `engram-coordinator::api::auth::ct_eq` so a deployment can audit
+/// "where do we compare secrets" by grepping the same name across
+/// crates. We don't pull `subtle` as a dep — single tight loop,
+/// dwarfed by a vsock round trip, and the project's
+/// `forbid(unsafe_code)` rules out the SIMD shortcut.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,7 +243,7 @@ mod tests {
         let (mut client, server) = duplex(64 * 1024);
 
         // Server side: handler reads request, runs cmd, writes events.
-        let server_task = tokio::spawn(async move { serve_connection(server).await });
+        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
 
         // Client side: send request, then read events until EOF.
         write_msg(&mut client, &req).await.unwrap();
@@ -326,7 +387,7 @@ mod tests {
         // but here the handler must error. Drive serve_connection
         // manually so we can inspect the error.
         let (mut client, server) = duplex(1024);
-        let server_task = tokio::spawn(async move { serve_connection(server).await });
+        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
         write_msg(
             &mut client,
             &WireExecRequest {
@@ -347,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_surfaces_io_error() {
         let (mut client, server) = duplex(1024);
-        let server_task = tokio::spawn(async move { serve_connection(server).await });
+        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
         write_msg(
             &mut client,
             &WireExecRequest {
@@ -363,6 +424,124 @@ mod tests {
         let err = server_task.await.unwrap().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains("spawn"));
+    }
+
+    #[tokio::test]
+    async fn handshake_with_correct_token_admits_exec_request() {
+        // Drive the auth-on path: send WireHandshake first, expect
+        // an ok ack, then send WireExecRequest as usual.
+        let (mut client, server) = duplex(64 * 1024);
+        let token = "shared-secret".to_string();
+        let server_task =
+            tokio::spawn(async move { serve_connection(server, Some(token)).await });
+
+        write_msg(
+            &mut client,
+            &WireHandshake {
+                token: "shared-secret".into(),
+                agent_version: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: WireHandshakeAck = read_msg(&mut client).await.unwrap();
+        assert!(ack.ok, "ack must be ok for matching token; got {ack:?}");
+
+        write_msg(
+            &mut client,
+            &WireExecRequest {
+                command: vec!["sh".into(), "-c".into(), "printf hi".into()],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: None,
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut events = Vec::new();
+        loop {
+            match read_msg::<_, WireExecEvent>(&mut client).await {
+                Ok(ev) => {
+                    let exit = matches!(ev, WireExecEvent::Exit(_));
+                    events.push(ev);
+                    if exit {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = server_task.await.unwrap();
+        let stdout: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                WireExecEvent::Stdout(b) => Some(b.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(stdout, b"hi");
+    }
+
+    #[tokio::test]
+    async fn handshake_with_wrong_token_is_rejected() {
+        let (mut client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(server, Some("expected".into())).await
+        });
+        write_msg(
+            &mut client,
+            &WireHandshake {
+                token: "wrong".into(),
+                agent_version: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Agent sends a typed rejection so the host sees a clean
+        // reason rather than just a connection drop.
+        let ack: WireHandshakeAck = read_msg(&mut client).await.unwrap();
+        assert!(!ack.ok);
+        assert!(ack.message.is_some());
+
+        let res = server_task.await.unwrap();
+        let err = res.expect_err("auth failure must surface as Err");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_path_skips_handshake_for_back_compat() {
+        // expected_token = None means the agent doesn't read or
+        // expect a WireHandshake — host can send WireExecRequest
+        // straight away. Critical for back-compat with older hosts
+        // that don't know about the handshake.
+        let (mut client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        write_msg(
+            &mut client,
+            &WireExecRequest {
+                command: vec!["sh".into(), "-c".into(), "printf x".into()],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: None,
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Drain to exit.
+        let mut got_exit = None;
+        while let Ok(ev) = read_msg::<_, WireExecEvent>(&mut client).await {
+            if let WireExecEvent::Exit(code) = ev {
+                got_exit = Some(code);
+                break;
+            }
+        }
+        assert_eq!(got_exit, Some(Some(0)));
+        let _ = server_task.await.unwrap();
     }
 
     /// Intentionally not asserting any cross-stream interleaving —
