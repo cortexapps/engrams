@@ -28,3 +28,6 @@ result
 result-*
 /.direnv/
 /.envrc.local
+
+# personal Claude Code skills + dev-vm scripts (local-only)
+/.claude/
