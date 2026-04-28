@@ -679,7 +679,7 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 
 - `firecracker-jailer` integration (drop privileges, chroot, cgroups, seccomp, `/dev/kvm` fd passing)
 - TAP networking + per-VM IP allocation
-- Broker-mode HTTPS proxy (secret value substitution at the network boundary)
+- **Broker-mode HTTPS proxy** — sized as its own focused work, not a tail-of-session add-on. Implementation needs: per-deployment managed CA cert (baked into the image trust store at bake time, see "Inject the per-deployment broker CA cert into the rootfs's trust store" below); per-session listener that terminates TLS using a hostname-derived spoofed leaf cert signed by the managed CA; HTTP request inspection that scans headers (`Authorization: Bearer engram_ph_*`), URL params, and request bodies for `engram_ph_<session>_<hash>` placeholders; lookup table per session mapping placeholder → real secret value; allow-host enforcement (refuse outbound to anything not in the manifest's `schema.allow_hosts`/`allow_host_patterns`); re-encrypt and forward to upstream. Per-session scope so one session's leaked-via-side-channel placeholder can't be redeemed by another session. Significant project (~1500 LOC + cert management); a half-measure HTTP-only proxy delivers `allow_hosts` enforcement but not actual substitution and isn't worth landing as a placeholder.
 - Network policy enforcement via iptables/nftables at the TAP boundary
 - `SendCtrlAltDel` graceful shutdown (agent-side shutdown handshake is done — the host's pairing piece lives here)
 
@@ -1026,7 +1026,7 @@ Switching backends is a coordinator config flag — no manifest changes. The `re
 - **`literal`** — real values land as plain env vars. Simple, fast, dev only. Trivial to set up; secrets are visible to anyone with code execution inside the sandbox.
 - **`broker`** — random placeholders (`engram_ph_<sessionId>_<hash>`) land as env vars; a per-session network proxy substitutes the real value only on outbound HTTPS requests whose host matches `schema.allow_hosts` / `schema.allow_host_patterns`. The agent process never sees the real credential, so prompt-injection exfiltration attacks fail. Modeled on microsandbox's `Secret.env(..., allow_hosts=...)` design.
 
-The proxy that performs broker-mode substitution is **not yet implemented** — `secret_mode = "broker"` results in unsubstituted placeholders today. Production rollout for Cortex is gated on this. Implementation lands with the Firecracker network-namespace work in Phase 2.
+The proxy that performs broker-mode substitution is **not yet implemented** — `secret_mode = "broker"` results in unsubstituted placeholders today. Production rollout for Cortex is gated on this. The implementation is sized as its own focused work (~1500 LOC + cert-management plumbing) and tracked under Phase 2's deferred list with the implementation sketch; a half-measure HTTP-only proxy that delivers `allow_hosts` enforcement without actual substitution was considered and rejected — it doesn't deliver what the docstring promises and would need to be replaced wholesale once the real implementation lands.
 
 ### Resolution flow
 
