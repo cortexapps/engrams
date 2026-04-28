@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use engram_sandbox_firecracker::{ActionType, BootSource, DriveConfig, FirecrackerClient, MachineConfig};
+use engram_sandbox_firecracker::{
+    ActionType, BootSource, DriveConfig, FirecrackerClient, MachineConfig,
+};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 

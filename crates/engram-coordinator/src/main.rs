@@ -83,6 +83,12 @@ struct Cli {
     #[arg(long, env = "ENGRAM_DEFAULT_IMAGE", default_value = "warm-bootstrap")]
     default_image_version: String,
 
+    /// Path to a kernel image (vmlinux) Firecracker can boot. Required
+    /// when `--sandbox-backend=firecracker`; ignored otherwise. Every
+    /// microVM on this host boots the same kernel.
+    #[arg(long, env = "ENGRAM_KERNEL_IMAGE_PATH")]
+    kernel_image_path: Option<PathBuf>,
+
     /// Target warm-pool size per (repo, image_version). 0 = disable.
     #[arg(long, env = "ENGRAM_WARM_POOL_SIZE", default_value_t = 1)]
     warm_pool_size: u32,
@@ -170,7 +176,15 @@ async fn main() -> Result<(), CoordinatorError> {
 
     let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
         SandboxBackendChoice::Firecracker => {
-            Arc::new(FirecrackerBackend::new(cli.sandbox_work_dir))
+            let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
+                CoordinatorError::Config(
+                    "ENGRAM_KERNEL_IMAGE_PATH (or --kernel-image-path) is required when \
+                     --sandbox-backend=firecracker"
+                        .into(),
+                )
+            })?;
+            let fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
+            Arc::new(FirecrackerBackend::new(cli.sandbox_work_dir, fc_cfg))
         }
         SandboxBackendChoice::Process => {
             tracing::warn!(

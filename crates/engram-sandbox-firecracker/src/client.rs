@@ -312,8 +312,11 @@ fn parse_response(method: &str, path: &str, raw: &[u8]) -> Result<Vec<u8>, Sandb
         .split("\r\n")
         .next()
         .ok_or_else(|| vm_err(format!("{method} {path}: empty headers")))?;
-    let code = parse_status_code(status_line)
-        .ok_or_else(|| vm_err(format!("{method} {path}: malformed status: {status_line:?}")))?;
+    let code = parse_status_code(status_line).ok_or_else(|| {
+        vm_err(format!(
+            "{method} {path}: malformed status: {status_line:?}"
+        ))
+    })?;
 
     if (200..300).contains(&code) {
         return Ok(body);
@@ -322,9 +325,7 @@ fn parse_response(method: &str, path: &str, raw: &[u8]) -> Result<Vec<u8>, Sandb
     // 4xx/5xx — try to surface Firecracker's structured fault_message.
     let detail = serde_json::from_slice::<FaultMessage>(&body)
         .map(|f| f.fault_message)
-        .unwrap_or_else(|_| {
-            String::from_utf8_lossy(&body[..body.len().min(512)]).into_owned()
-        });
+        .unwrap_or_else(|_| String::from_utf8_lossy(&body[..body.len().min(512)]).into_owned());
     Err(vm_err(format!(
         "Firecracker {method} {path} -> {code}: {detail}"
     )))
@@ -451,7 +452,10 @@ mod tests {
             initrd_path: None,
         };
         let s = serde_json::to_string(&src).unwrap();
-        assert!(!s.contains("initrd_path"), "initrd_path should be omitted: {s}");
+        assert!(
+            !s.contains("initrd_path"),
+            "initrd_path should be omitted: {s}"
+        );
     }
 
     #[test]
