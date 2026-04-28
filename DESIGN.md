@@ -64,8 +64,8 @@ The Modal/E2B/Ramp pattern: spawn an ephemeral, isolated environment per task; p
          │ agent   │         │ agent   │         │ agent   │
          │   │     │         │   │     │         │   │     │
          │   ▼     │         │   ▼     │         │   ▼     │
-         │microsbx │         │microsbx │         │microsbx │
-         │+Firec.  │         │+Firec.  │         │+Firec.  │
+         │firecrkr │         │firecrkr │         │firecrkr │
+         │ +UFFD   │         │ +UFFD   │         │ +UFFD   │
          │snap-mgr │         │snap-mgr │         │snap-mgr │
          │pool-warm│         │pool-warm│         │pool-warm│
          └────┬────┘         └────┬────┘         └────┬────┘
@@ -142,7 +142,7 @@ Three layers of state, with explicit durability guarantees:
 
 **Tech:**
 - Rust 2021, tokio
-- `engram-sandbox-firecracker`: `hyper` over `tokio::net::UnixStream` (via `hyperlocal`) for the Firecracker control API; `userfaultfd(2)` for snapshot restore
+- `engram-sandbox-firecracker`: manual HTTP/1.1 over `tokio::net::UnixStream` (no `hyper` — the API is small and the protocol is explicit); the matching `engram-uffd-handler` companion process uses `userfaultfd(2)` for sub-100ms snapshot restore
 - `engram-sandbox-process`: `tokio::process::Command` + per-sandbox cwds; tar+gzip for the dev "snapshot" path
 - google-cloud-storage / aws-sdk-s3 / S3-compatible client (BlobStorage trait)
 
@@ -273,18 +273,18 @@ pub trait SandboxBackend: Send + Sync {
 
 **v1 implementations**:
 
-- **`engram-sandbox-firecracker` (production)** — drives Firecracker over its HTTP-over-Unix-socket API. Each sandbox owns a `firecracker-jailer`-managed process, a per-VM TAP device, and a vsock channel to an in-guest agent (see "In-guest agent" below). Snapshot via `PATCH /vm Paused` + `PUT /snapshot/create`. Restore via `PUT /snapshot/load` with `userfaultfd`-backed memory: pages stream in lazily on guest fault, giving sub-100ms resume regardless of guest RAM size. Currently shipped as a typed stub with every method returning a structured error pointing at the Firecracker endpoint to wire — Phase 2 fills it in.
+- **`engram-sandbox-firecracker` (production)** — drives Firecracker over its HTTP-over-Unix-socket API. Each sandbox owns a Firecracker process, a per-VM vsock UDS, and (forthcoming) a TAP device. Snapshot via `PATCH /vm Paused` + `PUT /snapshot/create`. Restore via `PUT /snapshot/load` with either `backend_type=File` (synchronous read of `memory.bin`) or `backend_type=Uffd` (lazy paging via the `engram-uffd-handler` companion process — pages stream in on guest fault for sub-100ms resume regardless of guest RAM size). All `SandboxBackend` methods are wired and exercised by integration tests against real microVMs (`tests/{boot,lifecycle,snapshot,snapshot_uffd,exec_real_vm}.rs`). Production hardening (jailer, TAP networking, broker-mode HTTPS proxy, `SendCtrlAltDel` graceful shutdown, snapshot upload to BlobStorage) lands in Phase 6 / 4.
 - **`engram-sandbox-process` (dev)** — runs commands as plain host subprocesses, each rooted in a per-sandbox working directory. No isolation, no resource enforcement. Exists so the entire orchestration layer (coordinator API, scheduler, snapshot manager, warm pool, blob storage, host-agent loops) iterates locally on macOS Apple Silicon without any VMM. `snapshot()` is a tarball of the workdir; functional enough to exercise the snapshot manager's LRU/replication paths, not enough to evict in-memory state. **Never use in deployment.**
 
-#### In-guest agent (`engram-agentd`, future)
+#### In-guest agent (`engram-agentd`)
 
-Firecracker has no "exec a command in a running guest" primitive. Production rootfs images include a small daemon that listens on vsock and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec` on the Firecracker backend becomes "send the exec request to `engram-agentd` over `(vsock_cid, port=1024)` and stream the response." This is a separate workstream from the Firecracker plumbing itself; AWS Lambda's runtime, Modal's agent, and similar platforms all do this. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
+Firecracker has no "exec a command in a running guest" primitive. Production rootfs images include `engram-agentd` (`crates/engram-agentd`) — a small Rust binary baked into `/sbin/engram-agentd` that listens on AF_VSOCK port 1024 and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec_stream` on the Firecracker backend connects to Firecracker's vsock proxy at `<vsock_uds>`, performs the `CONNECT 1024\n` → `OK <peer_port>\n` handshake, sends a `WireExecRequest`, and streams `WireExecEvent`s back. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
 
 ---
 
 ## Communication architecture
 
-This section documents the design for **coordinator ↔ host-agent** and **host ↔ guest** communication. v1 (everything we've built so far) runs both in one process, so this is forward-looking — Phase 3 wires the multi-host channel; Phase 2 wires the host-to-guest channel.
+This section documents the design for **coordinator ↔ host-agent** and **host ↔ guest** communication. The host-to-guest channel (vsock to `engram-agentd`) is implemented and exercised end-to-end by `tests/exec_real_vm.rs`. The coordinator-to-host-agent channel is forward-looking — today the host-agent runs in the same process as the coordinator; Phase 3 splits them out and wires this WebSocket transport.
 
 ### Coordinator ↔ host-agent: phone-home WebSocket
 
@@ -393,18 +393,19 @@ Phase 4 adds (1) and the trait surface for the others.
 
 ## In-guest agent (`engram-agentd`)
 
-Phase 2 dependency. A small Rust binary baked into every production rootfs, started by init at guest boot. Bridges the gap between Firecracker (which has no exec primitive) and the host agent.
+A small Rust binary baked into every Firecracker rootfs at `/sbin/engram-agentd`, started at guest boot by a tiny init shim (`/sbin/engram-init`). Bridges the gap between Firecracker (which has no exec primitive) and the host agent. Lives at `crates/engram-agentd`.
 
 ```text
             host-agent                            ┌── guest VM ──────────┐
-                │                                 │  PID 1: init         │
-                │   PUT /vsock { guest_cid: N }   │   ↓                  │
+                │                                 │  PID 1: /sbin/engram-init
+                │   PUT /vsock { guest_cid: N,    │   ↓ (mount /proc, /sys,
+                │                uds_path: U }    │      /dev; exec agentd)
                 ├────────────────────────────────►│  engram-agentd       │
                 │                                 │  vsock listen :1024  │
-                │   vsock connect (cid=N, port=1024)                     │
-                ├────────────────────────────────►│                      │
-                │   {token frame}                 │  ← validate          │
-                │   Exec { argv, env, cwd }       │  ← spawn child       │
+                │   connect to U (host UDS)       │                      │
+                │   write "CONNECT 1024\n"        │                      │
+                │ ◄──── "OK <peer_port>\n" ──────┤                      │
+                │   WireExecRequest               │  ← spawn child       │
                 │ ◄──── Stdout(...) ─────────────┤                      │
                 │ ◄──── Stdout(...) ─────────────┤                      │
                 │ ◄──── Exit { status: 0 } ──────┤                      │
@@ -423,75 +424,56 @@ Why vsock and not e.g. SSH-over-virtio-net or a TCP server in the guest:
 
 We reserve port `1024` (declared as `ENGRAM_AGENTD_PORT` in `engram-sandbox-firecracker`) for agentd.
 
-### Authentication
+### Protocol (`engram-agentd::proto`)
 
-Per-session token, validated on the first frame of each new connection. Never travels in env vars (which are visible to any in-guest process) and never appears on disk.
-
-Three injection options, in order of preference:
-
-1. **First-frame handshake (chosen)** — host opens vsock connection, sends `{ token }` as the first frame; agentd validates. Token never persists anywhere on the guest; rotates per connection. Robust against any in-guest exfiltration short of a kernel exploit.
-2. **virtio-fs single-file mount** — `/run/engram/token` mode 0400 owned by root. Visible to root processes inside the guest; mount point goes away on shutdown.
-3. **Kernel cmdline** — `engram_token=...` injected via `BootSource.boot_args`. Visible in `/proc/cmdline` to any in-guest reader. Simplest; least secure.
-
-We pick (1).
-
-### Protocol
-
-Length-prefixed CBOR (compact, schema-stable across language bindings). Each frame is `[u32 length][cbor payload]`. Top-level message is a tagged enum mirroring `engram-protocol`'s exec types.
+One connection per exec. Length-prefixed bincode: each frame is `[u32 BE length][bincode body]`. Bincode (rather than CBOR/JSON) because both sides are Rust, we own both schemas, and `Vec<u8>` encodes byte-for-byte — important on the hot stdout/stderr path where JSON's array-of-ints would inflate 3-5×.
 
 ```rust
-// crates/engram-protocol/src/agentd.rs (Phase 2)
+// crates/engram-agentd/src/proto.rs
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentRequest {
-    Auth { token: String },
-    Exec {
-        request_id: u64,
-        argv: Vec<String>,
-        env: HashMap<String, String>,
-        cwd: Option<String>,
-        stdin: Option<Vec<u8>>,
-        timeout_secs: Option<u64>,
-    },
-    Stat { request_id: u64, path: String },
-    Upload { request_id: u64, path: String, contents: Vec<u8>, mode: u32 },
-    Download { request_id: u64, path: String },
-    Ping { request_id: u64 },
-    Shutdown { graceful: bool },
+#[derive(Serialize, Deserialize, ...)]
+pub struct WireExecRequest {
+    pub command: Vec<String>,                // argv; command[0] is the program (no shell)
+    pub stdin: Option<Vec<u8>>,
+    pub env: HashMap<String, String>,
+    pub workdir: Option<String>,
+    pub timeout_ms: Option<u64>,             // SIGKILL after this; reports Exit(None)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentResponse {
-    AuthOk,
-    AuthFailed { reason: String },
-    Stdout { request_id: u64, chunk: Vec<u8> },
-    Stderr { request_id: u64, chunk: Vec<u8> },
-    Exit { request_id: u64, status: Option<i32> },
-    StatResult { request_id: u64, /* size, mode, mtime */ },
-    UploadOk { request_id: u64 },
-    DownloadChunk { request_id: u64, chunk: Vec<u8> },
-    DownloadDone { request_id: u64 },
-    Pong { request_id: u64, agent_info: AgentInfo },
-    Error { request_id: u64, message: String },
+#[derive(Serialize, Deserialize, ...)]
+pub enum WireExecEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(Option<i32>),                       // None = signalled / timed out
 }
 ```
 
-Multiple in-flight requests are demuxed by `request_id`, so the host agent can pipeline `Exec` calls without waiting for the previous one to complete.
+Conversation shape: host writes one `WireExecRequest`, agent streams 0+ `Stdout`/`Stderr` events, terminates with exactly one `Exit`, then closes. Multiple in-flight execs use multiple connections (FC's vsock proxy multiplexes them); single-stream demuxing isn't worth the complexity at the in-guest exec scale.
+
+### Authentication — TODO
+
+The agent currently does not authenticate connections — anything that can talk to the vsock UDS gets to spawn processes. This is acceptable for now because:
+
+- Firecracker's vsock proxy is owned by the host's `engram-host-agent` (the same process driving the FC HTTP API)
+- The proxy UDS lives in the host-agent's work_dir with default permissions
+- Multi-tenant deployments aren't a v1 goal (single-org assumption)
+
+Production hardening will add a first-frame token handshake. Token injection options under consideration: kernel cmdline (`engram_token=...` in `BootSource.boot_args`, visible via `/proc/cmdline` to in-guest readers — simplest), virtio-fs single-file mount (better hygiene, more setup), per-connection token written to vsock UDS by the host before the agent's accept (best — token never persists in the guest). Tracked under Phase 6 (production operability).
 
 ### Lifecycle
 
-1. **Init** — guest's init system (we ship one of: minimal busybox-init, OpenRC, systemd) starts agentd as a service. agentd listens on `vsock://(any, 1024)`.
-2. **Host connects** — sandbox backend opens vsock, sends `Auth { token }`. agentd replies `AuthOk` or `AuthFailed`.
-3. **Steady state** — host pipelines `Exec` and other requests; agentd spawns subprocesses for `Exec`, streams stdout/stderr back as it produces output.
-4. **Shutdown** — host sends `Shutdown { graceful }` before snapshot or destroy. agentd kills any in-flight subprocesses, flushes pending output, closes the connection cleanly.
+1. **Init** — kernel boots, exec's `init=/sbin/engram-init`. The shim mounts /proc, /sys, /dev, then exec's `engram-agentd --vsock-port 1024`.
+2. **Host connects** — `FirecrackerBackend::exec_stream` opens the FC vsock UDS, writes `CONNECT 1024\n`, reads back `OK <peer_port>\n`.
+3. **Per-exec** — host writes a `WireExecRequest`; agent spawns the child, streams events back, sends `Exit`, closes the connection.
+4. **Shutdown** — host sends SIGKILL to the firecracker process (today). A graceful path via `SendCtrlAltDel` + agent-side handler lands when the in-guest agent supports more than just exec.
 
 ### Distribution
 
-agentd binary is baked into every production rootfs at `/usr/local/bin/engram-agentd`, statically linked (musl target) so it runs in any base image without libc dependencies. The image-baker pipeline (`engram-image-builder`) injects it during rootfs construction.
+`engram-agentd` is baked into every Firecracker rootfs at `/sbin/engram-agentd`, plus `/sbin/engram-init` (the init shim that brings up just enough kernel plumbing for the agent to talk vsock). Both injected by `engram-image-builder` when `BuildRequest.agent_injection` is set; the binary is built statically against musl (`x86_64-unknown-linux-musl`, release mode) so it runs in any base image regardless of the rootfs's libc / dynamic-linker layout.
 
-Versioning: agentd sends its version string in the `Pong.agent_info` response. Coordinator can refuse to run on hosts whose images carry an agentd that's too old to speak the current protocol — surfaces incompatibility cleanly rather than as mysterious RPC errors.
+Initial scope is exec-only — `Stat`/`Upload`/`Download`/`Ping`/`Shutdown` verbs from the original design are deferred. They'll land when the surface is needed (file upload for snapshot transfer, ping for liveness, etc.).
+
+Versioning: TODO. The current wire types are stable; once we add a second consumer (the coordinator's WS protocol, Phase 3) we'll need to negotiate a version on first frame.
 
 ---
 
@@ -611,8 +593,10 @@ engram/
     │       └── error.rs
     ├── engram-coordinator/            # binary: HTTP/gRPC service
     ├── engram-host-agent/             # binary: per-host daemon
-    ├── engram-image-builder/          # binary: cron-style image baker
+    ├── engram-image-builder/          # binary + library: image baker (Directory / Ext4 modes)
     ├── engram-cli/                    # binary: ops/admin
+    ├── engram-agentd/                 # binary + library: in-guest exec daemon (vsock + UDS)
+    ├── engram-uffd-handler/           # binary + library: userfaultfd page-fault handler
     ├── engram-sandbox-firecracker/    # impl of SandboxBackend driving Firecracker (production)
     ├── engram-sandbox-process/        # impl of SandboxBackend using host subprocesses (dev only)
     ├── engram-cloud-gcp/              # impl of CloudBackend for GCE
@@ -644,43 +628,54 @@ engram/
 
 Order is deliberate: each phase produces something runnable end-to-end. Don't build pluggability before there's something to plug into.
 
-### Phase 1 — Orchestration layer end-to-end on the dev backend (largely done)
+### Phase 1 — Orchestration layer end-to-end on the dev backend ✅
 
 **Goal**: one binary, one host, one repo, end-to-end session, runnable on macOS Apple Silicon.
 
-- ✅ `engram-coordinator` HTTP API: `POST /sessions`, `GET/DELETE /sessions/:id`, `POST /sessions/:id/exec`, plus snapshot/resume/evict-local stubs.
+- ✅ `engram-coordinator` HTTP API: `POST /sessions`, `GET/DELETE /sessions/:id`, `POST /sessions/:id/exec` + `/exec/stream` (SSE), `POST /sessions/:id/snapshot/resume`, `DELETE /sessions/:id/local`, `GET /sessions/:id/events` (SSE replay via `?since=N` / `Last-Event-ID`).
+- ✅ Bearer-token auth middleware (constant-time compare, `/healthz` exempt).
 - ✅ `engram-sandbox-process` real implementation: per-sandbox cwd, real subprocess exec, tarball-based snapshot/restore.
+- ✅ Pluggable `SecretStore` (env / dotenv / GCP-Secret-Manager-stub) with `Literal` and `Broker` modes (the broker proxy itself lands in Phase 6).
 - ✅ `engram-cloud-{static,gcp,mock}`, `engram-storage-{local,gcs-stub,s3-stub}`, `engram-postgres`.
 - ✅ SandboxRegistry + lifecycle wiring: create allocates a sandbox, exec routes through it, delete tears it down.
-- ✅ Warm-pool data structure (no SandboxBackend-driven replenish yet).
+- ✅ Warm-pool data structure with backend-driven replenish.
 - ✅ Postgres schema + migration runner.
-- ✅ ~120 tests including end-to-end API integration via `tower::ServiceExt::oneshot`.
+- ✅ Persistent session-event log + SSE bus, `Last-Event-ID` reconnect.
+- ✅ Per-exec `ExecRusage { wall_ms, peak_rss_kb?, user_cpu_ms?, sys_cpu_ms? }` on `ExecCompleted` events and `/exec` responses.
+- ✅ ~290 workspace tests across the unit + integration surface.
 
 **Deliverable**: `just dev` brings up Postgres + coordinator (subprocess backend) on a Mac. `curl POST /sessions` returns a session, `POST /sessions/:id/exec` round-trips real stdout/stderr/exit-status.
 
-### Phase 2 — Firecracker integration (Linux production path)
+### Phase 2 — Firecracker integration (Linux production path) ✅
 
 **Goal**: production-grade isolation, snapshot-evict mechanic working end-to-end.
 
-Concrete deliverables:
+**Done:**
 
-- **`engram-sandbox-firecracker` real implementation**
-  - `hyper`-over-`tokio::net::UnixStream` (via `hyperlocal`) client to the Firecracker control socket
-  - Per-sandbox jailer setup: `firecracker-jailer` invocation that drops privileges, chroots, applies cgroups, sets up seccomp filters, passes `/dev/kvm` fd
-  - VM config: `PUT /machine-config` + `/boot-source` + `/drives/rootfs` + `/network-interfaces/eth0` + `/vsock`, then `PUT /actions InstanceStart`
-  - TAP-per-VM networking, host-side bridge or routed network, predictable IP allocation
-  - Lifecycle: `SendCtrlAltDel` for graceful, SIGKILL for forced
-- **`engram-agentd`** — full design in [In-guest agent](#in-guest-agent-engram-agentd) section above. Phase 2 makes it real: musl-static binary, virtio-vsock protocol, first-frame token auth, exec/stat/upload/download/ping/shutdown methods.
-- **Snapshot/restore via Firecracker API**
+- ✅ `engram-sandbox-firecracker` real implementation
+  - Manual HTTP/1.1 over `tokio::net::UnixStream` (no `hyper`; the protocol is small and explicit)
+  - VM config: `PUT /machine-config` + `/boot-source` + `/drives/rootfs` + `/vsock`, then `PUT /actions InstanceStart`
+  - Lifecycle: SIGKILL on destroy via the spawned `Child` (graceful `SendCtrlAltDel` deferred to Phase 6)
+- ✅ `engram-agentd` (in-guest exec daemon, vsock listener) and `engram-init` (boot shim that mounts /proc /sys /dev and exec's the agent). Built static-musl via `x86_64-unknown-linux-musl`; injected into rootfs by the image baker.
+- ✅ Snapshot/restore via Firecracker API
   - Take: `PATCH /vm Paused` → `PUT /snapshot/create { snapshot_path, mem_file_path, snapshot_type: "Full" }` → `PATCH /vm Resumed`
-  - Restore: `PUT /snapshot/load { snapshot_path, mem_backend: { backend_type: "Uffd", backend_path: <handler socket> }, resume_vm: true }`
-  - **UFFD memory backend** (the load-bearing part): a host-agent task accepts page-fault events on the UFFD socket and pages in 4 KiB chunks from the on-disk memory file. Resume returns immediately; pages stream in lazily on guest fault. Sub-100ms warm time regardless of guest RAM.
-- **Snapshot manager (real)** — host-agent's `SnapshotManager::replicate` TODO becomes: stream local NVMe → BlobStorage with `async-compression` zstd-3, mark `replicated_at`. LRU eviction once replicated.
-- **Real `engram-storage-{gcs,s3}`** — fill the typed-stub crates with the SDK calls. Match the trait shape we already have.
-- **Broker-mode secret proxy** — per-session HTTPS-MITM proxy that substitutes placeholders for real values on outbound requests matching `schema.allow_hosts`. TLS interception requires generating a per-session CA cert + injecting it into the guest trust store at first boot. Network namespace setup makes the proxy the only egress path so the agent can't bypass.
-- **Network policy enforcement** — iptables/nftables rules at the TAP boundary derived from `manifest.network`. Default-deny outbound; allowlist hosts get DNS + connection through the proxy.
+  - Restore: `PUT /snapshot/load` with both `backend_type=File` (synchronous, simple) and `backend_type=Uffd` (lazy paging)
+- ✅ **UFFD memory backend** (`engram-uffd-handler`) — separate companion process. Receives the userfaultfd via SCM_RIGHTS, mmaps `memory.bin` (PROT_READ + MAP_PRIVATE + MAP_POPULATE), services `Pagefault` events with `UFFDIO_COPY`. Sub-100ms resume regardless of guest RAM. Confirmed against upstream's `on_demand_handler.rs`.
+- ✅ Image baker `Format::Ext4` mode — `mke2fs -t ext4 -F -d <staging> <out>.ext4`. No loopback mount, no root.
+- ✅ Coordinator config plumbing — `--kernel-image-path` / `ENGRAM_KERNEL_IMAGE_PATH`; `FirecrackerConfig::{kernel_image_path, default_boot_args, restore_mode, uffd_handler_bin}`.
+- ✅ 5 integration tests against real microVMs on the GCP dev VM — `boot`, `lifecycle`, `snapshot`, `snapshot_uffd`, `exec_real_vm` (full bake → boot → vsock CONNECT → exec → assert stdout).
 
-**Deliverable**: on a Linux box with KVM, idle a session, evict from RAM via `DELETE /sessions/:id/local`, resume in <100ms via UFFD-backed restore. Outbound HTTPS to `api.github.com` succeeds with a real token; outbound HTTPS to `evil.com` is blocked at the network layer; the agent inside the sandbox never sees the real `GITHUB_TOKEN` value.
+**Deferred** (rolled into Phase 6 production hardening, since they're orthogonal to "the trait surface works"):
+
+- `firecracker-jailer` integration (drop privileges, chroot, cgroups, seccomp, `/dev/kvm` fd passing)
+- TAP networking + per-VM IP allocation
+- Broker-mode HTTPS proxy (secret value substitution at the network boundary)
+- Network policy enforcement via iptables/nftables at the TAP boundary
+- `SendCtrlAltDel` graceful shutdown; agent-side shutdown handshake
+- Snapshot manager replication path (`replicate()` TODO → stream local → BlobStorage with zstd-3, mark `replicated_at`, LRU eviction once replicated)
+- Real `engram-storage-{gcs,s3}` SDK calls (currently typed stubs)
+- First-frame token auth on the in-guest agent
+- The full agent verb set (`Stat` / `Upload` / `Download` / `Ping` / `Shutdown` — exec-only today)
 
 ### Phase 3 — Multi-host coordinator
 
@@ -729,20 +724,24 @@ Concrete deliverables:
 
 **Goal**: warm-pool images refresh on a schedule, no human in the loop.
 
-- **`engram-image-builder` real implementation** (the existing stub):
-  - Cron / k8s CronJob / systemd timer triggers per-repo every ~30 min
-  - Spawn temporary build sandbox (using whichever sandbox backend is configured)
-  - `git clone <repo>` (using GitHub App token from SecretStore, with fine-grained `contents:read` scope for that repo)
-  - Run repo's setup script declared in `engram.toml` (the per-repo config — `setup = ["pnpm install", "cargo fetch"]` etc.)
-  - For Firecracker: snapshot the resulting filesystem to `rootfs.ext4` via `mkfs.ext4` + `tar` extraction; for ProcessBackend: tarball the workdir into a `rootfs/` directory
-  - Inject the static `engram-agentd` musl binary into `/usr/local/bin/engram-agentd` and an init unit/service file
-  - Write `manifest.toml` (env vars + secret schema + network policy + resources) — this is what production agent code declares its dependencies on
-  - Push artifacts to image registry; record `(repo, tag, status=ready)` in `image_versions` table
-- **Image registry backend** — for Firecracker production, images live in BlobStorage (GCS/S3) and host-agents fetch on demand. Registry resolution lookups become an HTTP-y thing rather than a filesystem walk
-- **Warm pool refresh** — when a new image_version is published, existing warm VMs drain naturally on checkout; new replenishes spawn from the new image. No mid-flight migration
-- **Image GC** — old image versions retire after a configurable TTL (default 24h after last access); blobs lifecycle to coldline storage; eventually deleted
+The baker itself is real today (`crates/engram-image-builder`):
 
-**Deliverable**: schedule the baker every 30 min in CI. Observe new image versions appear in `image_versions` table with `status=ready`, and warm-pool VMs spawn from the latest tag without disrupting in-flight sessions.
+- ✅ One-shot bake from a `Dockerfile` + `engram.toml`: `docker build` → `docker create + export | tar -x` → manifest.toml → optional `mke2fs -t ext4 -F -d` packing
+- ✅ `Format::{Directory, Ext4}` — Directory for the dev backend, Ext4 for Firecracker
+- ✅ `AgentInjection` — bakes the static-musl `engram-agentd` to `/sbin/engram-agentd` + writes `/sbin/engram-init` with the negotiated vsock port substituted in
+- ✅ `image_versions` row recorded in Postgres via `record_in_metadata`
+- ✅ CLI surface: `engram image build --repo <r> --source . [--format directory|ext4]`
+
+What Phase 5 still needs to ship:
+
+- **Cron-driven schedule** — k8s CronJob / systemd timer / GitHub Action; the baker is invoked manually today
+- **`git clone <repo>` step inside the bake** — currently the `--source` is a local path; production wants the baker to clone fresh from the remote, using a GitHub App token from `SecretStore` with fine-grained `contents:read` scope for that repo
+- **Repo setup-script execution** — running an `engram.toml`-declared `setup = ["pnpm install", "cargo fetch"]` inside the build sandbox before snapshotting (the slow stuff that benefits most from warm-pool caching)
+- **Image registry on BlobStorage** — for Firecracker production, images live in GCS/S3, host-agents fetch on demand. Registry resolution becomes an HTTP-y thing rather than a filesystem walk
+- **Warm-pool refresh on new image version** — existing warm VMs drain naturally on checkout; replenishes spawn from the latest tag. No mid-flight migration
+- **Image GC** — old image versions retire after a configurable TTL (default 24h after last access); blobs lifecycle to coldline; eventually deleted
+
+**Deliverable**: schedule the baker every 30 min in CI. Observe new image versions appear in `image_versions` with `status=ready`, and warm-pool VMs spawn from the latest tag without disrupting in-flight sessions.
 
 ### Phase 6 — Production operability
 
@@ -830,9 +829,9 @@ Firecracker requires KVM. On GCE that means specific machine types (N2, N2D, C3)
 
 A session running backend + frontend + postgres can produce 8–12 GB compressed snapshots. At thousands of sessions/day, this is significant disk + network. Mitigation: aggressive lazy-startup pattern (don't run all services in every session), zstd compression, GCS lifecycle policies for cold tier, Firecracker diff snapshots so subsequent saves only capture dirtied pages.
 
-### Risk 4 — In-guest agent (`engram-agentd`) is its own workstream
+### ~~Risk 4 — In-guest agent (closed)~~
 
-Firecracker doesn't expose an "exec a command in a running guest" primitive — exec routes through a small daemon we ship inside the rootfs, listening on vsock. This is a real new component to design and bake into images: protocol (likely length-prefixed CBOR or simple framed JSON over vsock), auth (per-session token injected via kernel cmdline or virtio-fs file), lifecycle (started by init in the guest). Well-trodden — every Firecracker-based platform has built one — but it's not free. Sequence: get Firecracker boot working first, then layer agentd onto the image-baker pipeline.
+**Closed.** `engram-agentd` shipped in Phase 2: length-prefixed bincode over vsock (host CONNECT-handshakes through Firecracker's UDS proxy), exec verb only, no auth yet. Static-musl binary baked into the rootfs by `engram-image-builder`'s `AgentInjection` path. Auth + the broader verb set (`Stat`/`Upload`/`Download`/`Ping`/`Shutdown`) land in Phase 6.
 
 ---
 
@@ -1082,27 +1081,35 @@ curl -s -X POST "localhost:8090/sessions/$SID/exec" \
   -d '{"command":"echo still here"}' | jq -r .stdout
 ```
 
-If that all works, Phase 1+2 are done.
+For Phase 2 the equivalent end-to-end is the FC integration suite (each test is `#[ignore]`'d and runs on a Linux + KVM host):
+
+```bash
+bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
+# boot, lifecycle, snapshot (file-backed), snapshot_uffd (lazy paging),
+# exec_real_vm (bake → boot → vsock CONNECT → exec → assert stdout)
+```
+
+Phase 1 + 2 are landed against the dev VM. The remaining items in the Phase 2 list above are scoped under Phase 4 (cloud / spot) and Phase 6 (production hardening).
 
 ---
 
-## Critical files (to be created in v1)
+## Critical files (current)
 
-This is a greenfield project. Phase 1 specifically creates:
+The pieces that load-bear the Phase 1+2 surface, for new contributors finding their way around:
 
-- `Cargo.toml` (workspace root)
-- `crates/engram-core/src/traits/{cloud,storage,metadata,sandbox}.rs` — trait definitions
-- `crates/engram-core/src/types/mod.rs` — shared types
-- `crates/engram-core/src/error.rs` — error enums
-- `crates/engram-coordinator/src/main.rs` + `src/api/{sessions,exec,health}.rs`
-- `crates/engram-host-agent/src/main.rs` + `src/{pool,snapshot,resource}.rs`
-- `crates/engram-sandbox-microsandbox/src/lib.rs` — SandboxBackend impl
-- `crates/engram-cloud-static/src/lib.rs` — CloudBackend impl (no-op preemption)
-- `crates/engram-storage-local/src/lib.rs` — BlobStorage impl
-- `crates/engram-postgres/src/lib.rs` — MetadataStore impl
-- `deploy/migrations/0001_initial.sql` — schema from this doc
-- `deploy/docker-compose.yml` — dev stack
-- `README.md`, `LICENSE`, `.github/workflows/ci.yml`
+- `crates/engram-core/src/traits/{cloud,storage,metadata,sandbox,secrets}.rs` — pluggable seams
+- `crates/engram-core/src/types/{ids,sandbox,session,snapshot,event,host,image}.rs` — shared types
+- `crates/engram-core/src/error.rs` — `SandboxError` / `MetaError` / `StorageError` / `BackendError`
+- `crates/engram-coordinator/src/api/{sessions,exec,events,snapshot,auth,health}.rs` — HTTP surface
+- `crates/engram-coordinator/src/state.rs` — `SessionEventBus`, `SandboxRegistry`, `AppState`
+- `crates/engram-host-agent/src/{pool,snapshot}.rs` — warm pool, snapshot manager scaffold
+- `crates/engram-sandbox-firecracker/src/{lib,client}.rs` — FC HTTP-over-UDS client + backend impl
+- `crates/engram-agentd/src/{proto,handler,main}.rs` — in-guest agent + wire protocol
+- `crates/engram-uffd-handler/src/{proto,runtime,main}.rs` — UFFD page-fault handler
+- `crates/engram-image-builder/src/{lib,docker,ext4}.rs` — bake pipeline
+- `crates/engram-{secrets-dev,secrets-gcp}/src/lib.rs` — `SecretStore` impls
+- `deploy/migrations/{0001_initial,0002_session_events}.sql`
+- `flake.nix`, `rust-toolchain.toml` — pinned dev toolchain
 
 ---
 

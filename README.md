@@ -8,9 +8,11 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 
 ## Status
 
-Phase 1 — orchestration layer end-to-end on the dev backend. The coordinator HTTP API, scheduler, warm pool, blob storage, snapshot manager scaffolding, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → registry rootfs), pluggable secret store (env / dotenv / GCP-stub), and metadata store are real. End-to-end create → exec → delete works locally on macOS Apple Silicon via `engram-sandbox-process`, with per-exec wall-time accounting on the response. CLI covers session list/get/delete/logs and image build. 240 tests, fmt + clippy clean.
+**Phase 1** — orchestration layer end-to-end on the dev backend. The coordinator HTTP API, scheduler, warm pool, blob storage, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → registry rootfs), pluggable secret store (env / dotenv / GCP-stub), and metadata store are real. End-to-end create → exec → delete works locally on macOS Apple Silicon via `engram-sandbox-process`, with per-exec wall-time accounting. CLI covers session list/get/delete/logs and image build.
 
-Phase 2 — the production Firecracker backend (`engram-sandbox-firecracker`) is scaffolded as a typed stub: trait surface complete, every method returns a structured error pointing at the Firecracker endpoint to wire (`PUT /machine-config`, `PUT /snapshot/load` with UFFD, etc.). Implementation work in progress on a Linux dev box.
+**Phase 2 — done.** `engram-sandbox-firecracker` drives real Firecracker microVMs end-to-end: typed HTTP client over the FC unix socket; `create`/`destroy`/`list`/`snapshot`/`restore`/`exec_stream` all wired and exercised by integration tests on a Linux dev VM. `restore` supports both `File` mode (synchronous read of `memory.bin`) and `Uffd` mode (lazy paging via the new `engram-uffd-handler` companion process — sub-100ms resume). `exec_stream` reaches an in-guest `engram-agentd` over Firecracker's vsock proxy; the image baker injects a static-musl agent + init shim into ext4 rootfs images. 292 tests pass on macOS, plus 5 microVM integration tests on the dev VM.
+
+**Phase 3 — multi-host scheduling.** Next.
 
 ## Workspace
 
@@ -20,10 +22,12 @@ crates/
   engram-protocol                   # gRPC defs (coordinator <-> host)
   engram-coordinator                # binary: HTTP API + scheduler
   engram-host-agent                 # binary: per-host daemon
-  engram-image-builder              # binary: warm-image baker
+  engram-image-builder              # binary: warm-image baker (Directory + Ext4 modes)
   engram-cli                        # binary: ops/admin tool
-  engram-sandbox-firecracker        # SandboxBackend: Firecracker microVMs (production, stub)
+  engram-agentd                     # binary: in-guest exec daemon (vsock + UDS)
+  engram-sandbox-firecracker        # SandboxBackend: Firecracker microVMs (production)
   engram-sandbox-process            # SandboxBackend: host subprocesses (DEV ONLY, no isolation)
+  engram-uffd-handler               # binary: userfaultfd page-fault handler for fast snapshot restore
   engram-cloud-{gcp,static,mock}    # CloudBackend impls
   engram-storage-{gcs,s3,local}     # BlobStorage impls
   engram-secrets-{dev,gcp}          # SecretStore impls (env/dotenv; GCP Secret Manager)
@@ -37,7 +41,7 @@ The orchestration layer is VMM-agnostic — anything that implements `SandboxBac
 | Backend | Isolation | Snapshots | Where it runs | When to use |
 |---|---|---|---|---|
 | `engram-sandbox-process` | **None** — host subprocess | Tarball of workdir | Anywhere (macOS, Linux) | Local dev. Iterating on the orchestration layer without firing up a VMM. |
-| `engram-sandbox-firecracker` | microVM (KVM) | Full + diff, UFFD restore | Linux + KVM | Production. Real isolation, real resource enforcement, real snapshot/restore. |
+| `engram-sandbox-firecracker` | microVM (KVM) | Full, file-backed or UFFD restore | Linux + KVM | Production. Real isolation, real resource enforcement, real snapshot/restore. |
 
 The dev backend is for fast iteration; it deliberately doesn't try to mimic production isolation. Use a Linux box (CI, Hetzner, remote dev VM) to validate against Firecracker when fidelity matters.
 
@@ -125,11 +129,14 @@ suggested_memory_mib = 4096
 Bake it:
 
 ```bash
-engram image build \
-  --repo cortex/api \
-  --source ./path/to/repo \
-  --images-dir ./var/snapshots/images
+# Directory rootfs (dev backend, default)
+engram image build --repo cortex/api --source ./path/to/repo
+
+# ext4 rootfs for Firecracker
+engram image build --repo cortex/api --source ./path/to/repo --format ext4
 ```
+
+`--format ext4` produces `<images_dir>/<repo>/<tag>/rootfs.ext4` (a block-device image Firecracker mounts directly), built via `mke2fs -t ext4 -F -d` from the staged Docker export — no loopback mount, no root needed. The `Directory` default produces `<images_dir>/<repo>/<tag>/rootfs/` for the dev backend.
 
 Then create a session against it (the coordinator picks up the new tag automatically):
 
@@ -146,11 +153,12 @@ Requires Docker on the host. Compatible with Docker Desktop, OrbStack, Colima, a
 The `engram` CLI talks to the coordinator's HTTP API. `--json` on any read command emits raw JSON for piping into `jq` / scripts.
 
 ```bash
-engram session list                       # active sessions, table view
+engram session list                                   # active sessions, table view
 engram session get <id>
 engram session delete <id>
-engram session logs <id> --since 0        # tail SSE event log; resume after idx
-engram image build --repo <r> --source .  # bake Dockerfile + engram.toml
+engram session logs <id> --since 0                    # tail SSE event log; resume after idx
+engram image build --repo <r> --source .              # bake (directory rootfs, default)
+engram image build --repo <r> --source . --format ext4  # bake ext4 image for Firecracker
 ```
 
 `ENGRAM_ENDPOINT` and `ENGRAM_TOKEN` (when auth is on) configure where the CLI talks and what it sends in `Authorization: Bearer ...`. The CLI defaults to `http://localhost:8080`; the `just dev` setup binds to `:8090`, so set `ENGRAM_ENDPOINT=http://localhost:8090` in dev.
@@ -166,16 +174,35 @@ ENGRAM_AUTH_TOKENS=alpha,beta cargo run -p engram-coordinator
 ENGRAM_TOKEN=alpha engram session list
 ```
 
-## Validating the production path
+## Running on real Firecracker
 
-The dev backend is for orchestration iteration. Real Firecracker validation needs Linux + KVM:
+The dev backend is for orchestration iteration. Real Firecracker needs Linux + KVM:
 
 - A Hetzner AX-series box (~€40/mo, no nested-virt tax)
 - A GCE n2d / n2 / c3 instance with `--enable-nested-virtualization`
 - A Linux laptop or workstation
 - CI
 
-`just dev-firecracker` runs the coordinator against the Firecracker backend and refuses to start in environments where it can't bring a VM up. Phase 2 fills in the actual Firecracker integration; today it surfaces structured "not yet implemented" errors that point at the specific Firecracker endpoint to wire.
+`just dev-firecracker` runs the coordinator against the Firecracker backend. Set `ENGRAM_KERNEL_IMAGE_PATH` to a vmlinux on disk; the rootfs comes from images baked with `--format ext4` (and, for `exec_stream`, with `engram-agentd` injected — see `crates/engram-image-builder/src/lib.rs::AgentInjection`).
+
+The crate ships a five-test integration suite that covers the full surface against real microVMs:
+
+```bash
+# On a Linux + KVM host, after building engram-uffd-handler + engram-agentd:
+bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
+```
+
+Tests: `boot` (kernel banner on serial), `lifecycle` (create/list/destroy round-trip), `snapshot` (file-backed restore), `snapshot_uffd` (lazy paging via the userfaultfd handler), `exec_real_vm` (bake → boot → exec through in-guest agent over vsock).
+
+For UFFD-backed restore, the coordinator's host needs:
+- `/dev/userfaultfd` mode 0666 (set via udev rule, see `dev-vm/scripts/bootstrap-remote.sh`)
+- `vm.unprivileged_userfaultfd = 1` sysctl
+- `engram-uffd-handler` binary on `$PATH` (or set `FirecrackerConfig::uffd_handler_bin`)
+
+For agent-baked images, the coordinator needs:
+- A static-musl `engram-agentd` build:
+  `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`
+- `init=/sbin/engram-init` in the kernel boot args (set via `FirecrackerConfig::default_boot_args`)
 
 ## License
 
