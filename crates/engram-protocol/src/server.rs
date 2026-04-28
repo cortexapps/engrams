@@ -125,11 +125,12 @@ impl HostSession {
             };
 
             match frame {
-                Frame::Request { req_id, kind } => {
+                Frame::Request { req_id, trace, kind } => {
                     tokio::spawn(handle_request(
                         backend.clone(),
                         self.writer.clone(),
                         req_id,
+                        trace,
                         kind,
                     ));
                 }
@@ -203,8 +204,21 @@ async fn handle_request(
     backend: Arc<dyn SandboxBackend>,
     writer: SharedSink,
     req_id: u64,
+    trace: crate::wire::TraceContext,
     kind: RequestKind,
 ) {
+    // Open a span around the dispatch so every log line emitted by
+    // backend code (the local SandboxBackend impl) carries the
+    // coordinator's trace_id / span_id. With a real OTel exporter
+    // wired in later these become a single distributed trace.
+    let span = tracing::info_span!(
+        "host.handle_request",
+        req_id,
+        trace_id = %trace.trace_id_hex(),
+        span_id = %trace.span_id_hex(),
+        kind = request_kind_name(&kind),
+    );
+    let _enter = span.enter();
     let result: Result<ResponseKind, RemoteError> = match kind {
         RequestKind::CreateSandbox { spec } => match backend.create(spec).await {
             Ok(sandbox_id) => Ok(ResponseKind::SandboxCreated { sandbox_id }),
@@ -277,6 +291,17 @@ async fn handle_request(
     };
 
     send_frame(&writer, Frame::Response { req_id, result }).await;
+}
+
+fn request_kind_name(kind: &RequestKind) -> &'static str {
+    match kind {
+        RequestKind::CreateSandbox { .. } => "create",
+        RequestKind::DestroySandbox { .. } => "destroy",
+        RequestKind::ListSandboxes => "list",
+        RequestKind::ExecStart { .. } => "exec_start",
+        RequestKind::Snapshot { .. } => "snapshot",
+        RequestKind::Restore { .. } => "restore",
+    }
 }
 
 async fn drain_exec_stream(

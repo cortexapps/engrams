@@ -20,4 +20,7 @@ pub mod wire;
 
 pub use heartbeat::*;
 pub use scheduling::*;
-pub use wire::{Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, WireExecRequest};
+pub use wire::{
+    Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, TraceContext,
+    WireExecRequest,
+};

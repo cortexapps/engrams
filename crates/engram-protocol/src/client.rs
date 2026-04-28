@@ -26,7 +26,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::codec;
-use crate::wire::{Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, WireExecRequest};
+use crate::wire::{
+    Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, TraceContext,
+    WireExecRequest,
+};
 
 /// Capacity of the per-exec stream channel. Bounds memory growth when
 /// the coordinator-side consumer is slow; the host's WS writer blocks
@@ -169,10 +172,21 @@ impl ConnectedHost {
         }
 
         let req_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let trace = TraceContext::random();
+        // Surface the ids on coord-side log lines emitted while the
+        // RPC is in flight; the host attaches the same values to its
+        // dispatch span (see `server::handle_request`) so a single
+        // grep stitches both sides together.
+        tracing::debug!(
+            req_id,
+            trace_id = %trace.trace_id_hex(),
+            span_id = %trace.span_id_hex(),
+            "sending unary RPC",
+        );
         let (tx, rx) = oneshot::channel();
         self.inner.pending.insert(req_id, Pending::Unary(tx));
 
-        let frame = Frame::Request { req_id, kind };
+        let frame = Frame::Request { req_id, trace, kind };
         let msg = codec::encode(&frame)?;
 
         // Hold the writer lock only across the send. If send fails we
@@ -206,6 +220,13 @@ impl ConnectedHost {
         }
 
         let req_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let trace = TraceContext::random();
+        tracing::debug!(
+            req_id,
+            trace_id = %trace.trace_id_hex(),
+            span_id = %trace.span_id_hex(),
+            "starting streaming exec RPC",
+        );
         let (started_tx, started_rx) = oneshot::channel();
         let (stream_tx, stream_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
 
@@ -219,6 +240,7 @@ impl ConnectedHost {
 
         let frame = Frame::Request {
             req_id,
+            trace,
             kind: RequestKind::ExecStart {
                 sandbox_id,
                 request: WireExecRequest::from_engine(request),

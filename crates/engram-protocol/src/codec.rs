@@ -85,6 +85,7 @@ mod tests {
     fn encode_decode_round_trips_request() {
         let f = Frame::Request {
             req_id: 99,
+            trace: crate::wire::TraceContext::random(),
             kind: RequestKind::DestroySandbox {
                 sandbox_id: SandboxId::new(),
             },

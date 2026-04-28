@@ -26,10 +26,18 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 /// originated the call (currently always coordinator → host). Stream
 /// frames also carry the originating `req_id`. Notifies are unrelated
 /// to any specific request.
+///
+/// Request frames also carry a [`TraceContext`] (W3C-style 16-byte
+/// trace id + 8-byte span id) so the host's `tracing` span for the
+/// dispatched RPC can include the same ids the coordinator's
+/// originating span did. With a future tracing-opentelemetry collector
+/// these stitch into real distributed traces; today they at least
+/// give `grep` something common across coord + host logs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Frame {
     Request {
         req_id: u64,
+        trace: TraceContext,
         kind: RequestKind,
     },
     Response {
@@ -45,6 +53,53 @@ pub enum Frame {
     /// Heartbeat / hello / push notifications that aren't tied to a
     /// specific outstanding request.
     Notify(NotifyKind),
+}
+
+/// W3C-shaped trace context — 16-byte trace id + 8-byte span id. The
+/// coordinator generates fresh ids per outgoing Request (proper
+/// propagation from a parent span lands when the workspace adopts
+/// `tracing-opentelemetry`). Hosts attach the values as fields on the
+/// span they create around `handle_request` so per-RPC log lines
+/// across both sides share `trace_id` / `span_id`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct TraceContext {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+impl TraceContext {
+    /// Generate a fresh, random context. Cryptographic-quality
+    /// randomness isn't required here — these are debug correlation
+    /// ids, not security tokens — but `uuid::Uuid::new_v4` is what
+    /// the workspace already pulls in for sandbox/session ids and
+    /// gives 16 bytes of v4 randomness for free.
+    pub fn random() -> Self {
+        let trace_id = *uuid::Uuid::new_v4().as_bytes();
+        let mut span_id = [0u8; 8];
+        // Use the low half of a fresh v4 UUID for the span id —
+        // independent randomness keeps the span id from being
+        // trivially derivable from the trace id.
+        span_id.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        Self { trace_id, span_id }
+    }
+
+    /// Hex-format the trace id for log fields. Matches the W3C
+    /// traceparent header style (lowercase, no separators).
+    pub fn trace_id_hex(&self) -> String {
+        hex_lower(&self.trace_id)
+    }
+
+    pub fn span_id_hex(&self) -> String {
+        hex_lower(&self.span_id)
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Coordinator → host requests. Mirrors the [`SandboxBackend`] trait
@@ -228,8 +283,10 @@ mod tests {
 
     #[test]
     fn frame_request_round_trips_via_bincode() {
+        let trace = TraceContext::random();
         let f = Frame::Request {
             req_id: 42,
+            trace,
             kind: RequestKind::DestroySandbox {
                 sandbox_id: SandboxId::new(),
             },
@@ -239,9 +296,12 @@ mod tests {
         match back {
             Frame::Request {
                 req_id,
+                trace: trace_back,
                 kind: RequestKind::DestroySandbox { sandbox_id },
             } => {
                 assert_eq!(req_id, 42);
+                assert_eq!(trace_back.trace_id, trace.trace_id);
+                assert_eq!(trace_back.span_id, trace.span_id);
                 let _ = sandbox_id;
             }
             other => panic!("wrong variant: {other:?}"),
@@ -262,6 +322,7 @@ mod tests {
         };
         let f = Frame::Request {
             req_id: 1,
+            trace: TraceContext::random(),
             kind: RequestKind::CreateSandbox { spec: spec.clone() },
         };
         let bytes = bincode::serialize(&f).unwrap();
