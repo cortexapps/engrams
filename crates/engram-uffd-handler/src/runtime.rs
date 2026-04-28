@@ -18,6 +18,29 @@ use std::ptr;
 use sendfd::RecvWithFd;
 use userfaultfd::{Event, Uffd};
 
+/// Strip O_NONBLOCK from `fd` so blocking reads on it actually block.
+///
+/// Firecracker creates the userfaultfd as O_NONBLOCK (it polls on its
+/// own side). The `userfaultfd` crate's `read_event` translates EAGAIN
+/// into `Ok(None)`, and our event loop's `Ok(None) => exit` arm
+/// triggered after the *first* fault. Without this fix, the handler
+/// served one page then quit, FC's vCPU faulted on the next
+/// untouched page and blocked in `handle_userfault` forever.
+fn make_blocking(fd: i32) -> std::io::Result<()> {
+    // SAFETY: fd is a valid kernel fd we own (received via SCM_RIGHTS,
+    // wrapped in Uffd which owns it). fcntl with F_GETFL/F_SETFL is
+    // standard and side-effect-free on flag bits we don't touch.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let new_flags = flags & !libc::O_NONBLOCK;
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 use crate::proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
 
 /// Anything that can go wrong during handler startup or while serving
@@ -264,19 +287,27 @@ impl Runtime {
 /// because FC keeps its side open and treats our close as a
 /// protocol error).
 pub fn run_listener(listen: PathBuf, memory_bin: PathBuf) -> Result<(), HandlerError> {
+    let pid = std::process::id();
     let _ = std::fs::remove_file(&listen);
     let listener = std::os::unix::net::UnixListener::bind(&listen)?;
-    tracing::info!(socket = %listen.display(), "engram-uffd-handler listening");
+    tracing::info!(pid, socket = %listen.display(), "engram-uffd-handler listening");
     let (stream, _addr) = listener.accept()?;
-    tracing::info!("Firecracker connected; awaiting handshake");
+    tracing::info!(pid, "Firecracker connected; awaiting handshake");
     let (mappings, uffd) = recv_handshake(&stream)?;
+    let uffd_fd = std::os::fd::AsRawFd::as_raw_fd(&uffd);
+    make_blocking(uffd_fd)?;
     let total: usize = mappings.iter().map(|m| m.size).sum();
     tracing::info!(
+        pid,
+        uffd_fd,
         regions = mappings.len(),
         total_bytes = total,
-        "handshake complete; starting fault loop",
+        "handshake complete",
     );
     let rt = Runtime::new(&memory_bin, mappings, uffd)?;
-    let _stream_alive = stream; // keep open for the VM's lifetime
-    rt.run()
+    let _stream_alive = stream;
+    tracing::info!(pid, "starting fault loop");
+    let result = rt.run();
+    tracing::info!(pid, ?result, "fault loop returned");
+    result
 }

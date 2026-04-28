@@ -15,16 +15,12 @@
 //!   `WireExecRequest`, and translates the streamed `WireExecEvent`s
 //!   back into `engram_core::ExecEvent`s.
 //!
-//! `restore` supports two modes via `FirecrackerConfig::restore_mode`:
-//!
-//! - `RestoreMode::File` — default, fully working. Synchronous read
-//!   of `memory.bin`. Simple, slow, no extra processes.
-//! - `RestoreMode::Uffd` — plumbed but the FC ↔ handler handshake
-//!   currently hangs Firecracker's `PUT /snapshot/load` after a
-//!   visibly-clean handshake. The handler crate (`engram-uffd-handler`)
-//!   and the integration test (`tests/snapshot_uffd.rs`,
-//!   `#[ignore]`'d) live on disk for the next investigation pass.
-//!   `RestoreMode::File` is the right choice for any caller today.
+//! `restore` supports both `RestoreMode::File` (synchronous read of
+//! memory.bin, simple, slow, no extra processes) and `RestoreMode::Uffd`
+//! (lazy paging via the `engram-uffd-handler` companion process — fast,
+//! Linux-only). `FirecrackerConfig::restore_mode` defaults to `File`;
+//! set it to `Uffd` for production-grade eviction/resume latency. Both
+//! are verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
 //!
 //! One slice remains to claim "production-ready":
 //!
@@ -567,13 +563,7 @@ impl FirecrackerBackend {
                 let handler = self
                     .spawn_uffd_handler(&uffd_uds, &mem_path, jail_dir)
                     .await?;
-                // PUT /snapshot/load with UFFD can take longer than
-                // file-backed because Firecracker waits for the VM to
-                // resume against the live UFFD before responding.
-                // Bump the client's per-request timeout for this call.
-                let api_uffd =
-                    FirecrackerClient::new(api.socket()).with_timeout(Duration::from_secs(60));
-                api_uffd.load_snapshot_uffd(&state_path, &uffd_uds).await?;
+                api.load_snapshot_uffd(&state_path, &uffd_uds).await?;
                 Some(handler)
             }
         };

@@ -12,7 +12,6 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
-    use std::path::PathBuf;
     use std::process::ExitCode;
 
     tracing_subscriber::fmt()

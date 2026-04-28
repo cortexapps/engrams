@@ -21,9 +21,7 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test boot           -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test lifecycle      -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test snapshot       -- --ignored --nocapture
-    # snapshot_uffd is KNOWN-BROKEN — see tests/snapshot_uffd.rs
-    # docstring. Run it explicitly with `... snapshot_uffd` when
-    # debugging. Excluded from `all` so a green `all` means green.
+    cargo test -p engram-sandbox-firecracker --test snapshot_uffd  -- --ignored --nocapture
     ;;
   *)
     echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|all]" >&2

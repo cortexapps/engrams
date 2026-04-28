@@ -20,25 +20,8 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 
-/// KNOWN BROKEN: the handshake completes cleanly (verified by the
-/// handler's tracing output: "starting fault loop") but Firecracker's
-/// `PUT /snapshot/load` hangs indefinitely after exchanging the
-/// `GuestRegionUffdMapping` JSON + UFFD fd. No page-fault events
-/// reach our handler in the meantime.
-///
-/// What's verified: handshake protocol + fd-passing match upstream.
-/// What's NOT yet verified: post-handshake cooperation between FC
-/// and the handler (FC stays silent in its log after the CPU vendor
-/// check). Next investigation:
-///   1. Replace our handler with the upstream `on_demand_handler.rs`
-///      built from the firecracker repo and see if FC is happy.
-///   2. strace the firecracker process during the hang to pinpoint
-///      which syscall it's blocked on.
-///   3. Check whether vsock + UFFD restore have a known interaction.
-///
-/// Marked `#[ignore]` so CI / `cargo test --workspace` is unaffected.
 #[tokio::test]
-#[ignore = "KNOWN-BROKEN: FC PUT /snapshot/load hangs post-handshake — see test docstring"]
+#[ignore = "requires Linux + KVM + firecracker + built engram-uffd-handler"]
 async fn snapshot_then_uffd_restore_round_trips_microvm() {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => PathBuf::from(p),
