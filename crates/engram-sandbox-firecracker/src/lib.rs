@@ -15,14 +15,23 @@
 //!   `WireExecRequest`, and translates the streamed `WireExecEvent`s
 //!   back into `engram_core::ExecEvent`s.
 //!
-//! Two slices remain to claim "production-ready":
+//! `restore` supports two modes via `FirecrackerConfig::restore_mode`:
 //!
-//! - **Image baker ext4 mode** — today's tests embed `engram-agentd`
-//!   manually outside the VM (see `tests/exec.rs`); a real microVM
-//!   needs the agent baked into the rootfs as `init=/sbin/engram-agentd`.
-//! - **UFFD-backed restore** — restore is currently `backend_type=File`
-//!   (synchronous read of `memory.bin`). The userfaultfd handler that
-//!   gives sub-100ms resume needs its own crate + scoped `unsafe`.
+//! - `RestoreMode::File` — default, fully working. Synchronous read
+//!   of `memory.bin`. Simple, slow, no extra processes.
+//! - `RestoreMode::Uffd` — plumbed but the FC ↔ handler handshake
+//!   currently hangs Firecracker's `PUT /snapshot/load` after a
+//!   visibly-clean handshake. The handler crate (`engram-uffd-handler`)
+//!   and the integration test (`tests/snapshot_uffd.rs`,
+//!   `#[ignore]`'d) live on disk for the next investigation pass.
+//!   `RestoreMode::File` is the right choice for any caller today.
+//!
+//! One slice remains to claim "production-ready":
+//!
+//! - **Image baker ext4 mode** — today's exec tests embed
+//!   `engram-agentd` manually outside the VM (see `tests/exec.rs`); a
+//!   real microVM needs the agent baked into the rootfs as
+//!   `init=/sbin/engram-agentd`.
 //!
 //! # Architecture
 //!
@@ -133,6 +142,27 @@ pub struct FirecrackerConfig {
     /// `firecracker` binary on PATH or absolute path. Override for
     /// testing or when a different build is required.
     pub firecracker_bin: PathBuf,
+    /// Path to the UFFD handler binary (engram-uffd-handler). Used
+    /// when `restore_mode == Uffd`. Defaults to `engram-uffd-handler`
+    /// (resolved via PATH).
+    pub uffd_handler_bin: PathBuf,
+    /// How to wire memory on snapshot restore. File mode synchronously
+    /// reads memory.bin (slow, simple, no extra processes). Uffd mode
+    /// spawns engram-uffd-handler and serves pages on demand (fast,
+    /// requires Linux + the handler binary on the host).
+    pub restore_mode: RestoreMode,
+}
+
+/// Backing-memory strategy for `restore`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestoreMode {
+    /// `mem_backend = { backend_type: "File", ... }`. Synchronous —
+    /// Firecracker reads the entire memory file before InstanceStart.
+    File,
+    /// `mem_backend = { backend_type: "Uffd", ... }`. Lazy — pages
+    /// stream in on demand via a `engram-uffd-handler` process the
+    /// backend spawns alongside firecracker.
+    Uffd,
 }
 
 impl FirecrackerConfig {
@@ -143,6 +173,8 @@ impl FirecrackerConfig {
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off".into(),
             firecracker_bin: PathBuf::from("firecracker"),
+            uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
+            restore_mode: RestoreMode::File,
         }
     }
 }
@@ -150,9 +182,13 @@ impl FirecrackerConfig {
 /// Live sandbox handle. Keeps the spawned firecracker `Child` so
 /// `destroy` can SIGKILL it; `kill_on_drop` is a backstop in case a
 /// `LiveSandbox` is dropped without going through `destroy` (panic).
+/// `uffd_handler` is `Some` only for sandboxes restored via
+/// `RestoreMode::Uffd`; it lives as long as the VM does and serves
+/// page faults from memory.bin.
 struct LiveSandbox {
     state: SandboxState,
     child: Child,
+    uffd_handler: Option<Child>,
 }
 
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
@@ -334,6 +370,53 @@ impl FirecrackerBackend {
         Ok((socket, child))
     }
 
+    /// Spawn `engram-uffd-handler --listen <uffd_uds> --memory-bin <mem>`
+    /// and wait until it's listening. Stdout/stderr go into the jail
+    /// dir's `uffd-handler.log` so a snapshot-restore failure has a
+    /// recoverable diagnostic. Returns the live `Child` so the caller
+    /// can hold it for the VM's lifetime.
+    async fn spawn_uffd_handler(
+        &self,
+        uffd_uds: &Path,
+        memory_bin: &Path,
+        jail_dir: &Path,
+    ) -> Result<Child, SandboxError> {
+        let log_path = jail_dir.join("uffd-handler.log");
+        let log = std::fs::File::create(&log_path)
+            .map_err(|e| vm_err(format!("open uffd handler log {}: {e}", log_path.display())))?;
+        let log_clone = log
+            .try_clone()
+            .map_err(|e| vm_err(format!("dup uffd-handler log fd: {e}")))?;
+
+        let mut child = Command::new(&self.config.uffd_handler_bin)
+            .args([
+                "--listen",
+                uffd_uds.to_string_lossy().as_ref(),
+                "--memory-bin",
+                memory_bin.to_string_lossy().as_ref(),
+            ])
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_clone))
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                vm_err(format!(
+                    "spawn {}: {e}",
+                    self.config.uffd_handler_bin.display()
+                ))
+            })?;
+
+        if let Err(e) = wait_for_socket(uffd_uds, Duration::from_secs(5), &mut child).await {
+            let _ = child.kill().await;
+            let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
+            return Err(vm_err(format!(
+                "uffd handler did not open UDS: {e}\n--- handler log ---\n{log_tail}"
+            )));
+        }
+        Ok(child)
+    }
+
     /// Run the create lifecycle inside a per-sandbox jail dir. Split out
     /// so the outer `create` can do unconditional cleanup on failure.
     /// On any error, the spawned firecracker `Child` is dropped (and
@@ -428,8 +511,14 @@ impl FirecrackerBackend {
             vsock_cid,
             vsock_uds_path,
         };
-        self.sandboxes
-            .insert(sandbox_id, LiveSandbox { state, child });
+        self.sandboxes.insert(
+            sandbox_id,
+            LiveSandbox {
+                state,
+                child,
+                uffd_handler: None,
+            },
+        );
         tracing::info!(%sandbox_id, jail = %jail_dir.display(), "firecracker microVM started");
         Ok(())
     }
@@ -458,13 +547,36 @@ impl FirecrackerBackend {
         let (socket, child) = self.spawn_firecracker(jail_dir).await?;
         let api = FirecrackerClient::new(&socket);
 
-        // resume_vm: true inside load_snapshot makes Firecracker start
-        // executing the guest immediately — no separate PATCH /vm.
-        api.load_snapshot(&SnapshotPaths {
-            state_path: state_path.clone(),
-            mem_path: mem_path.clone(),
-        })
-        .await?;
+        // For UFFD restore, spawn the handler BEFORE PUT /snapshot/load
+        // so it's listening when Firecracker connects. The handler
+        // takes ownership of the kernel UFFD via SCM_RIGHTS, mmaps
+        // memory.bin, and pages it in lazily. Either way the VM is
+        // running by the time `load_snapshot*` returns (resume_vm: true).
+        let uffd_handler = match self.config.restore_mode {
+            RestoreMode::File => {
+                api.load_snapshot(&SnapshotPaths {
+                    state_path: state_path.clone(),
+                    mem_path: mem_path.clone(),
+                })
+                .await?;
+                None
+            }
+            RestoreMode::Uffd => {
+                let uffd_uds = jail_dir.join("uffd.sock");
+                let _ = tokio::fs::remove_file(&uffd_uds).await;
+                let handler = self
+                    .spawn_uffd_handler(&uffd_uds, &mem_path, jail_dir)
+                    .await?;
+                // PUT /snapshot/load with UFFD can take longer than
+                // file-backed because Firecracker waits for the VM to
+                // resume against the live UFFD before responding.
+                // Bump the client's per-request timeout for this call.
+                let api_uffd =
+                    FirecrackerClient::new(api.socket()).with_timeout(Duration::from_secs(60));
+                api_uffd.load_snapshot_uffd(&state_path, &uffd_uds).await?;
+                Some(handler)
+            }
+        };
 
         // Carry the manifest's spec forward so SandboxState reflects
         // what the snapshot was taken from. rootfs_path mirrors what
@@ -486,12 +598,19 @@ impl FirecrackerBackend {
             vsock_cid,
             vsock_uds_path,
         };
-        self.sandboxes
-            .insert(sandbox_id, LiveSandbox { state, child });
+        self.sandboxes.insert(
+            sandbox_id,
+            LiveSandbox {
+                state,
+                child,
+                uffd_handler,
+            },
+        );
         tracing::info!(
             %sandbox_id,
             jail = %jail_dir.display(),
             from = %snapshot_dir.display(),
+            mode = ?self.config.restore_mode,
             "firecracker microVM restored from snapshot",
         );
         Ok(())
@@ -653,7 +772,17 @@ impl SandboxBackend for FirecrackerBackend {
         {
             Ok(()) => Ok(sandbox_id),
             Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&jail_dir).await;
+                // Set ENGRAM_FC_KEEP_JAIL_ON_FAILURE=1 to keep the
+                // jail dir for post-mortem of firecracker.log /
+                // uffd-handler.log. Default is to clean up.
+                if std::env::var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE").is_err() {
+                    let _ = tokio::fs::remove_dir_all(&jail_dir).await;
+                } else {
+                    tracing::warn!(
+                        jail = %jail_dir.display(),
+                        "preserving jail dir for diagnostics (ENGRAM_FC_KEEP_JAIL_ON_FAILURE)",
+                    );
+                }
                 Err(e)
             }
         }
@@ -671,6 +800,14 @@ impl SandboxBackend for FirecrackerBackend {
             tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
         }
         let _ = live.child.wait().await;
+
+        // UFFD handler (only set on Uffd-mode restore) follows
+        // firecracker into oblivion. Its UDS + log live inside
+        // jail_dir, which the remove_dir_all below sweeps.
+        if let Some(mut handler) = live.uffd_handler {
+            let _ = handler.kill().await;
+            let _ = handler.wait().await;
+        }
 
         // Vsock UDS lives at work_dir root; remove explicitly since
         // it isn't inside the jail dir we wipe below.
@@ -710,6 +847,8 @@ mod tests {
             kernel_image_path: dir.path().join("nonexistent-vmlinux"),
             default_boot_args: "console=ttyS0".into(),
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
+            uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
+            restore_mode: RestoreMode::File,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }

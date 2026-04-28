@@ -37,16 +37,22 @@
             pkg-config
             openssl
             protobuf                # protoc, for tonic-build when grpc lands
+            llvmPackages.libclang   # bindgen for userfaultfd-sys (Linux only,
+                                    # but harmless on macOS)
           ] ++ lib.optionals stdenv.isDarwin [
             libiconv                # required by some macOS-aarch64 crates
           ];
 
           # OPENSSL_DIR / PKG_CONFIG_PATH so `cargo build` finds the
           # Nix-provided openssl instead of looking system-wide.
+          # LIBCLANG_PATH points bindgen at the Nix-provided libclang;
+          # without it, `userfaultfd-sys`'s build script can't find
+          # libLLVM under the Nix loader.
           env = {
             OPENSSL_DIR = "${pkgs.openssl.dev}";
             OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
             PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
           shellHook = ''

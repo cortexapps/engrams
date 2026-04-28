@@ -166,16 +166,41 @@ impl FirecrackerClient {
     /// Restore from `paths` with file-backed memory. Returns once the
     /// VM is fully running again (`resume_vm: true`).
     ///
-    /// UFFD-backed restore (the load-bearing perf optimisation for
-    /// fast resume) lands as a separate `load_snapshot_uffd` once the
-    /// userfaultfd handler crate is in place — that needs `unsafe`
-    /// for the syscall and deserves its own scrutiny.
+    /// File mode synchronously reads `mem_path` into the guest's
+    /// address space — fine for warm-pool restore on a slow loop, slow
+    /// for fast eviction-resume. Use [`Self::load_snapshot_uffd`] in
+    /// production-grade resume paths.
     pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: paths.state_path.to_string_lossy().into_owned(),
             mem_backend: MemBackend {
                 backend_type: MemBackendType::File,
                 backend_path: paths.mem_path.to_string_lossy().into_owned(),
+            },
+            enable_diff_snapshots: false,
+            resume_vm: true,
+        };
+        self.put("/snapshot/load", &body).await
+    }
+
+    /// Restore with UFFD-backed memory. `state_path` is the snapshot
+    /// state file; `uffd_uds_path` points at the *already-listening*
+    /// `engram-uffd-handler` UDS — Firecracker connects to it during
+    /// this call, hands the kernel-side UFFD over SCM_RIGHTS, and
+    /// resumes the guest. Pages stream in lazily on guest fault.
+    ///
+    /// The caller is responsible for spawning the handler (and
+    /// keeping it alive for the VM's lifetime) before invoking this.
+    pub async fn load_snapshot_uffd(
+        &self,
+        state_path: &Path,
+        uffd_uds_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let body = SnapshotLoadBody {
+            snapshot_path: state_path.to_string_lossy().into_owned(),
+            mem_backend: MemBackend {
+                backend_type: MemBackendType::Uffd,
+                backend_path: uffd_uds_path.to_string_lossy().into_owned(),
             },
             enable_diff_snapshots: false,
             resume_vm: true,
@@ -504,7 +529,6 @@ struct MemBackend {
 #[derive(Debug, Clone, Copy, Serialize)]
 enum MemBackendType {
     File,
-    #[allow(dead_code)] // surfaced when the UFFD slice lands
     Uffd,
 }
 

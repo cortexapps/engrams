@@ -8,6 +8,7 @@ members = [
     "crates/engram-image-builder",
     "crates/engram-cli",
     "crates/engram-agentd",
+    "crates/engram-uffd-handler",
     "crates/engram-sandbox-firecracker",
     "crates/engram-sandbox-process",
     "crates/engram-cloud-gcp",
@@ -49,6 +50,7 @@ engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
 engram-image-builder = { path = "crates/engram-image-builder" }
 engram-agentd = { path = "crates/engram-agentd" }
+engram-uffd-handler = { path = "crates/engram-uffd-handler" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }

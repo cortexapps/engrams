@@ -1,0 +1,55 @@
+[package]
+name = "engram-uffd-handler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Userfaultfd page-fault handler for Firecracker UFFD-backed snapshot restore. Receives the guest's UFFD over SCM_RIGHTS, mmaps memory.bin, and serves page faults on-demand."
+
+# UNSAFE-CODE CARVE-OUT
+#
+# The workspace lints forbid `unsafe_code`. This crate is the one
+# place we have to break that rule because the kernel surface
+# (userfaultfd, mmap, fd-from-cmsg) is fundamentally unsafe and
+# can't be wrapped without it.
+#
+# Four unsafe blocks live in src/runtime.rs, each with its own SAFETY
+# comment:
+#   - `Uffd::from_raw_fd` on the fd we just received from the kernel
+#     via SCM_RIGHTS in `recv_handshake`.
+#   - `libc::mmap` on the backing memory.bin file in `Runtime::new`
+#     (PROT_READ + MAP_PRIVATE + MAP_POPULATE — matches upstream's
+#     `on_demand_handler.rs` so the handler doesn't take its own
+#     page faults while servicing the guest's).
+#   - `Uffd::copy` in `serve_pagefault` (UFFDIO_COPY — writes a page
+#     into the guest's address space).
+#   - `libc::munmap` in `impl Drop for Runtime` to undo the mmap.
+#
+# `unsafe_code = "allow"` here, not `"warn"`, so that `cargo clippy
+# -- -D warnings` doesn't flag every legitimate block.
+[lints.rust]
+unsafe_code = "allow"
+
+[lib]
+name = "engram_uffd_handler"
+
+[[bin]]
+name = "engram-uffd-handler"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+sendfd = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Linux-only: userfaultfd is a Linux kernel surface. The crate
+# itself doesn't gate by target_os; we do here so a workspace-wide
+# `cargo check` on macOS doesn't try to build it.
+[target.'cfg(target_os = "linux")'.dependencies]
+userfaultfd = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
