@@ -63,6 +63,7 @@ impl MetadataStore for MiniMeta {
                 status: SessionStatus::Pending,
                 image_version,
                 host_id: None,
+                sandbox_id: None,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
             },
@@ -99,6 +100,16 @@ impl MetadataStore for MiniMeta {
         s.host_id = host_id;
         Ok(())
     }
+    async fn assign_session_sandbox(
+        &self,
+        id: SessionId,
+        sandbox_id: Option<engram_core::SandboxId>,
+    ) -> Result<(), MetaError> {
+        let mut g = self.sessions.lock();
+        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
+        s.sandbox_id = sandbox_id;
+        Ok(())
+    }
     async fn upsert_host(&self, _h: HostRecord) -> Result<(), MetaError> {
         Ok(())
     }
@@ -125,6 +136,7 @@ impl MetadataStore for MiniMeta {
                 && !matches!(s.status, SessionStatus::Completed | SessionStatus::Failed)
             {
                 s.host_id = None;
+                s.sandbox_id = None;
                 s.status = SessionStatus::PendingReassign;
                 s.last_active_at = Utc::now();
                 affected.push(s.id);

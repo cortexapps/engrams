@@ -55,6 +55,18 @@ pub async fn run_with_registry(
         host_registry,
     ));
 
+    // Phase 3 follow-up: rebuild in-memory routing maps from
+    // sessions persisted in Postgres. After a coordinator restart
+    // the SandboxRegistry (session_id → sandbox_id) and
+    // HostRegistry.sandbox_owner (sandbox_id → host_id) are empty,
+    // so any existing Active session would get "no live sandbox"
+    // until reseed. Best-effort — failure here just means existing
+    // sessions need /resume after a restart, which they would
+    // anyway in some failure modes.
+    if let Err(e) = repopulate_routing(&state).await {
+        tracing::warn!(error = %e, "routing-map repopulate at startup failed");
+    }
+
     // Phase 3c HA: every replica subscribes to the shared
     // `session_events` channel so SSE clients connected to any one
     // replica see events emitted via any other. The same listener
@@ -102,6 +114,34 @@ pub async fn run_with_registry(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(CoordinatorError::Io)
+}
+
+/// Read every active session and re-bind its `sandbox_id`/`host_id`
+/// in the in-memory maps so a coordinator restart doesn't leave
+/// `Active` sessions stranded. Pre-populates `HostRegistry`'s
+/// `sandbox_owner` with the persisted `sandbox_id → host_id` pairs;
+/// once the host dials back in via `/api/hosts/connect` and registers
+/// its backend, routing resumes for those sessions without further
+/// intervention. Sessions in `Pending` (sandbox not created yet),
+/// `Idle` (evicted), or `PendingReassign` (awaiting reschedule) are
+/// left for `/resume` to handle on next access.
+async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaError> {
+    let sessions = state.services.meta.list_active_sessions().await?;
+    let mut bound = 0usize;
+    for s in sessions {
+        if let (Some(sandbox_id), Some(host_id)) = (s.sandbox_id, s.host_id) {
+            state.registry.bind(s.id, sandbox_id);
+            state.host_registry.record_sandbox_owner(sandbox_id, host_id);
+            bound += 1;
+        }
+    }
+    if bound > 0 {
+        tracing::info!(
+            sessions = bound,
+            "rebuilt in-memory routing for active sessions",
+        );
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

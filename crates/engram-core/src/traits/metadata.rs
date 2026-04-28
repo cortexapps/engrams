@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::error::MetaError;
 use crate::types::event::PersistedEvent;
 use crate::types::host::{HostRecord, HostStatus};
-use crate::types::ids::{HostId, SessionId};
+use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::image::ImageVersion;
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
@@ -29,6 +29,17 @@ pub trait MetadataStore: Send + Sync {
         &self,
         id: SessionId,
         host_id: Option<HostId>,
+    ) -> Result<(), MetaError>;
+
+    /// Persist the in-memory `SandboxId` of the live sandbox serving
+    /// this session. Set to `Some` after `host_registry.create_for_session`
+    /// returns, cleared to `None` on evict/migrate. The coordinator
+    /// uses these rows to rebuild its in-memory routing maps after
+    /// a restart.
+    async fn assign_session_sandbox(
+        &self,
+        id: SessionId,
+        sandbox_id: Option<SandboxId>,
     ) -> Result<(), MetaError>;
 
     // ---- hosts ----

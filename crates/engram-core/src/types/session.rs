@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::ids::{HostId, SessionId};
+use super::ids::{HostId, SandboxId, SessionId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +53,15 @@ pub struct Session {
     pub status: SessionStatus,
     pub image_version: String,
     pub host_id: Option<HostId>,
+    /// In-memory `SandboxId` of the live sandbox serving this
+    /// session, persisted so a coordinator restart can rebuild its
+    /// in-memory routing maps from `SELECT ... FROM sessions WHERE
+    /// status NOT IN ('completed','failed')`. `None` for sessions in
+    /// `Pending` (sandbox not created yet) / `Idle` (sandbox evicted)
+    /// / `PendingReassign` (host died, awaiting reschedule) /
+    /// `Completed` / `Failed`.
+    #[serde(default)]
+    pub sandbox_id: Option<SandboxId>,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
 }
@@ -101,6 +110,7 @@ mod tests {
             status: SessionStatus::Active,
             image_version: "warm-20260101T000000Z".into(),
             host_id: Some(HostId::new()),
+            sandbox_id: Some(SandboxId::new()),
             created_at: Utc::now(),
             last_active_at: Utc::now(),
         };

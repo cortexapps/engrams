@@ -184,6 +184,19 @@ pub async fn resume(
             "assign_session_host on restore failed; HostRegistry routing still works",
         );
     }
+    if let Err(e) = state
+        .services
+        .meta
+        .assign_session_sandbox(id, Some(new_sandbox_id))
+        .await
+    {
+        tracing::warn!(
+            session_id = %id,
+            sandbox_id = %new_sandbox_id,
+            error = %e,
+            "assign_session_sandbox on restore failed; live routing still works (in-memory only)",
+        );
+    }
     state.registry.bind(id, new_sandbox_id);
     state
         .services
@@ -260,6 +273,15 @@ pub async fn evict_local(
         }
     }
 
+    // Clear the persisted sandbox_id so a coordinator restart
+    // doesn't repopulate routing for a sandbox that no longer
+    // exists. host_id stays so resume's snapshot affinity still
+    // prefers the same host.
+    let _ = state
+        .services
+        .meta
+        .assign_session_sandbox(id, None)
+        .await;
     state
         .services
         .meta

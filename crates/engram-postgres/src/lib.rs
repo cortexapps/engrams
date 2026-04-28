@@ -14,7 +14,7 @@ use engram_core::types::{
     HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
     SnapshotRecord,
 };
-use engram_core::{HostId, MetaError, SessionId};
+use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
@@ -88,7 +88,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, repo, branch, user_id, status, image_version, host_id,
-                   created_at, last_active_at
+                   sandbox_id, created_at, last_active_at
             FROM sessions WHERE id = $1
             "#,
         )
@@ -104,7 +104,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, repo, branch, user_id, status, image_version, host_id,
-                   created_at, last_active_at
+                   sandbox_id, created_at, last_active_at
             FROM sessions
             WHERE status IN ('pending','active','idle')
             "#,
@@ -151,6 +151,28 @@ impl MetadataStore for PostgresStore {
         )
         .bind(id.as_uuid())
         .bind(host_id.map(|h| h.as_uuid()))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn assign_session_sandbox(
+        &self,
+        id: SessionId,
+        sandbox_id: Option<SandboxId>,
+    ) -> Result<(), MetaError> {
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions SET sandbox_id = $2, updated_at = NOW() WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(sandbox_id.map(|s| s.as_uuid()))
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -267,8 +289,9 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             UPDATE sessions
-               SET host_id = NULL,
-                   status = 'pending_reassign',
+               SET host_id    = NULL,
+                   sandbox_id = NULL,
+                   status     = 'pending_reassign',
                    last_active_at = NOW()
              WHERE host_id = $1
                AND status NOT IN ('completed','failed')

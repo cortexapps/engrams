@@ -241,6 +241,21 @@ pub async fn create_session(
                     "assign_session_host failed; routing still works via HostRegistry"
                 );
             }
+            // Persist the sandbox_id so a coordinator restart can
+            // rebuild its in-memory routing maps from `sessions`.
+            if let Err(e) = state
+                .services
+                .meta
+                .assign_session_sandbox(session_id, Some(id))
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    sandbox_id = %id,
+                    error = %e,
+                    "assign_session_sandbox failed; live routing still works (in-memory only)"
+                );
+            }
             id
         }
         Err(e) => {
@@ -398,6 +413,14 @@ pub async fn migrate(
         .meta
         .assign_session_host(id, None)
         .await?;
+    // Clear sandbox_id alongside host_id — the sandbox was just
+    // destroyed, and the next /resume will land on a new host with
+    // a fresh sandbox_id.
+    let _ = state
+        .services
+        .meta
+        .assign_session_sandbox(id, None)
+        .await;
     state
         .services
         .meta
@@ -451,6 +474,16 @@ pub async fn delete_session(
         }
     }
 
+    // Clear sandbox_id since the sandbox is destroyed; the session
+    // row is now terminal and won't be repopulated by startup
+    // routing rebuild even if it kept the column set, but tidy
+    // anyway so an audit query "what sandboxes does the coordinator
+    // think exist" matches reality.
+    let _ = state
+        .services
+        .meta
+        .assign_session_sandbox(id, None)
+        .await;
     state
         .services
         .meta

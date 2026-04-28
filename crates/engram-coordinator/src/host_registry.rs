@@ -257,6 +257,17 @@ impl HostRegistry {
         self.sandbox_owner.get(&sandbox_id).map(|r| *r.value())
     }
 
+    /// Pre-populate the `sandbox_id → host_id` map without going
+    /// through `create()`. Used by the coordinator's startup
+    /// `repopulate_routing` step to rebuild routing from the
+    /// persisted `sessions.sandbox_id`/`sessions.host_id` columns
+    /// after a restart. Once the host dials back in and registers
+    /// its `RemoteSandboxBackend`, routing for these pre-seeded
+    /// sandboxes resumes without further coordination.
+    pub fn record_sandbox_owner(&self, sandbox_id: SandboxId, host_id: HostId) {
+        self.sandbox_owner.insert(sandbox_id, host_id);
+    }
+
     fn lookup(&self, sandbox_id: SandboxId) -> Result<Arc<dyn SandboxBackend>, SandboxError> {
         let host_id = self
             .sandbox_owner
@@ -612,6 +623,40 @@ mod tests {
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_ready);
+    }
+
+    #[tokio::test]
+    async fn record_sandbox_owner_lets_existing_id_route_post_restart() {
+        // Simulates the post-restart flow: the coordinator runs
+        // `repopulate_routing` from sessions.sandbox_id/host_id and
+        // calls `record_sandbox_owner` to seed the in-memory map.
+        // The host then dials back in and `register`s. From that
+        // point, exec/snapshot/destroy on the pre-existing sandbox_id
+        // route to the right backend without going through `create`.
+        let reg = HostRegistry::new();
+        let host = HostId::new();
+        let sandbox = SandboxId::new();
+
+        // Pre-restart state: the row says sandbox X is on host Y.
+        reg.record_sandbox_owner(sandbox, host);
+
+        // Host hasn't dialed back yet — lookup fails because no
+        // backend is registered.
+        let err = reg
+            .destroy(sandbox)
+            .await
+            .expect_err("no backend registered yet");
+        assert!(matches!(err, SandboxError::NotFound));
+
+        // Host re-registers (same host_id). Now routing works.
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path()));
+        reg.register(host, backend);
+
+        // The (idempotent) destroy on a ProcessBackend with an unknown
+        // sandbox_id returns Ok — the wire round-trip we care about.
+        reg.destroy(sandbox).await.expect("routing reaches backend");
     }
 
     #[test]

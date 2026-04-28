@@ -8,7 +8,7 @@ use engram_core::types::{
     HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent,
     Session, SessionStatus, SnapshotRecord,
 };
-use engram_core::{HostId, ImageVersionId, MetaError, SessionId, SnapshotId};
+use engram_core::{HostId, ImageVersionId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ fn col_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
 pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let host_id: Option<Uuid> = row.try_get("host_id").map_err(col_err)?;
+    let sandbox_id: Option<Uuid> = row.try_get("sandbox_id").map_err(col_err)?;
     let status: String = row.try_get("status").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_active_at: DateTime<Utc> = row.try_get("last_active_at").map_err(col_err)?;
@@ -31,6 +32,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         status: parse_session_status(&status)?,
         image_version: row.try_get("image_version").map_err(col_err)?,
         host_id: host_id.map(HostId),
+        sandbox_id: sandbox_id.map(SandboxId),
         created_at,
         last_active_at,
     })
