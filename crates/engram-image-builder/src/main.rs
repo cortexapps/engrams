@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use engram_image_builder::{BuildRequest, Builder, DockerCli};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
 use engram_postgres::PostgresStore;
 
 #[derive(Parser, Debug)]
@@ -68,6 +68,22 @@ struct BuildOpts {
     /// Override the docker binary (e.g. `podman`).
     #[arg(long, env = "ENGRAM_DOCKER_BIN")]
     docker_bin: Option<String>,
+
+    /// Output format. `directory` (default) produces a directory tree
+    /// for the dev backend; `ext4` produces a `rootfs.ext4` block-
+    /// device image for Firecracker.
+    #[arg(long, value_parser = parse_format, default_value = "directory")]
+    format: Format,
+}
+
+fn parse_format(s: &str) -> Result<Format, String> {
+    match s {
+        "directory" | "dir" => Ok(Format::Directory),
+        "ext4" => Ok(Format::Ext4),
+        other => Err(format!(
+            "unknown format `{other}`; expected `directory` or `ext4`"
+        )),
+    }
 }
 
 #[tokio::main]
@@ -95,6 +111,7 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         repo: opts.repo.clone(),
         tag: tag.clone(),
         images_dir: opts.images_dir.clone(),
+        format: opts.format,
     };
 
     let docker = match opts.docker_bin {

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use engram_image_builder::{BuildRequest, Builder, DockerCli};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
 use serde_json::Value;
 
 #[derive(Parser, Debug)]
@@ -108,7 +108,22 @@ enum ImageCmd {
         /// Override the docker binary (e.g. `podman`).
         #[arg(long, env = "ENGRAM_DOCKER_BIN")]
         docker_bin: Option<String>,
+
+        /// Output format. `directory` for the dev backend (Process),
+        /// `ext4` for Firecracker. Defaults to `directory`.
+        #[arg(long, value_parser = parse_image_format, default_value = "directory")]
+        format: Format,
     },
+}
+
+fn parse_image_format(s: &str) -> Result<Format, String> {
+    match s {
+        "directory" | "dir" => Ok(Format::Directory),
+        "ext4" => Ok(Format::Ext4),
+        other => Err(format!(
+            "unknown format `{other}`; expected `directory` or `ext4`"
+        )),
+    }
 }
 
 #[tokio::main]
@@ -169,6 +184,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 tag,
                 images_dir,
                 docker_bin,
+                format,
             } => {
                 image_build(
                     repo,
@@ -176,6 +192,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     tag.as_deref(),
                     images_dir,
                     docker_bin.as_deref(),
+                    *format,
                 )
                 .await
             }
@@ -357,6 +374,7 @@ async fn image_build(
     tag: Option<&str>,
     images_dir: &Path,
     docker_bin: Option<&str>,
+    format: Format,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
@@ -366,6 +384,7 @@ async fn image_build(
         repo: repo.to_string(),
         tag: resolved_tag.clone(),
         images_dir: images_dir.to_path_buf(),
+        format,
     };
     let docker = match docker_bin {
         Some(bin) => DockerCli::with_binary(bin.to_string()),

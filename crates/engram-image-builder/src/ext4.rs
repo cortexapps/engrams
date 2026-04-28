@@ -1,0 +1,179 @@
+//! Pack a directory tree into an ext4 disk image, ready for
+//! `FirecrackerBackend` to attach as a root drive.
+//!
+//! The default [`Mke2fsPacker`] shells out to `mke2fs -t ext4 -F -d`,
+//! which (since e2fsprogs 1.43) populates the freshly-formatted
+//! filesystem from a source directory in one shot — no loopback
+//! mount, no root needed. This is the same flow Firecracker's CI uses
+//! to bake their published `ubuntu-*.ext4` artifacts.
+//!
+//! [`Ext4Packer`] is a trait so the unit tests can mock it; the
+//! integration test in `tests/builder.rs` exercises the real binary
+//! against a real source dir.
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait Ext4Packer: Send + Sync {
+    /// Create `dst_image` (overwriting any existing file) of size
+    /// `size_bytes`, format it as ext4, and copy the contents of
+    /// `src_dir` into the new filesystem. The image is left ready for
+    /// Firecracker to attach as a block device.
+    async fn pack(
+        &self,
+        src_dir: &Path,
+        dst_image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), Ext4Error>;
+}
+
+#[derive(Debug)]
+pub enum Ext4Error {
+    Io(std::io::Error),
+    /// mke2fs returned a non-zero exit code. The string is its
+    /// captured stderr — verbose, but useful when the bake fails.
+    Mke2fs(String),
+    /// Could not find the mke2fs binary (PATH miss or stale config).
+    MissingBinary(String),
+}
+
+impl std::fmt::Display for Ext4Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io: {e}"),
+            Self::Mke2fs(s) => write!(f, "mke2fs: {s}"),
+            Self::MissingBinary(b) => write!(f, "binary not found: {b}"),
+        }
+    }
+}
+
+impl std::error::Error for Ext4Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Ext4Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Production [`Ext4Packer`] backed by `mke2fs` from e2fsprogs.
+#[derive(Clone, Debug)]
+pub struct Mke2fsPacker {
+    bin: PathBuf,
+}
+
+impl Default for Mke2fsPacker {
+    fn default() -> Self {
+        Self {
+            bin: PathBuf::from("mke2fs"),
+        }
+    }
+}
+
+impl Mke2fsPacker {
+    pub fn with_binary(bin: impl Into<PathBuf>) -> Self {
+        Self { bin: bin.into() }
+    }
+}
+
+#[async_trait]
+impl Ext4Packer for Mke2fsPacker {
+    async fn pack(
+        &self,
+        src_dir: &Path,
+        dst_image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), Ext4Error> {
+        // 1. Truncate / preallocate. mke2fs reads the file's size to
+        //    decide how big to make the filesystem; we want exactly
+        //    `size_bytes`.
+        let f = tokio::fs::File::create(dst_image).await?;
+        f.set_len(size_bytes).await?;
+        drop(f);
+
+        // 2. Format + populate in one mke2fs call.
+        //    `-t ext4`   filesystem type
+        //    `-F`        force overwrite (file already exists)
+        //    `-d <dir>`  populate from this directory at create time
+        //    `-q`        quiet on stdout (errors still go to stderr)
+        let output = tokio::process::Command::new(&self.bin)
+            .arg("-t")
+            .arg("ext4")
+            .arg("-F")
+            .arg("-q")
+            .arg("-d")
+            .arg(src_dir)
+            .arg(dst_image)
+            .output()
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ext4Error::MissingBinary(self.bin.to_string_lossy().into_owned())
+                } else {
+                    Ext4Error::Io(e)
+                }
+            })?;
+
+        if !output.status.success() {
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if stderr.is_empty() {
+                stderr = format!("exit status {}", output.status);
+            }
+            return Err(Ext4Error::Mke2fs(stderr));
+        }
+        Ok(())
+    }
+}
+
+/// Pick a sensible image size for `dir_size_bytes` of source data:
+/// ext4 metadata (~3-5%), inode table, journal (~64 MiB by default),
+/// plus headroom for the booted VM to write to /tmp etc.
+///
+/// Formula: `max(dir_size * 2, dir_size + 128 MiB)`. The doubling
+/// catches small images (a 50 MiB rootfs gets 178 MiB, plenty for
+/// the journal); the +128 MiB minimum catches tiny test images
+/// where 2× doesn't even cover ext4's overhead.
+pub fn recommended_size(dir_size_bytes: u64) -> u64 {
+    let twice = dir_size_bytes.saturating_mul(2);
+    let plus_128 = dir_size_bytes.saturating_add(128 * 1024 * 1024);
+    twice.max(plus_128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recommended_size_uses_2x_for_large_images() {
+        // 500 MiB dir → 1 GiB image (2x dominates over +128 MiB).
+        let s = 500 * 1024 * 1024;
+        assert_eq!(recommended_size(s), 2 * s);
+    }
+
+    #[test]
+    fn recommended_size_uses_plus_128mib_for_small_images() {
+        // 10 MiB dir → 138 MiB image (+128 MiB dominates over 2x = 20 MiB).
+        let s = 10 * 1024 * 1024;
+        assert_eq!(recommended_size(s), s + 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn recommended_size_handles_zero() {
+        // Empty dir still gets a 128 MiB image rather than 0.
+        assert_eq!(recommended_size(0), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn recommended_size_does_not_overflow() {
+        // Adversarial input doesn't panic.
+        assert!(recommended_size(u64::MAX) > 0);
+    }
+}

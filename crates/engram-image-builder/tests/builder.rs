@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engram_image_builder::docker::{BuildArgs, DockerError, DockerRunner};
-use engram_image_builder::{BuildRequest, Builder};
+use engram_image_builder::ext4::{Ext4Error, Ext4Packer};
+use engram_image_builder::{BuildRequest, Builder, Format};
 
 // ---------------------------------------------------------------------
 // RecordingDocker — mock for unit-shape integration tests
@@ -162,6 +163,80 @@ fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest 
         repo: repo.into(),
         tag: tag.into(),
         images_dir: images_dir.to_path_buf(),
+        format: Format::Directory,
+    }
+}
+
+fn req_ext4(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest {
+    BuildRequest {
+        format: Format::Ext4,
+        ..req(source, images_dir, repo, tag)
+    }
+}
+
+// ---------------------------------------------------------------------
+// RecordingPacker — Ext4Packer mock parallel to RecordingDocker
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+struct PackCall {
+    src_dir: PathBuf,
+    dst_image: PathBuf,
+    size_bytes: u64,
+}
+
+#[derive(Default)]
+struct PackerState {
+    calls: Vec<PackCall>,
+    inject_err: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct RecordingPacker {
+    inner: Arc<parking_lot::Mutex<PackerState>>,
+}
+
+impl RecordingPacker {
+    fn calls(&self) -> Vec<PackCall> {
+        self.inner.lock().calls.clone()
+    }
+
+    fn fail_next(&self, msg: impl Into<String>) {
+        self.inner.lock().inject_err = Some(msg.into());
+    }
+}
+
+#[async_trait]
+impl Ext4Packer for RecordingPacker {
+    async fn pack(
+        &self,
+        src_dir: &Path,
+        dst_image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), Ext4Error> {
+        // Record the call + take any injected error inside the lock,
+        // then drop the guard before any await — parking_lot's
+        // MutexGuard isn't Send, and serve_connection's Send bound
+        // would otherwise reject the future.
+        let injected = {
+            let mut g = self.inner.lock();
+            g.calls.push(PackCall {
+                src_dir: src_dir.to_path_buf(),
+                dst_image: dst_image.to_path_buf(),
+                size_bytes,
+            });
+            g.inject_err.take()
+        };
+        if let Some(msg) = injected {
+            return Err(Ext4Error::Mke2fs(msg));
+        }
+        // Materialize a non-empty file at dst_image so the builder's
+        // metadata().len() check succeeds and BuildOutcome reports a
+        // realistic size_bytes. Real mke2fs would do something similar.
+        let mut data = vec![0u8; 4096];
+        data[0] = 0xAB; // mark so accidents in test setup show up
+        tokio::fs::write(dst_image, &data).await?;
+        Ok(())
     }
 }
 
@@ -569,4 +644,174 @@ async fn end_to_end_with_real_docker() {
         toml::from_str(&std::fs::read_to_string(outcome.manifest_path).unwrap()).unwrap();
     assert_eq!(manifest.name, "baker-test");
     assert_eq!(manifest.env["BAKED"], "yes");
+}
+
+// ---------------------------------------------------------------------
+// Format::Ext4
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
+    // The Ext4 path should: extract via docker, run the packer once
+    // with src=<staging rootfs> and dst=<image_dir>/rootfs.ext4, then
+    // remove the staging rootfs/. Final on-disk shape mirrors what
+    // `image_registry::Rootfs::Ext4Image` consumes.
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(src.path(), "name = \"ext4-test\"\n");
+
+    let docker = RecordingDocker::new().with_fake_rootfs([
+        (PathBuf::from("etc/hostname"), b"engram\n".to_vec()),
+        (
+            PathBuf::from("bin/init"),
+            b"#!/bin/sh\nexec /sbin/agent\n".to_vec(),
+        ),
+    ]);
+    let packer = RecordingPacker::default();
+    let builder = Builder::with_packer(docker.clone(), packer.clone());
+
+    let outcome = builder
+        .build(&req_ext4(src.path(), images.path(), "p", "warm-1"))
+        .await
+        .expect("ext4 bake should succeed");
+
+    // Outcome points at rootfs.ext4, not the directory.
+    assert_eq!(outcome.rootfs_path, outcome.image_dir.join("rootfs.ext4"));
+    assert!(outcome.rootfs_path.is_file(), "rootfs.ext4 should exist");
+    // RecordingPacker writes a 4KB stub.
+    assert_eq!(outcome.size_bytes, 4096);
+
+    // Staging rootfs/ should have been wiped after a successful pack.
+    assert!(
+        !outcome.image_dir.join("rootfs").exists(),
+        "staging dir must be removed after Ext4 pack",
+    );
+
+    // Packer was invoked exactly once with the right paths.
+    let pack_calls = packer.calls();
+    assert_eq!(pack_calls.len(), 1, "expected one pack call");
+    assert_eq!(pack_calls[0].src_dir, outcome.image_dir.join("rootfs"));
+    assert_eq!(
+        pack_calls[0].dst_image,
+        outcome.image_dir.join("rootfs.ext4")
+    );
+    assert!(
+        pack_calls[0].size_bytes > 0,
+        "size should be sized via recommended_size"
+    );
+
+    // Docker orchestration unchanged: build → create → export → rm → rmi.
+    let calls = docker.calls();
+    assert!(
+        matches!(calls[0], Call::Build { .. })
+            && matches!(calls[1], Call::Create { .. })
+            && matches!(calls[2], Call::Export { .. }),
+        "expected build → create → export prefix; got {calls:?}",
+    );
+}
+
+#[tokio::test]
+async fn build_directory_format_skips_packer() {
+    // Sanity: the default Directory format must NOT invoke the packer
+    // (it's only relevant for Ext4 mode). Catches a regression where
+    // someone accidentally always packs.
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(src.path(), "name = \"dir-only\"\n");
+
+    let docker = RecordingDocker::new();
+    let packer = RecordingPacker::default();
+    let builder = Builder::with_packer(docker, packer.clone());
+
+    builder
+        .build(&req(src.path(), images.path(), "p", "warm-1"))
+        .await
+        .expect("directory bake should succeed");
+
+    assert!(
+        packer.calls().is_empty(),
+        "Format::Directory must not invoke the packer; got {:?}",
+        packer.calls()
+    );
+}
+
+#[tokio::test]
+async fn build_ext4_propagates_packer_failure_and_keeps_rootfs_for_diagnostics() {
+    // If mke2fs fails (out of disk, permission, etc.) we want the
+    // staging rootfs/ to stay on disk so the user can rerun the
+    // packer manually instead of re-doing the docker steps. Lock
+    // that contract in.
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(src.path(), "name = \"ext4-fails\"\n");
+
+    let docker = RecordingDocker::new()
+        .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
+    let packer = RecordingPacker::default();
+    packer.fail_next("mocked mke2fs failure");
+    let builder = Builder::with_packer(docker, packer);
+
+    let err = builder
+        .build(&req_ext4(src.path(), images.path(), "p", "warm-1"))
+        .await
+        .expect_err("ext4 bake should fail");
+
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ext4") && msg.contains("mocked mke2fs failure"),
+        "error should surface the packer failure: {msg}",
+    );
+    let image_dir = images.path().join("p").join("warm-1");
+    assert!(
+        image_dir.join("rootfs").is_dir(),
+        "staging rootfs/ must survive a failed pack for diagnostics",
+    );
+    assert!(
+        !image_dir.join("rootfs.ext4").exists(),
+        "rootfs.ext4 should not exist after a failed pack",
+    );
+}
+
+// ---------------------------------------------------------------------
+// Real mke2fs end-to-end. Linux + e2fsprogs only.
+// ---------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ext4_pack_with_real_mke2fs_produces_mountable_image() {
+    use engram_image_builder::ext4::Mke2fsPacker;
+
+    let mke2fs_on_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))
+        .unwrap_or(false);
+    if !mke2fs_on_path {
+        eprintln!("mke2fs not on PATH; skipping real-packer test");
+        return;
+    }
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("etc")).unwrap();
+    std::fs::write(src.path().join("etc/hostname"), "engram\n").unwrap();
+    std::fs::write(src.path().join("greeting"), "hello-from-ext4").unwrap();
+
+    let dst = tempfile::NamedTempFile::new().unwrap();
+    Mke2fsPacker::default()
+        .pack(src.path(), dst.path(), 64 * 1024 * 1024)
+        .await
+        .expect("real mke2fs should succeed");
+
+    let meta = std::fs::metadata(dst.path()).unwrap();
+    assert_eq!(meta.len(), 64 * 1024 * 1024);
+
+    // The file's first 1024 bytes should be ext4's superblock —
+    // magic 0xEF53 lives at offset 0x438 (1080) inside the FS.
+    let mut buf = vec![0u8; 1100];
+    use std::io::Read;
+    let mut f = std::fs::File::open(dst.path()).unwrap();
+    f.read_exact(&mut buf).unwrap();
+    let magic = u16::from_le_bytes([buf[1080], buf[1081]]);
+    assert_eq!(
+        magic, 0xEF53,
+        "expected ext4 superblock magic at offset 1080"
+    );
 }

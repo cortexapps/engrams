@@ -26,6 +26,7 @@
 
 pub mod config;
 pub mod docker;
+pub mod ext4;
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,19 @@ use engram_core::ImageVersionId;
 
 pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
+pub use ext4::{recommended_size, Ext4Error, Ext4Packer, Mke2fsPacker};
+
+/// Output format the baker should produce.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Format {
+    /// `<image_dir>/rootfs/` — directory tree. Consumed by
+    /// `ProcessBackend` (the dev backend on macOS / non-KVM Linux).
+    #[default]
+    Directory,
+    /// `<image_dir>/rootfs.ext4` — ext4 filesystem image. Consumed by
+    /// `FirecrackerBackend` as a block device.
+    Ext4,
+}
 
 /// What the user wants the baker to do.
 #[derive(Clone, Debug)]
@@ -49,6 +63,10 @@ pub struct BuildRequest {
     pub tag: String,
     /// Where the registry lives (the same root the coordinator reads).
     pub images_dir: PathBuf,
+    /// Output format — `Directory` for the dev backend, `Ext4` for
+    /// Firecracker. Defaults to `Directory` so existing callers keep
+    /// working.
+    pub format: Format,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +82,7 @@ pub enum BuildError {
     Config(String),
     Io(std::io::Error),
     Docker(String),
+    Ext4(Ext4Error),
     Persist(engram_core::MetaError),
     InvalidPath(String),
 }
@@ -74,6 +93,7 @@ impl std::fmt::Display for BuildError {
             Self::Config(m) => write!(f, "engram.toml: {m}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Docker(m) => write!(f, "docker: {m}"),
+            Self::Ext4(e) => write!(f, "ext4: {e}"),
             Self::Persist(e) => write!(f, "metadata: {e}"),
             Self::InvalidPath(p) => write!(f, "invalid path: {p}"),
         }
@@ -84,6 +104,7 @@ impl std::error::Error for BuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::Ext4(e) => Some(e),
             Self::Persist(e) => Some(e),
             _ => None,
         }
@@ -96,15 +117,36 @@ impl From<std::io::Error> for BuildError {
     }
 }
 
-/// The baker. Composed of a [`DockerRunner`] (mockable) and an
-/// optional [`MetadataStore`] for recording the produced row.
-pub struct Builder<D: DockerRunner> {
-    docker: D,
+impl From<Ext4Error> for BuildError {
+    fn from(e: Ext4Error) -> Self {
+        Self::Ext4(e)
+    }
 }
 
-impl<D: DockerRunner> Builder<D> {
+/// The baker. Composed of a [`DockerRunner`] (mockable) for `docker
+/// build/create/export`, an [`Ext4Packer`] (mockable) for the
+/// `Format::Ext4` step, and optionally a [`MetadataStore`] for
+/// recording the produced row.
+pub struct Builder<D: DockerRunner, P: Ext4Packer = Mke2fsPacker> {
+    docker: D,
+    packer: P,
+}
+
+impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
+    /// Default constructor: real `mke2fs` packer for `Format::Ext4`.
     pub fn new(docker: D) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            packer: Mke2fsPacker::default(),
+        }
+    }
+}
+
+impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
+    /// Construct with a custom packer — used by tests to record /
+    /// inject errors instead of running real mke2fs.
+    pub fn with_packer(docker: D, packer: P) -> Self {
+        Self { docker, packer }
     }
 
     /// Run a single bake. Steps:
@@ -191,9 +233,10 @@ impl<D: DockerRunner> Builder<D> {
         })
     }
 
-    /// Steps 5–6 of `build`: export, write manifest, compute size.
-    /// Factored out so the unconditional cleanup at the bottom of
-    /// `build` is symmetrical regardless of where this fails.
+    /// Steps 5–6 of `build`: export, write manifest, optionally pack
+    /// to ext4, compute size. Factored out so the unconditional
+    /// cleanup at the bottom of `build` is symmetrical regardless of
+    /// where this fails.
     async fn build_after_container(
         &self,
         req: &BuildRequest,
@@ -205,6 +248,7 @@ impl<D: DockerRunner> Builder<D> {
         let rootfs_dir = image_dir.join("rootfs");
         // Wipe any prior contents — bake is overwrite-semantics.
         let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
+        let _ = tokio::fs::remove_file(image_dir.join("rootfs.ext4")).await;
         tokio::fs::create_dir_all(&rootfs_dir).await?;
 
         self.docker
@@ -216,14 +260,30 @@ impl<D: DockerRunner> Builder<D> {
         let manifest_str = render_manifest(cfg)?;
         tokio::fs::write(&manifest_path, manifest_str).await?;
 
-        let size_bytes = recursive_size(&rootfs_dir).await?;
+        let dir_size = recursive_size(&rootfs_dir).await?;
 
-        let _ = req; // outcome shape only carries paths + size
+        let (rootfs_path, total_size) = match req.format {
+            Format::Directory => (rootfs_dir, dir_size),
+            Format::Ext4 => {
+                // Format the staging dir into a single ext4 image,
+                // then drop the staging dir — Firecracker only needs
+                // the .ext4. Doing the wipe AFTER pack succeeds means
+                // a failed mke2fs leaves the directory in place for
+                // diagnostics.
+                let ext4_path = image_dir.join("rootfs.ext4");
+                let ext4_size = recommended_size(dir_size);
+                self.packer.pack(&rootfs_dir, &ext4_path, ext4_size).await?;
+                let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
+                let on_disk = tokio::fs::metadata(&ext4_path).await?.len();
+                (ext4_path, on_disk)
+            }
+        };
+
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
             manifest_path,
-            rootfs_path: rootfs_dir,
-            size_bytes,
+            rootfs_path,
+            size_bytes: total_size,
         })
     }
 
