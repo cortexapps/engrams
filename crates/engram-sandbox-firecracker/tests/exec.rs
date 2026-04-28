@@ -12,17 +12,20 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use engram_agentd::serve_connection;
 use engram_core::types::ids::SandboxId;
-use engram_core::types::sandbox::{ExecEvent, ExecRequest};
+use engram_core::types::sandbox::ExecRequest;
 use engram_sandbox_firecracker::FirecrackerBackend;
-use futures::StreamExt;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
+
+use common::drain;
 
 /// Spawn an `engram-agentd`-shaped listener at `socket`. Returns a
 /// `JoinHandle` so callers can `.abort()` it after the test. The
@@ -42,25 +45,6 @@ async fn spawn_test_agent(socket: PathBuf) -> JoinHandle<()> {
             }
         }
     })
-}
-
-async fn drain(
-    mut stream: impl StreamExt<Item = ExecEvent> + Unpin,
-) -> (Vec<u8>, Vec<u8>, Option<i32>) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit_code = None;
-    while let Some(ev) = stream.next().await {
-        match ev {
-            ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-            ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-            ExecEvent::Exit(code) => {
-                exit_code = code;
-                break;
-            }
-        }
-    }
-    (stdout, stderr, exit_code)
 }
 
 #[tokio::test]

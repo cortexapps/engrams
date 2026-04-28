@@ -12,8 +12,10 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
@@ -23,36 +25,15 @@ use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreM
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + built engram-uffd-handler"]
 async fn snapshot_then_uffd_restore_round_trips_microvm() {
-    let kernel = match std::env::var("FC_TEST_KERNEL") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_KERNEL not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
     };
-    let rootfs = match std::env::var("FC_TEST_ROOTFS") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_ROOTFS not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
-    };
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("SKIP: /dev/kvm not present");
-        return;
-    }
-    if which("firecracker").is_none() {
-        eprintln!("SKIP: firecracker binary not on PATH");
-        return;
-    }
 
     // Find the built engram-uffd-handler binary. Workspace target
     // root is two `..`s up from this crate's manifest dir.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let target_root = std::path::Path::new(&manifest)
-        .join("..")
-        .join("..")
-        .join("target");
+    let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let handler = target_root.join("debug").join("engram-uffd-handler");
     if !handler.exists() {
         eprintln!(
@@ -64,11 +45,11 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
 
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&rootfs, &local_rootfs)
+    tokio::fs::copy(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
-    let mut cfg = FirecrackerConfig::with_kernel(kernel);
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.uffd_handler_bin = handler;
     cfg.restore_mode = RestoreMode::Uffd;
     let backend = FirecrackerBackend::new(work.path(), cfg);
@@ -168,12 +149,4 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         .destroy(restored_id)
         .await
         .expect("destroy restored");
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(|p| Path::new(p).join(bin))
-        .find(|p| p.is_file())
 }

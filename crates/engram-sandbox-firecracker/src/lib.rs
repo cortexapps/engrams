@@ -483,9 +483,9 @@ impl FirecrackerBackend {
         .await?;
 
         // Vsock — must be configured BEFORE InstanceStart. Firecracker
-        // creates the host-side UDS at vsock_uds_path; host code
-        // reaches the in-guest agent (engram-agentd listening on
-        // ENGRAM_AGENTD_PORT) by connecting to `<vsock_uds_path>_<port>`.
+        // creates the host-side UDS at vsock_uds_path; host→guest
+        // connections go through that base UDS with a `CONNECT <port>\n`
+        // handshake (see exec_stream_via_fc_vsock).
         //
         // The path lives at work_dir root (NOT inside jail_dir) on
         // purpose: a snapshot bakes this path into state.bin, and FC

@@ -13,43 +13,27 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::sandbox::{
-    CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec,
-};
+use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
-use futures::StreamExt;
+
+use common::{drain, fc_preflight, require_bin};
 
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots a microVM"]
 async fn exec_runs_inside_baked_microvm() {
-    // ---- Preconditions ----
-    let kernel = match std::env::var("FC_TEST_KERNEL") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_KERNEL not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
     };
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("SKIP: /dev/kvm not present");
-        return;
-    }
-    if which("firecracker").is_none() {
-        eprintln!("SKIP: firecracker binary not on PATH");
-        return;
-    }
-    if which("docker").is_none() {
-        eprintln!("SKIP: docker not on PATH");
-        return;
-    }
-    if which("mke2fs").is_none() {
-        eprintln!("SKIP: mke2fs not on PATH");
+    if !require_bin("docker") || !require_bin("mke2fs") {
         return;
     }
 
@@ -115,7 +99,7 @@ async fn exec_runs_inside_baked_microvm() {
 
     // ---- 2. Set up FC backend, boot the microVM ----
     let work = tempfile::tempdir().expect("work dir");
-    let mut cfg = FirecrackerConfig::with_kernel(kernel);
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     // Boot directly into our init shim. Without this the kernel
     // would try to exec /sbin/init (debian's systemd) which we
     // don't have configured.
@@ -210,31 +194,4 @@ async fn wait_for_agent(
         }
     }
     Err(last_err.expect("no attempts made"))
-}
-
-async fn drain(
-    mut stream: impl StreamExt<Item = ExecEvent> + Unpin,
-) -> (Vec<u8>, Vec<u8>, Option<i32>) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit_code = None;
-    while let Some(ev) = stream.next().await {
-        match ev {
-            ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-            ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-            ExecEvent::Exit(code) => {
-                exit_code = code;
-                break;
-            }
-        }
-    }
-    (stdout, stderr, exit_code)
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(|p| Path::new(p).join(bin))
-        .find(|p| p.is_file())
 }

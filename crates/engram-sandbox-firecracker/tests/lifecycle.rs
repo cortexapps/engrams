@@ -13,8 +13,9 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
@@ -24,39 +25,21 @@ use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
 async fn create_list_destroy_round_trip() {
-    let kernel = match std::env::var("FC_TEST_KERNEL") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_KERNEL not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
     };
-    let rootfs = match std::env::var("FC_TEST_ROOTFS") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_ROOTFS not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
-    };
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("SKIP: /dev/kvm not present");
-        return;
-    }
-    if which("firecracker").is_none() {
-        eprintln!("SKIP: firecracker binary not on PATH");
-        return;
-    }
 
     // The test rootfs is shared across runs; copy it so we can attach
     // it read-write without polluting the cache. Same workaround the
     // Firecracker examples use.
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&rootfs, &local_rootfs)
+    tokio::fs::copy(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
-    let backend = FirecrackerBackend::new(work.path(), FirecrackerConfig::with_kernel(kernel));
+    let backend = FirecrackerBackend::new(work.path(), FirecrackerConfig::with_kernel(env.kernel));
 
     let spec = SandboxSpec {
         image: "fc-lifecycle-test".into(),
@@ -115,12 +98,4 @@ async fn create_list_destroy_round_trip() {
         .destroy(id)
         .await
         .expect("destroy on unknown id is no-op");
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(|p| Path::new(p).join(bin))
-        .find(|p| p.is_file())
 }

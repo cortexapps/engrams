@@ -20,7 +20,9 @@
 
 #![cfg(target_os = "linux")]
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -33,31 +35,14 @@ use tokio::process::Command;
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
 async fn boot_microvm_and_capture_kernel_banner() {
-    // ---- preconditions ---------------------------------------------
-    let kernel = match std::env::var("FC_TEST_KERNEL") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_KERNEL not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
     };
-    let rootfs = match std::env::var("FC_TEST_ROOTFS") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("SKIP: FC_TEST_ROOTFS not set; run scripts/fetch-fc-test-artifacts.sh");
-            return;
-        }
-    };
+    let kernel = env.kernel;
+    let rootfs = env.rootfs;
     for (label, p) in [("kernel", &kernel), ("rootfs", &rootfs)] {
         assert!(p.exists(), "{label} missing at {}", p.display());
-    }
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("SKIP: /dev/kvm not present");
-        return;
-    }
-    if which("firecracker").is_none() {
-        eprintln!("SKIP: firecracker binary not on PATH");
-        return;
     }
 
     // ---- spawn firecracker -----------------------------------------
@@ -168,13 +153,4 @@ async fn wait_for_socket(path: &Path, budget: Duration) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-/// Tiny `which` so the test doesn't grow a dependency for one lookup.
-fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(|p| Path::new(p).join(bin))
-        .find(|p| p.is_file())
 }

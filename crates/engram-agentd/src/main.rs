@@ -137,18 +137,10 @@ async fn run_unix(listen_path: PathBuf) -> std::io::Result<()> {
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, _addr)) => {
-                        tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream).await {
-                                tracing::warn!(error = %e, "connection ended with error");
-                            }
-                        });
-                    }
-                    Err(e) => tracing::warn!(error = %e, "accept failed"),
-                }
-            }
+            res = listener.accept() => match res {
+                Ok((stream, _addr)) => spawn_serve(stream),
+                Err(e) => tracing::warn!(error = %e, "accept failed"),
+            },
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received; closing listener");
                 return Ok(());
@@ -167,22 +159,27 @@ async fn run_vsock(port: u32) -> std::io::Result<()> {
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, _addr)) => {
-                        tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream).await {
-                                tracing::warn!(error = %e, "connection ended with error");
-                            }
-                        });
-                    }
-                    Err(e) => tracing::warn!(error = %e, "vsock accept failed"),
-                }
-            }
+            res = listener.accept() => match res {
+                Ok((stream, _addr)) => spawn_serve(stream),
+                Err(e) => tracing::warn!(error = %e, "vsock accept failed"),
+            },
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received; closing listener");
                 return Ok(());
             }
         }
     }
+}
+
+/// Hand an accepted stream to [`serve_connection`] on its own task,
+/// logging any per-connection error without tearing the listener down.
+fn spawn_serve<S>(stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = serve_connection(stream).await {
+            tracing::warn!(error = %e, "connection ended with error");
+        }
+    });
 }
