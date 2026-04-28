@@ -669,6 +669,8 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 
 - ✅ **Snapshot replication path** — coordinator-side driver in `engram-coordinator::replication` polls `MetadataStore::list_pending_replications` every ~30s, tar+zstd-3-compresses each pending snapshot's `local_path`, streams to `BlobStorage::put`, then stamps `blob_url` + `replicated_at` via `mark_snapshot_replicated`. Once a snapshot is replicated the host-side `SnapshotManager`'s LRU layer can evict it under disk-cap pressure (LRU itself is dormant code today, activates when host disk fills). Coordinator-driven works for any deployment where coord can read the host's filesystem (`--mode=all`, co-located fs); true multi-machine adds a host-side `UploadSnapshot` RPC. The original Phase 2 TODO on `engram-host-agent::snapshot::replicate` is now a no-op pass-through pointing at the coord-side driver.
 
+- ✅ **Real `engram-storage-{gcs,s3}` SDK calls** — `engram-storage-s3` now uses `aws-sdk-s3` v1 (default credential chain, optional region + endpoint override for MinIO / R2 / other S3-compatibles); `engram-storage-gcs` uses `google-cloud-storage` v0.24 with ADC. Both implement the full `BlobStorage` surface (`put`/`get`/`delete`/`exists`/`list`) including pagination on `list_objects` and `NotFound` error mapping (404 → `StorageError::NotFound`, idempotent delete on missing). `put` collects the inbound stream into a `Vec<u8>` before handing to the SDK — fine for dev-tier ProcessBackend tarballs; multi-GB Firecracker `memory.bin` uploads will switch to streaming bodies (S3 `ByteStream::from_body_1_x`, GCS resumable upload) once we plumb content-length through the snapshot wire path. Each crate ships an `#[ignore]`'d live round-trip test gated on `ENGRAM_TEST_{S3,GCS}_BUCKET` so CI / dev can verify against a real bucket without forcing every workspace test run to need cloud credentials.
+
 **Still deferred** (rolled into Phase 6 production hardening, since they're orthogonal to "the trait surface works"):
 
 - `firecracker-jailer` integration (drop privileges, chroot, cgroups, seccomp, `/dev/kvm` fd passing)
@@ -676,7 +678,6 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 - Broker-mode HTTPS proxy (secret value substitution at the network boundary)
 - Network policy enforcement via iptables/nftables at the TAP boundary
 - `SendCtrlAltDel` graceful shutdown; agent-side shutdown handshake
-- Real `engram-storage-{gcs,s3}` SDK calls (currently typed stubs)
 - First-frame token auth on the in-guest agent
 - The full agent verb set (`Stat` / `Upload` / `Download` / `Ping` / `Shutdown` — exec-only today)
 

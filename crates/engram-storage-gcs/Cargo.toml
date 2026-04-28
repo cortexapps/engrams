@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Google Cloud Storage BlobStorage implementation (Phase 2 stub)."
+description = "Google Cloud Storage BlobStorage implementation."
 
 [lints]
 workspace = true
@@ -15,5 +15,10 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+google-cloud-storage.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid.workspace = true

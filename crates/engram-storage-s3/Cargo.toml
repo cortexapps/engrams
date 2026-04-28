@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "S3 / S3-compatible (MinIO) BlobStorage implementation (Phase 2 stub)."
+description = "S3 / S3-compatible (MinIO) BlobStorage implementation."
 
 [lints]
 workspace = true
@@ -12,8 +12,14 @@ workspace = true
 [dependencies]
 engram-core.workspace = true
 async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid.workspace = true
