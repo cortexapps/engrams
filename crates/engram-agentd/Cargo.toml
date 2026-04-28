@@ -1,0 +1,27 @@
+[package]
+name = "engram-agentd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-guest exec daemon for Firecracker microVMs. Listens on vsock, runs commands, streams stdout/stderr/exit back over the same connection."
+
+[lints]
+workspace = true
+
+[lib]
+name = "engram_agentd"
+
+[[bin]]
+name = "engram-agentd"
+path = "src/main.rs"
+
+[dependencies]
+bincode.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

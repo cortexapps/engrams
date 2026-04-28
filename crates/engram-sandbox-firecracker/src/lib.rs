@@ -5,13 +5,24 @@
 //!
 //! # Status
 //!
-//! `create`, `destroy`, `list`, `snapshot`, and `restore` are wired
-//! end-to-end and verified by integration tests
-//! (`tests/lifecycle.rs`, `tests/snapshot.rs`). Restore is currently
-//! file-backed (synchronous `mem_file_path` read on load); UFFD-backed
-//! restore — the load-bearing perf optimisation for sub-100ms resume —
-//! lands in its own slice once the userfaultfd handler crate exists.
-//! `exec_stream` still requires the in-guest agent + vsock plumbing.
+//! All `SandboxBackend` methods are wired:
+//!
+//! - `create`/`destroy`/`list`/`snapshot`/`restore` go through real
+//!   Firecracker microVMs (verified by `tests/lifecycle.rs`,
+//!   `tests/snapshot.rs`).
+//! - `exec_stream` connects to `engram-agentd` over the per-VM vsock
+//!   UDS (`<work_dir>/<sandbox_id>.vsock_<port>`), sends a
+//!   `WireExecRequest`, and translates the streamed `WireExecEvent`s
+//!   back into `engram_core::ExecEvent`s.
+//!
+//! Two slices remain to claim "production-ready":
+//!
+//! - **Image baker ext4 mode** — today's tests embed `engram-agentd`
+//!   manually outside the VM (see `tests/exec.rs`); a real microVM
+//!   needs the agent baked into the rootfs as `init=/sbin/engram-agentd`.
+//! - **UFFD-backed restore** — restore is currently `backend_type=File`
+//!   (synchronous read of `memory.bin`). The userfaultfd handler that
+//!   gives sub-100ms resume needs its own crate + scoped `unsafe`.
 //!
 //! # Architecture
 //!
@@ -57,18 +68,24 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::{SandboxId, SnapshotId};
-use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
 
@@ -80,19 +97,25 @@ pub use client::{
 /// Per-sandbox state owned by the host agent: the spec it was launched
 /// with, the path to its Firecracker control socket, and the path to
 /// the rootfs.ext4 image that was attached. `vsock_cid` is the context
-/// ID assigned to the guest's virtio-vsock device; `engram-agentd`
-/// inside the guest listens on `(cid, ENGRAM_AGENTD_PORT)`. Reserved
-/// for the next slice — no vsock is configured today.
+/// ID assigned to the guest's virtio-vsock device; `vsock_uds_path` is
+/// the host-side Unix socket Firecracker proxies vsock traffic through
+/// (host connects to `<vsock_uds_path>_<port>` to reach the guest's
+/// listener on `port`).
 #[derive(Clone, Debug)]
 pub struct SandboxState {
     pub spec: SandboxSpec,
     pub firecracker_socket: PathBuf,
     pub rootfs_path: PathBuf,
     pub vsock_cid: u32,
+    pub vsock_uds_path: PathBuf,
 }
 
 /// Reserved vsock port `engram-agentd` listens on inside the guest.
 pub const ENGRAM_AGENTD_PORT: u32 = 1024;
+
+/// Lowest CID we'll hand out to a guest. CIDs 0/1/2 are reserved
+/// (hypervisor / loopback / host); user-allocatable starts at 3.
+const FIRST_GUEST_CID: u32 = 3;
 
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
 /// here rather than on `SandboxSpec` because it's tied to the host
@@ -150,6 +173,10 @@ pub struct FirecrackerBackend {
     work_dir: PathBuf,
     config: FirecrackerConfig,
     sandboxes: DashMap<SandboxId, LiveSandbox>,
+    /// Monotonic CID allocator. Each `create` bumps this. We don't
+    /// reuse CIDs of destroyed VMs — a u32 gives us 4 billion before
+    /// wrap, which is fine for any single host's lifetime.
+    next_cid: AtomicU32,
 }
 
 impl FirecrackerBackend {
@@ -158,6 +185,7 @@ impl FirecrackerBackend {
             work_dir: work_dir.into(),
             config,
             sandboxes: DashMap::new(),
+            next_cid: AtomicU32::new(FIRST_GUEST_CID),
         }
     }
 
@@ -172,6 +200,86 @@ impl FirecrackerBackend {
     /// Used by the host agent for inspection / heartbeat reporting.
     pub fn snapshot_state(&self, id: SandboxId) -> Option<SandboxState> {
         self.sandboxes.get(&id).map(|r| r.state.clone())
+    }
+
+    /// Connect to a running `engram-agentd` at `agent_socket`, send a
+    /// `WireExecRequest`, and turn the resulting stream of
+    /// `WireExecEvent`s into an `ExecStream` of the trait's
+    /// `engram_core::ExecEvent`s.
+    ///
+    /// Production callers go through `<Self as SandboxBackend>::exec_stream`,
+    /// which derives `agent_socket` from the sandbox's vsock UDS. This
+    /// associated function is `pub` only so the `tests/exec.rs`
+    /// integration test (and any future test that wants to exercise
+    /// the wire protocol against an agent without booting a microVM)
+    /// can drive it directly. Don't call it from the host-agent.
+    pub async fn exec_stream_via_agent_socket(
+        sandbox_id: SandboxId,
+        agent_socket: &Path,
+        cmd: ExecRequest,
+    ) -> Result<ExecStream, SandboxError> {
+        let conn = UnixStream::connect(agent_socket).await.map_err(|e| {
+            vm_err(format!(
+                "connect to agent at {}: {e}",
+                agent_socket.display()
+            ))
+        })?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+
+        let req = WireExecRequest {
+            command: cmd.command,
+            stdin: cmd.stdin,
+            env: cmd.env,
+            workdir: cmd.workdir,
+            timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
+        };
+        write_msg(&mut writer, &req)
+            .await
+            .map_err(|e| vm_err(format!("send WireExecRequest: {e}")))?;
+
+        let exec_id = format!("fc-{}", uuid::Uuid::new_v4().simple());
+        // 64 events of buffer is enough that a slow consumer doesn't
+        // immediately backpressure the agent; the agent has its own
+        // 64-event channel so total in-flight bound is bounded.
+        let (tx, rx) = mpsc::channel::<ExecEvent>(64);
+
+        tokio::spawn(async move {
+            loop {
+                match read_msg::<_, WireExecEvent>(&mut reader).await {
+                    Ok(WireExecEvent::Stdout(b)) => {
+                        if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(WireExecEvent::Stderr(b)) => {
+                        if tx.send(ExecEvent::Stderr(Bytes::from(b))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(WireExecEvent::Exit(code)) => {
+                        let _ = tx.send(ExecEvent::Exit(code)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        // Connection died before Exit: surface as a
+                        // synthetic Exit(None) so the consumer's
+                        // ".next() until Exit" loop terminates.
+                        tracing::warn!(
+                            error = %e,
+                            "agent connection ended without explicit Exit",
+                        );
+                        let _ = tx.send(ExecEvent::Exit(None)).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ExecStream {
+            sandbox_id,
+            exec_id,
+            events: Box::pin(ReceiverStream::new(rx)),
+        })
     }
 
     /// Allocate the jail dir, spawn `firecracker --api-sock <sock>`
@@ -292,16 +400,33 @@ impl FirecrackerBackend {
             is_read_only: false,
         })
         .await?;
+
+        // Vsock — must be configured BEFORE InstanceStart. Firecracker
+        // creates the host-side UDS at vsock_uds_path; host code
+        // reaches the in-guest agent (engram-agentd listening on
+        // ENGRAM_AGENTD_PORT) by connecting to `<vsock_uds_path>_<port>`.
+        //
+        // The path lives at work_dir root (NOT inside jail_dir) on
+        // purpose: a snapshot bakes this path into state.bin, and FC
+        // reopens it on load. If we put it inside jail_dir, destroy()
+        // would remove the parent and break restore. work_dir survives.
+        let vsock_cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
+        let vsock_uds_path = self.work_dir.join(format!("{sandbox_id}.vsock"));
+        let _ = tokio::fs::remove_file(&vsock_uds_path).await;
+        api.put_vsock(&VsockConfig {
+            guest_cid: vsock_cid,
+            uds_path: vsock_uds_path.to_string_lossy().into_owned(),
+        })
+        .await?;
+
         api.put_action(ActionType::InstanceStart).await?;
 
-        // Vsock + network are deferred to the next slice; document the
-        // shape we want by carrying vsock_cid in state even though we
-        // don't configure /vsock yet.
         let state = SandboxState {
             spec,
             firecracker_socket: socket,
             rootfs_path: rootfs,
-            vsock_cid: 0,
+            vsock_cid,
+            vsock_uds_path,
         };
         self.sandboxes
             .insert(sandbox_id, LiveSandbox { state, child });
@@ -346,11 +471,20 @@ impl FirecrackerBackend {
         // the original VM had attached — Firecracker reopens that
         // path on load, so it must still be valid on disk.
         let rootfs_path = manifest.spec.rootfs_source.clone().unwrap_or_default();
+        // FC restored the vsock device at the same UDS path stored in
+        // state.bin (under work_dir, by design). We don't have the
+        // pre-snapshot CID in the manifest — that was a Firecracker
+        // internal — so we surface the original sandbox_id-derived
+        // path and a freshly-allocated CID for our SandboxState. The
+        // CID we record is informational on the restored side.
+        let vsock_uds_path = self.work_dir.join(format!("{}.vsock", manifest.sandbox_id));
+        let vsock_cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
         let state = SandboxState {
             spec: manifest.spec.clone(),
             firecracker_socket: socket,
             rootfs_path,
-            vsock_cid: 0,
+            vsock_cid,
+            vsock_uds_path,
         };
         self.sandboxes
             .insert(sandbox_id, LiveSandbox { state, child });
@@ -364,14 +498,20 @@ impl FirecrackerBackend {
     }
 }
 
-fn unimplemented(method: &'static str, endpoint: &'static str) -> SandboxError {
-    SandboxError::Vm(
-        format!("FirecrackerBackend::{method} not yet implemented (target: {endpoint})").into(),
-    )
-}
-
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// Compose the host-side path Firecracker presents for connections to
+/// the guest's vsock listener on `port`. Convention is documented at
+/// <https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md>:
+/// host connects to `<uds_path>_<port>`. We append `_<port>` to the
+/// last path component (not the parent dir, which would put it in a
+/// sibling directory).
+fn agent_socket_path(vsock_uds_path: &Path, port: u32) -> PathBuf {
+    let mut s = vsock_uds_path.as_os_str().to_os_string();
+    s.push(format!("_{port}"));
+    PathBuf::from(s)
 }
 
 /// Wait until either:
@@ -432,14 +572,15 @@ impl SandboxBackend for FirecrackerBackend {
 
     async fn exec_stream(
         &self,
-        _id: SandboxId,
-        _cmd: ExecRequest,
+        id: SandboxId,
+        cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        // TODO(phase-2): connect to (vsock_cid, ENGRAM_AGENTD_PORT),
-        // send the ExecRequest, stream stdout/stderr/exit_status back
-        // as ExecEvents. This is *not* a Firecracker API call — it's a
-        // vsock RPC to engram-agentd inside the guest.
-        Err(unimplemented("exec_stream", "vsock to engram-agentd"))
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let agent_socket = agent_socket_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        Self::exec_stream_via_agent_socket(id, &agent_socket, cmd).await
     }
 
     async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
@@ -530,6 +671,10 @@ impl SandboxBackend for FirecrackerBackend {
             tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
         }
         let _ = live.child.wait().await;
+
+        // Vsock UDS lives at work_dir root; remove explicitly since
+        // it isn't inside the jail dir we wipe below.
+        let _ = tokio::fs::remove_file(&live.state.vsock_uds_path).await;
 
         let jail_dir = self.work_dir.join(id.to_string());
         if let Err(e) = tokio::fs::remove_dir_all(&jail_dir).await {
@@ -671,5 +816,35 @@ mod tests {
             }
             other => panic!("expected Snapshot error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exec_stream_unknown_id_is_not_found() {
+        let (b, _d) = backend();
+        let req = ExecRequest {
+            command: vec!["true".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+        };
+        match b.exec_stream(SandboxId::new(), req).await {
+            Err(SandboxError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_socket_path_appends_underscore_port_to_uds_path() {
+        // Lock down the Firecracker convention so a refactor that
+        // moves the suffix into a sibling dir would fail loud.
+        let p = agent_socket_path(Path::new("/tmp/foo.vsock"), 1024);
+        assert_eq!(p, PathBuf::from("/tmp/foo.vsock_1024"));
+    }
+
+    #[test]
+    fn agent_socket_path_handles_paths_with_no_extension() {
+        let p = agent_socket_path(Path::new("/var/run/engram/abc.sock"), 9000);
+        assert_eq!(p, PathBuf::from("/var/run/engram/abc.sock_9000"));
     }
 }

@@ -7,6 +7,7 @@ members = [
     "crates/engram-host-agent",
     "crates/engram-image-builder",
     "crates/engram-cli",
+    "crates/engram-agentd",
     "crates/engram-sandbox-firecracker",
     "crates/engram-sandbox-process",
     "crates/engram-cloud-gcp",
@@ -47,6 +48,7 @@ engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
 engram-image-builder = { path = "crates/engram-image-builder" }
+engram-agentd = { path = "crates/engram-agentd" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }
@@ -55,6 +57,9 @@ futures = "0.3"
 futures-util = "0.3"
 bytes = "1"
 pin-project-lite = "0.2"
+
+# wire codecs
+bincode = "1.3"
 
 # http / api
 axum = { version = "0.7", features = ["macros"] }
