@@ -706,9 +706,10 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 
 - ✅ **W3C tracing context on the wire** — `Frame::Request` carries a `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }`. The coordinator's `client.rs` generates fresh ids per outgoing RPC and logs them at debug; the host's `server.rs::handle_request` opens a `tracing::info_span` with `trace_id`/`span_id`/`req_id`/`kind` fields so backend code (e.g. `ProcessBackend`, `FirecrackerBackend`) inherits them on every log line. Without an OTel collector wired in, this stitches both sides' logs together via grep; with `tracing-opentelemetry` added later, the same fields plug straight into a real distributed trace. Wire-format change — coordinator + host need to be on the same version (intentional: this is an internal protocol with no version negotiation yet, that's tracked in Phase 6).
 
-**Still deferred:**
+- ✅ **`tests/ha_listener.rs` against live Postgres** — two `#[ignore]`'d integration tests in `crates/engram-coordinator/tests/ha_listener.rs`: `cross_replica_event_fan_out` builds two `AppState`s sharing one Postgres, subscribes on coord-A, emits via coord-B, and asserts coord-A's subscriber sees the byte-identical event within 2s; `append_session_event_fires_pg_notify` does a targeted check that `append_session_event` actually emits a `NOTIFY` payload with the correct `(session_id, idx)` shape. Gated behind `ENGRAM_TEST_DATABASE_URL`; run with `docker compose -f deploy/docker-compose.yml up -d postgres && ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram cargo test -p engram-coordinator --test ha_listener -- --ignored`.
 
-- **Real `tests/ha_listener.rs` against live Postgres** — proves the cross-replica SSE fan-out end-to-end. Currently `#[ignore]`'d concept; the SQL change is implicitly covered by the existing `append_session_event` tests since any breakage there would break all 100+ tests that emit events.
+**Still deferred (rolled into Phase 6):**
+
 - **Production hardening** — TLS for the WS channel, `HostStatus::Disconnected` (network blip vs. dead distinction), backpressure tuning past the default 64-frame mpsc capacity. Lands with Phase 6.
 
 **Deliverable**: stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.

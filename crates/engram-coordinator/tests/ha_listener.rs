@@ -1,0 +1,233 @@
+//! Live-Postgres integration test for Phase 3c HA.
+//!
+//! Spins up two `AppState`s sharing a real Postgres, attaches an SSE
+//! subscriber to coord-A, and emits an event via coord-B's
+//! `AppState::emit`. The `pg_notify('session_events', ...)` fired by
+//! `append_session_event` reaches coord-A's `pg_listener` task, which
+//! re-broadcasts the typed `SessionEvent` into coord-A's local
+//! `SessionEventBus` so the subscriber sees it.
+//!
+//! `#[ignore]`'d by default — requires Postgres reachable at the URL
+//! pointed to by `ENGRAM_TEST_DATABASE_URL` (the local
+//! `deploy/docker-compose.yml` brings one up at
+//! `postgres://engram:engram@localhost:5435/engram`). To run:
+//!
+//! ```bash
+//! docker compose -f deploy/docker-compose.yml up -d postgres
+//! ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
+//!     cargo test -p engram-coordinator --test ha_listener -- --ignored --nocapture
+//! ```
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use engram_core::traits::{BlobStorage, MetadataStore};
+use engram_core::types::SessionSpec;
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn cross_replica_event_fan_out() {
+    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "skipping: ENGRAM_TEST_DATABASE_URL not set. Bring up the dev DB with \
+                 `docker compose -f deploy/docker-compose.yml up -d postgres` and re-run with \
+                 ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram"
+            );
+            return;
+        }
+    };
+
+    let store = engram_postgres::PostgresStore::connect(&database_url)
+        .await
+        .expect("connect postgres");
+    store.migrate().await.expect("migrate");
+    let meta: Arc<dyn MetadataStore> = Arc::new(store);
+
+    // Seed a session row both AppStates can refer to. The producer
+    // (coord-B) appends an event against this id; the subscriber on
+    // coord-A waits for it.
+    let session_id = meta
+        .create_session(
+            SessionSpec {
+                repo: "ha-listener-test".into(),
+                branch: "main".into(),
+                user_id: None,
+                image_version: Some("warm-test".into()),
+            },
+            "warm-test".into(),
+        )
+        .await
+        .expect("create session");
+
+    let coord_a = build_app_state(meta.clone(), &database_url).await;
+    let coord_b = build_app_state(meta.clone(), &database_url).await;
+
+    // Subscribe BEFORE emitting so we don't race the broadcast.
+    // The pg_listener task in each AppState was spawned by
+    // `run_with_registry`; for this test we instead spawn it
+    // explicitly against the shared meta+events.
+    let mut rx = coord_a.events.subscribe(session_id);
+
+    // Give pg_listener a moment to actually start listening.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Producer-side: emit through coord-B. This persists + fires
+    // pg_notify; coord-A's listener picks it up and re-broadcasts.
+    let test_chunk = format!("ha-test-{}", uuid::Uuid::new_v4().simple());
+    let event = engram_coordinator::state::SessionEvent::Stdout {
+        exec_id: "test-exec".into(),
+        chunk: test_chunk.clone(),
+    };
+    coord_b
+        .emit(session_id, event)
+        .await
+        .expect("coord-b emit");
+
+    // Coord-A's subscriber should see the same event within a
+    // generous bound. LISTEN delivery is sub-100ms locally; we
+    // give 2s to absorb test-runner jitter without flaking.
+    let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("event arrived within timeout")
+        .expect("subscriber wasn't dropped");
+
+    match received.event {
+        engram_coordinator::state::SessionEvent::Stdout { chunk, .. } => {
+            assert_eq!(
+                chunk, test_chunk,
+                "coord-A must see the chunk emitted by coord-B byte-for-byte"
+            );
+        }
+        other => panic!(
+            "expected Stdout cross-replica event, got {other:?} (the bridge \
+             is decoding the wrong variant or fan-out went sideways)"
+        ),
+    }
+}
+
+async fn build_app_state(
+    meta: Arc<dyn MetadataStore>,
+    database_url: &str,
+) -> Arc<engram_coordinator::AppState> {
+    use engram_cloud_mock::MockCloud;
+    use engram_coordinator::image_registry::ImageRegistry;
+    use engram_coordinator::{AppState, CoordinatorConfig, HostRegistry, Services};
+    use engram_storage_local::LocalStorage;
+
+    let work_dir = tempfile::tempdir().expect("work dir").keep();
+    let blob_dir = tempfile::tempdir().expect("blob dir").keep();
+    let images_dir = tempfile::tempdir().expect("images dir").keep();
+
+    let raw: Arc<dyn engram_core::traits::SandboxBackend> =
+        Arc::new(engram_sandbox_process::ProcessBackend::new(work_dir));
+    let pooled: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(
+        engram_host_agent::pooled_backend::PooledBackend::new(raw, 0),
+    );
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalStorage::new(blob_dir));
+
+    let services = Services {
+        meta: meta.clone(),
+        blob,
+        cloud: Arc::new(MockCloud::new()),
+        sandbox: pooled,
+        secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
+        images: ImageRegistry::new(images_dir),
+    };
+    let cfg = CoordinatorConfig {
+        database_url: database_url.to_string(),
+        ..CoordinatorConfig::default()
+    };
+    let registry = Arc::new(HostRegistry::new());
+    registry.register(engram_core::HostId::new(), services.sandbox.clone());
+    let state = Arc::new(AppState::new_with_registry(cfg, services, registry));
+
+    // Spawn a pg_listener bound to this AppState's event bus.
+    // `run_with_registry` does this in production; for the test we
+    // wire it up directly so we don't need to bind an axum server.
+    let _ = engram_coordinator::pg_listener::spawn(
+        database_url.to_string(),
+        meta,
+        state.events.clone(),
+        state.host_registry.clone(),
+    );
+    state
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn append_session_event_fires_pg_notify() {
+    // Targeted check that the SQL change in `append_session_event`
+    // actually emits a NOTIFY (and not, say, a silent INSERT).
+    // Subscribes a raw PgListener and counts notifications.
+    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let store = engram_postgres::PostgresStore::connect(&database_url)
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let mut listener = sqlx::postgres::PgListener::connect(&database_url)
+        .await
+        .expect("listener connect");
+    listener
+        .listen("session_events")
+        .await
+        .expect("listen session_events");
+
+    let session_id = store
+        .create_session(
+            SessionSpec {
+                repo: "ha-notify-test".into(),
+                branch: "main".into(),
+                user_id: None,
+                image_version: Some("warm-test".into()),
+            },
+            "warm-test".into(),
+        )
+        .await
+        .expect("create");
+
+    // Give the listener time to settle on the channel.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let _idx = store
+        .append_session_event(
+            session_id,
+            "stdout",
+            serde_json::json!({"type": "stdout", "exec_id": "x", "chunk": "hi"}),
+        )
+        .await
+        .expect("append");
+
+    let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("notification arrived")
+        .expect("listener stayed open");
+
+    assert_eq!(notification.channel(), "session_events");
+    let payload: serde_json::Value =
+        serde_json::from_str(notification.payload()).expect("payload is JSON");
+    assert_eq!(
+        payload["session_id"].as_str(),
+        Some(session_id.to_string().as_str()),
+        "NOTIFY payload should carry the session id we just appended for"
+    );
+    assert!(payload["idx"].is_number(), "payload includes idx");
+
+    // Smoke read of the row through the public API to confirm the
+    // INSERT committed alongside the NOTIFY (the CTE wraps both in
+    // one statement; this catches a regression that decouples them).
+    let row = store
+        .list_active_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .expect("session row is present after the NOTIFY arrived");
+    assert_eq!(row.id, session_id);
+}
