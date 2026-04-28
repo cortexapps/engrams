@@ -62,9 +62,12 @@ use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 
-mod client;
+pub mod client;
 
-pub use client::FirecrackerClient;
+pub use client::{
+    ActionType, BootSource, DriveConfig, FirecrackerClient, MachineConfig, SnapshotPaths,
+    VmState, VsockConfig,
+};
 
 /// Per-sandbox state owned by the host agent: the spec it was launched
 /// with, the path to its Firecracker control socket, and the path to
