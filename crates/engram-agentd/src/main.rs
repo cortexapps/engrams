@@ -1,27 +1,22 @@
 //! `engram-agentd` — in-guest exec daemon binary.
 //!
-//! Today it only knows how to bind a Unix-domain socket, which is
-//! enough for the integration tests on the dev VM (`exec_stream`'s
-//! host side connects to the same kind of UDS that Firecracker's
-//! vsock proxy presents). A `--vsock-port <PORT>` mode for running
-//! inside an actual microVM lands when the image baker can produce
-//! an ext4 with this binary embedded as `init=/sbin/engram-agentd`.
+//! Two listen modes:
 //!
-//! Usage:
+//! - `--listen unix:///path/to/sock` — Unix-domain socket. Used by the
+//!   integration tests on dev hosts (where the host connects directly
+//!   to the same UDS path our process bound).
+//! - `--vsock-port <PORT>` — AF_VSOCK listener (Linux-only). The
+//!   production deployment: this binary is baked into the rootfs at
+//!   `/sbin/engram-agentd`, the boot init exec's it, Firecracker
+//!   proxies `<vsock_uds>_<PORT>` ↔ guest port. The host's
+//!   `FirecrackerBackend::exec_stream` connects to that proxy.
 //!
-//! ```text
-//!   engram-agentd --listen unix:///tmp/engram-agentd.sock
-//! ```
-//!
-//! On SIGTERM the accept loop stops taking new connections; in-flight
-//! execs continue until they exit naturally (no graceful-cancel today —
-//! Phase 3 work alongside `SendCtrlAltDel`).
+//! On SIGTERM/SIGINT the accept loop stops taking new connections;
+//! in-flight execs continue until they exit naturally (no
+//! graceful-cancel today — Phase 3 work alongside `SendCtrlAltDel`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-
-use tokio::net::UnixListener;
-use tokio::signal;
 
 use engram_agentd::serve_connection;
 
@@ -62,27 +57,50 @@ fn main() -> ExitCode {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Vsock(u32) field is only read on Linux; on other targets
+                    // the variant just produces a clean "Unsupported" error
+enum Listen {
+    Unix(PathBuf),
+    Vsock(u32),
+}
+
+#[derive(Debug)]
 struct Args {
-    listen_unix: PathBuf,
+    listen: Listen,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut listen_unix: Option<PathBuf> = None;
+    let mut listen: Option<Listen> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--listen" => {
+                if listen.is_some() {
+                    return Err("--listen and --vsock-port are mutually exclusive".into());
+                }
                 let v = argv
                     .next()
                     .ok_or_else(|| "--listen requires a value".to_string())?;
                 let path = v.strip_prefix("unix://").ok_or_else(|| {
-                    format!("unsupported listen scheme: {v}; only `unix://<path>` works today")
+                    format!("unsupported listen scheme: {v}; expected `unix://<path>`")
                 })?;
-                listen_unix = Some(PathBuf::from(path));
+                listen = Some(Listen::Unix(PathBuf::from(path)));
+            }
+            "--vsock-port" => {
+                if listen.is_some() {
+                    return Err("--listen and --vsock-port are mutually exclusive".into());
+                }
+                let v = argv
+                    .next()
+                    .ok_or_else(|| "--vsock-port requires a value".to_string())?;
+                let port: u32 = v
+                    .parse()
+                    .map_err(|e| format!("--vsock-port must be a u32: {e}"))?;
+                listen = Some(Listen::Vsock(port));
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "engram-agentd --listen unix:///path/to/sock\n\n\
+                    "engram-agentd [--listen unix:///path/to/sock | --vsock-port <PORT>]\n\n\
                      In-guest exec daemon. Accepts WireExecRequest frames,\n\
                      runs commands, streams stdout/stderr/exit back."
                 );
@@ -91,25 +109,32 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    let listen_unix =
-        listen_unix.ok_or_else(|| "--listen unix://<path> is required".to_string())?;
-    Ok(Args { listen_unix })
+    let listen = listen.ok_or_else(|| "one of --listen or --vsock-port is required".to_string())?;
+    Ok(Args { listen })
 }
 
 async fn run(args: Args) -> std::io::Result<()> {
-    // Refuse to start with a pre-existing socket file that we don't
-    // own — UnixListener::bind would EADDRINUSE. Caller is expected
-    // to clean up; this is just a clearer error message.
-    if args.listen_unix.exists() {
-        let _ = tokio::fs::remove_file(&args.listen_unix).await;
+    match args.listen {
+        Listen::Unix(path) => run_unix(path).await,
+        #[cfg(target_os = "linux")]
+        Listen::Vsock(port) => run_vsock(port).await,
+        #[cfg(not(target_os = "linux"))]
+        Listen::Vsock(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "--vsock-port is Linux-only (AF_VSOCK)",
+        )),
     }
-    let listener = UnixListener::bind(&args.listen_unix)?;
-    tracing::info!(socket = %args.listen_unix.display(), "engram-agentd listening");
+}
 
-    // Cancel-safe shutdown: SIGTERM/SIGINT stops accepting, in-flight
-    // tasks keep going until they finish on their own.
-    let mut shutdown = Box::pin(signal::ctrl_c());
+async fn run_unix(listen_path: PathBuf) -> std::io::Result<()> {
+    use tokio::net::UnixListener;
+    if listen_path.exists() {
+        let _ = tokio::fs::remove_file(&listen_path).await;
+    }
+    let listener = UnixListener::bind(&listen_path)?;
+    tracing::info!(socket = %listen_path.display(), "engram-agentd listening (unix)");
 
+    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -121,9 +146,37 @@ async fn run(args: Args) -> std::io::Result<()> {
                             }
                         });
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
+                    Err(e) => tracing::warn!(error = %e, "accept failed"),
+                }
+            }
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received; closing listener");
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_vsock(port: u32) -> std::io::Result<()> {
+    use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+
+    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
+    tracing::info!(port, "engram-agentd listening (vsock)");
+
+    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, _addr)) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = serve_connection(stream).await {
+                                tracing::warn!(error = %e, "connection ended with error");
+                            }
+                        });
                     }
+                    Err(e) => tracing::warn!(error = %e, "vsock accept failed"),
                 }
             }
             _ = &mut shutdown => {

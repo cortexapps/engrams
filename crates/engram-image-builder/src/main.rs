@@ -112,6 +112,10 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         tag: tag.clone(),
         images_dir: opts.images_dir.clone(),
         format: opts.format,
+        // Agent injection isn't exposed on the CLI yet — Phase 2's
+        // real-microVM exec test drives it via the library. Adding a
+        // `--inject-agent` flag is a CLI ergonomics task for later.
+        agent_injection: None,
     };
 
     let docker = match opts.docker_bin {

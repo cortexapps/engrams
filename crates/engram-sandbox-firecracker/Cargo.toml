@@ -25,5 +25,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+engram-image-builder.workspace = true
 futures.workspace = true
 tempfile = "3"

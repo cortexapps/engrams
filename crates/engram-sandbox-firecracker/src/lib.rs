@@ -10,10 +10,11 @@
 //! - `create`/`destroy`/`list`/`snapshot`/`restore` go through real
 //!   Firecracker microVMs (verified by `tests/lifecycle.rs`,
 //!   `tests/snapshot.rs`).
-//! - `exec_stream` connects to `engram-agentd` over the per-VM vsock
-//!   UDS (`<work_dir>/<sandbox_id>.vsock_<port>`), sends a
-//!   `WireExecRequest`, and translates the streamed `WireExecEvent`s
-//!   back into `engram_core::ExecEvent`s.
+//! - `exec_stream` connects to the in-guest `engram-agentd` via
+//!   Firecracker's vsock proxy (the host UDS at
+//!   `<work_dir>/<sandbox_id>.vsock`, with a `CONNECT <port>\n`
+//!   handshake), sends a `WireExecRequest`, and translates the
+//!   streamed `WireExecEvent`s back into `engram_core::ExecEvent`s.
 //!
 //! `restore` supports both `RestoreMode::File` (synchronous read of
 //! memory.bin, simple, slow, no extra processes) and `RestoreMode::Uffd`
@@ -22,12 +23,11 @@
 //! set it to `Uffd` for production-grade eviction/resume latency. Both
 //! are verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
 //!
-//! One slice remains to claim "production-ready":
-//!
-//! - **Image baker ext4 mode** — today's exec tests embed
-//!   `engram-agentd` manually outside the VM (see `tests/exec.rs`); a
-//!   real microVM needs the agent baked into the rootfs as
-//!   `init=/sbin/engram-agentd`.
+//! End-to-end `tests/exec_real_vm.rs` bakes a debian-slim rootfs with
+//! a static-musl `engram-agentd` injected at `/sbin/engram-agentd`,
+//! boots it under FC with `init=/sbin/engram-init`, and round-trips
+//! an exec through the agent over vsock — the whole `SandboxBackend`
+//! contract works against a real microVM.
 //!
 //! # Architecture
 //!
@@ -87,6 +87,7 @@ use engram_core::types::sandbox::{ExecEvent, ExecRequest, ExecStream, SandboxSpe
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -103,9 +104,10 @@ pub use client::{
 /// with, the path to its Firecracker control socket, and the path to
 /// the rootfs.ext4 image that was attached. `vsock_cid` is the context
 /// ID assigned to the guest's virtio-vsock device; `vsock_uds_path` is
-/// the host-side Unix socket Firecracker proxies vsock traffic through
-/// (host connects to `<vsock_uds_path>_<port>` to reach the guest's
-/// listener on `port`).
+/// the host-side Unix socket Firecracker proxies vsock traffic through.
+/// To reach the guest's listener on `port`, the host opens
+/// `vsock_uds_path` and writes `CONNECT <port>\n`; FC replies
+/// `OK <peer_port>\n` and the bytes after that are the guest stream.
 #[derive(Clone, Debug)]
 pub struct SandboxState {
     pub spec: SandboxSpec,
@@ -256,62 +258,62 @@ impl FirecrackerBackend {
                 agent_socket.display()
             ))
         })?;
-        let (mut reader, mut writer) = tokio::io::split(conn);
+        let (reader, writer) = tokio::io::split(conn);
+        drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+    }
 
-        let req = WireExecRequest {
-            command: cmd.command,
-            stdin: cmd.stdin,
-            env: cmd.env,
-            workdir: cmd.workdir,
-            timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
-        };
-        write_msg(&mut writer, &req)
+    /// Connect to the in-guest agent over Firecracker's vsock proxy.
+    /// The host UDS at `vsock_uds_path` is multiplexed: every host→
+    /// guest connection sends `CONNECT <port>\n` first and reads back
+    /// `OK <peer_port>\n`. Only AFTER the handshake is the byte stream
+    /// connected to the guest's listener on `port`. Documented at
+    /// `firecracker/docs/vsock.md`.
+    async fn exec_stream_via_fc_vsock(
+        sandbox_id: SandboxId,
+        vsock_uds_path: &Path,
+        port: u32,
+        cmd: ExecRequest,
+    ) -> Result<ExecStream, SandboxError> {
+        let mut conn = UnixStream::connect(vsock_uds_path).await.map_err(|e| {
+            vm_err(format!(
+                "connect to FC vsock UDS {}: {e}",
+                vsock_uds_path.display()
+            ))
+        })?;
+
+        // Send the CONNECT line.
+        conn.write_all(format!("CONNECT {port}\n").as_bytes())
             .await
-            .map_err(|e| vm_err(format!("send WireExecRequest: {e}")))?;
+            .map_err(|e| vm_err(format!("send CONNECT to FC vsock: {e}")))?;
 
-        let exec_id = format!("fc-{}", uuid::Uuid::new_v4().simple());
-        // 64 events of buffer is enough that a slow consumer doesn't
-        // immediately backpressure the agent; the agent has its own
-        // 64-event channel so total in-flight bound is bounded.
-        let (tx, rx) = mpsc::channel::<ExecEvent>(64);
-
-        tokio::spawn(async move {
-            loop {
-                match read_msg::<_, WireExecEvent>(&mut reader).await {
-                    Ok(WireExecEvent::Stdout(b)) => {
-                        if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(WireExecEvent::Stderr(b)) => {
-                        if tx.send(ExecEvent::Stderr(Bytes::from(b))).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(WireExecEvent::Exit(code)) => {
-                        let _ = tx.send(ExecEvent::Exit(code)).await;
-                        return;
-                    }
-                    Err(e) => {
-                        // Connection died before Exit: surface as a
-                        // synthetic Exit(None) so the consumer's
-                        // ".next() until Exit" loop terminates.
-                        tracing::warn!(
-                            error = %e,
-                            "agent connection ended without explicit Exit",
-                        );
-                        let _ = tx.send(ExecEvent::Exit(None)).await;
-                        return;
-                    }
-                }
+        // Read back exactly one line, byte-by-byte, so we don't
+        // over-read and lose any bytes the agent has already sent.
+        let mut line = Vec::with_capacity(32);
+        let mut byte = [0u8; 1];
+        loop {
+            conn.read_exact(&mut byte)
+                .await
+                .map_err(|e| vm_err(format!("read FC vsock CONNECT response: {e}")))?;
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
             }
-        });
+            if line.len() > 64 {
+                return Err(vm_err(
+                    "FC vsock CONNECT response exceeded 64 bytes; protocol mismatch",
+                ));
+            }
+        }
+        let line_str = std::str::from_utf8(&line)
+            .map_err(|e| vm_err(format!("non-UTF8 FC vsock response: {e}")))?;
+        if !line_str.starts_with("OK ") {
+            return Err(vm_err(format!(
+                "FC vsock refused CONNECT (expected `OK <port>\\n`, got {line_str:?})"
+            )));
+        }
 
-        Ok(ExecStream {
-            sandbox_id,
-            exec_id,
-            events: Box::pin(ReceiverStream::new(rx)),
-        })
+        let (reader, writer) = tokio::io::split(conn);
+        drive_exec_protocol(sandbox_id, reader, writer, cmd).await
     }
 
     /// Allocate the jail dir, spawn `firecracker --api-sock <sock>`
@@ -611,16 +613,74 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
 }
 
-/// Compose the host-side path Firecracker presents for connections to
-/// the guest's vsock listener on `port`. Convention is documented at
-/// <https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md>:
-/// host connects to `<uds_path>_<port>`. We append `_<port>` to the
-/// last path component (not the parent dir, which would put it in a
-/// sibling directory).
-fn agent_socket_path(vsock_uds_path: &Path, port: u32) -> PathBuf {
-    let mut s = vsock_uds_path.as_os_str().to_os_string();
-    s.push(format!("_{port}"));
-    PathBuf::from(s)
+/// Send the WireExecRequest, spawn the reader task that translates
+/// agent events into the trait's `ExecEvent`, return an `ExecStream`.
+/// Generic over the reader/writer halves so both the direct-UDS and
+/// the FC-vsock-CONNECT paths can share it.
+async fn drive_exec_protocol<R, W>(
+    sandbox_id: SandboxId,
+    mut reader: R,
+    mut writer: W,
+    cmd: ExecRequest,
+) -> Result<ExecStream, SandboxError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let req = WireExecRequest {
+        command: cmd.command,
+        stdin: cmd.stdin,
+        env: cmd.env,
+        workdir: cmd.workdir,
+        timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
+    };
+    write_msg(&mut writer, &req)
+        .await
+        .map_err(|e| vm_err(format!("send WireExecRequest: {e}")))?;
+
+    let exec_id = format!("fc-{}", uuid::Uuid::new_v4().simple());
+    // 64 events of buffer is enough that a slow consumer doesn't
+    // immediately backpressure the agent; the agent has its own
+    // 64-event channel so total in-flight bound is bounded.
+    let (tx, rx) = mpsc::channel::<ExecEvent>(64);
+
+    tokio::spawn(async move {
+        loop {
+            match read_msg::<_, WireExecEvent>(&mut reader).await {
+                Ok(WireExecEvent::Stdout(b)) => {
+                    if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(WireExecEvent::Stderr(b)) => {
+                    if tx.send(ExecEvent::Stderr(Bytes::from(b))).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(WireExecEvent::Exit(code)) => {
+                    let _ = tx.send(ExecEvent::Exit(code)).await;
+                    return;
+                }
+                Err(e) => {
+                    // Connection died before Exit: surface as a
+                    // synthetic Exit(None) so the consumer's
+                    // ".next() until Exit" loop terminates.
+                    tracing::warn!(
+                        error = %e,
+                        "agent connection ended without explicit Exit",
+                    );
+                    let _ = tx.send(ExecEvent::Exit(None)).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(ExecStream {
+        sandbox_id,
+        exec_id,
+        events: Box::pin(ReceiverStream::new(rx)),
+    })
 }
 
 /// Wait until either:
@@ -688,8 +748,7 @@ impl SandboxBackend for FirecrackerBackend {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.vsock_uds_path.clone()
         };
-        let agent_socket = agent_socket_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
-        Self::exec_stream_via_agent_socket(id, &agent_socket, cmd).await
+        Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
     }
 
     async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
@@ -961,19 +1020,5 @@ mod tests {
             Err(SandboxError::NotFound) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn agent_socket_path_appends_underscore_port_to_uds_path() {
-        // Lock down the Firecracker convention so a refactor that
-        // moves the suffix into a sibling dir would fail loud.
-        let p = agent_socket_path(Path::new("/tmp/foo.vsock"), 1024);
-        assert_eq!(p, PathBuf::from("/tmp/foo.vsock_1024"));
-    }
-
-    #[test]
-    fn agent_socket_path_handles_paths_with_no_extension() {
-        let p = agent_socket_path(Path::new("/var/run/engram/abc.sock"), 9000);
-        assert_eq!(p, PathBuf::from("/var/run/engram/abc.sock_9000"));
     }
 }

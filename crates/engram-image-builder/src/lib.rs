@@ -39,6 +39,9 @@ pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
 pub use ext4::{recommended_size, Ext4Error, Ext4Packer, Mke2fsPacker};
 
+// AgentInjection is defined below; re-exported here so the public
+// surface is reachable via `engram_image_builder::AgentInjection`.
+
 /// Output format the baker should produce.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Format {
@@ -67,7 +70,48 @@ pub struct BuildRequest {
     /// Firecracker. Defaults to `Directory` so existing callers keep
     /// working.
     pub format: Format,
+    /// Optional: bake `engram-agentd` into the rootfs at
+    /// `/sbin/engram-agentd` plus a small init shim at
+    /// `/sbin/engram-init` that mounts the essentials and exec's
+    /// the agent on a vsock port. When `Some`, the resulting image
+    /// boots straight into the agent — pair with FC's
+    /// `default_boot_args = "... init=/sbin/engram-init"` and the
+    /// host's `exec_stream` reaches the in-guest agent over vsock.
+    pub agent_injection: Option<AgentInjection>,
 }
+
+/// How to put `engram-agentd` inside the rootfs at bake time. Optional
+/// because the dev backend doesn't need it — only Firecracker images
+/// do.
+#[derive(Clone, Debug)]
+pub struct AgentInjection {
+    /// Linux-built `engram-agentd` binary on the host. Copied verbatim
+    /// to `/sbin/engram-agentd` inside the rootfs and chmod'd 0755.
+    pub agent_binary: PathBuf,
+    /// Vsock port the agent should listen on inside the guest. Pair
+    /// this with the host-side `ENGRAM_AGENTD_PORT` constant
+    /// (`engram_sandbox_firecracker::ENGRAM_AGENTD_PORT`, currently
+    /// 1024).
+    pub vsock_port: u32,
+    /// Override the default init script. When `None`, the baker
+    /// writes a minimal `/bin/sh` shim that mounts `/proc`, `/sys`,
+    /// `/dev`, and exec's `engram-agentd --vsock-port <port>`.
+    pub init_script: Option<PathBuf>,
+}
+
+/// Default init shim. Written to `/sbin/engram-init` when an
+/// [`AgentInjection`] is requested without an explicit override.
+/// Requires `/bin/sh` in the rootfs (alpine, debian-slim, ubuntu —
+/// all standard bases ship it).
+const DEFAULT_INIT_SHIM: &str = r#"#!/bin/sh
+# engram-init — minimal init shim. Brings up just enough kernel
+# plumbing for engram-agentd to talk vsock, then exec's it.
+set -e
+mount -t proc  proc /proc 2>/dev/null || true
+mount -t sysfs sys  /sys  2>/dev/null || true
+mount -t devtmpfs dev /dev 2>/dev/null || true
+exec /sbin/engram-agentd --vsock-port __VSOCK_PORT__
+"#;
 
 #[derive(Clone, Debug)]
 pub struct BuildOutcome {
@@ -256,6 +300,14 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Docker(format!("export: {e}")))?;
 
+        // Optional: inject engram-agentd + an init shim before we
+        // pack to ext4. Done after docker export so the rootfs the
+        // user described in their Dockerfile is the base; we just
+        // overlay our agent on top.
+        if let Some(injection) = &req.agent_injection {
+            inject_agent(&rootfs_dir, injection).await?;
+        }
+
         let manifest_path = image_dir.join("manifest.toml");
         let manifest_str = render_manifest(cfg)?;
         tokio::fs::write(&manifest_path, manifest_str).await?;
@@ -315,6 +367,66 @@ fn render_manifest(cfg: &EngramRepoConfig) -> Result<String, BuildError> {
     let manifest = cfg.to_manifest();
     toml::to_string_pretty(&manifest)
         .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
+}
+
+/// Copy the agent binary into `<rootfs>/sbin/engram-agentd`, write the
+/// init shim to `<rootfs>/sbin/engram-init`, and chmod 0755 on both.
+/// Mirrors the layout the kernel boot args expect:
+/// `init=/sbin/engram-init`.
+async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(), BuildError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !injection.agent_binary.exists() {
+        return Err(BuildError::Config(format!(
+            "agent_binary {} does not exist",
+            injection.agent_binary.display()
+        )));
+    }
+
+    let sbin = rootfs_dir.join("sbin");
+    tokio::fs::create_dir_all(&sbin).await?;
+
+    // 1. Agent binary.
+    let agent_dst = sbin.join("engram-agentd");
+    tokio::fs::copy(&injection.agent_binary, &agent_dst)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "copy agent {} -> {}: {e}",
+                    injection.agent_binary.display(),
+                    agent_dst.display()
+                ),
+            )
+        })?;
+    let mut perms = tokio::fs::metadata(&agent_dst).await?.permissions();
+    perms.set_mode(0o755);
+    tokio::fs::set_permissions(&agent_dst, perms).await?;
+
+    // 2. Init shim. Either copied from the override or rendered
+    //    from the bundled template with the vsock port substituted.
+    let init_dst = sbin.join("engram-init");
+    match &injection.init_script {
+        Some(src) => {
+            tokio::fs::copy(src, &init_dst).await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("copy init {} -> {}: {e}", src.display(), init_dst.display()),
+                )
+            })?;
+        }
+        None => {
+            let body =
+                DEFAULT_INIT_SHIM.replace("__VSOCK_PORT__", &injection.vsock_port.to_string());
+            tokio::fs::write(&init_dst, body).await?;
+        }
+    }
+    let mut perms = tokio::fs::metadata(&init_dst).await?.permissions();
+    perms.set_mode(0o755);
+    tokio::fs::set_permissions(&init_dst, perms).await?;
+
+    Ok(())
 }
 
 async fn recursive_size(dir: &Path) -> std::io::Result<u64> {

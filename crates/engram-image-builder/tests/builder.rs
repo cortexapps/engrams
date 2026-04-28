@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engram_image_builder::docker::{BuildArgs, DockerError, DockerRunner};
 use engram_image_builder::ext4::{Ext4Error, Ext4Packer};
-use engram_image_builder::{BuildRequest, Builder, Format};
+use engram_image_builder::{AgentInjection, BuildRequest, Builder, Format};
 
 // ---------------------------------------------------------------------
 // RecordingDocker — mock for unit-shape integration tests
@@ -164,6 +164,7 @@ fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest 
         tag: tag.into(),
         images_dir: images_dir.to_path_buf(),
         format: Format::Directory,
+        agent_injection: None,
     }
 }
 
@@ -769,6 +770,115 @@ async fn build_ext4_propagates_packer_failure_and_keeps_rootfs_for_diagnostics()
     assert!(
         !image_dir.join("rootfs.ext4").exists(),
         "rootfs.ext4 should not exist after a failed pack",
+    );
+}
+
+// ---------------------------------------------------------------------
+// AgentInjection
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn build_directory_with_agent_injection_writes_agent_and_init() {
+    // Lock the layout: /sbin/engram-agentd carries the binary
+    // verbatim, /sbin/engram-init is a shell script with the
+    // negotiated vsock port substituted in. Both 0755.
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    let agent_src = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(agent_src.path(), b"\x7fELF<fake binary>").unwrap();
+    write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
+
+    let docker = RecordingDocker::new()
+        .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
+    let builder = Builder::new(docker);
+
+    let mut request = req(src.path(), images.path(), "p", "warm-1");
+    request.agent_injection = Some(AgentInjection {
+        agent_binary: agent_src.path().to_path_buf(),
+        vsock_port: 1024,
+        init_script: None,
+    });
+
+    let outcome = builder.build(&request).await.expect("bake");
+    let rootfs = &outcome.rootfs_path;
+
+    let agent_dst = rootfs.join("sbin/engram-agentd");
+    let init_dst = rootfs.join("sbin/engram-init");
+    assert!(agent_dst.is_file(), "agent missing at /sbin/engram-agentd");
+    assert!(init_dst.is_file(), "init missing at /sbin/engram-init");
+
+    // Agent bytes match exactly what we passed in.
+    let agent_bytes = std::fs::read(&agent_dst).unwrap();
+    assert_eq!(agent_bytes, b"\x7fELF<fake binary>");
+
+    // Init has the port substituted; doesn't still contain the placeholder.
+    let init_body = std::fs::read_to_string(&init_dst).unwrap();
+    assert!(
+        init_body.contains("--vsock-port 1024"),
+        "init should reference vsock port 1024: {init_body}",
+    );
+    assert!(
+        !init_body.contains("__VSOCK_PORT__"),
+        "placeholder should be substituted: {init_body}",
+    );
+
+    // Both files are world-executable (0755).
+    let agent_mode = std::fs::metadata(&agent_dst).unwrap().permissions().mode();
+    let init_mode = std::fs::metadata(&init_dst).unwrap().permissions().mode();
+    assert_eq!(agent_mode & 0o777, 0o755, "agent mode {agent_mode:o}");
+    assert_eq!(init_mode & 0o777, 0o755, "init mode {init_mode:o}");
+}
+
+#[tokio::test]
+async fn build_with_missing_agent_binary_errors_cleanly() {
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
+    let docker = RecordingDocker::new();
+    let builder = Builder::new(docker);
+
+    let mut request = req(src.path(), images.path(), "p", "warm-1");
+    request.agent_injection = Some(AgentInjection {
+        agent_binary: PathBuf::from("/this/path/does/not/exist"),
+        vsock_port: 1024,
+        init_script: None,
+    });
+
+    let err = builder.build(&request).await.expect_err("should fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("agent_binary") && msg.contains("does not exist"),
+        "error should reference the missing agent binary: {msg}",
+    );
+}
+
+#[tokio::test]
+async fn build_with_init_script_override_uses_provided_script() {
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    let agent_src = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(agent_src.path(), b"\x7fELF").unwrap();
+    let init_src = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(init_src.path(), b"#!/bin/sh\necho custom-init\n").unwrap();
+    write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
+
+    let docker = RecordingDocker::new();
+    let builder = Builder::new(docker);
+
+    let mut request = req(src.path(), images.path(), "p", "warm-1");
+    request.agent_injection = Some(AgentInjection {
+        agent_binary: agent_src.path().to_path_buf(),
+        vsock_port: 1024,
+        init_script: Some(init_src.path().to_path_buf()),
+    });
+
+    let outcome = builder.build(&request).await.expect("bake");
+    let init_body = std::fs::read_to_string(outcome.rootfs_path.join("sbin/engram-init")).unwrap();
+    assert!(
+        init_body.contains("custom-init"),
+        "expected override init body: {init_body}",
     );
 }
 

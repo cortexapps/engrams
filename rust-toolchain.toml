@@ -1,3 +1,9 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
+# x86_64-unknown-linux-musl: needed to build engram-agentd as a fully
+# static binary, so it can run inside any Linux rootfs (debian, alpine,
+# scratch) without depending on a specific glibc / dynamic-linker
+# location. The Nix dev shell brings glibc/ld-linux from /nix/store,
+# which makes a glibc-linked binary unbootable inside a baked image.
+targets = ["x86_64-unknown-linux-musl"]
