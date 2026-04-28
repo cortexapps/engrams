@@ -10,15 +10,16 @@ here="$(dirname "${BASH_SOURCE[0]}")"
 eval "$(bash "$here/fetch-fc-test-artifacts.sh")"
 
 case "${1:-all}" in
-  boot|lifecycle)
+  boot|lifecycle|snapshot)
     exec cargo test -p engram-sandbox-firecracker --test "$1" -- --ignored --nocapture
     ;;
   all)
     cargo test -p engram-sandbox-firecracker --test boot      -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test lifecycle -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test snapshot  -- --ignored --nocapture
     ;;
   *)
-    echo "usage: $0 [boot|lifecycle|all]" >&2
+    echo "usage: $0 [boot|lifecycle|snapshot|all]" >&2
     exit 2
     ;;
 esac

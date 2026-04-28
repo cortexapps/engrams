@@ -123,27 +123,68 @@ impl FirecrackerClient {
         Ok(())
     }
 
-    // ---- snapshot operations (still stubs — wired in next slice) ----
+    // ---- snapshot operations ----------------------------------------
 
-    /// Pause the VM, write a Full snapshot to `dir`, then resume.
-    /// Filled in when the snapshot/restore slice lands.
-    pub async fn create_snapshot(&self, _dir: &Path) -> Result<SnapshotPaths, SandboxError> {
-        Err(SandboxError::Snapshot(
-            "FirecrackerClient::create_snapshot not yet implemented \
-             (target: PATCH /vm Paused + PUT /snapshot/create + PATCH /vm Resumed)"
-                .into(),
-        ))
+    /// Atomically pause → snapshot → resume, writing `state.bin` and
+    /// `memory.bin` to `dir`. Returns the resolved paths so the caller
+    /// can hand them to a future `load_snapshot`.
+    ///
+    /// `dir` must already exist and be writable by the firecracker
+    /// process (which on a non-jailer setup is just the host user).
+    /// The VM stays running on success — snapshots are save-points,
+    /// not eviction.
+    ///
+    /// On failure the VM may be left paused. Callers should follow up
+    /// with `resume()` if the error originated *after* `pause` but
+    /// before the implicit resume below.
+    pub async fn create_snapshot(&self, dir: &Path) -> Result<SnapshotPaths, SandboxError> {
+        let state_path = dir.join("state.bin");
+        let mem_path = dir.join("memory.bin");
+
+        self.pause().await?;
+
+        let body = SnapshotCreateBody {
+            snapshot_path: state_path.to_string_lossy().into_owned(),
+            mem_file_path: mem_path.to_string_lossy().into_owned(),
+            snapshot_type: SnapshotType::Full,
+        };
+        let create_res = self.put("/snapshot/create", &body).await;
+
+        // Always try to resume, regardless of whether the create
+        // succeeded — leaving the VM paused on error is worse than
+        // doubling up on the failure path.
+        let resume_res = self.resume().await;
+
+        create_res?;
+        resume_res?;
+        Ok(SnapshotPaths {
+            state_path,
+            mem_path,
+        })
     }
 
-    /// Restore from `paths` with UFFD-backed memory. Returns once the
-    /// guest is paused and the UFFD handler is registered; pages stream
-    /// in lazily as the guest faults on them.
-    pub async fn load_snapshot(&self, _paths: &SnapshotPaths) -> Result<(), SandboxError> {
-        Err(SandboxError::Snapshot(
-            "FirecrackerClient::load_snapshot not yet implemented \
-             (target: PUT /snapshot/load with backend_type=Uffd)"
-                .into(),
-        ))
+    /// Restore from `paths` with file-backed memory. Returns once the
+    /// VM is fully running again (`resume_vm: true`).
+    ///
+    /// UFFD-backed restore (the load-bearing perf optimisation for
+    /// fast resume) lands as a separate `load_snapshot_uffd` once the
+    /// userfaultfd handler crate is in place — that needs `unsafe`
+    /// for the syscall and deserves its own scrutiny.
+    pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
+        let body = SnapshotLoadBody {
+            snapshot_path: paths.state_path.to_string_lossy().into_owned(),
+            mem_backend: MemBackend {
+                backend_type: MemBackendType::File,
+                backend_path: paths.mem_path.to_string_lossy().into_owned(),
+            },
+            enable_diff_snapshots: false,
+            resume_vm: true,
+        };
+        self.put("/snapshot/load", &body).await
+    }
+
+    pub async fn pause(&self) -> Result<(), SandboxError> {
+        self.patch_vm_state(VmState::Paused).await
     }
 
     pub async fn resume(&self) -> Result<(), SandboxError> {
@@ -418,6 +459,55 @@ pub struct SnapshotPaths {
     pub mem_path: PathBuf,
 }
 
+/// `PUT /snapshot/create` payload. `snapshot_type` is `Full` for a
+/// self-contained snapshot, `Diff` for an incremental one against the
+/// previous Full. We only emit `Full` today.
+#[derive(Debug, Serialize)]
+struct SnapshotCreateBody {
+    snapshot_path: String,
+    mem_file_path: String,
+    snapshot_type: SnapshotType,
+}
+
+/// PascalCase variant names match Firecracker's expected JSON values
+/// (`{"snapshot_type": "Full"}`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum SnapshotType {
+    Full,
+    Diff,
+}
+
+/// `PUT /snapshot/load` payload.
+#[derive(Debug, Serialize)]
+struct SnapshotLoadBody {
+    snapshot_path: String,
+    mem_backend: MemBackend,
+    enable_diff_snapshots: bool,
+    /// `true` makes Firecracker resume the guest immediately after
+    /// load (no separate `PATCH /vm Resumed` needed).
+    resume_vm: bool,
+}
+
+/// How memory is supplied during snapshot load.
+///   - `File`: Firecracker reads the memory file synchronously. Slow
+///     start but simple.
+///   - `Uffd`: a separate userfaultfd handler streams pages on demand.
+///     Sub-100ms restore, but needs the handler process / `unsafe`.
+///     We don't emit this variant today; it lands with the UFFD
+///     handler slice.
+#[derive(Debug, Serialize)]
+struct MemBackend {
+    backend_type: MemBackendType,
+    backend_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+enum MemBackendType {
+    File,
+    #[allow(dead_code)] // surfaced when the UFFD slice lands
+    Uffd,
+}
+
 #[derive(Debug, Deserialize)]
 struct FaultMessage {
     fault_message: String,
@@ -552,5 +642,52 @@ mod tests {
     fn parse_status_code_handles_well_formed_status_line() {
         assert_eq!(parse_status_code("HTTP/1.1 204 No Content"), Some(204));
         assert_eq!(parse_status_code("HTTP/1.1 400 Bad Request"), Some(400));
+    }
+
+    #[test]
+    fn snapshot_create_body_uses_swagger_field_names() {
+        let body = SnapshotCreateBody {
+            snapshot_path: "/snap/state.bin".into(),
+            mem_file_path: "/snap/memory.bin".into(),
+            snapshot_type: SnapshotType::Full,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["snapshot_path"], "/snap/state.bin");
+        assert_eq!(v["mem_file_path"], "/snap/memory.bin");
+        assert_eq!(v["snapshot_type"], "Full");
+    }
+
+    #[test]
+    fn snapshot_load_body_uses_file_backend_by_default() {
+        // PUT /snapshot/load with backend_type=File is what the
+        // FirecrackerClient::load_snapshot helper builds. Lock the
+        // wire shape so a serde rename refactor would fail loud.
+        let body = SnapshotLoadBody {
+            snapshot_path: "/snap/state.bin".into(),
+            mem_backend: MemBackend {
+                backend_type: MemBackendType::File,
+                backend_path: "/snap/memory.bin".into(),
+            },
+            enable_diff_snapshots: false,
+            resume_vm: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["snapshot_path"], "/snap/state.bin");
+        assert_eq!(v["mem_backend"]["backend_type"], "File");
+        assert_eq!(v["mem_backend"]["backend_path"], "/snap/memory.bin");
+        assert_eq!(v["enable_diff_snapshots"], false);
+        assert_eq!(v["resume_vm"], true);
+    }
+
+    #[test]
+    fn snapshot_type_serializes_pascal_case() {
+        assert_eq!(
+            serde_json::to_string(&SnapshotType::Full).unwrap(),
+            "\"Full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotType::Diff).unwrap(),
+            "\"Diff\""
+        );
     }
 }

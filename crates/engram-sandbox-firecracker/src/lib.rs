@@ -5,12 +5,13 @@
 //!
 //! # Status
 //!
-//! `create`, `destroy`, `list` are wired and verified end-to-end —
-//! `tests/lifecycle.rs` round-trips a real microVM through the
-//! `SandboxBackend` trait. `exec_stream` (vsock to in-guest agent),
-//! `snapshot` (PATCH /vm Paused + PUT /snapshot/create), and
-//! `restore` (PUT /snapshot/load with UFFD) remain stubbed —
-//! they're the next slices of Phase 2.
+//! `create`, `destroy`, `list`, `snapshot`, and `restore` are wired
+//! end-to-end and verified by integration tests
+//! (`tests/lifecycle.rs`, `tests/snapshot.rs`). Restore is currently
+//! file-backed (synchronous `mem_file_path` read on load); UFFD-backed
+//! restore — the load-bearing perf optimisation for sub-100ms resume —
+//! lands in its own slice once the userfaultfd handler crate exists.
+//! `exec_stream` still requires the in-guest agent + vsock plumbing.
 //!
 //! # Architecture
 //!
@@ -59,12 +60,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::ids::SandboxId;
+use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
 pub mod client;
@@ -129,6 +132,20 @@ struct LiveSandbox {
     child: Child,
 }
 
+/// Sidecar JSON file written next to `state.bin` and `memory.bin` to
+/// carry fields Firecracker doesn't store itself but our trait surface
+/// needs to reconstruct on restore — primarily the original
+/// `SandboxSpec`. Not consumed by Firecracker; entirely ours.
+///
+/// We don't try to make this format stable across major versions
+/// — snapshots have an implicit shelf life tied to a release.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FcSnapshotManifest {
+    sandbox_id: SandboxId,
+    created_at: DateTime<Utc>,
+    spec: SandboxSpec,
+}
+
 pub struct FirecrackerBackend {
     work_dir: PathBuf,
     config: FirecrackerConfig,
@@ -155,6 +172,58 @@ impl FirecrackerBackend {
     /// Used by the host agent for inspection / heartbeat reporting.
     pub fn snapshot_state(&self, id: SandboxId) -> Option<SandboxState> {
         self.sandboxes.get(&id).map(|r| r.state.clone())
+    }
+
+    /// Allocate the jail dir, spawn `firecracker --api-sock <sock>`
+    /// inside it, and wait until the socket is ready (or the process
+    /// dies during startup). Common to `create_in_jail` and
+    /// `restore_in_jail`. Returns the socket path and the live `Child`.
+    /// On any error after this call, the caller drops the Child —
+    /// `kill_on_drop=true` cleans up.
+    async fn spawn_firecracker(&self, jail_dir: &Path) -> Result<(PathBuf, Child), SandboxError> {
+        tokio::fs::create_dir_all(jail_dir)
+            .await
+            .map_err(|e| vm_err(format!("create jail dir {}: {e}", jail_dir.display())))?;
+
+        let socket = jail_dir.join("firecracker.sock");
+        // Firecracker refuses to start if the socket already exists.
+        let _ = tokio::fs::remove_file(&socket).await;
+        let log_path = jail_dir.join("firecracker.log");
+
+        // stdout (serial console) + stderr (firecracker's own logs)
+        // go to a per-sandbox log file so they're recoverable for
+        // diagnostics without polluting the host-agent's stdout.
+        let log = std::fs::File::create(&log_path)
+            .map_err(|e| vm_err(format!("open log {}: {e}", log_path.display())))?;
+        let log_clone = log
+            .try_clone()
+            .map_err(|e| vm_err(format!("dup log fd: {e}")))?;
+
+        let mut child = Command::new(&self.config.firecracker_bin)
+            .args(["--api-sock", socket.to_string_lossy().as_ref()])
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_clone))
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                vm_err(format!(
+                    "spawn {}: {e}",
+                    self.config.firecracker_bin.display()
+                ))
+            })?;
+
+        // Race the socket appearing against the process exiting. If
+        // firecracker dies during startup, surface that with the log.
+        if let Err(e) = wait_for_socket(&socket, Duration::from_secs(5), &mut child).await {
+            let _ = child.kill().await;
+            let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
+            return Err(vm_err(format!(
+                "firecracker did not open API socket: {e}\n--- firecracker log ---\n{log_tail}"
+            )));
+        }
+
+        Ok((socket, child))
     }
 
     /// Run the create lifecycle inside a per-sandbox jail dir. Split out
@@ -194,47 +263,7 @@ impl FirecrackerBackend {
             )));
         }
 
-        tokio::fs::create_dir_all(jail_dir)
-            .await
-            .map_err(|e| vm_err(format!("create jail dir {}: {e}", jail_dir.display())))?;
-
-        let socket = jail_dir.join("firecracker.sock");
-        // Firecracker refuses to start if the socket already exists.
-        let _ = tokio::fs::remove_file(&socket).await;
-        let log_path = jail_dir.join("firecracker.log");
-
-        // Spawn firecracker. stdout (serial console) + stderr (its own
-        // logs) go to a per-sandbox log file so they're recoverable for
-        // diagnostics without polluting the host-agent's stdout.
-        let log = std::fs::File::create(&log_path)
-            .map_err(|e| vm_err(format!("open log {}: {e}", log_path.display())))?;
-        let log_clone = log
-            .try_clone()
-            .map_err(|e| vm_err(format!("dup log fd: {e}")))?;
-
-        let mut child = Command::new(&self.config.firecracker_bin)
-            .args(["--api-sock", socket.to_string_lossy().as_ref()])
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_clone))
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                vm_err(format!(
-                    "spawn {}: {e}",
-                    self.config.firecracker_bin.display()
-                ))
-            })?;
-
-        // Race the socket appearing against the process exiting. If
-        // firecracker dies during startup, surface that with the log.
-        if let Err(e) = wait_for_socket(&socket, Duration::from_secs(5), &mut child).await {
-            let _ = child.kill().await;
-            let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
-            return Err(vm_err(format!(
-                "firecracker did not open API socket: {e}\n--- firecracker log ---\n{log_tail}"
-            )));
-        }
+        let (socket, child) = self.spawn_firecracker(jail_dir).await?;
 
         // Configure + start. Any failure here means the Child gets
         // dropped (and SIGKILL'd via kill_on_drop) by the outer
@@ -277,6 +306,60 @@ impl FirecrackerBackend {
         self.sandboxes
             .insert(sandbox_id, LiveSandbox { state, child });
         tracing::info!(%sandbox_id, jail = %jail_dir.display(), "firecracker microVM started");
+        Ok(())
+    }
+
+    /// Stand up a fresh Firecracker process and load `snapshot_dir`'s
+    /// `state.bin`/`memory.bin` into it. Symmetric with `create_in_jail`
+    /// — same outer cleanup contract on error.
+    async fn restore_in_jail(
+        &self,
+        sandbox_id: SandboxId,
+        jail_dir: &Path,
+        snapshot_dir: &Path,
+        manifest: &FcSnapshotManifest,
+    ) -> Result<(), SandboxError> {
+        let state_path = snapshot_dir.join("state.bin");
+        let mem_path = snapshot_dir.join("memory.bin");
+        for (label, p) in [("state.bin", &state_path), ("memory.bin", &mem_path)] {
+            if !p.exists() {
+                return Err(SandboxError::Snapshot(format!(
+                    "snapshot {label} missing at {}",
+                    p.display()
+                )));
+            }
+        }
+
+        let (socket, child) = self.spawn_firecracker(jail_dir).await?;
+        let api = FirecrackerClient::new(&socket);
+
+        // resume_vm: true inside load_snapshot makes Firecracker start
+        // executing the guest immediately — no separate PATCH /vm.
+        api.load_snapshot(&SnapshotPaths {
+            state_path: state_path.clone(),
+            mem_path: mem_path.clone(),
+        })
+        .await?;
+
+        // Carry the manifest's spec forward so SandboxState reflects
+        // what the snapshot was taken from. rootfs_path mirrors what
+        // the original VM had attached — Firecracker reopens that
+        // path on load, so it must still be valid on disk.
+        let rootfs_path = manifest.spec.rootfs_source.clone().unwrap_or_default();
+        let state = SandboxState {
+            spec: manifest.spec.clone(),
+            firecracker_socket: socket,
+            rootfs_path,
+            vsock_cid: 0,
+        };
+        self.sandboxes
+            .insert(sandbox_id, LiveSandbox { state, child });
+        tracing::info!(
+            %sandbox_id,
+            jail = %jail_dir.display(),
+            from = %snapshot_dir.display(),
+            "firecracker microVM restored from snapshot",
+        );
         Ok(())
     }
 }
@@ -359,44 +442,80 @@ impl SandboxBackend for FirecrackerBackend {
         Err(unimplemented("exec_stream", "vsock to engram-agentd"))
     }
 
-    async fn snapshot(
-        &self,
-        _id: SandboxId,
-        _dest: &Path,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        // TODO(phase-2):
-        //   1. PATCH /vm { state: "Paused" }
-        //   2. PUT /snapshot/create {
-        //          snapshot_path: dest/state.bin,
-        //          mem_file_path: dest/memory.bin,
-        //          snapshot_type: "Full" | "Diff"
-        //      }
-        //   3. PATCH /vm { state: "Resumed" }   (snapshot keeps VM live)
-        // Diff snapshots use KVM_GET_DIRTY_LOG; we'll start with Full
-        // and add Diff once the eviction policy needs it.
-        Err(unimplemented(
-            "snapshot",
-            "PATCH /vm Paused + PUT /snapshot/create",
-        ))
+    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
+        // Read sandbox state under the dashmap guard, drop guard before
+        // any await so we don't hold the read lock across an HTTP call.
+        let (socket, spec) = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            (
+                live.state.firecracker_socket.clone(),
+                live.state.spec.clone(),
+            )
+        };
+
+        tokio::fs::create_dir_all(dest).await.map_err(|e| {
+            SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
+        })?;
+
+        // pause → PUT /snapshot/create → resume happens inside the
+        // client; a failure mid-sequence still tries to resume the
+        // VM rather than leaving it stuck Paused.
+        let api = FirecrackerClient::new(&socket);
+        let paths = api.create_snapshot(dest).await?;
+
+        let created_at = Utc::now();
+        let manifest = FcSnapshotManifest {
+            sandbox_id: id,
+            created_at,
+            spec: spec.clone(),
+        };
+        let manifest_path = dest.join("manifest.json");
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("manifest serialize: {e}")))?;
+        tokio::fs::write(&manifest_path, manifest_bytes)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("write manifest: {e}")))?;
+
+        // Sum the three artefacts so callers know the size_bytes that
+        // landed in `dest`. memory.bin dominates (= guest RAM size).
+        let mut size_bytes = 0u64;
+        for p in [&paths.state_path, &paths.mem_path, &manifest_path] {
+            size_bytes += tokio::fs::metadata(p)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?
+                .len();
+        }
+
+        Ok(SnapshotMetadata {
+            id: SnapshotId::new(),
+            size_bytes,
+            created_at,
+            image_version: spec.image,
+        })
     }
 
-    async fn restore(&self, _src: PathBuf) -> Result<SandboxId, SandboxError> {
-        // TODO(phase-2):
-        //   1. Spawn a fresh firecracker-jailer.
-        //   2. PUT /snapshot/load {
-        //          snapshot_path: src/state.bin,
-        //          mem_backend: { backend_type: "Uffd",
-        //                         backend_path: <our uffd handler socket> },
-        //          enable_diff_snapshots: false,
-        //          resume_vm: true
-        //      }
-        //   3. The handler at `backend_path` pages in 4KiB at a time
-        //      from `src/memory.bin` (or BlobStorage) on guest fault.
-        //      This is what gives sub-100ms resume.
-        Err(unimplemented(
-            "restore",
-            "PUT /snapshot/load with UFFD memory backend",
-        ))
+    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+        let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
+        let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
+
+        // Always allocate a *fresh* sandbox id — same on-disk state,
+        // different lifecycle handle.
+        let sandbox_id = SandboxId::new();
+        let jail_dir = self.work_dir.join(sandbox_id.to_string());
+
+        match self
+            .restore_in_jail(sandbox_id, &jail_dir, &src, &manifest)
+            .await
+        {
+            Ok(()) => Ok(sandbox_id),
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&jail_dir).await;
+                Err(e)
+            }
+        }
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -526,34 +645,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_returns_typed_stub_error_referencing_firecracker_api() {
+    async fn snapshot_unknown_id_is_not_found() {
+        // Same contract ProcessBackend follows. Surfaces as NotFound
+        // (not a Firecracker API error) because we never spawned a
+        // VM to talk to.
         let (b, _d) = backend();
         match b.snapshot(SandboxId::new(), Path::new("/tmp/x")).await {
-            Err(SandboxError::Vm(e)) => {
-                let msg = e.to_string();
-                assert!(msg.contains("snapshot"));
-                assert!(
-                    msg.contains("/snapshot/create") || msg.contains("Paused"),
-                    "error names the Firecracker snapshot endpoint",
-                );
-            }
-            other => panic!("expected Vm error, got {other:?}"),
+            Err(SandboxError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn restore_error_references_uffd() {
+    async fn restore_with_missing_manifest_errors_cleanly() {
+        // Restoring from a non-existent dir shouldn't try to spawn
+        // firecracker — manifest read is the first step and it should
+        // fail loudly with a Snapshot error.
         let (b, _d) = backend();
-        match b.restore(PathBuf::from("/tmp/x")).await {
-            Err(SandboxError::Vm(e)) => {
-                let msg = e.to_string();
+        match b.restore(PathBuf::from("/nonexistent/snapshot/dir")).await {
+            Err(SandboxError::Snapshot(msg)) => {
                 assert!(
-                    msg.to_lowercase().contains("uffd")
-                        || msg.contains("/snapshot/load"),
-                    "stub must point at the UFFD restore path so the next implementer knows where to wire",
+                    msg.contains("manifest"),
+                    "error should reference the missing manifest: {msg}",
                 );
             }
-            other => panic!("expected Vm error, got {other:?}"),
+            other => panic!("expected Snapshot error, got {other:?}"),
         }
     }
 }
