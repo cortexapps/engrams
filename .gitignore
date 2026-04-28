@@ -1,0 +1,30 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# sqlx offline cache (regenerated)
+/.sqlx
+
+# local snapshot/blob storage during dev (root + per-crate test artifacts)
+var/
+data/
+
+# nix / direnv
+result
+result-*
+/.direnv/
+/.envrc.local

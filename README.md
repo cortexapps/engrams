@@ -43,7 +43,19 @@ The dev backend is for fast iteration; it deliberately doesn't try to mimic prod
 
 ## Quick start (dev, macOS or Linux)
 
-Requires Rust >= 1.80, Docker, and `just` ([install](https://github.com/casey/just)).
+The pinned toolchain (Rust, `just`, `jq`, `sqlx-cli`, `psql`, `protoc`, `pkg-config`, `openssl`) lives in `flake.nix`. Both options work:
+
+**With Nix (recommended)** — same toolchain hashes on macOS aarch64 and Linux x86_64:
+
+```bash
+nix develop      # drops you into a shell with everything pinned
+```
+
+If you use [direnv](https://direnv.net), `direnv allow` once and the shell auto-activates whenever you `cd` in. Don't have Nix? The [Determinate Systems installer](https://install.determinate.systems) is one line and uninstalls cleanly.
+
+**Without Nix** — install Rust >= 1.80, Docker, and `just` ([install](https://github.com/casey/just)) yourself.
+
+Either way, run the dev stack:
 
 ```bash
 just dev          # postgres + coordinator with the subprocess backend
