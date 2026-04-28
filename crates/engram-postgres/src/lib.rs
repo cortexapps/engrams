@@ -389,6 +389,54 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::snapshot_from_row(&r)).transpose()
     }
 
+    async fn list_pending_replications(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<SnapshotRecord>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, host_id, local_path, blob_url,
+                   image_version, size_bytes, replicated_at,
+                   created_at, last_accessed_at
+              FROM snapshots
+             WHERE blob_url IS NULL
+               AND local_path IS NOT NULL
+             ORDER BY created_at
+             LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::snapshot_from_row).collect()
+    }
+
+    async fn mark_snapshot_replicated(
+        &self,
+        id: engram_core::SnapshotId,
+        blob_url: String,
+    ) -> Result<(), MetaError> {
+        let n = sqlx::query(
+            r#"
+            UPDATE snapshots
+               SET blob_url      = $2,
+                   replicated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(blob_url)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
         sqlx::query(
             r#"

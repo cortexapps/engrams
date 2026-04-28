@@ -78,11 +78,17 @@ impl SnapshotManager {
         v.into_iter().map(|s| s.id).collect()
     }
 
-    /// Phase 2: stream `local_path` -> `blob.put(key, ...)` with zstd-3
-    /// compression in flight, then mark `replicated_at`.
+    /// Replication is now driven coordinator-side by
+    /// `engram-coordinator::replication`, which polls
+    /// `MetadataStore::list_pending_replications` and uploads via
+    /// the BlobStorage configured at the coordinator. This in-memory
+    /// `SnapshotManager` is the LRU eviction layer that activates
+    /// once local disk fills past `cap_bytes`; it intentionally
+    /// doesn't drive uploads of its own. Left as a no-op for callers
+    /// that haven't migrated yet — replicating-from-here is dead
+    /// code, harmless to invoke.
     pub async fn replicate(&self, _id: SnapshotId) {
         let _ = &self.blob;
-        // TODO(phase-2)
     }
 }
 

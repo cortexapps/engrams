@@ -231,6 +231,40 @@ impl MetadataStore for MockMetadataStore {
             .and_then(|v| v.last().cloned()))
     }
 
+    async fn list_pending_replications(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<SnapshotRecord>, MetaError> {
+        let g = self.snapshots.lock();
+        let mut out: Vec<SnapshotRecord> = g
+            .values()
+            .flatten()
+            .filter(|s| s.blob_url.is_none() && s.local_path.is_some())
+            .cloned()
+            .collect();
+        out.sort_by_key(|s| s.created_at);
+        out.truncate(limit.max(0) as usize);
+        Ok(out)
+    }
+
+    async fn mark_snapshot_replicated(
+        &self,
+        id: engram_core::SnapshotId,
+        blob_url: String,
+    ) -> Result<(), MetaError> {
+        let mut g = self.snapshots.lock();
+        for v in g.values_mut() {
+            for s in v.iter_mut() {
+                if s.id == id {
+                    s.blob_url = Some(blob_url);
+                    s.replicated_at = Some(Utc::now());
+                    return Ok(());
+                }
+            }
+        }
+        Err(MetaError::NotFound)
+    }
+
     async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
         self.images
             .lock()

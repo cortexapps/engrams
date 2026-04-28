@@ -665,14 +665,17 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 - ✅ Coordinator config plumbing — `--kernel-image-path` / `ENGRAM_KERNEL_IMAGE_PATH`; `FirecrackerConfig::{kernel_image_path, default_boot_args, restore_mode, uffd_handler_bin}`.
 - ✅ 5 integration tests against real microVMs on the GCP dev VM — `boot`, `lifecycle`, `snapshot`, `snapshot_uffd`, `exec_real_vm` (full bake → boot → vsock CONNECT → exec → assert stdout).
 
-**Deferred** (rolled into Phase 6 production hardening, since they're orthogonal to "the trait surface works"):
+**Done in follow-up PRs:**
+
+- ✅ **Snapshot replication path** — coordinator-side driver in `engram-coordinator::replication` polls `MetadataStore::list_pending_replications` every ~30s, tar+zstd-3-compresses each pending snapshot's `local_path`, streams to `BlobStorage::put`, then stamps `blob_url` + `replicated_at` via `mark_snapshot_replicated`. Once a snapshot is replicated the host-side `SnapshotManager`'s LRU layer can evict it under disk-cap pressure (LRU itself is dormant code today, activates when host disk fills). Coordinator-driven works for any deployment where coord can read the host's filesystem (`--mode=all`, co-located fs); true multi-machine adds a host-side `UploadSnapshot` RPC. The original Phase 2 TODO on `engram-host-agent::snapshot::replicate` is now a no-op pass-through pointing at the coord-side driver.
+
+**Still deferred** (rolled into Phase 6 production hardening, since they're orthogonal to "the trait surface works"):
 
 - `firecracker-jailer` integration (drop privileges, chroot, cgroups, seccomp, `/dev/kvm` fd passing)
 - TAP networking + per-VM IP allocation
 - Broker-mode HTTPS proxy (secret value substitution at the network boundary)
 - Network policy enforcement via iptables/nftables at the TAP boundary
 - `SendCtrlAltDel` graceful shutdown; agent-side shutdown handshake
-- Snapshot manager replication path (`replicate()` TODO → stream local → BlobStorage with zstd-3, mark `replicated_at`, LRU eviction once replicated)
 - Real `engram-storage-{gcs,s3}` SDK calls (currently typed stubs)
 - First-frame token auth on the in-guest agent
 - The full agent verb set (`Stat` / `Upload` / `Download` / `Ping` / `Shutdown` — exec-only today)

@@ -139,6 +139,19 @@ impl MetadataStore for MiniMeta {
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         Ok(None)
     }
+    async fn list_pending_replications(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<SnapshotRecord>, MetaError> {
+        Ok(Vec::new())
+    }
+    async fn mark_snapshot_replicated(
+        &self,
+        _id: engram_core::SnapshotId,
+        _blob_url: String,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
     async fn upsert_image_version(&self, _v: ImageVersion) -> Result<(), MetaError> {
         Ok(())
     }

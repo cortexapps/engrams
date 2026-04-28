@@ -16,6 +16,7 @@ pub mod error;
 pub mod host_registry;
 pub mod image_registry;
 pub mod pg_listener;
+pub mod replication;
 pub mod scheduler;
 pub mod state;
 
@@ -80,6 +81,19 @@ pub async fn run_with_registry(
         meta_for_listener.clone(),
         state.events.clone(),
         state.host_registry.clone(),
+    );
+
+    // Phase 2 follow-up: snapshot replication driver. Polls for
+    // snapshots that landed on a host's local disk but haven't been
+    // pushed to BlobStorage yet, tar+zstd-compresses the directory,
+    // and uploads. Once a snapshot is replicated the host's local
+    // copy is safe to evict under LRU pressure (LRU itself lives in
+    // the host-side SnapshotManager). Drops the JoinHandle — task
+    // lives for the coordinator's lifetime.
+    let _replication = replication::spawn(
+        replication::ReplicationConfig::default(),
+        state.services.blob.clone(),
+        meta_for_listener.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own
