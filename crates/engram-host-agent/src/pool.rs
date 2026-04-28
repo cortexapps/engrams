@@ -90,6 +90,27 @@ impl Pool {
             .unwrap_or(0)
     }
 
+    /// Build the per-pool view the heartbeat ships to the coordinator.
+    /// Iterates configured pool entries (the ones for which `replenish`
+    /// has a recipe); a pool that has only ever had `ready` items
+    /// pushed without `configure` would be omitted, but that path
+    /// isn't used in production.
+    pub fn snapshot_reports(&self) -> Vec<engram_protocol::WarmPoolReport> {
+        let g = self.inner.lock();
+        g.cfg
+            .iter()
+            .map(|(key, entry)| {
+                let ready = g.ready.get(key).map(|v| v.len() as u32).unwrap_or(0);
+                engram_protocol::WarmPoolReport {
+                    repo: key.repo.clone(),
+                    image_version: key.image_version.clone(),
+                    ready,
+                    target: entry.target,
+                }
+            })
+            .collect()
+    }
+
     /// Take a warm sandbox if one is ready. The caller is responsible
     /// for triggering replenish to top the pool back up.
     pub fn checkout(&self, key: &PoolKey) -> Option<SandboxId> {

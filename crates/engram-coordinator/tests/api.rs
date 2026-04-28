@@ -338,11 +338,21 @@ impl TestFixture {
         let blob_dir = tempfile::tempdir().expect("blob tempdir").keep();
         let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
         let images_dir = tempfile::tempdir().expect("images tempdir").keep();
+        // Match production wiring: the host-side PooledBackend wraps
+        // the real backend so warm-pool semantics (checkout / configure /
+        // replenish) work the same way the multi-host setup runs them.
+        // `warm_pool_size = 0` skips pooling entirely (every session
+        // takes the cold path).
+        let raw: Arc<dyn engram_core::traits::SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_dir));
+        let backend: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(
+            engram_host_agent::pooled_backend::PooledBackend::new(raw, warm_pool_size),
+        );
         let services = Services {
             meta,
             blob: Arc::new(LocalStorage::new(blob_dir)),
             cloud: Arc::new(MockCloud::new()),
-            sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
+            sandbox: backend,
             secrets: Arc::new(secrets),
             images: ImageRegistry::new(images_dir.clone()),
         };

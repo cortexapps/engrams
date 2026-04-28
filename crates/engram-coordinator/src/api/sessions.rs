@@ -13,7 +13,6 @@ use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
 use crate::image_registry::{ImageError, Rootfs};
 use crate::state::{SessionEvent, SharedState};
-use engram_host_agent::pool::PoolKey;
 
 /// Default sandbox sizing for sessions created without explicit limits.
 /// Phase 1 numbers — will move to per-repo `engram.toml` config later.
@@ -215,99 +214,47 @@ pub async fn create_session(
         workdir: None,
     };
 
-    // 3. Configure the pool with this spec (idempotent — same key
-    //    just refreshes the spec) and try a warm checkout. On miss,
-    //    fall through to a synchronous create so callers don't wait
-    //    for the warmer.
-    let pool_key = PoolKey {
-        repo: req.repo.clone(),
-        image_version: image_version.clone(),
+    // 3. Scheduler picks a host based on heartbeat-derived state
+    //    (snapshot affinity → warm-pool match → capacity), then the
+    //    host's `PooledBackend` opportunistically returns a warm slot
+    //    or creates fresh as needed. The pool, replenish loop, and
+    //    spec storage all live host-side now — the coordinator just
+    //    routes.
+    let ctx = ScheduleContext {
+        repo: &req.repo,
+        image_version: &image_version,
+        prefer_snapshot_id: None,
+        memory_mib: Some(vm_spec.memory.max_mib),
     };
-    let target = state.cfg.default_warm_pool_size;
-    if target > 0 {
-        state
-            .pool
-            .configure(pool_key.clone(), target, vm_spec.clone());
-    }
-
-    let sandbox_id = match state.pool.checkout(&pool_key) {
-        Some(id) => {
-            tracing::debug!(
-                session_id = %session_id,
-                sandbox_id = %id,
-                "session served from warm pool",
-            );
-            // The pool's checkout returned a sandbox_id; HostRegistry
-            // recorded its host_id when `replenish` originally created
-            // it. Surface that to the metadata row so the next access
-            // can route directly without re-running the scheduler.
-            if let Some(host_id) = state.host_registry.host_of(id) {
-                let _ = state
-                    .services
-                    .meta
-                    .assign_session_host(session_id, Some(host_id))
-                    .await;
+    let sandbox_id = match state.host_registry.create_for_session(&ctx, vm_spec).await {
+        Ok((host_id, id)) => {
+            if let Err(e) = state
+                .services
+                .meta
+                .assign_session_host(session_id, Some(host_id))
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    host_id = %host_id,
+                    error = %e,
+                    "assign_session_host failed; routing still works via HostRegistry"
+                );
             }
             id
         }
-        None => {
-            // Cold path: scheduler picks a host based on heartbeat-
-            // derived state, then we create the sandbox on that host.
-            let ctx = ScheduleContext {
-                repo: &req.repo,
-                image_version: &image_version,
-                prefer_snapshot_id: None,
-                memory_mib: Some(vm_spec.memory.max_mib),
-            };
-            match state.host_registry.create_for_session(&ctx, vm_spec).await {
-                Ok((host_id, id)) => {
-                    if let Err(e) = state
-                        .services
-                        .meta
-                        .assign_session_host(session_id, Some(host_id))
-                        .await
-                    {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            host_id = %host_id,
-                            error = %e,
-                            "assign_session_host failed; routing still works via HostRegistry"
-                        );
-                    }
-                    id
-                }
-                Err(e) => {
-                    // Best-effort: mark the row failed and bubble the error.
-                    // We don't tear down the row — Postgres remains the
-                    // audit trail for the failure.
-                    let _ = state
-                        .services
-                        .meta
-                        .set_session_status(session_id, SessionStatus::Failed)
-                        .await;
-                    return Err(e.into());
-                }
-            }
+        Err(e) => {
+            // Best-effort: mark the row failed and bubble the error.
+            // We don't tear down the row — Postgres remains the
+            // audit trail for the failure.
+            let _ = state
+                .services
+                .meta
+                .set_session_status(session_id, SessionStatus::Failed)
+                .await;
+            return Err(e.into());
         }
     };
-
-    // 4. Top the pool back up in the background. We don't await — the
-    //    request finishes immediately; the next session in this
-    //    bucket gets the freshly-created warm slot.
-    if target > 0 {
-        let pool = state.pool.clone();
-        let key = pool_key.clone();
-        tokio::spawn(async move {
-            if let Err(e) = pool.replenish(&key).await {
-                tracing::warn!(
-                    error = %e,
-                    repo = %key.repo,
-                    image = %key.image_version,
-                    "background pool replenish failed",
-                );
-            }
-        });
-    }
 
     state.registry.bind(session_id, sandbox_id);
     state

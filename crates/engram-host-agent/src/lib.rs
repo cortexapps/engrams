@@ -18,6 +18,7 @@ pub mod config;
 pub mod dialer;
 pub mod heartbeat;
 pub mod pool;
+pub mod pooled_backend;
 pub mod resource;
 pub mod snapshot;
 
@@ -60,21 +61,34 @@ impl HostAgent {
                 coordinator = %coord_url,
                 "dialing coordinator",
             );
-            // No real Pool wiring yet — for 3b the host-agent doesn't
-            // run a warm pool of its own (the coordinator's pool was
-            // historically owned in-process). The heartbeat reports
-            // empty pools/snapshots; the scheduler falls through to
-            // capacity-based ranking. Real pool reporting lands once
-            // the Pool moves host-side in a follow-up.
+            // Wrap the underlying SandboxBackend in a PooledBackend so
+            // `create()` opportunistically returns warm slots and the
+            // heartbeat ships real `(ready, target)` counts to the
+            // coordinator's scheduler. With this in place the
+            // scheduler's warm-pool branch in pick_for_session
+            // actually fires instead of falling through to capacity.
+            let pooled = Arc::new(pooled_backend::PooledBackend::new(
+                self.sandbox.clone(),
+                self.cfg.warm_pool_size,
+            ));
+            let pooled_for_dialer: Arc<dyn engram_core::traits::SandboxBackend> = pooled.clone();
+            let pooled_for_hb = pooled.clone();
+            let provider: dialer::HeartbeatProvider = std::sync::Arc::new(move || {
+                (
+                    engram_protocol::HostCapacityReport::default(),
+                    pooled_for_hb.snapshot_warm_pools(),
+                    Vec::new(),
+                    false,
+                )
+            });
             let dialer_cfg = dialer::DialerConfig {
                 coordinator_url: coord_url,
                 auth_token: self.cfg.coordinator_token.clone(),
                 heartbeat_interval: self.cfg.heartbeat_interval,
-                heartbeat_provider: None,
+                heartbeat_provider: Some(provider),
             };
-            let backend = self.sandbox.clone();
             let dialer_task = tokio::spawn(async move {
-                if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, backend).await {
+                if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, pooled_for_dialer).await {
                     tracing::error!(error = %e, "dialer terminated with error");
                 }
             });

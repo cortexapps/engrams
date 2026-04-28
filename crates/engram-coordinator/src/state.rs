@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionStatus};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
-use engram_host_agent::pool::Pool;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -209,19 +208,22 @@ pub struct AppState {
     /// to clone (`Arc` clone), so handlers freely take a reference and
     /// the listener task takes its own.
     pub events: Arc<SessionEventBus>,
-    pub pool: Pool,
-    /// Multi-host routing layer. In Phase 3a single-host or `--mode=all`
-    /// this has exactly one entry registered at startup; `--mode=coordinator`
-    /// fills it in as hosts dial `/api/hosts/connect`. `services.sandbox`
-    /// is this same object cast to `Arc<dyn SandboxBackend>` so existing
-    /// call sites route through it transparently.
+    /// Multi-host routing layer. In `--mode=all` this has exactly one
+    /// entry registered at startup (the local backend, wrapped in
+    /// `engram_host_agent::pooled_backend::PooledBackend` so warm-pool
+    /// semantics still apply); `--mode=coordinator` fills it in as
+    /// hosts dial `/api/hosts/connect`. The warm pool is host-side
+    /// now — the coordinator just routes via the scheduler and lets
+    /// each host's `PooledBackend` handle checkout/replenish.
     pub host_registry: Arc<HostRegistry>,
 }
 
 impl AppState {
     /// Convenience constructor for tests and `--mode=all`-flavoured
     /// embeddings: builds a fresh `HostRegistry` and pre-registers
-    /// `services.sandbox` as the sole host. Production
+    /// `services.sandbox` as the sole host. Callers that want warm-
+    /// pool semantics in this single-host setup should pass a
+    /// `PooledBackend`-wrapped `services.sandbox`. Production
     /// `--mode=coordinator` should use [`AppState::new_with_registry`]
     /// to thread a registry that hosts dial into via WS.
     pub fn new(cfg: CoordinatorConfig, services: Services) -> Self {
@@ -230,22 +232,18 @@ impl AppState {
         Self::new_with_registry(cfg, services, registry)
     }
 
-    /// Construct an AppState whose `services.sandbox` already routes via
-    /// the supplied `HostRegistry`. The pool reuses the same registry
-    /// so `replenish()` calls fan out to whichever host the registry's
-    /// scheduler picks.
+    /// Construct an AppState whose `services.sandbox` already routes
+    /// via the supplied `HostRegistry`.
     pub fn new_with_registry(
         cfg: CoordinatorConfig,
         services: Services,
         host_registry: Arc<HostRegistry>,
     ) -> Self {
-        let pool = Pool::new(services.sandbox.clone());
         Self {
             cfg,
             services,
             registry: SandboxRegistry::new(),
             events: Arc::new(SessionEventBus::default()),
-            pool,
             host_registry,
         }
     }

@@ -189,7 +189,7 @@ async fn main() -> Result<(), CoordinatorError> {
     let host_registry = Arc::new(HostRegistry::new());
 
     if matches!(cli.mode, RunMode::All) {
-        let local_backend: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
+        let raw_backend: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
             SandboxBackendChoice::Firecracker => {
                 let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
                     CoordinatorError::Config(
@@ -209,10 +209,22 @@ async fn main() -> Result<(), CoordinatorError> {
                 Arc::new(ProcessBackend::new(cli.sandbox_work_dir.clone()))
             }
         };
+        // Wrap in PooledBackend so warm-pool semantics still apply in
+        // --mode=all (the same wrapper that production multi-host
+        // deployments run inside their host-agent process). Without
+        // this, single-binary dev would lose sub-second session
+        // checkout for repeat (repo, image_version) hits.
+        let pooled_backend: Arc<dyn SandboxBackend> = Arc::new(
+            engram_host_agent::pooled_backend::PooledBackend::new(
+                raw_backend,
+                cli.warm_pool_size,
+            ),
+        );
         let in_proc_host = HostId::new();
-        host_registry.register(in_proc_host, local_backend);
+        host_registry.register(in_proc_host, pooled_backend);
         tracing::info!(
             host_id = %in_proc_host,
+            warm_pool_size = cli.warm_pool_size,
             "registered in-process host (--mode=all bypasses the WS path)",
         );
     } else {

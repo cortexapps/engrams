@@ -164,7 +164,12 @@ impl HostRegistry {
             }
         }
 
-        // Warm-pool affinity: highest `ready` count wins.
+        // Warm-pool affinity: highest `ready` count for this
+        // `image_version` wins. The pool's `repo` field is diagnostic
+        // only — host-side `PooledBackend` keys on image_version
+        // alone, so two repos sharing an image share warm slots,
+        // which is the right behaviour: the pool's job is to amortise
+        // create-time cost per image, not enforce per-repo isolation.
         let mut best_warm: Option<(u32, HostId, Arc<dyn SandboxBackend>)> = None;
         for entry in self.hosts.iter() {
             let st = entry.value().state.read();
@@ -172,7 +177,7 @@ impl HostRegistry {
                 continue;
             }
             for pool in &st.warm_pools {
-                if pool.repo == ctx.repo && pool.image_version == ctx.image_version && pool.ready > 0 {
+                if pool.image_version == ctx.image_version && pool.ready > 0 {
                     let candidate = (pool.ready, *entry.key(), entry.value().backend.clone());
                     best_warm = match best_warm {
                         Some((cur, _, _)) if cur >= pool.ready => best_warm,
@@ -531,10 +536,23 @@ mod tests {
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_warm);
 
-        // Different repo: warm-pool match doesn't apply, capacity wins.
+        // Different repo, same image: warm pool still applies because
+        // the host-side pool keys on image_version only. The h_warm
+        // host's warm slot for image "v" services any repo using v.
         let ctx = ScheduleContext {
             repo: "other",
             image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: None,
+        };
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_warm);
+
+        // Different image: warm-pool match doesn't apply, capacity
+        // wins (h_big has 16x more free RAM than h_warm).
+        let ctx = ScheduleContext {
+            repo: "r",
+            image_version: "other-image",
             prefer_snapshot_id: None,
             memory_mib: None,
         };
