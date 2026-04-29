@@ -68,6 +68,47 @@ enum SessionCmd {
         #[arg(long)]
         since: Option<i64>,
     },
+    /// Show the conversation timeline (`session_events`) or the
+    /// workspace `git log` for a session's checkpoint branch.
+    Log {
+        id: String,
+        /// `conversation` (default) or `workspace`.
+        #[arg(long, default_value = "conversation")]
+        kind: String,
+        /// Cap on rows / commits returned.
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Show the workspace diff between the session's checkpoint
+    /// branch and `--vs` (defaults to the session's base branch).
+    Diff {
+        id: String,
+        #[arg(long)]
+        vs: Option<String>,
+    },
+    /// Fork a session at HEAD or at `--at <event_idx>`. Creates a
+    /// new session row whose checkpoint branch starts at the
+    /// referenced workspace commit.
+    Fork {
+        id: String,
+        /// Fork point in the source's `session_events` log.
+        /// Defaults to "fork from current HEAD".
+        #[arg(long)]
+        at: Option<i64>,
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Resume an Idle / PendingReassign session. With `--from N`,
+    /// rewinds the workspace to the checkpoint at or before that
+    /// event_idx (cold path; FC snapshot is bypassed).
+    Resume {
+        id: String,
+        #[arg(long)]
+        from: Option<i64>,
+    },
+    /// Force a checkpoint flush on a Git session — Postgres event
+    /// + git commit + push to `engram/sessions/<id>`.
+    Checkpoint { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -181,6 +222,21 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Delete { id } => session_delete(&client, &cli.endpoint, id).await,
             SessionCmd::Logs { id, since } => {
                 session_logs(&client, &cli.endpoint, id, *since).await
+            }
+            SessionCmd::Log { id, kind, limit } => {
+                session_log(&client, &cli.endpoint, id, kind, *limit, cli.json).await
+            }
+            SessionCmd::Diff { id, vs } => {
+                session_diff(&client, &cli.endpoint, id, vs.as_deref()).await
+            }
+            SessionCmd::Fork { id, at, title } => {
+                session_fork(&client, &cli.endpoint, id, *at, title.as_deref(), cli.json).await
+            }
+            SessionCmd::Resume { id, from } => {
+                session_resume(&client, &cli.endpoint, id, *from, cli.json).await
+            }
+            SessionCmd::Checkpoint { id } => {
+                session_checkpoint(&client, &cli.endpoint, id, cli.json).await
             }
         },
         Cmd::Image { cmd } => match cmd {
@@ -436,6 +492,207 @@ async fn session_logs(
     Ok(())
 }
 
+async fn session_log(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    kind: &str,
+    limit: Option<i64>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut url = format!("{endpoint}/sessions/{id}/log?kind={kind}");
+    if let Some(l) = limit {
+        url.push_str(&format!("&limit={l}"));
+    }
+    let body = get_json(client, &url).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let kind_str = body["kind"].as_str().unwrap_or("");
+    if kind_str == "conversation" {
+        let empty = Vec::new();
+        let events = body["events"].as_array().unwrap_or(&empty);
+        if events.is_empty() {
+            println!("(no events)");
+            return Ok(());
+        }
+        println!("{:<6}  {:<28}  {:<25}  PAYLOAD", "IDX", "KIND", "AT");
+        for e in events {
+            let payload = e["payload"].clone();
+            let summary = match payload {
+                Value::Object(map) if !map.is_empty() => {
+                    let pairs: Vec<String> = map
+                        .iter()
+                        .take(3)
+                        .map(|(k, v)| format!("{k}={}", short_value(v)))
+                        .collect();
+                    pairs.join(" ")
+                }
+                Value::Null => String::new(),
+                other => short_value(&other),
+            };
+            println!(
+                "{:<6}  {:<28}  {:<25}  {}",
+                e["idx"].as_i64().unwrap_or(0),
+                truncate(e["kind"].as_str().unwrap_or(""), 28),
+                e["at"].as_str().unwrap_or(""),
+                truncate(&summary, 80),
+            );
+        }
+    } else {
+        // workspace: list of commits
+        let empty = Vec::new();
+        let commits = body["commits"].as_array().unwrap_or(&empty);
+        if commits.is_empty() {
+            println!("(no checkpoint commits)");
+            return Ok(());
+        }
+        for c in commits {
+            let sha = c["sha"].as_str().unwrap_or("");
+            let short: String = sha.chars().take(10).collect();
+            println!(
+                "{short}  {date}  {author}  {message}",
+                date = c["date"].as_str().unwrap_or(""),
+                author = truncate(c["author"].as_str().unwrap_or(""), 24),
+                message = c["message"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn short_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => truncate(s, 24),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".into(),
+        Value::Array(a) => format!("[{} items]", a.len()),
+        Value::Object(o) => format!("{{{} keys}}", o.len()),
+    }
+}
+
+async fn session_diff(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    vs: Option<&str>,
+) -> Result<(), CliError> {
+    let mut url = format!("{endpoint}/sessions/{id}/diff");
+    if let Some(v) = vs {
+        // The vs param is a git ref; assume the caller has already
+        // shell-quoted it. URL-encoding could happen here later if
+        // we ever surface refs with awkward characters.
+        url.push_str(&format!("?vs={v}"));
+    }
+    let resp = client.get(url).send().await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    print!("{body}");
+    Ok(())
+}
+
+async fn session_fork(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    at: Option<i64>,
+    title: Option<&str>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut payload = serde_json::Map::new();
+    if let Some(idx) = at {
+        payload.insert("from_event_idx".into(), Value::from(idx));
+    }
+    if let Some(t) = title {
+        payload.insert("title".into(), Value::from(t));
+    }
+    let resp = client
+        .post(format!("{endpoint}/sessions/{id}/fork"))
+        .json(&Value::Object(payload))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+    println!("forked: {}", parsed["session_id"].as_str().unwrap_or(""));
+    if let Some(branch) = parsed["branch"].as_str() {
+        println!("branch: {branch}");
+    }
+    if let Some(sha) = parsed["from_sha"].as_str() {
+        println!("from  : {sha}");
+    }
+    Ok(())
+}
+
+async fn session_resume(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    from: Option<i64>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut url = format!("{endpoint}/sessions/{id}/resume");
+    if let Some(idx) = from {
+        url.push_str(&format!("?from_event_idx={idx}"));
+    }
+    let resp = client.post(url).send().await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+    println!("{}", parsed["note"].as_str().unwrap_or("resumed"));
+    Ok(())
+}
+
+async fn session_checkpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/sessions/{id}/checkpoint"))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+    if let Some(sha) = parsed["commit_sha"].as_str() {
+        println!("checkpoint: {sha}");
+    } else {
+        println!("checkpoint: (no-op — workspace clean)");
+    }
+    Ok(())
+}
+
 fn print_sse_frame(frame: &str) {
     if let Some(line) = format_sse_frame(frame) {
         println!("{line}");
@@ -615,5 +872,27 @@ mod tests {
     fn format_sse_frame_uses_dash_for_missing_id() {
         let out = format_sse_frame("event:x\ndata:1").unwrap();
         assert!(out.contains("[     -]"), "got {out}");
+    }
+
+    #[test]
+    fn short_value_renders_scalar_payload_kinds() {
+        assert_eq!(short_value(&Value::String("hello".into())), "hello");
+        assert_eq!(short_value(&Value::Bool(true)), "true");
+        assert_eq!(short_value(&Value::Null), "null");
+        // Long strings get truncated so a single payload field can't
+        // blow up the terminal column.
+        let s = "a".repeat(40);
+        assert!(short_value(&Value::String(s)).chars().count() <= 24);
+    }
+
+    #[test]
+    fn short_value_summarizes_compound_payloads() {
+        let arr = Value::Array(vec![Value::Null, Value::Null, Value::Null]);
+        assert_eq!(short_value(&arr), "[3 items]");
+        let obj = Value::Object(serde_json::Map::from_iter([
+            ("a".into(), Value::Null),
+            ("b".into(), Value::Null),
+        ]));
+        assert_eq!(short_value(&obj), "{2 keys}");
     }
 }
