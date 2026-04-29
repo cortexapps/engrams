@@ -662,6 +662,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-harness-noop"
+version = "0.1.0"
+dependencies = [
+ "engram-core",
+ "engram-harness-proto",
+ "serde",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "engram-harness-proto"
 version = "0.1.0"
 dependencies = [
@@ -684,6 +696,7 @@ dependencies = [
  "dashmap",
  "engram-cloud-static",
  "engram-core",
+ "engram-harness-noop",
  "engram-harness-proto",
  "engram-protocol",
  "engram-sandbox-process",

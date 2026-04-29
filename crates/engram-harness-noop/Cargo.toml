@@ -1,0 +1,21 @@
+[package]
+name = "engram-harness-noop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party test harness: emits a configurable cadence of HarnessEvents over the harness vsock channel. Used by Track B/D integration tests."
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+engram-core.workspace = true
+engram-harness-proto.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
