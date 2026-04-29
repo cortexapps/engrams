@@ -154,12 +154,7 @@ before the post-Phase-4 review.
 4. **`--mode=all` didn't heartbeat its in-process host**, so the
    dead-host detector reaped it after ~30s. Fixed by stamping
    `last_heartbeat_at` on a 5s tick.
-5. **`HarnessHub::bind_session` happens AFTER `backend.create()`
-   spawns the agent**, so the noop harness's first attach attempt
-   loses the race. Worked around with retry+backoff in the noop
-   binary; the cleaner fix is a deferred-bind hook between create
-   and spawn (or have `create` take the binding).
-6. **`ENGRAM_DEV_AUTO_NOOP=1` was rejected by clap's default bool
+5. **`ENGRAM_DEV_AUTO_NOOP=1` was rejected by clap's default bool
    parser** — it expected `true` / `false`. Fixed with
    `BoolishValueParser`.
 

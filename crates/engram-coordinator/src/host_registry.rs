@@ -339,6 +339,11 @@ impl SandboxBackend for HostRegistry {
         result
     }
 
+    async fn start_agent(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let backend = self.lookup(id)?;
+        backend.start_agent(id).await
+    }
+
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // Aggregate across all connected hosts. Errors from any one
         // host are surfaced; partial results aren't reported in 3a.

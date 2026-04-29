@@ -281,14 +281,26 @@ pub async fn create_session(
     };
 
     state.registry.bind(session_id, sandbox_id);
-    // Tell the harness hub that an upcoming TCP connection
-    // identifying as `session_id` should attach to this sandbox.
-    // No-op for sessions without an agent (the harness never
-    // dials so the binding is just garbage that gets cleared on
-    // destroy). The noop binary's retry loop covers the small
-    // window between `create_for_session` returning (which
-    // already spawned the agent) and this bind.
+    // Bind the routing in the hub *before* the agent has a chance
+    // to dial. `backend.create()` returns with the sandbox ready
+    // to accept exec but the agent (if any) NOT yet spawned —
+    // the trait splits create from `start_agent` precisely so
+    // this window can be filled with whatever routing setup the
+    // caller needs.
     state.harness_hub.bind_session(session_id, sandbox_id);
+    // Now release the agent into the world. If the spec carried
+    // no agent (production sessions today), this is a no-op.
+    if let Err(e) = state.services.sandbox.start_agent(sandbox_id).await {
+        // Agent failed to spawn: surface as Internal but leave the
+        // session row so the caller sees a clear error chain.
+        let _ = state
+            .services
+            .meta
+            .set_session_status(session_id, SessionStatus::Failed)
+            .await;
+        state.harness_hub.unbind_session(session_id);
+        return Err(e.into());
+    }
     state
         .services
         .meta

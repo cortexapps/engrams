@@ -23,6 +23,29 @@ use crate::types::snapshot::SnapshotMetadata;
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
 
+    /// Start the long-running agent attached to this sandbox's
+    /// `SandboxSpec::agent` (the harness adapter — Claude Code,
+    /// the dev noop). Idempotent: a second call with the agent
+    /// already running is a no-op. No-op if the spec carried
+    /// `agent: None`.
+    ///
+    /// **Why this is separate from `create`.** The coordinator
+    /// wires routing (e.g. `HarnessHub::bind_session`) before the
+    /// agent has a chance to dial out, so an attach can resolve
+    /// its target without racing against the spawn. The contract
+    /// is: `create` returns once the sandbox is ready to accept
+    /// `exec`; the agent is *not* running yet. The caller then
+    /// registers whatever routing it needs and calls
+    /// `start_agent` to release the agent into the world.
+    ///
+    /// Default impl is a no-op (Ok). Backends that support agents
+    /// override; backends that don't (today: Firecracker, until
+    /// `engram-bootstrap` lands) can return `Ok(())` and rely on
+    /// `create` to have already errored if `agent.is_some()`.
+    async fn start_agent(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// Run a command in the sandbox and return a stream of stdout/stderr
     /// chunks ending with a single [`ExecEvent::Exit`]. Terminating the
     /// stream early (dropping it) does NOT necessarily kill the

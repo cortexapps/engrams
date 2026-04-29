@@ -87,43 +87,32 @@ async fn main() -> ExitCode {
         cfg.transcript_delta_template = tmpl.into_bytes();
     }
 
-    // Retry attach on rejection: the host-agent's session→sandbox
-    // binding is set after `backend.create()` returns, which races
-    // with the agent's dial inside that same `create()`. Five
-    // attempts at 50ms-1s exponential backoff comfortably covers the
-    // race in practice.
-    let mut backoff = Duration::from_millis(50);
-    for attempt in 1..=5 {
-        let stream = match tokio::net::TcpStream::connect(&cli.connect).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, attempt, "noop harness: dial failed; retrying");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(1));
-                continue;
-            }
-        };
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::warn!(error = %e, "noop harness: set_nodelay failed (continuing)");
+    let stream = match tokio::net::TcpStream::connect(&cli.connect).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, addr = %cli.connect, "noop harness: dial failed");
+            return ExitCode::from(1);
         }
-
-        match run(stream, cfg.clone()).await {
-            Ok(NoopOutcome::AttachRejected) => {
-                tracing::warn!(attempt, "noop harness: attach rejected; retrying");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(1));
-                continue;
-            }
-            Ok(outcome) => {
-                tracing::info!(?outcome, "noop harness done");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "noop harness: run failed");
-                return ExitCode::from(1);
-            }
+    };
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!(error = %e, "noop harness: set_nodelay failed (continuing)");
+    }
+    // The host-agent splits sandbox creation from agent spawn so
+    // routing (`HarnessHub::bind_session`) is in place by the time
+    // we dial. A rejected attach here means a real misconfiguration,
+    // not a race; bail out instead of retrying.
+    match run(stream, cfg).await {
+        Ok(NoopOutcome::AttachRejected) => {
+            tracing::error!("noop harness: attach rejected by host (no session bound?)");
+            ExitCode::from(1)
+        }
+        Ok(outcome) => {
+            tracing::info!(?outcome, "noop harness done");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "noop harness: run failed");
+            ExitCode::from(1)
         }
     }
-    tracing::error!("noop harness: gave up after 5 attach attempts");
-    ExitCode::from(1)
 }

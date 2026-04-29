@@ -117,6 +117,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.destroy(id).await
     }
 
+    async fn start_agent(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.inner.start_agent(id).await
+    }
+
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         self.inner.list().await
     }

@@ -102,15 +102,29 @@ impl SandboxBackend for ProcessBackend {
                 .await
                 .map_err(|e| SandboxError::Vm(format!("materialize rootfs: {e}").into()))?;
         }
-        // Spawn the long-running agent (harness adapter) if the spec
-        // includes one. Agent stdout/stderr go to `agent.log` inside
-        // the sandbox cwd — on Firecracker that's the serial console;
-        // here it's just a file you can `tail -f` while debugging.
-        if let Some(agent) = spec.agent.as_ref() {
-            spawn_agent(&self.agent_children, id, agent, &spec.env, &cwd).await?;
-        }
+        // Note: spec.agent is *stored*, not spawned. The agent
+        // launches when the caller invokes `start_agent` — see the
+        // trait docs for why.
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
+    }
+
+    async fn start_agent(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .clone();
+        let Some(agent) = state.spec.agent.as_ref() else {
+            return Ok(());
+        };
+        // Idempotent: a second call with the agent already running
+        // is a no-op. Reused on warm-pool checkout when the slot
+        // was pre-spawned with no agent.
+        if self.agent_children.contains_key(&id) {
+            return Ok(());
+        }
+        spawn_agent(&self.agent_children, id, agent, &state.spec.env, &state.cwd).await
     }
 
     async fn exec_stream(
@@ -704,6 +718,9 @@ mod tests {
             env: HashMap::new(),
         });
         let id = b.create(spec).await.unwrap();
+        // Agent spawn is now explicit (the trait split lets callers
+        // bind routing between create and the agent dialing out).
+        b.start_agent(id).await.unwrap();
 
         // Wait for the agent to write its pid file. Real-world race
         // budgets are tiny here; a few hundred ms is plenty.
