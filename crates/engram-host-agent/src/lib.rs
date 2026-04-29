@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use engram_core::traits::{CloudBackend, SandboxBackend};
 
+pub mod checkpoint;
 pub mod config;
 pub mod dialer;
 pub mod harness;

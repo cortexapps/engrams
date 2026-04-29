@@ -18,20 +18,27 @@ default:
 # ------------------------------------------------------------------
 
 # Format, clippy, build, and test gates — run before pushing.
+#
+# Uses `cargo nextest` for ~3-5× speedup over `cargo test --workspace`.
+# Inside `nix develop` it's already on $PATH; outside Nix install with
+# `cargo install cargo-nextest --locked` (one-time, ~30s). The doctest
+# pass stays on `cargo test` because nextest doesn't run doctests yet.
 check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    cargo nextest run --workspace
+    cargo test --workspace --doc
 
 # Auto-format the workspace.
 fmt:
     cargo fmt --all
 
-# Run all tests.
+# Run all tests via nextest (faster). Pass extra args after `--`.
 test *ARGS:
-    cargo test --workspace {{ARGS}}
+    cargo nextest run --workspace {{ARGS}}
 
-# Run a single crate's tests with output.
+# Run a single crate's tests with output. Stays on `cargo test` so
+# `--nocapture` works the way you expect.
 test-pkg pkg *ARGS:
     cargo test -p {{pkg}} -- --nocapture {{ARGS}}
 
@@ -74,8 +81,7 @@ dev: db-up
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
     ENGRAM_SANDBOX_BACKEND=process \
     ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
-    ENGRAM_STORAGE_BACKEND=local \
-    ENGRAM_STORAGE_LOCAL_PATH=./var/snapshots \
+    ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_DEFAULT_IMAGE=warm-bootstrap \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
@@ -87,8 +93,7 @@ dev-firecracker: db-up
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
     ENGRAM_SANDBOX_BACKEND=firecracker \
     ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
-    ENGRAM_STORAGE_BACKEND=local \
-    ENGRAM_STORAGE_LOCAL_PATH=./var/snapshots \
+    ENGRAM_LOCAL_PATH=./var/engram \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 

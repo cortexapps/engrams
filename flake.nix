@@ -1,5 +1,5 @@
 {
-  description = "Engram — pinned dev toolchain (Rust + just + jq + sqlx-cli + cargo-watch).";
+  description = "Engram — pinned dev toolchain (Rust + just + jq + sqlx-cli + cargo-watch + cargo-nextest).";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -34,6 +34,9 @@
             postgresql              # psql + pg_dump; not the server
             sqlx-cli
             cargo-watch
+            cargo-nextest             # parallel test runner; `just check`
+                                       # uses it for ~3-5× speedup over
+                                       # `cargo test --workspace`.
             pkg-config
             openssl
             protobuf                # protoc, for tonic-build when grpc lands
