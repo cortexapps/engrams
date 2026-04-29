@@ -622,6 +622,7 @@ dependencies = [
  "engram-cloud-mock",
  "engram-cloud-static",
  "engram-core",
+ "engram-harness-proto",
  "engram-host-agent",
  "engram-postgres",
  "engram-protocol",

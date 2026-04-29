@@ -5,6 +5,7 @@ use axum::Router;
 use crate::state::SharedState;
 
 pub mod auth;
+mod checkpoint;
 mod events;
 mod exec;
 mod health;
@@ -33,6 +34,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/snapshot", post(snapshot::snapshot))
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
+        .route("/sessions/:id/checkpoint", post(checkpoint::checkpoint))
         .route("/sessions/:id/migrate", post(sessions::migrate))
         .route("/api/hosts/connect", get(hosts::connect))
         .route("/api/hosts", get(hosts::list))

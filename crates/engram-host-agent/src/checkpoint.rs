@@ -255,16 +255,57 @@ impl From<SandboxError> for CheckpointError {
 }
 
 /// One git invocation through the SandboxBackend's buffered exec.
+///
+/// Passes `-c core.fsmonitor=false -c gc.auto=0` and an isolated env
+/// (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+/// `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`) to every
+/// invocation:
+///
+/// - **fsmonitor** spawns a long-lived helper daemon that watches the
+///   working tree via fsevents/inotify. We don't want that in a
+///   short-lived sandbox; if `materialize_rootfs` copied a stale
+///   fsmonitor IPC socket from the host's git, the sandbox's git
+///   will try to talk to a daemon that doesn't exist (or worse, one
+///   shared with other parallel tests) and hang.
+/// - **gc.auto=0** suppresses the surprise "Auto packing the
+///   repository for optimum performance" runs that can fire on
+///   `commit` / `push` and slow down a checkpoint.
+/// - **GIT_CONFIG_GLOBAL/NOSYSTEM** hermetically seal off the user's
+///   global gitconfig — production sandboxes have no `~/.gitconfig`
+///   anyway, but on the dev path (ProcessBackend on macOS) the host
+///   user's config bleeds in and can carry hostile fsmonitor / signing
+///   defaults.
+/// - **GIT_OPTIONAL_LOCKS=0** stops `git status` from holding a write
+///   lock on the index when it's read-only; with parallel checkpoints
+///   touching the same workspace this avoids spurious "Another git
+///   process seems to be running" errors.
+/// - **GIT_TERMINAL_PROMPT=0** turns any credential / passphrase
+///   prompt into a hard error instead of a hang on `git push`.
 async fn run_git(
     backend: &Arc<dyn SandboxBackend>,
     sandbox_id: SandboxId,
     workspace: &str,
     argv: &[&str],
 ) -> Result<engram_core::types::sandbox::ExecHandle, CheckpointError> {
+    let mut command: Vec<String> = Vec::with_capacity(argv.len() + 4);
+    command.push(argv[0].to_string()); // "git"
+    command.push("-c".into());
+    command.push("core.fsmonitor=false".into());
+    command.push("-c".into());
+    command.push("gc.auto=0".into());
+    for a in &argv[1..] {
+        command.push(a.to_string());
+    }
+    let mut env = std::collections::HashMap::new();
+    env.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
+    env.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
+    env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+    env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+
     let req = ExecRequest {
-        command: argv.iter().map(|s| s.to_string()).collect(),
+        command,
         stdin: None,
-        env: Default::default(),
+        env,
         workdir: Some(workspace.to_string()),
         timeout: Some(Duration::from_secs(60)),
     };
@@ -304,10 +345,22 @@ mod tests {
         Arc::new(|_, _, _: HarnessEvent| Box::new(Box::pin(async {})))
     }
 
+    /// Run a host-side command for test setup, with the same hermetic
+    /// git environment the production primitive uses. Specifically
+    /// `GIT_CONFIG_GLOBAL=/dev/null` to keep the dev user's
+    /// `~/.gitconfig` (which on macOS often enables fsmonitor by
+    /// default) from leaking into the test repo's `.git/config`.
+    /// Without this, `cp -c -R` of `.git/` would copy a stale
+    /// `fsmonitor--daemon.ipc` socket and the sandbox's git would
+    /// hang trying to talk to it.
     fn run_host(args: &[&str], cwd: &Path) {
         let out = StdCommand::new(args[0])
             .args(&args[1..])
             .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .expect("spawn host command");
         assert!(

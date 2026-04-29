@@ -25,6 +25,7 @@ engram-sandbox-firecracker.workspace = true
 engram-cloud-static.workspace = true
 engram-cloud-gcp.workspace = true
 engram-cloud-mock.workspace = true
+engram-harness-proto.workspace = true
 engram-sandbox-process.workspace = true
 engram-secrets-dev.workspace = true
 async-stream.workspace = true

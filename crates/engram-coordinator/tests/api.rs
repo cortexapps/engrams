@@ -85,7 +85,24 @@ impl MetadataStore for MockMetadataStore {
         spec: SessionSpec,
         image_version: String,
     ) -> Result<SessionId, MetaError> {
+        use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
+
         let id = SessionId::new();
+        // Match PostgresStore's behaviour: parse the repo URL,
+        // derive session_kind, allocate a checkpoint branch for
+        // writable Git sessions. Falls back to Local on parse error
+        // so legacy test cases passing bare strings (`repo: "r"`)
+        // continue to work as ephemeral sessions rather than fail
+        // the test setup.
+        let parsed = RepoUrl::parse(&spec.repo).ok();
+        let kind = parsed
+            .as_ref()
+            .map(|p| SessionKind::derive(p, spec.read_only))
+            .unwrap_or(SessionKind::Local);
+        let checkpoint_branch = match kind {
+            SessionKind::Git => Some(checkpoint_branch_for(id)),
+            _ => None,
+        };
         let session = Session {
             id,
             repo: spec.repo,
@@ -96,9 +113,9 @@ impl MetadataStore for MockMetadataStore {
             host_id: None,
             sandbox_id: None,
             created_at: Utc::now(),
-            session_kind: engram_core::types::session::SessionKind::Local,
-            repo_url: None,
-            checkpoint_branch: None,
+            session_kind: kind,
+            repo_url: parsed,
+            checkpoint_branch,
             last_harness_event_at: None,
             last_active_at: Utc::now(),
         };
@@ -2662,4 +2679,70 @@ async fn persistent_log_captures_lifecycle_and_exec_kinds() {
             "persistent log must capture {required}; got {kinds:?}",
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// POST /sessions/:id/checkpoint  (Phase 4 Track C.8)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn checkpoint_returns_409_for_local_session() {
+    // The default test fixture's `repo: "r"` parses as a Local-kind
+    // session (RepoUrl::parse rejects bare strings; the Mock falls
+    // back to Local). Local sessions have no checkpoint branch and
+    // the endpoint must refuse explicitly with 409.
+    let store = MockMetadataStore::arc();
+    let app = build_app(store);
+    let id = api_create_session(app.clone(), "r").await;
+
+    let resp = post(app, &format!("/sessions/{id}/checkpoint"), json!({})).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let v = body_json(resp.into_body()).await;
+    assert!(
+        v["message"].as_str().unwrap_or("").contains("local"),
+        "error must call out the session_kind: got {v}",
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_returns_404_for_unknown_session() {
+    let app = build_app(MockMetadataStore::arc());
+    let resp = post(
+        app,
+        &format!("/sessions/{}/checkpoint", SessionId::new()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn checkpoint_returns_409_for_readonly_session() {
+    // `read_only: true` on a Git URL → session_kind = Readonly.
+    // No checkpoint branch; endpoint refuses.
+    let app = build_app(MockMetadataStore::arc());
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/sessions",
+            json!({
+                "repo": "git+https://github.com/cortex/api.git",
+                "branch": "main",
+                "read_only": true,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = body_json(resp.into_body()).await;
+    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+
+    let resp = post(app, &format!("/sessions/{id}/checkpoint"), json!({})).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let v = body_json(resp.into_body()).await;
+    assert!(
+        v["message"].as_str().unwrap_or("").contains("readonly"),
+        "error must call out the session_kind: got {v}",
+    );
 }

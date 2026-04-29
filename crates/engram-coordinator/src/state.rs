@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionStatus};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
+use engram_harness_proto::HarnessEvent;
+use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -70,6 +72,72 @@ pub enum SessionEvent {
         snapshot_id: SnapshotId,
         at: DateTime<Utc>,
     },
+    /// Phase 4 (Track C.6): a checkpoint successfully pushed the
+    /// session's workspace to its `engram/sessions/<id>` branch.
+    /// `commit_sha` is the new HEAD on that branch; `harness_acked`
+    /// reflects whether the in-guest harness flushed its transcript
+    /// before the push (false on best-effort/timeout paths — the
+    /// workspace is durable but the transcript may lag one tool call).
+    CheckpointPushed {
+        commit_sha: String,
+        harness_acked: bool,
+        at: DateTime<Utc>,
+    },
+    /// Phase 4 (Track C.6): a checkpoint attempt failed. Surfaces
+    /// the underlying reason (workspace size cap, broken remote,
+    /// missing harness, etc.) for operator forensics.
+    CheckpointFailed {
+        reason: String,
+        at: DateTime<Utc>,
+    },
+    /// Phase 4 (Track A.3): tool-call-grain harness events. Web UI
+    /// and Slackbot subscribe to these to render the agent's
+    /// play-by-play. `transcript_delta` carries the bytes the
+    /// harness appended to its native transcript file; opaque to
+    /// Engram, replayed on resume to reconstruct the agent's view.
+    HarnessRunStarted {
+        run_id: String,
+        prompt_summary: Option<String>,
+        at: DateTime<Utc>,
+    },
+    HarnessToolCallStarted {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        args_summary: Option<String>,
+        at: DateTime<Utc>,
+    },
+    HarnessToolCallCompleted {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        ok: bool,
+        duration_ms: u64,
+        /// Bytes the harness appended to its native transcript file
+        /// for this call. Stored verbatim; replayed on resume to
+        /// reconstruct the file in the agent's format.
+        #[serde(default, with = "transcript_delta_serde")]
+        transcript_delta: Vec<u8>,
+        at: DateTime<Utc>,
+    },
+    HarnessRunCompleted {
+        run_id: String,
+        ok: bool,
+        at: DateTime<Utc>,
+    },
+    HarnessIdle {
+        at: DateTime<Utc>,
+    },
+}
+
+mod transcript_delta_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        b.serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        Vec::<u8>::deserialize(d)
+    }
 }
 
 impl SessionEvent {
@@ -87,6 +155,61 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
+            Self::CheckpointPushed { .. } => "checkpoint_pushed",
+            Self::CheckpointFailed { .. } => "checkpoint_failed",
+            Self::HarnessRunStarted { .. } => "run_started",
+            Self::HarnessToolCallStarted { .. } => "tool_call_started",
+            Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
+            Self::HarnessRunCompleted { .. } => "run_completed",
+            Self::HarnessIdle { .. } => "harness_idle",
+        }
+    }
+
+    /// Convert a wire [`HarnessEvent`] into the coord-side
+    /// [`SessionEvent`]. Used by the host-agent → session_events
+    /// bridge that Track A.3 wires through `EventSink`.
+    pub fn from_harness(ev: HarnessEvent, at: DateTime<Utc>) -> Self {
+        match ev {
+            HarnessEvent::RunStarted {
+                run_id,
+                prompt_summary,
+            } => Self::HarnessRunStarted {
+                run_id,
+                prompt_summary,
+                at,
+            },
+            HarnessEvent::ToolCallStarted {
+                run_id,
+                tool_call_id,
+                tool_name,
+                args_summary,
+            } => Self::HarnessToolCallStarted {
+                run_id,
+                tool_call_id,
+                tool_name,
+                args_summary,
+                at,
+            },
+            HarnessEvent::ToolCallCompleted {
+                run_id,
+                tool_call_id,
+                tool_name,
+                ok,
+                duration_ms,
+                transcript_delta,
+            } => Self::HarnessToolCallCompleted {
+                run_id,
+                tool_call_id,
+                tool_name,
+                ok,
+                duration_ms,
+                transcript_delta,
+                at,
+            },
+            HarnessEvent::RunCompleted { run_id, ok } => {
+                Self::HarnessRunCompleted { run_id, ok, at }
+            }
+            HarnessEvent::Idle => Self::HarnessIdle { at },
         }
     }
 }
@@ -216,6 +339,19 @@ pub struct AppState {
     /// now — the coordinator just routes via the scheduler and lets
     /// each host's `PooledBackend` handle checkout/replenish.
     pub host_registry: Arc<HostRegistry>,
+    /// Phase 4: harness ↔ host vsock channel hub. Holds one
+    /// connection per attached harness; routes inbound HarnessEvents
+    /// into the configured EventSink (which forwards them into
+    /// session_events). Constructed at AppState creation with a sink
+    /// that captures clones of `services.meta` + `events` — the
+    /// closure is intentionally short so AppState construction stays
+    /// non-circular.
+    ///
+    /// `--mode=all` and the dev `--mode=coordinator` both populate
+    /// this; multi-host production will additionally accept inbound
+    /// harness connections off a real vsock listener wired through
+    /// the same hub.
+    pub harness_hub: Arc<HarnessHub>,
 }
 
 impl AppState {
@@ -239,12 +375,18 @@ impl AppState {
         services: Services,
         host_registry: Arc<HostRegistry>,
     ) -> Self {
+        let events = Arc::new(SessionEventBus::default());
+        let harness_hub = Arc::new(HarnessHub::new(harness_event_sink(
+            events.clone(),
+            services.meta.clone(),
+        )));
         Self {
             cfg,
             services,
             registry: SandboxRegistry::new(),
-            events: Arc::new(SessionEventBus::default()),
+            events,
             host_registry,
+            harness_hub,
         }
     }
 
@@ -280,6 +422,48 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// Build the [`EventSink`] that forwards harness events into
+/// `session_events`. Captures clones of the bus + meta service so
+/// the closure has no cycles back into AppState.
+fn harness_event_sink(
+    events: Arc<SessionEventBus>,
+    meta: Arc<dyn engram_core::traits::MetadataStore>,
+) -> EventSink {
+    Arc::new(move |session_id, _sandbox_id, ev| {
+        let events = events.clone();
+        let meta = meta.clone();
+        Box::new(Box::pin(async move {
+            let session_event = SessionEvent::from_harness(ev, Utc::now());
+            let kind = session_event.kind();
+            let payload = match serde_json::to_value(&session_event) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "harness event serialize failed");
+                    return;
+                }
+            };
+            match meta.append_session_event(session_id, kind, payload).await {
+                Ok(idx) => {
+                    events.publish(
+                        session_id,
+                        IndexedEvent {
+                            idx,
+                            event: session_event,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "append_session_event for harness event failed",
+                    );
+                }
+            }
+        }))
+    })
+}
 
 #[cfg(test)]
 mod tests {
