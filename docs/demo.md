@@ -30,10 +30,11 @@ runs the coordinator with:
 - `ENGRAM_DEV_AUTO_NOOP=1` — every new session auto-spawns the
   noop harness adapter, which dials the host-agent's harness TCP
   listener.
-- `ENGRAM_WARM_POOL_SIZE=0` — warm pool disabled in dev so
-  exactly one harness attaches per session (the warm-pool path
-  spawns extra harnesses bound to the same session_id; needs a
-  follow-up to make warm-spawn deferred-bind).
+- `ENGRAM_WARM_POOL_SIZE=1` — pre-spawn one warm slot per
+  `(repo, image_version)` so the second session checkout is
+  sub-second. Warm slots are agent-blind: the per-session
+  `AgentSpec` is supplied at `start_agent` time, after the
+  coordinator binds the session→sandbox routing.
 
 Wait until you see:
 
@@ -134,27 +135,19 @@ just db-down                # if you want Postgres gone too
 These are the bugs the demo found. Track them as cleanup items
 before the post-Phase-4 review.
 
-1. **Warm pool spawns spurious harnesses.** With
-   `ENGRAM_WARM_POOL_SIZE>0`, the pool replenishes a sandbox using
-   the same `AgentSpec` template that was built for the
-   triggering session. Both the consumed slot's pre-spawned agent
-   and the freshly-replenished one connect with the same
-   `session_id`. **Fix direction**: warm-pool sandboxes shouldn't
-   carry a session-bound `AgentSpec`; bind it post-checkout.
-   Workaround: dev recipe sets `ENGRAM_WARM_POOL_SIZE=0`.
-2. **`hosts.hostname UNIQUE` + `id` not in `ON CONFLICT` made the
+1. **`hosts.hostname UNIQUE` + `id` not in `ON CONFLICT` made the
    in-process host id drift across restarts.** Worked around by
    pinning `--mode=all` to a stable HostId
-   (`00000000-0000-4000-8000-000000000a11`). The trait-level fix is
-   to either drop the UNIQUE on hostname or update `id` in the
+   (`00000000-0000-4000-8000-000000000a11`). The trait-level fix
+   is to either drop the UNIQUE on hostname or update `id` in the
    ON CONFLICT clause.
-3. **`pending_reassign` wasn't a recognised wire string** in
+2. **`pending_reassign` wasn't a recognised wire string** in
    `parse_session_status` even though the enum had the variant.
    Fixed in this pass.
-4. **`--mode=all` didn't heartbeat its in-process host**, so the
+3. **`--mode=all` didn't heartbeat its in-process host**, so the
    dead-host detector reaped it after ~30s. Fixed by stamping
    `last_heartbeat_at` on a 5s tick.
-5. **`ENGRAM_DEV_AUTO_NOOP=1` was rejected by clap's default bool
+4. **`ENGRAM_DEV_AUTO_NOOP=1` was rejected by clap's default bool
    parser** — it expected `true` / `false`. Fixed with
    `BoolishValueParser`.
 

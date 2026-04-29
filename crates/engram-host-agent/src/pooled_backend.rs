@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engram_core::traits::SandboxBackend;
-use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId};
 use engram_protocol::WarmPoolReport;
@@ -117,8 +117,8 @@ impl SandboxBackend for PooledBackend {
         self.inner.destroy(id).await
     }
 
-    async fn start_agent(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.inner.start_agent(id).await
+    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
+        self.inner.start_agent(id, agent).await
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -157,7 +157,6 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            agent: None,
         }
     }
 

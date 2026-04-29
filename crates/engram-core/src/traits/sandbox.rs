@@ -5,7 +5,9 @@ use futures::stream::StreamExt;
 
 use crate::error::SandboxError;
 use crate::types::ids::SandboxId;
-use crate::types::sandbox::{ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
+use crate::types::sandbox::{
+    AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec,
+};
 use crate::types::snapshot::SnapshotMetadata;
 
 /// VM lifecycle seam. Production implementation: `engram-sandbox-firecracker`
@@ -23,27 +25,35 @@ use crate::types::snapshot::SnapshotMetadata;
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
 
-    /// Start the long-running agent attached to this sandbox's
-    /// `SandboxSpec::agent` (the harness adapter — Claude Code,
-    /// the dev noop). Idempotent: a second call with the agent
-    /// already running is a no-op. No-op if the spec carried
-    /// `agent: None`.
+    /// Start the long-running agent process for this sandbox (the
+    /// harness adapter — Claude Code, the dev noop). Idempotent:
+    /// a second call with the agent already running is a no-op.
+    ///
+    /// **Why agent argv is supplied here, not on `SandboxSpec`.**
+    /// The warm pool reuses one `SandboxSpec` template across many
+    /// sessions in a `(repo, image_version)` bucket. Per-session
+    /// agent argv (carrying `session_id`, the attach token, etc.)
+    /// can't ride on that template — it'd freeze at the first
+    /// session's id. The caller supplies the per-session agent at
+    /// checkout time.
     ///
     /// **Why this is separate from `create`.** The coordinator
     /// wires routing (e.g. `HarnessHub::bind_session`) before the
     /// agent has a chance to dial out, so an attach can resolve
-    /// its target without racing against the spawn. The contract
-    /// is: `create` returns once the sandbox is ready to accept
-    /// `exec`; the agent is *not* running yet. The caller then
-    /// registers whatever routing it needs and calls
-    /// `start_agent` to release the agent into the world.
+    /// its target without racing against the spawn.
     ///
-    /// Default impl is a no-op (Ok). Backends that support agents
-    /// override; backends that don't (today: Firecracker, until
-    /// `engram-bootstrap` lands) can return `Ok(())` and rely on
-    /// `create` to have already errored if `agent.is_some()`.
-    async fn start_agent(&self, _id: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
+    /// Default impl errors with `InvalidSpec` — backends that
+    /// don't yet support agents (Firecracker until
+    /// `engram-bootstrap` lands) inherit it; backends that do
+    /// (ProcessBackend) override.
+    async fn start_agent(
+        &self,
+        _id: SandboxId,
+        _agent: AgentSpec,
+    ) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `start_agent` yet".into(),
+        ))
     }
 
     /// Run a command in the sandbox and return a stream of stdout/stderr

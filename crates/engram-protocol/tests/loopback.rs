@@ -33,7 +33,6 @@ fn live_spec() -> SandboxSpec {
         ttl: None,
         env: Default::default(),
         workdir: None,
-        agent: None,
     }
 }
 

@@ -194,7 +194,12 @@ pub async fn create_session(
         session_id,
     );
 
-    let agent = build_dev_noop_agent(&state, session_id);
+    // Per-session agent argv (carries this session's id, the
+    // attach token in future). Built here so `start_agent` can
+    // pass it post-create — the warm-pool spec must NOT carry
+    // session-scoped argv or replenished slots would all attach
+    // claiming to be this session.
+    let agent_for_session = build_dev_noop_agent(&state, session_id);
 
     let vm_spec = VmSpec {
         image: image_version.clone(),
@@ -220,7 +225,6 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
-        agent,
     };
 
     // 3. Scheduler picks a host based on heartbeat-derived state
@@ -288,18 +292,21 @@ pub async fn create_session(
     // this window can be filled with whatever routing setup the
     // caller needs.
     state.harness_hub.bind_session(session_id, sandbox_id);
-    // Now release the agent into the world. If the spec carried
-    // no agent (production sessions today), this is a no-op.
-    if let Err(e) = state.services.sandbox.start_agent(sandbox_id).await {
-        // Agent failed to spawn: surface as Internal but leave the
-        // session row so the caller sees a clear error chain.
-        let _ = state
-            .services
-            .meta
-            .set_session_status(session_id, SessionStatus::Failed)
-            .await;
-        state.harness_hub.unbind_session(session_id);
-        return Err(e.into());
+    // Now release the agent into the world (if any). Production
+    // sessions today don't declare an agent — `agent_for_session`
+    // is `None` unless `dev_auto_noop` is set.
+    if let Some(agent) = agent_for_session {
+        if let Err(e) = state.services.sandbox.start_agent(sandbox_id, agent).await {
+            // Agent failed to spawn: surface as Internal but leave
+            // the session row so the caller sees a clear error chain.
+            let _ = state
+                .services
+                .meta
+                .set_session_status(session_id, SessionStatus::Failed)
+                .await;
+            state.harness_hub.unbind_session(session_id);
+            return Err(e.into());
+        }
     }
     state
         .services

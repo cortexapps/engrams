@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_core::traits::SandboxBackend;
-use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
 use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport, WarmPoolReport};
@@ -339,9 +339,9 @@ impl SandboxBackend for HostRegistry {
         result
     }
 
-    async fn start_agent(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
         let backend = self.lookup(id)?;
-        backend.start_agent(id).await
+        backend.start_agent(id, agent).await
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -371,7 +371,6 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            agent: None,
         }
     }
 

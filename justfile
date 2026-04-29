@@ -87,7 +87,7 @@ dev: db-up dev-build-harness
     ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
     ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_DEFAULT_IMAGE=warm-bootstrap \
-    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-0} \
+    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
     ENGRAM_DEV_AUTO_NOOP=${ENGRAM_DEV_AUTO_NOOP:-1} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator

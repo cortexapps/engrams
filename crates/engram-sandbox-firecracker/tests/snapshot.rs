@@ -51,7 +51,6 @@ async fn snapshot_then_restore_round_trips_microvm() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        agent: None,
     };
 
     // Step 1: create

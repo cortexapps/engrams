@@ -41,7 +41,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::{SandboxId, SnapshotId};
-use engram_core::types::sandbox::{ExecEvent, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
@@ -68,8 +68,7 @@ pub struct ProcessBackend {
     sandboxes: DashMap<SandboxId, SandboxState>,
     /// Long-running agent process per sandbox (the harness adapter).
     /// Tracked separately from `sandboxes` because `tokio::process::Child`
-    /// isn't `Clone`. Populated at `create()` if `SandboxSpec::agent`
-    /// is `Some`; killed at `destroy()`.
+    /// isn't `Clone`. Populated at `start_agent()`; killed at `destroy()`.
     agent_children: DashMap<SandboxId, std::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
@@ -102,29 +101,24 @@ impl SandboxBackend for ProcessBackend {
                 .await
                 .map_err(|e| SandboxError::Vm(format!("materialize rootfs: {e}").into()))?;
         }
-        // Note: spec.agent is *stored*, not spawned. The agent
-        // launches when the caller invokes `start_agent` — see the
-        // trait docs for why.
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
     }
 
-    async fn start_agent(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
         let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let Some(agent) = state.spec.agent.as_ref() else {
-            return Ok(());
-        };
         // Idempotent: a second call with the agent already running
-        // is a no-op. Reused on warm-pool checkout when the slot
-        // was pre-spawned with no agent.
+        // is a no-op. The warm-pool path may call start_agent more
+        // than once if the same sandbox is resumed-then-checkpointed-
+        // then-resumed; we keep the first agent.
         if self.agent_children.contains_key(&id) {
             return Ok(());
         }
-        spawn_agent(&self.agent_children, id, agent, &state.spec.env, &state.cwd).await
+        spawn_agent(&self.agent_children, id, &agent, &state.spec.env, &state.cwd).await
     }
 
     async fn exec_stream(
@@ -337,7 +331,6 @@ impl SandboxBackend for ProcessBackend {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            agent: None,
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -542,7 +535,6 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            agent: None,
         }
     }
 
@@ -705,22 +697,20 @@ mod tests {
         // Long-running agent: a sleep loop that writes its PID to
         // a file at startup so the test can probe whether the
         // process is still alive after destroy.
-        use engram_core::types::sandbox::AgentSpec;
         let (b, _d) = backend();
         let pid_file = "agent.pid";
-        let mut spec = spec();
-        spec.agent = Some(AgentSpec {
+        let id = b.create(spec()).await.unwrap();
+        // Agent argv is supplied at start_agent time, not on the
+        // SandboxSpec — see the trait docs for why.
+        let agent = AgentSpec {
             argv: vec![
                 "sh".into(),
                 "-c".into(),
                 format!("echo $$ > {pid_file}; exec sleep 60"),
             ],
             env: HashMap::new(),
-        });
-        let id = b.create(spec).await.unwrap();
-        // Agent spawn is now explicit (the trait split lets callers
-        // bind routing between create and the agent dialing out).
-        b.start_agent(id).await.unwrap();
+        };
+        b.start_agent(id, agent).await.unwrap();
 
         // Wait for the agent to write its pid file. Real-world race
         // budgets are tiny here; a few hundred ms is plenty.

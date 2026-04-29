@@ -351,7 +351,6 @@ async fn resume_from_git_checkpoint(
         ttl: None,
         env: manifest.env.clone(),
         workdir: None,
-        agent: None,
     };
 
     let session_for_ctx = session.clone();
@@ -759,7 +758,6 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            agent: None,
         }
     }
 
