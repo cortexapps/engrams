@@ -117,6 +117,7 @@ async fn exec_runs_inside_baked_microvm() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
+        agent: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create");
 
@@ -130,6 +131,7 @@ async fn exec_runs_inside_baked_microvm() {
         stdin: None,
         env: HashMap::new(),
         workdir: None,
+        agent: None,
         timeout: Some(Duration::from_secs(5)),
     };
 

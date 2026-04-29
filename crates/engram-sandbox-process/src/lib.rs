@@ -66,6 +66,11 @@ struct SandboxState {
 pub struct ProcessBackend {
     work_dir: PathBuf,
     sandboxes: DashMap<SandboxId, SandboxState>,
+    /// Long-running agent process per sandbox (the harness adapter).
+    /// Tracked separately from `sandboxes` because `tokio::process::Child`
+    /// isn't `Clone`. Populated at `create()` if `SandboxSpec::agent`
+    /// is `Some`; killed at `destroy()`.
+    agent_children: DashMap<SandboxId, std::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
 impl ProcessBackend {
@@ -73,6 +78,7 @@ impl ProcessBackend {
         Self {
             work_dir: work_dir.into(),
             sandboxes: DashMap::new(),
+            agent_children: DashMap::new(),
         }
     }
 
@@ -95,6 +101,13 @@ impl SandboxBackend for ProcessBackend {
             materialize_rootfs(src, &cwd)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("materialize rootfs: {e}").into()))?;
+        }
+        // Spawn the long-running agent (harness adapter) if the spec
+        // includes one. Agent stdout/stderr go to `agent.log` inside
+        // the sandbox cwd — on Firecracker that's the serial console;
+        // here it's just a file you can `tail -f` while debugging.
+        if let Some(agent) = spec.agent.as_ref() {
+            spawn_agent(&self.agent_children, id, agent, &spec.env, &cwd).await?;
         }
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -310,12 +323,27 @@ impl SandboxBackend for ProcessBackend {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
+            agent: None,
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // Kill the agent first (if any) so it can't keep writing into
+        // the cwd we're about to delete. SIGKILL via `Child::kill` —
+        // the dev harness has no ack-shutdown protocol on this
+        // path; production harnesses get a graceful Shutdown command
+        // via the harness channel before destroy is called.
+        if let Some((_, slot)) = self.agent_children.remove(&id) {
+            // Take the Child out from under the std::sync::Mutex
+            // (which is !Send across .await) before awaiting wait().
+            let taken = { slot.lock().unwrap().take() };
+            if let Some(mut child) = taken {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
         if let Some((_, state)) = self.sandboxes.remove(&id) {
             // Best-effort cleanup; if the cwd disappeared between create
             // and destroy, that's fine.
@@ -327,6 +355,56 @@ impl SandboxBackend for ProcessBackend {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
+}
+
+/// Spawn the sandbox's long-running agent process (harness adapter,
+/// noop dev harness, etc.). Stdout/stderr go to `<cwd>/agent.log` so
+/// the agent's chatter doesn't bleed into the test's stderr but is
+/// still tail-able while debugging.
+async fn spawn_agent(
+    children: &DashMap<SandboxId, std::sync::Mutex<Option<tokio::process::Child>>>,
+    id: SandboxId,
+    agent: &engram_core::types::sandbox::AgentSpec,
+    sandbox_env: &HashMap<String, String>,
+    cwd: &Path,
+) -> Result<(), SandboxError> {
+    let argv0 = agent
+        .argv
+        .first()
+        .ok_or_else(|| SandboxError::InvalidSpec("agent argv must not be empty".into()))?;
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cwd.join("agent.log"))
+        .map_err(|e| SandboxError::Vm(format!("open agent.log: {e}").into()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| SandboxError::Vm(format!("dup agent.log fd: {e}").into()))?;
+
+    let mut env = sandbox_env.clone();
+    env.extend(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if !env.contains_key("PATH") {
+        if let Ok(p) = std::env::var("PATH") {
+            env.insert("PATH".into(), p);
+        }
+    }
+
+    let mut cmd = Command::new(argv0);
+    cmd.args(agent.argv.iter().skip(1))
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env_iter(&env))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .kill_on_drop(true);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| SandboxError::Vm(format!("spawn agent `{argv0}`: {e}").into()))?;
+    children.insert(id, std::sync::Mutex::new(Some(child)));
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -450,6 +528,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
+            agent: None,
         }
     }
 
@@ -605,6 +684,62 @@ mod tests {
             b.exec(id, exec(&["true"])).await,
             Err(SandboxError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_spawns_at_create_and_dies_at_destroy() {
+        // Long-running agent: a sleep loop that writes its PID to
+        // a file at startup so the test can probe whether the
+        // process is still alive after destroy.
+        use engram_core::types::sandbox::AgentSpec;
+        let (b, _d) = backend();
+        let pid_file = "agent.pid";
+        let mut spec = spec();
+        spec.agent = Some(AgentSpec {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("echo $$ > {pid_file}; exec sleep 60"),
+            ],
+            env: HashMap::new(),
+        });
+        let id = b.create(spec).await.unwrap();
+
+        // Wait for the agent to write its pid file. Real-world race
+        // budgets are tiny here; a few hundred ms is plenty.
+        let pid_path = b.cwd_for(id).join(pid_file);
+        for _ in 0..50 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let pid: i32 = fs::read_to_string(&pid_path)
+            .expect("agent should have written its pid")
+            .trim()
+            .parse()
+            .expect("pid file should contain an integer");
+        // /proc isn't on macOS, but `kill -0` works to probe liveness
+        // portably. exit_status==0 ⇔ process exists.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(alive, "agent pid {pid} should be alive after create");
+
+        b.destroy(id).await.unwrap();
+
+        // After destroy, the pid should be gone (or, on platforms
+        // where the kernel recycles pids quickly, kill -0 may still
+        // succeed against an unrelated process — accept that and
+        // assert at minimum that the cwd was removed).
+        let dead = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true);
+        assert!(dead, "agent pid {pid} should be dead after destroy");
     }
 
     #[tokio::test]

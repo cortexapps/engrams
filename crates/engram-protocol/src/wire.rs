@@ -318,6 +318,7 @@ mod tests {
             ttl: None,
             env: HashMap::from([("K".into(), "V".into())]),
             workdir: Some("/work".into()),
+            agent: None,
         };
         let f = Frame::Request {
             req_id: 1,

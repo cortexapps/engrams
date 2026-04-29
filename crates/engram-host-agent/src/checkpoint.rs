@@ -464,6 +464,7 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
+            agent: None,
         }
     }
 

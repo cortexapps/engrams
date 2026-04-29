@@ -725,6 +725,21 @@ async fn read_tail(path: &Path, max: u64) -> Option<String> {
 #[async_trait]
 impl SandboxBackend for FirecrackerBackend {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        // Phase 4 Track A wired AgentSpec on the SandboxSpec. The
+        // Firecracker path that consumes it (`engram-bootstrap` reading
+        // the agent argv from a file dropped into the rootfs at
+        // create-time) lands in Phase 5 alongside the image-baker
+        // changes. Until then, surface the gap explicitly rather than
+        // silently dropping the agent — a session that boots without
+        // its harness wouldn't emit any events and would look hung.
+        if spec.agent.is_some() {
+            return Err(SandboxError::InvalidSpec(
+                "FirecrackerBackend doesn't honor SandboxSpec::agent yet — \
+                 use ProcessBackend for harness-driven sessions until \
+                 engram-bootstrap lands"
+                    .into(),
+            ));
+        }
         let sandbox_id = SandboxId::new();
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
 
@@ -912,6 +927,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
+            agent: None,
         }
     }
 

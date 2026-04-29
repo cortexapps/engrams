@@ -218,6 +218,7 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
+        agent: None,
     };
 
     // 3. Scheduler picks a host based on heartbeat-derived state

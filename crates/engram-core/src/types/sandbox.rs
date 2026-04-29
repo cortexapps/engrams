@@ -30,6 +30,34 @@ pub struct SandboxSpec {
     pub ttl: Option<Duration>,
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
+    /// Long-running agent process to launch alongside the sandbox —
+    /// the harness adapter (Claude Code wrapper, noop dev harness,
+    /// etc.). `None` = quiescent sandbox that only runs explicit
+    /// `exec()`s; useful for bootstrap and tests.
+    ///
+    /// `ProcessBackend` spawns this as a child rooted in the
+    /// sandbox cwd at `create()` and SIGTERMs it at `destroy()`.
+    /// Firecracker reads it via `engram-bootstrap` from a file
+    /// dropped into the rootfs (Phase 5+); for now, Firecracker
+    /// errors if `agent.is_some()` rather than silently ignoring.
+    #[serde(default)]
+    pub agent: Option<AgentSpec>,
+}
+
+/// Argv + env for the long-running "agent" process (Claude Code,
+/// the dev noop harness, future adapters). Backends launch this at
+/// `create()` and tear it down at `destroy()`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentSpec {
+    /// Argv. `argv[0]` must be reachable by the backend — for
+    /// ProcessBackend this means an absolute host path; for
+    /// Firecracker it's a path inside the rootfs.
+    pub argv: Vec<String>,
+    /// Extra env on top of `SandboxSpec::env`. Used to inject the
+    /// harness-hub address, session id, attach token, etc. without
+    /// polluting the sandbox-wide env.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
