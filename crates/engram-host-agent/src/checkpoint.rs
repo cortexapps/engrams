@@ -105,8 +105,8 @@ pub async fn checkpoint_session(
     reason: CheckpointReason,
     cfg: &CheckpointConfig,
 ) -> Result<CheckpointOutcome, CheckpointError> {
-    // Step 1: ask the harness to flush its transcript. Don't block
-    // the push if it doesn't ack — workspace durability is the
+    // Ask the harness to flush its transcript. Don't block the
+    // push if it doesn't ack — workspace durability is the
     // contract; transcript freshness is an opportunistic bonus.
     let harness_acked =
         match tokio::time::timeout(cfg.harness_ack_timeout, hub.checkpoint(sandbox_id, reason))
@@ -124,13 +124,36 @@ pub async fn checkpoint_session(
             }
         };
 
-    // Step 2: workspace size guard. Cheap: `git status --porcelain`
-    // gives us a manageable byte count of the diff plus untracked
-    // files; we read it and gate on its size. Doesn't catch the
-    // case where the agent stuffed a 500MB file into a tracked
-    // directory, but for the common runaway-log pattern (a
-    // `.log` file the agent writes) it surfaces the problem
-    // before the push.
+    let outcome = checkpoint_workspace_only(backend, sandbox_id, workspace, branch, reason, cfg)
+        .await?
+        .with_harness_acked(harness_acked);
+    Ok(outcome)
+}
+
+/// Run only the git-push portion of a checkpoint, skipping the
+/// harness `Checkpoint` round-trip.
+///
+/// Used by Track C.9's auto-checkpoint path: the harness has just
+/// emitted `HarnessEvent::Idle` / `RunCompleted`, so we already
+/// know it's at a safe boundary — no need to re-flush.
+/// `harness_acked` on the returned [`CheckpointOutcome`] is `true`
+/// since the harness implicitly acked by going idle. Manual /
+/// preemption checkpoints continue to use [`checkpoint_session`]
+/// which adds the explicit harness round-trip.
+pub async fn checkpoint_workspace_only(
+    backend: &Arc<dyn SandboxBackend>,
+    sandbox_id: SandboxId,
+    workspace: &str,
+    branch: &str,
+    reason: CheckpointReason,
+    cfg: &CheckpointConfig,
+) -> Result<CheckpointOutcome, CheckpointError> {
+    // Workspace size guard. `git status --porcelain` gives us a
+    // manageable byte count of the diff plus untracked files; we
+    // read it and gate on its size. Doesn't catch a 500MB file
+    // tucked into a tracked directory, but for the common runaway-
+    // log pattern (a `.log` the agent writes) it surfaces the
+    // problem before the push.
     let status = run_git(
         backend,
         sandbox_id,
@@ -145,9 +168,21 @@ pub async fn checkpoint_session(
         });
     }
 
-    // Step 3: stage every change, commit (always, even if empty —
-    // it's how a successful checkpoint registers in `git log` so
-    // operators can see the cadence), push to the session branch.
+    // Skip empty checkpoints: if the agent's "completed run" produced
+    // zero workspace changes (read-only run, or every change reverted
+    // before the agent went idle), don't bother committing or pushing.
+    // Returns Ok with commit_sha = None so callers can distinguish
+    // "checkpointed nothing" from "pushed a new commit". Saves a
+    // round-trip per idle event for read-only agents and keeps the
+    // checkpoint branch's `git log` aligned with actual progress.
+    if status.stdout.is_empty() {
+        return Ok(CheckpointOutcome {
+            commit_sha: None,
+            harness_acked: true,
+        });
+    }
+
+    // Stage every change, commit, push to the session branch.
     run_git(backend, sandbox_id, workspace, &["git", "add", "-A"]).await?;
 
     let message = format!("engram-checkpoint {}", checkpoint_reason_str(reason));
@@ -160,16 +195,13 @@ pub async fn checkpoint_session(
         "-c",
         "commit.gpgsign=false",
         "commit",
-        "--allow-empty",
         "-m",
         &message,
     ];
     let _ = run_git(backend, sandbox_id, workspace, &commit_args).await?;
 
-    // Capture the commit SHA so the caller can stamp it on the
-    // session_events row that triggered this checkpoint (Track A.3
-    // forwards harness events; Track C.9 ties the event row to the
-    // commit via `workspace_commit_sha`).
+    // Capture the commit SHA so the caller can emit it as part of
+    // the SessionEvent::CheckpointPushed broadcast.
     let rev = run_git(
         backend,
         sandbox_id,
@@ -189,8 +221,15 @@ pub async fn checkpoint_session(
 
     Ok(CheckpointOutcome {
         commit_sha: Some(commit_sha),
-        harness_acked,
+        harness_acked: true,
     })
+}
+
+impl CheckpointOutcome {
+    fn with_harness_acked(mut self, acked: bool) -> Self {
+        self.harness_acked = acked;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -602,6 +641,17 @@ mod tests {
             .await
             .expect("create");
 
+        // Make the workspace dirty so the checkpoint primitive
+        // doesn't short-circuit on the empty-diff guard.
+        let req = ExecRequest {
+            command: vec!["sh".into(), "-c".into(), "echo dirty > note.txt".into()],
+            stdin: None,
+            env: Default::default(),
+            workdir: None,
+            timeout: Some(Duration::from_secs(5)),
+        };
+        backend.exec(sandbox_id, req).await.unwrap();
+
         let hub = HarnessHub::new(null_sink());
         let err = checkpoint_session(
             &hub,
@@ -623,5 +673,74 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_workspace_only_skips_when_diff_is_empty() {
+        // Idle-triggered auto-checkpoint with no workspace changes
+        // should return Ok with commit_sha=None and not push at all.
+        let (_remote, workspace) = seed_remote_and_workspace();
+
+        let sandbox_root = TempDir::new().expect("sandbox root");
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
+        let sandbox_id = backend
+            .create(process_spec_with_rootfs(workspace.path()))
+            .await
+            .expect("create");
+
+        // Don't touch the workspace; its diff against the seed clone
+        // is empty.
+        let outcome = checkpoint_workspace_only(
+            &backend,
+            sandbox_id,
+            ".",
+            "engram/sessions/idle-no-change",
+            CheckpointReason::RunCompleted,
+            &CheckpointConfig::default(),
+        )
+        .await
+        .expect("checkpoint");
+        assert!(outcome.commit_sha.is_none(), "no diff → no commit");
+        assert!(outcome.harness_acked, "auto path is implicitly ack'd");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_workspace_only_pushes_when_diff_present() {
+        let (remote, workspace) = seed_remote_and_workspace();
+
+        let sandbox_root = TempDir::new().expect("sandbox root");
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
+        let sandbox_id = backend
+            .create(process_spec_with_rootfs(workspace.path()))
+            .await
+            .expect("create");
+
+        let req = ExecRequest {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo idle-test > completed.txt".into(),
+            ],
+            stdin: None,
+            env: Default::default(),
+            workdir: None,
+            timeout: Some(Duration::from_secs(5)),
+        };
+        backend.exec(sandbox_id, req).await.unwrap();
+
+        let outcome = checkpoint_workspace_only(
+            &backend,
+            sandbox_id,
+            ".",
+            "engram/sessions/idle-with-change",
+            CheckpointReason::RunCompleted,
+            &CheckpointConfig::default(),
+        )
+        .await
+        .expect("checkpoint");
+        let sha = outcome.commit_sha.expect("non-empty diff → commit");
+        let remote_sha =
+            assert_branch_has_commits(remote.path(), "engram/sessions/idle-with-change");
+        assert_eq!(sha, remote_sha);
     }
 }

@@ -5,9 +5,13 @@
 //! Refuses (409 Conflict) when the session isn't `SessionKind::Git`
 //! — `Local` and `Readonly` sessions have no checkpoint branch.
 //!
-//! Track C.9 (auto-checkpoint on every `ToolCallCompleted`) builds
-//! on the same primitive but invokes it from the harness EventSink
-//! rather than this HTTP endpoint.
+//! Track C.9 (auto-checkpoint on `HarnessEvent::Idle` /
+//! `HarnessEvent::RunCompleted`) builds on the same primitive but
+//! invokes it from the harness EventSink rather than this HTTP
+//! endpoint. Per-tool-call cadence was the original Track C.9 design;
+//! we settled on idle/run-completed instead — one commit per
+//! completed agent run is the right unit of work for `engram session
+//! diff/pr` and the noise from per-call empty commits isn't worth it.
 
 use axum::extract::{Path, State};
 use axum::Json;

@@ -140,8 +140,9 @@ impl HarnessEvent {
         }
     }
 
-    /// Tool-call ID if this event carries one. Used by the host's
-    /// `session_events` writer to populate the `tool_call_id` column.
+    /// Tool-call ID if this event carries one. Useful for callers
+    /// that want to correlate Started/Completed pairs (e.g. a Web UI
+    /// rendering the agent's play-by-play timeline).
     pub fn tool_call_id(&self) -> Option<&str> {
         match self {
             Self::ToolCallStarted { tool_call_id, .. }
