@@ -324,7 +324,7 @@ fn parse_log_lines(out: &str) -> Vec<WorkspaceCommit> {
 /// `commit_sha` payload field. None if no checkpoint exists at or
 /// before that idx (e.g., session forked before any tool call
 /// completed).
-async fn checkpoint_sha_at_or_before(
+pub(crate) async fn checkpoint_sha_at_or_before(
     state: &SharedState,
     session_id: SessionId,
     at_or_before_idx: i64,

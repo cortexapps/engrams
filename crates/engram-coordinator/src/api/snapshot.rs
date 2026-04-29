@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
@@ -30,7 +30,7 @@ use engram_core::types::session::{RepoUrl, SessionKind};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{Session, SessionStatus};
 use engram_core::{SandboxId, SessionId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
@@ -116,11 +116,22 @@ pub async fn snapshot(
     }))
 }
 
+#[derive(Deserialize, Default)]
+pub struct ResumeQuery {
+    /// Optional "go back in time" pointer. When set, the resume
+    /// re-spins the sandbox onto the workspace SHA captured at (or
+    /// just before) `from_event_idx` instead of the checkpoint
+    /// branch's current HEAD. Forces the cold-resume path — FC
+    /// snapshots correspond to "now," not to a past event.
+    pub from_event_idx: Option<i64>,
+}
+
 pub async fn resume(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
+    Query(q): Query<ResumeQuery>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
-    resume_session(state, id).await.map(Json)
+    resume_session(state, id, q.from_event_idx).await.map(Json)
 }
 
 /// Auto-resume an `Idle` session if needed, before routing an
@@ -137,7 +148,7 @@ pub async fn resume(
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
     if session.status == SessionStatus::Idle {
-        resume_session(state.clone(), id).await?;
+        resume_session(state.clone(), id, None).await?;
     }
     // For everything else (Active, Pending, PendingReassign,
     // Completed, Failed) we let the downstream handler decide. The
@@ -151,8 +162,45 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
     Ok(())
 }
 
-async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
+async fn resume_session(
+    state: SharedState,
+    id: SessionId,
+    from_event_idx: Option<i64>,
+) -> Result<SnapshotResponse, ApiError> {
     let session = state.services.meta.get_session(id).await?;
+
+    // "Go back in time" mode: resolve the requested event_idx into a
+    // workspace SHA on the checkpoint branch and force the cold-resume
+    // path. An Active session can't be silently rewound — the caller
+    // should fork instead, so they keep the live work alongside the
+    // historical replay.
+    if let Some(idx) = from_event_idx {
+        if session.status == SessionStatus::Active {
+            return Err(ApiError::Conflict(
+                "session is Active — fork to replay from a past event_idx".into(),
+            ));
+        }
+        if session.session_kind != SessionKind::Git {
+            return Err(ApiError::Conflict(format!(
+                "session ({}) has no checkpoint history — only Git sessions \
+                 support resume?from_event_idx",
+                session.session_kind.as_str()
+            )));
+        }
+        let branch = session.checkpoint_branch.clone().ok_or_else(|| {
+            ApiError::Internal(
+                "git session is missing its checkpoint_branch — schema invariant broken".into(),
+            )
+        })?;
+        let sha = super::sessions_inspect::checkpoint_sha_at_or_before(&state, id, idx)
+            .await?
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "no checkpoint at or before event_idx {idx} for this session",
+                ))
+            })?;
+        return resume_from_git_checkpoint(state, session, &branch, Some(sha)).await;
+    }
 
     // Resuming an Active session is a no-op the caller probably
     // didn't mean. Idle (operator-evicted) and PendingReassign
@@ -196,7 +244,7 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
             "git session is missing its checkpoint_branch — schema invariant broken".into(),
         )
     })?;
-    resume_from_git_checkpoint(state, session, &branch).await
+    resume_from_git_checkpoint(state, session, &branch, None).await
 }
 
 /// Hot-resume path: a local FC snapshot exists, restore it on the
@@ -252,6 +300,7 @@ async fn resume_from_git_checkpoint(
     state: SharedState,
     session: Session,
     branch: &str,
+    pin_to_sha: Option<String>,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
 
@@ -328,8 +377,14 @@ async fn resume_from_git_checkpoint(
             ));
         }
     };
-    if let Err(e) =
-        smart_bootstrap_to_branch(&state.services.sandbox, sandbox_id, &url, branch).await
+    if let Err(e) = smart_bootstrap_to_branch(
+        &state.services.sandbox,
+        sandbox_id,
+        &url,
+        branch,
+        pin_to_sha.as_deref(),
+    )
+    .await
     {
         // Failure leaves the sandbox running but in an unknown
         // state. Surface as Internal; the operator can destroy /
@@ -378,6 +433,7 @@ pub(crate) async fn smart_bootstrap_to_branch(
     sandbox_id: SandboxId,
     url: &str,
     branch: &str,
+    pin_to_sha: Option<&str>,
 ) -> Result<(), String> {
     let detect = run_workspace(
         backend,
@@ -417,13 +473,18 @@ pub(crate) async fn smart_bootstrap_to_branch(
     run_workspace(backend, sandbox_id, &["git", "fetch", "origin", branch])
         .await
         .map_err(|e| format!("git fetch origin {branch}: {e}"))?;
+    // Reset to the pinned SHA (if given) — must be reachable from
+    // the just-fetched branch tip — or to FETCH_HEAD (the current
+    // tip). The SHA path is the "go back in time" resume; the
+    // FETCH_HEAD path is the standard rejoin-where-you-left-off.
+    let reset_target = pin_to_sha.unwrap_or("FETCH_HEAD");
     run_workspace(
         backend,
         sandbox_id,
-        &["git", "reset", "--hard", "FETCH_HEAD"],
+        &["git", "reset", "--hard", reset_target],
     )
     .await
-    .map_err(|e| format!("git reset --hard FETCH_HEAD: {e}"))?;
+    .map_err(|e| format!("git reset --hard {reset_target}: {e}"))?;
     Ok(())
 }
 
@@ -713,7 +774,7 @@ mod tests {
         let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
         let sandbox_id = backend.create(process_spec()).await.unwrap();
 
-        smart_bootstrap_to_branch(&backend, sandbox_id, &url, "engram/sessions/abc")
+        smart_bootstrap_to_branch(&backend, sandbox_id, &url, "engram/sessions/abc", None)
             .await
             .expect("smart_bootstrap should succeed on empty workspace");
 
@@ -811,6 +872,7 @@ mod tests {
             sandbox_id,
             &format!("{}", remote.path().display()),
             "engram/sessions/xyz",
+            None,
         )
         .await
         .expect("smart_bootstrap should fast-forward the warm clone");
@@ -874,6 +936,7 @@ mod tests {
             sandbox_id,
             &format!("{}", real_remote.path().display()),
             "engram/sessions/foo",
+            None,
         )
         .await
         .expect("smart_bootstrap should re-init when origin URL diverges");
