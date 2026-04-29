@@ -720,30 +720,62 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 
 **Deliverable**: stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.
 
-### Phase 4 — Cloud abstraction & spot tolerance
+### Phase 4 — Versioned conversations + pack hosts
 
-**Goal**: GCP-native production deployment; gracefully survive Spot/preemptible eviction; clean trait surfaces for non-GCP adopters.
+**Goal**: agent-first durability via git checkpoints + first-class hot/cold suspend mechanics. Phase 4 was originally framed as "drain VM memory snapshots to GCS in the 30s GCP preemption window." That model is mathematically infeasible for realistic workloads (5 sandboxes × 8 GiB ≫ 30s × 250 MB/s) and conflates "preserve VM state" with "preserve agent progress" — different things. The reframe: **agent state is externalized** (workspace files + transcript), so the right durability primitive is git, not blob-replicated memory.
 
-- **`engram-cloud-gcp`** real implementation
-  - GCE metadata server polling for `instance/maintenance-event` and `instance/preempted`
-  - Compute Engine API (via `google-cloud-compute`) for autoscaling primitives — `provision_host` / `deprovision_host` flip from `NotSupported` stubs to real
-- **Preemption drain handler** — on signal:
-  1. Coordinator marks host `draining`, refuses new assignments
-  2. Host force-snapshots all in-RAM sessions, fan-out uploads to BlobStorage in parallel
-  3. Host upgrades unreplicated → replicated as fast as possible before deadline
-  4. After deadline (or upload completion), session migrations land on remaining hosts; new sessions start on demand restoring from blob
-- **Cloud autoscaler** (optional, runs in coordinator) — provisions hosts when fleet pool pressure exceeds a threshold; deprovisions on slack
-- **Reference deployments**:
-  - `deploy/gcp/` Terraform module — managed instance group of preemptible n2d-highmem hosts with nested-virt, plus a coordinator service running on Cloud Run or GKE
-  - `deploy/hetzner/` setup script — bare-metal AX-series box with KVM, coordinator on the same host (no autoscaling)
-  - `deploy/bare-metal/` — single-host, no cloud SDK, suitable for self-hosters
-- **`engram-cloud-aws`** + **`engram-cloud-hetzner`** — typed stubs that fill in as adopters need them
+**Storage split**:
 
-**Deliverable**: stand up the `deploy/gcp/` Terraform on a real GCP project. Run a load test that triggers preemption via `gcloud compute instances simulate-maintenance-event`. Sessions seamlessly resume on remaining hosts; no client-visible downtime.
+- **Postgres `session_events`** is the conversation source of truth. Tool-call-grain harness events land here with their `transcript_delta` bytes; the SSE bus, Web UI, Slackbot, and resume bootstrap consume from this stream.
+- **Git** is the workspace source of truth. Each session owns an `engram/sessions/<id>` checkpoint branch on its writable repo. Checkpoints push the workspace state; resume fetches and resets to the branch.
+- **Blob storage is removed** (Track 0). Snapshots are local-NVMe-only. Image distribution moves to a Docker registry in Phase 5.
+
+**Two snapshot mechanisms, distinct purposes**:
+
+| | Hot snapshot (Firecracker) | Cold checkpoint (git) |
+|---|---|---|
+| Mechanism | `PATCH /vm Paused` + `PUT /snapshot/create`, memory.bin to local NVMe | `git add/commit/push` from inside the sandbox |
+| Resume cost | Sub-second (UFFD lazy page-in, same host) | Few seconds (fresh sandbox + git fetch + reset) |
+| Cross-host? | No — memory tied to that host's RAM | Yes |
+| Right for | Idle eviction → pack hosts. Warm pool. | Spot preemption. Long-term parking. Cross-host migration. Forking. |
+
+**Auto-checkpoint cadence**: one commit per *completed agent run*, not per tool call. The harness emits `HarnessEvent::Idle` / `RunCompleted` when it finishes a prompt; the EventSink fires `checkpoint_workspace_only` for Git sessions, which runs `git add -A && git commit && git push origin engram/sessions/<id>`. Per-tool-call commits would drown the branch in dozens of empty/near-empty pushes per run; one-per-completed-run aligns with the unit a human reviews via `engram session diff <id>` or `engram session pr <id>`.
+
+**Smart-bootstrap composition with warm pool**:
+
+- Phase 5's image baker bakes warm-pool images that include a clone of the writable repo at "bake SHA" + dependencies installed + long-lived daemons warmed (gradle daemon, language servers, Firecracker memory snapshot of post-init state).
+- Session create: warm pool delivers a sandbox with `/workspace` already cloned at bake SHA. Bootstrap runs `git fetch origin && git reset --hard origin/<branch>` — milliseconds for sessions on the same `<branch>` the image was baked from; small diff for resumed sessions on `engram/sessions/<id>`.
+- Session resume on a different host: same image, fresh sandbox, smart-bootstrap detects the existing clone via `git remote get-url origin`. If origin matches: fetch + reset. If origin diverged or `/workspace` is empty: `git init . && git remote add origin <url> && git fetch + reset --hard FETCH_HEAD`. Either path lands the workspace at the checkpoint branch HEAD without a full re-clone.
+- Resume always uses the *same image_version* the session was originally created with, so the bake SHA → checkpoint branch diff is bounded and predictable.
+
+**Resume contract**:
+
+- **Hot resume** (FC snapshot intact, same host): in-memory state preserved. `POST /sessions/:id/resume` routes to the snapshot's host; sub-second.
+- **Cold resume** (host gone, no FC snapshot): fresh sandbox on the same image, smart-bootstrap to the checkpoint branch. In-memory state lost; workspace + transcript reconstructed. Caller-driven — preempted sessions land in `PendingReassign` and stay there until `POST /sessions/:id/resume`.
+- **Read-only / Local sessions**: no checkpoint branch; cold resume is unavailable. Caller forks via `engram session fork` if they want to continue from the workspace state.
+
+**Tracks** (see plan file for granular breakdown):
+
+- Track 0: blob storage removal — done
+- Track A: harness protocol (engram-harness-proto, HarnessHub, noop test harness, Claude Code adapter)
+- Track B: hot-suspend pack hosts (idle evictor + auto-resume)
+- Track C: git-as-durable-state (RepoUrl/SessionKind types, schema, checkpoint primitive, manual endpoint, auto-checkpoint on Idle, smart-bootstrap resume)
+- Track D: preemption best-effort flush (consume `cloud.preemption_signal()`, call checkpoint on every live sandbox in parallel within the 30s window, accept VM death)
+- Track E: cleanup + dev ergonomics + docs
+- Track F: git-native CLI verbs (`engram session log/diff/fork/pr/resume`)
+
+**What Engram does NOT solve** (explicit contract):
+
+- **Idempotency for non-idempotent tool calls.** A session that calls `slack.post()` and gets preempted may, on resume, redo the post. Tool wrappers must use idempotency keys derived from `(session_id, tool_call_id)`. Same model as Modal, AWS Step Functions.
+- **Fork determinism for sessions with side effects.** Forking from a checkpoint that pre-dates a `db.delete_user(123)` call replays a conversation into a world where 123 is *already* deleted. Forking is best-suited to code-edit tasks.
+- **Mid-tool-call work preservation.** A 5-minute `pytest` running when preemption hits has no checkpoint since the last tool call returned. On resume, the agent reruns it. Acceptable; checkpoints land at run boundaries (Idle/RunCompleted), not within tool calls.
+- **Cross-vendor agent compatibility out of the box.** Each agent (Claude Code, Codex, Aider) needs an adapter implementing the harness protocol. Phase 4 ships Claude Code as the reference; others land as adopters need them.
+
+**Deliverable**: stand up the `deploy/gcp/` Terraform on a real GCP project (lands later — the Phase 4 deliverable as written has shrunk to "the durability + pack-hosts engineering"). Run a session against the Claude Code adapter. Verify per-run checkpoint pushes, hot-suspend pack-hosts behaviour, and `engram session resume <id>` recovers a session whose host was killed.
 
 ### Phase 5 — Image baking pipeline
 
-**Goal**: warm-pool images refresh on a schedule, no human in the loop.
+**Goal**: warm-pool images refresh on a schedule, no human in the loop. Composes with Phase 4's git-native sessions: each warm image includes a clone of the writable repo at "bake SHA" + dependencies + warm daemons, so session create / cold resume runs `git fetch + reset` (milliseconds) instead of a full clone (seconds-to-minutes).
 
 The baker itself is real today (`crates/engram-image-builder`):
 

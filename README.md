@@ -14,7 +14,7 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 
 **Phase 3 — done.** Multi-host coordinator: host-agents run as a separate binary that dials the coordinator over WebSocket (bincode-over-WS with hand-rolled `request_id` demuxer + W3C trace context per RPC; `--mode=all` keeps single-binary `just dev` working by registering the local backend in-process). The warm `Pool` is host-side (`engram-host-agent::pooled_backend::PooledBackend`), so heartbeats carry real `(ready, target)` per `image_version` and `HostRegistry`'s scheduler ranks by snapshot affinity → warm pool → capacity. Cold-tier blob restore unblocked. `LISTEN/NOTIFY` on `session_events` + `host_dead` lets coordinator replicas re-broadcast events into local SSE subscribers and drop dead hosts in lockstep. `SessionStatus::PendingReassign` + `POST /sessions/:id/migrate` for operator-initiated transitions; the dead-host auto-detector (`crates/engram-coordinator/src/dead_host.rs`) handles the `kill -9 host → migrate within 30s` deliverable, racing replicas via `pg_try_advisory_lock` so exactly one wins each eviction. `sessions.sandbox_id` persistence + `repopulate_routing` on coord startup means Active sessions survive a coordinator restart. New `GET /api/hosts` + `engram host list/get/drain` CLI. 332 tests pass on macOS (up from 292), plus 2 `#[ignore]`'d integration tests gated on a live Postgres. Production hardening (TLS, `HostStatus::Disconnected`, backpressure tuning) lands with Phase 6.
 
-**Phase 4 — cloud abstraction & spot tolerance.** Next.
+**Phase 4 — versioned conversations + pack hosts.** In progress. Reframes the original "drain VM memory to GCS in 30s" plan around an agent-first model: workspace + transcript are durable via git checkpoints, hot-suspend keeps Firecracker memory snapshots for *local* idle eviction, and cross-host resume reconstructs from `engram/sessions/<id>` branches. Blob storage retired (Track 0); harness protocol + `engram-harness-{proto,noop}` foundations landed (Track A); `RepoUrl`/`SessionKind` + per-session checkpoint branches in the schema (Track C.1+C.2); `checkpoint_session` primitive (Track C.6) + manual `POST /sessions/:id/checkpoint` (Track C.8); auto-checkpoint on `HarnessEvent::Idle` / `RunCompleted` for one commit per completed agent run (Track C.9); cross-host resume via smart-bootstrap (`git fetch + reset` if pre-cloned, `git init + remote + fetch + reset` if empty) so warm-pool images keep sub-second resume even on the cold path (Track C.7). 363 tests pass on macOS via `cargo nextest run`. Tracks B (idle-evictor pack-hosts), D (preemption best-effort flush), F (`engram session log/diff/fork/pr`), and the in-VM `engram-bootstrap` binary still ahead.
 
 ## Workspace
 
@@ -22,8 +22,10 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 crates/
   engram-core                       # types, traits, errors. No I/O.
   engram-protocol                   # wire types: bincode-over-WS Frame protocol (coordinator <-> host)
+  engram-harness-proto              # wire types: harness ↔ host vsock channel (HarnessEvent / HarnessCommand)
+  engram-harness-noop               # first-party test harness (deterministic event cadence, no real agent)
   engram-coordinator                # binary: HTTP API + scheduler
-  engram-host-agent                 # binary: per-host daemon
+  engram-host-agent                 # binary: per-host daemon (warm pool, harness hub, checkpoint primitive)
   engram-image-builder              # binary: warm-image baker (Directory + Ext4 modes)
   engram-cli                        # binary: ops/admin tool
   engram-agentd                     # binary: in-guest exec daemon (vsock + UDS)
@@ -93,13 +95,57 @@ You'll see real `uname` output and the session id env var injected by the coordi
 ## Other recipes
 
 ```bash
-just check              # fmt + clippy + tests, the pre-push gate
-just test               # all tests
+just check              # fmt + clippy + tests (cargo nextest), the pre-push gate
+just test               # all tests via cargo nextest
 just psql               # psql into the dev Postgres
 just db-reset           # destroy + recreate the dev DB
 just dev-firecracker    # coordinator wired to the Firecracker backend (Linux + KVM only)
 just clean-var          # rm -rf the local sandbox cwds + snapshots
 ```
+
+## Sessions are versioned conversations (Phase 4)
+
+A session is a unit of agent work. Each session is bound to a writable git repo + base branch on create, and owns a checkpoint branch — `engram/sessions/<session_id>` — on that repo's remote. The agent's progress is durable via that branch, not VM memory.
+
+**Lifecycle:**
+
+```
+POST /sessions {repo: "git+https://...", branch: "main"}
+  → bootstrap clones the repo, agent starts on a warm-pool sandbox
+
+(agent runs, makes tool calls, eventually emits HarnessEvent::Idle)
+  → host-agent's EventSink fires checkpoint_workspace_only
+  → `git push origin engram/sessions/<id>` on the writable repo
+  → SessionEvent::CheckpointPushed broadcast on the SSE bus
+
+POST /sessions/:id/snapshot     # operator: take a hot FC snapshot
+DELETE /sessions/:id/local      # operator: hot-suspend (frees host RAM)
+POST /sessions/:id/resume       # bring back: FC restore if same host alive,
+                                # else fresh sandbox + smart-bootstrap to checkpoint
+POST /sessions/:id/checkpoint   # operator: force a workspace push now
+```
+
+**Hot vs cold resume.** `POST /sessions/:id/resume` first tries Firecracker memory restore against the snapshot's host (sub-second; in-memory state preserved). If the host is gone, it falls through to **cold resume**: fresh sandbox on the same `image_version`, then `git fetch origin engram/sessions/<id> && git reset --hard FETCH_HEAD`. The bake SHA → checkpoint diff is bounded because resume always uses the *same* image the session was created with — only the agent's own work to apply, not weeks of unrelated drift.
+
+**Smart-bootstrap composition with warm pool.** Phase 5's image baker bakes warm-pool images that include a clone of the writable repo at "bake SHA" + dependencies installed + warm daemons. Smart-bootstrap detects whether the sandbox's `/workspace` already has the right clone via `git remote get-url origin`:
+
+- If yes (warm pool slot): `git fetch + reset --hard FETCH_HEAD` — milliseconds, no full clone, no `npm install` rerun unless deps actually changed.
+- If no (empty cwd or origin diverged): `git init . && git remote add origin <url> && git fetch + reset` — works from any starting state.
+
+This keeps sub-second start times for cold resume on warm-pool slots.
+
+**Auto-checkpoint cadence.** One commit per *completed agent run*, not per tool call. The harness emits `HarnessEvent::Idle` / `RunCompleted` when it finishes a prompt; the EventSink pushes the workspace then. The branch reads as the agent's session log — exactly what you'd `git diff` or PR. Per-tool-call commits would drown the branch in dozens of empty/near-empty pushes per run.
+
+**Checkpoint branches as forkable artifacts.** `engram session fork <id>` (Track F, in progress) creates a new session whose checkpoint branch starts at the source's HEAD — that's how you "continue" a session whose host is gone, or branch a session that went off the rails. The original session's branch keeps existing for inspection / `engram session pr <id>`.
+
+**What survives what:**
+
+| Failure mode | Workspace files | Conversation log | In-memory state |
+|---|---|---|---|
+| Hot-suspend (idle eviction, same host) | preserved (in `/workspace`) | preserved | preserved (FC snapshot) |
+| Cross-host resume from checkpoint | preserved (checkpoint branch) | preserved (Postgres replay) | lost — agent reruns from last `Idle` |
+| Mid-run preemption (no fresh checkpoint) | last completed run's state | up to last completed run | lost — agent reruns the in-flight prompt |
+| Read-only / `local://` session host loss | lost | preserved | lost — caller restarts |
 
 ## Building images
 

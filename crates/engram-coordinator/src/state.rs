@@ -72,6 +72,18 @@ pub enum SessionEvent {
         snapshot_id: SnapshotId,
         at: DateTime<Utc>,
     },
+    /// Phase 4 (Track C.7): cross-host resume via the session's
+    /// checkpoint branch. Distinct from `Resumed` so SSE
+    /// subscribers can tell hot resume (FC snapshot, sub-second,
+    /// in-memory state preserved) from cold resume (fresh sandbox
+    /// + git fetch + reset; in-memory state lost, workspace
+    /// restored to checkpoint HEAD). `commit_sha` is the SHA the
+    /// new sandbox's workspace reset to.
+    ResumedFromCheckpoint {
+        branch: String,
+        commit_sha: String,
+        at: DateTime<Utc>,
+    },
     /// Phase 4 (Track C.6): a checkpoint successfully pushed the
     /// session's workspace to its `engram/sessions/<id>` branch.
     /// `commit_sha` is the new HEAD on that branch; `harness_acked`
@@ -158,6 +170,7 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
+            Self::ResumedFromCheckpoint { .. } => "resumed_from_checkpoint",
             Self::CheckpointPushed { .. } => "checkpoint_pushed",
             Self::CheckpointFailed { .. } => "checkpoint_failed",
             Self::HarnessRunStarted { .. } => "run_started",
