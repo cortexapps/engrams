@@ -38,8 +38,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use engram_core::SessionId;
 
 /// Vsock port the in-guest harness dials to reach the host. Distinct
-/// from the agentd exec port so the host can demux at `accept` time.
-pub const HARNESS_VSOCK_PORT: u32 = 1024;
+/// from the agentd exec port (1024) so the host can demux at `accept`
+/// time. Direction: guest-to-host (host listens on a UDS at
+/// `<vsock_uds>_<port>.sock`; guest dials AF_VSOCK CID=2 port=1026).
+pub const HARNESS_VSOCK_PORT: u32 = 1026;
+
+/// Vsock port the in-guest `engram-bootstrap` listener binds. The
+/// host's `start_agent` connects to this port and pushes a
+/// [`BootstrapLaunch`] frame; bootstrap reads it and `exec`s the
+/// described argv (with merged env) so the per-session agent process
+/// can take over. Direction: host-to-guest (host writes
+/// `CONNECT 1025\n` to `<vsock_uds>`).
+pub const BOOTSTRAP_VSOCK_PORT: u32 = 1025;
+
+/// Wire shape for the bootstrap-launch frame. The host sends this
+/// once after CONNECTing to [`BOOTSTRAP_VSOCK_PORT`]; bootstrap reads
+/// it, prepares the env, and `exec`s `argv[0]` with the rest as
+/// arguments. Bootstrap exits (via exec replacing its image) — there
+/// is no reply.
+///
+/// Argv may reference any binary baked into the rootfs (typically
+/// `/sbin/engram-harness-noop` for dev or `/sbin/engram-harness-claude`
+/// for production). Env is merged on top of bootstrap's existing env;
+/// duplicate keys take the BootstrapLaunch value.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapLaunch {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
 
 /// Single-frame size cap. Same as `engram-agentd::proto::MAX_MSG_BYTES`.
 /// `transcript_delta` payloads are typically a few KB (one JSONL line

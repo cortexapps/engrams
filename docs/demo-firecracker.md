@@ -13,12 +13,21 @@ What this exercises:
   In-memory state is preserved across the round-trip — files
   written before the snapshot are still there after resume.
 
+What this also exercises (after the harness path landed):
+- Harness-driven flow on Firecracker: in-VM `engram-bootstrap`
+  listens on vsock 1025; the host's `start_agent` pushes a
+  `BootstrapLaunch` frame; bootstrap exec's
+  `/sbin/engram-harness-noop`; the harness dials AF_VSOCK
+  CID=2 port=1026 back to a per-sandbox UDS the FC backend
+  pre-bound; events land in `session_events` and drive
+  the same `harness_hub.idle_sandboxes(ttl)` path used by
+  ProcessBackend. Idle eviction fires automatically after
+  60s without harness events.
+- Auto-resume on the FC path: a session that idle-evicted
+  comes back via FC's UFFD-backed snapshot restore on the
+  next `exec`, transparent to the caller.
+
 What this does **not** exercise yet:
-- Harness-driven flow (auto-noop, idle eviction,
-  auto-checkpoint on Idle). `engram-bootstrap` (Phase 5) is the
-  in-VM piece that launches the harness; until it lands,
-  `FirecrackerBackend::start_agent` errors with `InvalidSpec`,
-  so we run with `ENGRAM_DEV_AUTO_NOOP=` (off).
 - Cross-host migration. Single host, single coordinator.
 - Git-session checkpoint push. Works in principle on this stack;
   add it after picking a real test repo.

@@ -121,6 +121,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_agent(id, agent).await
     }
 
+    fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
+        self.inner.set_harness_sink(sink);
+    }
+
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         self.inner.list().await
     }

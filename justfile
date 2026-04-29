@@ -120,16 +120,28 @@ dev-firecracker: db-up
     ENGRAM_KERNEL_IMAGE_PATH=$ENGRAM_KERNEL_IMAGE_PATH \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-bootstrap} \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
+    ENGRAM_DEV_AUTO_NOOP=${ENGRAM_DEV_AUTO_NOOP:-} \
+    ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
-# Bake a tiny Firecracker image (debian-slim + engram-agentd) for the
-# `local://demo` repo and register it under `./var/engram/images/`.
-# The repo name passed to `engram image build` must match what the
-# session create body will carry (`local://demo`), because the image
-# registry resolves images by literal repo string.
+# Bake a tiny Firecracker image (debian-slim + engram-agentd +
+# engram-bootstrap + engram-harness-noop) for the `local://demo`
+# repo and register it under `./var/engram/images/`. The repo name
+# passed to `engram image build` must match what the session-create
+# body will carry (`local://demo`), because the image registry
+# resolves images by literal repo string.
+#
+# `--inject-bootstrap` + `--inject-harness` light up the Phase 4
+# harness path on FC: bootstrap listens on vsock 1025 in the guest,
+# the host's `start_agent` pushes a BootstrapLaunch frame, bootstrap
+# exec's the harness, harness dials back via vsock to the harness
+# hub. Without these flags the image is exec-only (no live tool
+# call timeline / idle eviction).
 fc-bake-demo:
-    cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-agentd     --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap  --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-harness-noop --target x86_64-unknown-linux-musl --release
     mkdir -p ./var/fc-bake
     printf 'FROM debian:bookworm-slim\n' > ./var/fc-bake/Dockerfile
     printf 'name = "local-demo"\n'         > ./var/fc-bake/engram.toml
@@ -139,7 +151,9 @@ fc-bake-demo:
         --source ./var/fc-bake \
         --format ext4 \
         --images-dir ./var/engram/images \
-        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd
+        --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
+        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
+        --inject-harness   engram-harness-noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop
 
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch

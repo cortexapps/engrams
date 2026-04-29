@@ -17,6 +17,9 @@ futures.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# tokio brought in solely for the AsyncRead+AsyncWrite traits in the
+# HarnessSink type alias. No runtime dependency.
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

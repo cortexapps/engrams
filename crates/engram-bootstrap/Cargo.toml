@@ -1,0 +1,23 @@
+[package]
+name = "engram-bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-guest binary that listens on vsock for a BootstrapLaunch frame from the host, then exec's the described agent process. Lives at /sbin/engram-bootstrap inside the rootfs; spawned by /sbin/engram-init alongside engram-agentd."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "engram-bootstrap"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.7"
+
+[dependencies]
+engram-harness-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

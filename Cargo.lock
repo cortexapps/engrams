@@ -551,6 +551,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "engram-harness-proto",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "engram-cli"
 version = "0.1.0"
 dependencies = [
@@ -658,6 +669,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
  "uuid",
 ]
@@ -671,6 +683,7 @@ dependencies = [
  "engram-harness-proto",
  "serde",
  "tokio",
+ "tokio-vsock",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -782,6 +795,7 @@ dependencies = [
  "dashmap",
  "engram-agentd",
  "engram-core",
+ "engram-harness-proto",
  "engram-image-builder",
  "futures",
  "parking_lot",

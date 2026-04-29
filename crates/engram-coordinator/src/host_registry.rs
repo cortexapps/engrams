@@ -344,6 +344,17 @@ impl SandboxBackend for HostRegistry {
         backend.start_agent(id, agent).await
     }
 
+    fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
+        // Fan out to every currently-registered host's backend so
+        // the FC sandbox listeners can route inbound vsock harness
+        // dials into the same hub. Hosts registered after this call
+        // miss it — re-call after registering new hosts in
+        // `--mode=all` flows where order can drift.
+        for entry in self.hosts.iter() {
+            entry.value().backend.set_harness_sink(sink.clone());
+        }
+    }
+
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // Aggregate across all connected hosts. Errors from any one
         // host are surfaced; partial results aren't reported in 3a.

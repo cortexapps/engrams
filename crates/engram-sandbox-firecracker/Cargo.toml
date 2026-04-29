@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 engram-core.workspace = true
 engram-agentd.workspace = true
+engram-harness-proto.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true

@@ -528,30 +528,64 @@ pub async fn delete_session(
 }
 
 /// Build the `AgentSpec` for the dev `engram-harness-noop` binary if
-/// `cfg.dev_auto_noop` is set, the harness binary path is configured,
-/// and the harness TCP listener is bound. None otherwise — production
-/// callers don't auto-spawn anything; their harness lives inside the
-/// rootfs and is invoked by `engram-bootstrap`.
+/// `cfg.dev_auto_noop` is set. None otherwise — production callers
+/// don't auto-spawn anything; their harness lives inside the rootfs
+/// and is invoked by `engram-bootstrap`.
+///
+/// Two flavors of argv depending on the sandbox backend:
+/// - `Process`: `--connect host:port` (TCP loopback to the
+///    coord-side harness listener).
+/// - `Firecracker`: `--vsock-host <port>` (the in-VM harness dials
+///    AF_VSOCK CID=2 port=1026; FC's vsock UDS routes it to the
+///    coord-side sink registered on the FC backend).
 fn build_dev_noop_agent(
     state: &SharedState,
     session_id: SessionId,
 ) -> Option<engram_core::types::sandbox::AgentSpec> {
+    use crate::config::SandboxBackendChoice;
     if !state.cfg.dev_auto_noop {
         return None;
     }
-    let bin = state.cfg.dev_noop_harness_path.as_ref()?.to_string_lossy().to_string();
-    let addr = (*state.harness_listen_addr.lock())?;
+    let bin = state
+        .cfg
+        .dev_noop_harness_path
+        .as_ref()?
+        .to_string_lossy()
+        .to_string();
     let mut env = HashMap::new();
-    env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
-    Some(engram_core::types::sandbox::AgentSpec {
-        argv: vec![
-            bin,
-            "--connect".into(),
-            addr.to_string(),
-            "--session-id".into(),
-            session_id.to_string(),
-        ],
-        env,
-    })
+
+    let argv = match state.cfg.sandbox_backend {
+        SandboxBackendChoice::Process => {
+            // ProcessBackend dev path — TCP loopback. Look up the
+            // bound port from the harness listener that was
+            // started in lib::run.
+            let addr = (*state.harness_listen_addr.lock())?;
+            env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
+            vec![
+                bin,
+                "--connect".into(),
+                addr.to_string(),
+                "--session-id".into(),
+                session_id.to_string(),
+            ]
+        }
+        SandboxBackendChoice::Firecracker => {
+            // FC path — guest dials AF_VSOCK CID=2 on the harness
+            // port. Inside the rootfs, `bin` is whatever path
+            // `engram image build --inject-harness <name>=...`
+            // landed at (typically `/sbin/engram-harness-noop`),
+            // so the host's `dev_noop_harness_path` should be set
+            // to the in-rootfs path, not a host filesystem path.
+            let port = engram_harness_proto::HARNESS_VSOCK_PORT;
+            vec![
+                bin,
+                "--vsock-host".into(),
+                port.to_string(),
+                "--session-id".into(),
+                session_id.to_string(),
+            ]
+        }
+    };
+    Some(engram_core::types::sandbox::AgentSpec { argv, env })
 }

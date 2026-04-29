@@ -199,7 +199,33 @@ enum ImageCmd {
         /// `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`.
         #[arg(long)]
         inject_agent: Option<PathBuf>,
+
+        /// Inject a static-musl `engram-bootstrap` binary at
+        /// `/sbin/engram-bootstrap`. The default init shim spawns
+        /// it in the background; it listens on vsock 1025 for a
+        /// `BootstrapLaunch` from the host and exec's the per-
+        /// session agent (e.g. a harness adapter). Pair with
+        /// `--inject-harness-noop` (or another harness binary) so
+        /// bootstrap has something to exec into.
+        #[arg(long)]
+        inject_bootstrap: Option<PathBuf>,
+
+        /// Inject a harness adapter binary at `/sbin/<name>`. Repeat
+        /// for multiple. Format: `name=path`, e.g.
+        /// `engram-harness-noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop`.
+        #[arg(long, value_parser = parse_harness_binary)]
+        inject_harness: Vec<(String, PathBuf)>,
     },
+}
+
+fn parse_harness_binary(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected `name=path`, got `{s}`"))?;
+    if name.is_empty() || name.contains('/') {
+        return Err(format!("name `{name}` must be a single path component"));
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 fn parse_image_format(s: &str) -> Result<Format, String> {
@@ -311,6 +337,8 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 docker_bin,
                 format,
                 inject_agent,
+                inject_bootstrap,
+                inject_harness,
             } => {
                 image_build(
                     repo,
@@ -320,6 +348,8 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     docker_bin.as_deref(),
                     *format,
                     inject_agent.as_deref(),
+                    inject_bootstrap.as_deref(),
+                    inject_harness,
                 )
                 .await
             }
@@ -898,6 +928,7 @@ fn format_sse_frame(frame: &str) -> Option<String> {
 
 // ---- image subcommand ---------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn image_build(
     repo: &str,
     source: &Path,
@@ -906,6 +937,8 @@ async fn image_build(
     docker_bin: Option<&str>,
     format: Format,
     inject_agent: Option<&Path>,
+    inject_bootstrap: Option<&Path>,
+    inject_harness: &[(String, PathBuf)],
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
@@ -918,6 +951,8 @@ async fn image_build(
         // logic agree without a config flow.
         vsock_port: 1024,
         init_script: None,
+        bootstrap_binary: inject_bootstrap.map(|p| p.to_path_buf()),
+        harness_binaries: inject_harness.to_vec(),
     });
     let req = BuildRequest {
         source: source.to_path_buf(),

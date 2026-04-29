@@ -87,6 +87,8 @@ async fn exec_runs_inside_baked_microvm() {
                 agent_binary: agent,
                 vsock_port: ENGRAM_AGENTD_PORT,
                 init_script: None,
+                bootstrap_binary: None,
+                harness_binaries: Vec::new(),
             }),
         })
         .await

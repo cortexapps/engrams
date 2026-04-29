@@ -92,8 +92,22 @@ pub struct AgentInjection {
     pub vsock_port: u32,
     /// Override the default init script. When `None`, the baker
     /// writes a minimal `/bin/sh` shim that mounts `/proc`, `/sys`,
-    /// `/dev`, and exec's `engram-agentd --vsock-port <port>`.
+    /// `/dev`, spawns any baked-in sidecars (engram-bootstrap), and
+    /// `exec`s `engram-agentd --vsock-port <port>`.
     pub init_script: Option<PathBuf>,
+    /// Optional `engram-bootstrap` binary. When provided, baked at
+    /// `/sbin/engram-bootstrap` (chmod 0755) and the default init
+    /// shim spawns it in the background before exec'ing agentd.
+    /// Required for any image that wants to run a harness over the
+    /// Phase 4 vsock path; safe to omit for images that only need
+    /// the exec channel.
+    #[allow(dead_code)] // surfaced via this struct's field so callers can construct it
+    pub bootstrap_binary: Option<PathBuf>,
+    /// Harness adapter binaries to inject. Each entry is
+    /// `(guest_filename, host_path)`. Bootstrap exec's whatever
+    /// path the host's `start_agent` carries in
+    /// `BootstrapLaunch::argv[0]` — usually one of these.
+    pub harness_binaries: Vec<(String, PathBuf)>,
 }
 
 /// Where the agent binary lands inside the rootfs (relative to root).
@@ -109,7 +123,10 @@ const VSOCK_PORT_PLACEHOLDER: &str = "__VSOCK_PORT__";
 /// Default init shim. Written to `/sbin/engram-init` when an
 /// [`AgentInjection`] is requested without an explicit override.
 /// Requires `/bin/sh` in the rootfs (alpine, debian-slim, ubuntu —
-/// all standard bases ship it).
+/// all standard bases ship it). When `bootstrap_binary` is set on
+/// the injection, the shim spawns it in the background before
+/// exec'ing agentd; `[ -x ... ] &&` keeps it tolerant of images
+/// baked without bootstrap.
 const DEFAULT_INIT_SHIM: &str = r#"#!/bin/sh
 # engram-init — minimal init shim. Brings up just enough kernel
 # plumbing for engram-agentd to talk vsock, then exec's it.
@@ -117,6 +134,7 @@ set -e
 mount -t proc  proc /proc 2>/dev/null || true
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true
+[ -x /sbin/engram-bootstrap ] && /sbin/engram-bootstrap &
 exec /sbin/engram-agentd --vsock-port __VSOCK_PORT__
 "#;
 
@@ -395,6 +413,33 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
     }
 
     install_file(&injection.agent_binary, &agent_dst, "agent").await?;
+
+    if let Some(bootstrap) = injection.bootstrap_binary.as_deref() {
+        if !bootstrap.exists() {
+            return Err(BuildError::Config(format!(
+                "bootstrap_binary {} does not exist",
+                bootstrap.display()
+            )));
+        }
+        let dst = rootfs_dir.join("sbin/engram-bootstrap");
+        install_file(bootstrap, &dst, "bootstrap").await?;
+    }
+
+    for (name, src) in &injection.harness_binaries {
+        if !src.exists() {
+            return Err(BuildError::Config(format!(
+                "harness_binary {} does not exist (intended for /sbin/{name})",
+                src.display()
+            )));
+        }
+        if name.contains('/') || name.is_empty() {
+            return Err(BuildError::InvalidPath(format!(
+                "harness_binary guest filename `{name}` must be a single path component"
+            )));
+        }
+        let dst = rootfs_dir.join("sbin").join(name);
+        install_file(src, &dst, "harness").await?;
+    }
 
     match &injection.init_script {
         Some(src) => install_file(src, &init_dst, "init").await?,

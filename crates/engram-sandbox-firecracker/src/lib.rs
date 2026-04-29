@@ -74,6 +74,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -119,6 +120,20 @@ pub struct SandboxState {
 
 /// Reserved vsock port `engram-agentd` listens on inside the guest.
 pub const ENGRAM_AGENTD_PORT: u32 = 1024;
+
+/// Filename FC uses for the per-port host-side UDS when the guest
+/// dials out via vsock: `<base>_<port>`. Extracted so callers
+/// (here for harness 1026) and FC's own filename convention stay
+/// in sync. See firecracker/docs/vsock.md for the protocol.
+fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
+    let port = engram_harness_proto::HARNESS_VSOCK_PORT;
+    let file_name = base_vsock_uds
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = base_vsock_uds.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{file_name}_{port}"))
+}
 
 /// Lowest CID we'll hand out to a guest. CIDs 0/1/2 are reserved
 /// (hypervisor / loopback / host); user-allocatable starts at 3.
@@ -218,6 +233,14 @@ pub struct FirecrackerBackend {
     /// reuse CIDs of destroyed VMs — a u32 gives us 4 billion before
     /// wrap, which is fine for any single host's lifetime.
     next_cid: AtomicU32,
+    /// Sink for inbound harness connections. Set by the coord at
+    /// startup via `set_harness_sink`. `None` until then; if a
+    /// guest dials before set, the connection is closed (the sink
+    /// is what feeds the HarnessHub, so without it we can't route).
+    /// Wrapped in an `Arc` so per-sandbox accept loops clone the
+    /// pointer and read the current sink on each accept — a
+    /// `set_harness_sink` call updates them all atomically.
+    harness_sink: Arc<parking_lot::RwLock<Option<engram_core::traits::HarnessSink>>>,
 }
 
 impl FirecrackerBackend {
@@ -227,6 +250,7 @@ impl FirecrackerBackend {
             config,
             sandboxes: DashMap::new(),
             next_cid: AtomicU32::new(FIRST_GUEST_CID),
+            harness_sink: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -281,6 +305,20 @@ impl FirecrackerBackend {
         port: u32,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
+        let (reader, writer) = tokio::io::split(conn);
+        drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+    }
+
+    /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`
+    /// + read back `OK <peer>\n`, return the resulting stream now
+    /// directly connected to the guest's listener on `port`.
+    /// Shared between exec (port 1024) and start_agent (port 1025
+    /// for bootstrap).
+    async fn connect_fc_vsock(
+        vsock_uds_path: &Path,
+        port: u32,
+    ) -> Result<UnixStream, SandboxError> {
         let mut conn = UnixStream::connect(vsock_uds_path).await.map_err(|e| {
             vm_err(format!(
                 "connect to FC vsock UDS {}: {e}",
@@ -288,13 +326,13 @@ impl FirecrackerBackend {
             ))
         })?;
 
-        // Send the CONNECT line.
         conn.write_all(format!("CONNECT {port}\n").as_bytes())
             .await
             .map_err(|e| vm_err(format!("send CONNECT to FC vsock: {e}")))?;
 
-        // Read back exactly one line, byte-by-byte, so we don't
-        // over-read and lose any bytes the agent has already sent.
+        // Read exactly one line, byte-by-byte, so we don't over-read
+        // and lose bytes the guest has already sent on the now-
+        // connected stream.
         let mut line = Vec::with_capacity(32);
         let mut byte = [0u8; 1];
         loop {
@@ -318,9 +356,7 @@ impl FirecrackerBackend {
                 "FC vsock refused CONNECT (expected `OK <port>\\n`, got {line_str:?})"
             )));
         }
-
-        let (reader, writer) = tokio::io::split(conn);
-        drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+        Ok(conn)
     }
 
     /// Allocate the jail dir, spawn `firecracker --api-sock <sock>`
@@ -507,6 +543,16 @@ impl FirecrackerBackend {
         })
         .await?;
 
+        // Pre-bind the host-side UDS that FC routes guest-to-host
+        // vsock connections through. When the guest dials AF_VSOCK
+        // CID=2 port=N, FC connects to `<vsock_uds>_<N>`. Binding
+        // BEFORE InstanceStart guarantees the harness's first
+        // dial-out lands on a live listener (the engram-init
+        // shim spawns engram-bootstrap which dials shortly after
+        // boot — we'd race otherwise).
+        self.spawn_harness_listener(sandbox_id, &vsock_uds_path)
+            .await?;
+
         api.put_action(ActionType::InstanceStart).await?;
 
         let state = SandboxState {
@@ -525,6 +571,53 @@ impl FirecrackerBackend {
             },
         );
         tracing::info!(%sandbox_id, jail = %jail_dir.display(), "firecracker microVM started");
+        Ok(())
+    }
+
+    /// Bind a host-side UDS for inbound harness connections from
+    /// this sandbox's guest. The accept loop forwards each accepted
+    /// stream into whatever [`HarnessSink`] is currently registered
+    /// on `self.harness_sink`. Bound at
+    /// `<vsock_uds_path>_<HARNESS_VSOCK_PORT>` so guest dials of
+    /// AF_VSOCK CID=2 port=1026 land here (FC's vsock UDS contract).
+    async fn spawn_harness_listener(
+        &self,
+        sandbox_id: SandboxId,
+        vsock_uds_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let path = harness_uds_for(vsock_uds_path);
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "bind harness UDS {} for sandbox {sandbox_id}: {e}",
+                    path.display()
+                )
+                .into(),
+            )
+        })?;
+        let sink_slot = self.harness_sink.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _peer)) => match sink_slot.read().clone() {
+                        Some(sink) => {
+                            sink(Box::pin(stream));
+                        }
+                        None => {
+                            tracing::warn!(
+                                %sandbox_id,
+                                "harness connection arrived but no sink registered; dropping",
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(error = %e, %sandbox_id, "harness UDS accept ended");
+                        return;
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -921,6 +1014,65 @@ impl SandboxBackend for FirecrackerBackend {
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
+    }
+
+    async fn start_agent(
+        &self,
+        id: SandboxId,
+        agent: engram_core::types::sandbox::AgentSpec,
+    ) -> Result<(), SandboxError> {
+        // Read sandbox state under the dashmap guard, drop it
+        // before any await — the path/cid we need is `Clone`.
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+
+        // Connect to the in-guest engram-bootstrap. The bootstrap
+        // listener takes seconds to come up after VM boot — same
+        // race as `exec_stream`'s vsock CONNECT. Retry the
+        // handshake-only error patterns with backoff.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut backoff = Duration::from_millis(100);
+        let mut conn = loop {
+            match Self::connect_fc_vsock(
+                &vsock_uds_path,
+                engram_harness_proto::BOOTSTRAP_VSOCK_PORT,
+            )
+            .await
+            {
+                Ok(c) => break c,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let is_boot_race = msg.contains("read FC vsock CONNECT response")
+                        || msg.contains("connect to FC vsock UDS");
+                    if !is_boot_race || std::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+            }
+        };
+
+        // Push the BootstrapLaunch frame. The in-guest bootstrap
+        // reads it, exec's the described argv (replacing its
+        // process), then dies via exec — the connection drops
+        // here, which is fine.
+        let launch = engram_harness_proto::BootstrapLaunch {
+            argv: agent.argv,
+            env: agent.env.into_iter().collect(),
+        };
+        engram_harness_proto::write_msg(&mut conn, &launch)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("write BootstrapLaunch: {e}").into()))?;
+        // Best-effort flush; bootstrap closes its end on exec.
+        let _ = conn.shutdown().await;
+        Ok(())
+    }
+
+    fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
+        *self.harness_sink.write() = Some(sink);
     }
 }
 

@@ -20,9 +20,18 @@ use engram_harness_noop::{run, NoopConfig, NoopOutcome};
 #[derive(Parser, Debug)]
 #[command(name = "engram-harness-noop", about = "Dev-mode noop harness")]
 struct Cli {
-    /// Hub address: `host:port`. The host-agent's harness listener.
-    #[arg(long, env = "ENGRAM_HARNESS_ADDR")]
-    connect: String,
+    /// Hub address: `host:port`. The host-agent's TCP harness
+    /// listener (ProcessBackend dev path). Mutually exclusive with
+    /// `--vsock-host` — provide exactly one.
+    #[arg(long, env = "ENGRAM_HARNESS_ADDR", conflicts_with = "vsock_host")]
+    connect: Option<String>,
+
+    /// Vsock port on the host (CID = `VMADDR_CID_HOST`, 2). Used
+    /// when the harness runs inside a Firecracker guest — the host
+    /// pre-binds a UDS at `<vsock_uds>_<port>.sock` and the guest
+    /// dials it. Mutually exclusive with `--connect`.
+    #[arg(long, env = "ENGRAM_HARNESS_VSOCK_HOST")]
+    vsock_host: Option<u32>,
 
     /// Session id this harness is attached to. The host-agent
     /// validates that this matches the session it expects on the
@@ -71,7 +80,8 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
     tracing::info!(
-        addr = %cli.connect,
+        connect = ?cli.connect,
+        vsock_host = ?cli.vsock_host,
         session = %cli.session_id,
         tool_calls = cli.tool_calls,
         interval_secs = cli.interval_secs,
@@ -87,21 +97,34 @@ async fn main() -> ExitCode {
         cfg.transcript_delta_template = tmpl.into_bytes();
     }
 
-    let stream = match tokio::net::TcpStream::connect(&cli.connect).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, addr = %cli.connect, "noop harness: dial failed");
-            return ExitCode::from(1);
+    // Dial the hub. Two flavors:
+    //   --connect host:port      → TCP loopback (ProcessBackend dev)
+    //   --vsock-host <port>      → AF_VSOCK CID=VMADDR_CID_HOST (FC guest)
+    // clap rejects "neither" / "both" via `conflicts_with`; the
+    // outer match here covers the two valid shapes.
+    let outcome = match (cli.connect.as_deref(), cli.vsock_host) {
+        (Some(addr), None) => match tokio::net::TcpStream::connect(addr).await {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                run(s, cfg).await
+            }
+            Err(e) => {
+                tracing::error!(error = %e, addr = %addr, "noop harness: TCP dial failed");
+                return ExitCode::from(1);
+            }
+        },
+        (None, Some(port)) => dial_vsock_and_run(port, cfg).await,
+        _ => {
+            tracing::error!("provide exactly one of --connect or --vsock-host");
+            return ExitCode::from(2);
         }
     };
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::warn!(error = %e, "noop harness: set_nodelay failed (continuing)");
-    }
+
     // The host-agent splits sandbox creation from agent spawn so
     // routing (`HarnessHub::bind_session`) is in place by the time
     // we dial. A rejected attach here means a real misconfiguration,
     // not a race; bail out instead of retrying.
-    match run(stream, cfg).await {
+    match outcome {
         Ok(NoopOutcome::AttachRejected) => {
             tracing::error!("noop harness: attach rejected by host (no session bound?)");
             ExitCode::from(1)
@@ -115,4 +138,37 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Dial AF_VSOCK CID=VMADDR_CID_HOST (2) on `port` and run the noop
+/// session against the resulting stream. Linux-only; non-Linux builds
+/// of the binary won't expose this code path because clap's
+/// `--vsock-host` flag is rejected at parse time when the feature
+/// isn't compiled in.
+#[cfg(target_os = "linux")]
+async fn dial_vsock_and_run(
+    port: u32,
+    cfg: NoopConfig,
+) -> Result<NoopOutcome, engram_harness_noop::NoopError> {
+    use tokio_vsock::{VsockAddr, VsockStream, VMADDR_CID_HOST};
+    let addr = VsockAddr::new(VMADDR_CID_HOST, port);
+    let stream = match VsockStream::connect(addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, port, "vsock dial failed");
+            return Err(engram_harness_noop::NoopError::Io(e));
+        }
+    };
+    run(stream, cfg).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn dial_vsock_and_run(
+    _port: u32,
+    _cfg: NoopConfig,
+) -> Result<NoopOutcome, engram_harness_noop::NoopError> {
+    Err(engram_harness_noop::NoopError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "AF_VSOCK is Linux-only; --vsock-host won't work here",
+    )))
 }

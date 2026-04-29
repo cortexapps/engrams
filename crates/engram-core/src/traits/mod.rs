@@ -17,5 +17,5 @@ pub mod secrets;
 
 pub use cloud::{CloudBackend, PreemptionStream};
 pub use metadata::MetadataStore;
-pub use sandbox::SandboxBackend;
+pub use sandbox::{HarnessByteStream, HarnessSink, SandboxBackend};
 pub use secrets::{ResolvedSecret, SecretBundle, SecretContext, SecretStore};

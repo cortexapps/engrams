@@ -130,9 +130,7 @@ pub async fn run_with_registry(
     // Demo wiring: bind the harness-channel TCP listener so
     // `SandboxSpec::agent`-spawned harnesses (today: the dev
     // `engram-harness-noop`) can dial the hub. Off the critical
-    // path for sessions that don't declare an agent. Production
-    // multi-host will replace this with a vsock listener so guests
-    // inside Firecracker can reach the same hub.
+    // path for sessions that don't declare an agent.
     let (harness_addr, _harness_listener) = engram_host_agent::harness::spawn_tcp_listener(
         (*state.harness_hub).clone(),
         cfg.harness_listen_addr,
@@ -140,6 +138,18 @@ pub async fn run_with_registry(
     .await
     .map_err(CoordinatorError::Io)?;
     *state.harness_listen_addr.lock() = Some(harness_addr);
+
+    // Firecracker path: register a HarnessSink on the sandbox
+    // backend so per-VM vsock UDS accepts feed the same HarnessHub
+    // as the TCP listener above. ProcessBackend's default no-op
+    // is fine — its harness binary dials TCP loopback directly.
+    {
+        let hub = state.harness_hub.clone();
+        let sink: engram_core::traits::HarnessSink = std::sync::Arc::new(move |stream| {
+            hub.accept_via_session_lookup(stream);
+        });
+        state.services.sandbox.set_harness_sink(sink);
+    }
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())

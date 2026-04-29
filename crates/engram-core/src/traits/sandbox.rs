@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::StreamExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::SandboxError;
 use crate::types::ids::SandboxId;
@@ -9,6 +12,25 @@ use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
+
+/// Combined `AsyncRead + AsyncWrite` so trait-object types below can
+/// require both — Rust's trait-object syntax only allows one
+/// non-auto trait, so we need this supertrait shim.
+pub trait HarnessByteStreamObj: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> HarnessByteStreamObj for T {}
+
+/// A duplex byte stream the backend hands the harness sink. Owned
+/// (`'static`) so the sink can move it into a tokio task.
+pub type HarnessByteStream = Pin<Box<dyn HarnessByteStreamObj + Send + Unpin + 'static>>;
+
+/// Callback registered on a [`SandboxBackend`] that wants to expose
+/// inbound harness connections. The backend invokes the sink with a
+/// fresh `HarnessByteStream` whenever a guest's harness adapter
+/// dials in. The sink — typically `HarnessHub::accept_via_session_lookup`
+/// — drives the post-attach loop from there.
+///
+/// `Fn` (not `FnOnce`) so a single sink handles many connections.
+pub type HarnessSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 
 /// VM lifecycle seam. Production implementation: `engram-sandbox-firecracker`
 /// (Firecracker over its HTTP-over-Unix-socket API). Dev implementation:
@@ -55,6 +77,18 @@ pub trait SandboxBackend: Send + Sync {
             "this backend doesn't support `start_agent` yet".into(),
         ))
     }
+
+    /// Register a sink that will receive inbound harness connections
+    /// (one stream per guest dial). Backends that route the harness
+    /// channel through their own transport (FC's vsock UDS, future
+    /// ones) call the sink for each fresh connection. Default is a
+    /// no-op — `ProcessBackend` doesn't need this hook because its
+    /// harness binary dials the host-agent's TCP listener directly.
+    ///
+    /// Idempotent in the sense that the latest registration wins;
+    /// backends shouldn't expect multiple sinks. Pass before any
+    /// session-create call so the first dial isn't dropped.
+    fn set_harness_sink(&self, _sink: HarnessSink) {}
 
     /// Run a command in the sandbox and return a stream of stdout/stderr
     /// chunks ending with a single [`ExecEvent::Exit`]. Terminating the
