@@ -25,6 +25,22 @@ pub struct CoordinatorConfig {
     /// expected to source tokens from a secret manager and rotate
     /// the process; for v1 we don't hot-reload.
     pub auth_tokens: Vec<String>,
+    /// Local address the harness-channel TCP listener binds to.
+    /// Harnesses spawned via `SandboxSpec::agent` dial this from the
+    /// same host. `127.0.0.1:0` (default) lets the OS pick a free
+    /// port; the coordinator reads back the bound address and
+    /// plumbs it into the agent's env at session-create time.
+    pub harness_listen_addr: std::net::SocketAddr,
+    /// Path to the dev `engram-harness-noop` binary. When
+    /// `dev_auto_noop = true`, the coordinator stamps this into
+    /// `SandboxSpec::agent.argv[0]` for any new Git/Local session
+    /// that doesn't already declare an agent. None disables
+    /// auto-spawn even when `dev_auto_noop` is set.
+    pub dev_noop_harness_path: Option<PathBuf>,
+    /// Auto-spawn the noop harness for every new session in dev. Off
+    /// by default; turn on via `ENGRAM_DEV_AUTO_NOOP=1` (read in
+    /// `main.rs`). Implies `dev_noop_harness_path` is set.
+    pub dev_auto_noop: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -45,6 +61,11 @@ impl Default for CoordinatorConfig {
             // this from `ENGRAM_AUTH_TOKENS` (or a future secret-store
             // hookup) at startup.
             auth_tokens: Vec::new(),
+            harness_listen_addr: "127.0.0.1:0"
+                .parse()
+                .expect("default harness_listen_addr must parse"),
+            dev_noop_harness_path: None,
+            dev_auto_noop: false,
         }
     }
 }

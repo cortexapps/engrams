@@ -65,6 +65,13 @@ struct HubInner {
     /// Event-emit callback supplied at construction. Invoked for every
     /// inbound `HarnessEvent` after the local maps are updated.
     event_sink: EventSink,
+    /// SessionId → SandboxId routing for the TCP listener path.
+    /// Populated by `bind_session` when the host-agent spawns a
+    /// harness; cleared by `unbind_session` (or implicitly on
+    /// `destroy()`). The listener reads HarnessAttach off an incoming
+    /// connection, looks up the sandbox here, and hands the stream to
+    /// the existing connection logic.
+    session_to_sandbox: Mutex<HashMap<SessionId, SandboxId>>,
 }
 
 struct ConnectionHandle {
@@ -87,8 +94,46 @@ impl HarnessHub {
                 connections: Mutex::new(HashMap::new()),
                 last_event_at: Mutex::new(HashMap::new()),
                 event_sink,
+                session_to_sandbox: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Tell the hub that an upcoming harness connection identifying
+    /// itself with `session_id` should be routed to `sandbox_id`. The
+    /// host-agent calls this when it spawns a harness as part of
+    /// `SandboxBackend::create()`. Idempotent; later binds replace
+    /// earlier ones (so a re-spawned harness on resume routes to the
+    /// new sandbox).
+    pub fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+        self.inner
+            .session_to_sandbox
+            .lock()
+            .insert(session_id, sandbox_id);
+    }
+
+    /// Drop the session→sandbox binding. Called from `destroy()` paths
+    /// so a stale TCP connection identifying with the old session_id
+    /// can't accidentally attach to a freshly-created replacement
+    /// sandbox.
+    pub fn unbind_session(&self, session_id: SessionId) {
+        self.inner.session_to_sandbox.lock().remove(&session_id);
+    }
+
+    /// Accept an anonymous connection from a harness — used by the
+    /// TCP listener. Reads `HarnessAttach` from the stream, looks up
+    /// `bind_session`'s map for the sandbox_id, then proceeds through
+    /// the same handshake-and-loop path as `accept_connection`. If no
+    /// binding exists for the announced session_id, sends
+    /// `HarnessAttachAck { ok: false }` and closes.
+    pub fn accept_via_session_lookup<S>(&self, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            run_connection_with_session_lookup(inner, stream).await;
+        });
     }
 
     /// Inbound connection from the harness. Spawns a task that runs
@@ -256,7 +301,67 @@ async fn run_connection<S>(
             return;
         }
     }
+    drive_attached(inner, sandbox_id, attach, reader, writer).await;
+}
 
+/// TCP-listener path: read HarnessAttach, look up the bound
+/// sandbox_id (set by `bind_session()` when the host-agent spawns
+/// the harness), then run the same post-attach loop as
+/// `run_connection`. Closes with `ok: false` if no binding exists.
+async fn run_connection_with_session_lookup<S>(inner: Arc<HubInner>, stream: S)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let attach: HarnessAttach = match read_msg(&mut reader).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!(error = %e, "harness handshake read failed (no session bound)");
+            return;
+        }
+    };
+    let bound = {
+        // Scope the guard so it drops before the AsyncWrite below.
+        // parking_lot guards aren't Send, and the writer may be
+        // awaited across threads via tokio::spawn.
+        inner
+            .session_to_sandbox
+            .lock()
+            .get(&attach.session_id)
+            .copied()
+    };
+    let sandbox_id = match bound {
+        Some(id) => id,
+        None => {
+            let ack = HarnessAttachAck {
+                ok: false,
+                message: Some("no sandbox bound to this session_id".into()),
+            };
+            let _ = write_msg(&mut writer, &ack).await;
+            tracing::warn!(
+                session_id = %attach.session_id,
+                "harness attach rejected: no sandbox bound",
+            );
+            return;
+        }
+    };
+    drive_attached(inner, sandbox_id, attach, reader, writer).await;
+}
+
+/// Shared post-attach work: send `ok: true`, register the
+/// connection, run reader+writer loops, clean up. Both
+/// `run_connection` and `run_connection_with_session_lookup`
+/// dispatch into here once they've resolved sandbox_id.
+async fn drive_attached<R, W>(
+    inner: Arc<HubInner>,
+    sandbox_id: SandboxId,
+    attach: HarnessAttach,
+    reader: R,
+    mut writer: W,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let ack = HarnessAttachAck {
         ok: true,
         message: None,
@@ -409,6 +514,44 @@ impl std::error::Error for HarnessError {
             _ => None,
         }
     }
+}
+
+/// Spawn a TCP listener that hands every accepted connection to
+/// `hub.accept_via_session_lookup`. Returns the bound address (so
+/// callers using port 0 can read back the OS-assigned port to
+/// publish into `AgentSpec::env`) and a `JoinHandle` for the accept
+/// loop.
+///
+/// Production deployments would put this behind a vsock listener
+/// instead — TCP is fine for ProcessBackend dev mode where the
+/// "guest" is just a host child process.
+pub async fn spawn_tcp_listener(
+    hub: HarnessHub,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    tracing::info!(addr = %bound, "harness TCP listener bound");
+    let handle = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    tracing::debug!(peer = %peer, "harness connection accepted");
+                    let _ = stream.set_nodelay(true);
+                    hub.accept_via_session_lookup(stream);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "harness listener accept failed");
+                    // Brief pause before retrying so a wedged listener
+                    // doesn't burn CPU. Practical accept errors on a
+                    // bound TCP socket are rare; mostly EMFILE under
+                    // fd exhaustion.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    Ok((bound, handle))
 }
 
 #[cfg(test)]
@@ -680,5 +823,74 @@ mod tests {
             hub.last_event_at(sandbox_id).is_none(),
             "last_event_at cleared on disconnect",
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_routes_attach_via_session_lookup_to_bound_sandbox() {
+        // End-to-end demo wiring: bind a (session_id, sandbox_id)
+        // pair, spawn a real TCP listener, connect a harness client
+        // over a real TCP socket, observe an event arrive at the
+        // collecting sink keyed on the *bound* sandbox_id.
+        let (sink, collected) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        hub.bind_session(session_id, sandbox_id);
+
+        let (addr, _listener_task) =
+            spawn_tcp_listener(hub.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("listener bound");
+
+        // Harness side: dial the listener, send Attach, await ack,
+        // emit one event, then drop.
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        write_msg(
+            &mut conn,
+            &HarnessAttach {
+                session_id,
+                harness_version: "tcp-test/0.1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: HarnessAttachAck = read_msg(&mut conn).await.unwrap();
+        assert!(ack.ok, "attach should succeed when session is bound");
+        write_msg(&mut conn, &HarnessFrame::Event(HarnessEvent::Idle))
+            .await
+            .unwrap();
+        drop(conn);
+
+        // The collecting sink should observe the Idle event for the
+        // bound sandbox_id. Poll briefly — the event arrives async.
+        assert!(
+            wait_until(|| !collected.lock().is_empty()).await,
+            "should have collected one event",
+        );
+        assert!(matches!(collected.lock()[0], HarnessEvent::Idle));
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_rejects_attach_for_unbound_session() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+
+        let (addr, _listener_task) =
+            spawn_tcp_listener(hub.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("listener bound");
+
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        write_msg(
+            &mut conn,
+            &HarnessAttach {
+                session_id: SessionId::new(), // not bound
+                harness_version: "tcp-test/0.1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: HarnessAttachAck = read_msg(&mut conn).await.unwrap();
+        assert!(!ack.ok, "unbound session should be rejected");
     }
 }

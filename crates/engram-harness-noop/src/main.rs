@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use engram_core::SessionId;
-use engram_harness_noop::{run, NoopConfig};
+use engram_harness_noop::{run, NoopConfig, NoopOutcome};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram-harness-noop", about = "Dev-mode noop harness")]
@@ -78,21 +78,6 @@ async fn main() -> ExitCode {
         "noop harness starting",
     );
 
-    let stream = match tokio::net::TcpStream::connect(&cli.connect).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, addr = %cli.connect, "noop harness: dial failed");
-            return ExitCode::from(1);
-        }
-    };
-    // Disable Nagle so per-event writes hit the wire promptly —
-    // the harness emits small frames at human-perceptible cadence
-    // and we'd rather pay extra packets than have the host see
-    // events bunched up.
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::warn!(error = %e, "noop harness: set_nodelay failed (continuing)");
-    }
-
     let mut cfg = NoopConfig::for_session(cli.session_id);
     cfg.tool_calls = cli.tool_calls;
     cfg.interval = Duration::from_secs(cli.interval_secs);
@@ -102,14 +87,43 @@ async fn main() -> ExitCode {
         cfg.transcript_delta_template = tmpl.into_bytes();
     }
 
-    match run(stream, cfg).await {
-        Ok(outcome) => {
-            tracing::info!(?outcome, "noop harness done");
-            ExitCode::SUCCESS
+    // Retry attach on rejection: the host-agent's session→sandbox
+    // binding is set after `backend.create()` returns, which races
+    // with the agent's dial inside that same `create()`. Five
+    // attempts at 50ms-1s exponential backoff comfortably covers the
+    // race in practice.
+    let mut backoff = Duration::from_millis(50);
+    for attempt in 1..=5 {
+        let stream = match tokio::net::TcpStream::connect(&cli.connect).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "noop harness: dial failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+                continue;
+            }
+        };
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::warn!(error = %e, "noop harness: set_nodelay failed (continuing)");
         }
-        Err(e) => {
-            tracing::error!(error = %e, "noop harness: run failed");
-            ExitCode::from(1)
+
+        match run(stream, cfg.clone()).await {
+            Ok(NoopOutcome::AttachRejected) => {
+                tracing::warn!(attempt, "noop harness: attach rejected; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+                continue;
+            }
+            Ok(outcome) => {
+                tracing::info!(?outcome, "noop harness done");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "noop harness: run failed");
+                return ExitCode::from(1);
+            }
         }
     }
+    tracing::error!("noop harness: gave up after 5 attach attempts");
+    ExitCode::from(1)
 }

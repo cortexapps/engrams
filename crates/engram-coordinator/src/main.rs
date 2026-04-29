@@ -87,6 +87,25 @@ struct Cli {
         default_value = ""
     )]
     auth_tokens: Vec<String>,
+
+    /// Local address the harness-channel TCP listener binds to.
+    /// Default `127.0.0.1:0` lets the OS pick a free port.
+    #[arg(long, env = "ENGRAM_HARNESS_LISTEN_ADDR", default_value = "127.0.0.1:0")]
+    harness_listen_addr: std::net::SocketAddr,
+
+    /// Path to the dev `engram-harness-noop` binary. Defaults to
+    /// `<workspace>/target/debug/engram-harness-noop` so a plain
+    /// `cargo run -p engram-coordinator` after `cargo build` finds
+    /// it. Override via `ENGRAM_DEV_NOOP_HARNESS_PATH` in production
+    /// builds.
+    #[arg(long, env = "ENGRAM_DEV_NOOP_HARNESS_PATH")]
+    dev_noop_harness_path: Option<std::path::PathBuf>,
+
+    /// Auto-spawn the noop harness for every new session. Off by
+    /// default — set `ENGRAM_DEV_AUTO_NOOP=1` (or pass `--dev-auto-noop`)
+    /// to enable. Implies `dev_noop_harness_path` is set.
+    #[arg(long, env = "ENGRAM_DEV_AUTO_NOOP")]
+    dev_auto_noop: bool,
 }
 
 #[tokio::main]
@@ -118,6 +137,11 @@ async fn main() -> Result<(), CoordinatorError> {
             .filter(|t| !t.is_empty())
             .cloned()
             .collect(),
+        harness_listen_addr: cli.harness_listen_addr,
+        dev_noop_harness_path: cli
+            .dev_noop_harness_path
+            .or_else(default_noop_harness_path),
+        dev_auto_noop: cli.dev_auto_noop,
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)
@@ -213,4 +237,21 @@ async fn main() -> Result<(), CoordinatorError> {
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await
+}
+
+/// If the user didn't pass `--dev-noop-harness-path` or set
+/// `ENGRAM_DEV_NOOP_HARNESS_PATH`, look for the binary next to our own
+/// (the cargo `target/debug` layout) so a plain `cargo run` after
+/// `cargo build` finds it without ceremony. Production builds should
+/// set the env var explicitly — if the binary moves, the path here
+/// becomes wrong.
+fn default_noop_harness_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    let candidate = dir.join("engram-harness-noop");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }

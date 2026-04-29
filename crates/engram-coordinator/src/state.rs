@@ -368,6 +368,12 @@ pub struct AppState {
     /// harness connections off a real vsock listener wired through
     /// the same hub.
     pub harness_hub: Arc<HarnessHub>,
+    /// Bound address of the harness TCP listener (set by `lib::run`
+    /// once the listener has accepted a port from the OS — `127.0.0.1:0`
+    /// becomes e.g. `127.0.0.1:54123`). The session-create handler
+    /// reads this to plumb `ENGRAM_HARNESS_ADDR` into the spawned
+    /// agent's env. `None` until the listener is up.
+    pub harness_listen_addr: parking_lot::Mutex<Option<std::net::SocketAddr>>,
     /// Phase 4 Track F: coord-local bare clones of every writable
     /// repo Engram has touched, used for `engram session log/diff/
     /// fork` queries that need git history without involving a
@@ -412,6 +418,7 @@ impl AppState {
             events,
             host_registry,
             harness_hub,
+            harness_listen_addr: parking_lot::Mutex::new(None),
             git_workdir,
         }
     }

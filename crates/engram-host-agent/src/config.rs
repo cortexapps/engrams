@@ -20,6 +20,13 @@ pub struct HostAgentConfig {
     /// match an entry in the coordinator's `ENGRAM_AUTH_TOKENS`. `None`
     /// is acceptable when the coordinator is in dev (auth disabled).
     pub coordinator_token: Option<String>,
+    /// Local address the harness-channel TCP listener binds. Harnesses
+    /// spawned by `SandboxBackend::create()` (via `SandboxSpec::agent`)
+    /// dial this from the same host. `127.0.0.1:0` (the default) lets
+    /// the OS pick a free port; the host-agent reads back the bound
+    /// address and plumbs it into the agent's env. Override to a fixed
+    /// port if a firewall or container network demands it.
+    pub harness_listen_addr: std::net::SocketAddr,
 }
 
 impl Default for HostAgentConfig {
@@ -31,6 +38,9 @@ impl Default for HostAgentConfig {
             local_snapshot_cap_bytes: 500 * 1024 * 1024 * 1024, // 500 GiB
             coordinator_endpoint: None,
             coordinator_token: None,
+            harness_listen_addr: "127.0.0.1:0"
+                .parse()
+                .expect("default harness_listen_addr must parse"),
         }
     }
 }
