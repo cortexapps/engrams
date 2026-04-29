@@ -166,10 +166,17 @@ pub enum RestoreMode {
 impl FirecrackerConfig {
     /// Convenience constructor for production wiring: just the kernel
     /// path; everything else uses defaults.
+    ///
+    /// The default boot args include `init=/sbin/engram-init` because
+    /// every Engram-baked image ships the init shim that exec's
+    /// `engram-agentd` on vsock — without it the host can't reach
+    /// the guest. Override `default_boot_args` after construction if
+    /// you're booting an image that handles agent launch differently.
     pub fn with_kernel(kernel_image_path: impl Into<PathBuf>) -> Self {
         Self {
             kernel_image_path: kernel_image_path.into(),
-            default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off".into(),
+            default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
+                .into(),
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
@@ -755,7 +762,32 @@ impl SandboxBackend for FirecrackerBackend {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.vsock_uds_path.clone()
         };
-        Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
+        // The agent inside the guest takes a couple of seconds to come up
+        // after `create()` returns: kernel boot → init → engram-agentd
+        // bind on vsock 1024. Connecting before that returns "early eof"
+        // on the CONNECT response (FC closes the UDS when there's no
+        // listener on the requested guest port). Retry with exponential
+        // backoff for ~10s; bail fast on any non-handshake error so
+        // genuine breakage doesn't get hidden.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut sleep = Duration::from_millis(50);
+        loop {
+            match Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd.clone())
+                .await
+            {
+                Ok(s) => return Ok(s),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let is_boot_race = msg.contains("read FC vsock CONNECT response")
+                        || msg.contains("connect to FC vsock UDS");
+                    if !is_boot_race || std::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(sleep).await;
+                    sleep = (sleep * 2).min(Duration::from_secs(1));
+                }
+            }
+        }
     }
 
     async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
@@ -776,7 +808,11 @@ impl SandboxBackend for FirecrackerBackend {
         // pause → PUT /snapshot/create → resume happens inside the
         // client; a failure mid-sequence still tries to resume the
         // VM rather than leaving it stuck Paused.
-        let api = FirecrackerClient::new(&socket);
+        // Snapshot duration scales with guest memory (every dirty page
+        // is flushed to memory.bin synchronously). The default 10s
+        // client timeout fits a 64 MiB VM but trips on larger ones —
+        // give the snapshot path 60s explicitly. Tune up for huge VMs.
+        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
         let paths = api.create_snapshot(dest).await?;
 
         let created_at = Utc::now();

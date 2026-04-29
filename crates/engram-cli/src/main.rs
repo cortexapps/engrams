@@ -190,6 +190,15 @@ enum ImageCmd {
         /// `ext4` for Firecracker. Defaults to `directory`.
         #[arg(long, value_parser = parse_image_format, default_value = "directory")]
         format: Format,
+
+        /// Inject a static-musl `engram-agentd` binary into the
+        /// rootfs at `/sbin/engram-agentd` and write a `/sbin/engram-init`
+        /// shim that exec's it on the reserved vsock port (1024).
+        /// Required for Firecracker images; without it the host
+        /// can't `exec()` against the VM. Pre-build the binary with
+        /// `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`.
+        #[arg(long)]
+        inject_agent: Option<PathBuf>,
     },
 }
 
@@ -301,6 +310,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 images_dir,
                 docker_bin,
                 format,
+                inject_agent,
             } => {
                 image_build(
                     repo,
@@ -309,6 +319,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     images_dir,
                     docker_bin.as_deref(),
                     *format,
+                    inject_agent.as_deref(),
                 )
                 .await
             }
@@ -894,17 +905,27 @@ async fn image_build(
     images_dir: &Path,
     docker_bin: Option<&str>,
     format: Format,
+    inject_agent: Option<&Path>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
         .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
+    let agent_injection = inject_agent.map(|p| engram_image_builder::AgentInjection {
+        agent_binary: p.to_path_buf(),
+        // Reserved port engram-agentd listens on inside the guest.
+        // Hard-coded here (and in engram-sandbox-firecracker as
+        // ENGRAM_AGENTD_PORT) so the bake and the host's connect
+        // logic agree without a config flow.
+        vsock_port: 1024,
+        init_script: None,
+    });
     let req = BuildRequest {
         source: source.to_path_buf(),
         repo: repo.to_string(),
         tag: resolved_tag.clone(),
         images_dir: images_dir.to_path_buf(),
         format,
-        agent_injection: None,
+        agent_injection,
     };
     let docker = match docker_bin {
         Some(bin) => DockerCli::with_binary(bin.to_string()),

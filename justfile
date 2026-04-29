@@ -99,14 +99,47 @@ dev-build-harness:
 
 # Run the coordinator wired to the Firecracker backend. Requires
 # Linux + KVM. Will not work on macOS — use `just dev` instead.
+#
+# Set ENGRAM_KERNEL_IMAGE_PATH to a vmlinux Firecracker can boot.
+# The fc-test artifact path under ~/.cache/engram-fc-test/ works
+# (run `bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh`
+# once to populate it).
+#
+# The sandbox image you create sessions against must be baked with
+# `engram image build --inject-agent <agentd-musl-binary> --format ext4`
+# so the in-VM agent is present. Without it `session exec` will
+# hang waiting for vsock to come up.
 dev-firecracker: db-up
+    : "${ENGRAM_KERNEL_IMAGE_PATH:?set ENGRAM_KERNEL_IMAGE_PATH to a vmlinux on this host}"
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
+    ENGRAM_MODE=all \
     ENGRAM_SANDBOX_BACKEND=firecracker \
     ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
     ENGRAM_LOCAL_PATH=./var/engram \
+    ENGRAM_KERNEL_IMAGE_PATH=$ENGRAM_KERNEL_IMAGE_PATH \
+    ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-bootstrap} \
+    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
+
+# Bake a tiny Firecracker image (debian-slim + engram-agentd) for the
+# `local://demo` repo and register it under `./var/engram/images/`.
+# The repo name passed to `engram image build` must match what the
+# session create body will carry (`local://demo`), because the image
+# registry resolves images by literal repo string.
+fc-bake-demo:
+    cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
+    mkdir -p ./var/fc-bake
+    printf 'FROM debian:bookworm-slim\n' > ./var/fc-bake/Dockerfile
+    printf 'name = "local-demo"\n'         > ./var/fc-bake/engram.toml
+    cargo run -p engram-cli -- image build \
+        --repo local://demo \
+        --tag warm-1 \
+        --source ./var/fc-bake \
+        --format ext4 \
+        --images-dir ./var/engram/images \
+        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd
 
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
