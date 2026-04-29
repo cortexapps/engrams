@@ -666,11 +666,13 @@ dependencies = [
 name = "engram-harness-noop"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "engram-core",
  "engram-harness-proto",
  "serde",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

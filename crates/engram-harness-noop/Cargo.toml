@@ -12,10 +12,16 @@ workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "engram-harness-noop"
+path = "src/main.rs"
+
 [dependencies]
+clap.workspace = true
 engram-core.workspace = true
 engram-harness-proto.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
