@@ -120,6 +120,38 @@ pub async fn resume(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
+    resume_session(state, id).await.map(Json)
+}
+
+/// Auto-resume an `Idle` session if needed, before routing an
+/// exec / exec_stream / events request to it. Track B's pack-hosts
+/// counterpart: the idle evictor hot-suspends inactive sessions;
+/// this helper brings them back transparently on the next request.
+///
+/// `Active` sessions are a no-op (Ok). `Idle` sessions are
+/// resumed via the existing `/resume` flow and the function
+/// returns once the session is Active again. Any other status
+/// (Pending, Completed, Failed) returns an error — auto-resume
+/// only undoes idle-eviction; it doesn't try to reanimate
+/// terminal sessions.
+pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
+    let session = state.services.meta.get_session(id).await?;
+    if session.status == SessionStatus::Idle {
+        resume_session(state.clone(), id).await?;
+    }
+    // For everything else (Active, Pending, PendingReassign,
+    // Completed, Failed) we let the downstream handler decide. The
+    // existing "session has no live sandbox" registry check
+    // surfaces a clear error for sessions whose state precludes
+    // routing without auto-resume kicking in. PendingReassign
+    // specifically is *not* auto-resumed here — those sessions
+    // are explicitly waiting for the caller to decide between
+    // resume / fork / abandon, and silently re-routing them on a
+    // different host would surprise the caller.
+    Ok(())
+}
+
+async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
     // Resuming an Active session is a no-op the caller probably
@@ -173,7 +205,7 @@ async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
     record: SnapshotRecord,
-) -> Result<Json<SnapshotResponse>, ApiError> {
+) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
     let local_path = record.local_path.clone().ok_or_else(|| {
         ApiError::Internal("resume_from_fc_snapshot called without local_path".into())
@@ -201,12 +233,12 @@ async fn resume_from_fc_snapshot(
     )
     .await?;
 
-    Ok(Json(SnapshotResponse {
+    Ok(SnapshotResponse {
         session_id: id,
         snapshot_id: Some(record.id.to_string()),
         size_bytes: Some(record.size_bytes),
         note: "resumed from snapshot",
-    }))
+    })
 }
 
 /// Cold-resume path: the original host is gone, so we boot a fresh
@@ -220,7 +252,7 @@ async fn resume_from_git_checkpoint(
     state: SharedState,
     session: Session,
     branch: &str,
-) -> Result<Json<SnapshotResponse>, ApiError> {
+) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
 
     // Build a SandboxSpec from the session's *original* image
@@ -321,12 +353,12 @@ async fn resume_from_git_checkpoint(
     )
     .await?;
 
-    Ok(Json(SnapshotResponse {
+    Ok(SnapshotResponse {
         session_id: id,
         snapshot_id: None,
         size_bytes: None,
         note: "resumed from git checkpoint",
-    }))
+    })
 }
 
 /// Smart-bootstrap: detect whether `/workspace` (the sandbox cwd

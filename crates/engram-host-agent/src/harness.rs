@@ -74,6 +74,10 @@ struct ConnectionHandle {
     /// Currently-pending checkpoint ack. Only one `Checkpoint` may be
     /// in flight per connection at a time — the host serializes them.
     pending_checkpoint: Mutex<Option<oneshot::Sender<()>>>,
+    /// Session this harness belongs to (from `HarnessAttach`).
+    /// Stored on the connection so the idle evictor can return
+    /// `(SessionId, SandboxId)` pairs without a separate lookup.
+    session_id: SessionId,
 }
 
 impl HarnessHub {
@@ -190,6 +194,33 @@ impl HarnessHub {
     pub fn attached_count(&self) -> usize {
         self.inner.connections.lock().len()
     }
+
+    /// Sandboxes whose last harness event is older than `ttl`.
+    /// Used by Track B's idle evictor: every tick, scan for these
+    /// and run the suspend pipeline (checkpoint → FC snapshot →
+    /// destroy → mark Idle) on each.
+    ///
+    /// Returns `(SessionId, SandboxId)` pairs so the caller can
+    /// route into coord-side metadata (kind, checkpoint_branch)
+    /// without an extra lookup. Only returns sandboxes with an
+    /// attached harness — a sandbox without harness has no idle
+    /// signal and stays unreaped here (other lifecycle paths handle
+    /// it: dead-host detector, operator drain, etc.).
+    pub fn idle_sandboxes(&self, ttl: std::time::Duration) -> Vec<(SessionId, SandboxId)> {
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let last = self.inner.last_event_at.lock();
+        let conns = self.inner.connections.lock();
+        let mut out = Vec::new();
+        for (sandbox_id, handle) in conns.iter() {
+            if let Some(at) = last.get(sandbox_id) {
+                if *at <= cutoff {
+                    out.push((handle.session_id, *sandbox_id));
+                }
+            }
+        }
+        out
+    }
 }
 
 async fn run_connection<S>(
@@ -246,8 +277,15 @@ async fn run_connection<S>(
     let handle = ConnectionHandle {
         cmd_tx,
         pending_checkpoint: Mutex::new(None),
+        session_id: attach.session_id,
     };
     inner.connections.lock().insert(sandbox_id, handle);
+    // Treat attach as the first event for idle-eviction purposes —
+    // a sandbox that just connected and emitted nothing is the
+    // *idlest* possible state. Without seeding here, the evictor
+    // would never trigger on a harness that attaches and then dies
+    // silently.
+    inner.last_event_at.lock().insert(sandbox_id, Utc::now());
 
     let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
@@ -557,6 +595,51 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::NotAttached));
+    }
+
+    #[tokio::test]
+    async fn idle_sandboxes_returns_pairs_past_ttl() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        // Drive the harness side so the connection establishes,
+        // then keep it alive (don't close).
+        let _harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            // Keep the connection open until the test drops us.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach"
+        );
+
+        // Just attached — last_event_at = now. Long TTL means
+        // no sandbox is idle yet.
+        let fresh = hub.idle_sandboxes(Duration::from_secs(60));
+        assert!(fresh.is_empty(), "fresh attach is not idle: {fresh:?}");
+
+        // Zero TTL means everything attached counts as idle.
+        let aged = hub.idle_sandboxes(Duration::from_millis(0));
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].0, session_id);
+        assert_eq!(aged[0].1, sandbox_id);
     }
 
     #[tokio::test]

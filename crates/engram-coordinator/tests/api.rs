@@ -1407,14 +1407,27 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
         SessionStatus::Idle,
     );
 
-    // Exec must now 409 — the live sandbox is gone.
+    // Phase 4 Track B: an exec on an Idle session transparently
+    // auto-resumes from the snapshot before routing the command.
+    // The session ends up Active again and the exec succeeds.
     let resp = post(
         app,
         &format!("/sessions/{id}/exec"),
-        json!({"command": "echo nope"}),
+        json!({"command": "echo back"}),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "auto-resume should bring the Idle session back transparently"
+    );
+    assert_eq!(
+        store.get_session(id).await.unwrap().status,
+        SessionStatus::Active,
+        "session is Active after auto-resume",
+    );
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(v["stdout"], "back\n");
 }
 
 #[tokio::test]

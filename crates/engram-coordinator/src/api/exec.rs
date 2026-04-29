@@ -84,7 +84,13 @@ pub async fn exec(
 ) -> Result<Json<ExecResponse>, ApiError> {
     let (argv, sandbox_req) = build_exec(req, id)?;
 
-    state.services.meta.get_session(id).await?;
+    // Track B: idle sessions transparently auto-resume on the next
+    // request. The exec handler doesn't need to know whether the
+    // session was hot-suspended a few seconds ago — `ensure_active`
+    // handles the FC restore (or git-checkpoint cold resume) and
+    // returns once the session is Active again.
+    crate::api::snapshot::ensure_active(&state, id).await?;
+
     let sandbox_id = state.registry.get(id).ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
@@ -190,7 +196,7 @@ pub async fn exec_stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let (argv, sandbox_req) = build_exec(req, id)?;
 
-    state.services.meta.get_session(id).await?;
+    crate::api::snapshot::ensure_active(&state, id).await?;
     let sandbox_id = state.registry.get(id).ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),

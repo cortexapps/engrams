@@ -595,7 +595,7 @@ pub(crate) async fn auto_checkpoint(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -732,22 +732,25 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    /// Minimal MetadataStore for auto_checkpoint tests: only
-    /// `get_session` (returns the seeded Session) and
-    /// `append_session_event` (collects payloads in-memory) are
-    /// exercised; everything else is unreachable.
-    struct MiniMeta {
-        session: Session,
-        events: PlMutex<Vec<(String, serde_json::Value)>>,
+    /// In-memory MetadataStore for state-level + idle-evictor tests.
+    /// Tracks one session's status/host_id/sandbox_id mutably plus a
+    /// snapshot list; everything outside that surface is a benign
+    /// no-op rather than unreachable so a test that exercises a
+    /// secondary path doesn't panic.
+    pub(crate) struct MiniMeta {
+        pub(crate) session: PlMutex<Session>,
+        pub(crate) events: PlMutex<Vec<(String, serde_json::Value)>>,
         next_idx: PlMutex<i64>,
+        pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
     }
 
     impl MiniMeta {
-        fn new(session: Session) -> Self {
+        pub(crate) fn new(session: Session) -> Self {
             Self {
-                session,
+                session: PlMutex::new(session),
                 events: PlMutex::new(Vec::new()),
                 next_idx: PlMutex::new(0),
+                snapshots: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -759,77 +762,106 @@ mod tests {
             _: SessionSpec,
             _: String,
         ) -> Result<engram_core::SessionId, MetaError> {
-            unreachable!("create_session not used in auto_checkpoint tests")
+            unreachable!("create_session not used in state tests")
         }
         async fn get_session(&self, id: engram_core::SessionId) -> Result<Session, MetaError> {
-            if id == self.session.id {
-                Ok(self.session.clone())
+            let s = self.session.lock();
+            if id == s.id {
+                Ok(s.clone())
             } else {
                 Err(MetaError::NotFound)
             }
         }
         async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
-            unreachable!()
+            Ok(vec![self.session.lock().clone()])
         }
         async fn set_session_status(
             &self,
-            _: engram_core::SessionId,
-            _: engram_core::types::SessionStatus,
+            id: engram_core::SessionId,
+            status: engram_core::types::SessionStatus,
         ) -> Result<(), MetaError> {
-            unreachable!()
+            let mut s = self.session.lock();
+            if id != s.id {
+                return Err(MetaError::NotFound);
+            }
+            s.status = status;
+            Ok(())
         }
         async fn assign_session_host(
             &self,
-            _: engram_core::SessionId,
-            _: Option<HostId>,
+            id: engram_core::SessionId,
+            host_id: Option<HostId>,
         ) -> Result<(), MetaError> {
-            unreachable!()
+            let mut s = self.session.lock();
+            if id != s.id {
+                return Err(MetaError::NotFound);
+            }
+            s.host_id = host_id;
+            Ok(())
         }
         async fn assign_session_sandbox(
             &self,
-            _: engram_core::SessionId,
-            _: Option<engram_core::SandboxId>,
+            id: engram_core::SessionId,
+            sandbox_id: Option<engram_core::SandboxId>,
         ) -> Result<(), MetaError> {
-            unreachable!()
+            let mut s = self.session.lock();
+            if id != s.id {
+                return Err(MetaError::NotFound);
+            }
+            s.sandbox_id = sandbox_id;
+            Ok(())
         }
         async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
-            unreachable!()
+            Ok(())
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-            unreachable!()
+            Ok(Vec::new())
         }
         async fn set_host_status(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
-            unreachable!()
+            Ok(())
         }
         async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
-            unreachable!()
+            Ok(Vec::new())
         }
         async fn mark_host_dead_and_reassign_sessions(
             &self,
             _: HostId,
         ) -> Result<Vec<engram_core::SessionId>, MetaError> {
-            unreachable!()
+            Ok(Vec::new())
         }
-        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<(), MetaError> {
-            unreachable!()
+        async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
+            self.snapshots.lock().push(snap);
+            Ok(())
         }
         async fn list_snapshots_for_session(
             &self,
-            _: engram_core::SessionId,
+            sid: engram_core::SessionId,
         ) -> Result<Vec<SnapshotRecord>, MetaError> {
-            unreachable!()
+            Ok(self
+                .snapshots
+                .lock()
+                .iter()
+                .filter(|s| s.session_id == sid)
+                .cloned()
+                .collect())
         }
         async fn latest_snapshot_for_session(
             &self,
-            _: engram_core::SessionId,
+            sid: engram_core::SessionId,
         ) -> Result<Option<SnapshotRecord>, MetaError> {
-            unreachable!()
+            Ok(self
+                .snapshots
+                .lock()
+                .iter()
+                .filter(|s| s.session_id == sid)
+                .last()
+                .cloned())
         }
         async fn upsert_image_version(&self, _: ImageVersion) -> Result<(), MetaError> {
-            unreachable!()
+            Ok(())
         }
         async fn latest_ready_image(&self, _: &str) -> Result<Option<ImageVersion>, MetaError> {
-            unreachable!()
+            Ok(None)
         }
         async fn append_session_event(
             &self,

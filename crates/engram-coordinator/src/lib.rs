@@ -14,6 +14,7 @@ pub mod config;
 pub mod dead_host;
 pub mod error;
 pub mod host_registry;
+pub mod idle_evictor;
 pub mod image_registry;
 pub mod pg_listener;
 pub mod scheduler;
@@ -103,6 +104,18 @@ pub async fn run_with_registry(
             None
         }
     };
+
+    // Phase 4 Track B: idle-session evictor. Polls the harness hub
+    // every ~10s for sandboxes whose last harness event is older
+    // than `ENGRAM_IDLE_TTL_SECS` (default 60s) and runs the suspend
+    // pipeline (checkpoint → FC snapshot → destroy → mark Idle).
+    // Auto-resume on next request lands on the existing /resume path.
+    // Drops the JoinHandle — task lives for coord's lifetime.
+    let _idle_evictor = idle_evictor::spawn(
+        state.clone(),
+        idle_evictor::idle_ttl_from_env(),
+        idle_evictor::DEFAULT_POLL_INTERVAL,
+    );
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
