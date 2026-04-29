@@ -194,6 +194,8 @@ pub async fn create_session(
         session_id,
     );
 
+    let agent = build_dev_noop_agent(&state, session_id);
+
     let vm_spec = VmSpec {
         image: image_version.clone(),
         rootfs_source: rootfs_source_from(resolved.as_ref()),
@@ -218,7 +220,7 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
-        agent: None,
+        agent,
     };
 
     // 3. Scheduler picks a host based on heartbeat-derived state
@@ -279,6 +281,14 @@ pub async fn create_session(
     };
 
     state.registry.bind(session_id, sandbox_id);
+    // Tell the harness hub that an upcoming TCP connection
+    // identifying as `session_id` should attach to this sandbox.
+    // No-op for sessions without an agent (the harness never
+    // dials so the binding is just garbage that gets cleared on
+    // destroy). The noop binary's retry loop covers the small
+    // window between `create_for_session` returning (which
+    // already spawned the agent) and this bind.
+    state.harness_hub.bind_session(session_id, sandbox_id);
     state
         .services
         .meta
@@ -494,5 +504,35 @@ pub async fn delete_session(
             },
         )
         .await?;
+    state.harness_hub.unbind_session(id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Build the `AgentSpec` for the dev `engram-harness-noop` binary if
+/// `cfg.dev_auto_noop` is set, the harness binary path is configured,
+/// and the harness TCP listener is bound. None otherwise — production
+/// callers don't auto-spawn anything; their harness lives inside the
+/// rootfs and is invoked by `engram-bootstrap`.
+fn build_dev_noop_agent(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Option<engram_core::types::sandbox::AgentSpec> {
+    if !state.cfg.dev_auto_noop {
+        return None;
+    }
+    let bin = state.cfg.dev_noop_harness_path.as_ref()?.to_string_lossy().to_string();
+    let addr = (*state.harness_listen_addr.lock())?;
+    let mut env = HashMap::new();
+    env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
+    env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
+    Some(engram_core::types::sandbox::AgentSpec {
+        argv: vec![
+            bin,
+            "--connect".into(),
+            addr.to_string(),
+            "--session-id".into(),
+            session_id.to_string(),
+        ],
+        env,
+    })
 }
