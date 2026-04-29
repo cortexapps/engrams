@@ -11,6 +11,7 @@ mod exec;
 mod health;
 mod hosts;
 mod sessions;
+mod sessions_inspect;
 mod snapshot;
 
 pub fn router(state: SharedState) -> Router {
@@ -35,6 +36,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
         .route("/sessions/:id/checkpoint", post(checkpoint::checkpoint))
+        .route("/sessions/:id/log", get(sessions_inspect::log))
+        .route("/sessions/:id/diff", get(sessions_inspect::diff))
+        .route("/sessions/:id/fork", post(sessions_inspect::fork))
         .route("/sessions/:id/migrate", post(sessions::migrate))
         .route("/api/hosts/connect", get(hosts::connect))
         .route("/api/hosts", get(hosts::list))

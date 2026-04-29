@@ -13,6 +13,7 @@ pub mod api;
 pub mod config;
 pub mod dead_host;
 pub mod error;
+pub mod git_workdir;
 pub mod host_registry;
 pub mod idle_evictor;
 pub mod image_registry;

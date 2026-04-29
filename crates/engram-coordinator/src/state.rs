@@ -368,6 +368,11 @@ pub struct AppState {
     /// harness connections off a real vsock listener wired through
     /// the same hub.
     pub harness_hub: Arc<HarnessHub>,
+    /// Phase 4 Track F: coord-local bare clones of every writable
+    /// repo Engram has touched, used for `engram session log/diff/
+    /// fork` queries that need git history without involving a
+    /// session sandbox. Lazily clones per repo URL on first query.
+    pub git_workdir: Arc<crate::git_workdir::GitWorkdir>,
 }
 
 impl AppState {
@@ -397,6 +402,9 @@ impl AppState {
             services.meta.clone(),
             services.sandbox.clone(),
         )));
+        let git_workdir = Arc::new(crate::git_workdir::GitWorkdir::new(
+            cfg.local_path.join("git-workdirs"),
+        ));
         Self {
             cfg,
             services,
@@ -404,6 +412,7 @@ impl AppState {
             events,
             host_registry,
             harness_hub,
+            git_workdir,
         }
     }
 
@@ -739,7 +748,7 @@ pub(crate) mod tests {
     /// secondary path doesn't panic.
     pub(crate) struct MiniMeta {
         pub(crate) session: PlMutex<Session>,
-        pub(crate) events: PlMutex<Vec<(String, serde_json::Value)>>,
+        pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
     }
@@ -872,16 +881,29 @@ pub(crate) mod tests {
             let mut next = self.next_idx.lock();
             let idx = *next;
             *next += 1;
-            self.events.lock().push((kind.to_string(), payload));
+            self.events.lock().push(PersistedEvent {
+                idx,
+                kind: kind.to_string(),
+                payload,
+                created_at: chrono::Utc::now(),
+            });
             Ok(idx)
         }
         async fn list_session_events_since(
             &self,
             _: engram_core::SessionId,
-            _: i64,
-            _: i64,
+            since: i64,
+            limit: i64,
         ) -> Result<Vec<PersistedEvent>, MetaError> {
-            unreachable!()
+            let limit = if limit < 0 { i64::MAX } else { limit };
+            Ok(self
+                .events
+                .lock()
+                .iter()
+                .filter(|e| e.idx > since)
+                .take(limit as usize)
+                .cloned()
+                .collect())
         }
     }
 
