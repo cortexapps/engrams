@@ -17,6 +17,7 @@ pub mod host_registry;
 pub mod idle_evictor;
 pub mod image_registry;
 pub mod pg_listener;
+pub mod preemption_drain;
 pub mod scheduler;
 pub mod state;
 
@@ -116,6 +117,14 @@ pub async fn run_with_registry(
         idle_evictor::idle_ttl_from_env(),
         idle_evictor::DEFAULT_POLL_INTERVAL,
     );
+
+    // Phase 4 Track D: preemption best-effort drain. Subscribes to
+    // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE
+    // metadata server, MockCloud's `trigger_preemption` for tests)
+    // and on notice fans out across all active sessions on this
+    // host: workspace checkpoint → destroy → mark PendingReassign.
+    // Caller-driven recovery via `POST /sessions/:id/resume`.
+    let _preemption_drain = preemption_drain::spawn(state.clone());
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
