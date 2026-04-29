@@ -67,7 +67,6 @@ impl MetadataStore for MiniMeta {
                 session_kind: engram_core::types::session::SessionKind::Local,
                 repo_url: None,
                 checkpoint_branch: None,
-                last_harness_event_at: None,
                 last_active_at: Utc::now(),
             },
         );

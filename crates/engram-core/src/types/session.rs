@@ -215,12 +215,6 @@ pub struct Session {
     /// stable across resumes.
     #[serde(default)]
     pub checkpoint_branch: Option<String>,
-    /// Phase 4 (Track B): wall-clock of the most recent harness event
-    /// the host received for this session. The idle evictor reads this
-    /// to decide who's safe to hot-suspend. `None` until the harness
-    /// emits its first event.
-    #[serde(default)]
-    pub last_harness_event_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
 }
@@ -279,7 +273,6 @@ mod tests {
                 url: "https://github.com/cortex/api.git".into(),
             }),
             checkpoint_branch: Some(checkpoint_branch_for(SessionId::new())),
-            last_harness_event_at: None,
             created_at: Utc::now(),
             last_active_at: Utc::now(),
         };

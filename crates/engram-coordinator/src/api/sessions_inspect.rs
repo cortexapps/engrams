@@ -509,7 +509,6 @@ mod tests {
             session_kind: SessionKind::Git,
             repo_url: Some(RepoUrl::Git { url }),
             checkpoint_branch: Some(branch),
-            last_harness_event_at: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
         }
@@ -643,7 +642,6 @@ mod tests {
                 name: "hello".into(),
             }),
             checkpoint_branch: None,
-            last_harness_event_at: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
         };

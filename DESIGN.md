@@ -761,7 +761,7 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 - Track B — done. Idle evictor (`engram-coordinator::idle_evictor`) cold-checkpoints, takes a hot FC snapshot, destroys the sandbox, marks `Idle`. `ensure_active` auto-resumes on the next `exec` / `exec_stream` / SSE-subscribe.
 - Track C — done. `RepoUrl` / `SessionKind` types and schema migration; `checkpoint_session` primitive (harness round-trip + git push) and `checkpoint_workspace_only` (auto-cadence — skips the harness round-trip); `POST /sessions/:id/checkpoint`; auto-checkpoint on `HarnessEvent::Idle` / `RunCompleted`; `smart_bootstrap_to_branch` for cross-host resume.
 - Track D — done. Host-agent consumes `cloud.preemption_signal()`; on notice fans out `checkpoint_session` to every live sandbox in parallel with a 25s deadline, drops them, signals the coord, accepts VM death.
-- Track E — done. `local://hello` quickstart, CLI surfaces `session_kind` / `checkpoint_branch` / `last_harness_event_at`, ADR 0001 captures the trajectory.
+- Track E — done. `local://hello` quickstart, CLI surfaces `session_kind` / `checkpoint_branch`, ADR 0001 captures the trajectory.
 - Track F — mostly done. `GET /sessions/:id/log?kind=conversation|workspace`, `GET /sessions/:id/diff?vs=<ref>`, `POST /sessions/:id/fork`, `POST /sessions/:id/resume?from_event_idx=N`. CLI verbs ship at `engram session {log,diff,fork,resume,checkpoint}`. F.6 (`POST /sessions/:id/pr` — GitHub-only) is deferred until the prod auth path lands; the runtime API for PR creation is identical whether the session token comes from a per-session token (Phase 4 dev) or App installation token (Phase 6).
 
 **What Engram does NOT solve** (explicit contract):

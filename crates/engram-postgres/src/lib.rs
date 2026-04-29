@@ -106,7 +106,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, repo, branch, user_id, status, image_version, host_id,
                    sandbox_id, session_kind, repo_url, checkpoint_branch,
-                   last_harness_event_at, created_at, last_active_at
+                   created_at, last_active_at
             FROM sessions WHERE id = $1
             "#,
         )
@@ -123,7 +123,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, repo, branch, user_id, status, image_version, host_id,
                    sandbox_id, session_kind, repo_url, checkpoint_branch,
-                   last_harness_event_at, created_at, last_active_at
+                   created_at, last_active_at
             FROM sessions
             WHERE status IN ('pending','active','idle')
             "#,

@@ -54,10 +54,40 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum SessionCmd {
+    /// Create a new session. Prints the new session_id on stdout.
+    Create {
+        /// `git+https://...`, `git+ssh://...`, or `local://<name>`.
+        #[arg(long)]
+        repo: String,
+        /// Base branch the session forks from (Git sessions). Ignored
+        /// for `local://`.
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Clone-only mode: workspace is read; no checkpoint branch.
+        #[arg(long)]
+        read_only: bool,
+        /// Pin the session to a specific image_version (warm-pool tag).
+        /// Defaults to the coord's `--default-image-version`.
+        #[arg(long)]
+        image_version: Option<String>,
+        /// Free-form user identifier surfaced on the row.
+        #[arg(long)]
+        user_id: Option<String>,
+    },
     /// List sessions in `pending` / `active` / `idle` status.
     List,
     /// Print one session's row.
     Get { id: String },
+    /// Run a command synchronously inside the session's sandbox and
+    /// print stdout (and stderr if non-empty). Newlines preserved.
+    Exec {
+        id: String,
+        /// Command to run as a shell string (passed to `sh -c`).
+        cmd: String,
+        /// Optional wall-clock timeout in seconds.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
     /// Mark the session completed and tear down its sandbox.
     Delete { id: String },
     /// Tail the persistent event log via SSE. Stays open; Ctrl-C to
@@ -217,8 +247,32 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
     let client = build_client(cli.token.as_deref())?;
     match &cli.cmd {
         Cmd::Session { cmd } => match cmd {
+            SessionCmd::Create {
+                repo,
+                branch,
+                read_only,
+                image_version,
+                user_id,
+            } => {
+                session_create(
+                    &client,
+                    &cli.endpoint,
+                    repo,
+                    branch,
+                    *read_only,
+                    image_version.as_deref(),
+                    user_id.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
             SessionCmd::List => session_list(&client, &cli.endpoint, cli.json).await,
             SessionCmd::Get { id } => session_get(&client, &cli.endpoint, id, cli.json).await,
+            SessionCmd::Exec {
+                id,
+                cmd: shell,
+                timeout_secs,
+            } => session_exec(&client, &cli.endpoint, id, shell, *timeout_secs, cli.json).await,
             SessionCmd::Delete { id } => session_delete(&client, &cli.endpoint, id).await,
             SessionCmd::Logs { id, since } => {
                 session_logs(&client, &cli.endpoint, id, *since).await
@@ -344,9 +398,6 @@ async fn session_get(
         "last_active     : {}",
         body["last_active_at"].as_str().unwrap_or(""),
     );
-    if let Some(at) = body["last_harness_event_at"].as_str() {
-        println!("last_harness_at : {at}");
-    }
     Ok(())
 }
 
@@ -365,6 +416,98 @@ async fn session_delete(
         return Err(CliError::Http(status.as_u16(), body));
     }
     println!("deleted");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session_create(
+    client: &reqwest::Client,
+    endpoint: &str,
+    repo: &str,
+    branch: &str,
+    read_only: bool,
+    image_version: Option<&str>,
+    user_id: Option<&str>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("repo".into(), Value::from(repo));
+    payload.insert("branch".into(), Value::from(branch));
+    if read_only {
+        payload.insert("read_only".into(), Value::from(true));
+    }
+    if let Some(v) = image_version {
+        payload.insert("image_version".into(), Value::from(v));
+    }
+    if let Some(u) = user_id {
+        payload.insert("user_id".into(), Value::from(u));
+    }
+    let resp = client
+        .post(format!("{endpoint}/sessions"))
+        .json(&Value::Object(payload))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+    } else {
+        println!("{}", parsed["session_id"].as_str().unwrap_or(""));
+    }
+    Ok(())
+}
+
+async fn session_exec(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    cmd: &str,
+    timeout_secs: Option<u64>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("command".into(), Value::from(cmd));
+    if let Some(t) = timeout_secs {
+        payload.insert("timeout_secs".into(), Value::from(t));
+    }
+    let resp = client
+        .post(format!("{endpoint}/sessions/{id}/exec"))
+        .json(&Value::Object(payload))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+    // Plain mode: stdout to stdout, stderr to stderr. Exit code
+    // mirrors the remote process's exit so shell pipelines compose.
+    if let Some(s) = parsed["stdout"].as_str() {
+        if !s.is_empty() {
+            print!("{s}");
+        }
+    }
+    if let Some(s) = parsed["stderr"].as_str() {
+        if !s.is_empty() {
+            eprint!("{s}");
+        }
+    }
+    if let Some(exit) = parsed["exit_status"].as_i64() {
+        if exit != 0 {
+            return Err(CliError::Other(format!("exec exited with {exit}")));
+        }
+    }
     Ok(())
 }
 

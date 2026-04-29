@@ -388,7 +388,6 @@ mod tests {
                 url: format!("file://{}", remote.path().display()),
             }),
             checkpoint_branch: Some(branch.clone()),
-            last_harness_event_at: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
         };
@@ -488,7 +487,6 @@ mod tests {
                 url: format!("file://{}", remote.path().display()),
             }),
             checkpoint_branch: Some(branch.clone()),
-            last_harness_event_at: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
         };

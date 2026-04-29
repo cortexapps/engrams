@@ -116,7 +116,6 @@ impl MetadataStore for MockMetadataStore {
             session_kind: kind,
             repo_url: parsed,
             checkpoint_branch,
-            last_harness_event_at: None,
             last_active_at: Utc::now(),
         };
         self.sessions.lock().insert(id, session);
