@@ -1,0 +1,454 @@
+//! Wire types for the harness ↔ host vsock channel.
+//!
+//! The "harness" is whatever runs the agent process inside the
+//! sandbox: an Engram-aware first-party harness (`engram-harness-noop`
+//! for tests; agent-specific adapters in production), or a thin
+//! adapter wrapping a vendor agent like Claude Code (`engram-harness-claude`).
+//!
+//! This is deliberately separate from the existing exec channel
+//! (`engram-agentd::proto`). The exec channel is host-driven: the host
+//! sends one [`engram_agentd::proto::WireRequest`] per connection,
+//! gets back a stream or one-shot reply. The harness channel is
+//! _harness_-driven: the agent inside the sandbox dials the host and
+//! pushes [`HarnessEvent`]s as it makes tool calls; the host can send
+//! [`HarnessCommand`]s back over the same connection (Checkpoint /
+//! Shutdown) which the harness handles at safe boundaries.
+//!
+//! Conversation shape:
+//!
+//! ```text
+//!   harness ──[ HarnessAttach { session_id, harness_version } ]──► host
+//!   host    ──[ HarnessAttachAck { ok, message } ]──► harness
+//!     (host validates session_id is known; rejects unknown sessions)
+//!
+//!   harness ──[ HarnessFrame::Event(HarnessEvent::*) ]──► host  (0+ times)
+//!   host    ──[ HarnessFrame::Command(HarnessCommand::*) ]──► harness (0+ times)
+//!     (full duplex from here on)
+//!
+//!   <connection closed>
+//! ```
+//!
+//! Framing: same scheme as `engram-agentd::proto` — 4-byte big-endian
+//! length prefix + bincode body. Reusing the shape keeps the agent
+//! image small (one codec).
+
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use engram_core::SessionId;
+
+/// Vsock port the in-guest harness dials to reach the host. Distinct
+/// from the agentd exec port so the host can demux at `accept` time.
+pub const HARNESS_VSOCK_PORT: u32 = 1024;
+
+/// Single-frame size cap. Same as `engram-agentd::proto::MAX_MSG_BYTES`.
+/// `transcript_delta` payloads are typically a few KB (one JSONL line
+/// per tool call); 16 MiB gives plenty of headroom for outliers.
+pub const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
+
+/// First frame the harness sends after dialing the host. Identifies
+/// which session this connection belongs to. The host validates the
+/// session exists and is in a state that accepts harness traffic; on
+/// rejection it replies with `HarnessAttachAck { ok: false }` and
+/// closes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessAttach {
+    pub session_id: SessionId,
+    /// Free-form identifier for the harness build (e.g.
+    /// `"engram-harness-claude/0.1.0"`). Logged at debug; no semantics.
+    pub harness_version: String,
+}
+
+/// Host's reply to [`HarnessAttach`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessAttachAck {
+    pub ok: bool,
+    /// Short human-readable reason on `ok = false`. Plaintext on the
+    /// vsock — never include sensitive context.
+    pub message: Option<String>,
+}
+
+/// One frame on the steady-state full-duplex channel after the
+/// handshake. The harness sends `Event`s, the host sends `Command`s.
+/// Wrapping in a single enum keeps a single bincode-deserializer at
+/// each end.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HarnessFrame {
+    Event(HarnessEvent),
+    Command(HarnessCommand),
+}
+
+/// Events the harness emits as the agent inside it does work. These
+/// are forwarded by the host into `session_events` (where the SSE
+/// bus, Web UI, Slackbot, and resume bootstrap consume them).
+///
+/// "Tool call" maps to one observable unit of work in the agent's
+/// vocabulary — typically one Claude Code Bash/Edit/Read/etc call,
+/// or one custom-harness function dispatch. Engram doesn't interpret
+/// the tool-call args; `transcript_delta` carries whatever bytes the
+/// agent appended to its native transcript file for this call.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HarnessEvent {
+    /// New agent run started (typically: user prompt arrived). The
+    /// harness assigns `run_id`; subsequent ToolCall events carry the
+    /// same `run_id`.
+    RunStarted {
+        run_id: String,
+        prompt_summary: Option<String>,
+    },
+    /// Tool call beginning. `tool_call_id` ties Started/Completed.
+    ToolCallStarted {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        args_summary: Option<String>,
+    },
+    /// Tool call finished. `transcript_delta` is the bytes the harness
+    /// appended to its native transcript file for this call (JSONL
+    /// line(s) for Claude Code; whatever its format-of-the-day is for
+    /// other adapters). Opaque to Engram; replayed verbatim on resume
+    /// to reconstruct the transcript file in the agent's native shape.
+    ToolCallCompleted {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        ok: bool,
+        duration_ms: u64,
+        #[serde(default, with = "serde_bytes")]
+        transcript_delta: Vec<u8>,
+    },
+    /// Run finished cleanly (or failed terminally). After this, the
+    /// harness typically goes idle until the next prompt arrives.
+    RunCompleted { run_id: String, ok: bool },
+    /// Explicit "I'm not doing anything." Stronger signal than just
+    /// the absence of events — host can short-circuit idle eviction
+    /// without waiting for the TTL.
+    Idle,
+}
+
+impl HarnessEvent {
+    /// Discriminant string used as the `kind` column in `session_events`.
+    /// Stable across coordinator restarts — clients that subscribe by
+    /// kind (Slackbot, Web UI) match on these strings.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RunStarted { .. } => "run_started",
+            Self::ToolCallStarted { .. } => "tool_call_started",
+            Self::ToolCallCompleted { .. } => "tool_call_completed",
+            Self::RunCompleted { .. } => "run_completed",
+            Self::Idle => "harness_idle",
+        }
+    }
+
+    /// Tool-call ID if this event carries one. Used by the host's
+    /// `session_events` writer to populate the `tool_call_id` column.
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            Self::ToolCallStarted { tool_call_id, .. }
+            | Self::ToolCallCompleted { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Commands the host sends to the harness mid-stream. The harness
+/// responds at a safe boundary (i.e. between tool calls), not in the
+/// middle of an in-flight call.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HarnessCommand {
+    /// Flush any pending transcript writes; ack when the transcript
+    /// is durably on disk (so `git add -A && git push` would capture
+    /// it). Reason is informational — logged on the host side.
+    Checkpoint { reason: CheckpointReason },
+    /// Clean shutdown. `grace_secs` is how long the host will wait
+    /// for the harness to exit before escalating. Each adapter
+    /// translates this into the right signal sequence for its agent
+    /// (SIGINT then SIGKILL for Claude Code; whatever for others).
+    Shutdown { grace_secs: u32 },
+}
+
+/// Why the host is asking for a checkpoint. Logged in `session_events`
+/// so operators can tell idle-driven from preemption-driven flushes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointReason {
+    /// Host's idle TTL elapsed; we're about to hot-suspend.
+    Idle,
+    /// Cloud preemption signal received; flush before VM dies.
+    Preempt,
+    /// Operator invoked `POST /sessions/:id/checkpoint`.
+    Manual,
+    /// Run finished; opportunistic checkpoint to align workspace
+    /// with conversation state.
+    RunCompleted,
+}
+
+/// Harness's reply to a [`HarnessCommand::Checkpoint`]. `ok = false`
+/// means the harness couldn't reach a safe boundary in time; the host
+/// should retry or fall through to its escalation path.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAck {
+    pub ok: bool,
+    pub message: Option<String>,
+}
+
+/// Harness's reply to a [`HarnessCommand::Shutdown`]. Sent after the
+/// last `transcript_delta` has been flushed; harness exits its
+/// process tree shortly after.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShutdownAck {
+    pub ok: bool,
+    pub message: Option<String>,
+}
+
+// ---- Framing -----------------------------------------------------------
+
+/// Read one length-prefixed bincode frame. Mirrors
+/// `engram-agentd::proto::read_msg` so adapters can share a single
+/// codec.
+pub async fn read_msg<R, T>(r: &mut R) -> std::io::Result<T>
+where
+    R: AsyncReadExt + Unpin,
+    T: DeserializeOwned,
+{
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MSG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("harness frame length {len} exceeds MAX_MSG_BYTES ({MAX_MSG_BYTES})"),
+        ));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    bincode::deserialize(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+}
+
+/// Bincode-encode `msg` and write as a length-prefixed frame.
+pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
+    let body = bincode::serialize(msg).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
+    })?;
+    if body.len() > MAX_MSG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "encoded harness frame {} exceeds MAX_MSG_BYTES ({MAX_MSG_BYTES})",
+                body.len()
+            ),
+        ));
+    }
+    let len = (body.len() as u32).to_be_bytes();
+    w.write_all(&len).await?;
+    w.write_all(&body).await?;
+    Ok(())
+}
+
+// Tiny module to opt the bytea field into compact bincode encoding.
+// `Vec<u8>` already round-trips byte-for-byte via bincode; this just
+// keeps the JSON-side wire (when an event lands in session_events)
+// surface uniform if we ever want to opt into base64 there. For now
+// it's a passthrough.
+mod serde_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        b.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        Vec::<u8>::deserialize(d)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn round_trip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(value: T) {
+        let mut buf = Vec::new();
+        let fut = write_msg(&mut buf, &value);
+        futures_block_on(fut).unwrap();
+        let mut cur = Cursor::new(buf);
+        let got: T = futures_block_on(read_msg(&mut cur)).unwrap();
+        assert_eq!(got, value);
+    }
+
+    fn futures_block_on<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(f)
+    }
+
+    #[test]
+    fn attach_round_trip() {
+        round_trip(HarnessAttach {
+            session_id: SessionId::new(),
+            harness_version: "engram-harness-noop/0.1.0".into(),
+        });
+    }
+
+    #[test]
+    fn attach_ack_round_trip() {
+        round_trip(HarnessAttachAck {
+            ok: true,
+            message: None,
+        });
+        round_trip(HarnessAttachAck {
+            ok: false,
+            message: Some("unknown session".into()),
+        });
+    }
+
+    #[test]
+    fn event_variants_round_trip() {
+        round_trip(HarnessFrame::Event(HarnessEvent::RunStarted {
+            run_id: "r1".into(),
+            prompt_summary: Some("fix the test".into()),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::ToolCallStarted {
+            run_id: "r1".into(),
+            tool_call_id: "t1".into(),
+            tool_name: "Bash".into(),
+            args_summary: Some("cargo test".into()),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
+            run_id: "r1".into(),
+            tool_call_id: "t1".into(),
+            tool_name: "Bash".into(),
+            ok: true,
+            duration_ms: 12345,
+            transcript_delta: b"{\"role\":\"tool\",\"content\":\"ok\"}\n".to_vec(),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::RunCompleted {
+            run_id: "r1".into(),
+            ok: true,
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::Idle));
+    }
+
+    #[test]
+    fn command_variants_round_trip() {
+        round_trip(HarnessFrame::Command(HarnessCommand::Checkpoint {
+            reason: CheckpointReason::Idle,
+        }));
+        round_trip(HarnessFrame::Command(HarnessCommand::Checkpoint {
+            reason: CheckpointReason::Preempt,
+        }));
+        round_trip(HarnessFrame::Command(HarnessCommand::Shutdown {
+            grace_secs: 5,
+        }));
+    }
+
+    #[test]
+    fn binary_transcript_delta_round_trips_byte_for_byte() {
+        // Non-UTF-8 bytes survive (the harness's transcript format
+        // is opaque to Engram; binary safety matters).
+        let raw: Vec<u8> = (0..=255u8).cycle().take(8 * 1024).collect();
+        let ev = HarnessEvent::ToolCallCompleted {
+            run_id: "r".into(),
+            tool_call_id: "t".into(),
+            tool_name: "Custom".into(),
+            ok: true,
+            duration_ms: 1,
+            transcript_delta: raw.clone(),
+        };
+        let mut buf = Vec::new();
+        futures_block_on(write_msg(&mut buf, &ev)).unwrap();
+        let mut cur = Cursor::new(buf);
+        let got: HarnessEvent = futures_block_on(read_msg(&mut cur)).unwrap();
+        match got {
+            HarnessEvent::ToolCallCompleted {
+                transcript_delta, ..
+            } => assert_eq!(transcript_delta, raw),
+            _ => panic!("variant mismatch"),
+        }
+    }
+
+    #[test]
+    fn read_rejects_oversized_length() {
+        let bad = (MAX_MSG_BYTES as u32 + 1).to_be_bytes();
+        let mut cur = Cursor::new(bad.to_vec());
+        let err = futures_block_on(read_msg::<_, HarnessFrame>(&mut cur)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("MAX_MSG_BYTES"));
+    }
+
+    #[test]
+    fn event_kind_strings_are_stable() {
+        // Persisted clients (Slackbot, audit log) match on these.
+        // Changing them is a breaking change — this test forces a
+        // deliberate update if anyone tries.
+        assert_eq!(
+            HarnessEvent::RunStarted {
+                run_id: "x".into(),
+                prompt_summary: None,
+            }
+            .kind(),
+            "run_started"
+        );
+        assert_eq!(
+            HarnessEvent::ToolCallStarted {
+                run_id: "x".into(),
+                tool_call_id: "t".into(),
+                tool_name: "B".into(),
+                args_summary: None,
+            }
+            .kind(),
+            "tool_call_started"
+        );
+        assert_eq!(
+            HarnessEvent::ToolCallCompleted {
+                run_id: "x".into(),
+                tool_call_id: "t".into(),
+                tool_name: "B".into(),
+                ok: true,
+                duration_ms: 0,
+                transcript_delta: vec![],
+            }
+            .kind(),
+            "tool_call_completed"
+        );
+        assert_eq!(
+            HarnessEvent::RunCompleted {
+                run_id: "x".into(),
+                ok: true,
+            }
+            .kind(),
+            "run_completed"
+        );
+        assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
+    }
+
+    #[test]
+    fn tool_call_id_only_set_for_tool_call_events() {
+        assert_eq!(HarnessEvent::Idle.tool_call_id(), None);
+        assert_eq!(
+            HarnessEvent::RunStarted {
+                run_id: "x".into(),
+                prompt_summary: None,
+            }
+            .tool_call_id(),
+            None
+        );
+        let id = "tool-42";
+        assert_eq!(
+            HarnessEvent::ToolCallStarted {
+                run_id: "x".into(),
+                tool_call_id: id.into(),
+                tool_name: "Read".into(),
+                args_summary: None,
+            }
+            .tool_call_id(),
+            Some(id)
+        );
+    }
+}

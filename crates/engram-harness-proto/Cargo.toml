@@ -1,0 +1,22 @@
+[package]
+name = "engram-harness-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire types for the harness ↔ host vsock channel: tool-call events, checkpoint/shutdown commands."
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+bincode.workspace = true
+chrono.workspace = true
+engram-core.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
