@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use engram_core::types::session::{RepoUrl, SessionKind};
 use engram_core::types::{
     HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent,
     Session, SessionStatus, SnapshotRecord,
@@ -24,6 +25,16 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let status: String = row.try_get("status").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_active_at: DateTime<Utc> = row.try_get("last_active_at").map_err(col_err)?;
+    let session_kind: String = row.try_get("session_kind").map_err(col_err)?;
+    let repo_url: Option<String> = row.try_get("repo_url").map_err(col_err)?;
+    let checkpoint_branch: Option<String> = row.try_get("checkpoint_branch").map_err(col_err)?;
+    let last_harness_event_at: Option<DateTime<Utc>> =
+        row.try_get("last_harness_event_at").map_err(col_err)?;
+    let parsed_repo_url = repo_url
+        .as_deref()
+        .map(RepoUrl::parse)
+        .transpose()
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
     Ok(Session {
         id: SessionId(id),
         repo: row.try_get("repo").map_err(col_err)?,
@@ -33,6 +44,10 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         image_version: row.try_get("image_version").map_err(col_err)?,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
+        session_kind: SessionKind::parse(&session_kind).map_err(MetaError::Serialization)?,
+        repo_url: parsed_repo_url,
+        checkpoint_branch,
+        last_harness_event_at,
         created_at,
         last_active_at,
     })

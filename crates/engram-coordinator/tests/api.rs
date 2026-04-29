@@ -96,6 +96,10 @@ impl MetadataStore for MockMetadataStore {
             host_id: None,
             sandbox_id: None,
             created_at: Utc::now(),
+            session_kind: engram_core::types::session::SessionKind::Local,
+            repo_url: None,
+            checkpoint_branch: None,
+            last_harness_event_at: None,
             last_active_at: Utc::now(),
         };
         self.sessions.lock().insert(id, session);
@@ -726,6 +730,7 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
                     branch: "main".into(),
                     user_id: None,
                     image_version: None,
+                    read_only: false,
                 },
                 "warm-bootstrap".into(),
             )
@@ -779,6 +784,7 @@ async fn list_sessions_serializes_full_session_record() {
                 branch: "trunk".into(),
                 user_id: Some("user-42".into()),
                 image_version: None,
+                read_only: false,
             },
             "warm-2026-04-27".into(),
         )
@@ -818,6 +824,7 @@ async fn delete_session_marks_completed_and_returns_204() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1021,6 +1028,7 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1336,6 +1344,7 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1401,6 +1410,7 @@ async fn evict_local_409_when_session_not_active() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1434,6 +1444,7 @@ async fn resume_409_when_no_snapshot_exists() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1512,6 +1523,7 @@ async fn exec_rejects_request_without_command_or_argv() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1540,6 +1552,7 @@ async fn exec_rejects_empty_argv() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )
@@ -1741,6 +1754,7 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: None,
+                read_only: false,
             },
             "warm-bootstrap".into(),
         )

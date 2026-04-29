@@ -101,6 +101,11 @@ pub struct CreateSessionRequest {
     pub branch: String,
     pub user_id: Option<String>,
     pub image_version: Option<String>,
+    /// Phase 4: clones the repo at create but never pushes back; no
+    /// checkpoint branch allocated. Defaults to false (writable git
+    /// session for `git+...` repos; ephemeral for `local://`).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -163,6 +168,7 @@ pub async fn create_session(
         branch: req.branch,
         user_id: req.user_id,
         image_version: Some(image_version.clone()),
+        read_only: req.read_only,
     };
 
     // 1. Persist the session row first so it has a stable SessionId

@@ -55,6 +55,7 @@ async fn cross_replica_event_fan_out() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: Some("warm-test".into()),
+                read_only: false,
             },
             "warm-test".into(),
         )
@@ -181,6 +182,7 @@ async fn append_session_event_fires_pg_notify() {
                 branch: "main".into(),
                 user_id: None,
                 image_version: Some("warm-test".into()),
+                read_only: false,
             },
             "warm-test".into(),
         )

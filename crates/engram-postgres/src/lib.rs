@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
+use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
 use engram_core::types::{
     HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
     SnapshotRecord,
@@ -64,11 +65,24 @@ impl MetadataStore for PostgresStore {
     ) -> Result<SessionId, MetaError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
+        // Phase 4: parse the repo URL up-front so we persist a
+        // canonical `repo_url`, derive `session_kind`, and allocate
+        // a checkpoint branch for writable git sessions. A malformed
+        // repo string fails the create — caller's bug, surface as
+        // Conflict (not NotFound).
+        let parsed = RepoUrl::parse(&spec.repo).map_err(|e| MetaError::Conflict(e.to_string()))?;
+        let kind = SessionKind::derive(&parsed, spec.read_only);
+        let checkpoint_branch = match kind {
+            SessionKind::Git => Some(checkpoint_branch_for(SessionId(id))),
+            SessionKind::Local | SessionKind::Readonly => None,
+        };
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, repo, branch, user_id, status, image_version, host_id, created_at, last_active_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $7)
+                (id, repo, branch, user_id, status, image_version, host_id,
+                 session_kind, repo_url, checkpoint_branch,
+                 created_at, last_active_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $10)
             "#,
         )
         .bind(id)
@@ -77,6 +91,9 @@ impl MetadataStore for PostgresStore {
         .bind(spec.user_id.as_deref())
         .bind(SessionStatus::Pending.as_str())
         .bind(&image_version)
+        .bind(kind.as_str())
+        .bind(parsed.as_string())
+        .bind(checkpoint_branch.as_deref())
         .bind(now)
         .execute(&self.pool)
         .await
@@ -88,7 +105,8 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, repo, branch, user_id, status, image_version, host_id,
-                   sandbox_id, created_at, last_active_at
+                   sandbox_id, session_kind, repo_url, checkpoint_branch,
+                   last_harness_event_at, created_at, last_active_at
             FROM sessions WHERE id = $1
             "#,
         )
@@ -104,7 +122,8 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, repo, branch, user_id, status, image_version, host_id,
-                   sandbox_id, created_at, last_active_at
+                   sandbox_id, session_kind, repo_url, checkpoint_branch,
+                   last_harness_event_at, created_at, last_active_at
             FROM sessions
             WHERE status IN ('pending','active','idle')
             "#,
