@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod row;
 
+#[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
 }

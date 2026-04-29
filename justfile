@@ -75,16 +75,27 @@ db-reset:
 # ------------------------------------------------------------------
 
 # Run the coordinator wired to the subprocess sandbox backend.
-# Postgres must already be up (`just db-up`).
-dev: db-up
+# Postgres must already be up (`just db-up`). Auto-spawns the noop
+# harness on every new session so `engram session log <id>` shows
+# tool-call traffic out of the box. Set `ENGRAM_DEV_AUTO_NOOP=` to
+# disable.
+dev: db-up dev-build-harness
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
+    ENGRAM_MODE=all \
     ENGRAM_SANDBOX_BACKEND=process \
     ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
     ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_DEFAULT_IMAGE=warm-bootstrap \
+    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-0} \
+    ENGRAM_DEV_AUTO_NOOP=${ENGRAM_DEV_AUTO_NOOP:-1} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
+
+# Build the noop-harness binary so `--dev-auto-noop` finds it next
+# to the coordinator's exe. Cheap no-op once it's built.
+dev-build-harness:
+    cargo build -p engram-harness-noop --bin engram-harness-noop
 
 # Run the coordinator wired to the Firecracker backend. Requires
 # Linux + KVM. Will not work on macOS — use `just dev` instead.

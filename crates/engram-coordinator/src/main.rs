@@ -103,8 +103,15 @@ struct Cli {
 
     /// Auto-spawn the noop harness for every new session. Off by
     /// default — set `ENGRAM_DEV_AUTO_NOOP=1` (or pass `--dev-auto-noop`)
-    /// to enable. Implies `dev_noop_harness_path` is set.
-    #[arg(long, env = "ENGRAM_DEV_AUTO_NOOP")]
+    /// to enable. Implies `dev_noop_harness_path` is set. Accepts the
+    /// usual truthy strings (`1`, `true`, `yes`, `y`, `on`) via the
+    /// env var.
+    #[arg(
+        long,
+        env = "ENGRAM_DEV_AUTO_NOOP",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+    )]
     dev_auto_noop: bool,
 }
 
@@ -207,8 +214,68 @@ async fn main() -> Result<(), CoordinatorError> {
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new(
             engram_host_agent::pooled_backend::PooledBackend::new(raw_backend, cli.warm_pool_size),
         );
-        let in_proc_host = HostId::new();
+        // Use a stable HostId for `--mode=all` so a coordinator
+        // restart picks up the same `hosts` row (FK-safe — sessions
+        // / snapshots inserted in a prior run still reference a valid
+        // host row). The hostname column is UNIQUE; without a stable
+        // id, every restart would collide on `("in-process")` and
+        // the row's id would diverge from the in-memory id we route
+        // through, breaking snapshot inserts via FK.
+        let in_proc_host: HostId = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000a11")
+            .expect("stable in-proc host UUID must parse")
+            .into();
         host_registry.register(in_proc_host, pooled_backend);
+        // Persist a row in `hosts` so any FK-bearing insert (snapshots
+        // record the host that wrote them, sessions track host_id)
+        // doesn't trip on a phantom host. The dialer-driven multi-host
+        // path inserts via the WS hello frame; --mode=all does it
+        // synchronously here.
+        let host_record = engram_core::types::HostRecord {
+            id: in_proc_host,
+            hostname: "in-process".into(),
+            cloud_metadata: engram_core::types::host::HostMetadata::default(),
+            capacity: engram_core::types::host::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+            },
+            status: engram_core::types::host::HostStatus::Ready,
+            last_heartbeat_at: chrono::Utc::now(),
+        };
+        if let Err(e) =
+            engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await
+        {
+            return Err(CoordinatorError::Config(format!(
+                "register in-process host in postgres: {e}"
+            )));
+        }
+        // Keep the row's `last_heartbeat_at` fresh so the dead-host
+        // detector doesn't reap our own in-process host. The
+        // multi-host path uses the WS dialer's heartbeat loop for
+        // this; --mode=all stamps the timestamp directly.
+        let pg_for_hb = pg.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let r = engram_core::types::HostRecord {
+                    id: in_proc_host,
+                    hostname: "in-process".into(),
+                    cloud_metadata: engram_core::types::host::HostMetadata::default(),
+                    capacity: engram_core::types::host::HostCapacity {
+                        total_gb: 0,
+                        used_gb: 0,
+                    },
+                    status: engram_core::types::host::HostStatus::Ready,
+                    last_heartbeat_at: chrono::Utc::now(),
+                };
+                if let Err(e) =
+                    engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
+                {
+                    tracing::warn!(error = %e, "in-process heartbeat upsert failed");
+                }
+            }
+        });
         tracing::info!(
             host_id = %in_proc_host,
             warm_pool_size = cli.warm_pool_size,
