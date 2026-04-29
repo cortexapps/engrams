@@ -99,10 +99,7 @@ impl MetadataStore for MiniMeta {
     async fn set_host_status(&self, _id: HostId, _s: HostStatus) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn list_stale_hosts(
-        &self,
-        _threshold_secs: u64,
-    ) -> Result<Vec<HostRecord>, MetaError> {
+    async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         Ok(Vec::new())
     }
     async fn mark_host_dead_and_reassign_sessions(
@@ -139,19 +136,6 @@ impl MetadataStore for MiniMeta {
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         Ok(None)
     }
-    async fn list_pending_replications(
-        &self,
-        _limit: i64,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn mark_snapshot_replicated(
-        &self,
-        _id: engram_core::SnapshotId,
-        _blob_url: String,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
     async fn upsert_image_version(&self, _v: ImageVersion) -> Result<(), MetaError> {
         Ok(())
     }
@@ -176,11 +160,7 @@ impl MetadataStore for MiniMeta {
     }
 }
 
-async fn seed_session(
-    meta: &MiniMeta,
-    host: HostId,
-    status: SessionStatus,
-) -> SessionId {
+async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionStatus) -> SessionId {
     let id = meta
         .create_session(
             SessionSpec {
@@ -328,6 +308,8 @@ async fn arc_dyn_metadata_store_dispatches_correctly() {
     // dispatch reaches the same impl. (Compile-time check + smoke
     // call.)
     let meta: Arc<dyn MetadataStore> = Arc::new(MiniMeta::default());
-    let result = meta.mark_host_dead_and_reassign_sessions(HostId::new()).await;
+    let result = meta
+        .mark_host_dead_and_reassign_sessions(HostId::new())
+        .await;
     assert!(result.is_ok());
 }

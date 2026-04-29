@@ -50,8 +50,7 @@ async fn pair(
         coord_tx_a.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
     let coord_stream = coord_rx_b.map(Ok::<TungMessage, TungError>);
 
-    let host_sink =
-        host_tx_b.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
+    let host_sink = host_tx_b.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
     let host_stream = host_rx_a.map(Ok::<TungMessage, TungError>);
 
     let (connected, _notify_rx, _demux) =
@@ -74,9 +73,15 @@ async fn create_and_destroy_round_trip() {
     let local: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
     let (remote, _serve) = pair(local).await;
 
-    let id = remote.create(live_spec()).await.expect("create round-trips");
+    let id = remote
+        .create(live_spec())
+        .await
+        .expect("create round-trips");
     let listed = remote.list().await.expect("list round-trips");
-    assert!(listed.contains(&id), "list must include the created sandbox");
+    assert!(
+        listed.contains(&id),
+        "list must include the created sandbox"
+    );
     remote.destroy(id).await.expect("destroy round-trips");
 }
 
@@ -198,7 +203,8 @@ async fn destroy_unknown_sandbox_id_is_idempotent_through_the_wire() {
     let (remote, _serve) = pair(local).await;
 
     let bogus = engram_core::SandboxId::new();
-    remote.destroy(bogus).await.expect(
-        "ProcessBackend's destroy is idempotent on unknown ids; wire must round-trip Ok",
-    );
+    remote
+        .destroy(bogus)
+        .await
+        .expect("ProcessBackend's destroy is idempotent on unknown ids; wire must round-trip Ok");
 }

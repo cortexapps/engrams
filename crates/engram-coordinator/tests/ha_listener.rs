@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engram_core::traits::{BlobStorage, MetadataStore};
+use engram_core::traits::MetadataStore;
 use engram_core::types::SessionSpec;
 
 #[tokio::test]
@@ -80,10 +80,7 @@ async fn cross_replica_event_fan_out() {
         exec_id: "test-exec".into(),
         chunk: test_chunk.clone(),
     };
-    coord_b
-        .emit(session_id, event)
-        .await
-        .expect("coord-b emit");
+    coord_b.emit(session_id, event).await.expect("coord-b emit");
 
     // Coord-A's subscriber should see the same event within a
     // generous bound. LISTEN delivery is sub-100ms locally; we
@@ -114,10 +111,8 @@ async fn build_app_state(
     use engram_cloud_mock::MockCloud;
     use engram_coordinator::image_registry::ImageRegistry;
     use engram_coordinator::{AppState, CoordinatorConfig, HostRegistry, Services};
-    use engram_storage_local::LocalStorage;
 
     let work_dir = tempfile::tempdir().expect("work dir").keep();
-    let blob_dir = tempfile::tempdir().expect("blob dir").keep();
     let images_dir = tempfile::tempdir().expect("images dir").keep();
 
     let raw: Arc<dyn engram_core::traits::SandboxBackend> =
@@ -125,11 +120,9 @@ async fn build_app_state(
     let pooled: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(
         engram_host_agent::pooled_backend::PooledBackend::new(raw, 0),
     );
-    let blob: Arc<dyn BlobStorage> = Arc::new(LocalStorage::new(blob_dir));
 
     let services = Services {
         meta: meta.clone(),
-        blob,
         cloud: Arc::new(MockCloud::new()),
         sandbox: pooled,
         secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
@@ -146,12 +139,14 @@ async fn build_app_state(
     // Spawn a pg_listener bound to this AppState's event bus.
     // `run_with_registry` does this in production; for the test we
     // wire it up directly so we don't need to bind an axum server.
-    let _ = engram_coordinator::pg_listener::spawn(
+    // The handle is intentionally dropped — the task lives for the
+    // test's duration and the runtime collects it on shutdown.
+    drop(engram_coordinator::pg_listener::spawn(
         database_url.to_string(),
         meta,
         state.events.clone(),
         state.host_registry.clone(),
-    );
+    ));
     state
 }
 

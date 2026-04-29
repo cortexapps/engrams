@@ -226,9 +226,7 @@ impl HostRegistry {
         ctx: &ScheduleContext<'_>,
         spec: SandboxSpec,
     ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self
-            .pick_for_session(ctx)
-            .ok_or_else(Self::no_host_error)?;
+        let (host_id, backend) = self.pick_for_session(ctx).ok_or_else(Self::no_host_error)?;
         let sandbox_id = backend.create(spec).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
@@ -242,9 +240,7 @@ impl HostRegistry {
         ctx: &ScheduleContext<'_>,
         src: std::path::PathBuf,
     ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self
-            .pick_for_session(ctx)
-            .ok_or_else(Self::no_host_error)?;
+        let (host_id, backend) = self.pick_for_session(ctx).ok_or_else(Self::no_host_error)?;
         let sandbox_id = backend.restore(src).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
@@ -386,9 +382,7 @@ mod tests {
         assert_eq!(reg.host_count(), 1);
         // Ownership row was inserted.
         assert_eq!(
-            reg.sandbox_owner
-                .get(&sandbox_id)
-                .map(|r| *r.value()),
+            reg.sandbox_owner.get(&sandbox_id).map(|r| *r.value()),
             Some(host)
         );
 

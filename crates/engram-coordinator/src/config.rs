@@ -6,10 +6,10 @@ pub struct CoordinatorConfig {
     pub database_url: String,
     pub mode: RunMode,
     pub cloud_backend: CloudBackendChoice,
-    pub storage_backend: StorageBackendChoice,
-    pub storage_local_path: PathBuf,
-    pub storage_gcs_bucket: Option<String>,
-    pub storage_s3_bucket: Option<String>,
+    /// Local-disk root for snapshot dirs and the image registry.
+    /// Per-host; not durable across host loss (cross-host durability
+    /// for sessions is git, not local snapshots).
+    pub local_path: PathBuf,
     pub sandbox_backend: SandboxBackendChoice,
     pub default_image_version: String,
     /// Target warm-pool size for any (repo, image_version) the
@@ -34,10 +34,7 @@ impl Default for CoordinatorConfig {
             database_url: "postgres://engram:engram@localhost:5432/engram".into(),
             mode: RunMode::Coordinator,
             cloud_backend: CloudBackendChoice::Static,
-            storage_backend: StorageBackendChoice::Local,
-            storage_local_path: PathBuf::from("./var/snapshots"),
-            storage_gcs_bucket: None,
-            storage_s3_bucket: None,
+            local_path: PathBuf::from("./var/engram"),
             sandbox_backend: SandboxBackendChoice::Process,
             default_image_version: "warm-bootstrap".into(),
             // Modest dev default: one warm sandbox per (repo, image)
@@ -84,24 +81,6 @@ impl CloudBackendChoice {
             "gcp" => Ok(Self::Gcp),
             "mock" => Ok(Self::Mock),
             other => Err(format!("invalid cloud backend: {other}")),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageBackendChoice {
-    Local,
-    Gcs,
-    S3,
-}
-
-impl StorageBackendChoice {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "local" => Ok(Self::Local),
-            "gcs" => Ok(Self::Gcs),
-            "s3" => Ok(Self::S3),
-            other => Err(format!("invalid storage backend: {other}")),
         }
     }
 }
@@ -172,23 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn storage_backend_parse_rejects_unknown() {
-        assert_eq!(
-            StorageBackendChoice::parse("local").unwrap(),
-            StorageBackendChoice::Local
-        );
-        assert_eq!(
-            StorageBackendChoice::parse("gcs").unwrap(),
-            StorageBackendChoice::Gcs
-        );
-        assert_eq!(
-            StorageBackendChoice::parse("s3").unwrap(),
-            StorageBackendChoice::S3
-        );
-        assert!(StorageBackendChoice::parse("minio").is_err());
-    }
-
-    #[test]
     fn sandbox_backend_parse_rejects_unknown() {
         assert_eq!(
             SandboxBackendChoice::parse("firecracker").unwrap(),
@@ -209,7 +171,6 @@ mod tests {
         let cfg = CoordinatorConfig::default();
         assert_eq!(cfg.mode, RunMode::Coordinator);
         assert_eq!(cfg.cloud_backend, CloudBackendChoice::Static);
-        assert_eq!(cfg.storage_backend, StorageBackendChoice::Local);
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
         assert!(cfg.database_url.ends_with(":5432/engram"));
     }

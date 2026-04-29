@@ -14,9 +14,6 @@ members = [
     "crates/engram-cloud-gcp",
     "crates/engram-cloud-static",
     "crates/engram-cloud-mock",
-    "crates/engram-storage-gcs",
-    "crates/engram-storage-s3",
-    "crates/engram-storage-local",
     "crates/engram-secrets-dev",
     "crates/engram-secrets-gcp",
     "crates/engram-postgres",
@@ -41,9 +38,6 @@ engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
 engram-cloud-static = { path = "crates/engram-cloud-static" }
 engram-cloud-mock = { path = "crates/engram-cloud-mock" }
-engram-storage-gcs = { path = "crates/engram-storage-gcs" }
-engram-storage-s3 = { path = "crates/engram-storage-s3" }
-engram-storage-local = { path = "crates/engram-storage-local" }
 engram-host-agent = { path = "crates/engram-host-agent" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }
@@ -89,10 +83,8 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 
 # cloud sdks (optional / per-crate)
-aws-config = "1"
-aws-sdk-s3 = "1"
-google-cloud-storage = "0.24"
-google-cloud-auth = "0.20"
+# (storage SDKs removed in Phase 4 — durability moved to git;
+#  image distribution moves to Docker registry in Phase 5)
 
 # observability
 tracing = "0.1"

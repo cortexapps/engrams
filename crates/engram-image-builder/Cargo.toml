@@ -19,7 +19,6 @@ path = "src/main.rs"
 [dependencies]
 engram-core.workspace = true
 engram-postgres.workspace = true
-engram-storage-local.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true

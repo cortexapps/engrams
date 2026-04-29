@@ -27,7 +27,6 @@ use engram_core::types::{
 use engram_core::{HostId, ImageVersionId, MetaError, SessionId};
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
-use engram_storage_local::LocalStorage;
 use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -172,10 +171,7 @@ impl MetadataStore for MockMetadataStore {
         Ok(())
     }
 
-    async fn list_stale_hosts(
-        &self,
-        _threshold_secs: u64,
-    ) -> Result<Vec<HostRecord>, MetaError> {
+    async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         // Mock doesn't track heartbeat timestamps; existing tests
         // don't exercise the dead-host detector path.
         Ok(Vec::new())
@@ -189,10 +185,7 @@ impl MetadataStore for MockMetadataStore {
         let mut affected = Vec::new();
         for s in g.values_mut() {
             if s.host_id == Some(host_id)
-                && !matches!(
-                    s.status,
-                    SessionStatus::Completed | SessionStatus::Failed
-                )
+                && !matches!(s.status, SessionStatus::Completed | SessionStatus::Failed)
             {
                 s.host_id = None;
                 s.sandbox_id = None;
@@ -229,40 +222,6 @@ impl MetadataStore for MockMetadataStore {
             .lock()
             .get(&sid)
             .and_then(|v| v.last().cloned()))
-    }
-
-    async fn list_pending_replications(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        let g = self.snapshots.lock();
-        let mut out: Vec<SnapshotRecord> = g
-            .values()
-            .flatten()
-            .filter(|s| s.blob_url.is_none() && s.local_path.is_some())
-            .cloned()
-            .collect();
-        out.sort_by_key(|s| s.created_at);
-        out.truncate(limit.max(0) as usize);
-        Ok(out)
-    }
-
-    async fn mark_snapshot_replicated(
-        &self,
-        id: engram_core::SnapshotId,
-        blob_url: String,
-    ) -> Result<(), MetaError> {
-        let mut g = self.snapshots.lock();
-        for v in g.values_mut() {
-            for s in v.iter_mut() {
-                if s.id == id {
-                    s.blob_url = Some(blob_url);
-                    s.replicated_at = Some(Utc::now());
-                    return Ok(());
-                }
-            }
-        }
-        Err(MetaError::NotFound)
     }
 
     async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
@@ -343,12 +302,10 @@ fn build_app(meta: Arc<MockMetadataStore>) -> axum::Router {
 /// auth middleware tests; everything else relies on the default empty
 /// list (auth-disabled).
 fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> axum::Router {
-    let blob_dir = tempfile::tempdir().expect("blob tempdir").keep();
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let images_dir = tempfile::tempdir().expect("images tempdir").keep();
     let services = Services {
         meta,
-        blob: Arc::new(LocalStorage::new(blob_dir)),
         cloud: Arc::new(MockCloud::new()),
         sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
         secrets: Arc::new(InMemorySecretStore::new()),
@@ -382,7 +339,6 @@ impl TestFixture {
         // accidentally collide. All leak (`keep()`) because the axum
         // router needs to outlive this function — the OS cleans up
         // `/tmp` later.
-        let blob_dir = tempfile::tempdir().expect("blob tempdir").keep();
         let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
         let images_dir = tempfile::tempdir().expect("images tempdir").keep();
         // Match production wiring: the host-side PooledBackend wraps
@@ -397,7 +353,6 @@ impl TestFixture {
         );
         let services = Services {
             meta,
-            blob: Arc::new(LocalStorage::new(blob_dir)),
             cloud: Arc::new(MockCloud::new()),
             sandbox: backend,
             secrets: Arc::new(secrets),
@@ -1346,8 +1301,6 @@ async fn snapshot_records_a_snapshot_and_keeps_session_active() {
     let recorded = store.list_snapshots_for_session(id).await.unwrap();
     assert_eq!(recorded.len(), 1);
     assert!(recorded[0].local_path.is_some());
-    assert!(recorded[0].blob_url.is_none(), "blob upload happens later");
-    assert!(recorded[0].replicated_at.is_none());
 
     // After snapshot the live sandbox should still respond to exec.
     let resp = post(
@@ -1910,11 +1863,9 @@ async fn create_session_failure_marks_session_failed() {
     }
 
     let store = MockMetadataStore::arc();
-    let blob_dir = tempfile::tempdir().unwrap();
     let images_dir = tempfile::tempdir().unwrap();
     let services = Services {
         meta: store.clone(),
-        blob: Arc::new(LocalStorage::new(blob_dir.keep())),
         cloud: Arc::new(MockCloud::new()),
         sandbox: Arc::new(AlwaysFailSandbox),
         secrets: Arc::new(InMemorySecretStore::new()),

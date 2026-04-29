@@ -53,10 +53,7 @@ pub trait MetadataStore: Send + Sync {
     /// `pg_try_advisory_lock` for the right to evacuate each candidate.
     /// `Dead` rows are filtered out so a still-running coordinator
     /// replica's detector doesn't keep trying to re-kill them.
-    async fn list_stale_hosts(
-        &self,
-        threshold_secs: u64,
-    ) -> Result<Vec<HostRecord>, MetaError>;
+    async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError>;
 
     /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id` on
     /// every session pointed at it, (c) transition those sessions to
@@ -80,28 +77,6 @@ pub trait MetadataStore: Send + Sync {
         &self,
         sid: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError>;
-
-    /// Snapshots that are sitting on a host's local disk
-    /// (`local_path IS NOT NULL`) but haven't been pushed to BlobStorage
-    /// yet (`blob_url IS NULL`). The replication driver polls this every
-    /// few seconds and uploads each one to make eviction safe.
-    /// `limit` caps how many it returns per poll so a backlog doesn't
-    /// monopolise the driver's tick.
-    async fn list_pending_replications(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<SnapshotRecord>, MetaError>;
-
-    /// Stamp a snapshot row as replicated to BlobStorage. Sets
-    /// `blob_url = $blob_url`, `replicated_at = NOW()`. Idempotent —
-    /// a second call with the same `blob_url` is a no-op (the row is
-    /// already replicated). Used by the replication driver after
-    /// `BlobStorage::put` returns Ok.
-    async fn mark_snapshot_replicated(
-        &self,
-        id: crate::types::ids::SnapshotId,
-        blob_url: String,
-    ) -> Result<(), MetaError>;
 
     // ---- images ----
     async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError>;

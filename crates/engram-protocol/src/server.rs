@@ -56,7 +56,9 @@ pub async fn serve<W, R>(
         + 'static,
 {
     let session = HostSession::new(writer);
-    session.serve_with_reader(backend, notify_handler, reader).await
+    session
+        .serve_with_reader(backend, notify_handler, reader)
+        .await
 }
 
 /// Host-side connection handle. Owns the WS writer behind a mutex so
@@ -125,7 +127,11 @@ impl HostSession {
             };
 
             match frame {
-                Frame::Request { req_id, trace, kind } => {
+                Frame::Request {
+                    req_id,
+                    trace,
+                    kind,
+                } => {
                     tokio::spawn(handle_request(
                         backend.clone(),
                         self.writer.clone(),
@@ -159,9 +165,8 @@ async fn send_frame_typed(writer: &SharedSink, frame: Frame) -> Result<(), Strin
     w.send(msg).await.map_err(|e| e.to_string())
 }
 
-type SinkBox = Box<
-    dyn futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Unpin,
->;
+type SinkBox =
+    Box<dyn futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Unpin>;
 type SharedSink = Arc<Mutex<SinkBox>>;
 
 async fn send_frame(writer: &SharedSink, frame: Frame) {
@@ -178,11 +183,7 @@ async fn send_frame(writer: &SharedSink, frame: Frame) {
     }
 }
 
-async fn handle_notify(
-    handler: Arc<dyn NotifyHandler>,
-    writer: SharedSink,
-    notify: NotifyKind,
-) {
+async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, notify: NotifyKind) {
     match notify {
         NotifyKind::Hello {
             host_id,
@@ -257,12 +258,10 @@ async fn handle_request(
                 Err(e) => Err(RemoteError::from_sandbox(e)),
             }
         }
-        RequestKind::Restore { src_path } => {
-            match backend.restore(PathBuf::from(src_path)).await {
-                Ok(sandbox_id) => Ok(ResponseKind::Restored { sandbox_id }),
-                Err(e) => Err(RemoteError::from_sandbox(e)),
-            }
-        }
+        RequestKind::Restore { src_path } => match backend.restore(PathBuf::from(src_path)).await {
+            Ok(sandbox_id) => Ok(ResponseKind::Restored { sandbox_id }),
+            Err(e) => Err(RemoteError::from_sandbox(e)),
+        },
         RequestKind::ExecStart {
             sandbox_id,
             request,

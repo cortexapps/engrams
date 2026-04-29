@@ -65,9 +65,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
     let host_id: Option<Uuid> = row.try_get("host_id").map_err(col_err)?;
     let local_path: Option<String> = row.try_get("local_path").map_err(col_err)?;
-    let blob_url: Option<String> = row.try_get("blob_url").map_err(col_err)?;
     let size_bytes: i64 = row.try_get("size_bytes").map_err(col_err)?;
-    let replicated_at: Option<DateTime<Utc>> = row.try_get("replicated_at").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_accessed_at: DateTime<Utc> = row.try_get("last_accessed_at").map_err(col_err)?;
     Ok(SnapshotRecord {
@@ -75,10 +73,8 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         session_id: SessionId(session_id),
         host_id: host_id.map(HostId),
         local_path: local_path.map(PathBuf::from),
-        blob_url,
         image_version: row.try_get("image_version").map_err(col_err)?,
         size_bytes: size_bytes.max(0) as u64,
-        replicated_at,
         created_at,
         last_accessed_at,
     })

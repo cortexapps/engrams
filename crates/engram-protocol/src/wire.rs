@@ -46,10 +46,7 @@ pub enum Frame {
     },
     /// Streaming output for an in-flight Request. Concretely: ExecStream
     /// items. Terminated by exactly one `StreamItem::ExecExit`.
-    Stream {
-        req_id: u64,
-        item: StreamItem,
-    },
+    Stream { req_id: u64, item: StreamItem },
     /// Heartbeat / hello / push notifications that aren't tied to a
     /// specific outstanding request.
     Notify(NotifyKind),
@@ -161,7 +158,9 @@ pub enum StreamItem {
     ExecStderr(Vec<u8>),
     /// Terminal frame for an exec stream. The demuxer drops the stream
     /// channel after this.
-    ExecExit { status: Option<i32> },
+    ExecExit {
+        status: Option<i32>,
+    },
 }
 
 /// Connection-level events that don't correspond to a request.

@@ -6,19 +6,16 @@ use engram_cloud_gcp::GcpCloud;
 use engram_cloud_mock::MockCloud;
 use engram_cloud_static::StaticCloud;
 use engram_coordinator::{
-    config::{CloudBackendChoice, RunMode, SandboxBackendChoice, StorageBackendChoice},
+    config::{CloudBackendChoice, RunMode, SandboxBackendChoice},
     image_registry::ImageRegistry,
     CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
+use engram_core::traits::{CloudBackend, SandboxBackend, SecretStore};
 use engram_core::HostId;
-use engram_core::traits::{BlobStorage, CloudBackend, SandboxBackend, SecretStore};
 use engram_postgres::PostgresStore;
 use engram_sandbox_firecracker::FirecrackerBackend;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::EnvSecretStore;
-use engram_storage_gcs::GcsStorage;
-use engram_storage_local::LocalStorage;
-use engram_storage_s3::S3Storage;
 
 #[derive(Parser, Debug)]
 #[command(name = "engram-coordinator", version, about)]
@@ -45,26 +42,11 @@ struct Cli {
     )]
     cloud_backend: CloudBackendChoice,
 
-    #[arg(
-        long,
-        env = "ENGRAM_STORAGE_BACKEND",
-        default_value = "local",
-        value_parser = StorageBackendChoice::parse,
-    )]
-    storage_backend: StorageBackendChoice,
-
-    #[arg(
-        long,
-        env = "ENGRAM_STORAGE_LOCAL_PATH",
-        default_value = "./var/snapshots"
-    )]
-    storage_local_path: PathBuf,
-
-    #[arg(long, env = "ENGRAM_STORAGE_GCS_BUCKET")]
-    storage_gcs_bucket: Option<String>,
-
-    #[arg(long, env = "ENGRAM_STORAGE_S3_BUCKET")]
-    storage_s3_bucket: Option<String>,
+    /// Local-disk root for per-session snapshot directories and the
+    /// image registry. Survives process restarts; not durable across
+    /// host loss (cross-host durability is git, not snapshots).
+    #[arg(long, env = "ENGRAM_LOCAL_PATH", default_value = "./var/engram")]
+    local_path: PathBuf,
 
     #[arg(
         long,
@@ -123,10 +105,7 @@ async fn main() -> Result<(), CoordinatorError> {
         database_url: cli.database_url.clone(),
         mode: cli.mode,
         cloud_backend: cli.cloud_backend,
-        storage_backend: cli.storage_backend,
-        storage_local_path: cli.storage_local_path.clone(),
-        storage_gcs_bucket: cli.storage_gcs_bucket.clone(),
-        storage_s3_bucket: cli.storage_s3_bucket.clone(),
+        local_path: cli.local_path.clone(),
         sandbox_backend: cli.sandbox_backend,
         default_image_version: cli.default_image_version.clone(),
         default_warm_pool_size: cli.warm_pool_size,
@@ -159,22 +138,6 @@ async fn main() -> Result<(), CoordinatorError> {
         CloudBackendChoice::Mock => Arc::new(MockCloud::new()),
     };
 
-    let blob: Arc<dyn BlobStorage> = match cli.storage_backend {
-        StorageBackendChoice::Local => Arc::new(LocalStorage::new(cli.storage_local_path.clone())),
-        StorageBackendChoice::Gcs => {
-            let bucket = cli.storage_gcs_bucket.clone().ok_or_else(|| {
-                CoordinatorError::Config("ENGRAM_STORAGE_GCS_BUCKET required".into())
-            })?;
-            Arc::new(GcsStorage::new(bucket))
-        }
-        StorageBackendChoice::S3 => {
-            let bucket = cli.storage_s3_bucket.clone().ok_or_else(|| {
-                CoordinatorError::Config("ENGRAM_STORAGE_S3_BUCKET required".into())
-            })?;
-            Arc::new(S3Storage::new(bucket))
-        }
-    };
-
     if matches!(cli.mode, RunMode::Host) {
         // Pure host-agent mode is served by the engram-host-agent binary.
         return Err(CoordinatorError::Config(
@@ -199,7 +162,10 @@ async fn main() -> Result<(), CoordinatorError> {
                     )
                 })?;
                 let fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-                Arc::new(FirecrackerBackend::new(cli.sandbox_work_dir.clone(), fc_cfg))
+                Arc::new(FirecrackerBackend::new(
+                    cli.sandbox_work_dir.clone(),
+                    fc_cfg,
+                ))
             }
             SandboxBackendChoice::Process => {
                 tracing::warn!(
@@ -215,10 +181,7 @@ async fn main() -> Result<(), CoordinatorError> {
         // this, single-binary dev would lose sub-second session
         // checkout for repeat (repo, image_version) hits.
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new(
-            engram_host_agent::pooled_backend::PooledBackend::new(
-                raw_backend,
-                cli.warm_pool_size,
-            ),
+            engram_host_agent::pooled_backend::PooledBackend::new(raw_backend, cli.warm_pool_size),
         );
         let in_proc_host = HostId::new();
         host_registry.register(in_proc_host, pooled_backend);
@@ -235,15 +198,14 @@ async fn main() -> Result<(), CoordinatorError> {
 
     // Default dev wiring: env-var-backed SecretStore (pulls
     // `$GITHUB_TOKEN` etc. from the host shell), filesystem-backed
-    // ImageRegistry under `<storage_local_path>/images`. Production
+    // ImageRegistry under `<local_path>/images`. Production
     // deployments swap these out for `engram-secrets-gcp` / vault /
     // etc. via a config flag (next round).
     let secrets: Arc<dyn SecretStore> = Arc::new(EnvSecretStore::new());
-    let images = ImageRegistry::new(cli.storage_local_path.join("images"));
+    let images = ImageRegistry::new(cli.local_path.join("images"));
 
     let services = Services {
         meta: Arc::new(pg),
-        blob,
         cloud,
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets,

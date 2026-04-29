@@ -243,10 +243,7 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    async fn list_stale_hosts(
-        &self,
-        threshold_secs: u64,
-    ) -> Result<Vec<HostRecord>, MetaError> {
+    async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         // `make_interval` keeps the threshold parameterised without
         // string-templating an INTERVAL literal. Cast to BIGINT so a
         // very-large threshold (well past i32::MAX) doesn't overflow.
@@ -319,13 +316,11 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO snapshots
-                (id, session_id, host_id, local_path, blob_url,
-                 image_version, size_bytes, replicated_at, created_at, last_accessed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (id, session_id, host_id, local_path,
+                 image_version, size_bytes, created_at, last_accessed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (id) DO UPDATE SET
                 local_path       = EXCLUDED.local_path,
-                blob_url         = EXCLUDED.blob_url,
-                replicated_at    = EXCLUDED.replicated_at,
                 last_accessed_at = EXCLUDED.last_accessed_at,
                 updated_at       = NOW()
             "#,
@@ -338,10 +333,8 @@ impl MetadataStore for PostgresStore {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
         )
-        .bind(snap.blob_url.as_deref())
         .bind(&snap.image_version)
         .bind(snap.size_bytes as i64)
-        .bind(snap.replicated_at)
         .bind(snap.created_at)
         .bind(snap.last_accessed_at)
         .execute(&self.pool)
@@ -356,8 +349,8 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Vec<SnapshotRecord>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, host_id, local_path, blob_url,
-                   image_version, size_bytes, replicated_at,
+            SELECT id, session_id, host_id, local_path,
+                   image_version, size_bytes,
                    created_at, last_accessed_at
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
@@ -375,8 +368,8 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, session_id, host_id, local_path, blob_url,
-                   image_version, size_bytes, replicated_at,
+            SELECT id, session_id, host_id, local_path,
+                   image_version, size_bytes,
                    created_at, last_accessed_at
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
@@ -387,54 +380,6 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         row.map(|r| row::snapshot_from_row(&r)).transpose()
-    }
-
-    async fn list_pending_replications(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, session_id, host_id, local_path, blob_url,
-                   image_version, size_bytes, replicated_at,
-                   created_at, last_accessed_at
-              FROM snapshots
-             WHERE blob_url IS NULL
-               AND local_path IS NOT NULL
-             ORDER BY created_at
-             LIMIT $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.iter().map(row::snapshot_from_row).collect()
-    }
-
-    async fn mark_snapshot_replicated(
-        &self,
-        id: engram_core::SnapshotId,
-        blob_url: String,
-    ) -> Result<(), MetaError> {
-        let n = sqlx::query(
-            r#"
-            UPDATE snapshots
-               SET blob_url      = $2,
-                   replicated_at = NOW()
-             WHERE id = $1
-            "#,
-        )
-        .bind(id.as_uuid())
-        .bind(blob_url)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
-            return Err(MetaError::NotFound);
-        }
-        Ok(())
     }
 
     async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {

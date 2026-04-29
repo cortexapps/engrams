@@ -408,19 +408,11 @@ pub async fn migrate(
     }
 
     let from_host = session.host_id;
-    state
-        .services
-        .meta
-        .assign_session_host(id, None)
-        .await?;
+    state.services.meta.assign_session_host(id, None).await?;
     // Clear sandbox_id alongside host_id — the sandbox was just
     // destroyed, and the next /resume will land on a new host with
     // a fresh sandbox_id.
-    let _ = state
-        .services
-        .meta
-        .assign_session_sandbox(id, None)
-        .await;
+    let _ = state.services.meta.assign_session_sandbox(id, None).await;
     state
         .services
         .meta
@@ -479,11 +471,7 @@ pub async fn delete_session(
     // routing rebuild even if it kept the column set, but tidy
     // anyway so an audit query "what sandboxes does the coordinator
     // think exist" matches reality.
-    let _ = state
-        .services
-        .meta
-        .assign_session_sandbox(id, None)
-        .await;
+    let _ = state.services.meta.assign_session_sandbox(id, None).await;
     state
         .services
         .meta

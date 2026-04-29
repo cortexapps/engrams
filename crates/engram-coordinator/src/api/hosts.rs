@@ -17,36 +17,32 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use chrono::Utc;
-use engram_core::HostId;
-use serde::Serialize;
 use engram_core::types::host::{HostCapacity, HostMetadata, HostRecord, HostStatus};
+use engram_core::HostId;
 use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
 use engram_protocol::wire::NotifyKind;
 use engram_protocol::HeartbeatAck;
+use serde::Serialize;
 
 use crate::host_registry::HostState;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use tokio_tungstenite::tungstenite::{
-    protocol::CloseFrame as TungsteniteCloseFrame, Error as TungsteniteError, Message as TungMessage,
+    protocol::CloseFrame as TungsteniteCloseFrame, Error as TungsteniteError,
+    Message as TungMessage,
 };
 
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-pub async fn connect(
-    State(state): State<SharedState>,
-    ws: WebSocketUpgrade,
-) -> Response {
+pub async fn connect(State(state): State<SharedState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_connection(state, socket))
 }
 
 /// `GET /api/hosts` — list all hosts the coordinator knows about,
 /// merging the persisted Postgres rows with the live in-memory
 /// scheduler state (capacity, warm pools, local snapshots, draining).
-pub async fn list(
-    State(state): State<SharedState>,
-) -> Result<Json<ListHostsResponse>, ApiError> {
+pub async fn list(State(state): State<SharedState>) -> Result<Json<ListHostsResponse>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
     let hosts = rows
         .into_iter()

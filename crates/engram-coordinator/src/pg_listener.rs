@@ -113,7 +113,10 @@ async fn run(
         };
 
         // Fetch the row (`since=idx-1` returns at most this one event).
-        let rows = match meta.list_session_events_since(session_id, payload.idx - 1, 1).await {
+        let rows = match meta
+            .list_session_events_since(session_id, payload.idx - 1, 1)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -170,6 +173,12 @@ async fn run(
                 continue;
             }
         };
-        events.publish(session_id, IndexedEvent { idx: row.idx, event });
+        events.publish(
+            session_id,
+            IndexedEvent {
+                idx: row.idx,
+                event,
+            },
+        );
     }
 }

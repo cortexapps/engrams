@@ -249,11 +249,10 @@ impl AppState {
     }
 
     /// Where to write per-session snapshot directories on local disk.
-    /// Lives on the same volume as `storage_local_path` (the LocalStorage
-    /// blob root); a future split between the snapshot hot-tier and the
-    /// blob cold-tier mount would move this to its own config field.
+    /// Per-host scratch under `cfg.local_path`; not durable across host
+    /// loss. Cross-host durability for sessions is git, not snapshots.
     pub fn snapshot_dir(&self) -> std::path::PathBuf {
-        self.cfg.storage_local_path.join("snapshots")
+        self.cfg.local_path.join("snapshots")
     }
 
     /// Persist `event` to the session's event log, then publish it on

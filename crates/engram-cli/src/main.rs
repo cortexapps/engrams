@@ -300,11 +300,7 @@ async fn session_delete(
 
 // ---- host subcommands ---------------------------------------------------
 
-async fn host_list(
-    client: &reqwest::Client,
-    endpoint: &str,
-    json: bool,
-) -> Result<(), CliError> {
+async fn host_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Result<(), CliError> {
     let body = get_json(client, &format!("{endpoint}/api/hosts")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
@@ -317,8 +313,8 @@ async fn host_list(
         return Ok(());
     }
     println!(
-        "{:<36}  {:<10}  {:<10}  {:<10}  {}",
-        "ID", "STATUS", "USED_MIB", "TOTAL_MIB", "WARM_POOLS"
+        "{:<36}  {:<10}  {:<10}  {:<10}  WARM_POOLS",
+        "ID", "STATUS", "USED_MIB", "TOTAL_MIB"
     );
     for h in hosts {
         let warm_count = h["warm_pools"].as_array().map(|v| v.len()).unwrap_or(0);
@@ -385,11 +381,7 @@ async fn host_get(
     Ok(())
 }
 
-async fn host_drain(
-    client: &reqwest::Client,
-    endpoint: &str,
-    id: &str,
-) -> Result<(), CliError> {
+async fn host_drain(client: &reqwest::Client, endpoint: &str, id: &str) -> Result<(), CliError> {
     let resp = client
         .post(format!("{endpoint}/api/hosts/{id}/drain"))
         .send()

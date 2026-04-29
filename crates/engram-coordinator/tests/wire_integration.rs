@@ -27,7 +27,6 @@ use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
 use engram_protocol::server::HostSession;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
-use engram_storage_local::LocalStorage;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use http_body_util::BodyExt;
@@ -119,10 +118,7 @@ impl MetadataStore for MiniMeta {
     async fn set_host_status(&self, _id: HostId, _s: HostStatus) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn list_stale_hosts(
-        &self,
-        _threshold_secs: u64,
-    ) -> Result<Vec<HostRecord>, MetaError> {
+    async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         Ok(Vec::new())
     }
     async fn mark_host_dead_and_reassign_sessions(
@@ -168,38 +164,6 @@ impl MetadataStore for MiniMeta {
             .get(&id)
             .and_then(|v| v.last().cloned()))
     }
-    async fn list_pending_replications(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        let g = self.snapshots.lock();
-        let mut out: Vec<SnapshotRecord> = g
-            .values()
-            .flatten()
-            .filter(|s| s.blob_url.is_none() && s.local_path.is_some())
-            .cloned()
-            .collect();
-        out.sort_by_key(|s| s.created_at);
-        out.truncate(limit.max(0) as usize);
-        Ok(out)
-    }
-    async fn mark_snapshot_replicated(
-        &self,
-        id: engram_core::SnapshotId,
-        blob_url: String,
-    ) -> Result<(), MetaError> {
-        let mut g = self.snapshots.lock();
-        for v in g.values_mut() {
-            for s in v.iter_mut() {
-                if s.id == id {
-                    s.blob_url = Some(blob_url);
-                    s.replicated_at = Some(Utc::now());
-                    return Ok(());
-                }
-            }
-        }
-        Err(MetaError::NotFound)
-    }
     async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
         self.images
             .lock()
@@ -209,12 +173,11 @@ impl MetadataStore for MiniMeta {
         Ok(())
     }
     async fn latest_ready_image(&self, repo: &str) -> Result<Option<ImageVersion>, MetaError> {
-        Ok(self.images.lock().get(repo).and_then(|v| {
-            v.iter()
-                .filter(|i| i.status == ImageStatus::Ready)
-                .last()
-                .cloned()
-        }))
+        Ok(self
+            .images
+            .lock()
+            .get(repo)
+            .and_then(|v| v.iter().rfind(|i| i.status == ImageStatus::Ready).cloned()))
     }
     async fn append_session_event(
         &self,
@@ -269,7 +232,6 @@ fn ignored_image() -> ImageVersion {
 /// `--mode=coordinator` + `engram-host-agent` deployment uses, just
 /// without an actual TCP/WS handshake (mpsc channels carry the frames).
 fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
-    let blob_dir = tempfile::tempdir().expect("blob tmp").keep();
     let sandbox_dir = tempfile::tempdir().expect("host work_dir").keep();
     let images_dir = tempfile::tempdir().expect("images tmp").keep();
 
@@ -280,8 +242,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     let coord_sink =
         coord_tx_a.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
     let coord_stream = coord_rx_b.map(Ok::<TungMessage, TungError>);
-    let host_sink =
-        host_tx_b.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
+    let host_sink = host_tx_b.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
     let host_stream = host_rx_a.map(Ok::<TungMessage, TungError>);
 
     let (connected, _notify_rx, _demux) =
@@ -310,7 +271,6 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
 
     let services = Services {
         meta,
-        blob: Arc::new(LocalStorage::new(blob_dir)),
         cloud: Arc::new(MockCloud::new()),
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets: Arc::new(InMemorySecretStore::new()),
@@ -541,10 +501,7 @@ async fn migrate_without_snapshot_fails_with_clear_message() {
     );
     let body = body_json(mig.into_body()).await;
     let msg = body["message"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("snapshot"),
-        "error must explain why: {msg:?}"
-    );
+    assert!(msg.contains("snapshot"), "error must explain why: {msg:?}");
 }
 
 #[tokio::test]
@@ -552,7 +509,6 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
     // Build an AppState with an empty HostRegistry. The Phase 3a
     // single-host scheduler's "no host" path must surface as a 500
     // with a meaningful message rather than silently hanging.
-    let blob_dir = tempfile::tempdir().expect("blob tmp").keep();
     let images_dir = tempfile::tempdir().expect("images tmp").keep();
     let host_registry = Arc::new(HostRegistry::new());
     let meta = Arc::new(MiniMeta::default());
@@ -564,7 +520,6 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
 
     let services = Services {
         meta,
-        blob: Arc::new(LocalStorage::new(blob_dir)),
         cloud: Arc::new(MockCloud::new()),
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets: Arc::new(InMemorySecretStore::new()),
@@ -575,7 +530,11 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         default_warm_pool_size: 0,
         ..CoordinatorConfig::default()
     };
-    let app = api::router(Arc::new(AppState::new_with_registry(cfg, services, host_registry)));
+    let app = api::router(Arc::new(AppState::new_with_registry(
+        cfg,
+        services,
+        host_registry,
+    )));
 
     let create = app
         .oneshot(

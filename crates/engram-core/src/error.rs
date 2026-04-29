@@ -46,51 +46,6 @@ impl StdError for BackendError {
     }
 }
 
-// ---------- StorageError (BlobStorage) ----------
-
-#[derive(Debug)]
-pub enum StorageError {
-    NotFound(String),
-    Io(std::io::Error),
-    Sdk(BoxError),
-    InvalidKey(String),
-    /// Stream ended before the expected number of bytes was received.
-    Truncated {
-        expected: u64,
-        got: u64,
-    },
-}
-
-impl fmt::Display for StorageError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(k) => write!(f, "blob not found: {k}"),
-            Self::Io(e) => write!(f, "blob io error: {e}"),
-            Self::Sdk(e) => write!(f, "blob storage sdk error: {e}"),
-            Self::InvalidKey(k) => write!(f, "invalid blob key: {k}"),
-            Self::Truncated { expected, got } => {
-                write!(f, "blob truncated: expected {expected} bytes, got {got}")
-            }
-        }
-    }
-}
-
-impl StdError for StorageError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Sdk(e) => Some(&**e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for StorageError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
 // ---------- MetaError (MetadataStore) ----------
 
 #[derive(Debug)]
@@ -220,30 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn storage_io_from_conversion_preserves_kind() {
-        let storage: StorageError = io_err().into();
-        match storage {
-            StorageError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
-            other => panic!("expected Io, got {other}"),
-        }
-    }
-
-    #[test]
     fn sandbox_io_from_conversion_preserves_kind() {
         let sandbox: SandboxError = io_err().into();
         match sandbox {
             SandboxError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
             other => panic!("expected Io, got {other}"),
         }
-    }
-
-    #[test]
-    fn storage_io_source_chain_exposes_inner_io_error() {
-        let err = StorageError::Io(io_err());
-        let src: &dyn StdError = err.source().expect("source present");
-        // Confirm the underlying type is io::Error and kind survived.
-        let downcast = src.downcast_ref::<io::Error>().expect("io::Error source");
-        assert_eq!(downcast.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -261,8 +198,6 @@ mod tests {
         assert!(MetaError::Conflict("x".into()).source().is_none());
         assert!(MetaError::Migration("m".into()).source().is_none());
         assert!(MetaError::Serialization("s".into()).source().is_none());
-        assert!(StorageError::NotFound("k".into()).source().is_none());
-        assert!(StorageError::InvalidKey("k".into()).source().is_none());
         assert!(SandboxError::NotFound.source().is_none());
         assert!(SandboxError::Timeout.source().is_none());
         assert!(BackendError::NotSupported("op").source().is_none());
@@ -275,15 +210,6 @@ mod tests {
             BackendError::NotSupported("provision_host").to_string(),
             "operation not supported: provision_host",
         );
-        assert!(StorageError::NotFound("key/x".into())
-            .to_string()
-            .contains("key/x"));
-        assert!(StorageError::Truncated {
-            expected: 10,
-            got: 7,
-        }
-        .to_string()
-        .contains("expected 10"));
         assert_eq!(MetaError::NotFound.to_string(), "row not found");
         assert!(SandboxError::InvalidSpec("bad cpu".into())
             .to_string()

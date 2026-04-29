@@ -380,7 +380,9 @@ mod tests {
 
         // Client side: wrap the exec request in the multi-verb
         // envelope, then read events until EOF.
-        write_msg(&mut client, &WireRequest::Exec(req)).await.unwrap();
+        write_msg(&mut client, &WireRequest::Exec(req))
+            .await
+            .unwrap();
         let mut events = Vec::new();
         loop {
             match read_msg::<_, WireExecEvent>(&mut client).await {
@@ -566,8 +568,7 @@ mod tests {
         // an ok ack, then send WireExecRequest as usual.
         let (mut client, server) = duplex(64 * 1024);
         let token = "shared-secret".to_string();
-        let server_task =
-            tokio::spawn(async move { serve_connection(server, Some(token)).await });
+        let server_task = tokio::spawn(async move { serve_connection(server, Some(token)).await });
 
         write_msg(
             &mut client,
@@ -595,16 +596,11 @@ mod tests {
         .unwrap();
 
         let mut events = Vec::new();
-        loop {
-            match read_msg::<_, WireExecEvent>(&mut client).await {
-                Ok(ev) => {
-                    let exit = matches!(ev, WireExecEvent::Exit(_));
-                    events.push(ev);
-                    if exit {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(ev) = read_msg::<_, WireExecEvent>(&mut client).await {
+            let exit = matches!(ev, WireExecEvent::Exit(_));
+            events.push(ev);
+            if exit {
+                break;
             }
         }
         let _ = server_task.await.unwrap();
@@ -622,9 +618,8 @@ mod tests {
     #[tokio::test]
     async fn handshake_with_wrong_token_is_rejected() {
         let (mut client, server) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            serve_connection(server, Some("expected".into())).await
-        });
+        let server_task =
+            tokio::spawn(async move { serve_connection(server, Some("expected".into())).await });
         write_msg(
             &mut client,
             &WireHandshake {
@@ -838,7 +833,10 @@ mod tests {
         .await;
         match resp {
             WireResponse::Error { kind, message } => {
-                assert!(kind.contains("NotFound"), "expected NotFound kind, got {kind}");
+                assert!(
+                    kind.contains("NotFound"),
+                    "expected NotFound kind, got {kind}"
+                );
                 assert!(message.contains("read"), "message should name the op");
             }
             other => panic!("expected Error response, got {other:?}"),

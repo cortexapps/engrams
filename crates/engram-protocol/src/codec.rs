@@ -19,7 +19,10 @@ pub enum CodecError {
     Encode(String),
     /// Encoded frame exceeded `MAX_FRAME_BYTES`. Caller should treat
     /// this as a protocol violation by the local side.
-    TooLarge { encoded: usize, limit: usize },
+    TooLarge {
+        encoded: usize,
+        limit: usize,
+    },
     /// The decoded WS message wasn't a Binary message we could handle
     /// (e.g. a Ping or Text frame).
     UnexpectedMessage(&'static str),

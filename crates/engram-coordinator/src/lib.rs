@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use engram_core::traits::{BlobStorage, CloudBackend, MetadataStore, SandboxBackend, SecretStore};
+use engram_core::traits::{CloudBackend, MetadataStore, SandboxBackend, SecretStore};
 
 pub mod api;
 pub mod config;
@@ -16,7 +16,6 @@ pub mod error;
 pub mod host_registry;
 pub mod image_registry;
 pub mod pg_listener;
-pub mod replication;
 pub mod scheduler;
 pub mod state;
 
@@ -29,7 +28,6 @@ pub use state::AppState;
 /// passed by `Arc<AppState>` into the axum router.
 pub struct Services {
     pub meta: Arc<dyn MetadataStore>,
-    pub blob: Arc<dyn BlobStorage>,
     pub cloud: Arc<dyn CloudBackend>,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub secrets: Arc<dyn SecretStore>,
@@ -83,19 +81,6 @@ pub async fn run_with_registry(
         state.host_registry.clone(),
     );
 
-    // Phase 2 follow-up: snapshot replication driver. Polls for
-    // snapshots that landed on a host's local disk but haven't been
-    // pushed to BlobStorage yet, tar+zstd-compresses the directory,
-    // and uploads. Once a snapshot is replicated the host's local
-    // copy is safe to evict under LRU pressure (LRU itself lives in
-    // the host-side SnapshotManager). Drops the JoinHandle — task
-    // lives for the coordinator's lifetime.
-    let _replication = replication::spawn(
-        replication::ReplicationConfig::default(),
-        state.services.blob.clone(),
-        meta_for_listener.clone(),
-    );
-
     // Phase 3d follow-up: dead-host auto-detector. Opens its own
     // PgPool for advisory locks (the trait doesn't expose one;
     // sharing a connection between the trait and lock-holding code
@@ -145,7 +130,9 @@ async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaErr
     for s in sessions {
         if let (Some(sandbox_id), Some(host_id)) = (s.sandbox_id, s.host_id) {
             state.registry.bind(s.id, sandbox_id);
-            state.host_registry.record_sandbox_owner(sandbox_id, host_id);
+            state
+                .host_registry
+                .record_sandbox_owner(sandbox_id, host_id);
             bound += 1;
         }
     }

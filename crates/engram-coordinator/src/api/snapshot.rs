@@ -22,10 +22,7 @@ use chrono::Utc;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SessionStatus;
 use engram_core::SessionId;
-use futures::stream::StreamExt;
 use serde::Serialize;
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 
 use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
@@ -51,7 +48,7 @@ pub async fn snapshot(
         )
     })?;
 
-    // Snapshots live under `<storage_local_path>/snapshots/<session>/<dir>`.
+    // Snapshots live under `<local_path>/snapshots/<session>/<dir>`.
     // The directory name is its own UUID; the canonical SnapshotId is what
     // the backend reports back in SnapshotMetadata.
     let dest = state
@@ -74,10 +71,8 @@ pub async fn snapshot(
         session_id: id,
         host_id,
         local_path: Some(dest),
-        blob_url: None,
         image_version: metadata.image_version,
         size_bytes: metadata.size_bytes,
-        replicated_at: None,
         created_at: metadata.created_at,
         last_accessed_at: now,
     };
@@ -133,29 +128,17 @@ pub async fn resume(
             ApiError::Conflict("no snapshot exists for this session — cannot resume".into())
         })?;
 
-    // Hot-tier path: snapshot already lives on a host's local disk
-    // (`record.host_id`'s filesystem). Multi-host: the scheduler
-    // prefers that host so the restore is zero-cost. Single-host
-    // (`--mode=all`): both ends share the filesystem, the path just
-    // works.
-    //
-    // Cold-tier path: snapshot is in BlobStorage but no host has it
-    // locally. Pull the blob into a coordinator-local cache and pass
-    // that path to `restore`. For `--mode=all` (and any deployment
-    // where coord + host share storage_local_path) this round-trips;
-    // separate-machine multi-host needs a host-side fetch RPC, which
-    // lands with the broader 3b/c image registry work.
-    let local_path = match record.local_path.clone() {
-        Some(p) => p,
-        None => {
-            let blob_url = record.blob_url.clone().ok_or_else(|| {
-                ApiError::Conflict(
-                    "snapshot has neither local nor blob copy — cannot resume".into(),
-                )
-            })?;
-            cold_tier_fetch(&state, record.id, &blob_url).await?
-        }
-    };
+    // Snapshots are local-NVMe-only after Phase 4's blob removal.
+    // The scheduler's snapshot-affinity branch routes the restore
+    // back to the host that holds the snapshot (sub-second hot resume).
+    // If that host is gone the snapshot is gone too — cross-host
+    // durability lives in git, not snapshots. Resume from a git
+    // checkpoint is the right fallback (Track C).
+    let local_path = record.local_path.clone().ok_or_else(|| {
+        ApiError::Conflict(
+            "snapshot has no local copy — host is gone; resume must reconstruct from git".into(),
+        )
+    })?;
 
     // Snapshot affinity: prefer the host that has this snapshot
     // locally. When restoring from cold tier the affinity hint is
@@ -277,11 +260,7 @@ pub async fn evict_local(
     // doesn't repopulate routing for a sandbox that no longer
     // exists. host_id stays so resume's snapshot affinity still
     // prefers the same host.
-    let _ = state
-        .services
-        .meta
-        .assign_session_sandbox(id, None)
-        .await;
+    let _ = state.services.meta.assign_session_sandbox(id, None).await;
     state
         .services
         .meta
@@ -300,41 +279,4 @@ pub async fn evict_local(
         )
         .await?;
     Ok(StatusCode::ACCEPTED)
-}
-
-/// Pull a blob into the coordinator-local snapshot cache so a host
-/// running on the same filesystem (mode=all, or multi-host with
-/// shared storage_local_path) can restore from it. Returns the
-/// concrete on-disk path written.
-///
-/// Multi-machine multi-host (separate filesystems per host) needs a
-/// host-side fetch RPC that bypasses this path entirely — flagged on
-/// `restore` in DESIGN.md and tracked under the Phase 5 image-
-/// registry work.
-async fn cold_tier_fetch(
-    state: &SharedState,
-    snapshot_id: engram_core::SnapshotId,
-    blob_url: &str,
-) -> Result<PathBuf, ApiError> {
-    let dest_dir = state.snapshot_dir().join(snapshot_id.to_string());
-    tokio::fs::create_dir_all(&dest_dir)
-        .await
-        .map_err(|e| ApiError::Internal(format!("create cold-tier dir: {e}")))?;
-    let dest_file = dest_dir.join("memory.bin");
-
-    let mut stream = state.services.blob.get(blob_url).await?;
-    let mut file = tokio::fs::File::create(&dest_file)
-        .await
-        .map_err(|e| ApiError::Internal(format!("create cold-tier file: {e}")))?;
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(ApiError::from)?;
-        file.write_all(&bytes)
-            .await
-            .map_err(|e| ApiError::Internal(format!("write cold-tier file: {e}")))?;
-    }
-    file.flush()
-        .await
-        .map_err(|e| ApiError::Internal(format!("flush cold-tier file: {e}")))?;
-
-    Ok(dest_dir)
 }

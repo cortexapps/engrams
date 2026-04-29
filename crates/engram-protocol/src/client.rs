@@ -109,7 +109,8 @@ enum Pending {
 
 /// Sink for outgoing frames. Accepts WS messages so the demuxer task
 /// can also write Pongs / Close in response to incoming control frames.
-type WsSink = Box<dyn futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Unpin>;
+type WsSink =
+    Box<dyn futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Unpin>;
 
 #[derive(Clone)]
 pub struct ConnectedHost {
@@ -140,7 +141,11 @@ impl ConnectedHost {
     pub fn spawn<W, R>(
         writer: W,
         reader: R,
-    ) -> (Self, mpsc::Receiver<NotifyKind>, tokio::task::JoinHandle<()>)
+    ) -> (
+        Self,
+        mpsc::Receiver<NotifyKind>,
+        tokio::task::JoinHandle<()>,
+    )
     where
         W: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
             + Send
@@ -186,7 +191,11 @@ impl ConnectedHost {
         let (tx, rx) = oneshot::channel();
         self.inner.pending.insert(req_id, Pending::Unary(tx));
 
-        let frame = Frame::Request { req_id, trace, kind };
+        let frame = Frame::Request {
+            req_id,
+            trace,
+            kind,
+        };
         let msg = codec::encode(&frame)?;
 
         // Hold the writer lock only across the send. If send fails we
@@ -333,7 +342,13 @@ where
                     Some((_, Pending::Unary(tx))) => {
                         let _ = tx.send(result);
                     }
-                    Some((_, Pending::Streaming { started_tx, stream_tx })) => {
+                    Some((
+                        _,
+                        Pending::Streaming {
+                            started_tx,
+                            stream_tx,
+                        },
+                    )) => {
                         // For streaming RPCs the first Response is the
                         // start ack; later Stream items + the exit
                         // close out the channel. Re-insert the streaming
@@ -342,7 +357,7 @@ where
                         if let Some(tx) = started_tx {
                             let _ = tx.send(result.clone());
                         }
-                        if matches!(result, Ok(_)) {
+                        if result.is_ok() {
                             inner.pending.insert(
                                 req_id,
                                 Pending::Streaming {
@@ -388,10 +403,7 @@ where
                 }
             }
             Frame::Request { req_id, .. } => {
-                tracing::warn!(
-                    req_id,
-                    "client received Request frame from host; ignoring"
-                );
+                tracing::warn!(req_id, "client received Request frame from host; ignoring");
             }
         }
     }

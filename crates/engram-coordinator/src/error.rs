@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use engram_core::{BackendError, MetaError, SandboxError, StorageError};
+use engram_core::{BackendError, MetaError, SandboxError};
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -79,15 +79,6 @@ impl From<MetaError> for ApiError {
     }
 }
 
-impl From<StorageError> for ApiError {
-    fn from(e: StorageError) -> Self {
-        match e {
-            StorageError::NotFound(k) => Self::NotFound(format!("blob not found: {k}")),
-            other => Self::Internal(other.to_string()),
-        }
-    }
-}
-
 impl From<BackendError> for ApiError {
     fn from(e: BackendError) -> Self {
         match e {
@@ -143,16 +134,6 @@ mod tests {
         let inner: engram_core::error::BoxError = Box::new(std::io::Error::other("kaboom"));
         let api: ApiError = MetaError::Db(inner).into();
         assert_eq!(api.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn storage_not_found_maps_to_404_and_preserves_key() {
-        let api: ApiError = StorageError::NotFound("snapshots/x".into()).into();
-        assert_eq!(api.status(), StatusCode::NOT_FOUND);
-        assert!(
-            api.message().contains("snapshots/x"),
-            "key should appear in the user-facing message"
-        );
     }
 
     #[test]
