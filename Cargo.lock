@@ -684,6 +684,7 @@ dependencies = [
  "dashmap",
  "engram-cloud-static",
  "engram-core",
+ "engram-harness-proto",
  "engram-protocol",
  "engram-sandbox-process",
  "futures",

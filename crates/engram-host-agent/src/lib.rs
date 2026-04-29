@@ -16,6 +16,7 @@ use engram_core::traits::{CloudBackend, SandboxBackend};
 
 pub mod config;
 pub mod dialer;
+pub mod harness;
 pub mod heartbeat;
 pub mod pool;
 pub mod pooled_backend;

@@ -21,6 +21,7 @@ engram-core.workspace = true
 engram-protocol.workspace = true
 engram-sandbox-process.workspace = true
 engram-cloud-static.workspace = true
+engram-harness-proto.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
