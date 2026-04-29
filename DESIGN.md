@@ -754,15 +754,15 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 - **Cold resume** (host gone, no FC snapshot): fresh sandbox on the same image, smart-bootstrap to the checkpoint branch. In-memory state lost; workspace + transcript reconstructed. Caller-driven — preempted sessions land in `PendingReassign` and stay there until `POST /sessions/:id/resume`.
 - **Read-only / Local sessions**: no checkpoint branch; cold resume is unavailable. Caller forks via `engram session fork` if they want to continue from the workspace state.
 
-**Tracks** (see plan file for granular breakdown):
+**Tracks** (see ADR 0001 for the trajectory + plan file for granular breakdown):
 
-- Track 0: blob storage removal — done
-- Track A: harness protocol (engram-harness-proto, HarnessHub, noop test harness, Claude Code adapter)
-- Track B: hot-suspend pack hosts (idle evictor + auto-resume)
-- Track C: git-as-durable-state (RepoUrl/SessionKind types, schema, checkpoint primitive, manual endpoint, auto-checkpoint on Idle, smart-bootstrap resume)
-- Track D: preemption best-effort flush (consume `cloud.preemption_signal()`, call checkpoint on every live sandbox in parallel within the 30s window, accept VM death)
-- Track E: cleanup + dev ergonomics + docs
-- Track F: git-native CLI verbs (`engram session log/diff/fork/pr/resume`)
+- Track 0 — done. Blob storage removed; `engram-storage-{local,gcs,s3}` retired; replication subsystem deleted.
+- Track A — done. `engram-harness-proto` wire types; `engram-harness-noop` test harness; host-side `HarnessHub` forwards events into `session_events`. (`engram-harness-claude` adapter ships with adopter need.)
+- Track B — done. Idle evictor (`engram-coordinator::idle_evictor`) cold-checkpoints, takes a hot FC snapshot, destroys the sandbox, marks `Idle`. `ensure_active` auto-resumes on the next `exec` / `exec_stream` / SSE-subscribe.
+- Track C — done. `RepoUrl` / `SessionKind` types and schema migration; `checkpoint_session` primitive (harness round-trip + git push) and `checkpoint_workspace_only` (auto-cadence — skips the harness round-trip); `POST /sessions/:id/checkpoint`; auto-checkpoint on `HarnessEvent::Idle` / `RunCompleted`; `smart_bootstrap_to_branch` for cross-host resume.
+- Track D — done. Host-agent consumes `cloud.preemption_signal()`; on notice fans out `checkpoint_session` to every live sandbox in parallel with a 25s deadline, drops them, signals the coord, accepts VM death.
+- Track E — done. `local://hello` quickstart, CLI surfaces `session_kind` / `checkpoint_branch` / `last_harness_event_at`, ADR 0001 captures the trajectory.
+- Track F — mostly done. `GET /sessions/:id/log?kind=conversation|workspace`, `GET /sessions/:id/diff?vs=<ref>`, `POST /sessions/:id/fork`, `POST /sessions/:id/resume?from_event_idx=N`. CLI verbs ship at `engram session {log,diff,fork,resume,checkpoint}`. F.6 (`POST /sessions/:id/pr` — GitHub-only) is deferred until the prod auth path lands; the runtime API for PR creation is identical whether the session token comes from a per-session token (Phase 4 dev) or App installation token (Phase 6).
 
 **What Engram does NOT solve** (explicit contract):
 
@@ -790,7 +790,7 @@ What Phase 5 still needs to ship:
 - **Cron-driven schedule** — k8s CronJob / systemd timer / GitHub Action; the baker is invoked manually today
 - **`git clone <repo>` step inside the bake** — currently the `--source` is a local path; production wants the baker to clone fresh from the remote, using a GitHub App token from `SecretStore` with fine-grained `contents:read` scope for that repo
 - **Repo setup-script execution** — running an `engram.toml`-declared `setup = ["pnpm install", "cargo fetch"]` inside the build sandbox before snapshotting (the slow stuff that benefits most from warm-pool caching)
-- **Image registry on BlobStorage** — for Firecracker production, images live in GCS/S3, host-agents fetch on demand. Registry resolution becomes an HTTP-y thing rather than a filesystem walk
+- **Image registry as a Docker registry** — for Firecracker production, images live in a standard OCI registry (Artifact Registry, ECR, GHCR, self-hosted Distribution); host-agents pull on demand via the standard registry API. Phase 4's blob-storage removal means image distribution stops trying to be a bespoke subsystem and reuses tooling people already have. Engram-baked images are still ext4 rootfs + manifest.toml; the registry just transports them
 - **Warm-pool refresh on new image version** — existing warm VMs drain naturally on checkout; replenishes spawn from the latest tag. No mid-flight migration
 - **Image GC** — old image versions retire after a configurable TTL (default 24h after last access); blobs lifecycle to coldline; eventually deleted
 
@@ -1123,7 +1123,7 @@ sleep 10
 
 # Spawn a session
 SID=$(curl -s -X POST localhost:8090/sessions \
-  -d '{"repo":"hello-world","branch":"main"}' | jq -r .session_id)
+  -d '{"repo":"local://hello-world","branch":"main"}' | jq -r .session_id)
 
 # Run a command
 curl -s -X POST "localhost:8090/sessions/$SID/exec" \

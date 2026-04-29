@@ -290,12 +290,16 @@ async fn session_list(
     }
     // Plain columnar layout: header + rows. Avoids pulling a TUI dep
     // for what's effectively two-line output most of the time.
-    println!("{:<36}  {:<10}  {:<24}  BRANCH", "ID", "STATUS", "REPO");
+    println!(
+        "{:<36}  {:<10}  {:<10}  {:<24}  BRANCH",
+        "ID", "STATUS", "KIND", "REPO"
+    );
     for s in sessions {
         println!(
-            "{:<36}  {:<10}  {:<24}  {}",
+            "{:<36}  {:<10}  {:<10}  {:<24}  {}",
             s["id"].as_str().unwrap_or(""),
             s["status"].as_str().unwrap_or(""),
+            s["session_kind"].as_str().unwrap_or(""),
             truncate(s["repo"].as_str().unwrap_or(""), 24),
             s["branch"].as_str().unwrap_or(""),
         );
@@ -314,25 +318,35 @@ async fn session_get(
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
     }
-    println!("id           : {}", body["id"].as_str().unwrap_or(""));
-    println!("status       : {}", body["status"].as_str().unwrap_or(""));
-    println!("repo         : {}", body["repo"].as_str().unwrap_or(""));
-    println!("branch       : {}", body["branch"].as_str().unwrap_or(""));
+    println!("id              : {}", body["id"].as_str().unwrap_or(""));
+    println!("status          : {}", body["status"].as_str().unwrap_or(""));
     println!(
-        "image_version: {}",
+        "session_kind    : {}",
+        body["session_kind"].as_str().unwrap_or("")
+    );
+    println!("repo            : {}", body["repo"].as_str().unwrap_or(""));
+    println!("branch          : {}", body["branch"].as_str().unwrap_or(""));
+    if let Some(b) = body["checkpoint_branch"].as_str() {
+        println!("checkpoint_branch: {b}");
+    }
+    println!(
+        "image_version   : {}",
         body["image_version"].as_str().unwrap_or(""),
     );
     if let Some(uid) = body["user_id"].as_str() {
-        println!("user_id      : {uid}");
+        println!("user_id         : {uid}");
     }
     println!(
-        "created_at   : {}",
+        "created_at      : {}",
         body["created_at"].as_str().unwrap_or(""),
     );
     println!(
-        "last_active  : {}",
+        "last_active     : {}",
         body["last_active_at"].as_str().unwrap_or(""),
     );
+    if let Some(at) = body["last_harness_event_at"].as_str() {
+        println!("last_harness_at : {at}");
+    }
     Ok(())
 }
 

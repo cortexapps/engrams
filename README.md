@@ -81,7 +81,7 @@ End-to-end exec round-trip:
 ```bash
 SID=$(curl -s -X POST http://localhost:8090/sessions \
   -H 'content-type: application/json' \
-  -d '{"repo":"hello","branch":"main"}' | jq -r .session_id)
+  -d '{"repo":"local://hello","branch":"main"}' | jq -r .session_id)
 
 curl -s -X POST "http://localhost:8090/sessions/$SID/exec" \
   -H 'content-type: application/json' \

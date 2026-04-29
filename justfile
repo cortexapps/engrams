@@ -114,7 +114,7 @@ smoke-health:
 smoke-create:
     curl -s -X POST http://localhost:8090/sessions \
         -H 'content-type: application/json' \
-        -d '{"repo":"hello-world","branch":"main"}' | jq
+        -d '{"repo":"local://hello-world","branch":"main"}' | jq
 
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
