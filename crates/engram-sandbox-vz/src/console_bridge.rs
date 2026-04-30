@@ -148,23 +148,30 @@ pub(crate) fn build_console_device(
 
         let mut by_port: BTreeMap<u32, HostPortFds> = BTreeMap::new();
         for (idx, &port) in PORTS.iter().enumerate() {
-            // Two pipes per port: one host→guest, one guest→host.
-            let (h2g_read, h2g_write) = make_pipe()?;
-            let (g2h_read, g2h_write) = make_pipe()?;
-            // VZ side:
-            //   - file_handle_for_reading: VZ reads from this (we
-            //     write there from the host) → guest reads from
-            //     /dev/hvcN.
-            //   - file_handle_for_writing: VZ writes to this → host
-            //     reads from the other end.
+            // socketpair(AF_LOCAL, SOCK_STREAM) instead of pipe(2).
+            // Initial bring-up used pipes here, but VZ's
+            // VZFileHandleSerialPortAttachment doesn't drain the
+            // guest's virtio-tx queue reliably when its read fd is
+            // a unidirectional pipe — the guest's second write
+            // blocks indefinitely after a successful first write.
+            // Switching to bidirectional Unix-domain stream sockets
+            // lets VZ's runloop signal the guest properly. We pass
+            // one end of the pair as both VZ's "read" and "write"
+            // file handles; the other end stays on the host. Since
+            // they're bidirectional, that's all we need.
+            let (vz_end, host_end) = make_socketpair()?;
+
+            // VZ's NSFileHandles. closeOnDealloc=true gives the VZ
+            // side ownership of its end's lifetime.
+            let vz_fd_for_reading = vz_end.try_clone().map_err(BridgeError::Pipe)?;
             let vz_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                 NSFileHandle::alloc(),
-                h2g_read.into_raw_fd(),
+                vz_fd_for_reading.into_raw_fd(),
                 true,
             );
             let vz_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                 NSFileHandle::alloc(),
-                g2h_write.into_raw_fd(),
+                vz_end.into_raw_fd(),
                 true,
             );
             let attachment =
@@ -195,11 +202,15 @@ pub(crate) fn build_console_device(
 
             array.setObject_atIndexedSubscript(Some(&port_cfg), idx as NSUInteger);
 
+            // Host-side: one fd, used for both reading guest data
+            // and writing to the guest. We dup() it so the bridge's
+            // pump tasks can each own one direction.
+            let host_for_read = host_end.try_clone().map_err(BridgeError::Pipe)?;
             by_port.insert(
                 port,
                 HostPortFds {
-                    read_from_guest: g2h_read,
-                    write_to_guest: h2g_write,
+                    read_from_guest: host_for_read,
+                    write_to_guest: host_end,
                 },
             );
         }
@@ -208,21 +219,32 @@ pub(crate) fn build_console_device(
     }
 }
 
-/// `pipe(2)` wrapper that returns `(read_end, write_end)` as
-/// `OwnedFd`s, both set non-blocking.
-fn make_pipe() -> Result<(OwnedFd, OwnedFd), BridgeError> {
+/// `socketpair(AF_LOCAL, SOCK_STREAM)` wrapper. Returns the two
+/// connected ends as `OwnedFd`s, both set non-blocking. We use
+/// socketpair instead of pipe(2) because VZ's
+/// VZFileHandleSerialPortAttachment drains pipe-backed read fds
+/// unreliably (see comment in `build_console_device`); bidirectional
+/// stream sockets let VZ's runloop ack guest writes correctly.
+fn make_socketpair() -> Result<(OwnedFd, OwnedFd), BridgeError> {
     let mut fds = [0i32; 2];
-    // SAFETY: pipe(2) on a 2-int array is sound.
-    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    // SAFETY: socketpair(2) on a 2-int array is sound.
+    let r = unsafe {
+        libc::socketpair(
+            libc::AF_LOCAL,
+            libc::SOCK_STREAM,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     if r != 0 {
         return Err(BridgeError::Pipe(std::io::Error::last_os_error()));
     }
-    // SAFETY: pipe(2) just gave us valid fds.
-    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    set_nonblocking(read_fd.as_raw_fd())?;
-    set_nonblocking(write_fd.as_raw_fd())?;
-    Ok((read_fd, write_fd))
+    // SAFETY: socketpair(2) just gave us valid fds.
+    let a = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let b = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    set_nonblocking(a.as_raw_fd())?;
+    set_nonblocking(b.as_raw_fd())?;
+    Ok((a, b))
 }
 
 fn set_nonblocking(raw: std::os::fd::RawFd) -> Result<(), BridgeError> {
@@ -349,17 +371,13 @@ async fn host_initiated_pump(listener: UnixListener, fds: HostPortFds, port: u32
                 return;
             }
         };
-        tracing::debug!(port, "console pump: accepted host UDS connection");
         let reader = reader.clone();
         let writer = writer.clone();
         tokio::spawn(async move {
             let read_guard = reader.lock().await;
             let write_guard = writer.lock().await;
-            tracing::debug!(port, "console pump: starting bidirectional copy");
             if let Err(e) = pump_uds_pipe(host_stream, read_guard, write_guard).await {
                 tracing::warn!(error = %e, port, "console pump ended with error");
-            } else {
-                tracing::debug!(port, "console pump: copy ended cleanly");
             }
         });
     }
@@ -389,7 +407,7 @@ async fn pump_uds_pipe(
 }
 
 /// Pump for the guest-initiated harness port. There's no UDS — the
-/// guest writes to `/dev/hvc3`, the host reads from
+/// guest writes to `/dev/vport3p2`, the host reads from
 /// `read_from_guest`, and we deliver bytes to the harness sink via
 /// a duplex stream. Symmetric for the host→guest direction.
 async fn guest_initiated_pump(fds: HostPortFds, sink: Arc<HarnessSink>) {
@@ -565,13 +583,13 @@ mod tests {
     }
 
     #[test]
-    fn make_pipe_returns_two_nonblocking_fds() {
-        let (r, w) = make_pipe().expect("pipe creation");
-        for fd in [r.as_raw_fd(), w.as_raw_fd()] {
-            // SAFETY: fd is owned by `r`/`w` which outlive this call.
+    fn make_socketpair_returns_two_nonblocking_fds() {
+        let (a, b) = make_socketpair().expect("socketpair creation");
+        for fd in [a.as_raw_fd(), b.as_raw_fd()] {
+            // SAFETY: fd is owned by `a`/`b` which outlive this call.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
             assert!(flags >= 0);
-            assert_ne!(flags & libc::O_NONBLOCK, 0, "pipe end should be non-blocking");
+            assert_ne!(flags & libc::O_NONBLOCK, 0, "socket end should be non-blocking");
         }
     }
 

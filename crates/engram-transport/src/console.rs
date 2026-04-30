@@ -33,13 +33,14 @@
 //! rate); we don't need the readiness polling required for sockets.
 
 use std::io;
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use tokio::fs::{File, OpenOptions};
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -98,8 +99,9 @@ impl Transport for ConsoleTransport {
         // dial doesn't need an exclusivity permit — there's one
         // dialer per binary in our usage (the harness adapter
         // dials port 1026 once and keeps it for the session).
-        let file = open_port(port).await?;
-        Ok(Box::pin(file))
+        let fd = open_port(port).await?;
+        let stream = ConsoleStream::new(fd, None)?;
+        Ok(Box::pin(stream))
     }
 
     async fn listen(&self, port: u32) -> io::Result<Box<dyn Listener>> {
@@ -114,20 +116,49 @@ impl Transport for ConsoleTransport {
     }
 }
 
-/// Open the port's `/dev/<name>` device for read+write.
-async fn open_port(port: u32) -> io::Result<File> {
+/// Open the port's `/dev/<name>` device for read+write with
+/// O_NONBLOCK. Returns the raw fd wrapped in an `OwnedFd`. We
+/// deliberately bypass `tokio::fs::File` here — that wrapper
+/// serialises every read/write through a state machine + the
+/// blocking thread pool, and on virtio-console char devices it
+/// stalled mid-stream during initial bring-up (the second write
+/// blocked indefinitely after a successful first). Using
+/// `AsyncFd` directly lets us read/write via real non-blocking
+/// I/O, with the kernel's normal poll-readiness signalling.
+async fn open_port(port: u32) -> io::Result<OwnedFd> {
     let path = port_to_device(port)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
+    let path_for_err = path.clone();
+    let path_for_open = path.clone();
+    tokio::task::spawn_blocking(move || open_blocking(&path_for_open))
         .await
+        .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))?
         .map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("open {} (virtio-console port {port}): {e}", path.display()),
+                format!(
+                    "open {} (virtio-console port {port}): {e}",
+                    path_for_err.display()
+                ),
             )
         })
+}
+
+fn open_blocking(path: &Path) -> io::Result<OwnedFd> {
+    let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(io::Error::other)?;
+    // SAFETY: open(2) with valid CString path; fd ownership is
+    // captured by OwnedFd::from_raw_fd below.
+    let raw = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open(2) just gave us a valid fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// Listener with mutex-based exclusivity. virtio-console data
@@ -146,44 +177,109 @@ impl Listener for ConsoleListener {
     async fn accept(&mut self) -> io::Result<BoxedStream> {
         // Wait for any prior stream from this listener to drop.
         let guard = self.permit.clone().lock_owned().await;
-        let file = open_port(self.port).await?;
-        Ok(Box::pin(GuardedStream {
-            file,
-            _permit: guard,
-        }))
+        let fd = open_port(self.port).await?;
+        let stream = ConsoleStream::new(fd, Some(guard))?;
+        Ok(Box::pin(stream))
     }
 }
 
-/// Wraps a `tokio::fs::File` with an `OwnedMutexGuard` so dropping
-/// the stream releases the listener's per-port permit.
-struct GuardedStream {
-    file: File,
-    _permit: OwnedMutexGuard<()>,
+/// AsyncRead+AsyncWrite over a non-blocking virtio-console fd.
+/// Optionally carries an `OwnedMutexGuard` from the listener's
+/// per-port permit so dropping the stream lets the next accept
+/// proceed.
+struct ConsoleStream {
+    inner: AsyncFd<OwnedFd>,
+    _permit: Option<OwnedMutexGuard<()>>,
 }
 
-impl AsyncRead for GuardedStream {
+impl ConsoleStream {
+    fn new(fd: OwnedFd, permit: Option<OwnedMutexGuard<()>>) -> io::Result<Self> {
+        Ok(Self {
+            inner: AsyncFd::new(fd)?,
+            _permit: permit,
+        })
+    }
+}
+
+impl AsyncRead for ConsoleStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.file).poll_read(cx, buf)
+        loop {
+            let mut guard = match self.inner.poll_read_ready(cx) {
+                Poll::Ready(Ok(g)) => g,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            let unfilled = buf.initialize_unfilled();
+            // SAFETY: read(2) on a byte-stream fd is sound.
+            let n = unsafe {
+                libc::read(
+                    self.inner.get_ref().as_raw_fd(),
+                    unfilled.as_mut_ptr() as *mut _,
+                    unfilled.len(),
+                )
+            };
+            match n {
+                n if n > 0 => {
+                    buf.advance(n as usize);
+                    return Poll::Ready(Ok(()));
+                }
+                0 => return Poll::Ready(Ok(())), // EOF
+                _ => {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    return Poll::Ready(Err(err));
+                }
+            }
+        }
     }
 }
 
-impl AsyncWrite for GuardedStream {
+impl AsyncWrite for ConsoleStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.file).poll_write(cx, buf)
+        loop {
+            let mut guard = match self.inner.poll_write_ready(cx) {
+                Poll::Ready(Ok(g)) => g,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            // SAFETY: write(2) on a byte-stream fd is sound.
+            let n = unsafe {
+                libc::write(
+                    self.inner.get_ref().as_raw_fd(),
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Err(err));
+            }
+            return Poll::Ready(Ok(n as usize));
+        }
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.file).poll_flush(cx)
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.file).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // virtio-console char devices don't have a shutdown
+        // primitive; closing happens on drop.
+        Poll::Ready(Ok(()))
     }
 }
 
