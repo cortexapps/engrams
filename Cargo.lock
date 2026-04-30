@@ -882,6 +882,7 @@ dependencies = [
  "engram-core",
  "engram-harness-proto",
  "futures",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",

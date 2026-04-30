@@ -20,6 +20,7 @@ use engram_core::SandboxError;
 use parking_lot::Mutex;
 
 use crate::vm::{VmConfig, VzVm};
+use crate::vsock_bridge::VsockBridge;
 
 /// Static config for the VZ backend — values that are the same for
 /// every sandbox the backend creates. Per-sandbox overrides ride on
@@ -49,8 +50,7 @@ impl VzConfig {
     }
 }
 
-/// Per-sandbox state owned by `VzBackend`. The vsock bridge (task 28)
-/// will hang additional listener handles off this struct.
+/// Per-sandbox state owned by `VzBackend`.
 struct VzSandboxState {
     #[allow(dead_code)]
     spec: SandboxSpec,
@@ -58,9 +58,13 @@ struct VzSandboxState {
     /// (config, devices, queue) once any in-flight dispatched work
     /// completes.
     vm: Arc<VzVm>,
-    /// `<work_dir>/<sandbox_id>.vsock` — base path. The vsock UDS
-    /// bridge (task 28) binds `_1024`, `_1025`, `_1026` listeners
-    /// next to it.
+    /// vsock-as-UDS bridge tasks. Held in a Mutex so `destroy` can
+    /// take it out and call its async `stop`. None after stop.
+    bridge: parking_lot::Mutex<Option<VsockBridge>>,
+    /// `<work_dir>/<sandbox_id>.vsock` — base path. The vsock bridge
+    /// binds `_1024`, `_1025` UDS listeners next to it. Stored on
+    /// the state so future `start_agent` / `exec_stream` calls can
+    /// look up the per-port paths without recomputing them.
     #[allow(dead_code)]
     vsock_uds_path: PathBuf,
 }
@@ -165,11 +169,36 @@ impl SandboxBackend for VzBackend {
 
         let id = SandboxId::new();
         let vsock_uds_path = self.vsock_uds_path_for(id);
+
+        // Wire up the vsock UDS bridge. This binds <vsock_uds>_1024
+        // and <vsock_uds>_1025 immediately so a subsequent
+        // start_agent or exec_stream call can dial without racing
+        // a not-yet-bound window. If a harness sink is registered,
+        // it also installs the guest-listener for port 1026.
+        let harness_sink = self.harness_sink.lock().clone();
+        let bridge = VsockBridge::start(
+            vm.raw_clone(),
+            vm.queue_clone(),
+            vsock_uds_path.clone(),
+            harness_sink,
+        )
+        .await
+        .map_err(|e| {
+            // If bridge bind fails (e.g. EADDRINUSE), tear down the
+            // VM we just started so we don't leak it.
+            tracing::error!(error = %e, sandbox_id = %id, "vz bridge start failed; tearing down VM");
+            // Synchronous drop — vm.stop().await would be cleaner
+            // but we're already in an error path; the queue will
+            // drain on Retained drop.
+            engram_core::SandboxError::from(e)
+        })?;
+
         self.sandboxes.insert(
             id,
             VzSandboxState {
                 spec,
                 vm: Arc::new(vm),
+                bridge: parking_lot::Mutex::new(Some(bridge)),
                 vsock_uds_path,
             },
         );
@@ -217,6 +246,16 @@ impl SandboxBackend for VzBackend {
         let Some((_, state)) = self.sandboxes.remove(&id) else {
             return Err(SandboxError::NotFound);
         };
+        // Tear down the bridge first — abort pump tasks, unregister
+        // the guest-side listener, and remove the UDS files. Doing
+        // this before vm.stop avoids a race where pumps see EOF on
+        // their VZ-side fds and try to reach into a dying VM.
+        // Take the bridge out of its mutex before awaiting so we
+        // don't hold a non-Send guard across the await.
+        let bridge = state.bridge.lock().take();
+        if let Some(mut bridge) = bridge {
+            bridge.stop(state.vm.queue()).await;
+        }
         // Best-effort stop. If the VM is already stopped or in a
         // state that can't accept stop (e.g. failed-to-start),
         // VZ surfaces an NSError; we log and continue, since the
@@ -224,17 +263,7 @@ impl SandboxBackend for VzBackend {
         if let Err(e) = state.vm.stop().await {
             tracing::warn!(error = %e, sandbox_id = %id, "vz stop returned an error; releasing handle anyway");
         }
-        // Best-effort cleanup of the per-sandbox UDS files. They
-        // don't exist yet (task 28 will create them), but adding
-        // the cleanup here keeps it idempotent.
-        for suffix in ["_1024", "_1025", "_1026"] {
-            let mut p = state.vsock_uds_path.clone();
-            let mut name = p.file_name().unwrap_or_default().to_owned();
-            name.push(suffix);
-            p.set_file_name(name);
-            let _ = tokio::fs::remove_file(p).await;
-        }
-        // `state` (and the Arc<VzVm> inside) drops here — release
+        // `state` (and the Arc<VzVm> inside) drops here — releases
         // ObjC retains.
         drop(state);
         Ok(())

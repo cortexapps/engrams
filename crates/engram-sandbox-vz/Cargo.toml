@@ -45,6 +45,7 @@ objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSError"
 objc2-virtualization = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 futures.workspace = true

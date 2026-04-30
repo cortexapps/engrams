@@ -121,8 +121,9 @@ impl From<VzError> for engram_core::SandboxError {
 /// simultaneously, so there's no concurrent access. Non-mutating
 /// retain/release across threads is safe because Apple's ARC
 /// counters are atomic.
-struct Sendable<T>(T);
+pub(crate) struct Sendable<T>(pub(crate) T);
 unsafe impl<T> Send for Sendable<T> {}
+unsafe impl<T> Sync for Sendable<T> {}
 
 impl<T> std::ops::Deref for Sendable<T> {
     type Target = T;
@@ -151,6 +152,27 @@ unsafe impl Send for VzVm {}
 unsafe impl Sync for VzVm {}
 
 impl VzVm {
+    /// Hand out a Send/Sync clone of the VM pointer for use inside
+    /// queue-dispatched closures. The bridge holds onto this for
+    /// the lifetime of the VM. Wrapping in `Sendable` is sound as
+    /// long as every consumer dereferences only on the dispatch
+    /// queue (the bridge does).
+    pub(crate) fn raw_clone(&self) -> Sendable<Retained<VZVirtualMachine>> {
+        Sendable(self.vm.clone())
+    }
+
+    /// Borrow the per-VM dispatch queue. Only used by `vsock_bridge`
+    /// to dispatch VZ device-side calls onto the right thread.
+    pub(crate) fn queue(&self) -> &DispatchQueue {
+        &self.queue
+    }
+
+    /// Clone the queue handle. The bridge holds onto it for lifetime
+    /// reasons (cleanup at drop time).
+    pub(crate) fn queue_clone(&self) -> DispatchRetained<DispatchQueue> {
+        self.queue.clone()
+    }
+
     /// Build a VZ VM from `cfg`, validate the configuration, but
     /// do *not* start it — the caller starts via `start()` once it's
     /// done wiring the vsock UDS bridge (see `vsock_bridge.rs`).
