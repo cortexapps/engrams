@@ -156,6 +156,43 @@ fc-bake-demo:
         --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
         --inject-harness   engram-harness-noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop
 
+# Bake a Firecracker image containing the real Claude Code CLI plus
+# engram-agentd / engram-bootstrap / engram-harness-claude.
+#
+# The base is node:20-slim because Anthropic ships claude as an npm
+# package (`@anthropic-ai/claude-code`). git + ca-certificates are
+# pulled in so Claude can read/write the workspace and reach
+# api.anthropic.com.
+#
+# Image manifest declares ANTHROPIC_API_KEY as a required secret
+# under SecretMode::Literal (the dev default — values land directly
+# in env). The operator must `export ANTHROPIC_API_KEY=sk-...`
+# before `just dev-firecracker` for session-create to succeed; the
+# coordinator's EnvSecretStore reads it from the host process env.
+#
+# After this recipe, kick off:
+#   ENGRAM_DEFAULT_IMAGE=warm-1 \
+#   ENGRAM_DEV_AUTO_AGENT=claude \
+#   just dev-firecracker
+#
+# then `engram session create --repo local://claude-demo --prompt "..."`.
+fc-bake-claude:
+    cargo build -p engram-agentd         --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap      --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-harness-claude --target x86_64-unknown-linux-musl --release
+    mkdir -p ./var/fc-bake-claude
+    cp deploy/fc-bake-claude/Dockerfile  ./var/fc-bake-claude/Dockerfile
+    cp deploy/fc-bake-claude/engram.toml ./var/fc-bake-claude/engram.toml
+    cargo run -p engram-cli -- image build \
+        --repo local://claude-demo \
+        --tag warm-1 \
+        --source ./var/fc-bake-claude \
+        --format ext4 \
+        --images-dir ./var/engram/images \
+        --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
+        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
+        --inject-harness   engram-harness-claude=target/x86_64-unknown-linux-musl/release/engram-harness-claude
+
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
 watch:

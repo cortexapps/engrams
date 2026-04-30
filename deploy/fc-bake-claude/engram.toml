@@ -1,0 +1,19 @@
+name = "claude-demo"
+description = "Real Claude Code CLI inside a Firecracker microVM, driven via engram-harness-claude."
+
+# Anthropic API key, supplied to the in-VM `claude` process via env.
+# `required = true` makes session-create fail loudly if the operator
+# forgot to `export ANTHROPIC_API_KEY=sk-...` before launching the
+# coordinator. `allow_hosts` is a hint to the network policy and to
+# any future broker-mode substitution; today (SecretMode::Literal)
+# the value lands directly in the env regardless.
+[secrets.ANTHROPIC_API_KEY]
+required = true
+allow_hosts = ["api.anthropic.com"]
+
+# Egress: only Anthropic's API plane and npm (in case `claude`
+# self-updates or fetches MCP packages). Everything else is denied
+# at the per-session proxy in production; locally this is advisory.
+[network]
+default = "deny"
+allow_hosts = ["api.anthropic.com", "registry.npmjs.org"]
