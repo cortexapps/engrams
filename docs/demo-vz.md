@@ -163,10 +163,23 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
 - ✅ Multi-port virtio-console bridge: ports 1024 (agentd),
   1025 (bootstrap), 1026 (harness). Universal kernel support —
   no `CONFIG_VIRTIO_VSOCKETS=y` needed.
-- ✅ Snapshot/restore via `saveMachineStateToURL` /
-  `restoreMachineStateFromURL`.
+- ✅ Snapshot save (`saveMachineStateToURL`) — idle-eviction emits
+  `snapshot_taken` + `evicted` events as expected.
+- ⚠️ Snapshot **restore** (`restoreMachineStateFromURL`) returns
+  `invalid argument` on VZ + multi-port virtio-console. The on-disk
+  rootfs.ext4 mutates while the VM runs (kernel writes to /tmp,
+  /var, etc.) and VZ rejects restoring against a different rootfs
+  byte-state than what was saved. Workarounds: fork-from-Dead for
+  git-backed sessions (drops the snapshot, replays workspace from
+  git); for `local://` sessions, restart with a fresh session.
+  Permanent fix is a follow-up — likely involves attaching the
+  rootfs as read-only with an overlay, or using `VZDiskImageCachingMode`
+  + `VZDiskImageSynchronizationMode` tuning so VZ's snapshot can
+  reattach a mutated disk.
 - ✅ Bake pipeline: aarch64 cross-compile → docker buildx →
   ext4 → 512-byte aligned.
 - ✅ Codesign step.
-- ✅ End-to-end demo runs on the standard Ubuntu cloud-image
-  kernel.
+- ✅ End-to-end noop + Claude demos run on the standard Ubuntu
+  cloud-image kernel. Verified flow on macOS Apple Silicon:
+  `status_changed → run_started → agent_message → run_completed →
+  harness_idle → snapshot_taken → evicted → status_changed`.
