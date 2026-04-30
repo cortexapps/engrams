@@ -192,6 +192,21 @@ mount -t proc  proc /proc 2>/dev/null || true
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true
 export ENGRAM_TRANSPORT=__TRANSPORT__
+# Diagnostic: dump virtio-port + hvc device layout so a misconfig is
+# obvious from the kernel boot log. Cheap (one-shot, only at init).
+# engram-init: pre-flight diagnostics. Quiet on the happy path
+# (ENGRAM_INIT_DEBUG=0); operators set ENGRAM_INIT_DEBUG=1 in
+# the bake's BootstrapLaunch.env to see /sys/class/virtio-ports
+# enumeration when bringing up a new kernel build.
+if [ "${ENGRAM_INIT_DEBUG:-0}" = "1" ]; then
+    echo "engram-init: ENGRAM_TRANSPORT=$ENGRAM_TRANSPORT" >&2
+    for p in /sys/class/virtio-ports/*; do
+        [ -d "$p" ] || continue
+        n=$(cat "$p/name" 2>/dev/null || echo "<unnamed>")
+        d=$(cat "$p/dev" 2>/dev/null || echo "<no-dev>")
+        echo "  $(basename $p) name=$n dev=$d" >&2
+    done
+fi
 [ -x /sbin/engram-bootstrap ] && /sbin/engram-bootstrap &
 exec /sbin/engram-agentd --port __VSOCK_PORT__
 "#;

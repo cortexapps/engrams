@@ -274,6 +274,7 @@ impl SandboxBackend for VzBackend {
         id: SandboxId,
         agent: AgentSpec,
     ) -> Result<(), SandboxError> {
+        tracing::debug!(sandbox_id = %id, argv0 = %agent.argv.first().map(|s| s.as_str()).unwrap_or("<empty>"), "vz start_agent: dialing bootstrap UDS");
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.vsock_uds_path.clone()
@@ -312,6 +313,7 @@ impl SandboxBackend for VzBackend {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
         };
+        tracing::debug!(sandbox_id = %id, "vz start_agent: writing BootstrapLaunch frame");
         engram_harness_proto::write_msg(&mut conn, &launch)
             .await
             .map_err(|e| {
@@ -319,6 +321,7 @@ impl SandboxBackend for VzBackend {
             })?;
         // Best-effort flush; bootstrap closes its end after exec.
         let _ = conn.shutdown().await;
+        tracing::debug!(sandbox_id = %id, "vz start_agent: BootstrapLaunch sent");
         Ok(())
     }
 

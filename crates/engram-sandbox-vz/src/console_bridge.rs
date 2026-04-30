@@ -177,13 +177,18 @@ pub(crate) fn build_console_device(
                 Retained::cast_unchecked(attachment);
 
             let port_cfg = VZVirtioConsolePortConfiguration::new();
-            // isConsole=true → guest exposes as `/dev/hvcN`; with
-            // false the device would be `/dev/vport0p<N>`. Our
-            // `engram-transport::console` uses the hvc path.
-            port_cfg.setIsConsole(true);
-            // Symbolic name visible at /sys/class/virtio-ports/<dev>/name
-            // — useful for diagnostics; transport selection is by
-            // index/order, not name.
+            // isConsole=false → guest exposes as `/dev/vport*p*`
+            // (a regular virtio-console data port). With true the
+            // kernel registers them as HVC consoles, but on the
+            // VZ multi-port path we hit ENXIO when opening the
+            // resulting hvc node — VZ doesn't appear to mark
+            // multi-port HVC consoles as "active" the way the
+            // kernel needs. Data-port mode is more reliable and
+            // the wire is the same.
+            port_cfg.setIsConsole(false);
+            // Symbolic name visible at /sys/class/virtio-ports/<dev>/name.
+            // engram-transport's port_to_device looks up the matching
+            // sysfs entry by this name, then opens /dev/<basename>.
             let name = NSString::from_str(&format!("engram-port-{port}"));
             port_cfg.setName(Some(&name));
             port_cfg.setAttachment(Some(&attachment_super));
@@ -344,13 +349,17 @@ async fn host_initiated_pump(listener: UnixListener, fds: HostPortFds, port: u32
                 return;
             }
         };
+        tracing::debug!(port, "console pump: accepted host UDS connection");
         let reader = reader.clone();
         let writer = writer.clone();
         tokio::spawn(async move {
             let read_guard = reader.lock().await;
             let write_guard = writer.lock().await;
+            tracing::debug!(port, "console pump: starting bidirectional copy");
             if let Err(e) = pump_uds_pipe(host_stream, read_guard, write_guard).await {
                 tracing::warn!(error = %e, port, "console pump ended with error");
+            } else {
+                tracing::debug!(port, "console pump: copy ended cleanly");
             }
         });
     }

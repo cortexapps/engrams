@@ -429,13 +429,41 @@ pub(crate) fn build_dev_agent(
     initial_prompt: Option<&str>,
 ) -> Option<engram_core::types::sandbox::AgentSpec> {
     use crate::config::{DevAgent, SandboxBackendChoice};
-    let agent = state.cfg.dev_auto_agent?;
+    let agent = match state.cfg.dev_auto_agent {
+        Some(a) => a,
+        None => {
+            tracing::debug!("build_dev_agent: dev_auto_agent unset");
+            return None;
+        }
+    };
     let bin = match agent {
-        DevAgent::Noop => state.cfg.dev_noop_harness_path.as_ref()?,
-        DevAgent::Claude => state.cfg.dev_claude_harness_path.as_ref()?,
+        DevAgent::Noop => match state.cfg.dev_noop_harness_path.as_ref() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "build_dev_agent: ENGRAM_DEV_AUTO_AGENT=noop but dev_noop_harness_path is unset"
+                );
+                return None;
+            }
+        },
+        DevAgent::Claude => match state.cfg.dev_claude_harness_path.as_ref() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "build_dev_agent: ENGRAM_DEV_AUTO_AGENT=claude but dev_claude_harness_path is unset"
+                );
+                return None;
+            }
+        },
     }
     .to_string_lossy()
     .to_string();
+    tracing::debug!(
+        agent = ?agent,
+        bin = %bin,
+        backend = ?state.cfg.sandbox_backend,
+        "build_dev_agent: building AgentSpec"
+    );
     let mut env = HashMap::new();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
     if let Some(prompt) = initial_prompt {

@@ -302,6 +302,7 @@ vz-bake-demo:
         --source ./var/vz-bake \
         --format ext4 \
         --images-dir ./var/engram/images \
+        --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
         --inject-harness   engram-harness-noop=target/aarch64-unknown-linux-musl/release/engram-harness-noop
@@ -325,6 +326,7 @@ vz-bake-claude:
         --source ./var/vz-bake-claude \
         --format ext4 \
         --images-dir ./var/engram/images \
+        --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
         --inject-harness   engram-harness-claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude

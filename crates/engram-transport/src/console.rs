@@ -1,15 +1,15 @@
 //! virtio-console-backed [`Transport`] implementation.
 //!
 //! Each "port" maps to one of three multi-port virtio-console
-//! devices the host (Apple VZ) configures at VM-config time:
-//!
-//! ```text
-//!   port 1024 (engram-agentd)        → /dev/hvc1
-//!   port 1025 (engram-bootstrap)     → /dev/hvc2
-//!   port 1026 (engram-harness-*)     → /dev/hvc3
-//! ```
-//!
-//! `/dev/hvc0` is the kernel boot console; we leave it untouched.
+//! devices the host (Apple VZ) configures at VM-config time. Port
+//! lookup is by name via `/sys/class/virtio-ports/`: the host
+//! configures each port with `name = "engram-port-<port>"` (see
+//! `engram-sandbox-vz/src/console_bridge.rs`); the guest scans
+//! sysfs for the matching name and opens the corresponding
+//! `/dev/<basename>` device. The exact device-node naming
+//! (`/dev/hvc<N>` for `is_console=1` ports, `/dev/vport<bus>p<N>`
+//! for data ports) varies with the kernel build, so we resolve it
+//! at runtime instead of hardcoding.
 //!
 //! # One stream per port, but accept can re-open
 //!
@@ -34,34 +34,55 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use tokio::fs::OpenOptions;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{BoxedStream, Listener, Transport};
 
-/// Map well-known port number to in-VM virtio-console device path.
-/// The host side of the bake (engram-sandbox-vz's vm.rs) configures
-/// the same three ports in the same order.
+/// Resolve a well-known port number to its in-guest device path by
+/// scanning `/sys/class/virtio-ports/` for a port whose `name` file
+/// matches `engram-port-<port>`. The corresponding device node is
+/// `/dev/<basename-of-sysfs-entry>`.
+///
+/// Sync std::fs is fine here — the lookup runs once per dial/listen
+/// at startup and reads ~3 small files; we'd save no real time
+/// using tokio::fs.
 fn port_to_device(port: u32) -> io::Result<PathBuf> {
-    let n = match port {
-        1024 => 1, // engram-agentd
-        1025 => 2, // engram-bootstrap
-        1026 => 3, // engram-harness-*
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "virtio-console transport: port {other} is not mapped to a /dev/hvcN device"
-                ),
-            ));
+    let want_name = format!("engram-port-{port}");
+    let entries = std::fs::read_dir("/sys/class/virtio-ports").map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("read /sys/class/virtio-ports (kernel missing CONFIG_VIRTIO_CONSOLE?): {e}"),
+        )
+    })?;
+    for entry in entries.flatten() {
+        let name_path = entry.path().join("name");
+        let name = std::fs::read_to_string(&name_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if name == want_name {
+            let dev_basename = entry.file_name();
+            return Ok(PathBuf::from("/dev").join(dev_basename));
         }
-    };
-    Ok(PathBuf::from(format!("/dev/hvc{n}")))
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "virtio-console transport: no port named {want_name:?} under \
+             /sys/class/virtio-ports/ (host config drift?)"
+        ),
+    ))
 }
 
 /// virtio-console transport. Stateless — every dial/listen call
-/// opens a fresh fd to `/dev/hvcN`.
+/// opens a fresh fd via the per-port-name sysfs lookup.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConsoleTransport;
 
@@ -69,69 +90,100 @@ impl ConsoleTransport {
     pub const fn new() -> Self {
         Self
     }
-
-    /// Open `/dev/hvc<N>` for read+write. Used by both `dial` and
-    /// `listen` since the device is symmetric.
-    async fn open(&self, port: u32) -> io::Result<BoxedStream> {
-        let path = port_to_device(port)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("open {} (virtio-console port {port}): {e}", path.display()),
-                )
-            })?;
-        Ok(Box::pin(file))
-    }
 }
 
 #[async_trait]
 impl Transport for ConsoleTransport {
     async fn dial(&self, port: u32) -> io::Result<BoxedStream> {
-        self.open(port).await
+        // dial doesn't need an exclusivity permit — there's one
+        // dialer per binary in our usage (the harness adapter
+        // dials port 1026 once and keeps it for the session).
+        let file = open_port(port).await?;
+        Ok(Box::pin(file))
     }
 
     async fn listen(&self, port: u32) -> io::Result<Box<dyn Listener>> {
         // Validate the port maps to a known device path now, so a
         // bad port number fails at bind time rather than on first
-        // accept. We don't actually open the file until accept().
+        // accept.
         let _ = port_to_device(port)?;
-        Ok(Box::new(ConsoleListener { port }))
+        Ok(Box::new(ConsoleListener {
+            port,
+            permit: Arc::new(AsyncMutex::new(())),
+        }))
     }
 }
 
-/// Reopens `/dev/hvcN` on every [`accept`](Listener::accept). The
-/// fresh open blocks until the host has its end of the
-/// virtio-console port ready; subsequent reopens (after a host
-/// close → guest EOF → guest close cycle) reattach the same way.
+/// Open the port's `/dev/<name>` device for read+write.
+async fn open_port(port: u32) -> io::Result<File> {
+    let path = port_to_device(port)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .await
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("open {} (virtio-console port {port}): {e}", path.display()),
+            )
+        })
+}
+
+/// Listener with mutex-based exclusivity. virtio-console data
+/// ports allow only one concurrent open; if accept yielded
+/// streams without serializing, the second open would fail with
+/// EBUSY. We hold an `OwnedMutexGuard` inside each emitted
+/// stream — the next `accept` waits for the prior stream to drop
+/// (releasing the guard) before opening.
 struct ConsoleListener {
     port: u32,
+    permit: Arc<AsyncMutex<()>>,
 }
 
 #[async_trait]
 impl Listener for ConsoleListener {
     async fn accept(&mut self) -> io::Result<BoxedStream> {
-        let path = port_to_device(self.port)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "open {} (virtio-console port {}): {e}",
-                        path.display(),
-                        self.port
-                    ),
-                )
-            })?;
-        Ok(Box::pin(file))
+        // Wait for any prior stream from this listener to drop.
+        let guard = self.permit.clone().lock_owned().await;
+        let file = open_port(self.port).await?;
+        Ok(Box::pin(GuardedStream {
+            file,
+            _permit: guard,
+        }))
+    }
+}
+
+/// Wraps a `tokio::fs::File` with an `OwnedMutexGuard` so dropping
+/// the stream releases the listener's per-port permit.
+struct GuardedStream {
+    file: File,
+    _permit: OwnedMutexGuard<()>,
+}
+
+impl AsyncRead for GuardedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for GuardedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.file).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_shutdown(cx)
     }
 }
 
@@ -140,12 +192,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn port_to_device_maps_known_ports_and_rejects_others() {
-        assert_eq!(port_to_device(1024).unwrap(), PathBuf::from("/dev/hvc1"));
-        assert_eq!(port_to_device(1025).unwrap(), PathBuf::from("/dev/hvc2"));
-        assert_eq!(port_to_device(1026).unwrap(), PathBuf::from("/dev/hvc3"));
-        let err = port_to_device(9999).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("9999"));
+    fn port_to_device_errors_when_sysfs_entry_missing() {
+        // On a typical CI/host (no virtio-console attached),
+        // /sys/class/virtio-ports doesn't exist at all → the
+        // function should return a clean NotFound-flavoured error
+        // rather than panicking.
+        if std::path::Path::new("/sys/class/virtio-ports").exists() {
+            return; // can't easily simulate "missing port" on a host that has them
+        }
+        let err = port_to_device(1024).unwrap_err();
+        assert!(
+            err.to_string().contains("/sys/class/virtio-ports")
+                || err.to_string().contains("CONFIG_VIRTIO_CONSOLE"),
+            "error should hint at sysfs / kernel config: {err}"
+        );
     }
 }

@@ -26,34 +26,36 @@ shell-profile munging required.
 ## Step 1 — kernel
 
 `engram-sandbox-vz` boots an arm64 Linux kernel via VZ's
-`VZLinuxBootLoader`. The kernel must have:
+`VZLinuxBootLoader`. The kernel only needs:
 
-- `CONFIG_VIRTIO_VSOCKETS=y` (built-in, not a module)
-- `CONFIG_VIRTIO_BLK=y`
-- `CONFIG_VIRTIO_NET=y`
-- `CONFIG_VIRTIO_CONSOLE=y`
+- `CONFIG_VIRTIO_BLK=y` (rootfs)
+- `CONFIG_VIRTIO_NET=y` (NAT egress)
+- `CONFIG_VIRTIO_CONSOLE=y` (host↔guest control channels)
 
-**The Ubuntu 24.04 cloud-image kernel (`noble-server-cloudimg-arm64-vmlinuz-generic`)
-does NOT have `CONFIG_VIRTIO_VSOCKETS=y`**. If you boot with it, the
-in-VM `engram-bootstrap` fails with `Address family not supported by
-protocol (os error 97)` and the kernel panics with
-`Attempted to kill init`. Our `vz-pull-ubuntu-kernel` recipe is a
-known-broken baseline kept for diagnostic purposes.
+`CONFIG_VIRTIO_VSOCKETS` is *not* required. The host↔guest control
+plane runs over multi-port virtio-console rather than vsock; the
+in-VM binaries select the transport at runtime via
+`ENGRAM_TRANSPORT=console`, which the bake's `engram-init` shim
+sets automatically.
 
-Working sources:
+The standard Ubuntu 24.04 cloud-image kernel works:
 
-- **Apple's containerization sample kernel** — bundled with Apple's
-  Containerization framework, baked specifically for VZ.
-- **Lima / colima images** — `~/.lima/_images/` holds vsock-enabled
-  kernels for Apple Silicon. Extract with
-  `lima --debug` once a Lima VM has been created.
-- **Build from source** — easiest if you have a Linux build machine.
-  Standard arm64 defconfig + the four virtio configs above.
+```bash
+just vz-pull-ubuntu-kernel
+# → ~/.cache/engram-vz-test/vmlinuz-arm64 (compressed; uncompress
+#   to vmlinux-arm64 — VZ rejects gzip-wrapped kernels)
+gunzip -k -c ~/.cache/engram-vz-test/vmlinuz-arm64 \
+    > ~/.cache/engram-vz-test/vmlinux-arm64
+file ~/.cache/engram-vz-test/vmlinux-arm64
+# → "Linux kernel ARM64 boot executable Image"
+export ENGRAM_VZ_KERNEL_PATH=~/.cache/engram-vz-test/vmlinux-arm64
+```
 
-Cache the kernel at `~/.cache/engram-vz-test/vmlinux-arm64`. Must be
-the uncompressed Image format (the `file` command should report
-`Linux kernel ARM64 boot executable Image`). Compressed `vmlinuz` is
-NOT accepted by VZ.
+Other working sources (any one works; pick whatever's already on
+the machine):
+- Apple's `containerization` framework's bundled kernel
+- Lima / colima cached images
+- A custom build from upstream sources
 
 ## Step 2 — bake the rootfs
 
@@ -140,10 +142,13 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
 - **Serial console**: stderr from the coord carries kernel boot logs +
   the `engram-init` shim's output. Set `ENGRAM_VZ_SILENCE_CONSOLE=1`
   to mute it for production-style runs.
-- **`vz vsock connectToPort failed`**: the in-VM listener for that
-  port hasn't bound yet. The bridge retries with backoff for ~15s; a
-  permanent failure usually means the kernel is missing
-  `CONFIG_VIRTIO_VSOCKETS=y` (see Step 1).
+- **`console pump ended with error`**: the host UDS connection
+  closed mid-stream. Usually benign — the consumer (coord's
+  start_agent / exec_stream) finished its work and disconnected.
+- **`/dev/hvcN: open failed`** in guest logs: the kernel's
+  virtio-console driver didn't enumerate the configured port. Run
+  `ls /sys/class/virtio-ports/` from the guest to confirm port
+  names; check that `CONFIG_VIRTIO_CONSOLE=y` is set.
 - **Smoke test the plumbing without a real kernel**:
   `cargo nextest run -p engram-sandbox-vz` exercises VZ
   config-build through `validateWithError:`. The
@@ -155,12 +160,13 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
 
 - ✅ Coord wiring + `--sandbox-backend=vz` flag.
 - ✅ VM lifecycle: create, start, stop, destroy.
-- ✅ Vsock UDS bridge: ports 1024 (agentd), 1025 (bootstrap),
-  1026 (harness) with full retry/backoff during kernel boot.
+- ✅ Multi-port virtio-console bridge: ports 1024 (agentd),
+  1025 (bootstrap), 1026 (harness). Universal kernel support —
+  no `CONFIG_VIRTIO_VSOCKETS=y` needed.
 - ✅ Snapshot/restore via `saveMachineStateToURL` /
   `restoreMachineStateFromURL`.
 - ✅ Bake pipeline: aarch64 cross-compile → docker buildx →
   ext4 → 512-byte aligned.
 - ✅ Codesign step.
-- ⚠️  End-to-end demo blocked on a vsock-capable arm64 kernel
-  (Ubuntu generic kernel doesn't qualify — see Step 1).
+- ✅ End-to-end demo runs on the standard Ubuntu cloud-image
+  kernel.
