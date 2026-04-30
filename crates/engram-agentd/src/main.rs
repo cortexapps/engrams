@@ -5,11 +5,16 @@
 //! - `--listen unix:///path/to/sock` — Unix-domain socket. Used by the
 //!   integration tests on dev hosts (where the host connects directly
 //!   to the same UDS path our process bound).
-//! - `--vsock-port <PORT>` — AF_VSOCK listener (Linux-only). The
-//!   production deployment: this binary is baked into the rootfs at
-//!   `/sbin/engram-agentd`, the boot init exec's it, Firecracker
-//!   proxies `<vsock_uds>_<PORT>` ↔ guest port. The host's
-//!   `FirecrackerBackend::exec_stream` connects to that proxy.
+//! - `--port <PORT>` — host↔guest transport listener (Linux-only),
+//!   selected at runtime by [`engram_transport::from_env`] reading
+//!   `ENGRAM_TRANSPORT`. Two impls:
+//!   - `vsock` (default; Firecracker production path) — listens on
+//!     AF_VSOCK port `<PORT>`, host dials via FC's vsock proxy.
+//!   - `console` (VZ on Apple Silicon) — opens
+//!     `/dev/hvc<N>` for the well-known port mapping; host pairs
+//!     bytes via VZVirtioConsoleDevice + NSFileHandle. See
+//!     `crates/engram-transport/src/console.rs` for the port→hvc
+//!     map.
 //!
 //! On SIGTERM/SIGINT the accept loop stops taking new connections;
 //! in-flight execs continue until they exit naturally (no
@@ -57,11 +62,14 @@ fn main() -> ExitCode {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Vsock(u32) field is only read on Linux; on other targets
-                    // the variant just produces a clean "Unsupported" error
+#[allow(dead_code)] // Transport(u32) field is only read on Linux; on other
+                    // targets the variant just produces a clean
+                    // "Unsupported" error from engram_transport::from_env
 enum Listen {
     Unix(PathBuf),
-    Vsock(u32),
+    /// `--port <PORT>` — listen via the transport selected by
+    /// `ENGRAM_TRANSPORT` (vsock or virtio-console).
+    Transport(u32),
 }
 
 #[derive(Debug)]
@@ -94,17 +102,20 @@ fn parse_args() -> Result<Args, String> {
                 })?;
                 listen = Some(Listen::Unix(PathBuf::from(path)));
             }
-            "--vsock-port" => {
+            "--port" | "--vsock-port" => {
+                // `--vsock-port` retained as a deprecated alias for
+                // back-compat with existing FC bakes that hardcode
+                // it. Prefer `--port` going forward.
                 if listen.is_some() {
-                    return Err("--listen and --vsock-port are mutually exclusive".into());
+                    return Err("--listen and --port are mutually exclusive".into());
                 }
                 let v = argv
                     .next()
-                    .ok_or_else(|| "--vsock-port requires a value".to_string())?;
+                    .ok_or_else(|| format!("{arg} requires a value"))?;
                 let port: u32 = v
                     .parse()
-                    .map_err(|e| format!("--vsock-port must be a u32: {e}"))?;
-                listen = Some(Listen::Vsock(port));
+                    .map_err(|e| format!("{arg} must be a u32: {e}"))?;
+                listen = Some(Listen::Transport(port));
             }
             "--token" => {
                 let v = argv
@@ -114,10 +125,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "engram-agentd [--listen unix:///path/to/sock | --vsock-port <PORT>] \\\n  \
+                    "engram-agentd [--listen unix:///path/to/sock | --port <PORT>] \\\n  \
                      [--token <T>]\n\n\
                      In-guest exec daemon. Accepts WireExecRequest frames,\n\
                      runs commands, streams stdout/stderr/exit back.\n\n\
+                     `--port` listens via ENGRAM_TRANSPORT (vsock|console).\n\
+                     `--vsock-port` is a deprecated alias retained for FC bakes.\n\n\
                      With --token, the host must send a WireHandshake with\n\
                      the matching token before WireExecRequest is accepted.\n\
                      Falls back to ENGRAM_AGENT_TOKEN, then engram_token=<T>\n\
@@ -128,7 +141,7 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    let listen = listen.ok_or_else(|| "one of --listen or --vsock-port is required".to_string())?;
+    let listen = listen.ok_or_else(|| "one of --listen or --port is required".to_string())?;
     let token = token
         .or_else(|| std::env::var("ENGRAM_AGENT_TOKEN").ok())
         .or_else(token_from_kernel_cmdline);
@@ -162,13 +175,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     }
     match args.listen {
         Listen::Unix(path) => run_unix(path, token).await,
-        #[cfg(target_os = "linux")]
-        Listen::Vsock(port) => run_vsock(port, token).await,
-        #[cfg(not(target_os = "linux"))]
-        Listen::Vsock(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "--vsock-port is Linux-only (AF_VSOCK)",
-        )),
+        Listen::Transport(port) => run_transport(port, token).await,
     }
 }
 
@@ -195,19 +202,23 @@ async fn run_unix(listen_path: PathBuf, token: Option<String>) -> std::io::Resul
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn run_vsock(port: u32, token: Option<String>) -> std::io::Result<()> {
-    use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
-
-    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
-    tracing::info!(port, "engram-agentd listening (vsock)");
+/// Listen via the runtime-selected transport (vsock or
+/// virtio-console). Each accepted connection is handed to a fresh
+/// `serve_connection` task; vsock yields concurrent streams as
+/// expected, console reopens `/dev/hvcN` per accept and effectively
+/// serializes (one exec at a time per port).
+async fn run_transport(port: u32, token: Option<String>) -> std::io::Result<()> {
+    let transport = engram_transport::from_env()?;
+    let mut listener = transport.listen(port).await?;
+    let kind = std::env::var("ENGRAM_TRANSPORT").unwrap_or_else(|_| "vsock".into());
+    tracing::info!(port, transport = %kind, "engram-agentd listening");
 
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _addr)) => spawn_serve(stream, token.clone()),
-                Err(e) => tracing::warn!(error = %e, "vsock accept failed"),
+                Ok(stream) => spawn_serve(stream, token.clone()),
+                Err(e) => tracing::warn!(error = %e, "transport accept failed"),
             },
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received; closing listener");

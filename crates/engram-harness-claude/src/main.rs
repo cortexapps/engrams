@@ -58,9 +58,12 @@ mod adapter {
         #[arg(long, env = "ENGRAM_HARNESS_ADDR", conflicts_with = "vsock_host")]
         pub connect: Option<String>,
 
-        /// Vsock port on the host (CID = `VMADDR_CID_HOST`, 2). FC
-        /// dev path. Mutually exclusive with `--connect`.
-        #[arg(long, env = "ENGRAM_HARNESS_VSOCK_HOST")]
+        /// In-VM transport port on the host. Used when the harness
+        /// runs inside a microVM — `engram-transport` reads
+        /// `ENGRAM_TRANSPORT` (vsock|console) and dials accordingly.
+        /// Mutually exclusive with `--connect`. `--vsock-host` is a
+        /// deprecated alias kept for back-compat with FC bakes.
+        #[arg(long = "port", alias = "vsock-host", env = "ENGRAM_HARNESS_VSOCK_HOST")]
         pub vsock_host: Option<u32>,
 
         /// Engram session id (from `ENGRAM_SESSION_ID`). Sent in
@@ -105,9 +108,11 @@ mod adapter {
             "claude harness starting",
         );
 
-        // CLI dispatch: TCP loopback (Process backend) vs vsock (FC).
+        // CLI dispatch: TCP loopback (Process backend) vs in-VM
+        // transport (FC vsock or VZ virtio-console — selected by
+        // ENGRAM_TRANSPORT).
         if !((cli.connect.is_some()) ^ (cli.vsock_host.is_some())) {
-            tracing::error!("provide exactly one of --connect or --vsock-host");
+            tracing::error!("provide exactly one of --connect or --port");
             return ExitCode::from(2);
         }
 
@@ -188,21 +193,22 @@ mod adapter {
                     None
                 }
             },
-            (None, Some(port)) => {
-                use tokio_vsock::{VsockAddr, VMADDR_CID_HOST};
-                match tokio_vsock::VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, port))
-                    .await
-                {
-                    Ok(s) => {
-                        let (r, w) = tokio::io::split(s);
+            (None, Some(port)) => match engram_transport::from_env() {
+                Ok(transport) => match transport.dial(port).await {
+                    Ok(stream) => {
+                        let (r, w) = tokio::io::split(stream);
                         Some((Box::new(r), Box::new(w)))
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, port, "vsock dial failed");
+                        tracing::error!(error = %e, port, "transport dial failed");
                         None
                     }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "build transport from ENGRAM_TRANSPORT failed");
+                    None
                 }
-            }
+            },
             _ => unreachable!("validated in entry()"),
         }
     }

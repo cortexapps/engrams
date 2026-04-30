@@ -20,11 +20,9 @@ path = "src/main.rs"
 clap.workspace = true
 engram-core.workspace = true
 engram-harness-proto.workspace = true
+engram-transport.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-vsock = "0.7"

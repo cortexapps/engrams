@@ -22,15 +22,16 @@ use engram_harness_noop::{run, NoopConfig, NoopOutcome};
 struct Cli {
     /// Hub address: `host:port`. The host-agent's TCP harness
     /// listener (ProcessBackend dev path). Mutually exclusive with
-    /// `--vsock-host` — provide exactly one.
+    /// `--port` — provide exactly one.
     #[arg(long, env = "ENGRAM_HARNESS_ADDR", conflicts_with = "vsock_host")]
     connect: Option<String>,
 
-    /// Vsock port on the host (CID = `VMADDR_CID_HOST`, 2). Used
-    /// when the harness runs inside a Firecracker guest — the host
-    /// pre-binds a UDS at `<vsock_uds>_<port>.sock` and the guest
-    /// dials it. Mutually exclusive with `--connect`.
-    #[arg(long, env = "ENGRAM_HARNESS_VSOCK_HOST")]
+    /// In-VM transport port on the host. Used when the harness runs
+    /// inside a microVM — `engram-transport` reads `ENGRAM_TRANSPORT`
+    /// (vsock|console) and dials accordingly. Mutually exclusive
+    /// with `--connect`. `--vsock-host` is a deprecated alias kept
+    /// for back-compat with existing FC bakes.
+    #[arg(long = "port", alias = "vsock-host", env = "ENGRAM_HARNESS_VSOCK_HOST")]
     vsock_host: Option<u32>,
 
     /// Session id this harness is attached to. The host-agent
@@ -98,8 +99,9 @@ async fn main() -> ExitCode {
     }
 
     // Dial the hub. Two flavors:
-    //   --connect host:port      → TCP loopback (ProcessBackend dev)
-    //   --vsock-host <port>      → AF_VSOCK CID=VMADDR_CID_HOST (FC guest)
+    //   --connect host:port  → TCP loopback (ProcessBackend dev)
+    //   --port <port>        → in-VM transport selected by
+    //                          ENGRAM_TRANSPORT (vsock|console)
     // clap rejects "neither" / "both" via `conflicts_with`; the
     // outer match here covers the two valid shapes.
     let outcome = match (cli.connect.as_deref(), cli.vsock_host) {
@@ -113,9 +115,9 @@ async fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        (None, Some(port)) => dial_vsock_and_run(port, cfg).await,
+        (None, Some(port)) => dial_transport_and_run(port, cfg).await,
         _ => {
-            tracing::error!("provide exactly one of --connect or --vsock-host");
+            tracing::error!("provide exactly one of --connect or --port");
             return ExitCode::from(2);
         }
     };
@@ -140,35 +142,18 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Dial AF_VSOCK CID=VMADDR_CID_HOST (2) on `port` and run the noop
-/// session against the resulting stream. Linux-only; non-Linux builds
-/// of the binary won't expose this code path because clap's
-/// `--vsock-host` flag is rejected at parse time when the feature
-/// isn't compiled in.
-#[cfg(target_os = "linux")]
-async fn dial_vsock_and_run(
+/// Dial the host on `port` via the runtime-selected transport (vsock
+/// or virtio-console — see `engram-transport`). Linux-only; on
+/// non-Linux hosts `engram_transport::from_env` returns
+/// `ErrorKind::Unsupported`.
+async fn dial_transport_and_run(
     port: u32,
     cfg: NoopConfig,
 ) -> Result<NoopOutcome, engram_harness_noop::NoopError> {
-    use tokio_vsock::{VsockAddr, VsockStream, VMADDR_CID_HOST};
-    let addr = VsockAddr::new(VMADDR_CID_HOST, port);
-    let stream = match VsockStream::connect(addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, port, "vsock dial failed");
-            return Err(engram_harness_noop::NoopError::Io(e));
-        }
-    };
+    let transport = engram_transport::from_env().map_err(engram_harness_noop::NoopError::Io)?;
+    let stream = transport.dial(port).await.map_err(|e| {
+        tracing::error!(error = %e, port, "transport dial failed");
+        engram_harness_noop::NoopError::Io(e)
+    })?;
     run(stream, cfg).await
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn dial_vsock_and_run(
-    _port: u32,
-    _cfg: NoopConfig,
-) -> Result<NoopOutcome, engram_harness_noop::NoopError> {
-    Err(engram_harness_noop::NoopError::Io(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "AF_VSOCK is Linux-only; --vsock-host won't work here",
-    )))
 }

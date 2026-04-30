@@ -19,6 +19,7 @@ members = [
     "crates/engram-harness-claude",
     "crates/engram-harness-noop",
     "crates/engram-harness-proto",
+    "crates/engram-transport",
     "crates/engram-secrets-dev",
     "crates/engram-secrets-gcp",
     "crates/engram-postgres",
@@ -46,6 +47,7 @@ engram-cloud-static = { path = "crates/engram-cloud-static" }
 engram-cloud-mock = { path = "crates/engram-cloud-mock" }
 engram-harness-noop = { path = "crates/engram-harness-noop" }
 engram-harness-proto = { path = "crates/engram-harness-proto" }
+engram-transport = { path = "crates/engram-transport" }
 engram-host-agent = { path = "crates/engram-host-agent" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }

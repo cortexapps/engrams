@@ -1,0 +1,21 @@
+[package]
+name = "engram-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-guest host↔guest byte-stream transport. Two impls: vsock (Firecracker) and virtio-console (Apple Virtualization.framework). Selected at runtime via ENGRAM_TRANSPORT."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# vsock is a Linux-only kernel feature. Both transports compile only
+# on Linux; on macOS / other hosts the crate is an empty shell so the
+# workspace cargo check stays green everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.7"

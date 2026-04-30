@@ -18,16 +18,11 @@ path = "src/main.rs"
 
 [dependencies]
 bincode.workspace = true
+engram-transport.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-# AF_VSOCK listener for in-guest deployments. Linux-only; on macOS the
-# binary still builds (workspace `cargo check` passes) but `--vsock-port`
-# returns a clear "not supported on this OS" at runtime.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-vsock = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

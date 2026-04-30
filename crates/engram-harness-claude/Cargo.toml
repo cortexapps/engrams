@@ -13,13 +13,11 @@ workspace = true
 name = "engram-harness-claude"
 path = "src/main.rs"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-vsock = "0.7"
-
 [dependencies]
 clap.workspace = true
 engram-core.workspace = true
 engram-harness-proto.workspace = true
+engram-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "rt", "macros", "time", "sync", "fs", "net"] }

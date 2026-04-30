@@ -563,10 +563,10 @@ name = "engram-agentd"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "engram-transport",
  "serde",
  "tempfile",
  "tokio",
- "tokio-vsock",
  "tracing",
  "tracing-subscriber",
 ]
@@ -576,8 +576,8 @@ name = "engram-bootstrap"
 version = "0.1.0"
 dependencies = [
  "engram-harness-proto",
+ "engram-transport",
  "tokio",
- "tokio-vsock",
  "tracing",
  "tracing-subscriber",
 ]
@@ -703,10 +703,10 @@ dependencies = [
  "clap",
  "engram-core",
  "engram-harness-proto",
+ "engram-transport",
  "serde",
  "serde_json",
  "tokio",
- "tokio-vsock",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -719,9 +719,9 @@ dependencies = [
  "clap",
  "engram-core",
  "engram-harness-proto",
+ "engram-transport",
  "serde",
  "tokio",
- "tokio-vsock",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -915,6 +915,16 @@ dependencies = [
  "async-trait",
  "engram-core",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "engram-transport"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "tokio-vsock",
  "tracing",
 ]
 
