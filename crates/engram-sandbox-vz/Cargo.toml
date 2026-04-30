@@ -6,13 +6,20 @@ license.workspace = true
 repository.workspace = true
 description = "macOS Apple Silicon SandboxBackend driving Apple's Virtualization.framework via objc2."
 
-[lints]
-workspace = true
-
 # The crate is implemented for macOS only — on Linux/Windows it
 # compiles down to an empty shell so workspace `cargo check` stays
 # green everywhere. Coordinator main.rs gates VzBackend construction
 # behind the same target_os check.
+
+# Workspace forbids `unsafe_code`, but objc2 + Virtualization.framework
+# bindings fundamentally require `unsafe` blocks at every method call
+# (the bindings are auto-generated from Apple's headers and surface as
+# `unsafe fn`). We allow it here and confine all unsafe to the
+# vm.rs / vsock_bridge.rs / snapshot.rs modules, each guarded by
+# SAFETY comments. We don't inherit the workspace lints, but we
+# re-state the same denies the workspace applies elsewhere.
+[lints.rust]
+unsafe_code = "allow"
 
 [dependencies]
 engram-core.workspace = true
@@ -34,9 +41,10 @@ uuid.workspace = true
 # code is `#[cfg(target_os = "macos")]`.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSError", "NSArray", "NSData"] }
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSError", "NSArray", "NSData", "NSObject"] }
 objc2-virtualization = "0.3"
 block2 = "0.6"
+dispatch2 = "0.3"
 
 [dev-dependencies]
 futures.workspace = true

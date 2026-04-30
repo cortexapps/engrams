@@ -19,6 +19,8 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use parking_lot::Mutex;
 
+use crate::vm::{VmConfig, VzVm};
+
 /// Static config for the VZ backend — values that are the same for
 /// every sandbox the backend creates. Per-sandbox overrides ride on
 /// `SandboxSpec` (cpu/memory/disk).
@@ -47,15 +49,19 @@ impl VzConfig {
     }
 }
 
-/// Per-sandbox state owned by `VzBackend`. The actual `VZVirtualMachine`
-/// pointer goes here once task 27 lands; until then this carries the
-/// spec + UDS paths so other lifecycle calls have a place to look.
-#[allow(dead_code)]
+/// Per-sandbox state owned by `VzBackend`. The vsock bridge (task 28)
+/// will hang additional listener handles off this struct.
 struct VzSandboxState {
+    #[allow(dead_code)]
     spec: SandboxSpec,
+    /// Live VM. Dropping this releases the underlying ObjC objects
+    /// (config, devices, queue) once any in-flight dispatched work
+    /// completes.
+    vm: Arc<VzVm>,
     /// `<work_dir>/<sandbox_id>.vsock` — base path. The vsock UDS
     /// bridge (task 28) binds `_1024`, `_1025`, `_1026` listeners
     /// next to it.
+    #[allow(dead_code)]
     vsock_uds_path: PathBuf,
 }
 
@@ -101,31 +107,73 @@ impl VzBackend {
         &self.cfg
     }
 
-    // Used by `create()` (task 27) and a unit test today. The
-    // `allow(dead_code)` lasts until task 27 wires up the real
-    // create path.
-    #[allow(dead_code)]
     fn vsock_uds_path_for(&self, id: SandboxId) -> PathBuf {
         self.work_dir.join(format!("{id}.vsock"))
     }
 }
 
-// Helper to keep the "not yet implemented" message short and
-// uniform. Each method body lands in its target task; once they all
-// land this helper goes away.
+// Helper for the methods that still aren't implemented (snapshot,
+// restore, exec_stream, start_agent — each lands in tasks 28/29).
 fn unimpl(method: &str) -> SandboxError {
     SandboxError::Vm(
-        format!(
-            "VzBackend::{method} not yet implemented (see plan tasks 27/28/29)"
-        )
-        .into(),
+        format!("VzBackend::{method} not yet implemented (see plan tasks 28/29)").into(),
     )
 }
 
 #[async_trait]
 impl SandboxBackend for VzBackend {
-    async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        Err(unimpl("create"))
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        let rootfs = spec.rootfs_source.clone().ok_or_else(|| {
+            SandboxError::InvalidSpec(
+                "VzBackend requires SandboxSpec.rootfs_source — point it at the ext4 \
+                 rootfs produced by `just vz-bake-claude`"
+                    .into(),
+            )
+        })?;
+        // Validate up front rather than letting VZ surface a less
+        // specific NSError later.
+        if !rootfs.exists() {
+            return Err(SandboxError::InvalidSpec(format!(
+                "vz rootfs not found at {} — bake an image with `just vz-bake-claude` and \
+                 point SandboxSpec.rootfs_source at it",
+                rootfs.display()
+            )));
+        }
+
+        let memory_mib = if spec.memory.max_mib > 0 {
+            spec.memory.max_mib
+        } else {
+            self.cfg.default_memory_mib
+        };
+        let vcpus = if spec.cpu.vcpus > 0 {
+            spec.cpu.vcpus
+        } else {
+            self.cfg.default_vcpus
+        };
+
+        // Make sure the work_dir exists so the per-sandbox UDS
+        // base path has somewhere to live (the vsock bridge in
+        // task 28 binds listeners under it).
+        tokio::fs::create_dir_all(&self.work_dir).await?;
+
+        let vm_cfg = VmConfig::new(self.cfg.kernel_path.clone(), rootfs, memory_mib, vcpus);
+        let vm = VzVm::new(vm_cfg)?;
+
+        // Start the VM; if start fails, drop the VM via the early
+        // return (no half-registered state in the sandboxes map).
+        vm.start().await?;
+
+        let id = SandboxId::new();
+        let vsock_uds_path = self.vsock_uds_path_for(id);
+        self.sandboxes.insert(
+            id,
+            VzSandboxState {
+                spec,
+                vm: Arc::new(vm),
+                vsock_uds_path,
+            },
+        );
+        Ok(id)
     }
 
     async fn start_agent(
@@ -133,6 +181,9 @@ impl SandboxBackend for VzBackend {
         _id: SandboxId,
         _agent: AgentSpec,
     ) -> Result<(), SandboxError> {
+        // Lands with the vsock UDS bridge in task 28 — sends
+        // BootstrapLaunch over `<vsock_uds>_1025` to the in-VM
+        // bootstrap supervisor, same wire as Firecracker.
         Err(unimpl("start_agent"))
     }
 
@@ -145,6 +196,8 @@ impl SandboxBackend for VzBackend {
         _id: SandboxId,
         _cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        // Lands with the vsock UDS bridge in task 28 — dials
+        // `<vsock_uds>_1024` for the engram-agentd handshake.
         Err(unimpl("exec_stream"))
     }
 
@@ -160,19 +213,37 @@ impl SandboxBackend for VzBackend {
         Err(unimpl("restore"))
     }
 
-    async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
-        Err(unimpl("destroy"))
+    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let Some((_, state)) = self.sandboxes.remove(&id) else {
+            return Err(SandboxError::NotFound);
+        };
+        // Best-effort stop. If the VM is already stopped or in a
+        // state that can't accept stop (e.g. failed-to-start),
+        // VZ surfaces an NSError; we log and continue, since the
+        // observable goal of `destroy` is "this sandbox is gone."
+        if let Err(e) = state.vm.stop().await {
+            tracing::warn!(error = %e, sandbox_id = %id, "vz stop returned an error; releasing handle anyway");
+        }
+        // Best-effort cleanup of the per-sandbox UDS files. They
+        // don't exist yet (task 28 will create them), but adding
+        // the cleanup here keeps it idempotent.
+        for suffix in ["_1024", "_1025", "_1026"] {
+            let mut p = state.vsock_uds_path.clone();
+            let mut name = p.file_name().unwrap_or_default().to_owned();
+            name.push(suffix);
+            p.set_file_name(name);
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        // `state` (and the Arc<VzVm> inside) drops here — release
+        // ObjC retains.
+        drop(state);
+        Ok(())
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|kv| *kv.key()).collect())
     }
 }
-
-// Quiet `clippy::needless_pass_by_ref` and similar on the empty
-// impls without disabling the lints workspace-wide.
-#[allow(dead_code)]
-fn _force_arc_use_so_the_skeleton_compiles_with_set_harness_sink(_: &Arc<()>) {}
 
 #[cfg(test)]
 mod tests {

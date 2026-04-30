@@ -34,6 +34,9 @@
 mod backend;
 
 #[cfg(target_os = "macos")]
+mod vm;
+
+#[cfg(target_os = "macos")]
 pub use backend::{VzBackend, VzConfig};
 
 #[cfg(not(target_os = "macos"))]
