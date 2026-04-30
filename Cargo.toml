@@ -11,6 +11,7 @@ members = [
     "crates/engram-uffd-handler",
     "crates/engram-sandbox-firecracker",
     "crates/engram-sandbox-process",
+    "crates/engram-sandbox-vz",
     "crates/engram-cloud-gcp",
     "crates/engram-cloud-static",
     "crates/engram-cloud-mock",
@@ -39,6 +40,7 @@ engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
+engram-sandbox-vz = { path = "crates/engram-sandbox-vz" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
 engram-cloud-static = { path = "crates/engram-cloud-static" }
 engram-cloud-mock = { path = "crates/engram-cloud-mock" }

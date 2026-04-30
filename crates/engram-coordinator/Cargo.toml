@@ -22,6 +22,7 @@ engram-protocol.workspace = true
 engram-postgres.workspace = true
 engram-host-agent.workspace = true
 engram-sandbox-firecracker.workspace = true
+engram-sandbox-vz.workspace = true
 engram-cloud-static.workspace = true
 engram-cloud-gcp.workspace = true
 engram-cloud-mock.workspace = true

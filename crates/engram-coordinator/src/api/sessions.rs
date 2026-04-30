@@ -457,12 +457,15 @@ pub(crate) fn build_dev_agent(
                 session_id.to_string(),
             ]
         }
-        SandboxBackendChoice::Firecracker => {
-            // FC path — guest dials AF_VSOCK CID=2 on the harness
-            // port. Inside the rootfs, `bin` is whatever path
-            // `engram image build --inject-harness <name>=...`
-            // landed at, so the host's `dev_*_harness_path` should
-            // point at the in-rootfs path, not a host filesystem path.
+        SandboxBackendChoice::Firecracker | SandboxBackendChoice::Vz => {
+            // microVM path (FC on Linux/KVM, Apple VZ on macOS) — guest
+            // dials AF_VSOCK CID=2 on the harness port. Inside the
+            // rootfs, `bin` is whatever path `engram image build
+            // --inject-harness <name>=...` landed at, so the host's
+            // `dev_*_harness_path` should point at the in-rootfs path,
+            // not a host filesystem path. The argv shape is identical
+            // for FC and VZ — the bootstrap supervisor consumes the
+            // same `BootstrapLaunch` wire on both backends.
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
                 bin,

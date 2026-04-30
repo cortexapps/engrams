@@ -137,12 +137,19 @@ impl CloudBackendChoice {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxBackendChoice {
-    /// Production: Firecracker microVMs (Linux + KVM). Real isolation,
-    /// real resource enforcement, real snapshot/restore.
+    /// Production on Linux: Firecracker microVMs (KVM-only). Real
+    /// isolation, real resource enforcement, real snapshot/restore.
     Firecracker,
+    /// Production on macOS Apple Silicon: Apple Virtualization.framework
+    /// via the `engram-sandbox-vz` crate. Same wire surface as
+    /// Firecracker (vsock UDS at `<work_dir>/<sid>.vsock_*`), full
+    /// memory snapshot/restore via `saveMachineStateTo`. Coord binary
+    /// must carry the `com.apple.security.virtualization` entitlement
+    /// (see `just vz-codesign`).
+    Vz,
     /// Local dev: plain host subprocesses, no isolation. Lets the
-    /// orchestrator run end-to-end on any platform — including macOS
-    /// Apple Silicon — without a VMM. NEVER use in deployment.
+    /// orchestrator run end-to-end on any platform without a VMM.
+    /// NEVER use in deployment.
     Process,
 }
 
@@ -150,6 +157,7 @@ impl SandboxBackendChoice {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "firecracker" => Ok(Self::Firecracker),
+            "vz" => Ok(Self::Vz),
             "process" => Ok(Self::Process),
             other => Err(format!("invalid sandbox backend: {other}")),
         }
@@ -207,6 +215,10 @@ mod tests {
             SandboxBackendChoice::Firecracker,
         );
         assert_eq!(
+            SandboxBackendChoice::parse("vz").unwrap(),
+            SandboxBackendChoice::Vz,
+        );
+        assert_eq!(
             SandboxBackendChoice::parse("process").unwrap(),
             SandboxBackendChoice::Process,
         );
@@ -214,6 +226,7 @@ mod tests {
         // committed to Firecracker for production.
         assert!(SandboxBackendChoice::parse("microsandbox").is_err());
         assert!(SandboxBackendChoice::parse("kata").is_err());
+        assert!(SandboxBackendChoice::parse("vfkit").is_err());
     }
 
     #[test]

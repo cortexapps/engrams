@@ -72,6 +72,13 @@ struct Cli {
     #[arg(long, env = "ENGRAM_KERNEL_IMAGE_PATH")]
     kernel_image_path: Option<PathBuf>,
 
+    /// Path to an arm64 Linux kernel image VZ (Virtualization.framework)
+    /// can boot. Required when `--sandbox-backend=vz`; ignored
+    /// otherwise. Default points at `~/.cache/engram-vz-test/vmlinuz-arm64`,
+    /// the location `just vz-bake-kernel` populates.
+    #[arg(long, env = "ENGRAM_VZ_KERNEL_PATH")]
+    vz_kernel_path: Option<PathBuf>,
+
     /// Target warm-pool size per (repo, image_version). 0 = disable.
     #[arg(long, env = "ENGRAM_WARM_POOL_SIZE", default_value_t = 1)]
     warm_pool_size: u32,
@@ -223,6 +230,38 @@ async fn main() -> Result<(), CoordinatorError> {
                     fc_cfg,
                 ))
             }
+            SandboxBackendChoice::Vz => {
+                #[cfg(target_os = "macos")]
+                {
+                    let kernel = cli
+                        .vz_kernel_path
+                        .clone()
+                        .or_else(default_vz_kernel_path)
+                        .ok_or_else(|| {
+                            CoordinatorError::Config(
+                                "ENGRAM_VZ_KERNEL_PATH (or --vz-kernel-path) is required when \
+                                 --sandbox-backend=vz; default location \
+                                 ~/.cache/engram-vz-test/vmlinuz-arm64 does not exist (run \
+                                 `just vz-bake-kernel`)"
+                                    .into(),
+                            )
+                        })?;
+                    let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
+                    Arc::new(
+                        engram_sandbox_vz::VzBackend::new(cli.sandbox_work_dir.clone(), vz_cfg)
+                            .map_err(|e| CoordinatorError::Config(format!("vz backend: {e}")))?,
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(CoordinatorError::Config(
+                        "--sandbox-backend=vz only runs on macOS Apple Silicon. Use \
+                         --sandbox-backend=firecracker on Linux or --sandbox-backend=process \
+                         for dev"
+                            .into(),
+                    ));
+                }
+            }
             SandboxBackendChoice::Process => {
                 tracing::warn!(
                     "starting with --sandbox-backend=process: commands will run as host \
@@ -341,6 +380,24 @@ fn default_dev_harness_path(bin: &str) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     let candidate = dir.join(bin);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Default location for the arm64 Linux kernel `engram-sandbox-vz`
+/// boots: `~/.cache/engram-vz-test/vmlinuz-arm64`. Returns `None` if
+/// `$HOME` isn't set or the file doesn't exist; the caller surfaces
+/// a config error pointing at `just vz-bake-kernel`.
+#[cfg(target_os = "macos")]
+fn default_vz_kernel_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let candidate = std::path::PathBuf::from(home)
+        .join(".cache")
+        .join("engram-vz-test")
+        .join("vmlinuz-arm64");
     if candidate.exists() {
         Some(candidate)
     } else {
