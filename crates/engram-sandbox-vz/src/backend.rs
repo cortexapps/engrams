@@ -9,18 +9,31 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
+use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
 use engram_core::traits::sandbox::{HarnessSink, SandboxBackend};
 use engram_core::types::ids::SandboxId;
-use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use parking_lot::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::vm::{VmConfig, VzVm};
-use crate::vsock_bridge::VsockBridge;
+use crate::vsock_bridge::{port_uds_path, VsockBridge};
+
+/// Vsock port engram-agentd binds inside the rootfs. Same number FC
+/// uses; the in-VM binary doesn't know which VMM is hosting it.
+const ENGRAM_AGENTD_PORT: u32 = 1024;
 
 /// Static config for the VZ backend — values that are the same for
 /// every sandbox the backend creates. Per-sandbox overrides ride on
@@ -116,12 +129,76 @@ impl VzBackend {
     }
 }
 
-// Helper for the methods that still aren't implemented (snapshot,
-// restore, exec_stream, start_agent — each lands in tasks 28/29).
+// Helper for the methods that still aren't implemented
+// (snapshot/restore — each lands in task 29).
 fn unimpl(method: &str) -> SandboxError {
     SandboxError::Vm(
-        format!("VzBackend::{method} not yet implemented (see plan tasks 28/29)").into(),
+        format!("VzBackend::{method} not yet implemented (see plan task 29)").into(),
     )
+}
+
+/// Adapter that runs the engram-agentd wire protocol against a
+/// pre-connected byte stream. Mirrors the FC backend's
+/// `drive_exec_protocol` — the protocol is VMM-independent (it's
+/// defined in `engram-agentd`'s wire types), so the implementation
+/// is identical bar the connection setup. Future refactor:
+/// hoist this into a shared crate.
+async fn drive_exec_protocol<R, W>(
+    sandbox_id: SandboxId,
+    mut reader: R,
+    mut writer: W,
+    cmd: ExecRequest,
+) -> Result<ExecStream, SandboxError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let req = WireRequest::Exec(WireExecRequest {
+        command: cmd.command,
+        stdin: cmd.stdin,
+        env: cmd.env,
+        workdir: cmd.workdir,
+        timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
+    });
+    write_msg(&mut writer, &req)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("send WireRequest::Exec: {e}").into()))?;
+
+    let exec_id = format!("vz-{}", uuid::Uuid::new_v4().simple());
+    let (tx, rx) = mpsc::channel::<ExecEvent>(64);
+    tokio::spawn(async move {
+        loop {
+            match read_msg::<_, WireExecEvent>(&mut reader).await {
+                Ok(WireExecEvent::Stdout(b)) => {
+                    if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(WireExecEvent::Stderr(b)) => {
+                    if tx.send(ExecEvent::Stderr(Bytes::from(b))).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(WireExecEvent::Exit(code)) => {
+                    let _ = tx.send(ExecEvent::Exit(code)).await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "vz agent connection ended without explicit Exit",
+                    );
+                    let _ = tx.send(ExecEvent::Exit(None)).await;
+                    return;
+                }
+            }
+        }
+    });
+    Ok(ExecStream {
+        sandbox_id,
+        exec_id,
+        events: Box::pin(ReceiverStream::new(rx)),
+    })
 }
 
 #[async_trait]
@@ -207,13 +284,55 @@ impl SandboxBackend for VzBackend {
 
     async fn start_agent(
         &self,
-        _id: SandboxId,
-        _agent: AgentSpec,
+        id: SandboxId,
+        agent: AgentSpec,
     ) -> Result<(), SandboxError> {
-        // Lands with the vsock UDS bridge in task 28 — sends
-        // BootstrapLaunch over `<vsock_uds>_1025` to the in-VM
-        // bootstrap supervisor, same wire as Firecracker.
-        Err(unimpl("start_agent"))
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let bootstrap_uds = port_uds_path(
+            &vsock_uds_path,
+            engram_harness_proto::BOOTSTRAP_VSOCK_PORT,
+        );
+        // The in-VM bootstrap supervisor takes a few seconds to
+        // come up after VM boot — same race FC handles. Retry the
+        // dial with backoff for ~15s before giving up. Bridge bind
+        // already happened in `create`, so the UDS exists; what
+        // can fail is the dial-through to the guest until bootstrap
+        // accept()s on port 1025.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut backoff = Duration::from_millis(100);
+        let mut conn = loop {
+            match UnixStream::connect(&bootstrap_uds).await {
+                Ok(c) => break c,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(SandboxError::Vm(
+                            format!(
+                                "connect bootstrap UDS {}: {e}",
+                                bootstrap_uds.display()
+                            )
+                            .into(),
+                        ));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+            }
+        };
+        let launch = engram_harness_proto::BootstrapLaunch {
+            argv: agent.argv,
+            env: agent.env.into_iter().collect(),
+        };
+        engram_harness_proto::write_msg(&mut conn, &launch)
+            .await
+            .map_err(|e| {
+                SandboxError::Vm(format!("write BootstrapLaunch: {e}").into())
+            })?;
+        // Best-effort flush; bootstrap closes its end after exec.
+        let _ = conn.shutdown().await;
+        Ok(())
     }
 
     fn set_harness_sink(&self, sink: HarnessSink) {
@@ -222,12 +341,39 @@ impl SandboxBackend for VzBackend {
 
     async fn exec_stream(
         &self,
-        _id: SandboxId,
-        _cmd: ExecRequest,
+        id: SandboxId,
+        cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        // Lands with the vsock UDS bridge in task 28 — dials
-        // `<vsock_uds>_1024` for the engram-agentd handshake.
-        Err(unimpl("exec_stream"))
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        // Same boot-race retry as start_agent. engram-agentd inside
+        // the rootfs takes a couple of seconds to bind on vsock 1024
+        // after kernel init.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut backoff = Duration::from_millis(50);
+        let conn = loop {
+            match UnixStream::connect(&agent_uds).await {
+                Ok(c) => break c,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(SandboxError::Vm(
+                            format!(
+                                "connect engram-agentd UDS {}: {e}",
+                                agent_uds.display()
+                            )
+                            .into(),
+                        ));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+            }
+        };
+        let (reader, writer) = tokio::io::split(conn);
+        drive_exec_protocol(id, reader, writer, cmd).await
     }
 
     async fn snapshot(
