@@ -105,53 +105,123 @@ mod adapter {
             "claude harness starting",
         );
 
-        // Dial — the actual stream type differs (TcpStream vs
-        // VsockStream), so dispatch separately rather than boxing.
-        match (cli.connect.clone(), cli.vsock_host) {
-            (Some(addr), None) => {
-                let stream = match tokio::net::TcpStream::connect(&addr).await {
-                    Ok(s) => {
-                        let _ = s.set_nodelay(true);
-                        s
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, addr, "TCP dial failed");
+        // CLI dispatch: TCP loopback (Process backend) vs vsock (FC).
+        if !((cli.connect.is_some()) ^ (cli.vsock_host.is_some())) {
+            tracing::error!("provide exactly one of --connect or --vsock-host");
+            return ExitCode::from(2);
+        }
+
+        // Outer loop: dial → run one connection → if the connection
+        // dropped (FC snapshot/restore round-trip is the canonical
+        // case), back off briefly and re-dial. State that needs to
+        // survive a reconnect lives here:
+        //   - `next_prompt`: a queued user prompt the previous
+        //     connection died before we could ack/run. We carry it
+        //     forward so the user doesn't have to re-issue.
+        //   - `/workspace/.engram/claude-session-id`: persisted by
+        //     `run_one_claude_prompt`; survives because it's on disk.
+        let mut next_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+        let mut consecutive_failures: u32 = 0;
+        const MAX_BACKOFF_SECS: u64 = 30;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+        loop {
+            let stream = match dial(&cli).await {
+                Some(s) => s,
+                None => {
+                    // Dial itself failed — distinct from a mid-session
+                    // drop. With no connection, there's nothing to
+                    // reconnect *to*, so back off and retry.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!(
+                            consecutive_failures,
+                            "giving up after repeated dial failures",
+                        );
                         return ExitCode::from(1);
                     }
-                };
-                run(stream, cli).await
-            }
-            (None, Some(port)) => {
-                use tokio_vsock::{VsockAddr, VMADDR_CID_HOST};
-                let stream = match tokio_vsock::VsockStream::connect(VsockAddr::new(
-                    VMADDR_CID_HOST,
-                    port,
-                ))
-                .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(error = %e, port, "vsock dial failed");
-                        return ExitCode::from(1);
-                    }
-                };
-                run(stream, cli).await
-            }
-            _ => {
-                tracing::error!("provide exactly one of --connect or --vsock-host");
-                ExitCode::from(2)
+                    let backoff = std::cmp::min(
+                        MAX_BACKOFF_SECS,
+                        1u64 << consecutive_failures.min(5),
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    continue;
+                }
+            };
+            match run_one_connection(stream, &cli, &mut next_prompt).await {
+                Outcome::Exit(code) => return code,
+                Outcome::Reconnect { reason } => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff = std::cmp::min(
+                        MAX_BACKOFF_SECS,
+                        1u64 << consecutive_failures.min(5),
+                    );
+                    tracing::warn!(
+                        reason,
+                        consecutive_failures,
+                        backoff_secs = backoff,
+                        "harness connection dropped; reconnecting",
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                }
             }
         }
     }
 
-    async fn run<S>(stream: S, cli: Cli) -> ExitCode
-    where
-        S: AsyncRead + AsyncWrite + Send + 'static,
-    {
-        let (mut reader, writer) = tokio::io::split(stream);
+    /// Boxed stream half-pair so the outer reconnect loop can hold the
+    /// halves regardless of whether the transport was TCP or vsock.
+    type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
+    type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+    /// Dial the harness hub. Returns `None` on transport failure
+    /// (logged at error). The outer loop turns that into a backoff
+    /// retry.
+    async fn dial(cli: &Cli) -> Option<(BoxedReader, BoxedWriter)> {
+        match (cli.connect.as_deref(), cli.vsock_host) {
+            (Some(addr), None) => match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    let (r, w) = tokio::io::split(s);
+                    Some((Box::new(r), Box::new(w)))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, addr, "TCP dial failed");
+                    None
+                }
+            },
+            (None, Some(port)) => {
+                use tokio_vsock::{VsockAddr, VMADDR_CID_HOST};
+                match tokio_vsock::VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, port))
+                    .await
+                {
+                    Ok(s) => {
+                        let (r, w) = tokio::io::split(s);
+                        Some((Box::new(r), Box::new(w)))
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, port, "vsock dial failed");
+                        None
+                    }
+                }
+            }
+            _ => unreachable!("validated in entry()"),
+        }
+    }
+
+    enum Outcome {
+        /// Adapter is done — propagate this exit code up.
+        Exit(ExitCode),
+        /// Connection dropped mid-life; re-dial and continue.
+        Reconnect { reason: &'static str },
+    }
+
+    async fn run_one_connection(
+        stream: (BoxedReader, BoxedWriter),
+        cli: &Cli,
+        next_prompt: &mut Option<String>,
+    ) -> Outcome {
+        let (mut reader, mut writer) = stream;
 
         // Handshake.
-        let mut writer = writer;
         if let Err(e) = write_msg(
             &mut writer,
             &HarnessAttach {
@@ -165,23 +235,27 @@ mod adapter {
         .await
         {
             tracing::error!(error = %e, "attach write failed");
-            return ExitCode::from(1);
+            return Outcome::Reconnect { reason: "attach_write" };
         }
         let ack: HarnessAttachAck = match read_msg(&mut reader).await {
             Ok(a) => a,
             Err(e) => {
                 tracing::error!(error = %e, "attach ack read failed");
-                return ExitCode::from(1);
+                return Outcome::Reconnect { reason: "ack_read" };
             }
         };
         if !ack.ok {
+            // Host explicitly rejected — not transport flakiness, no
+            // amount of retry will fix it. Exit terminally.
             tracing::error!(message = ?ack.message, "host rejected attach");
-            return ExitCode::from(1);
+            return Outcome::Exit(ExitCode::from(1));
         }
 
         // Reader task: shovel HarnessCommands onto an mpsc; the
         // writer side stays single-threaded so event writes are
-        // serial and ordered.
+        // serial and ordered. Channel-close (sender dropped) is the
+        // signal that the reader task hit EOF — i.e. the connection
+        // is dead.
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<HarnessCommand>(8);
         let reader_task = tokio::spawn(async move {
             loop {
@@ -199,11 +273,15 @@ mod adapter {
 
         let writer = Arc::new(Mutex::new(writer));
 
-        // First run: pull the prompt from $ENGRAM_INITIAL_PROMPT if
-        // set, else emit Idle and wait for the first Prompt command.
-        let mut next_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+        // If we have a pending prompt (initial $ENGRAM_INITIAL_PROMPT,
+        // or a queued one rolled over from a dropped connection),
+        // we'll run it on this turn. Otherwise emit Idle so the host
+        // knows we're waiting.
         if next_prompt.is_none() {
-            let _ = write_event(&writer, HarnessEvent::Idle).await;
+            if write_event(&writer, HarnessEvent::Idle).await.is_err() {
+                reader_task.abort();
+                return Outcome::Reconnect { reason: "idle_write" };
+            }
         }
 
         loop {
@@ -215,7 +293,7 @@ mod adapter {
                         Some(HarnessCommand::Shutdown { .. }) => {
                             tracing::info!("shutdown received; exiting");
                             reader_task.abort();
-                            return ExitCode::SUCCESS;
+                            return Outcome::Exit(ExitCode::SUCCESS);
                         }
                         Some(HarnessCommand::Checkpoint { .. }) => {
                             // Claude writes its conversation file
@@ -223,27 +301,46 @@ mod adapter {
                             // flush.
                         }
                         None => {
-                            tracing::info!("command channel closed; exiting");
-                            return ExitCode::SUCCESS;
+                            // Reader task ended → connection died.
+                            // Reconnect rather than exit.
+                            reader_task.abort();
+                            return Outcome::Reconnect { reason: "cmd_chan_closed" };
                         }
                     }
                 },
             };
 
-            let outcome = run_one_claude_prompt(&cli, &writer, &text, &mut cmd_rx).await;
+            // Stash the prompt back into next_prompt so a mid-run
+            // disconnect re-runs it on the next connection. We clear
+            // it on successful RunCompleted+Idle below.
+            *next_prompt = Some(text.clone());
 
-            let _ = write_event(
+            let outcome = run_one_claude_prompt(cli, &writer, &text, &mut cmd_rx).await;
+
+            // Successful (or at least delivered) run — clear the
+            // pending prompt so we don't re-run it on the next turn.
+            *next_prompt = None;
+
+            if write_event(
                 &writer,
                 HarnessEvent::RunCompleted {
                     run_id: outcome.run_id.clone().unwrap_or_else(|| "unknown".into()),
                     ok: outcome.ok,
                 },
             )
-            .await;
-            let _ = write_event(&writer, HarnessEvent::Idle).await;
+            .await
+            .is_err()
+            {
+                reader_task.abort();
+                return Outcome::Reconnect { reason: "run_completed_write" };
+            }
+            if write_event(&writer, HarnessEvent::Idle).await.is_err() {
+                reader_task.abort();
+                return Outcome::Reconnect { reason: "idle_write" };
+            }
 
             if let Some(queued) = outcome.queued_prompt {
-                next_prompt = Some(queued);
+                *next_prompt = Some(queued);
             }
         }
     }

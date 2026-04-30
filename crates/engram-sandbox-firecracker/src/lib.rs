@@ -683,6 +683,14 @@ impl FirecrackerBackend {
         // CID we record is informational on the restored side.
         let vsock_uds_path = self.work_dir.join(format!("{}.vsock", manifest.sandbox_id));
         let vsock_cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
+        // Re-spawn the harness accept loop for the restored VM. FC
+        // restored its vsock device pointing at the snapshot-time UDS
+        // (manifest.sandbox_id-derived path), but the host-side accept
+        // loop that originally bound `<uds>_1026` died with the
+        // pre-snapshot sandbox. Without this, the in-VM adapter's
+        // post-resume reconnect dial finds no listener.
+        self.spawn_harness_listener(sandbox_id, &vsock_uds_path)
+            .await?;
         let state = SandboxState {
             spec: manifest.spec.clone(),
             firecracker_socket: socket,

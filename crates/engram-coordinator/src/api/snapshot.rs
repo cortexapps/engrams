@@ -318,6 +318,13 @@ async fn bind_resumed_session(
         );
     }
     state.registry.bind(id, sandbox_id);
+    // Critical for post-resume harness reconnect: the harness hub's
+    // session_to_sandbox map keys the FC vsock accept path. Without
+    // this, an in-VM adapter that re-dials after FC restore would
+    // hit `accept_via_session_lookup` → "no sandbox bound to this
+    // session_id" and bounce. The original `bind_session` from
+    // `create_session` pointed at the now-destroyed sandbox.
+    state.harness_hub.bind_session(id, sandbox_id);
 }
 
 async fn finalize_resume(
