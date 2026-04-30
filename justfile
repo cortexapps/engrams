@@ -193,6 +193,132 @@ fc-bake-claude:
         --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
         --inject-harness   engram-harness-claude=target/x86_64-unknown-linux-musl/release/engram-harness-claude
 
+# ------------------------------------------------------------------
+# Apple Silicon — Virtualization.framework backend
+#
+# `just dev-vz` is the macOS counterpart to `just dev-firecracker`.
+# Same wire surface (vsock UDS at <work_dir>/<sandbox>.vsock_*),
+# same chat-shaped event stream, same idle-evict-and-resume cycle —
+# different VMM. Boots arm64 Linux guests via VZ.
+# ------------------------------------------------------------------
+
+# Ad-hoc codesign the coordinator + the engram-sandbox-vz test
+# binaries with the com.apple.security.virtualization entitlement.
+# Without this, every VZ API call returns NSError "process doesn't
+# have the com.apple.security.virtualization entitlement" — see the
+# smoke test in crates/engram-sandbox-vz/src/vm.rs.
+#
+# Idempotent: re-running on an already-signed binary is a no-op
+# beyond a few ms of cycle. `dev-vz` and `vz-test` depend on it.
+#
+# We sign with the ad-hoc identity (`-`), which is enough for
+# locally-built dev binaries on Apple Silicon. CI does the same.
+# Distribution to other machines would need a real signing
+# identity + notarization; out of scope here.
+vz-codesign:
+    @if [ "$(uname -s)" != "Darwin" ]; then \
+        echo "vz-codesign is macOS-only; skipping" >&2; exit 0; \
+    fi
+    cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+    bash crates/engram-sandbox-vz/scripts/codesign.sh debug
+
+# Run the engram-sandbox-vz crate's unit tests, including the live
+# VZ smoke test gated behind --ignored. Codesigns first so the
+# entitlement check passes when the test reaches into VZ.
+vz-test: vz-codesign
+    cargo nextest run -p engram-sandbox-vz
+    cargo nextest run -p engram-sandbox-vz -- --ignored
+
+# Run the coordinator with the VZ backend.
+#
+# Prereqs (one-time):
+#   1. ENGRAM_VZ_KERNEL_PATH points at an arm64 Linux vmlinuz with
+#      VIRTIO_VSOCK / VIRTIO_BLK / VIRTIO_NET / VIRTIO_CONSOLE
+#      enabled. Default cache path is
+#      ~/.cache/engram-vz-test/vmlinuz-arm64; populate it via
+#      `just vz-bake-kernel` or `just vz-pull-ubuntu-kernel`.
+#   2. `just vz-bake-claude` (or vz-bake-demo) has run, so a
+#      warm-1 image exists for `local://claude-demo`.
+#
+# The recipe codesigns the coord binary first; without the
+# entitlement VZ refuses to instantiate any VM.
+dev-vz: db-up vz-codesign
+    @if [ "$(uname -s)" != "Darwin" ]; then \
+        echo "dev-vz only runs on macOS"; exit 1; \
+    fi
+    DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
+    ENGRAM_BIND_ADDR=127.0.0.1:8090 \
+    ENGRAM_MODE=all \
+    ENGRAM_SANDBOX_BACKEND=vz \
+    ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
+    ENGRAM_LOCAL_PATH=./var/engram \
+    ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinuz-arm64} \
+    ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
+    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-0} \
+    ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-} \
+    ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
+    ENGRAM_DEV_CLAUDE_HARNESS_PATH=${ENGRAM_DEV_CLAUDE_HARNESS_PATH:-/sbin/engram-harness-claude} \
+    RUST_LOG=info,engram=debug \
+    target/debug/engram-coordinator
+
+# Pull an arm64 Linux kernel from the Ubuntu 24.04 Server cloud
+# image. Faster than building one from upstream sources for first
+# bring-up; replace with `vz-bake-kernel` (build from sources)
+# once we hit a config drift.
+vz-pull-ubuntu-kernel:
+    @mkdir -p $HOME/.cache/engram-vz-test
+    @if [ -f $HOME/.cache/engram-vz-test/vmlinuz-arm64 ]; then \
+        echo "kernel already cached at $HOME/.cache/engram-vz-test/vmlinuz-arm64"; \
+        exit 0; \
+    fi
+    @echo "downloading Ubuntu 24.04 arm64 cloud image kernel ~10MB..."
+    @curl -fSL -o $HOME/.cache/engram-vz-test/vmlinuz-arm64 \
+        https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic
+    @ls -lh $HOME/.cache/engram-vz-test/vmlinuz-arm64
+
+# Bake the noop demo image for the VZ backend. arm64 + virtio-block.
+# Mirror of fc-bake-demo but cross-compiled for aarch64 and built
+# under linux/arm64 buildx so the rootfs binaries match the kernel.
+vz-bake-demo:
+    rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+    cargo build -p engram-agentd       --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap    --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-harness-noop --target aarch64-unknown-linux-musl --release
+    mkdir -p ./var/vz-bake
+    printf 'FROM --platform=linux/arm64 debian:bookworm-slim\n' > ./var/vz-bake/Dockerfile
+    printf 'name = "vz-demo"\n'                                 > ./var/vz-bake/engram.toml
+    cargo run -p engram-cli -- image build \
+        --repo local://demo \
+        --tag warm-1 \
+        --source ./var/vz-bake \
+        --format ext4 \
+        --images-dir ./var/engram/images \
+        --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
+        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
+        --inject-harness   engram-harness-noop=target/aarch64-unknown-linux-musl/release/engram-harness-noop
+
+# Bake the Claude image for VZ — arm64 sibling of fc-bake-claude.
+# Reuses the same Dockerfile / engram.toml under deploy/fc-bake-claude/
+# since the VZ build is architecture-neutral apart from the npm
+# install step (which docker buildx handles via --platform).
+vz-bake-claude:
+    rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+    cargo build -p engram-agentd         --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap      --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-harness-claude --target aarch64-unknown-linux-musl --release
+    mkdir -p ./var/vz-bake-claude
+    cp deploy/fc-bake-claude/Dockerfile  ./var/vz-bake-claude/Dockerfile
+    cp deploy/fc-bake-claude/engram.toml ./var/vz-bake-claude/engram.toml
+    cargo run -p engram-cli -- image build \
+        --repo local://claude-demo \
+        --tag warm-1 \
+        --source ./var/vz-bake-claude \
+        --format ext4 \
+        --images-dir ./var/engram/images \
+        --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
+        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
+        --inject-harness   engram-harness-claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
+
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
 watch:
