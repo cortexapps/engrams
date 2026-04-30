@@ -229,6 +229,30 @@ async fn resume_from_fc_snapshot(
     let local_path = record.local_path.clone().ok_or_else(|| {
         ApiError::Internal("resume_from_fc_snapshot called without local_path".into())
     })?;
+    // Pre-flight: if the snapshot dir or manifest disappeared on
+    // disk (host wiped /var, operator rm'd, FC's own writes failed
+    // halfway), the restore call below would surface as a generic
+    // 500. Treat the missing-file case the same as a null
+    // local_path in metadata — terminal-Dead, 410 Gone — so the
+    // caller's affordance ("fork the workspace") is the same.
+    let manifest_path = local_path.join("manifest.json");
+    if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
+        tracing::warn!(
+            session_id = %id,
+            path = %manifest_path.display(),
+            "snapshot manifest missing on disk; marking session Dead",
+        );
+        let _ = state
+            .services
+            .meta
+            .set_session_status(id, SessionStatus::Dead)
+            .await;
+        return Err(ApiError::Gone(
+            "snapshot_invalidated: session can't be revived; \
+             use `engram session fork <id>` to continue from the workspace"
+                .into(),
+        ));
+    }
     let session_for_ctx = session.clone();
     let ctx = ScheduleContext {
         repo: &session_for_ctx.repo,
