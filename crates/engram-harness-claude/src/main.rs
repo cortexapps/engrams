@@ -1,0 +1,641 @@
+//! Harness adapter for the `claude` CLI.
+//!
+//! Lives at `/sbin/engram-harness-claude` inside the rootfs (or
+//! cargo-target/.../engram-harness-claude on the dev-mode
+//! ProcessBackend path). Spawned by `engram-bootstrap` after the
+//! host pushes a `BootstrapLaunch` describing this binary.
+//!
+//! Strategy: child-per-prompt. Per `Prompt` command, spawn `claude
+//! --print --output-format stream-json [--resume <claude_id>]
+//! "<text>"`, parse stdout JSONL line-by-line, translate to
+//! `HarnessEvent`s, child exits, await next prompt.
+//!
+//! The first run captures Claude's auto-generated session id and
+//! stashes it in `/workspace/.engram/claude-session-id` so
+//! follow-ups can `--resume` into the same conversation. Lost on
+//! cold death (Dead status); a forked session gets a fresh
+//! Claude conversation.
+
+// Cross-platform stub — vsock dialing is Linux-only, and the
+// adapter only ships inside FC rootfs / Linux ProcessBackend.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("engram-harness-claude is Linux-only");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
+mod adapter {
+    use std::process::{ExitCode, Stdio};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use clap::Parser;
+    use engram_core::SessionId;
+    use engram_harness_proto::{
+        read_msg, write_msg, AgentRole, HarnessAttach, HarnessAttachAck, HarnessCommand,
+        HarnessEvent, HarnessFrame,
+    };
+    use serde_json::Value;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+    use tokio::process::Command;
+    use tokio::sync::{mpsc, Mutex};
+    use tokio::time::{timeout, Instant};
+
+    pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engram/claude-session-id";
+
+    /// Truncation budgets used when building summary fields. Adapter-
+    /// local enforcement of the wire docs.
+    pub const MAX_ARGS_SUMMARY_BYTES: usize = 1024;
+    pub const MAX_RESULT_SUMMARY_BYTES: usize = 4096;
+    pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+
+    #[derive(Parser, Debug)]
+    #[command(name = "engram-harness-claude", about = "Engram adapter for Claude Code")]
+    pub struct Cli {
+        /// TCP host:port of the harness hub (ProcessBackend dev path).
+        /// Mutually exclusive with `--vsock-host`.
+        #[arg(long, env = "ENGRAM_HARNESS_ADDR", conflicts_with = "vsock_host")]
+        pub connect: Option<String>,
+
+        /// Vsock port on the host (CID = `VMADDR_CID_HOST`, 2). FC
+        /// dev path. Mutually exclusive with `--connect`.
+        #[arg(long, env = "ENGRAM_HARNESS_VSOCK_HOST")]
+        pub vsock_host: Option<u32>,
+
+        /// Engram session id (from `ENGRAM_SESSION_ID`). Sent in
+        /// `HarnessAttach`.
+        #[arg(long, env = "ENGRAM_SESSION_ID")]
+        pub session_id: SessionId,
+
+        /// Cap on tool calls per run. Adapter logs and stops on
+        /// excess; hard cost backstop.
+        #[arg(long, default_value_t = 50)]
+        pub max_tool_calls: u32,
+
+        /// Per-tool-call wall-clock cap (seconds). Reserved.
+        #[arg(long, default_value_t = 600)]
+        pub max_tool_call_secs: u64,
+
+        /// Whole-run wall-clock cap (seconds). After this the
+        /// adapter SIGTERMs `claude` and emits
+        /// `RunCompleted{ok:false}`.
+        #[arg(long, default_value_t = 1800)]
+        pub max_run_secs: u64,
+
+        /// Override the `claude` binary path. Defaults to "claude"
+        /// on PATH inside the rootfs.
+        #[arg(long, default_value = "claude", env = "ENGRAM_CLAUDE_BIN")]
+        pub claude_bin: String,
+    }
+
+    pub async fn entry() -> ExitCode {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+
+        let cli = Cli::parse();
+        tracing::info!(
+            connect = ?cli.connect,
+            vsock_host = ?cli.vsock_host,
+            session = %cli.session_id,
+            "claude harness starting",
+        );
+
+        // Dial — the actual stream type differs (TcpStream vs
+        // VsockStream), so dispatch separately rather than boxing.
+        match (cli.connect.clone(), cli.vsock_host) {
+            (Some(addr), None) => {
+                let stream = match tokio::net::TcpStream::connect(&addr).await {
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        s
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, addr, "TCP dial failed");
+                        return ExitCode::from(1);
+                    }
+                };
+                run(stream, cli).await
+            }
+            (None, Some(port)) => {
+                use tokio_vsock::{VsockAddr, VMADDR_CID_HOST};
+                let stream = match tokio_vsock::VsockStream::connect(VsockAddr::new(
+                    VMADDR_CID_HOST,
+                    port,
+                ))
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, port, "vsock dial failed");
+                        return ExitCode::from(1);
+                    }
+                };
+                run(stream, cli).await
+            }
+            _ => {
+                tracing::error!("provide exactly one of --connect or --vsock-host");
+                ExitCode::from(2)
+            }
+        }
+    }
+
+    async fn run<S>(stream: S, cli: Cli) -> ExitCode
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (mut reader, writer) = tokio::io::split(stream);
+
+        // Handshake.
+        let mut writer = writer;
+        if let Err(e) = write_msg(
+            &mut writer,
+            &HarnessAttach {
+                session_id: cli.session_id,
+                harness_version: format!(
+                    "engram-harness-claude/{}",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            },
+        )
+        .await
+        {
+            tracing::error!(error = %e, "attach write failed");
+            return ExitCode::from(1);
+        }
+        let ack: HarnessAttachAck = match read_msg(&mut reader).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "attach ack read failed");
+                return ExitCode::from(1);
+            }
+        };
+        if !ack.ok {
+            tracing::error!(message = ?ack.message, "host rejected attach");
+            return ExitCode::from(1);
+        }
+
+        // Reader task: shovel HarnessCommands onto an mpsc; the
+        // writer side stays single-threaded so event writes are
+        // serial and ordered.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+        let reader_task = tokio::spawn(async move {
+            loop {
+                match read_msg::<_, HarnessFrame>(&mut reader).await {
+                    Ok(HarnessFrame::Command(c)) => {
+                        if cmd_tx.send(c).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(HarnessFrame::Event(_)) => {} // hosts shouldn't send events
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let writer = Arc::new(Mutex::new(writer));
+
+        // First run: pull the prompt from $ENGRAM_INITIAL_PROMPT if
+        // set, else emit Idle and wait for the first Prompt command.
+        let mut next_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+        if next_prompt.is_none() {
+            let _ = write_event(&writer, HarnessEvent::Idle).await;
+        }
+
+        loop {
+            let text = match next_prompt.take() {
+                Some(t) => t,
+                None => loop {
+                    match cmd_rx.recv().await {
+                        Some(HarnessCommand::Prompt { text }) => break text,
+                        Some(HarnessCommand::Shutdown { .. }) => {
+                            tracing::info!("shutdown received; exiting");
+                            reader_task.abort();
+                            return ExitCode::SUCCESS;
+                        }
+                        Some(HarnessCommand::Checkpoint { .. }) => {
+                            // Claude writes its conversation file
+                            // synchronously per message — nothing to
+                            // flush.
+                        }
+                        None => {
+                            tracing::info!("command channel closed; exiting");
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                },
+            };
+
+            let outcome = run_one_claude_prompt(&cli, &writer, &text, &mut cmd_rx).await;
+
+            let _ = write_event(
+                &writer,
+                HarnessEvent::RunCompleted {
+                    run_id: outcome.run_id.clone().unwrap_or_else(|| "unknown".into()),
+                    ok: outcome.ok,
+                },
+            )
+            .await;
+            let _ = write_event(&writer, HarnessEvent::Idle).await;
+
+            if let Some(queued) = outcome.queued_prompt {
+                next_prompt = Some(queued);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RunOutcome {
+        ok: bool,
+        run_id: Option<String>,
+        queued_prompt: Option<String>,
+    }
+
+    async fn run_one_claude_prompt<W>(
+        cli: &Cli,
+        writer: &Arc<Mutex<W>>,
+        text: &str,
+        cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
+    ) -> RunOutcome
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let resume_id = read_claude_session_id().await;
+        let argv = build_claude_argv(&resume_id, text);
+        tracing::info!(?argv, "spawning claude");
+
+        let mut child = match Command::new(&cli.claude_bin)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, bin = %cli.claude_bin, "spawn claude failed");
+                let _ = write_event(
+                    writer,
+                    HarnessEvent::AgentMessage {
+                        run_id: "spawn-failed".into(),
+                        message_id: format!("spawn-{}", uuid::Uuid::new_v4()),
+                        role: AgentRole::System,
+                        text: format!("failed to spawn `{}`: {e}", cli.claude_bin),
+                    },
+                )
+                .await;
+                return RunOutcome::default();
+            }
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+
+        let deadline = Instant::now() + Duration::from_secs(cli.max_run_secs);
+        let mut tool_calls = 0u32;
+        let mut run_id: Option<String> = None;
+        let mut queued_prompt: Option<String> = None;
+        let mut ok = true;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
+                ok = false;
+                let _ = child.start_kill();
+                break;
+            }
+
+            tokio::select! {
+                res = timeout(remaining, lines.next_line()) => {
+                    match res {
+                        Ok(Ok(Some(line))) => {
+                            if let Some(translated) = translate_jsonl(
+                                &line,
+                                &mut run_id,
+                                &mut tool_calls,
+                                cli.max_tool_calls,
+                            ) {
+                                for ev in translated {
+                                    let _ = write_event(writer, ev).await;
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => break, // EOF
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "stdout read error");
+                            ok = false;
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
+                            ok = false;
+                            let _ = child.start_kill();
+                            break;
+                        }
+                    }
+                }
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(HarnessCommand::Prompt { text }) => {
+                            if queued_prompt.is_none() {
+                                queued_prompt = Some(text);
+                            } else {
+                                tracing::warn!("dropping prompt — one already queued");
+                            }
+                        }
+                        Some(HarnessCommand::Shutdown { .. }) => {
+                            tracing::info!("shutdown mid-run; SIGTERM-ing claude");
+                            let _ = child.start_kill();
+                            ok = false;
+                            break;
+                        }
+                        Some(HarnessCommand::Checkpoint { .. }) => {}
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        let _ = child.wait().await;
+        RunOutcome {
+            ok,
+            run_id,
+            queued_prompt,
+        }
+    }
+
+    fn build_claude_argv(resume_id: &Option<String>, text: &str) -> Vec<String> {
+        let mut argv = vec![
+            "--print".to_string(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
+        ];
+        if let Some(id) = resume_id {
+            argv.push("--resume".into());
+            argv.push(id.clone());
+        }
+        argv.push(text.to_string());
+        argv
+    }
+
+    async fn read_claude_session_id() -> Option<String> {
+        match tokio::fs::read_to_string(CLAUDE_SESSION_ID_FILE).await {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
+    async fn write_claude_session_id(id: &str) {
+        let _ = tokio::fs::create_dir_all("/workspace/.engram").await;
+        if let Err(e) = tokio::fs::write(CLAUDE_SESSION_ID_FILE, id).await {
+            tracing::warn!(error = %e, "couldn't persist claude session id");
+        }
+    }
+
+    async fn write_event<W>(writer: &Arc<Mutex<W>>, ev: HarnessEvent) -> std::io::Result<()>
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut w = writer.lock().await;
+        write_msg(&mut *w, &HarnessFrame::Event(ev)).await
+    }
+
+    /// Translate one JSONL line from Claude's `--output-format
+    /// stream-json` into zero or more HarnessEvents. Tracks the
+    /// run_id captured from `system.init` and the per-run
+    /// tool-call count.
+    pub fn translate_jsonl(
+        line: &str,
+        run_id: &mut Option<String>,
+        tool_calls: &mut u32,
+        max_tool_calls: u32,
+    ) -> Option<Vec<HarnessEvent>> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        let ty = v.get("type")?.as_str()?;
+        let mut out: Vec<HarnessEvent> = Vec::new();
+        match ty {
+            "system" => {
+                let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+                if subtype == "init" {
+                    let session_id =
+                        v.get("session_id").and_then(|s| s.as_str()).map(str::to_string);
+                    let rid = session_id
+                        .clone()
+                        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
+                    *run_id = Some(rid.clone());
+                    if let Some(sid) = session_id {
+                        tokio::spawn(async move { write_claude_session_id(&sid).await });
+                    }
+                    out.push(HarnessEvent::RunStarted {
+                        run_id: rid,
+                        prompt_summary: None,
+                    });
+                }
+            }
+            "assistant" => {
+                let rid = run_id.clone().unwrap_or_default();
+                let msg = v.get("message")?;
+                let msg_id = msg
+                    .get("id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("msg-?")
+                    .to_string();
+                if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+                    let mut text_buf = String::new();
+                    for b in blocks {
+                        let bt = b.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                        match bt {
+                            "text" => {
+                                if let Some(t) = b.get("text").and_then(|s| s.as_str()) {
+                                    text_buf.push_str(t);
+                                }
+                            }
+                            "tool_use" => {
+                                *tool_calls += 1;
+                                if *tool_calls > max_tool_calls {
+                                    tracing::warn!(
+                                        tool_calls = *tool_calls,
+                                        max_tool_calls,
+                                        "max_tool_calls exceeded"
+                                    );
+                                }
+                                let tcid = b
+                                    .get("id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("toolu-?")
+                                    .to_string();
+                                let name = b
+                                    .get("name")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                let args_summary = b.get("input").map(|v| {
+                                    truncate_str(&v.to_string(), MAX_ARGS_SUMMARY_BYTES)
+                                });
+                                out.push(HarnessEvent::ToolCallStarted {
+                                    run_id: rid.clone(),
+                                    tool_call_id: tcid,
+                                    tool_name: name,
+                                    args_summary,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !text_buf.is_empty() {
+                        out.push(HarnessEvent::AgentMessage {
+                            run_id: rid,
+                            message_id: msg_id,
+                            role: AgentRole::Assistant,
+                            text: truncate_str(&text_buf, MAX_AGENT_MESSAGE_BYTES),
+                        });
+                    }
+                }
+            }
+            "user" => {
+                let rid = run_id.clone().unwrap_or_default();
+                let msg = v.get("message")?;
+                if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+                    for b in blocks {
+                        let bt = b.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                        if bt == "tool_result" {
+                            let tcid = b
+                                .get("tool_use_id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("toolu-?")
+                                .to_string();
+                            let is_error =
+                                b.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+                            let result_text = match b.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(arr)) => arr
+                                    .iter()
+                                    .filter_map(|c| {
+                                        c.get("text")
+                                            .and_then(|t| t.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => String::new(),
+                            };
+                            out.push(HarnessEvent::ToolCallCompleted {
+                                run_id: rid.clone(),
+                                tool_call_id: tcid,
+                                tool_name: String::new(),
+                                ok: !is_error,
+                                duration_ms: 0,
+                                result_summary: Some(truncate_str(
+                                    &result_text,
+                                    MAX_RESULT_SUMMARY_BYTES,
+                                )),
+                            });
+                        }
+                    }
+                }
+            }
+            "result" => {
+                // Outer loop emits RunCompleted from claude's exit
+                // status; the result event is informational.
+            }
+            _ => {}
+        }
+        Some(out)
+    }
+
+    pub fn truncate_str(s: &str, max_bytes: usize) -> String {
+        if s.len() <= max_bytes {
+            return s.to_string();
+        }
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = s[..end].to_string();
+        truncated.push_str("…[truncated]");
+        truncated
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    adapter::entry().await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::adapter::*;
+    use engram_harness_proto::HarnessEvent;
+
+    #[test]
+    fn translates_system_init_and_assistant_text() {
+        let init = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
+        let asst = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi there"}]}}"#;
+        let mut run_id = None;
+        let mut tc = 0u32;
+        let evs = translate_jsonl(init, &mut run_id, &mut tc, 50).unwrap();
+        assert_eq!(run_id.as_deref(), Some("abc-123"));
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], HarnessEvent::RunStarted { .. }));
+
+        let evs = translate_jsonl(asst, &mut run_id, &mut tc, 50).unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            HarnessEvent::AgentMessage { text, .. } => assert_eq!(text, "hi there"),
+            other => panic!("expected AgentMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translates_tool_use_and_tool_result_pair() {
+        let init = r#"{"type":"system","subtype":"init","session_id":"x"}"#;
+        let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls /workspace"}}]}}"#;
+        let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.py","is_error":false}]}}"#;
+
+        let mut run_id = None;
+        let mut tc = 0u32;
+        translate_jsonl(init, &mut run_id, &mut tc, 50);
+        let evs = translate_jsonl(asst, &mut run_id, &mut tc, 50).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], HarnessEvent::ToolCallStarted { .. }));
+        assert_eq!(tc, 1);
+
+        let evs = translate_jsonl(user, &mut run_id, &mut tc, 50).unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            HarnessEvent::ToolCallCompleted {
+                tool_call_id,
+                ok,
+                result_summary,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "toolu_1");
+                assert!(ok);
+                assert_eq!(result_summary.as_deref(), Some("file1.txt\nfile2.py"));
+            }
+            other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_respects_utf8_boundaries() {
+        let s = "🦀".repeat(100);
+        let t = truncate_str(&s, 10);
+        assert!(t.ends_with("…[truncated]"));
+    }
+}

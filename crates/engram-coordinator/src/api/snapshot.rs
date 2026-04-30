@@ -15,35 +15,18 @@
 //! callers that want both should snapshot then evict in two requests, or
 //! evict then resume across the lifecycle of a session.
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use engram_core::traits::SandboxBackend;
-use engram_core::types::sandbox::{
-    CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec as VmSpec,
-};
-use engram_core::types::session::{RepoUrl, SessionKind};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{Session, SessionStatus};
 use engram_core::{SandboxId, SessionId};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
-use crate::image_registry::{ImageError, Rootfs};
 use crate::state::{SessionEvent, SharedState};
-
-/// Default sandbox sizing for resumed sessions. Mirrors
-/// `api::sessions::create_session`'s defaults so a session resumed
-/// after host loss gets the same shape it originally had unless the
-/// image manifest overrides.
-const DEFAULT_VCPUS: u32 = 2;
-const DEFAULT_MEMORY_MIB: u32 = 4096;
-const DEFAULT_DISK_GIB: u32 = 20;
 
 #[derive(Serialize)]
 pub struct SnapshotResponse {

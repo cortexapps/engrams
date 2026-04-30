@@ -321,23 +321,6 @@ where
     Ok(())
 }
 
-// Tiny module to opt the bytea field into compact bincode encoding.
-// `Vec<u8>` already round-trips byte-for-byte via bincode; this just
-// keeps the JSON-side wire (when an event lands in session_events)
-// surface uniform if we ever want to opt into base64 there. For now
-// it's a passthrough.
-mod serde_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        b.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        Vec::<u8>::deserialize(d)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
