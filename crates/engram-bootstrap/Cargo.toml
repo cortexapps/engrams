@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "In-guest binary that listens on vsock for a BootstrapLaunch frame from the host, then exec's the described agent process. Lives at /sbin/engram-bootstrap inside the rootfs; spawned by /sbin/engram-init alongside engram-agentd."
+description = "In-guest supervisor that listens on vsock for BootstrapLaunch frames from the host, spawns the described agent process as a child, and respawns it (kill + spawn) on each subsequent launch frame — so the host can re-establish a fresh agent after FC snapshot/restore. Lives at /sbin/engram-bootstrap inside the rootfs."
 
 [lints]
 workspace = true

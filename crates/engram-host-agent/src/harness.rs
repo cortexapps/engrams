@@ -38,6 +38,15 @@ use tokio::sync::{mpsc, oneshot};
 /// proceeds without the durability guarantee.
 pub const CHECKPOINT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `send_prompt` waits for the harness connection to appear
+/// before giving up with `NotAttached`. Covers the post-resume window
+/// where ensure_active has returned but the in-VM bootstrap+harness
+/// handshake hasn't finished — typically a few hundred ms after FC
+/// restore. Generous enough to absorb cold-restore variance, tight
+/// enough that a session whose harness genuinely never reattaches
+/// surfaces an error in user-visible time.
+const SEND_PROMPT_ATTACH_WAIT_SECS: u64 = 10;
+
 /// Callback invoked for every `HarnessEvent` received on a connection.
 /// In production this is the host-agent's bridge into the coordinator's
 /// `session_events` log; tests pass a closure that just collects them.
@@ -256,16 +265,29 @@ impl HarnessHub {
         sandbox_id: SandboxId,
         text: String,
     ) -> Result<(), HarnessError> {
+        // Look up the connection, retrying briefly if it isn't there
+        // yet. The post-resume race: `ensure_active` returns once
+        // `start_agent` has written the BootstrapLaunch frame, but
+        // the in-VM bootstrap supervisor still needs to (a) accept
+        // the connection, (b) kill the previous adapter, (c) spawn
+        // the new one, (d) let the new adapter dial back over vsock
+        // and finish HarnessAttach. That's a few hundred ms in
+        // practice. Without a wait here, the user's prompt that
+        // triggered the resume races the handshake and bounces with
+        // NotAttached even though the system is healthy.
         let cmd_tx = {
-            let conns = self.inner.connections.lock();
-            let handle = conns.get(&sandbox_id).ok_or(HarnessError::NotAttached)?;
-            // Clear last_idle_at *atomically with* checking the
-            // connection — if the host's "we're sending you work
-            // now" lands at the same moment as the soft TTL would
-            // fire, the prompt wins. The evictor sees no
-            // last_idle_at on its next tick.
-            self.inner.last_idle_at.lock().remove(&sandbox_id);
-            handle.cmd_tx.clone()
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);
+            loop {
+                if let Some(handle) = self.inner.connections.lock().get(&sandbox_id) {
+                    self.inner.last_idle_at.lock().remove(&sandbox_id);
+                    break handle.cmd_tx.clone();
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(HarnessError::NotAttached);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         };
         cmd_tx
             .send(HarnessFrame::Command(HarnessCommand::Prompt { text }))

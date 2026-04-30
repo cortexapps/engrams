@@ -265,6 +265,35 @@ async fn resume_from_fc_snapshot(
         .restore_for_session(&ctx, local_path)
         .await?;
     bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
+    // Re-launch the per-session agent so the in-VM bootstrap
+    // supervisor kill+respawns the harness for the restored sandbox.
+    // Without this, the post-resume VM has the pre-snapshot adapter
+    // still running with a half-open vsock — the host can't reach
+    // it (its UDS died with the original sandbox), and the adapter
+    // can't notice (vsock reads on a half-open connection block
+    // forever). A fresh BootstrapLaunch is the in-VM signal to
+    // start clean. Resume omits ENGRAM_INITIAL_PROMPT so the
+    // adapter goes straight to Idle and waits for the next
+    // user prompt instead of replaying the original kickoff.
+    if let Some(agent) = crate::api::sessions::build_dev_agent(&state, id, None) {
+        if let Err(e) = state
+            .services
+            .sandbox
+            .start_agent(new_sandbox_id, agent)
+            .await
+        {
+            // Best-effort: log loudly but don't fail the resume —
+            // the VM is up and the snapshot succeeded; the agent
+            // relaunch can be retried by the next prompt's
+            // ensure_active path if needed.
+            tracing::warn!(
+                session_id = %id,
+                sandbox_id = %new_sandbox_id,
+                error = %e,
+                "post-resume start_agent failed; harness may not reattach",
+            );
+        }
+    }
     finalize_resume(
         &state,
         id,

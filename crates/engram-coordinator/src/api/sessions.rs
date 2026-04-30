@@ -423,7 +423,7 @@ pub async fn delete_session(
 /// - `Firecracker`: `--vsock-host <port>` (the in-VM harness dials
 ///    AF_VSOCK CID=2 port=1026; FC's vsock UDS routes it to the
 ///    coord-side sink registered on the FC backend).
-fn build_dev_agent(
+pub(crate) fn build_dev_agent(
     state: &SharedState,
     session_id: SessionId,
     initial_prompt: Option<&str>,

@@ -1064,9 +1064,12 @@ impl SandboxBackend for FirecrackerBackend {
         };
 
         // Push the BootstrapLaunch frame. The in-guest bootstrap
-        // reads it, exec's the described argv (replacing its
-        // process), then dies via exec — the connection drops
-        // here, which is fine.
+        // is a long-running supervisor that loops on accept, so a
+        // call here also covers post-resume re-launch (the
+        // supervisor kill+respawns its child harness on every fresh
+        // launch frame). The connection drops on our end after the
+        // write — bootstrap reads the frame and goes back to
+        // accept().
         let launch = engram_harness_proto::BootstrapLaunch {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),

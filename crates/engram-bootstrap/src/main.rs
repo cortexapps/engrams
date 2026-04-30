@@ -1,18 +1,30 @@
-//! In-guest bootstrap shim.
+//! In-guest bootstrap supervisor.
 //!
 //! Lives at `/sbin/engram-bootstrap` inside the rootfs. Spawned in
 //! the background by `/sbin/engram-init` alongside `engram-agentd`,
-//! waits for the host to push a [`BootstrapLaunch`] frame over vsock
-//! port [`BOOTSTRAP_VSOCK_PORT`], then `exec`s the described argv
-//! (with merged env) so the per-session agent process — typically a
-//! harness adapter — takes over.
+//! listens on vsock port [`BOOTSTRAP_VSOCK_PORT`] for
+//! [`BootstrapLaunch`] frames from the host, and runs the described
+//! agent process as a child. Each new launch frame kills the previous
+//! child and starts a fresh one — so the host has a clean way to
+//! re-establish the per-session agent (e.g. after FC snapshot/restore
+//! invalidates the previous adapter's vsock connection).
 //!
 //! This indirection exists because the warm pool's `SandboxSpec` is
 //! agent-blind: per-session argv (carrying `session_id`, attach
 //! token, etc.) can't ride on the spec template. The host populates
 //! the per-session AgentSpec at `start_agent` time, after the
 //! coordinator has bound the session→sandbox routing in the
-//! HarnessHub. Bootstrap is the in-VM half of that handoff.
+//! HarnessHub.
+//!
+//! Why supervise instead of `exec`. Earlier revisions exec'd into
+//! the harness so bootstrap exited and didn't hang around. That broke
+//! post-resume reconnect: an FC snapshot/restore round-trip leaves
+//! the in-VM adapter holding a half-open vsock connection it can't
+//! detect, with no in-VM process for the host to talk to. As a
+//! supervisor, bootstrap is always running with a live accept()
+//! listener; the host can re-deliver a `BootstrapLaunch` frame after
+//! restore and bootstrap kill+respawns the adapter for a clean
+//! reattach.
 
 // engram-bootstrap is Linux-only — vsock is a Linux kernel feature.
 // Cross-platform stub keeps the workspace cargo check / cargo nextest
@@ -25,20 +37,18 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
 use engram_harness_proto::{read_msg, BootstrapLaunch, BOOTSTRAP_VSOCK_PORT};
+#[cfg(target_os = "linux")]
+use tokio::process::{Child, Command};
 #[cfg(target_os = "linux")]
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    // Stay inside a single-threaded runtime so we can `exec` cleanly
-    // — multi-threaded tokio holds OS threads that block exec.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -47,7 +57,7 @@ async fn main() -> ExitCode {
         .init();
 
     let addr = VsockAddr::new(VMADDR_CID_ANY, BOOTSTRAP_VSOCK_PORT);
-    let mut listener = match VsockListener::bind(addr) {
+    let listener = match VsockListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, port = BOOTSTRAP_VSOCK_PORT, "bind vsock listener failed");
@@ -56,54 +66,81 @@ async fn main() -> ExitCode {
     };
     tracing::info!(
         port = BOOTSTRAP_VSOCK_PORT,
-        "engram-bootstrap waiting for host launch",
+        "engram-bootstrap supervisor listening",
     );
 
-    // The host opens the FC vsock UDS, writes `CONNECT 1025\n`, and
-    // drops the BootstrapLaunch frame on the resulting stream. We
-    // accept exactly one connection — once we've received the
-    // launch we exec away.
-    let (mut stream, peer) = match listener.accept().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "accept failed");
-            return ExitCode::from(1);
-        }
-    };
-    tracing::debug!(?peer, "accepted host bootstrap connection");
+    // Most recent agent child. Kept across iterations so we can
+    // SIGKILL+wait it before honoring a new launch frame — without
+    // this, a post-resume relaunch would leave the pre-snapshot
+    // adapter zombied alongside the fresh one, fighting over
+    // /workspace/.engram/claude-session-id.
+    let mut current_child: Option<Child> = None;
 
-    let launch: BootstrapLaunch = match read_msg(&mut stream).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, "read BootstrapLaunch failed");
-            return ExitCode::from(1);
-        }
-    };
-    drop(stream);
-    drop(listener);
+    loop {
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "accept failed; supervisor exiting");
+                if let Some(mut child) = current_child {
+                    let _ = child.kill().await;
+                }
+                return ExitCode::from(1);
+            }
+        };
+        tracing::debug!(?peer, "accepted host bootstrap connection");
 
-    let argv0 = match launch.argv.first() {
-        Some(a) => a.clone(),
-        None => {
-            tracing::error!("BootstrapLaunch.argv was empty");
-            return ExitCode::from(1);
-        }
-    };
-    tracing::info!(
-        argv0 = %argv0,
-        argc = launch.argv.len(),
-        envc = launch.env.len(),
-        "exec'ing into agent",
-    );
+        let launch: BootstrapLaunch = match read_msg(&mut stream).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "read BootstrapLaunch failed; ignoring this connection");
+                continue;
+            }
+        };
+        drop(stream);
 
-    let mut cmd = Command::new(&argv0);
-    cmd.args(&launch.argv[1..]);
-    for (k, v) in &launch.env {
-        cmd.env(k, v);
+        // Kill any prior child. We send SIGKILL rather than SIGTERM
+        // to keep the supervisor simple and predictable: the previous
+        // adapter's state is presumed stale (post-resume case) so we
+        // don't owe it a graceful shutdown window.
+        if let Some(mut prev) = current_child.take() {
+            tracing::info!(
+                pid = ?prev.id(),
+                "respawn requested; killing previous agent child",
+            );
+            let _ = prev.kill().await;
+            let _ = prev.wait().await;
+        }
+
+        let argv0 = match launch.argv.first() {
+            Some(a) => a.clone(),
+            None => {
+                tracing::warn!("BootstrapLaunch.argv was empty; ignoring");
+                continue;
+            }
+        };
+        tracing::info!(
+            argv0 = %argv0,
+            argc = launch.argv.len(),
+            envc = launch.env.len(),
+            "spawning agent",
+        );
+
+        let mut cmd = Command::new(&argv0);
+        cmd.args(&launch.argv[1..]);
+        for (k, v) in &launch.env {
+            cmd.env(k, v);
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                tracing::info!(pid = ?child.id(), "agent child running");
+                current_child = Some(child);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, argv0 = %argv0, "spawn failed");
+                // Don't exit — the host might recover and push a
+                // different launch frame. Just leave current_child
+                // unset for the next iteration.
+            }
+        }
     }
-    // exec replaces our image. Anything past this line means exec
-    // failed — surface a clear error and exit 1.
-    let err = cmd.exec();
-    tracing::error!(error = %err, argv0 = %argv0, "exec failed");
-    ExitCode::from(1)
 }
