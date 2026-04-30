@@ -38,12 +38,15 @@ pub struct NoopConfig {
     pub interval: Duration,
     /// Synthetic per-tool-call duration reported on `ToolCallCompleted`.
     pub tool_call_duration_ms: u64,
-    /// Bytes the harness pretends it appended to the transcript file
-    /// for each tool call. The host stores these verbatim in the
-    /// `transcript_delta` field of the corresponding `session_events`
-    /// row; tests typically pass small unique strings so they can
-    /// assert on order in resume tests.
-    pub transcript_delta_template: Vec<u8>,
+    /// Synthetic `result_summary` text the noop emits on each
+    /// `ToolCallCompleted`. Slack/UI consumers see this; tests
+    /// typically pass small unique strings so they can assert on
+    /// order in event-stream tests.
+    pub result_summary_template: String,
+    /// Synthetic assistant text emitted via `AgentMessage` between
+    /// runs. Set to a non-empty string to exercise the new chat-
+    /// shaped wire path.
+    pub agent_message_template: String,
     /// Whether to send `RunCompleted` at the end. Off by default so
     /// the harness stays at "between runs" when the test wants to
     /// exercise idle eviction.
@@ -58,7 +61,8 @@ impl NoopConfig {
             tool_calls: 3,
             interval: Duration::from_millis(50),
             tool_call_duration_ms: 10,
-            transcript_delta_template: b"{\"tool_call\":\"noop\"}\n".to_vec(),
+            result_summary_template: "ok (noop)".into(),
+            agent_message_template: "noop assistant message".into(),
             send_run_completed: false,
         }
     }
@@ -129,12 +133,15 @@ where
                     return;
                 }
                 Ok(HarnessFrame::Command(HarnessCommand::Checkpoint { .. })) => {
-                    // Noop: we have no transcript to flush; the per-
-                    // tool-call deltas were already on the wire when
-                    // we wrote them. The host's `checkpoint()` call
-                    // currently considers the writer ack the contract;
-                    // a richer ack channel lands with Track C's
-                    // checkpoint primitive.
+                    // Noop has no transcript to flush; ack via the
+                    // writer channel implicitly.
+                }
+                Ok(HarnessFrame::Command(HarnessCommand::Prompt { .. })) => {
+                    // Noop ignores prompts — its run shape is fixed
+                    // by the config. A real adapter would queue the
+                    // prompt and start a new run after the current
+                    // Idle. Tests for the prompt path use
+                    // engram-harness-claude or a fixture noop.
                 }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.
@@ -175,11 +182,26 @@ where
             tool_name: "Noop".into(),
             ok: true,
             duration_ms: cfg.tool_call_duration_ms,
-            transcript_delta: cfg.transcript_delta_template.clone(),
+            result_summary: Some(cfg.result_summary_template.clone()),
         });
         if write_msg(&mut writer, &completed).await.is_err() {
             reader_task.abort();
             return Ok(NoopOutcome::EmittedAndPeerClosed);
+        }
+        // Track B exercise: emit one synthetic AgentMessage after
+        // each tool call so the SSE flow exercises the chat-shaped
+        // wire path. Skip if the template is empty (legacy tests).
+        if !cfg.agent_message_template.is_empty() {
+            let msg = HarnessFrame::Event(HarnessEvent::AgentMessage {
+                run_id: run_id.clone(),
+                message_id: format!("noop-msg-{i}"),
+                role: engram_harness_proto::AgentRole::Assistant,
+                text: cfg.agent_message_template.clone(),
+            });
+            if write_msg(&mut writer, &msg).await.is_err() {
+                reader_task.abort();
+                return Ok(NoopOutcome::EmittedAndPeerClosed);
+            }
         }
         // Idle gap between tool calls.
         if i + 1 < cfg.tool_calls {
@@ -303,15 +325,19 @@ mod tests {
         ));
 
         let events = host_task.await.unwrap();
-        // Expected stream: RunStarted, ToolCallStarted, ToolCallCompleted, ToolCallStarted,
-        // ToolCallCompleted, Idle.
-        assert_eq!(events.len(), 6, "got: {events:?}");
+        // Expected stream after Track B's wire reshape: per tool call,
+        // the noop emits ToolCallStarted → ToolCallCompleted →
+        // AgentMessage (a synthetic assistant text). With 2 tool
+        // calls plus the bracketing RunStarted + Idle, that's 8 events.
+        assert_eq!(events.len(), 8, "got: {events:?}");
         assert!(matches!(events[0], HarnessEvent::RunStarted { .. }));
         assert!(matches!(events[1], HarnessEvent::ToolCallStarted { .. }));
         assert!(matches!(events[2], HarnessEvent::ToolCallCompleted { .. }));
-        assert!(matches!(events[3], HarnessEvent::ToolCallStarted { .. }));
-        assert!(matches!(events[4], HarnessEvent::ToolCallCompleted { .. }));
-        assert!(matches!(events[5], HarnessEvent::Idle));
+        assert!(matches!(events[3], HarnessEvent::AgentMessage { .. }));
+        assert!(matches!(events[4], HarnessEvent::ToolCallStarted { .. }));
+        assert!(matches!(events[5], HarnessEvent::ToolCallCompleted { .. }));
+        assert!(matches!(events[6], HarnessEvent::AgentMessage { .. }));
+        assert!(matches!(events[7], HarnessEvent::Idle));
     }
 
     #[tokio::test]

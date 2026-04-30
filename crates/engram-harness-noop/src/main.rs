@@ -56,9 +56,9 @@ struct Cli {
     #[arg(long, default_value_t = 200)]
     tool_call_duration_ms: u64,
 
-    /// Bytes the harness pretends it appended to the transcript file
-    /// for each call. Default = a tiny JSONL line with the call
-    /// index — readable in `engram session log` output.
+    /// String the noop emits as `result_summary` on each
+    /// `ToolCallCompleted`. Renders directly in `engram session log`
+    /// output and Slack/web UI consumers.
     #[arg(long)]
     transcript_template: Option<String>,
 
@@ -94,7 +94,7 @@ async fn main() -> ExitCode {
     cfg.tool_call_duration_ms = cli.tool_call_duration_ms;
     cfg.send_run_completed = cli.send_run_completed;
     if let Some(tmpl) = cli.transcript_template {
-        cfg.transcript_delta_template = tmpl.into_bytes();
+        cfg.result_summary_template = tmpl;
     }
 
     // Dial the hub. Two flavors:

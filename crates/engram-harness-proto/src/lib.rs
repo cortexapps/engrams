@@ -105,52 +105,87 @@ pub enum HarnessFrame {
     Command(HarnessCommand),
 }
 
-/// Events the harness emits as the agent inside it does work. These
-/// are forwarded by the host into `session_events` (where the SSE
-/// bus, Web UI, Slackbot, and resume bootstrap consume them).
+/// Events the harness emits as the agent inside it does work. The
+/// host forwards each into `session_events`; consumers (Slack bot,
+/// web UI, audit log) read `GET /sessions/:id/events` SSE and render
+/// directly from the structured fields below — no per-agent decoder.
 ///
-/// "Tool call" maps to one observable unit of work in the agent's
-/// vocabulary — typically one Claude Code Bash/Edit/Read/etc call,
-/// or one custom-harness function dispatch. Engram doesn't interpret
-/// the tool-call args; `transcript_delta` carries whatever bytes the
-/// agent appended to its native transcript file for this call.
+/// **Shape choices for chat consumers:**
+/// - Tool call events carry small structured `args_summary` /
+///   `result_summary` strings (≤ a few KB), not the agent's native
+///   bytes. Slack / web UIs render them straight.
+/// - `AgentMessage` is the assistant's text response between tool
+///   calls (or a system message). v1 ships per-final-message —
+///   adapters consolidate streaming responses before emitting.
+///   `AgentMessageChunk` for live-typing UIs is a future variant.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HarnessEvent {
     /// New agent run started (typically: user prompt arrived). The
-    /// harness assigns `run_id`; subsequent ToolCall events carry the
-    /// same `run_id`.
+    /// harness assigns `run_id`; subsequent events in this run carry
+    /// the same `run_id`. `prompt_summary` is the first ~1 KB of
+    /// the prompt for Slack/UI rendering.
     RunStarted {
         run_id: String,
         prompt_summary: Option<String>,
     },
+    /// Assistant / user / system text emitted by the agent. v1 is
+    /// per-final-message: streaming agents (Claude, OpenCode)
+    /// consolidate text content within one logical message before
+    /// emitting. `text` is truncated to 64 KB at the wire — bigger
+    /// gets clipped with a `…[truncated N bytes]` suffix the adapter
+    /// owns.
+    AgentMessage {
+        run_id: String,
+        /// Adapter-local id for de-dup / threading. Often the
+        /// underlying agent's message id (Claude's `message.id`,
+        /// OpenCode's event ulid).
+        message_id: String,
+        role: AgentRole,
+        text: String,
+    },
     /// Tool call beginning. `tool_call_id` ties Started/Completed.
+    /// `args_summary` is a human-readable rendering (≤ 1 KB) of the
+    /// tool's input — the adapter picks the format (e.g. for Bash:
+    /// the command line; for Read: the file path).
     ToolCallStarted {
         run_id: String,
         tool_call_id: String,
         tool_name: String,
         args_summary: Option<String>,
     },
-    /// Tool call finished. `transcript_delta` is the bytes the harness
-    /// appended to its native transcript file for this call (JSONL
-    /// line(s) for Claude Code; whatever its format-of-the-day is for
-    /// other adapters). Opaque to Engram; replayed verbatim on resume
-    /// to reconstruct the transcript file in the agent's native shape.
+    /// Tool call finished. `result_summary` is a human-readable
+    /// rendering (≤ 4 KB) of the tool's output — what a Slack bot
+    /// or UI would show after the tool-call header.
     ToolCallCompleted {
         run_id: String,
         tool_call_id: String,
         tool_name: String,
         ok: bool,
         duration_ms: u64,
-        #[serde(default, with = "serde_bytes")]
-        transcript_delta: Vec<u8>,
+        result_summary: Option<String>,
     },
     /// Run finished cleanly (or failed terminally). After this, the
-    /// harness typically goes idle until the next prompt arrives.
+    /// adapter MUST emit `Idle` to mark "awaiting user input."
     RunCompleted { run_id: String, ok: bool },
-    /// Explicit "I'm not doing anything." Stronger signal than just
-    /// the absence of events — host can short-circuit idle eviction
-    /// without waiting for the TTL.
+    /// Explicit "I'm awaiting user input." Engram's idle-eviction
+    /// soft TTL fires N seconds after this. Adapters MUST emit it
+    /// after every `RunCompleted`; emitting redundantly (no run in
+    /// between) just resets the soft timer, which is fine but
+    /// wasteful — don't do it.
     Idle,
+}
+
+/// Who emitted an [`HarnessEvent::AgentMessage`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    /// The agent talking to the user / driving the run.
+    Assistant,
+    /// User-injected content visible in the agent's view (rare;
+    /// some adapters surface the prompt itself this way).
+    User,
+    /// Adapter / agent-system messages (init banners, errors, etc.).
+    System,
 }
 
 impl HarnessEvent {
@@ -160,6 +195,7 @@ impl HarnessEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::RunStarted { .. } => "run_started",
+            Self::AgentMessage { .. } => "agent_message",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallCompleted { .. } => "tool_call_completed",
             Self::RunCompleted { .. } => "run_completed",
@@ -193,6 +229,13 @@ pub enum HarnessCommand {
     /// translates this into the right signal sequence for its agent
     /// (SIGINT then SIGKILL for Claude Code; whatever for others).
     Shutdown { grace_secs: u32 },
+    /// User prompt for the agent — the next run's input. The adapter
+    /// either starts a fresh run (if currently Idle) or queues this
+    /// for after the in-flight run's `Idle`. Each adapter's
+    /// strategy: Claude spawns `claude --resume <id> --print "<text>"`;
+    /// OpenCode POSTs to its server. Engram is opaque to the agent's
+    /// internal session shape — `text` is just plumbed through.
+    Prompt { text: String },
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`
@@ -348,13 +391,19 @@ mod tests {
             tool_name: "Bash".into(),
             args_summary: Some("cargo test".into()),
         }));
+        round_trip(HarnessFrame::Event(HarnessEvent::AgentMessage {
+            run_id: "r1".into(),
+            message_id: "m1".into(),
+            role: AgentRole::Assistant,
+            text: "hello".into(),
+        }));
         round_trip(HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
             run_id: "r1".into(),
             tool_call_id: "t1".into(),
             tool_name: "Bash".into(),
             ok: true,
             duration_ms: 12345,
-            transcript_delta: b"{\"role\":\"tool\",\"content\":\"ok\"}\n".to_vec(),
+            result_summary: Some("done".into()),
         }));
         round_trip(HarnessFrame::Event(HarnessEvent::RunCompleted {
             run_id: "r1".into(),
@@ -374,29 +423,28 @@ mod tests {
         round_trip(HarnessFrame::Command(HarnessCommand::Shutdown {
             grace_secs: 5,
         }));
+        round_trip(HarnessFrame::Command(HarnessCommand::Prompt {
+            text: "do the thing".into(),
+        }));
     }
 
     #[test]
-    fn binary_transcript_delta_round_trips_byte_for_byte() {
-        // Non-UTF-8 bytes survive (the harness's transcript format
-        // is opaque to Engram; binary safety matters).
-        let raw: Vec<u8> = (0..=255u8).cycle().take(8 * 1024).collect();
-        let ev = HarnessEvent::ToolCallCompleted {
+    fn agent_message_round_trips_with_unicode() {
+        let ev = HarnessEvent::AgentMessage {
             run_id: "r".into(),
-            tool_call_id: "t".into(),
-            tool_name: "Custom".into(),
-            ok: true,
-            duration_ms: 1,
-            transcript_delta: raw.clone(),
+            message_id: "m".into(),
+            role: AgentRole::Assistant,
+            text: "I see — let me check the workspace 🔧".into(),
         };
         let mut buf = Vec::new();
         futures_block_on(write_msg(&mut buf, &ev)).unwrap();
         let mut cur = Cursor::new(buf);
         let got: HarnessEvent = futures_block_on(read_msg(&mut cur)).unwrap();
         match got {
-            HarnessEvent::ToolCallCompleted {
-                transcript_delta, ..
-            } => assert_eq!(transcript_delta, raw),
+            HarnessEvent::AgentMessage { text, role, .. } => {
+                assert_eq!(text, "I see — let me check the workspace 🔧");
+                assert_eq!(role, AgentRole::Assistant);
+            }
             _ => panic!("variant mismatch"),
         }
     }
@@ -440,10 +488,20 @@ mod tests {
                 tool_name: "B".into(),
                 ok: true,
                 duration_ms: 0,
-                transcript_delta: vec![],
+                result_summary: None,
             }
             .kind(),
             "tool_call_completed"
+        );
+        assert_eq!(
+            HarnessEvent::AgentMessage {
+                run_id: "x".into(),
+                message_id: "m".into(),
+                role: AgentRole::Assistant,
+                text: "hi".into(),
+            }
+            .kind(),
+            "agent_message"
         );
         assert_eq!(
             HarnessEvent::RunCompleted {

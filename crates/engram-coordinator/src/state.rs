@@ -72,18 +72,6 @@ pub enum SessionEvent {
         snapshot_id: SnapshotId,
         at: DateTime<Utc>,
     },
-    /// Phase 4 (Track C.7): cross-host resume via the session's
-    /// checkpoint branch. Distinct from `Resumed` so SSE
-    /// subscribers can tell hot resume (FC snapshot, sub-second,
-    /// in-memory state preserved) from cold resume (fresh sandbox
-    /// + git fetch + reset; in-memory state lost, workspace
-    /// restored to checkpoint HEAD). `commit_sha` is the SHA the
-    /// new sandbox's workspace reset to.
-    ResumedFromCheckpoint {
-        branch: String,
-        commit_sha: String,
-        at: DateTime<Utc>,
-    },
     /// Phase 4 (Track C.6): a checkpoint successfully pushed the
     /// session's workspace to its `engram/sessions/<id>` branch.
     /// `commit_sha` is the new HEAD on that branch; `harness_acked`
@@ -102,17 +90,23 @@ pub enum SessionEvent {
         reason: String,
         at: DateTime<Utc>,
     },
-    /// Phase 4 (Track A.3): tool-call-grain harness events. Web UI
-    /// and Slackbot subscribe to these to render the agent's
-    /// play-by-play. Engram does *not* checkpoint on every tool
-    /// call — per-call commits would drown the branch. Auto-
-    /// checkpointing fires on `Idle` / `RunCompleted` instead
-    /// (Track C.9). `transcript_delta` carries the bytes the harness
-    /// appended to its native transcript file; opaque to Engram,
-    /// replayed on resume to reconstruct the agent's view.
+    /// Phase 4: harness-emitted events. Web UI and Slackbot
+    /// subscribe to these to render the agent's play-by-play.
+    /// Track B reshape: structured summary fields replace the
+    /// opaque `transcript_delta` bytes — chat consumers render
+    /// directly without parsing agent-native formats. New
+    /// `HarnessAgentMessage` variant carries assistant text
+    /// between tool calls.
     HarnessRunStarted {
         run_id: String,
         prompt_summary: Option<String>,
+        at: DateTime<Utc>,
+    },
+    HarnessAgentMessage {
+        run_id: String,
+        message_id: String,
+        role: engram_harness_proto::AgentRole,
+        text: String,
         at: DateTime<Utc>,
     },
     HarnessToolCallStarted {
@@ -128,11 +122,7 @@ pub enum SessionEvent {
         tool_name: String,
         ok: bool,
         duration_ms: u64,
-        /// Bytes the harness appended to its native transcript file
-        /// for this call. Stored verbatim; replayed on resume to
-        /// reconstruct the file in the agent's format.
-        #[serde(default, with = "transcript_delta_serde")]
-        transcript_delta: Vec<u8>,
+        result_summary: Option<String>,
         at: DateTime<Utc>,
     },
     HarnessRunCompleted {
@@ -143,16 +133,6 @@ pub enum SessionEvent {
     HarnessIdle {
         at: DateTime<Utc>,
     },
-}
-
-mod transcript_delta_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    pub fn serialize<S: Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        b.serialize(s)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        Vec::<u8>::deserialize(d)
-    }
 }
 
 impl SessionEvent {
@@ -170,10 +150,10 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
-            Self::ResumedFromCheckpoint { .. } => "resumed_from_checkpoint",
             Self::CheckpointPushed { .. } => "checkpoint_pushed",
             Self::CheckpointFailed { .. } => "checkpoint_failed",
             Self::HarnessRunStarted { .. } => "run_started",
+            Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
             Self::HarnessRunCompleted { .. } => "run_completed",
@@ -194,6 +174,18 @@ impl SessionEvent {
                 prompt_summary,
                 at,
             },
+            HarnessEvent::AgentMessage {
+                run_id,
+                message_id,
+                role,
+                text,
+            } => Self::HarnessAgentMessage {
+                run_id,
+                message_id,
+                role,
+                text,
+                at,
+            },
             HarnessEvent::ToolCallStarted {
                 run_id,
                 tool_call_id,
@@ -212,14 +204,14 @@ impl SessionEvent {
                 tool_name,
                 ok,
                 duration_ms,
-                transcript_delta,
+                result_summary,
             } => Self::HarnessToolCallCompleted {
                 run_id,
                 tool_call_id,
                 tool_name,
                 ok,
                 duration_ms,
-                transcript_delta,
+                result_summary,
                 at,
             },
             HarnessEvent::RunCompleted { run_id, ok } => {

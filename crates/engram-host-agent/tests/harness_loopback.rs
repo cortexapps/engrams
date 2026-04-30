@@ -4,7 +4,7 @@
 //! in-memory duplex stream) against `engram_host_agent::harness::HarnessHub`
 //! (the hub, on the other end). Asserts that the events the noop
 //! harness emits land in the configured `EventSink` in order, with
-//! `transcript_delta` bytes preserved verbatim.
+//! `result_summary` preserved verbatim.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +36,7 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
     cfg.tool_calls = 3;
     cfg.interval = Duration::from_millis(1);
     cfg.tool_call_duration_ms = 1;
-    cfg.transcript_delta_template = b"{\"step\":\"noop\"}\n".to_vec();
+    cfg.result_summary_template = "noop tool result".into();
 
     // Run noop in a task; once it emits Idle it stays connected
     // waiting for shutdown. Send Shutdown to release it.
@@ -88,11 +88,11 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
     let mut completed_count = 0usize;
     for ev in events.iter() {
         if let HarnessEvent::ToolCallCompleted {
-            transcript_delta, ..
+            result_summary, ..
         } = ev
         {
             completed_count += 1;
-            assert_eq!(transcript_delta.as_slice(), b"{\"step\":\"noop\"}\n");
+            assert_eq!(result_summary.as_deref(), Some("noop tool result"));
         }
     }
     assert_eq!(completed_count, 3, "expected 3 ToolCallCompleted events");

@@ -639,7 +639,7 @@ mod tests {
                     tool_name: "Bash".into(),
                     ok: true,
                     duration_ms: 1,
-                    transcript_delta: b"line\n".to_vec(),
+                    result_summary: Some("line".into()),
                 }),
             )
             .await
