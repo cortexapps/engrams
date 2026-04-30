@@ -106,6 +106,12 @@ pub struct CreateSessionRequest {
     /// session for `git+...` repos; ephemeral for `local://`).
     #[serde(default)]
     pub read_only: bool,
+    /// Initial prompt for the agent. When set, the harness adapter
+    /// reads `$ENGRAM_INITIAL_PROMPT` at startup and runs it as
+    /// the session's first prompt. None = adapter starts and
+    /// waits for `POST /sessions/:id/prompt`.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -195,11 +201,11 @@ pub async fn create_session(
     );
 
     // Per-session agent argv (carries this session's id, the
-    // attach token in future). Built here so `start_agent` can
-    // pass it post-create — the warm-pool spec must NOT carry
-    // session-scoped argv or replenished slots would all attach
-    // claiming to be this session.
-    let agent_for_session = build_dev_noop_agent(&state, session_id);
+    // attach token in future, the initial prompt). Built here so
+    // `start_agent` can pass it post-create — the warm-pool spec
+    // must NOT carry session-scoped argv or replenished slots
+    // would all attach claiming to be this session.
+    let agent_for_session = build_dev_noop_agent(&state, session_id, req.prompt.as_deref());
 
     let vm_spec = VmSpec {
         image: image_version.clone(),
@@ -420,6 +426,7 @@ pub async fn delete_session(
 fn build_dev_noop_agent(
     state: &SharedState,
     session_id: SessionId,
+    initial_prompt: Option<&str>,
 ) -> Option<engram_core::types::sandbox::AgentSpec> {
     use crate::config::SandboxBackendChoice;
     if !state.cfg.dev_auto_noop {
@@ -433,6 +440,9 @@ fn build_dev_noop_agent(
         .to_string();
     let mut env = HashMap::new();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
+    if let Some(prompt) = initial_prompt {
+        env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
+    }
 
     let argv = match state.cfg.sandbox_backend {
         SandboxBackendChoice::Process => {

@@ -73,6 +73,12 @@ enum SessionCmd {
         /// Free-form user identifier surfaced on the row.
         #[arg(long)]
         user_id: Option<String>,
+        /// Initial prompt for the agent. Read by the harness adapter
+        /// from `$ENGRAM_INITIAL_PROMPT` at startup; runs as the
+        /// session's first prompt. Omit to attach a fresh adapter
+        /// that waits for `engram session prompt <id>`.
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// List sessions in `pending` / `active` / `idle` status.
     List,
@@ -137,6 +143,12 @@ enum SessionCmd {
     /// Force a checkpoint flush on a Git session — Postgres event
     /// + git commit + push to `engram/sessions/<id>`.
     Checkpoint { id: String },
+    /// Push a prompt to a running session's agent. Auto-resumes
+    /// Idle sessions; 410 Gone for Dead.
+    Prompt {
+        id: String,
+        text: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -286,6 +298,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 read_only,
                 image_version,
                 user_id,
+                prompt,
             } => {
                 session_create(
                     &client,
@@ -295,6 +308,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     *read_only,
                     image_version.as_deref(),
                     user_id.as_deref(),
+                    prompt.as_deref(),
                     cli.json,
                 )
                 .await
@@ -324,6 +338,9 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             }
             SessionCmd::Checkpoint { id } => {
                 session_checkpoint(&client, &cli.endpoint, id, cli.json).await
+            }
+            SessionCmd::Prompt { id, text } => {
+                session_prompt(&client, &cli.endpoint, id, text, cli.json).await
             }
         },
         Cmd::Image { cmd } => match cmd {
@@ -459,6 +476,7 @@ async fn session_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
@@ -467,6 +485,7 @@ async fn session_create(
     read_only: bool,
     image_version: Option<&str>,
     user_id: Option<&str>,
+    prompt: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
     let mut payload = serde_json::Map::new();
@@ -480,6 +499,9 @@ async fn session_create(
     }
     if let Some(u) = user_id {
         payload.insert("user_id".into(), Value::from(u));
+    }
+    if let Some(p) = prompt {
+        payload.insert("prompt".into(), Value::from(p));
     }
     let resp = client
         .post(format!("{endpoint}/sessions"))
@@ -881,6 +903,34 @@ async fn session_checkpoint(
         println!("checkpoint: {sha}");
     } else {
         println!("checkpoint: (no-op — workspace clean)");
+    }
+    Ok(())
+}
+
+async fn session_prompt(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    text: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let payload = serde_json::json!({ "text": text });
+    let resp = client
+        .post(format!("{endpoint}/sessions/{id}/prompt"))
+        .json(&payload)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    if json {
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+    } else {
+        println!("prompt forwarded");
     }
     Ok(())
 }
