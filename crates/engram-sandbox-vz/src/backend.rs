@@ -129,14 +129,6 @@ impl VzBackend {
     }
 }
 
-// Helper for the methods that still aren't implemented
-// (snapshot/restore — each lands in task 29).
-fn unimpl(method: &str) -> SandboxError {
-    SandboxError::Vm(
-        format!("VzBackend::{method} not yet implemented (see plan task 29)").into(),
-    )
-}
-
 /// Adapter that runs the engram-agentd wire protocol against a
 /// pre-connected byte stream. Mirrors the FC backend's
 /// `drive_exec_protocol` — the protocol is VMM-independent (it's
@@ -378,14 +370,130 @@ impl SandboxBackend for VzBackend {
 
     async fn snapshot(
         &self,
-        _id: SandboxId,
-        _dest: &Path,
+        id: SandboxId,
+        dest: &Path,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Err(unimpl("snapshot"))
+        let (vm, spec) = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            (live.vm.clone(), live.spec.clone())
+        };
+        tokio::fs::create_dir_all(dest).await.map_err(|e| {
+            SandboxError::Snapshot(format!(
+                "create snapshot dir {}: {e}",
+                dest.display()
+            ))
+        })?;
+        // Mirror FC's pause → save → resume sequence so the live
+        // session loses ~no time. Best-effort resume on save
+        // failure so we don't leave the VM stuck Paused.
+        vm.pause().await?;
+        let state_path = crate::snapshot::state_path(dest);
+        let save_result = vm.save(&state_path).await;
+        let resume_result = vm.resume().await;
+        save_result?;
+        // If save succeeded but resume failed, the VM is stuck
+        // paused — surface the resume error so the caller can
+        // try `engram session resume <id>`.
+        resume_result?;
+
+        // Manifest. Image version is recorded so the snapshot
+        // catalog can flag stale-image restores in a future
+        // round.
+        let manifest = crate::snapshot::VzSnapshotManifest::new(id, spec.clone());
+        let manifest_path = dest.join(crate::snapshot::MANIFEST_FILENAME);
+        let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
+            SandboxError::Snapshot(format!("manifest serialize: {e}"))
+        })?;
+        tokio::fs::write(&manifest_path, bytes).await.map_err(|e| {
+            SandboxError::Snapshot(format!("write manifest: {e}"))
+        })?;
+        crate::snapshot::build_metadata(dest, &spec.image).await
     }
 
-    async fn restore(&self, _src: PathBuf) -> Result<SandboxId, SandboxError> {
-        Err(unimpl("restore"))
+    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+        let manifest = crate::snapshot::read_manifest(&src).await?;
+        let rootfs = manifest.spec.rootfs_source.clone().ok_or_else(|| {
+            SandboxError::Snapshot(
+                "snapshot manifest missing rootfs_source — cannot restore without an \
+                 attached disk image"
+                    .into(),
+            )
+        })?;
+        if !rootfs.exists() {
+            return Err(SandboxError::Snapshot(format!(
+                "restore: rootfs at {} no longer exists; the bake may have been \
+                 deleted since the snapshot was taken",
+                rootfs.display()
+            )));
+        }
+        let memory_mib = if manifest.spec.memory.max_mib > 0 {
+            manifest.spec.memory.max_mib
+        } else {
+            self.cfg.default_memory_mib
+        };
+        let vcpus = if manifest.spec.cpu.vcpus > 0 {
+            manifest.spec.cpu.vcpus
+        } else {
+            self.cfg.default_vcpus
+        };
+        // Build a fresh VzVm whose configuration matches the source.
+        // VZ's restoreMachineStateFromURL requires this — a
+        // mismatched config (different rootfs, different vsock
+        // device count, etc.) returns NSError code "configuration
+        // doesn't match save file."
+        let vm_cfg = VmConfig::new(
+            self.cfg.kernel_path.clone(),
+            rootfs,
+            memory_mib,
+            vcpus,
+        );
+        let vm = VzVm::new(vm_cfg)?;
+
+        let state_path = crate::snapshot::state_path(&src);
+        if !state_path.exists() {
+            return Err(SandboxError::Snapshot(format!(
+                "restore: VZ state file missing at {}",
+                state_path.display()
+            )));
+        }
+
+        // Restore + resume. After restoreMachineStateFromURL the
+        // VM is in `.paused`; the trait contract is that callers
+        // see a running sandbox, so resume here.
+        vm.restore(&state_path).await?;
+        vm.resume().await?;
+
+        // Allocate a fresh sandbox id (matches FC's behaviour —
+        // the original id only lives in the manifest for audit).
+        let new_id = SandboxId::new();
+        let vsock_uds_path = self.vsock_uds_path_for(new_id);
+        tokio::fs::create_dir_all(&self.work_dir).await?;
+
+        // Re-bind the vsock UDS bridge against the restored VM.
+        // Same path as `create()`. The in-VM `engram-bootstrap`
+        // supervisor (kept alive by FC's bootstrap-as-supervisor
+        // pattern, which this backend matches) is reachable via
+        // <vsock_uds>_1025 just like a fresh VM.
+        let harness_sink = self.harness_sink.lock().clone();
+        let bridge = VsockBridge::start(
+            vm.raw_clone(),
+            vm.queue_clone(),
+            vsock_uds_path.clone(),
+            harness_sink,
+        )
+        .await
+        .map_err(SandboxError::from)?;
+
+        self.sandboxes.insert(
+            new_id,
+            VzSandboxState {
+                spec: manifest.spec,
+                vm: Arc::new(vm),
+                bridge: parking_lot::Mutex::new(Some(bridge)),
+                vsock_uds_path,
+            },
+        );
+        Ok(new_id)
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
