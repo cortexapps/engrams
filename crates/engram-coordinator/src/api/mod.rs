@@ -39,7 +39,6 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/sessions/:id/diff", get(sessions_inspect::diff))
         .route("/sessions/:id/fork", post(sessions_inspect::fork))
-        .route("/sessions/:id/migrate", post(sessions::migrate))
         .route("/api/hosts/connect", get(hosts::connect))
         .route("/api/hosts", get(hosts::list))
         .route("/api/hosts/:id", get(hosts::get))

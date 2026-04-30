@@ -9,6 +9,10 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     Conflict(String),
+    /// 410 Gone — the resource lived but is now permanently
+    /// unavailable. Used for sessions whose FC snapshot was
+    /// invalidated (Dead): the only affordance is to fork.
+    Gone(String),
     Unsupported(String),
     Internal(String),
 }
@@ -25,6 +29,7 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Gone(_) => StatusCode::GONE,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -35,6 +40,7 @@ impl ApiError {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::Gone(_) => "snapshot_invalidated",
             Self::Unsupported(_) => "unsupported",
             Self::Internal(_) => "internal",
         }
@@ -45,6 +51,7 @@ impl ApiError {
             Self::BadRequest(m)
             | Self::NotFound(m)
             | Self::Conflict(m)
+            | Self::Gone(m)
             | Self::Unsupported(m)
             | Self::Internal(m) => m,
         }

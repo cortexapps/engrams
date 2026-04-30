@@ -123,7 +123,7 @@ pub async fn run_with_registry(
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE
     // metadata server, MockCloud's `trigger_preemption` for tests)
     // and on notice fans out across all active sessions on this
-    // host: workspace checkpoint → destroy → mark PendingReassign.
+    // host: workspace checkpoint → destroy → mark Dead.
     // Caller-driven recovery via `POST /sessions/:id/resume`.
     let _preemption_drain = preemption_drain::spawn(state.clone());
 
@@ -169,7 +169,7 @@ pub async fn run_with_registry(
 /// once the host dials back in via `/api/hosts/connect` and registers
 /// its backend, routing resumes for those sessions without further
 /// intervention. Sessions in `Pending` (sandbox not created yet),
-/// `Idle` (evicted), or `PendingReassign` (awaiting reschedule) are
+/// `Idle` (evicted), or `Dead` (awaiting reschedule) are
 /// left for `/resume` to handle on next access.
 async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaError> {
     let sessions = state.services.meta.list_active_sessions().await?;

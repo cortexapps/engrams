@@ -124,7 +124,7 @@ fn parse_session_status(s: &str) -> Result<SessionStatus, MetaError> {
         "pending" => SessionStatus::Pending,
         "active" => SessionStatus::Active,
         "idle" => SessionStatus::Idle,
-        "pending_reassign" => SessionStatus::PendingReassign,
+        "dead" => SessionStatus::Dead,
         "completed" => SessionStatus::Completed,
         "failed" => SessionStatus::Failed,
         other => {

@@ -128,13 +128,11 @@ enum SessionCmd {
         #[arg(long)]
         title: Option<String>,
     },
-    /// Resume an Idle / PendingReassign session. With `--from N`,
-    /// rewinds the workspace to the checkpoint at or before that
-    /// event_idx (cold path; FC snapshot is bypassed).
+    /// Resume an Idle session via its FC snapshot. Dead sessions
+    /// can't be resumed (snapshot invalidated) — use
+    /// `engram session fork <id>` to continue from the workspace.
     Resume {
         id: String,
-        #[arg(long)]
-        from: Option<i64>,
     },
     /// Force a checkpoint flush on a Git session — Postgres event
     /// + git commit + push to `engram/sessions/<id>`.
@@ -321,8 +319,8 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Fork { id, at, title } => {
                 session_fork(&client, &cli.endpoint, id, *at, title.as_deref(), cli.json).await
             }
-            SessionCmd::Resume { id, from } => {
-                session_resume(&client, &cli.endpoint, id, *from, cli.json).await
+            SessionCmd::Resume { id } => {
+                session_resume(&client, &cli.endpoint, id, cli.json).await
             }
             SessionCmd::Checkpoint { id } => {
                 session_checkpoint(&client, &cli.endpoint, id, cli.json).await
@@ -839,13 +837,9 @@ async fn session_resume(
     client: &reqwest::Client,
     endpoint: &str,
     id: &str,
-    from: Option<i64>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut url = format!("{endpoint}/sessions/{id}/resume");
-    if let Some(idx) = from {
-        url.push_str(&format!("?from_event_idx={idx}"));
-    }
+    let url = format!("{endpoint}/sessions/{id}/resume");
     let resp = client.post(url).send().await?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();

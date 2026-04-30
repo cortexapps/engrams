@@ -209,7 +209,7 @@ impl MetadataStore for MockMetadataStore {
             {
                 s.host_id = None;
                 s.sandbox_id = None;
-                s.status = SessionStatus::PendingReassign;
+                s.status = SessionStatus::Dead;
                 s.last_active_at = Utc::now();
                 affected.push(s.id);
             }
@@ -1462,9 +1462,11 @@ async fn resume_409_when_session_not_idle() {
 }
 
 #[tokio::test]
-async fn resume_409_when_no_snapshot_exists() {
-    // Set up an Idle session with no SnapshotRecord. resume must 409
-    // rather than restore from nothing.
+async fn resume_410_gone_when_no_snapshot_exists() {
+    // Set up an Idle session with no SnapshotRecord. resume must
+    // return 410 Gone — the session's snapshot is invalidated and
+    // engram is a one-shot task runner. The only affordance is
+    // `engram session fork <id>` to continue from the workspace.
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(
@@ -1485,7 +1487,7 @@ async fn resume_409_when_no_snapshot_exists() {
         .unwrap();
     let app = build_app(store);
     let resp = post(app, &format!("/sessions/{id}/resume"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::GONE);
 }
 
 #[tokio::test]

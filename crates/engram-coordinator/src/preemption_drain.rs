@@ -13,7 +13,7 @@
 //!   2. Best-effort `SandboxBackend::destroy` — release Firecracker
 //!      handles cleanly. The VM is about to die anyway; this is just
 //!      hygiene.
-//!   3. Mark the session `PendingReassign`, clear `host_id` +
+//!   3. Mark the session `Dead`, clear `host_id` +
 //!      `sandbox_id`. The caller decides what to do next via
 //!      `POST /sessions/:id/resume` (cross-host cold resume) or
 //!      `engram session fork` — Engram does *not* auto-resume on
@@ -62,7 +62,7 @@ pub fn spawn(state: SharedState) -> JoinHandle<()> {
             // than one signal — `engram-cloud-gcp`'s polling
             // semantics let multiple ticks fire if the underlying
             // metadata stays "TERMINATE" for a while. Drain is
-            // idempotent on already-PendingReassign sessions.
+            // idempotent on already-Dead sessions.
         }
     })
 }
@@ -128,7 +128,7 @@ async fn run_drain(state: &SharedState, notice: PreemptionNotice) {
     {
         tracing::warn!(
             ?deadline,
-            "preemption drain: deadline elapsed; some sessions may not be PendingReassign yet"
+            "preemption drain: deadline elapsed; some sessions may not be Dead yet"
         );
     } else {
         tracing::info!(count, "preemption drain complete");
@@ -136,7 +136,7 @@ async fn run_drain(state: &SharedState, notice: PreemptionNotice) {
 }
 
 /// Drain one session: checkpoint workspace, destroy sandbox, mark
-/// PendingReassign. Pure function over `SharedState`; the caller
+/// Dead. Pure function over `SharedState`; the caller
 /// (the cloud-signal consumer or, in multi-host production, the
 /// host-agent's preemption handler) wraps it in the appropriate
 /// fan-out.
@@ -182,7 +182,7 @@ pub async fn drain_session(
         );
     }
 
-    // Step 3: mark PendingReassign. The caller's resume call later
+    // Step 3: mark Dead. The caller's resume call later
     // brings the session back on a different host via the git
     // checkpoint branch.
     if let Err(e) = state
@@ -212,7 +212,7 @@ pub async fn drain_session(
     state
         .services
         .meta
-        .set_session_status(session_id, SessionStatus::PendingReassign)
+        .set_session_status(session_id, SessionStatus::Dead)
         .await
         .map_err(|e| DrainError::Meta(e.to_string()))?;
 
@@ -221,7 +221,7 @@ pub async fn drain_session(
             session_id,
             SessionEvent::StatusChanged {
                 from: SessionStatus::Active,
-                to: SessionStatus::PendingReassign,
+                to: SessionStatus::Dead,
                 at: Utc::now(),
             },
         )
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_session_pushes_workspace_and_marks_pending_reassign() {
+    async fn drain_session_pushes_workspace_and_marks_dead() {
         let (remote, workspace) = seed_remote_and_workspace();
         let session_id = engram_core::SessionId::new();
         let branch = checkpoint_branch_for(session_id);
@@ -427,9 +427,9 @@ mod tests {
             .await
             .expect("drain should succeed");
 
-        // Session is PendingReassign with host/sandbox cleared.
+        // Session is Dead with host/sandbox cleared.
         let after = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(after.status, SessionStatus::PendingReassign);
+        assert_eq!(after.status, SessionStatus::Dead);
         assert_eq!(after.host_id, None);
         assert_eq!(after.sandbox_id, None);
         assert_eq!(state.registry.get(session_id), None);
@@ -468,7 +468,7 @@ mod tests {
     async fn preemption_signal_drives_drain_end_to_end() {
         // Wire MockCloud, spawn the drain task, trigger a
         // preemption notice, assert the active session lands in
-        // PendingReassign within the 25s deadline.
+        // Dead within the 25s deadline.
         let (remote, workspace) = seed_remote_and_workspace();
         let session_id = engram_core::SessionId::new();
         let branch = checkpoint_branch_for(session_id);
@@ -515,11 +515,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         mock_cloud.trigger_preemption("simulated", Some(25));
 
-        // Wait for the session to flip to PendingReassign.
+        // Wait for the session to flip to Dead.
         let mut transitioned = false;
         for _ in 0..50 {
             let s = state.services.meta.get_session(session_id).await.unwrap();
-            if s.status == SessionStatus::PendingReassign {
+            if s.status == SessionStatus::Dead {
                 transitioned = true;
                 break;
             }

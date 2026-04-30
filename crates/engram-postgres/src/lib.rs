@@ -290,7 +290,7 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Vec<SessionId>, MetaError> {
         // Single transaction: hosts.status -> dead, every session row
         // pointing at this host gets host_id cleared and status flipped
-        // to pending_reassign. Returning the affected session ids lets
+        // to dead. Returning the affected session ids lets
         // the caller emit per-session StatusChanged events without a
         // second query. The hosts UPDATE deliberately omits a rows-
         // affected check — calling this on a host already marked dead
@@ -308,7 +308,7 @@ impl MetadataStore for PostgresStore {
             UPDATE sessions
                SET host_id    = NULL,
                    sandbox_id = NULL,
-                   status     = 'pending_reassign',
+                   status     = 'dead',
                    last_active_at = NOW()
              WHERE host_id = $1
                AND status NOT IN ('completed','failed')

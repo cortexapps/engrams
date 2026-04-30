@@ -117,7 +117,7 @@ impl MetadataStore for MiniMeta {
             {
                 s.host_id = None;
                 s.sandbox_id = None;
-                s.status = SessionStatus::PendingReassign;
+                s.status = SessionStatus::Dead;
                 s.last_active_at = Utc::now();
                 affected.push(s.id);
             }
@@ -204,11 +204,11 @@ async fn evacuates_active_and_idle_sessions_clears_host_id() {
     );
 
     let s_active_row = meta.get_session(s_active).await.unwrap();
-    assert_eq!(s_active_row.status, SessionStatus::PendingReassign);
+    assert_eq!(s_active_row.status, SessionStatus::Dead);
     assert_eq!(s_active_row.host_id, None);
 
     let s_idle_row = meta.get_session(s_idle).await.unwrap();
-    assert_eq!(s_idle_row.status, SessionStatus::PendingReassign);
+    assert_eq!(s_idle_row.status, SessionStatus::Dead);
     assert_eq!(s_idle_row.host_id, None);
 }
 

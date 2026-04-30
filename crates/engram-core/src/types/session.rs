@@ -11,12 +11,14 @@ pub enum SessionStatus {
     Idle,
     Completed,
     Failed,
-    /// Phase 3d: the host that owned this session went dark and
-    /// the dead-host detector cleared `host_id`. Next access picks
-    /// a new host (snapshot affinity if any other host has the
-    /// snapshot, else cold-tier blob restore) and transitions to
-    /// `Active`.
-    PendingReassign,
+    /// Terminal: the session's FC snapshot is gone (host crashed
+    /// mid-run, disk full, eviction past hard cap, etc.). Engram
+    /// is a one-shot task runner — sessions live ↔ FC-snapshot
+    /// life. The only affordance from Dead is `engram session fork
+    /// <id>` to start a new session with the workspace at the
+    /// last checkpoint SHA. (Renamed from `PendingReassign` when
+    /// the cross-host-resume code path was retired.)
+    Dead,
 }
 
 impl SessionStatus {
@@ -27,7 +29,7 @@ impl SessionStatus {
             Self::Idle => "idle",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::PendingReassign => "pending_reassign",
+            Self::Dead => "dead",
         }
     }
 }
@@ -195,7 +197,7 @@ pub struct Session {
     /// in-memory routing maps from `SELECT ... FROM sessions WHERE
     /// status NOT IN ('completed','failed')`. `None` for sessions in
     /// `Pending` (sandbox not created yet) / `Idle` (sandbox evicted)
-    /// / `PendingReassign` (host died, awaiting reschedule) /
+    /// / `Dead` (host died, awaiting reschedule) /
     /// `Completed` / `Failed`.
     #[serde(default)]
     pub sandbox_id: Option<SandboxId>,

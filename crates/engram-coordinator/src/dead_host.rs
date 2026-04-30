@@ -6,7 +6,7 @@
 //! each candidate. The winner:
 //!
 //! 1. Atomically marks the host `Dead` in Postgres and transitions
-//!    every session pointed at it to `PendingReassign` with `host_id`
+//!    every session pointed at it to `Dead` with `host_id`
 //!    cleared.
 //! 2. Emits a `StatusChanged` event for each affected session so SSE
 //!    subscribers see the transition.
@@ -167,7 +167,7 @@ async fn evict_host(
     for session_id in &session_ids {
         let event = SessionEvent::StatusChanged {
             from: SessionStatus::Active,
-            to: SessionStatus::PendingReassign,
+            to: SessionStatus::Dead,
             at: Utc::now(),
         };
         let kind = event.kind();
@@ -192,7 +192,7 @@ async fn evict_host(
     tracing::info!(
         host_id = %host_id,
         sessions_reassigned = session_ids.len(),
-        "host marked dead and sessions transitioned to pending_reassign",
+        "host marked dead and sessions transitioned to dead",
     );
 
     sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")

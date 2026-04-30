@@ -57,7 +57,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id` on
     /// every session pointed at it, (c) transition those sessions to
-    /// `PendingReassign`. Returns the affected SessionIds so the caller
+    /// `Dead`. Returns the affected SessionIds so the caller
     /// can emit per-session `StatusChanged` events. Postgres uses a
     /// single transaction; the Mock takes its sessions mutex once.
     /// Idempotent on a host already marked Dead — returns an empty
