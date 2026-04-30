@@ -17,12 +17,14 @@ use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+use objc2_foundation::NSFileHandle;
 use objc2_virtualization::{
-    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
-    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
+    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSerialPortAttachment,
+    VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 use tokio::sync::oneshot;
 
@@ -51,7 +53,14 @@ impl VmConfig {
             rootfs_path: rootfs_path.into(),
             memory_mib,
             vcpus,
-            kernel_cmdline: "console=hvc0 root=/dev/vda rw quiet".into(),
+            // `init=/sbin/engram-init` mirrors the FC backend's
+            // default — the engram-baked rootfs ships an init shim
+            // at /sbin/engram-init that exec's engram-agentd on
+            // vsock and spawns engram-bootstrap as a supervisor.
+            // Without this, the guest boots /sbin/init (systemd
+            // or none) and nothing listens on vsock 1024/1025.
+            kernel_cmdline:
+                "console=hvc0 root=/dev/vda rw quiet init=/sbin/engram-init".into(),
         }
     }
 }
@@ -438,10 +447,32 @@ fn build_configuration(
             NSArray::from_retained_slice(&[vsock_dev_super]);
         vz_cfg.setSocketDevices(&socket_array);
 
-        // Serial port: virtio-console wired to /dev/null on the
-        // host for now. Hooks into kernel boot logs are useful for
-        // debugging; we'll add an opt-in stderr forwarder later.
+        // Serial port: virtio-console wired to host stderr so kernel
+        // boot logs + the engram-init shim's output land in the
+        // coord's tracing stream. Critical for debugging "why
+        // didn't bootstrap come up" — without this, a kernel panic
+        // or init failure is invisible from the host.
+        //
+        // Opt-out: ENGRAM_VZ_SILENCE_CONSOLE=1 wires /dev/null
+        // instead, for production-style runs that don't want guest
+        // chatter mixed into coord logs.
+        let attach_console = std::env::var("ENGRAM_VZ_SILENCE_CONSOLE")
+            .map(|v| v == "0" || v.is_empty())
+            .unwrap_or(true);
         let serial_cfg = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        if attach_console {
+            // STDERR_FILENO = 2. NSFileHandle::fileHandleWithStandardError
+            // returns a singleton that wraps the process's fd 2.
+            let stderr_handle = NSFileHandle::fileHandleWithStandardError();
+            let attachment = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                None,
+                Some(&stderr_handle),
+            );
+            let attachment_super: Retained<VZSerialPortAttachment> =
+                Retained::cast_unchecked(attachment);
+            serial_cfg.setAttachment(Some(&attachment_super));
+        }
         let serial_super: Retained<VZSerialPortConfiguration> =
             Retained::cast_unchecked(serial_cfg);
         let serial_array: Retained<NSArray<VZSerialPortConfiguration>> =

@@ -1,0 +1,73 @@
+name: CI (macOS arm64 / VZ)
+
+# Mirrors the Linux ci.yml but runs the engram-sandbox-vz unit
+# tests on a macOS-arm64 runner with the
+# com.apple.security.virtualization entitlement signed in. Catches
+# regressions in:
+#   - the objc2 / objc2-virtualization bindings
+#   - the dispatch + Sendable plumbing in vm.rs
+#   - the vsock UDS bridge structure (path helpers, error mapping)
+#   - the codesign script + entitlement file
+#
+# What this workflow does NOT yet exercise:
+#   - actual VM boot — that requires a vsock-capable arm64 kernel,
+#     and we don't ship one in this repo (see docs/demo-vz.md
+#     "Step 1 — kernel"). Once we have a known-good kernel checked
+#     into a release artifact bucket, add a job that downloads it
+#     and runs `cargo nextest run -p engram-sandbox-vz -- --ignored`.
+#
+# Linux/FC remains the canonical CI gate; this workflow is purely
+# additive.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  SQLX_OFFLINE: "true"
+
+jobs:
+  vz:
+    name: engram-sandbox-vz unit tests
+    runs-on: macos-15  # arm64, has Xcode CLT pre-installed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install entitlements (verify file is well-formed plist)
+        run: plutil -lint crates/engram-sandbox-vz/entitlements.plist
+
+      - name: Build coord + sandbox-vz tests
+        # `cargo build --tests` produces the test binaries under
+        # target/debug/deps/ that vz-codesign signs.
+        run: cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+
+      - name: Codesign with virtualization entitlement
+        run: bash crates/engram-sandbox-vz/scripts/codesign.sh debug
+
+      - name: Run engram-sandbox-vz unit tests
+        # All of these run without a real kernel — the smoke test
+        # in vm.rs exercises VZ config-build through validateWithError;
+        # other tests are pure-Rust unit tests.
+        run: cargo nextest run -p engram-sandbox-vz
+
+      - name: Workspace check (catches downstream-of-VZ regressions)
+        # cargo check on the rest of the workspace ensures the
+        # `--sandbox-backend=vz` wiring in engram-coordinator stays
+        # green; the engram-sandbox-vz crate itself is macOS-only,
+        # so this provides the "does it integrate?" coverage that
+        # the Linux CI can't.
+        run: cargo check --workspace --all-targets

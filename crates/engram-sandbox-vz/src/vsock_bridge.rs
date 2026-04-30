@@ -275,10 +275,17 @@ impl Sendable<Retained<VZVirtualMachine>> {
     }
 }
 
+/// How long the bridge keeps retrying `VZ.connectToPort` after the
+/// host accepts a UDS connection. The 15s budget is sized to cover
+/// kernel boot → init → agentd/bootstrap binding their vsock
+/// listeners. Mirrors FC's start_agent / exec_stream retry windows.
+const DIAL_RETRY_BUDGET_SECS: u64 = 15;
+
 /// Per-port pump: accept on the host UDS listener, dial the
-/// corresponding port via VZ, and pipe bytes both ways. One
-/// connection at a time per port — `start_agent` and `exec_stream`
-/// are serialized on the host side anyway.
+/// corresponding port via VZ (with backoff while the kernel is
+/// still booting), and pipe bytes both ways. One connection at a
+/// time per port — `start_agent` and `exec_stream` are serialized
+/// on the host side anyway.
 async fn host_initiated_pump(
     listener: UnixListener,
     device: Sendable<Retained<VZVirtioSocketDevice>>,
@@ -298,17 +305,50 @@ async fn host_initiated_pump(
         // Each accepted connection gets its own task so a slow
         // consumer doesn't block the listener.
         tokio::spawn(async move {
-            match dial_vz(&queue, &device, port).await {
+            match dial_vz_with_retry(&queue, &device, port).await {
                 Ok(vz_fd) => {
                     if let Err(e) = pump(vz_fd, host_stream).await {
                         tracing::warn!(error = %e, port, "vz vsock pump ended with error");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, port, "vz vsock connectToPort failed");
+                    tracing::warn!(error = %e, port, "vz vsock connectToPort failed after retry budget");
                 }
             }
         });
+    }
+}
+
+/// Retry `dial_vz` with backoff while the kernel is booting and
+/// the in-VM agent/bootstrap haven't bound their vsock listeners
+/// yet. Exits early on success or when the budget elapses.
+///
+/// "Connection reset by peer" is the typical signal during boot —
+/// VZ delivers an RST to the host because no guest process is
+/// listening on the requested port. Other errors (e.g. NSError
+/// from VZ saying the device is gone) bail out immediately.
+async fn dial_vz_with_retry(
+    queue: &dispatch2::DispatchQueue,
+    device: &Sendable<Retained<VZVirtioSocketDevice>>,
+    port: u32,
+) -> Result<std::os::fd::OwnedFd, String> {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(DIAL_RETRY_BUDGET_SECS);
+    let mut backoff = std::time::Duration::from_millis(100);
+    loop {
+        match dial_vz(queue, device, port).await {
+            Ok(fd) => return Ok(fd),
+            Err(e) => {
+                let is_boot_race = e.contains("Connection reset by peer")
+                    || e.contains("connection refused")
+                    || e.contains("connection was refused");
+                if !is_boot_race || tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+            }
+        }
     }
 }
 
