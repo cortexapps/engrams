@@ -1,0 +1,21 @@
+# Cross-compile linkers for the musl-static targets baked into our
+# microVM rootfs images. Both targets are built on macOS hosts via
+# the `vz-bake-*` and `fc-bake-*` justfile recipes — without
+# explicit linker mapping, cargo falls back to Apple's `cc` and
+# trips on Linux ld flags (--as-needed, -Bstatic, etc.).
+#
+# Install the toolchains via:
+#   brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
+#   brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+#   # OR (formula `musl-cross` covers both with renaming):
+#   brew install FiloSottile/musl-cross/musl-cross --with-aarch64
+#
+# The bare formula `musl-cross` installs `x86_64-linux-musl-gcc` and
+# `aarch64-linux-musl-gcc` under /opt/homebrew/bin which is what
+# this config expects.
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"

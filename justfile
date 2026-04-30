@@ -279,6 +279,14 @@ vz-pull-ubuntu-kernel:
 # Bake the noop demo image for the VZ backend. arm64 + virtio-block.
 # Mirror of fc-bake-demo but cross-compiled for aarch64 and built
 # under linux/arm64 buildx so the rootfs binaries match the kernel.
+#
+# One-time setup on Apple Silicon:
+#   brew install musl-cross         # x86_64-linux-musl-gcc + aarch64-linux-musl-gcc
+#   brew install e2fsprogs          # mke2fs (keg-only — see PATH munge below)
+#
+# `.cargo/config.toml` wires the cross-linker; the e2fsprogs PATH
+# is added inline by these recipes so a bare `just vz-bake-demo`
+# works without the operator munging their shell profile.
 vz-bake-demo:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     cargo build -p engram-agentd       --target aarch64-unknown-linux-musl --release
@@ -287,6 +295,7 @@ vz-bake-demo:
     mkdir -p ./var/vz-bake
     printf 'FROM --platform=linux/arm64 debian:bookworm-slim\n' > ./var/vz-bake/Dockerfile
     printf 'name = "vz-demo"\n'                                 > ./var/vz-bake/engram.toml
+    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
     cargo run -p engram-cli -- image build \
         --repo local://demo \
         --tag warm-1 \
@@ -309,6 +318,7 @@ vz-bake-claude:
     mkdir -p ./var/vz-bake-claude
     cp deploy/fc-bake-claude/Dockerfile  ./var/vz-bake-claude/Dockerfile
     cp deploy/fc-bake-claude/engram.toml ./var/vz-bake-claude/engram.toml
+    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
     cargo run -p engram-cli -- image build \
         --repo local://claude-demo \
         --tag warm-1 \
