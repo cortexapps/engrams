@@ -58,10 +58,17 @@ struct HubInner {
     /// Per-sandbox connection state. Populated by `accept_connection`,
     /// removed when the harness disconnects (clean or error).
     connections: Mutex<HashMap<SandboxId, ConnectionHandle>>,
-    /// Per-sandbox last-harness-event timestamps. Used by the idle
-    /// evictor (Track B). Updated atomically inside the same lock as
-    /// `connections` so one mutex covers both maps.
+    /// Per-sandbox last-event-of-any-kind timestamp. Drives the
+    /// **hard** TTL — backstop for stuck adapters that never emit
+    /// `Idle`. Updated on every inbound `HarnessEvent`.
     last_event_at: Mutex<HashMap<SandboxId, DateTime<Utc>>>,
+    /// Per-sandbox last-`Idle`-event timestamp. Drives the **soft**
+    /// TTL — "agent is awaiting user input." Set on `HarnessEvent::Idle`,
+    /// cleared (set to None / removed) on any other event so a long
+    /// tool call doesn't trip the soft TTL mid-call. Also cleared on
+    /// `send_prompt` so the host's "we just gave you work" closes
+    /// the slow-adapter race.
+    last_idle_at: Mutex<HashMap<SandboxId, DateTime<Utc>>>,
     /// Event-emit callback supplied at construction. Invoked for every
     /// inbound `HarnessEvent` after the local maps are updated.
     event_sink: EventSink,
@@ -93,6 +100,7 @@ impl HarnessHub {
             inner: Arc::new(HubInner {
                 connections: Mutex::new(HashMap::new()),
                 last_event_at: Mutex::new(HashMap::new()),
+                last_idle_at: Mutex::new(HashMap::new()),
                 event_sink,
                 session_to_sandbox: Mutex::new(HashMap::new()),
             }),
@@ -235,33 +243,88 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// Push a prompt to the running adapter. Adapter starts a
+    /// fresh run (or queues if a run is in flight). Atomically
+    /// clears `last_idle_at` so the soft idle-eviction TTL doesn't
+    /// fire while the adapter is starting Claude.
+    ///
+    /// Returns `NotAttached` if no harness is bound to `sandbox_id`
+    /// (e.g., session is `Idle` and needs auto-resume first — call
+    /// `ensure_active` upstream).
+    pub async fn send_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        let cmd_tx = {
+            let conns = self.inner.connections.lock();
+            let handle = conns.get(&sandbox_id).ok_or(HarnessError::NotAttached)?;
+            // Clear last_idle_at *atomically with* checking the
+            // connection — if the host's "we're sending you work
+            // now" lands at the same moment as the soft TTL would
+            // fire, the prompt wins. The evictor sees no
+            // last_idle_at on its next tick.
+            self.inner.last_idle_at.lock().remove(&sandbox_id);
+            handle.cmd_tx.clone()
+        };
+        cmd_tx
+            .send(HarnessFrame::Command(HarnessCommand::Prompt { text }))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
     /// Number of currently-attached harnesses. Diagnostic / test helper.
     pub fn attached_count(&self) -> usize {
         self.inner.connections.lock().len()
     }
 
-    /// Sandboxes whose last harness event is older than `ttl`.
-    /// Used by Track B's idle evictor: every tick, scan for these
-    /// and run the suspend pipeline (checkpoint → FC snapshot →
-    /// destroy → mark Idle) on each.
+    /// Sandboxes due for idle eviction under the two-tier policy.
     ///
-    /// Returns `(SessionId, SandboxId)` pairs so the caller can
-    /// route into coord-side metadata (kind, checkpoint_branch)
-    /// without an extra lookup. Only returns sandboxes with an
-    /// attached harness — a sandbox without harness has no idle
-    /// signal and stays unreaped here (other lifecycle paths handle
-    /// it: dead-host detector, operator drain, etc.).
-    pub fn idle_sandboxes(&self, ttl: std::time::Duration) -> Vec<(SessionId, SandboxId)> {
-        let cutoff = Utc::now()
-            - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
-        let last = self.inner.last_event_at.lock();
+    /// Returns `(SessionId, SandboxId)` pairs that satisfy EITHER:
+    /// - **Soft TTL fired:** `last_idle_at` is older than
+    ///   `soft_ttl`. The agent emitted `Idle` (= "awaiting user
+    ///   input") and stayed quiet that long. Normal "user afk"
+    ///   case; Idle eviction frees the host slot.
+    /// - **Hard TTL fired:** `last_event_at` is older than
+    ///   `hard_ttl`. The adapter went silent without ever emitting
+    ///   `Idle` — stuck in a tool call, infinite loop, etc. Backstop
+    ///   so a buggy adapter can't pin a sandbox forever.
+    ///
+    /// A long-running tool call (e.g. 5-minute pytest) doesn't
+    /// trip the soft TTL — `last_idle_at` is None during the call.
+    /// `hard_ttl` is the operator's safety net; default 30 min.
+    ///
+    /// Only returns sandboxes with an attached harness; bare
+    /// sandboxes (no adapter) aren't tracked here. Other lifecycle
+    /// paths handle them (dead-host detector, operator drain).
+    pub fn idle_sandboxes(
+        &self,
+        soft_ttl: std::time::Duration,
+        hard_ttl: std::time::Duration,
+    ) -> Vec<(SessionId, SandboxId)> {
+        let now = Utc::now();
+        let soft_cutoff = now
+            - chrono::Duration::from_std(soft_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let hard_cutoff = now
+            - chrono::Duration::from_std(hard_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let event_at = self.inner.last_event_at.lock();
+        let idle_at = self.inner.last_idle_at.lock();
         let conns = self.inner.connections.lock();
         let mut out = Vec::new();
         for (sandbox_id, handle) in conns.iter() {
-            if let Some(at) = last.get(sandbox_id) {
-                if *at <= cutoff {
-                    out.push((handle.session_id, *sandbox_id));
-                }
+            let soft = idle_at
+                .get(sandbox_id)
+                .map(|at| *at <= soft_cutoff)
+                .unwrap_or(false);
+            let hard = event_at
+                .get(sandbox_id)
+                .map(|at| *at <= hard_cutoff)
+                .unwrap_or(false);
+            if soft || hard {
+                out.push((handle.session_id, *sandbox_id));
             }
         }
         out
@@ -385,17 +448,21 @@ async fn drive_attached<R, W>(
         session_id: attach.session_id,
     };
     inner.connections.lock().insert(sandbox_id, handle);
-    // Treat attach as the first event for idle-eviction purposes —
-    // a sandbox that just connected and emitted nothing is the
-    // *idlest* possible state. Without seeding here, the evictor
-    // would never trigger on a harness that attaches and then dies
-    // silently.
-    inner.last_event_at.lock().insert(sandbox_id, Utc::now());
+    // Seed the timers at attach. `last_event_at` so the hard TTL
+    // can fire on a harness that goes silent without ever sending
+    // a real event. `last_idle_at` so the soft TTL fires on an
+    // adapter that attaches and just sits there (a Claude adapter
+    // started without ENGRAM_INITIAL_PROMPT — awaiting a Prompt
+    // command, which is exactly "awaiting user input").
+    let now = Utc::now();
+    inner.last_event_at.lock().insert(sandbox_id, now);
+    inner.last_idle_at.lock().insert(sandbox_id, now);
 
     let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
     inner.connections.lock().remove(&sandbox_id);
     inner.last_event_at.lock().remove(&sandbox_id);
+    inner.last_idle_at.lock().remove(&sandbox_id);
     let _ = writer_task.await;
     if let Err(e) = reader_outcome {
         tracing::debug!(
@@ -427,7 +494,21 @@ where
         };
         match frame {
             HarnessFrame::Event(ev) => {
-                hub.last_event_at.lock().insert(sandbox_id, Utc::now());
+                let now = Utc::now();
+                hub.last_event_at.lock().insert(sandbox_id, now);
+                // Soft TTL bookkeeping: Idle SETS last_idle_at;
+                // anything else CLEARS it. A long tool call has
+                // ToolCallStarted recently and no Idle, so soft
+                // doesn't trip; the agent finishes, emits Idle,
+                // soft starts ticking from there.
+                match &ev {
+                    HarnessEvent::Idle => {
+                        hub.last_idle_at.lock().insert(sandbox_id, now);
+                    }
+                    _ => {
+                        hub.last_idle_at.lock().remove(&sandbox_id);
+                    }
+                }
                 let fut = (hub.event_sink)(session_id, sandbox_id, ev);
                 fut.await;
             }
@@ -773,16 +854,71 @@ mod tests {
             "harness should attach"
         );
 
-        // Just attached — last_event_at = now. Long TTL means
-        // no sandbox is idle yet.
-        let fresh = hub.idle_sandboxes(Duration::from_secs(60));
+        // Just attached — both timers seeded with `now`. Long
+        // TTLs mean no sandbox is idle yet.
+        let fresh = hub.idle_sandboxes(Duration::from_secs(60), Duration::from_secs(3600));
         assert!(fresh.is_empty(), "fresh attach is not idle: {fresh:?}");
 
-        // Zero TTL means everything attached counts as idle.
-        let aged = hub.idle_sandboxes(Duration::from_millis(0));
+        // Zero soft TTL — `last_idle_at` was seeded at attach so
+        // soft fires; the pair comes back. Hard 0 would also fire,
+        // but we test soft alone here.
+        let aged = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].0, session_id);
         assert_eq!(aged[0].1, sandbox_id);
+    }
+
+    #[tokio::test]
+    async fn long_tool_call_does_not_trip_soft_ttl() {
+        // The motivating case for the two-tier rewrite: an adapter
+        // emits ToolCallStarted, runs a 5-min pytest, and emits
+        // ToolCallCompleted. The soft TTL must NOT fire on
+        // last_event_at staleness — only `last_idle_at`.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let _harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            // Emit ToolCallStarted, then sit silent.
+            write_msg(
+                &mut hw,
+                &HarnessFrame::Event(HarnessEvent::ToolCallStarted {
+                    run_id: "r".into(),
+                    tool_call_id: "t".into(),
+                    tool_name: "Bash".into(),
+                    args_summary: Some("sleep 300".into()),
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(wait_until(|| hub.attached_count() == 1).await);
+        // Wait for ToolCallStarted to be processed.
+        assert!(wait_until(|| hub.last_event_at(sandbox_id).is_some()).await);
+
+        // Soft TTL of 0ms — should NOT fire (last_idle_at was cleared
+        // by the ToolCallStarted event). Hard TTL of 1h — also not.
+        let none = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
+        assert!(
+            none.is_empty(),
+            "tool-call-in-flight must not be idle: {none:?}",
+        );
     }
 
     #[tokio::test]

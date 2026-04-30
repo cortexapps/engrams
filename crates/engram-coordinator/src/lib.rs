@@ -116,6 +116,7 @@ pub async fn run_with_registry(
     let _idle_evictor = idle_evictor::spawn(
         state.clone(),
         idle_evictor::idle_ttl_from_env(),
+        idle_evictor::idle_hard_ttl_from_env(),
         idle_evictor::DEFAULT_POLL_INTERVAL,
     );
 

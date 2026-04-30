@@ -40,11 +40,16 @@ use tokio::task::JoinHandle;
 
 use crate::state::{auto_checkpoint, SessionEvent, SharedState};
 
-/// Default idle TTL — a session that's emitted no harness events
-/// for this long is hot-suspended. 60s is loose enough to avoid
-/// thrashing on conversational pauses but tight enough to actually
-/// pack hosts. Override per-deployment via `ENGRAM_IDLE_TTL_SECS`.
-pub const DEFAULT_IDLE_TTL_SECS: u64 = 60;
+/// **Soft** idle TTL — a session whose adapter emitted `Idle` and
+/// stayed quiet for this long is hot-suspended. Default 30s tracks
+/// "user is afk." Override via `ENGRAM_IDLE_TTL_SECS`.
+pub const DEFAULT_IDLE_TTL_SECS: u64 = 30;
+
+/// **Hard** idle TTL — backstop for adapters that go silent
+/// without ever emitting `Idle` (stuck in a tool call, infinite
+/// loop, etc.). Default 30 minutes; override via
+/// `ENGRAM_IDLE_HARD_TTL_SECS`.
+pub const DEFAULT_IDLE_HARD_TTL_SECS: u64 = 1800;
 
 /// How often the evictor scans for over-TTL sandboxes. 10s is loose
 /// enough that the scan itself is negligible load and tight enough
@@ -54,7 +59,12 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Spawn the idle evictor as a background task. Returns the
 /// JoinHandle so the caller can abort on shutdown (the run loop
 /// itself never exits voluntarily).
-pub fn spawn(state: SharedState, idle_ttl: Duration, poll_interval: Duration) -> JoinHandle<()> {
+pub fn spawn(
+    state: SharedState,
+    soft_ttl: Duration,
+    hard_ttl: Duration,
+    poll_interval: Duration,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(poll_interval);
         // Skip the immediate first tick so a freshly-started coord
@@ -63,13 +73,13 @@ pub fn spawn(state: SharedState, idle_ttl: Duration, poll_interval: Duration) ->
         tick.tick().await;
         loop {
             tick.tick().await;
-            run_once(&state, idle_ttl).await;
+            run_once(&state, soft_ttl, hard_ttl).await;
         }
     })
 }
 
-async fn run_once(state: &SharedState, idle_ttl: Duration) {
-    let candidates = state.harness_hub.idle_sandboxes(idle_ttl);
+async fn run_once(state: &SharedState, soft_ttl: Duration, hard_ttl: Duration) {
+    let candidates = state.harness_hub.idle_sandboxes(soft_ttl, hard_ttl);
     for (session_id, sandbox_id) in candidates {
         if let Err(e) = evict_idle_session(state, session_id, sandbox_id).await {
             // Per-eviction failure logs but doesn't kill the loop;
@@ -247,14 +257,25 @@ impl std::error::Error for EvictError {
     }
 }
 
-/// Helper: pull `idle_ttl_secs` from the env, falling back to the
-/// default. Called at coord startup to compose the spawn args.
+/// Helper: pull the soft TTL from the env, falling back to the
+/// default. Called at coord startup.
 pub fn idle_ttl_from_env() -> Duration {
     std::env::var("ENGRAM_IDLE_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_IDLE_TTL_SECS))
+}
+
+/// Helper: pull the hard TTL from the env, falling back to the
+/// default. The hard TTL is the stuck-adapter backstop — far
+/// looser than the soft TTL so legit long tool calls don't trip it.
+pub fn idle_hard_ttl_from_env() -> Duration {
+    std::env::var("ENGRAM_IDLE_HARD_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_IDLE_HARD_TTL_SECS))
 }
 
 /// Marker that this module exists so unused-arg checkers don't
