@@ -21,11 +21,12 @@ use objc2_foundation::NSFileHandle;
 use objc2_virtualization::{
     VZBootLoader, VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
     VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSerialPortAttachment,
-    VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
+    VZSerialPortConfiguration, VZStorageDeviceConfiguration,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
 };
+
+use crate::console_bridge::{build_console_device, ConsolePortFds};
 use tokio::sync::oneshot;
 
 /// Per-VM declarative inputs. Built once at create time.
@@ -161,31 +162,16 @@ unsafe impl Send for VzVm {}
 unsafe impl Sync for VzVm {}
 
 impl VzVm {
-    /// Hand out a Send/Sync clone of the VM pointer for use inside
-    /// queue-dispatched closures. The bridge holds onto this for
-    /// the lifetime of the VM. Wrapping in `Sendable` is sound as
-    /// long as every consumer dereferences only on the dispatch
-    /// queue (the bridge does).
-    pub(crate) fn raw_clone(&self) -> Sendable<Retained<VZVirtualMachine>> {
-        Sendable(self.vm.clone())
-    }
-
-    /// Borrow the per-VM dispatch queue. Only used by `vsock_bridge`
-    /// to dispatch VZ device-side calls onto the right thread.
-    pub(crate) fn queue(&self) -> &DispatchQueue {
-        &self.queue
-    }
-
-    /// Clone the queue handle. The bridge holds onto it for lifetime
-    /// reasons (cleanup at drop time).
-    pub(crate) fn queue_clone(&self) -> DispatchRetained<DispatchQueue> {
-        self.queue.clone()
-    }
-
     /// Build a VZ VM from `cfg`, validate the configuration, but
     /// do *not* start it — the caller starts via `start()` once it's
-    /// done wiring the vsock UDS bridge (see `vsock_bridge.rs`).
-    pub fn new(cfg: VmConfig) -> Result<Self, VzError> {
+    /// done wiring the console UDS bridge (see `console_bridge.rs`).
+    ///
+    /// Returns the VM alongside the host-side `ConsolePortFds` that
+    /// the `ConsoleBridge` consumes after `start()`. Splitting this
+    /// out keeps the device-config (which must be set before init)
+    /// and the bridge wiring (which runs after start) on opposite
+    /// sides of `VZVirtualMachine::initWithConfiguration_queue`.
+    pub fn new(cfg: VmConfig) -> Result<(Self, ConsolePortFds), VzError> {
         // Each VM gets its own serial queue. Label is debug-only —
         // shows up in `Activity Monitor` and `lldb`.
         let queue =
@@ -194,7 +180,7 @@ impl VzVm {
         // Build configuration. None of this needs to be on the
         // queue — the configuration object is plain data; it only
         // becomes "live" when handed to VZVirtualMachine::init.
-        let vz_cfg = build_configuration(&cfg)?;
+        let (vz_cfg, port_fds) = build_configuration(&cfg)?;
 
         // Validate. Returns `Result<(), Retained<NSError>>`.
         // SAFETY: vz_cfg is freshly built and live for the call.
@@ -215,7 +201,7 @@ impl VzVm {
             )
         };
 
-        Ok(Self { vm, queue })
+        Ok((Self { vm, queue }, port_fds))
     }
 
     /// Start the VM. Resolves once VZ's `startWithCompletionHandler`
@@ -367,11 +353,17 @@ impl VzVm {
 }
 
 /// Build a fully-configured `VZVirtualMachineConfiguration` for
-/// `cfg`. Linux boot, virtio-block rootfs, virtio-vsock,
-/// virtio-net NAT, virtio-console.
+/// `cfg`. Linux boot, virtio-block rootfs, multi-port virtio-console
+/// for the host↔guest control channels, virtio-net NAT, and a
+/// separate single-port virtio-console wired to host stderr for the
+/// kernel boot log.
+///
+/// Returns the configuration alongside the host-side
+/// `ConsolePortFds` that `ConsoleBridge::start` consumes after
+/// `VZVirtualMachine::start`.
 fn build_configuration(
     cfg: &VmConfig,
-) -> Result<Retained<VZVirtualMachineConfiguration>, VzError> {
+) -> Result<(Retained<VZVirtualMachineConfiguration>, ConsolePortFds), VzError> {
     // SAFETY: every call below operates on freshly-allocated
     // ObjC objects whose lifetimes are managed via Retained. None
     // of them have started running on a queue yet, so there's no
@@ -437,15 +429,22 @@ fn build_configuration(
         > = NSArray::from_retained_slice(&[net_dev_super]);
         vz_cfg.setNetworkDevices(&network_array);
 
-        // Vsock device — a single one, shared across all ports.
-        // The vsock bridge (vsock_bridge.rs) attaches per-port
-        // listeners after `VZVirtualMachine::initWithConfiguration_queue`.
-        let vsock_dev = VZVirtioSocketDeviceConfiguration::new();
-        let vsock_dev_super: Retained<VZSocketDeviceConfiguration> =
-            Retained::cast_unchecked(vsock_dev);
-        let socket_array: Retained<NSArray<VZSocketDeviceConfiguration>> =
-            NSArray::from_retained_slice(&[vsock_dev_super]);
-        vz_cfg.setSocketDevices(&socket_array);
+        // Multi-port virtio-console for the host↔guest control
+        // channels (agentd, bootstrap, harness). Replaces the
+        // earlier virtio-vsock device since virtio-console is
+        // universally compiled into Linux kernels — no
+        // CONFIG_VIRTIO_VSOCKETS=y requirement on the rootfs's
+        // kernel. The bridge consumes the returned fds after
+        // VM start (see console_bridge.rs).
+        let (console_dev, port_fds) =
+            build_console_device().map_err(|e| VzError::ConfigInvalid(e.to_string()))?;
+        let console_dev_super: Retained<
+            objc2_virtualization::VZConsoleDeviceConfiguration,
+        > = Retained::cast_unchecked(console_dev);
+        let console_array: Retained<
+            NSArray<objc2_virtualization::VZConsoleDeviceConfiguration>,
+        > = NSArray::from_retained_slice(&[console_dev_super]);
+        vz_cfg.setConsoleDevices(&console_array);
 
         // Serial port: virtio-console wired to host stderr so kernel
         // boot logs + the engram-init shim's output land in the
@@ -479,7 +478,7 @@ fn build_configuration(
             NSArray::from_retained_slice(&[serial_super]);
         vz_cfg.setSerialPorts(&serial_array);
 
-        Ok(vz_cfg)
+        Ok((vz_cfg, port_fds))
     }
 }
 
@@ -533,7 +532,7 @@ mod tests {
         // Without entitlement we expect ConfigInvalid; with it,
         // VzVm::new should succeed.
         match VzVm::new(cfg) {
-            Ok(_) => eprintln!("VM constructed (entitlement is present)"),
+            Ok((_vm, _fds)) => eprintln!("VM constructed (entitlement is present)"),
             Err(VzError::ConfigInvalid(msg)) => {
                 eprintln!("got expected ConfigInvalid: {msg}");
                 assert!(!msg.is_empty(), "error message must not be empty");
@@ -569,7 +568,7 @@ mod tests {
         // is well above any plausible minimum.
         let cfg = VmConfig::new(kernel.path(), rootfs.path(), 512, 1);
         match VzVm::new(cfg) {
-            Ok(_vm) => {
+            Ok((_vm, _fds)) => {
                 eprintln!("vz_vm_new succeeded — test binary carries entitlement");
             }
             Err(VzError::ConfigInvalid(msg)) => {

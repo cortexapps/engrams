@@ -28,8 +28,8 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::console_bridge::{port_uds_path, ConsoleBridge};
 use crate::vm::{VmConfig, VzVm};
-use crate::vsock_bridge::{port_uds_path, VsockBridge};
 
 /// Vsock port engram-agentd binds inside the rootfs. Same number FC
 /// uses; the in-VM binary doesn't know which VMM is hosting it.
@@ -73,7 +73,7 @@ struct VzSandboxState {
     vm: Arc<VzVm>,
     /// vsock-as-UDS bridge tasks. Held in a Mutex so `destroy` can
     /// take it out and call its async `stop`. None after stop.
-    bridge: parking_lot::Mutex<Option<VsockBridge>>,
+    bridge: parking_lot::Mutex<Option<ConsoleBridge>>,
     /// `<work_dir>/<sandbox_id>.vsock` — base path. The vsock bridge
     /// binds `_1024`, `_1025` UDS listeners next to it. Stored on
     /// the state so future `start_agent` / `exec_stream` calls can
@@ -225,12 +225,12 @@ impl SandboxBackend for VzBackend {
         };
 
         // Make sure the work_dir exists so the per-sandbox UDS
-        // base path has somewhere to live (the vsock bridge in
-        // task 28 binds listeners under it).
+        // base path has somewhere to live (the console bridge
+        // binds listeners under it).
         tokio::fs::create_dir_all(&self.work_dir).await?;
 
         let vm_cfg = VmConfig::new(self.cfg.kernel_path.clone(), rootfs, memory_mib, vcpus);
-        let vm = VzVm::new(vm_cfg)?;
+        let (vm, port_fds) = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
         // return (no half-registered state in the sandboxes map).
@@ -239,26 +239,21 @@ impl SandboxBackend for VzBackend {
         let id = SandboxId::new();
         let vsock_uds_path = self.vsock_uds_path_for(id);
 
-        // Wire up the vsock UDS bridge. This binds <vsock_uds>_1024
-        // and <vsock_uds>_1025 immediately so a subsequent
-        // start_agent or exec_stream call can dial without racing
-        // a not-yet-bound window. If a harness sink is registered,
-        // it also installs the guest-listener for port 1026.
+        // Wire up the virtio-console UDS bridge. This binds
+        // <vsock_uds>_1024 and <vsock_uds>_1025 immediately so a
+        // subsequent start_agent or exec_stream call can dial
+        // without racing a not-yet-bound window. If a harness sink
+        // is registered, it also pipes port 1026's guest writes
+        // straight to the sink.
         let harness_sink = self.harness_sink.lock().clone();
-        let bridge = VsockBridge::start(
-            vm.raw_clone(),
-            vm.queue_clone(),
+        let bridge = ConsoleBridge::start(
             vsock_uds_path.clone(),
+            port_fds,
             harness_sink,
         )
         .await
         .map_err(|e| {
-            // If bridge bind fails (e.g. EADDRINUSE), tear down the
-            // VM we just started so we don't leak it.
             tracing::error!(error = %e, sandbox_id = %id, "vz bridge start failed; tearing down VM");
-            // Synchronous drop — vm.stop().await would be cleaner
-            // but we're already in an error path; the queue will
-            // drain on Retained drop.
             engram_core::SandboxError::from(e)
         })?;
 
@@ -447,7 +442,7 @@ impl SandboxBackend for VzBackend {
             memory_mib,
             vcpus,
         );
-        let vm = VzVm::new(vm_cfg)?;
+        let (vm, port_fds) = VzVm::new(vm_cfg)?;
 
         let state_path = crate::snapshot::state_path(&src);
         if !state_path.exists() {
@@ -469,16 +464,15 @@ impl SandboxBackend for VzBackend {
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
         tokio::fs::create_dir_all(&self.work_dir).await?;
 
-        // Re-bind the vsock UDS bridge against the restored VM.
-        // Same path as `create()`. The in-VM `engram-bootstrap`
-        // supervisor (kept alive by FC's bootstrap-as-supervisor
-        // pattern, which this backend matches) is reachable via
-        // <vsock_uds>_1025 just like a fresh VM.
+        // Re-bind the virtio-console UDS bridge against the
+        // restored VM. The in-VM `engram-bootstrap` supervisor
+        // (kept alive by the bootstrap-as-supervisor pattern this
+        // backend matches) is reachable via <vsock_uds>_1025 just
+        // like a fresh VM.
         let harness_sink = self.harness_sink.lock().clone();
-        let bridge = VsockBridge::start(
-            vm.raw_clone(),
-            vm.queue_clone(),
+        let bridge = ConsoleBridge::start(
             vsock_uds_path.clone(),
+            port_fds,
             harness_sink,
         )
         .await
@@ -508,7 +502,7 @@ impl SandboxBackend for VzBackend {
         // don't hold a non-Send guard across the await.
         let bridge = state.bridge.lock().take();
         if let Some(mut bridge) = bridge {
-            bridge.stop(state.vm.queue()).await;
+            bridge.stop().await;
         }
         // Best-effort stop. If the VM is already stopped or in a
         // state that can't accept stop (e.g. failed-to-start),

@@ -37,7 +37,7 @@ mod backend;
 mod vm;
 
 #[cfg(target_os = "macos")]
-mod vsock_bridge;
+mod console_bridge;
 
 #[cfg(target_os = "macos")]
 mod snapshot;
