@@ -77,8 +77,8 @@ db-reset:
 # Run the coordinator wired to the subprocess sandbox backend.
 # Postgres must already be up (`just db-up`). Auto-spawns the noop
 # harness on every new session so `engram session log <id>` shows
-# tool-call traffic out of the box. Set `ENGRAM_DEV_AUTO_NOOP=` to
-# disable.
+# tool-call traffic out of the box. Override which harness via
+# `ENGRAM_DEV_AUTO_AGENT=noop|claude`; unset it to disable auto-spawn.
 dev: db-up dev-build-harness
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
@@ -88,7 +88,7 @@ dev: db-up dev-build-harness
     ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_DEFAULT_IMAGE=warm-bootstrap \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    ENGRAM_DEV_AUTO_NOOP=${ENGRAM_DEV_AUTO_NOOP:-1} \
+    ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-noop} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
@@ -120,8 +120,9 @@ dev-firecracker: db-up
     ENGRAM_KERNEL_IMAGE_PATH=$ENGRAM_KERNEL_IMAGE_PATH \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-bootstrap} \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    ENGRAM_DEV_AUTO_NOOP=${ENGRAM_DEV_AUTO_NOOP:-} \
+    ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-} \
     ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
+    ENGRAM_DEV_CLAUDE_HARNESS_PATH=${ENGRAM_DEV_CLAUDE_HARNESS_PATH:-/sbin/engram-harness-claude} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 

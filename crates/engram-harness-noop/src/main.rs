@@ -1,7 +1,7 @@
 //! Standalone binary for the noop harness.
 //!
 //! Auto-spawned by `engram-host-agent` (via the `SandboxSpec::agent`
-//! field) when `ENGRAM_DEV_AUTO_NOOP=1` is set, so a session created
+//! field) when `ENGRAM_DEV_AUTO_AGENT=noop` is set, so a session created
 //! against `local://hello` immediately starts emitting fake tool
 //! calls. Reads its config from CLI flags (which the host-agent
 //! plumbs through `AgentSpec::argv` — env vars are reserved for

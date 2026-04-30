@@ -32,15 +32,43 @@ pub struct CoordinatorConfig {
     /// plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
     /// Path to the dev `engram-harness-noop` binary. When
-    /// `dev_auto_noop = true`, the coordinator stamps this into
+    /// `dev_auto_agent = Some(Noop)`, the coordinator stamps this into
     /// `SandboxSpec::agent.argv[0]` for any new Git/Local session
     /// that doesn't already declare an agent. None disables
-    /// auto-spawn even when `dev_auto_noop` is set.
+    /// auto-spawn even when `dev_auto_agent = Some(Noop)`.
     pub dev_noop_harness_path: Option<PathBuf>,
-    /// Auto-spawn the noop harness for every new session in dev. Off
-    /// by default; turn on via `ENGRAM_DEV_AUTO_NOOP=1` (read in
-    /// `main.rs`). Implies `dev_noop_harness_path` is set.
-    pub dev_auto_noop: bool,
+    /// Path to the dev `engram-harness-claude` binary. Symmetric to
+    /// `dev_noop_harness_path`. For Firecracker, this is the in-rootfs
+    /// path (typically `/sbin/engram-harness-claude`). For Process,
+    /// it's a host path.
+    pub dev_claude_harness_path: Option<PathBuf>,
+    /// Auto-spawn a harness for every new session in dev. None = off.
+    /// Set via `ENGRAM_DEV_AUTO_AGENT=noop|claude`. Implies the
+    /// corresponding `dev_*_harness_path` is set.
+    pub dev_auto_agent: Option<DevAgent>,
+}
+
+/// Which adapter the dev coordinator auto-spawns inside every new
+/// sandbox. Each variant has a corresponding `dev_*_harness_path`
+/// field that must be set for the auto-spawn to take effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevAgent {
+    /// `engram-harness-noop` — predictable fake tool calls, used for
+    /// integration tests and as the default demo harness.
+    Noop,
+    /// `engram-harness-claude` — wraps the real `claude` CLI, requires
+    /// `ANTHROPIC_API_KEY` in the operator's env.
+    Claude,
+}
+
+impl DevAgent {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "noop" => Ok(Self::Noop),
+            "claude" => Ok(Self::Claude),
+            other => Err(format!("invalid dev agent: {other} (expected noop|claude)")),
+        }
+    }
 }
 
 impl Default for CoordinatorConfig {
@@ -65,7 +93,8 @@ impl Default for CoordinatorConfig {
                 .parse()
                 .expect("default harness_listen_addr must parse"),
             dev_noop_harness_path: None,
-            dev_auto_noop: false,
+            dev_claude_harness_path: None,
+            dev_auto_agent: None,
         }
     }
 }

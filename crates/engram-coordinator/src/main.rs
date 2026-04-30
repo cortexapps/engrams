@@ -6,7 +6,7 @@ use engram_cloud_gcp::GcpCloud;
 use engram_cloud_mock::MockCloud;
 use engram_cloud_static::StaticCloud;
 use engram_coordinator::{
-    config::{CloudBackendChoice, RunMode, SandboxBackendChoice},
+    config::{CloudBackendChoice, DevAgent, RunMode, SandboxBackendChoice},
     image_registry::ImageRegistry,
     CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
@@ -97,20 +97,36 @@ struct Cli {
     /// `<workspace>/target/debug/engram-harness-noop` so a plain
     /// `cargo run -p engram-coordinator` after `cargo build` finds
     /// it. Override via `ENGRAM_DEV_NOOP_HARNESS_PATH` in production
-    /// builds.
+    /// builds. For Firecracker, set this to the in-rootfs path
+    /// (typically `/sbin/engram-harness-noop`) baked by the image
+    /// builder.
     #[arg(long, env = "ENGRAM_DEV_NOOP_HARNESS_PATH")]
     dev_noop_harness_path: Option<std::path::PathBuf>,
 
-    /// Auto-spawn the noop harness for every new session. Off by
-    /// default — set `ENGRAM_DEV_AUTO_NOOP=1` (or pass `--dev-auto-noop`)
-    /// to enable. Implies `dev_noop_harness_path` is set. Accepts the
-    /// usual truthy strings (`1`, `true`, `yes`, `y`, `on`) via the
-    /// env var.
+    /// Path to the dev `engram-harness-claude` binary. Mirrors
+    /// `dev_noop_harness_path` — host path under Process backend,
+    /// in-rootfs path (typically `/sbin/engram-harness-claude`) under
+    /// Firecracker.
+    #[arg(long, env = "ENGRAM_DEV_CLAUDE_HARNESS_PATH")]
+    dev_claude_harness_path: Option<std::path::PathBuf>,
+
+    /// Auto-spawn one of the dev harnesses for every new session.
+    /// `noop` for fake tool calls (tests, demo); `claude` for the
+    /// real `claude` CLI (requires `ANTHROPIC_API_KEY` in env).
+    /// Unset = no auto-spawn (production default — sessions declare
+    /// their agent via the image manifest instead).
+    #[arg(long, env = "ENGRAM_DEV_AUTO_AGENT", value_parser = DevAgent::parse)]
+    dev_auto_agent: Option<DevAgent>,
+
+    /// Deprecated alias for `--dev-auto-agent=noop`. Retained so the
+    /// existing justfile recipes and shell scripts keep working
+    /// during the rename.
     #[arg(
         long,
         env = "ENGRAM_DEV_AUTO_NOOP",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false,
+        hide = true,
     )]
     dev_auto_noop: bool,
 }
@@ -147,8 +163,17 @@ async fn main() -> Result<(), CoordinatorError> {
         harness_listen_addr: cli.harness_listen_addr,
         dev_noop_harness_path: cli
             .dev_noop_harness_path
-            .or_else(default_noop_harness_path),
-        dev_auto_noop: cli.dev_auto_noop,
+            .or_else(|| default_dev_harness_path("engram-harness-noop")),
+        dev_claude_harness_path: cli
+            .dev_claude_harness_path
+            .or_else(|| default_dev_harness_path("engram-harness-claude")),
+        // Backward-compat: the legacy `--dev-auto-noop` / `ENGRAM_DEV_AUTO_NOOP`
+        // bool wins only when the new `--dev-auto-agent` flag isn't set,
+        // so existing recipes keep working without overriding an explicit
+        // `claude` selection.
+        dev_auto_agent: cli
+            .dev_auto_agent
+            .or(if cli.dev_auto_noop { Some(DevAgent::Noop) } else { None }),
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)
@@ -307,15 +332,15 @@ async fn main() -> Result<(), CoordinatorError> {
 }
 
 /// If the user didn't pass `--dev-noop-harness-path` or set
-/// `ENGRAM_DEV_NOOP_HARNESS_PATH`, look for the binary next to our own
+/// the corresponding env var, look for the binary next to our own
 /// (the cargo `target/debug` layout) so a plain `cargo run` after
 /// `cargo build` finds it without ceremony. Production builds should
 /// set the env var explicitly — if the binary moves, the path here
 /// becomes wrong.
-fn default_noop_harness_path() -> Option<std::path::PathBuf> {
+fn default_dev_harness_path(bin: &str) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
-    let candidate = dir.join("engram-harness-noop");
+    let candidate = dir.join(bin);
     if candidate.exists() {
         Some(candidate)
     } else {

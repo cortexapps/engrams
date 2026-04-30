@@ -205,7 +205,7 @@ pub async fn create_session(
     // `start_agent` can pass it post-create — the warm-pool spec
     // must NOT carry session-scoped argv or replenished slots
     // would all attach claiming to be this session.
-    let agent_for_session = build_dev_noop_agent(&state, session_id, req.prompt.as_deref());
+    let agent_for_session = build_dev_agent(&state, session_id, req.prompt.as_deref());
 
     let vm_spec = VmSpec {
         image: image_version.clone(),
@@ -300,7 +300,7 @@ pub async fn create_session(
     state.harness_hub.bind_session(session_id, sandbox_id);
     // Now release the agent into the world (if any). Production
     // sessions today don't declare an agent — `agent_for_session`
-    // is `None` unless `dev_auto_noop` is set.
+    // is `None` unless `dev_auto_agent` is set.
     if let Some(agent) = agent_for_session {
         if let Err(e) = state.services.sandbox.start_agent(sandbox_id, agent).await {
             // Agent failed to spawn: surface as Internal but leave
@@ -412,10 +412,10 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Build the `AgentSpec` for the dev `engram-harness-noop` binary if
-/// `cfg.dev_auto_noop` is set. None otherwise — production callers
-/// don't auto-spawn anything; their harness lives inside the rootfs
-/// and is invoked by `engram-bootstrap`.
+/// Build the `AgentSpec` for whichever dev harness `cfg.dev_auto_agent`
+/// selects. None when auto-spawn is off (the production default —
+/// real sessions declare their agent inside the rootfs and let
+/// `engram-bootstrap` invoke it).
 ///
 /// Two flavors of argv depending on the sandbox backend:
 /// - `Process`: `--connect host:port` (TCP loopback to the
@@ -423,21 +423,19 @@ pub async fn delete_session(
 /// - `Firecracker`: `--vsock-host <port>` (the in-VM harness dials
 ///    AF_VSOCK CID=2 port=1026; FC's vsock UDS routes it to the
 ///    coord-side sink registered on the FC backend).
-fn build_dev_noop_agent(
+fn build_dev_agent(
     state: &SharedState,
     session_id: SessionId,
     initial_prompt: Option<&str>,
 ) -> Option<engram_core::types::sandbox::AgentSpec> {
-    use crate::config::SandboxBackendChoice;
-    if !state.cfg.dev_auto_noop {
-        return None;
+    use crate::config::{DevAgent, SandboxBackendChoice};
+    let agent = state.cfg.dev_auto_agent?;
+    let bin = match agent {
+        DevAgent::Noop => state.cfg.dev_noop_harness_path.as_ref()?,
+        DevAgent::Claude => state.cfg.dev_claude_harness_path.as_ref()?,
     }
-    let bin = state
-        .cfg
-        .dev_noop_harness_path
-        .as_ref()?
-        .to_string_lossy()
-        .to_string();
+    .to_string_lossy()
+    .to_string();
     let mut env = HashMap::new();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
     if let Some(prompt) = initial_prompt {
@@ -463,9 +461,8 @@ fn build_dev_noop_agent(
             // FC path — guest dials AF_VSOCK CID=2 on the harness
             // port. Inside the rootfs, `bin` is whatever path
             // `engram image build --inject-harness <name>=...`
-            // landed at (typically `/sbin/engram-harness-noop`),
-            // so the host's `dev_noop_harness_path` should be set
-            // to the in-rootfs path, not a host filesystem path.
+            // landed at, so the host's `dev_*_harness_path` should
+            // point at the in-rootfs path, not a host filesystem path.
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
                 bin,
