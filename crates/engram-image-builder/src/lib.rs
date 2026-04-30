@@ -90,17 +90,24 @@ pub struct AgentInjection {
     /// (`engram_sandbox_firecracker::ENGRAM_AGENTD_PORT`, currently
     /// 1024).
     pub vsock_port: u32,
+    /// Which host↔guest transport the in-VM binaries (agentd,
+    /// bootstrap, harness) should use. The default init shim sets
+    /// `ENGRAM_TRANSPORT=...` accordingly so `engram-transport`'s
+    /// runtime factory picks the matching impl. Defaults to
+    /// `Vsock` for back-compat with FC bakes that predate this
+    /// field.
+    pub transport: Transport,
     /// Override the default init script. When `None`, the baker
     /// writes a minimal `/bin/sh` shim that mounts `/proc`, `/sys`,
     /// `/dev`, spawns any baked-in sidecars (engram-bootstrap), and
-    /// `exec`s `engram-agentd --vsock-port <port>`.
+    /// `exec`s `engram-agentd --port <port>`.
     pub init_script: Option<PathBuf>,
     /// Optional `engram-bootstrap` binary. When provided, baked at
     /// `/sbin/engram-bootstrap` (chmod 0755) and the default init
     /// shim spawns it in the background before exec'ing agentd.
     /// Required for any image that wants to run a harness over the
-    /// Phase 4 vsock path; safe to omit for images that only need
-    /// the exec channel.
+    /// Phase 4 in-VM transport; safe to omit for images that only
+    /// need the exec channel.
     #[allow(dead_code)] // surfaced via this struct's field so callers can construct it
     pub bootstrap_binary: Option<PathBuf>,
     /// Harness adapter binaries to inject. Each entry is
@@ -110,6 +117,42 @@ pub struct AgentInjection {
     pub harness_binaries: Vec<(String, PathBuf)>,
 }
 
+/// Which `engram-transport` implementation the in-VM binaries
+/// should select at runtime. Set on [`AgentInjection`] at bake time;
+/// the default init shim writes `ENGRAM_TRANSPORT=<value>` into the
+/// rootfs so `engram-transport::from_env` picks the right impl.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Transport {
+    /// AF_VSOCK (Linux + Firecracker). Default — matches every FC
+    /// bake we've shipped.
+    #[default]
+    Vsock,
+    /// virtio-console (Apple Virtualization.framework on
+    /// macOS). Selected by the vz-bake-* recipes.
+    Console,
+}
+
+impl Transport {
+    /// Value for `ENGRAM_TRANSPORT` in the init shim. Lowercase
+    /// matches what `engram-transport::from_env` parses.
+    pub fn env_value(self) -> &'static str {
+        match self {
+            Self::Vsock => "vsock",
+            Self::Console => "console",
+        }
+    }
+
+    /// Parse a CLI flag value (case-insensitive). Used by
+    /// `engram-cli image build --transport=...`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "vsock" => Ok(Self::Vsock),
+            "console" | "virtio-console" => Ok(Self::Console),
+            other => Err(format!("invalid transport: {other} (expected vsock|console)")),
+        }
+    }
+}
+
 /// Where the agent binary lands inside the rootfs (relative to root).
 const AGENT_PATH: &str = "sbin/engram-agentd";
 
@@ -117,8 +160,15 @@ const AGENT_PATH: &str = "sbin/engram-agentd";
 /// Pair with kernel boot arg `init=/sbin/engram-init`.
 const INIT_PATH: &str = "sbin/engram-init";
 
-/// Placeholder in [`DEFAULT_INIT_SHIM`] swapped for `vsock_port` at bake time.
+/// Placeholder in [`DEFAULT_INIT_SHIM`] swapped for the agent port
+/// at bake time. Named for the original vsock-only world; retained
+/// to keep this string stable across the multi-transport refactor.
 const VSOCK_PORT_PLACEHOLDER: &str = "__VSOCK_PORT__";
+
+/// Placeholder swapped for `ENGRAM_TRANSPORT=vsock|console` at
+/// bake time so `engram-transport::from_env` in the in-VM binaries
+/// picks the matching impl.
+const TRANSPORT_PLACEHOLDER: &str = "__TRANSPORT__";
 
 /// Default init shim. Written to `/sbin/engram-init` when an
 /// [`AgentInjection`] is requested without an explicit override.
@@ -127,15 +177,23 @@ const VSOCK_PORT_PLACEHOLDER: &str = "__VSOCK_PORT__";
 /// the injection, the shim spawns it in the background before
 /// exec'ing agentd; `[ -x ... ] &&` keeps it tolerant of images
 /// baked without bootstrap.
+///
+/// The exported `ENGRAM_TRANSPORT` env propagates to engram-bootstrap
+/// (forked here) and to engram-agentd (exec'd at the bottom). It
+/// also rides through `BootstrapLaunch.env` to harness adapters
+/// when bootstrap re-execs them, so all four in-VM binaries see a
+/// consistent transport selection.
 const DEFAULT_INIT_SHIM: &str = r#"#!/bin/sh
 # engram-init — minimal init shim. Brings up just enough kernel
-# plumbing for engram-agentd to talk vsock, then exec's it.
+# plumbing for the in-VM binaries to talk to the host, then exec's
+# engram-agentd.
 set -e
 mount -t proc  proc /proc 2>/dev/null || true
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true
+export ENGRAM_TRANSPORT=__TRANSPORT__
 [ -x /sbin/engram-bootstrap ] && /sbin/engram-bootstrap &
-exec /sbin/engram-agentd --vsock-port __VSOCK_PORT__
+exec /sbin/engram-agentd --port __VSOCK_PORT__
 "#;
 
 #[derive(Clone, Debug)]
@@ -445,7 +503,8 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
         Some(src) => install_file(src, &init_dst, "init").await?,
         None => {
             let body = DEFAULT_INIT_SHIM
-                .replace(VSOCK_PORT_PLACEHOLDER, &injection.vsock_port.to_string());
+                .replace(VSOCK_PORT_PLACEHOLDER, &injection.vsock_port.to_string())
+                .replace(TRANSPORT_PLACEHOLDER, injection.transport.env_value());
             tokio::fs::write(&init_dst, body).await?;
             chmod_executable(&init_dst).await?;
         }

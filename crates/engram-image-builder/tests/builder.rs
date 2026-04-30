@@ -799,6 +799,7 @@ async fn build_directory_with_agent_injection_writes_agent_and_init() {
         agent_binary: agent_src.path().to_path_buf(),
         vsock_port: 1024,
         init_script: None,
+        transport: Default::default(),
         bootstrap_binary: None,
         harness_binaries: Vec::new(),
     });
@@ -815,15 +816,23 @@ async fn build_directory_with_agent_injection_writes_agent_and_init() {
     let agent_bytes = std::fs::read(&agent_dst).unwrap();
     assert_eq!(agent_bytes, b"\x7fELF<fake binary>");
 
-    // Init has the port substituted; doesn't still contain the placeholder.
+    // Init has the port + transport substituted; placeholders gone.
     let init_body = std::fs::read_to_string(&init_dst).unwrap();
     assert!(
-        init_body.contains("--vsock-port 1024"),
-        "init should reference vsock port 1024: {init_body}",
+        init_body.contains("--port 1024"),
+        "init should reference agent port 1024: {init_body}",
+    );
+    assert!(
+        init_body.contains("ENGRAM_TRANSPORT=vsock"),
+        "default transport export should be vsock: {init_body}",
     );
     assert!(
         !init_body.contains("__VSOCK_PORT__"),
-        "placeholder should be substituted: {init_body}",
+        "port placeholder should be substituted: {init_body}",
+    );
+    assert!(
+        !init_body.contains("__TRANSPORT__"),
+        "transport placeholder should be substituted: {init_body}",
     );
 
     // Both files are world-executable (0755).
@@ -846,6 +855,7 @@ async fn build_with_missing_agent_binary_errors_cleanly() {
         agent_binary: PathBuf::from("/this/path/does/not/exist"),
         vsock_port: 1024,
         init_script: None,
+        transport: Default::default(),
         bootstrap_binary: None,
         harness_binaries: Vec::new(),
     });
@@ -876,6 +886,7 @@ async fn build_with_init_script_override_uses_provided_script() {
         agent_binary: agent_src.path().to_path_buf(),
         vsock_port: 1024,
         init_script: Some(init_src.path().to_path_buf()),
+        transport: Default::default(),
         bootstrap_binary: None,
         harness_binaries: Vec::new(),
     });

@@ -225,7 +225,25 @@ enum ImageCmd {
         /// `engram-harness-noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop`.
         #[arg(long, value_parser = parse_harness_binary)]
         inject_harness: Vec<(String, PathBuf)>,
+
+        /// Which `engram-transport` impl the in-VM binaries should
+        /// select at runtime. The init shim writes
+        /// `ENGRAM_TRANSPORT=<value>` into the rootfs.
+        ///
+        /// `vsock` (default): AF_VSOCK on Linux, used by the
+        /// Firecracker production path. Requires
+        /// `CONFIG_VIRTIO_VSOCKETS=y` in the guest kernel.
+        ///
+        /// `console`: virtio-console on Apple Virtualization.framework,
+        /// used by the vz-bake-* recipes. Universally available in
+        /// every Linux kernel.
+        #[arg(long, value_parser = parse_transport, default_value = "vsock")]
+        transport: engram_image_builder::Transport,
     },
+}
+
+fn parse_transport(s: &str) -> Result<engram_image_builder::Transport, String> {
+    engram_image_builder::Transport::parse(s)
 }
 
 fn parse_harness_binary(s: &str) -> Result<(String, PathBuf), String> {
@@ -354,6 +372,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 inject_agent,
                 inject_bootstrap,
                 inject_harness,
+                transport,
             } => {
                 image_build(
                     repo,
@@ -365,6 +384,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     inject_agent.as_deref(),
                     inject_bootstrap.as_deref(),
                     inject_harness,
+                    *transport,
                 )
                 .await
             }
@@ -983,6 +1003,7 @@ async fn image_build(
     inject_agent: Option<&Path>,
     inject_bootstrap: Option<&Path>,
     inject_harness: &[(String, PathBuf)],
+    transport: engram_image_builder::Transport,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
@@ -994,6 +1015,7 @@ async fn image_build(
         // ENGRAM_AGENTD_PORT) so the bake and the host's connect
         // logic agree without a config flow.
         vsock_port: 1024,
+        transport,
         init_script: None,
         bootstrap_binary: inject_bootstrap.map(|p| p.to_path_buf()),
         harness_binaries: inject_harness.to_vec(),
