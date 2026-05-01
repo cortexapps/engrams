@@ -1,10 +1,12 @@
-import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import './theme.css';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+// StrictMode intentionally double-mounts effects in dev. Useful in
+// general, but it interacts badly with ghostty-web's WASM Terminal:
+// the first mount opens a WS to ttyd, cleanup closes it, the second
+// mount opens a fresh WS — bash sees two SIGWINCH-driven resize
+// flurries on top of each other and the rendered output overlaps.
+// Until we make TerminalPane fully StrictMode-idempotent, opt out
+// at the root.
+createRoot(document.getElementById('root')!).render(<App />);

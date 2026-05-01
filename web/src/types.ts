@@ -66,6 +66,32 @@ export interface ListHostsResponse {
   hosts: HostView[];
 }
 
+// ---- Image registry (for the create-session form) ---------------------
+
+export interface RequiredSecret {
+  name: string;
+  required: boolean;
+  allow_hosts: string[];
+}
+
+export interface ImageDescriptor {
+  repo: string;
+  tag: string;
+  name: string;
+  description: string | null;
+  /** "literal" or "broker" — broker images reject browser-pasted secrets. */
+  secret_mode: string;
+  required_secrets: RequiredSecret[];
+}
+
+// ---- Session creation -------------------------------------------------
+
+export interface CreateSessionResponse {
+  session_id: string;
+  status: string;
+  image_version: string;
+}
+
 // ---- Session events (SSE) ----------------------------------------------
 
 export type AgentRole = 'assistant' | 'user' | 'system';

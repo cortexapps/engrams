@@ -191,6 +191,12 @@ set -e
 mount -t proc  proc /proc 2>/dev/null || true
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true
+# devpts is required for PTY allocation (`forkpty` / `posix_openpt`).
+# Without `/dev/pts/` ttyd fails with `pty_spawn: ENOENT` even though
+# `/dev/ptmx` is present, because the kernel needs the slave-side
+# nodes to materialise here. Standard Linux init does this.
+mkdir -p /dev/pts 2>/dev/null || true
+mount -t devpts devpts /dev/pts 2>/dev/null || true
 # DNS for userspace. The kernel handled IP+routes via `ip=dhcp` (see
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
 # we do it here. 192.168.64.1 is the VZ NAT gateway, which Apple's
@@ -217,6 +223,33 @@ if [ "${ENGRAM_INIT_DEBUG:-0}" = "1" ]; then
         d=$(cat "$p/dev" 2>/dev/null || echo "<no-dev>")
         echo "  $(basename $p) name=$n dev=$d" >&2
     done
+fi
+# In-guest ttyd: serves an interactive bash session over WebSocket on
+# :7681. The coordinator's `GET /sessions/:id/shell` proxy bridges
+# browser <-> ttyd, ghostty-web on the browser side renders it. We
+# don't fail the boot if the binary is missing — older images that
+# predate the shell feature continue to work, the dashboard's SHELL
+# tab just shows "shell unavailable" for those sessions.
+#
+# /bin/sh is the safe-everywhere fallback (always present; debian-slim
+# bases ship dash). If the image happens to also include bash —
+# node:20-slim does at /usr/bin/bash — prefer it for an interactive
+# experience that matches what users expect from a terminal.
+# Absolute path required because PID 1's environment doesn't carry a
+# PATH and ttyd uses execvp to find the shell.
+#
+# We also export HOME / USER / PATH before launching ttyd. The
+# kernel's PID-1 env doesn't include these, and without them bash
+# resolves `~/.bashrc` to `/.bashrc` (does not exist) and skips it —
+# losing the prompt + ls-color aliases we baked into /root/.bashrc.
+# Setting them here is enough; bash inherits them through ttyd.
+if [ -x /usr/local/bin/ttyd ]; then
+    SHELL_BIN=/bin/sh
+    [ -x /usr/bin/bash ] && SHELL_BIN=/usr/bin/bash
+    export HOME=/root
+    export USER=root
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    (cd /workspace && /usr/local/bin/ttyd -W -p 7681 "$SHELL_BIN" >/var/log/ttyd.log 2>&1) &
 fi
 [ -x /sbin/engram-bootstrap ] && /sbin/engram-bootstrap &
 exec /sbin/engram-agentd --port __VSOCK_PORT__

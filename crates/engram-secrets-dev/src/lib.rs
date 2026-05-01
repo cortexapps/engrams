@@ -270,7 +270,7 @@ mod tests {
         let mut schema_map = HashMap::new();
         schema_map.insert("PRESENT".into(), schema(true));
         schema_map.insert("MISSING".into(), schema(true));
-        let res = store.resolve(&ctx(), &schema_map).await;
+        let res = store.resolve(&ctx(), &schema_map, None).await;
         match res {
             Err(SecretError::Backend(e)) => assert!(e.to_string().contains("MISSING")),
             other => panic!("expected Backend(MISSING), got {other:?}"),
@@ -283,7 +283,7 @@ mod tests {
         let mut schema_map = HashMap::new();
         schema_map.insert("PRESENT".into(), schema(true));
         schema_map.insert("MISSING".into(), schema(false));
-        let bundle = store.resolve(&ctx(), &schema_map).await.unwrap();
+        let bundle = store.resolve(&ctx(), &schema_map, None).await.unwrap();
         assert!(bundle.secrets.contains_key("PRESENT"));
         assert!(!bundle.secrets.contains_key("MISSING"));
     }

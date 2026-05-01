@@ -100,7 +100,45 @@ of the empty map. Ideally factor the create-time secret-resolution
 block out of `api/sessions.rs::create_session` into a helper so both
 paths share it.
 
-## 4. No system-wide event stream on the coordinator
+## 4. Browser shell endpoint has no auth gate
+
+**File**: `crates/engram-coordinator/src/api/shell.rs` — `GET /sessions/:id/shell`.
+
+The dashboard's `SHELL` tab opens a WebSocket through the coordinator
+to `ttyd` running inside the session's guest VM, giving the user an
+interactive `bash` PTY against `/workspace`. The endpoint sits behind
+the coordinator's existing bearer-token middleware, so production
+deployments with `ENGRAM_AUTH_TOKENS` set are fine. **Dev** runs
+without auth, which means anyone with network access to the coordinator
+(by default `127.0.0.1:8090`, but trivially exposed via `--bind-addr
+0.0.0.0:...`) can drop into a shell on any live session.
+
+**Fix**: don't expose the dashboard publicly without
+`ENGRAM_AUTH_TOKENS`. If we want a stronger guard, add a per-session
+shell capability token issued at create-time and verified on the
+upgrade — same shape as the existing harness attach token. Out of
+scope for the current PR; the shell feature ships as a dev tool.
+
+## 5. Browser shell only works on the VZ backend
+
+**File**: `crates/engram-sandbox-firecracker/src/lib.rs:498-574` —
+`create_in_jail` configures `machine-config`, `boot-source`, `drives`,
+and `vsock` but never calls `put_network_interfaces`. As a result,
+FC guests have no `eth0`, no DHCP, no IP routing from the host —
+nothing for the shell proxy to dial.
+
+`SandboxBackend::guest_ip` returns `None` from the trait default,
+which `FirecrackerBackend` inherits. The dashboard surfaces this as
+`shell unavailable for this session` and skips opening the WebSocket.
+
+**Fix**: wire TAP networking on FC. Provision a TAP device per
+sandbox, call `PUT /network-interfaces/{id}` on the FC HTTP API, add
+`ip=dhcp` to the kernel cmdline (matching VZ), and have agentd report
+the lease back via the existing `WireRequest::GuestIp` verb. ~4–5
+days. Tracking out-of-band — there's no FC-on-Linux production
+deployment depending on it yet.
+
+## 6. No system-wide event stream on the coordinator
 
 The dashboard's Overview page only polls `GET /sessions` and
 `GET /api/hosts` at 1Hz — no SSE. Live event streaming is reserved

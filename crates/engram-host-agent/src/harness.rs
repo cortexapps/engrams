@@ -88,6 +88,13 @@ struct HubInner {
     /// connection, looks up the sandbox here, and hands the stream to
     /// the existing connection logic.
     session_to_sandbox: Mutex<HashMap<SessionId, SandboxId>>,
+    /// Sandboxes with at least one external long-lived client
+    /// connected (today: a browser shell WebSocket). Counted so a
+    /// future second client doesn't accidentally let the first one
+    /// release the keep-alive. While the count is > 0 for a sandbox,
+    /// `idle_sandboxes` skips it — the human is actively poking at
+    /// the box and we don't snapshot-and-evict under their feet.
+    shell_attached: Mutex<HashMap<SandboxId, u32>>,
 }
 
 struct ConnectionHandle {
@@ -112,7 +119,37 @@ impl HarnessHub {
                 last_idle_at: Mutex::new(HashMap::new()),
                 event_sink,
                 session_to_sandbox: Mutex::new(HashMap::new()),
+                shell_attached: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    /// Mark a sandbox as having an active external shell client. While
+    /// the count is non-zero, the soft/hard idle TTLs are suppressed:
+    /// the user opening a browser shell is unambiguous "I'm using this
+    /// session, leave it alone" intent. Symmetrically released by
+    /// `release_shell`. Reference-counted so a future second client
+    /// (e.g. a second tab) doesn't release the keep-alive when the
+    /// first disconnects.
+    pub fn acquire_shell(&self, sandbox_id: SandboxId) {
+        *self
+            .inner
+            .shell_attached
+            .lock()
+            .entry(sandbox_id)
+            .or_insert(0) += 1;
+    }
+
+    /// Decrement the shell-attached count for `sandbox_id`. The
+    /// sandbox falls back under the normal idle eviction policy once
+    /// the count hits zero.
+    pub fn release_shell(&self, sandbox_id: SandboxId) {
+        let mut map = self.inner.shell_attached.lock();
+        if let Some(count) = map.get_mut(&sandbox_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&sandbox_id);
+            }
         }
     }
 
@@ -335,8 +372,17 @@ impl HarnessHub {
         let event_at = self.inner.last_event_at.lock();
         let idle_at = self.inner.last_idle_at.lock();
         let conns = self.inner.connections.lock();
+        let shell = self.inner.shell_attached.lock();
         let mut out = Vec::new();
         for (sandbox_id, handle) in conns.iter() {
+            // Browser-shell connections express explicit "user is
+            // poking at this session" intent. Suppress eviction while
+            // any shell is open — the count drops to zero (and the
+            // sandbox falls back under the normal TTLs) when the
+            // user closes the tab or otherwise drops the WebSocket.
+            if shell.contains_key(sandbox_id) {
+                continue;
+            }
             let soft = idle_at
                 .get(sandbox_id)
                 .map(|at| *at <= soft_cutoff)

@@ -11,6 +11,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.62.7",
     "framer-motion": "^11.15.0",
+    "ghostty-web": "^0.4.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.1.1"
@@ -22,6 +23,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "ws": "^8.20.0"
   }
 }

@@ -77,14 +77,28 @@ pub trait SecretStore: Send + Sync {
     /// Resolve a manifest's full secret schema map. Default impl
     /// loops over `get`; backends that can batch (single RPC for all
     /// secrets) override. Errors if a `required` secret is missing.
+    ///
+    /// `overrides` is a per-request escape hatch: any name present in
+    /// the override map short-circuits the backend lookup and uses the
+    /// supplied value verbatim. Used by the dashboard's "create
+    /// session" form, where a user pastes a credential into the
+    /// browser instead of relying on host-process env. Only safe under
+    /// `SecretMode::Literal` — the broker mode's per-session proxy
+    /// doesn't know about request-scoped secrets.
     async fn resolve(
         &self,
         ctx: &SecretContext<'_>,
         schema: &HashMap<String, SecretSchema>,
+        overrides: Option<&HashMap<String, String>>,
     ) -> Result<SecretBundle, SecretError> {
         let mut bundle = SecretBundle::default();
         for (name, sch) in schema {
-            match self.get(ctx, name, sch).await? {
+            let override_value = overrides.and_then(|m| m.get(name));
+            let resolved = match override_value {
+                Some(v) => Some(v.clone()),
+                None => self.get(ctx, name, sch).await?,
+            };
+            match resolved {
                 Some(value) => {
                     bundle.secrets.insert(
                         name.clone(),

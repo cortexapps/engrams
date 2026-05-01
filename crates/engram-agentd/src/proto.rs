@@ -157,6 +157,14 @@ pub enum WireRequest {
     /// accept loop notices the agent task ended and exits the
     /// process. Used for graceful VM shutdown coordination.
     Shutdown,
+    /// Ask the agent for its primary IPv4 address. Used by the host
+    /// to discover the guest's DHCP-assigned address on backends
+    /// that route traffic by IP (the VZ NAT bridge), so the
+    /// coordinator can proxy a WebSocket to a TCP service running
+    /// inside the guest (e.g. ttyd for the in-browser shell).
+    /// Replies [`WireResponse::GuestIp`] with `None` if no eligible
+    /// non-loopback address could be determined.
+    GuestIp,
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.
@@ -171,6 +179,10 @@ pub enum WireResponse {
     Download(WireDownloadResponse),
     Pong,
     ShutdownAck,
+    /// Reply to [`WireRequest::GuestIp`]. `None` if the agent
+    /// could not determine a non-loopback address (e.g. networking
+    /// not configured, all interfaces down).
+    GuestIp(Option<String>),
     /// Anything the agent couldn't fulfil. `message` is a short
     /// human-readable reason; `kind` mirrors the std `io::ErrorKind`
     /// stringly so the host can map back to a typed error

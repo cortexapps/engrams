@@ -1,7 +1,6 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import { StatusGlyph } from './Glyph';
-import { SectionHead } from './HostManifest';
 import type { Session } from '../types';
 
 const STATUS_ORDER: Session['status'][] = [
@@ -13,12 +12,45 @@ const STATUS_ORDER: Session['status'][] = [
   'dead',
 ];
 
-export function SessionManifest({ sessions }: { sessions: Session[] | undefined }) {
+export function SessionManifest({
+  sessions,
+  onNewClick,
+}: {
+  sessions: Session[] | undefined;
+  /** When defined, render a "+ new session" link in the section head. */
+  onNewClick?: () => void;
+}) {
   const sorted = sortSessions(sessions ?? []);
 
   return (
     <section className="mb-12">
-      <SectionHead label="SESSIONS" />
+      <div
+        className="flex items-baseline justify-between mb-4 pb-2"
+        style={{ borderBottom: '1px solid var(--color-rule)' }}
+      >
+        <h2
+          className="font-mono smallcaps text-[0.7rem]"
+          style={{
+            color: 'var(--color-ink-quiet)',
+            letterSpacing: '0.18em',
+          }}
+        >
+          SESSIONS
+        </h2>
+        {onNewClick && (
+          <button
+            type="button"
+            onClick={onNewClick}
+            className="font-mono smallcaps text-[0.7rem] transition-colors hover:[opacity:0.75]"
+            style={{
+              color: 'var(--color-amber)',
+              letterSpacing: '0.12em',
+            }}
+          >
+            + new session
+          </button>
+        )}
+      </div>
       <div className="space-y-1">
         <AnimatePresence>
           {sorted.map((s) => (
@@ -30,15 +62,8 @@ export function SessionManifest({ sessions }: { sessions: Session[] | undefined 
             className="font-display italic"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            No sessions yet. Create one with{' '}
-            <code
-              className="font-mono"
-              style={{ color: 'var(--color-ink-faded)' }}
-            >
-              curl -X POST localhost:8090/sessions -d
-              '&#123;"repo":"local://hello","branch":"main"&#125;'
-            </code>
-            .
+            no sessions yet
+            {onNewClick && ' — start one with the link above'}.
           </p>
         )}
       </div>

@@ -128,6 +128,10 @@ impl SandboxBackend for PooledBackend {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         self.inner.list().await
     }
+
+    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+        self.inner.guest_ip(id).await
+    }
 }
 
 impl PooledBackend {

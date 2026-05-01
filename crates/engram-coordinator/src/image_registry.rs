@@ -94,6 +94,102 @@ impl ImageRegistry {
             image_dir,
         })
     }
+
+    /// Walk the registry filesystem and return every `(repo, tag,
+    /// manifest)` triple it finds. Used by `GET /api/images` so the
+    /// dashboard can render a dropdown of available images.
+    ///
+    /// Repo reconstruction: `local://demo` is stored on disk as
+    /// `<root>/local:/demo/...` because `Path::join("local://demo")`
+    /// collapses `//` to `/`. We reverse this by tracking which path
+    /// components ended with `:` (a scheme like `local:` or
+    /// `git+https:`) and re-inserting the lost slash. Works for
+    /// `local://x` and `git+https://x/y/z`; schemes without a trailing
+    /// colon round-trip unchanged.
+    pub async fn list(&self) -> Result<Vec<RegisteredImage>, ImageError> {
+        let mut out = Vec::new();
+        if !tokio::fs::try_exists(&self.root).await.unwrap_or(false) {
+            return Ok(out);
+        }
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Some(entry) = rd.next_entry().await.map_err(ImageError::Io)? {
+                let path = entry.path();
+                let ft = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if !ft.is_dir() {
+                    continue;
+                }
+                let manifest_path = path.join("manifest.toml");
+                if tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
+                    let bytes = match tokio::fs::read(&manifest_path).await {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let s = match std::str::from_utf8(&bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let manifest: ImageManifest = match toml::from_str(s) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let tag = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    let repo_components: Vec<String> = path
+                        .strip_prefix(&self.root)
+                        .ok()
+                        .and_then(|p| p.parent())
+                        .map(|p| {
+                            p.iter()
+                                .filter_map(|c| c.to_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if repo_components.is_empty() {
+                        continue;
+                    }
+                    let repo = reconstruct_repo(&repo_components);
+                    out.push(RegisteredImage {
+                        repo,
+                        tag: tag.to_string(),
+                        manifest,
+                    });
+                } else {
+                    stack.push(path);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.repo.cmp(&b.repo).then(a.tag.cmp(&b.tag)));
+        Ok(out)
+    }
+}
+
+fn reconstruct_repo(components: &[String]) -> String {
+    let mut s = String::new();
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            if components[i - 1].ends_with(':') {
+                s.push_str("//");
+            } else {
+                s.push('/');
+            }
+        }
+        s.push_str(c);
+    }
+    s
+}
+
+#[derive(Clone, Debug)]
+pub struct RegisteredImage {
+    pub repo: String,
+    pub tag: String,
+    pub manifest: ImageManifest,
 }
 
 #[derive(Clone, Debug)]

@@ -14,7 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
+use engram_agentd::{
+    read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
+};
 use engram_core::traits::sandbox::{HarnessSink, SandboxBackend};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{
@@ -88,6 +90,13 @@ struct VzSandboxState {
     /// `destroy()`. The clone is what VZ actually attaches; the
     /// originating bake / snapshot file stays intact.
     rootfs_path: PathBuf,
+    /// Cached IPv4 address discovered by querying agentd over the
+    /// existing vsock-bridge transport. Populated on first
+    /// `guest_ip` call (the agent's eth0 takes a moment to come up
+    /// after IP_PNP DHCP, so we don't try at create time). Used by
+    /// the coordinator's `GET /sessions/:id/shell` proxy to dial
+    /// `ttyd` running inside the guest.
+    guest_ip: Mutex<Option<String>>,
 }
 
 pub struct VzBackend {
@@ -309,6 +318,7 @@ impl SandboxBackend for VzBackend {
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 vsock_uds_path,
                 rootfs_path,
+                guest_ip: Mutex::new(None),
             },
         );
         Ok(id)
@@ -557,6 +567,7 @@ impl SandboxBackend for VzBackend {
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 vsock_uds_path,
                 rootfs_path,
+                guest_ip: Mutex::new(None),
             },
         );
         Ok(new_id)
@@ -604,6 +615,51 @@ impl SandboxBackend for VzBackend {
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|kv| *kv.key()).collect())
+    }
+
+    /// Discover the guest's primary IPv4 address by asking agentd
+    /// over the vsock-bridge. First successful answer is cached on
+    /// the per-sandbox state; subsequent calls are O(1) memory reads.
+    /// Returns `None` if the agent isn't reachable yet (e.g. shell
+    /// requested before bootstrap completes) or reports no
+    /// non-loopback address.
+    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+        if let Some(live) = self.sandboxes.get(&id) {
+            if let Some(ip) = live.guest_ip.lock().clone() {
+                return Some(ip);
+            }
+        }
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        // Bound the round-trip — virtio-console doesn't surface clean
+        // close semantics back to host UDS reads, so an agent that
+        // doesn't understand the GuestIp verb (e.g. an older bake)
+        // would otherwise hang the dial here forever. 2s is plenty for
+        // a healthy in-process round trip and short enough that a
+        // dashboard SHELL-tab click sees a prompt 503.
+        let fut = async {
+            let conn = UnixStream::connect(&agent_uds).await.ok()?;
+            let (mut reader, mut writer) = tokio::io::split(conn);
+            write_msg(&mut writer, &WireRequest::GuestIp).await.ok()?;
+            let resp: WireResponse = read_msg(&mut reader).await.ok()?;
+            match resp {
+                WireResponse::GuestIp(ip) => ip,
+                _ => None,
+            }
+        };
+        let ip = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .ok()
+            .flatten();
+        if let Some(ref s) = ip {
+            if let Some(live) = self.sandboxes.get(&id) {
+                *live.guest_ip.lock() = Some(s.clone());
+            }
+        }
+        ip
     }
 }
 

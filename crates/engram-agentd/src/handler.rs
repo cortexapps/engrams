@@ -116,6 +116,11 @@ where
             write_msg(&mut writer, &WireResponse::ShutdownAck).await?;
             return Ok(());
         }
+        WireRequest::GuestIp => {
+            let ip = read_primary_ipv4();
+            write_msg(&mut writer, &WireResponse::GuestIp(ip)).await?;
+            return Ok(());
+        }
     };
 
     let req = exec_req;
@@ -351,6 +356,29 @@ fn wire_io_err(op: &str, err: io::Error) -> WireResponse {
 /// crates. We don't pull `subtle` as a dep — single tight loop,
 /// dwarfed by a vsock round trip, and the project's
 /// `forbid(unsafe_code)` rules out the SIMD shortcut.
+/// Determine the agent's primary IPv4 address by asking the kernel
+/// which local IP would be used to reach an off-box destination. The
+/// `connect()` call on a UDP socket doesn't actually send a packet —
+/// it just sets up the routing decision so `local_addr()` can return
+/// the source IP that would be used. Avoids spawning `ip(8)` (which
+/// many slim images don't ship) and avoids netlink dependencies.
+///
+/// Returns `None` if no default route exists (e.g. networking not
+/// configured) or if only loopback is available.
+fn read_primary_ipv4() -> Option<String> {
+    use std::net::{IpAddr, UdpSocket};
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Any routable destination works. 192.0.2.1 is RFC5737
+    // documentation space — guaranteed unallocated and never
+    // actually contacted (UDP connect is route-only).
+    sock.connect("192.0.2.1:1").ok()?;
+    let local = sock.local_addr().ok()?;
+    match local.ip() {
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4.to_string()),
+        _ => None,
+    }
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

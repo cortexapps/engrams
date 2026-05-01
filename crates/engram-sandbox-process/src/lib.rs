@@ -362,6 +362,18 @@ impl SandboxBackend for ProcessBackend {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
+
+    /// Process-backend "guests" share the host's network stack —
+    /// anything ttyd binds is reachable on localhost. Doesn't bother
+    /// confirming the sandbox is alive; the caller deals with the
+    /// connection failure if it isn't.
+    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+        if self.sandboxes.contains_key(&id) {
+            Some("127.0.0.1".to_string())
+        } else {
+            None
+        }
+    }
 }
 
 /// Spawn the sandbox's long-running agent process (harness adapter,

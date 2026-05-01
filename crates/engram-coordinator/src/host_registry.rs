@@ -365,6 +365,11 @@ impl SandboxBackend for HostRegistry {
         }
         Ok(all)
     }
+
+    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+        let backend = self.lookup(id).ok()?;
+        backend.guest_ip(id).await
+    }
 }
 
 #[cfg(test)]

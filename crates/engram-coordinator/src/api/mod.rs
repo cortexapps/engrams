@@ -10,8 +10,10 @@ mod events;
 mod exec;
 mod health;
 mod hosts;
+mod images;
 mod prompt;
 mod sessions;
+mod shell;
 mod sessions_inspect;
 mod snapshot;
 
@@ -38,6 +40,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/local", delete(snapshot::evict_local))
         .route("/sessions/:id/checkpoint", post(checkpoint::checkpoint))
         .route("/sessions/:id/prompt", post(prompt::prompt))
+        .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/sessions/:id/diff", get(sessions_inspect::diff))
         .route("/sessions/:id/fork", post(sessions_inspect::fork))
@@ -45,6 +48,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/hosts", get(hosts::list))
         .route("/api/hosts/:id", get(hosts::get))
         .route("/api/hosts/:id/drain", post(hosts::drain))
+        .route("/api/images", get(images::list_images))
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

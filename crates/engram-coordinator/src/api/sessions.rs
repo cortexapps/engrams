@@ -112,6 +112,15 @@ pub struct CreateSessionRequest {
     /// waits for `POST /sessions/:id/prompt`.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Per-request secret values keyed by env-var name (e.g.
+    /// `CLAUDE_CODE_OAUTH_TOKEN`). Short-circuits the configured
+    /// `SecretStore` for any name in the map. Used by the dashboard's
+    /// "create session" form so a user can paste a credential into
+    /// the browser without exporting it on the host. Only honored
+    /// under `SecretMode::Literal` — broker mode rejects overrides
+    /// because the proxy doesn't know about request-scoped values.
+    #[serde(default)]
+    pub secrets: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -162,10 +171,27 @@ pub async fn create_session(
         repo: &req.repo,
         image_tag: &image_version,
     };
+    // Reject browser-supplied secrets for Broker-mode images: the
+    // per-session proxy registers values from the configured store
+    // and has no path for request-scoped overrides. Catching this
+    // here makes the failure mode explicit (400) rather than the
+    // sandbox booting with placeholder env that the proxy can't
+    // substitute.
+    if req.secrets.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
+        && manifest_for_secrets.secret_mode != engram_core::types::image::SecretMode::Literal
+    {
+        return Err(ApiError::BadRequest(
+            "per-request `secrets` are only supported for `secret_mode = literal` images".into(),
+        ));
+    }
     let secret_bundle: SecretBundle = state
         .services
         .secrets
-        .resolve(&secret_ctx, &manifest_for_secrets.secrets)
+        .resolve(
+            &secret_ctx,
+            &manifest_for_secrets.secrets,
+            req.secrets.as_ref(),
+        )
         .await
         .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
 

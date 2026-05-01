@@ -1,19 +1,40 @@
+import { AnimatePresence } from 'framer-motion';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useHosts } from '../hooks/useHosts';
 import { useSessions } from '../hooks/useSessions';
 import { VitalSigns } from '../components/VitalSigns';
 import { HostManifest } from '../components/HostManifest';
 import { SessionManifest } from '../components/SessionManifest';
+import { NewSessionForm } from '../components/NewSessionForm';
 
 export function Overview() {
   const { data: hosts } = useHosts();
   const { data: sessions } = useSessions();
+  const [creating, setCreating] = useState(false);
+  const navigate = useNavigate();
 
   return (
     <main className="book py-12">
       <Header />
       <VitalSigns hosts={hosts} sessions={sessions} />
       <HostManifest hosts={hosts} />
-      <SessionManifest sessions={sessions} />
+      <AnimatePresence>
+        {creating && (
+          <NewSessionForm
+            key="new-session-form"
+            onCancel={() => setCreating(false)}
+            onCreated={(id) => {
+              setCreating(false);
+              navigate(`/sessions/${id}`);
+            }}
+          />
+        )}
+      </AnimatePresence>
+      <SessionManifest
+        sessions={sessions}
+        onNewClick={creating ? undefined : () => setCreating(true)}
+      />
       <Footer />
     </main>
   );

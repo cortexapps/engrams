@@ -22,7 +22,15 @@ export default defineConfig({
       '/sessions': {
         target: COORDINATOR,
         changeOrigin: true,
+        // The shell endpoint is a WebSocket; without this flag http-proxy
+        // returns 426 Upgrade Required and the upgrade never completes.
+        ws: true,
         bypass(req) {
+          // WebSocket upgrade requests carry `Upgrade: websocket` —
+          // never shunt those to index.html, no matter what their
+          // Accept header says.
+          const upgrade = (req.headers.upgrade ?? '').toString().toLowerCase();
+          if (upgrade === 'websocket') return undefined;
           if (
             req.method === 'GET' &&
             (req.headers.accept ?? '').includes('text/html')

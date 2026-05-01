@@ -150,6 +150,49 @@
   }
 }
 
+/* Form inputs styled as typeset entries: paper background, hairline
+ * bottom rule, no native chrome. Focus thickens the rule to ink — same
+ * visual mechanic as a fountain-pen line going darker under pressure. */
+.ledger-input {
+  background-color: transparent;
+  color: var(--color-ink);
+  border: 0;
+  border-bottom: 1px solid var(--color-rule);
+  border-radius: 0;
+  outline: none;
+  padding: 0.2rem 0;
+  width: 100%;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  transition: border-color 200ms ease-out;
+}
+
+.ledger-input:focus {
+  border-bottom-color: var(--color-ink);
+}
+
+.ledger-input:disabled {
+  color: var(--color-ink-quiet);
+  cursor: not-allowed;
+}
+
+/* Drop the native dropdown arrow on <select> in favour of a small
+ * caret rendered in our own type. */
+select.ledger-input {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--color-ink-faded) 50%),
+    linear-gradient(135deg, var(--color-ink-faded) 50%, transparent 50%);
+  background-position:
+    calc(100% - 12px) 0.6em,
+    calc(100% - 7px) 0.6em;
+  background-size:
+    5px 5px,
+    5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 1.6rem;
+}
+
 /* Margin notes — sits in the gutter outside the book column. */
 .margin-note {
   position: absolute;

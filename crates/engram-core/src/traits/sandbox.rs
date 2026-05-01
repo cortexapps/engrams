@@ -134,4 +134,19 @@ pub trait SandboxBackend: Send + Sync {
     async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError>;
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
+
+    /// IPv4 address the *host* can use to reach a TCP service running
+    /// inside this sandbox's guest. Used by the `GET /sessions/:id/shell`
+    /// proxy to dial `ttyd` on the guest. Returns `None` if:
+    ///
+    /// - the sandbox isn't running yet (no agent up to ask),
+    /// - the backend has no host→guest IP routing wired (FC today),
+    /// - the agent reported no eligible non-loopback address.
+    ///
+    /// Default returns `None` so backends that don't yet implement
+    /// host→guest IP discovery (FC) inherit a clean "shell unavailable"
+    /// surface.
+    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+        None
+    }
 }
