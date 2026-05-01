@@ -184,6 +184,11 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
   `<work_dir>/<sandbox_id>.rootfs.ext4` (cloned from the bake's
   warm-1 image at `create()`); concurrent sandboxes no longer
   share a writable disk.
+- ✅ Warm pool. `ENGRAM_WARM_POOL_SIZE=N` pre-spawns N VMs
+  against the bake's warm-1 image; subsequent `session create`
+  hits the pool and returns in ~30 ms vs ~165 ms cold. The
+  `PooledBackend` wrapper is backend-agnostic — same code path
+  as Firecracker, no VZ-specific changes were required.
 - ✅ Bake pipeline: aarch64 cross-compile → docker buildx →
   ext4 → 512-byte aligned.
 - ✅ Codesign step.
