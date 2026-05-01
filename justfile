@@ -169,11 +169,15 @@ fc-bake-demo:
 # coordinator's EnvSecretStore reads it from the host process env.
 #
 # After this recipe, kick off:
-#   ENGRAM_DEFAULT_IMAGE=warm-1 \
-#   ENGRAM_DEV_AUTO_AGENT=claude \
-#   just dev-firecracker
+#   ENGRAM_DEFAULT_IMAGE=warm-1 just dev-firecracker
 #
-# then `engram session create --repo local://claude-demo --prompt "..."`.
+# Then create a session pointing at the baked image and asking for
+# the `claude` harness (declared in deploy/fc-bake-claude/engram.toml):
+#   engram session create \
+#       --repo local://claude-demo \
+#       --image-version warm-1 \
+#       --harness claude \
+#       --prompt "..."
 fc-bake-claude:
     cargo build -p engram-agentd         --target x86_64-unknown-linux-musl --release
     cargo build -p engram-bootstrap      --target x86_64-unknown-linux-musl --release
@@ -413,11 +417,30 @@ watch:
 smoke-health:
     curl -s http://localhost:8090/healthz | jq
 
-# POST a session and print the session_id.
+# POST a session and print the session_id. Phase 2 wire shape:
+# explicit `image` + `workspace` + `harness`. The smoke-create variant
+# requires the bootstrap image — `just dev` seeds it for free.
 smoke-create:
     curl -s -X POST http://localhost:8090/sessions \
         -H 'content-type: application/json' \
-        -d '{"repo":"local://hello-world","branch":"main"}' | jq
+        -d '{ \
+              "image": {"kind":"registry","repo":"hello-world","tag":"warm-bootstrap"}, \
+              "workspace": {"kind":"empty"}, \
+              "harness": {"kind":"none"} \
+            }' | jq
+
+# Smallest-possible dev session: empty workspace, no agent. Useful
+# for confirming the orthogonal axes in isolation — no git remote
+# to clone, no harness binary to attach, just a VM with a shell.
+# Pair with the dashboard's SHELL tab or `engram session exec`.
+dev-shell:
+    curl -s -X POST http://localhost:8090/sessions \
+        -H 'content-type: application/json' \
+        -d '{ \
+              "image": {"kind":"registry","repo":"hello-world","tag":"warm-bootstrap"}, \
+              "workspace": {"kind":"empty"}, \
+              "harness": {"kind":"none"} \
+            }' | jq -r '.session_id'
 
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
