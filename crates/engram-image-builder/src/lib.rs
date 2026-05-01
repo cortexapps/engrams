@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::{ImageStatus, ImageVersion};
+use engram_core::types::{HarnessEntry, ImageManifest, ImageStatus, ImageVersion};
 use engram_core::ImageVersionId;
 
 pub use config::{BuildConfig, EngramRepoConfig};
@@ -445,13 +445,18 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // Optional: inject engram-agentd + an init shim before we
         // pack to ext4. Done after docker export so the rootfs the
         // user described in their Dockerfile is the base; we just
-        // overlay our agent on top.
+        // overlay our agent on top. The injection step also drives
+        // which `[[harness]]` entries land in `manifest.toml` —
+        // every binary we copy in must be discoverable from the
+        // manifest so the coord can resolve `HarnessSpec::Builtin`
+        // names at session-create time.
+        let mut effective_manifest = cfg.to_manifest();
         if let Some(injection) = &req.agent_injection {
-            inject_agent(&rootfs_dir, injection).await?;
+            inject_agent(&rootfs_dir, injection, &mut effective_manifest).await?;
         }
 
         let manifest_path = image_dir.join("manifest.toml");
-        let manifest_str = render_manifest(cfg)?;
+        let manifest_str = render_manifest_value(&effective_manifest)?;
         tokio::fs::write(&manifest_path, manifest_str).await?;
 
         let dir_size = recursive_size(&rootfs_dir).await?;
@@ -503,11 +508,11 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     }
 }
 
-/// Render the rendered manifest.toml from the source EngramRepoConfig.
-/// Strips the `[build]` section since runtime doesn't need it.
-fn render_manifest(cfg: &EngramRepoConfig) -> Result<String, BuildError> {
-    let manifest = cfg.to_manifest();
-    toml::to_string_pretty(&manifest)
+/// Render the manifest as TOML. Strips the `[build]` section since
+/// runtime doesn't need it (already filtered out by
+/// `EngramRepoConfig::to_manifest`).
+fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError> {
+    toml::to_string_pretty(manifest)
         .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
 }
 
@@ -515,7 +520,19 @@ fn render_manifest(cfg: &EngramRepoConfig) -> Result<String, BuildError> {
 /// init shim to `<rootfs>/sbin/engram-init`, and chmod 0755 on both.
 /// Mirrors the layout the kernel boot args expect:
 /// `init=/sbin/engram-init`.
-async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(), BuildError> {
+///
+/// `manifest` is mutated in place: harness binaries provided via the
+/// CLI flag (`AgentInjection.harness_binaries`) that aren't already
+/// declared in `[[harness]]` are appended as synthetic entries with
+/// the default `/sbin/<name>` guest path and a deprecation warning.
+/// Declared entries with no matching CLI flag (host binary missing)
+/// are removed from the manifest — the coord must never advertise a
+/// harness whose binary isn't in the rootfs.
+async fn inject_agent(
+    rootfs_dir: &Path,
+    injection: &AgentInjection,
+    manifest: &mut ImageManifest,
+) -> Result<(), BuildError> {
     if !injection.agent_binary.exists() {
         return Err(BuildError::Config(format!(
             "agent_binary {} does not exist",
@@ -542,10 +559,11 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
         install_file(bootstrap, &dst, "bootstrap").await?;
     }
 
+    let mut copied_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, src) in &injection.harness_binaries {
         if !src.exists() {
             return Err(BuildError::Config(format!(
-                "harness_binary {} does not exist (intended for /sbin/{name})",
+                "harness_binary {} does not exist (intended for harness `{name}`)",
                 src.display()
             )));
         }
@@ -554,8 +572,54 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
                 "harness_binary guest filename `{name}` must be a single path component"
             )));
         }
-        let dst = rootfs_dir.join("sbin").join(name);
+        // Prefer the guest path declared in `[[harness]]` so the
+        // baker, manifest, and runtime all agree on where the binary
+        // lands. If no entry exists, fall back to the legacy
+        // `/sbin/<name>` convention and synthesize a manifest entry
+        // — but warn so the user knows engram.toml is the source of
+        // truth going forward.
+        let guest_path = match manifest.harnesses.iter().find(|h| h.name == *name) {
+            Some(entry) => entry.guest_path.clone(),
+            None => {
+                let synthesized = format!("/sbin/{name}");
+                tracing::warn!(
+                    name = %name,
+                    guest_path = %synthesized,
+                    "harness `{name}` was injected via --inject-harness but is not declared \
+                     in engram.toml's [[harness]] block; appending a synthetic manifest entry. \
+                     Declare it explicitly to silence this warning.",
+                );
+                manifest.harnesses.push(HarnessEntry {
+                    name: name.clone(),
+                    guest_path: synthesized.clone(),
+                    description: None,
+                });
+                synthesized
+            }
+        };
+        let rel = guest_path.trim_start_matches('/');
+        if rel.is_empty() {
+            return Err(BuildError::InvalidPath(format!(
+                "harness `{name}` has empty guest_path"
+            )));
+        }
+        let dst = rootfs_dir.join(rel);
         install_file(src, &dst, "harness").await?;
+        copied_names.insert(name.clone());
+    }
+
+    // Drop any manifest entries whose binary wasn't supplied — the
+    // manifest must only advertise harnesses that actually exist in
+    // the rootfs. Surfacing this via tracing rather than a hard error
+    // because a user may legitimately want to bake a slimmed-down
+    // image with only some of the declared harnesses.
+    let pre = manifest.harnesses.len();
+    manifest.harnesses.retain(|h| copied_names.contains(&h.name));
+    if manifest.harnesses.len() < pre {
+        tracing::info!(
+            dropped = pre - manifest.harnesses.len(),
+            "dropped declared [[harness]] entries with no --inject-harness binary",
+        );
     }
 
     match &injection.init_script {

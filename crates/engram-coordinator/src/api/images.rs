@@ -24,6 +24,16 @@ pub struct ImageDescriptor {
     /// is just so the UI can disable the inputs up front).
     pub secret_mode: String,
     pub required_secrets: Vec<RequiredSecret>,
+    /// Harness adapters baked into this image's rootfs. The dashboard
+    /// populates the per-session "harness" dropdown from this list +
+    /// a synthetic "none" option. Empty = the image is shell-only.
+    pub harnesses: Vec<HarnessDescriptor>,
+    /// Whether this deployment's sandbox backend supports
+    /// `WorkspaceSpec::LocalMount`. Driven by `cfg.sandbox_backend` —
+    /// false on Firecracker (until virtio-fs parity lands), true on
+    /// VZ / Process. Surfaced per-image so the form can gray out the
+    /// "local mount" radio without a separate `/api/host` round-trip.
+    pub supports_local_mount: bool,
 }
 
 #[derive(Serialize)]
@@ -33,15 +43,29 @@ pub struct RequiredSecret {
     pub allow_hosts: Vec<String>,
 }
 
+#[derive(Serialize)]
+pub struct HarnessDescriptor {
+    pub name: String,
+    pub description: Option<String>,
+}
+
 pub async fn list_images(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<ImageDescriptor>>, ApiError> {
+    use crate::config::SandboxBackendChoice;
     let images = state
         .services
         .images
         .list()
         .await
         .map_err(|e| ApiError::Internal(format!("image registry list: {e}")))?;
+    // LocalMount support is a backend-level capability, not per-image —
+    // resolve it once here and stamp every descriptor with the same
+    // value so the dashboard doesn't need a second endpoint.
+    let supports_local_mount = match state.cfg.sandbox_backend {
+        SandboxBackendChoice::Firecracker => false,
+        SandboxBackendChoice::Process | SandboxBackendChoice::Vz => true,
+    };
 
     let descriptors = images
         .into_iter()
@@ -60,6 +84,15 @@ pub async fn list_images(
                     allow_hosts: schema.allow_hosts.clone(),
                 })
                 .collect();
+            let harnesses = img
+                .manifest
+                .harnesses
+                .iter()
+                .map(|h| HarnessDescriptor {
+                    name: h.name.clone(),
+                    description: h.description.clone(),
+                })
+                .collect();
             ImageDescriptor {
                 repo: img.repo,
                 tag: img.tag,
@@ -67,6 +100,8 @@ pub async fn list_images(
                 description: img.manifest.description,
                 secret_mode: secret_mode.to_string(),
                 required_secrets,
+                harnesses,
+                supports_local_mount,
             }
         })
         .collect();

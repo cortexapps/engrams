@@ -229,6 +229,62 @@ mod tests {
     }
 
     #[test]
+    fn parse_engram_toml_with_harness_block() {
+        // Round-trip the source-side `[[harness]]` block through the
+        // split-and-reparse logic to confirm it lands on the manifest
+        // half (not lost as a "build" section).
+        let cfg = EngramRepoConfig::parse(
+            r#"
+            name = "claude-oauth"
+
+            [[harness]]
+            name = "claude"
+            guest_path = "/sbin/engram-harness-claude"
+            description = "Claude Code adapter"
+
+            [[harness]]
+            name = "noop"
+            guest_path = "/sbin/engram-harness-noop"
+
+            [build]
+            dockerfile = "Dockerfile"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.manifest.harnesses.len(), 2);
+        assert_eq!(cfg.manifest.harnesses[0].name, "claude");
+        assert_eq!(
+            cfg.manifest.harnesses[0].guest_path,
+            "/sbin/engram-harness-claude"
+        );
+        assert_eq!(
+            cfg.manifest.harnesses[0].description.as_deref(),
+            Some("Claude Code adapter")
+        );
+        assert_eq!(cfg.manifest.harnesses[1].name, "noop");
+    }
+
+    #[test]
+    fn rendered_manifest_includes_harness_entries() {
+        let cfg = EngramRepoConfig::parse(
+            r#"
+            name = "x"
+            [[harness]]
+            name = "claude"
+            guest_path = "/sbin/h"
+            "#,
+        )
+        .unwrap();
+        let rendered = toml::to_string(&cfg.to_manifest()).unwrap();
+        assert!(
+            rendered.contains("[[harness]]"),
+            "rendered manifest must carry [[harness]] entries; got:\n{rendered}",
+        );
+        assert!(rendered.contains("name = \"claude\""));
+        assert!(rendered.contains("guest_path = \"/sbin/h\""));
+    }
+
+    #[test]
     fn rendered_manifest_does_not_include_build_section() {
         let cfg = EngramRepoConfig::parse(
             r#"

@@ -17,3 +17,11 @@ allow_hosts = ["api.anthropic.com"]
 [network]
 default = "deny"
 allow_hosts = ["api.anthropic.com", "registry.npmjs.org"]
+
+# Harness adapters baked in. Coord resolves
+# `HarnessSpec::Builtin{name="claude"}` to `guest_path`; the baker
+# copies the host binary (`--inject-harness claude=<path>`) here.
+[[harness]]
+name = "claude"
+guest_path = "/sbin/engram-harness-claude"
+description = "Wraps the in-VM `claude` CLI with engram-bootstrap"

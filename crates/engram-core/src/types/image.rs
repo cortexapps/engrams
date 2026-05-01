@@ -77,6 +77,36 @@ pub struct ImageManifest {
     /// [`SecretMode`] for the security tradeoff.
     #[serde(default)]
     pub secret_mode: SecretMode,
+
+    /// Harness adapter binaries baked into this image's rootfs.
+    /// Each entry tells the coordinator a name (`"claude"`,
+    /// `"noop"`, ...) it can resolve to a guest path when a session
+    /// asks for `HarnessSpec::Builtin{name}`. Empty means the image
+    /// is "no agent" only — sessions on this image must use
+    /// `HarnessSpec::None`. Populated by the baker from the
+    /// `[[harness]]` blocks in `engram.toml` — singular TOML key
+    /// so the array-of-tables shape reads naturally.
+    #[serde(default, rename = "harness")]
+    pub harnesses: Vec<HarnessEntry>,
+}
+
+/// One harness adapter baked into an image. Surfaced on
+/// `ImageManifest.harnesses` and via `GET /api/images` so the
+/// dashboard can populate its per-image harness dropdown.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessEntry {
+    /// Stable name a session references via
+    /// `HarnessSpec::Builtin{name}`. Convention: lowercase, no
+    /// spaces (`"claude"`, `"noop"`).
+    pub name: String,
+    /// Absolute path inside the rootfs where the binary lives.
+    /// `engram-bootstrap` exec's this directly when it receives a
+    /// `BootstrapLaunch` frame.
+    pub guest_path: String,
+    /// Free-form one-liner for the dashboard's dropdown label.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// How an image wants its resolved secret values delivered to the
@@ -237,6 +267,39 @@ mod tests {
 
         assert_eq!(m.network.allow_hosts.len(), 2);
         assert_eq!(m.resources.suggested_memory_mib, Some(4096));
+    }
+
+    #[test]
+    fn manifest_parses_harness_entries() {
+        let src = r#"
+            name = "cortex-api"
+
+            [[harness]]
+            name = "claude"
+            guest_path = "/sbin/engram-harness-claude"
+            description = "Claude Code adapter"
+
+            [[harness]]
+            name = "noop"
+            guest_path = "/sbin/engram-harness-noop"
+        "#;
+        let m: ImageManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.harnesses.len(), 2);
+        assert_eq!(m.harnesses[0].name, "claude");
+        assert_eq!(m.harnesses[0].guest_path, "/sbin/engram-harness-claude");
+        assert_eq!(
+            m.harnesses[0].description.as_deref(),
+            Some("Claude Code adapter")
+        );
+        assert_eq!(m.harnesses[1].name, "noop");
+        assert!(m.harnesses[1].description.is_none());
+    }
+
+    #[test]
+    fn manifest_omits_harnesses_when_unset() {
+        let src = r#"name = "x""#;
+        let m: ImageManifest = toml::from_str(src).unwrap();
+        assert!(m.harnesses.is_empty());
     }
 
     #[test]
