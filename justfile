@@ -174,8 +174,7 @@ fc-bake-demo:
 # Then create a session pointing at the baked image and asking for
 # the `claude` harness (declared in deploy/fc-bake-claude/engram.toml):
 #   engram session create \
-#       --repo local://claude-demo \
-#       --image-version warm-1 \
+#       --image local://claude-demo:warm-1 \
 #       --harness claude \
 #       --prompt "..."
 fc-bake-claude:

@@ -56,42 +56,50 @@ enum Cmd {
 enum SessionCmd {
     /// Create a new session. Prints the new session_id on stdout.
     ///
-    /// Legacy `--repo` + `--branch` + `--read-only` flags continue to
-    /// work — the CLI translates them into the orthogonal
-    /// `image` / `workspace` axes the API now requires. New scripts
-    /// should prefer `--image-repo` + `--image-tag` + workspace
-    /// flags so the relationship is explicit.
+    /// Three orthogonal axes shape a session: `image`, `workspace`,
+    /// `harness`. The flags below set each one independently —
+    /// matching the `POST /sessions` wire shape exactly.
     Create {
-        /// `git+https://...`, `git+ssh://...`, or `local://<name>`.
-        /// Drives both the workspace (Git vs Empty) and — when
-        /// `--image-repo` is omitted — the image registry lookup.
+        /// Image to boot, in `repo:tag` form. Required.
+        ///
+        /// Example: `--image cortex/api:warm-2026-04`
         #[arg(long)]
-        repo: String,
-        /// Base branch the session forks from (Git sessions). Ignored
-        /// for `local://`.
+        image: String,
+        /// Clone the given git URL into the workspace. Mutually
+        /// exclusive with `--mount`. Omit both for an `Empty`
+        /// workspace ("just a VM and a shell").
+        ///
+        /// Example: `--git https://github.com/cortex/api.git`
+        #[arg(long, group = "workspace_kind")]
+        git: Option<String>,
+        /// Bind a host directory into the guest at `host:guest`.
+        /// Mutually exclusive with `--git`. Rejected on the
+        /// Firecracker backend.
+        ///
+        /// Example: `--mount /Users/me/code:/workspace`
+        #[arg(long, group = "workspace_kind")]
+        mount: Option<String>,
+        /// Branch to check out for `--git` workspaces. Ignored
+        /// otherwise.
         #[arg(long, default_value = "main")]
         branch: String,
-        /// Clone-only mode: workspace is read; no checkpoint branch.
+        /// Make the workspace read-only — for `--git` this also
+        /// suppresses the per-session checkpoint branch.
         #[arg(long)]
         read_only: bool,
-        /// Pin the session to a specific image_version (warm-pool tag).
-        /// Required since phase 2 unless `--image-tag` is given.
-        #[arg(long)]
-        image_version: Option<String>,
-        /// Free-form user identifier surfaced on the row.
-        #[arg(long)]
-        user_id: Option<String>,
-        /// Initial prompt for the agent. Read by the harness adapter
-        /// from `$ENGRAM_INITIAL_PROMPT` at startup; runs as the
-        /// session's first prompt. Omit to attach a fresh adapter
-        /// that waits for `engram session prompt <id>`.
-        #[arg(long)]
-        prompt: Option<String>,
         /// Which baked-in harness to attach. `none` (default) boots
         /// the VM with no agent; otherwise the value is the manifest
         /// `[[harness]] name = ...` to attach (e.g. `claude`, `noop`).
         #[arg(long, default_value = "none")]
         harness: String,
+        /// Initial prompt for the agent. Only meaningful when
+        /// `--harness` is not `none`; the API rejects with 400 if a
+        /// prompt is supplied alongside `--harness none`.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Free-form user identifier surfaced on the row.
+        #[arg(long)]
+        user_id: Option<String>,
     },
     /// List sessions in `pending` / `active` / `idle` status.
     List,
@@ -324,24 +332,26 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
     match &cli.cmd {
         Cmd::Session { cmd } => match cmd {
             SessionCmd::Create {
-                repo,
+                image,
+                git,
+                mount,
                 branch,
                 read_only,
-                image_version,
-                user_id,
-                prompt,
                 harness,
+                prompt,
+                user_id,
             } => {
                 session_create(
                     &client,
                     &cli.endpoint,
-                    repo,
+                    image,
+                    git.as_deref(),
+                    mount.as_deref(),
                     branch,
                     *read_only,
-                    image_version.as_deref(),
-                    user_id.as_deref(),
-                    prompt.as_deref(),
                     harness,
+                    prompt.as_deref(),
+                    user_id.as_deref(),
                     cli.json,
                 )
                 .await
@@ -510,47 +520,74 @@ async fn session_delete(
     Ok(())
 }
 
+/// Split `--image cortex/api:warm-1` on the *last* colon so repo
+/// names containing `:` (rare but legal in registry URLs) don't get
+/// truncated. Returns `(repo, tag)`.
+fn parse_image_ref(spec: &str) -> Result<(String, String), CliError> {
+    match spec.rsplit_once(':') {
+        Some((repo, tag)) if !repo.is_empty() && !tag.is_empty() => {
+            Ok((repo.to_string(), tag.to_string()))
+        }
+        _ => Err(CliError::Other(format!(
+            "invalid --image `{spec}` — expected `<repo>:<tag>`"
+        ))),
+    }
+}
+
+/// Split `--mount /host/path:/guest/path` on the first colon. Hosts
+/// path with embedded colons aren't supported (vanishingly rare on
+/// Unix); the user can drop a symlink and point `--mount` at that.
+fn parse_mount_spec(spec: &str) -> Result<(String, String), CliError> {
+    match spec.split_once(':') {
+        Some((host, guest)) if !host.is_empty() && !guest.is_empty() => {
+            Ok((host.to_string(), guest.to_string()))
+        }
+        _ => Err(CliError::Other(format!(
+            "invalid --mount `{spec}` — expected `<host_path>:<guest_path>`"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
-    repo: &str,
+    image: &str,
+    git: Option<&str>,
+    mount: Option<&str>,
     branch: &str,
     read_only: bool,
-    image_version: Option<&str>,
-    user_id: Option<&str>,
-    prompt: Option<&str>,
     harness: &str,
+    prompt: Option<&str>,
+    user_id: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    // Translate the legacy CLI flags into the phase-2 wire shape.
-    // The `--repo` flag still drives the workspace/image identity;
-    // `git+...` becomes a Git workspace; everything else (including
-    // `local://...`) becomes Empty. The image registry's `repo` is
-    // the `--repo` value with any `git+` prefix stripped. Bare names
-    // pass through unchanged.
-    let image_repo = repo
-        .strip_prefix("git+")
-        .map(str::to_string)
-        .or_else(|| repo.strip_prefix("local://").map(str::to_string))
-        .unwrap_or_else(|| repo.to_string());
-    let image_tag = image_version.ok_or_else(|| {
-        CliError::Other(
-            "phase 2: --image-version is required (autoresolution removed)".into(),
-        )
-    })?;
-    let image_value = serde_json::json!({
-        "kind": "registry",
-        "repo": image_repo,
-        "tag": image_tag,
-    });
-    let workspace_value = match repo.strip_prefix("git+") {
-        Some(url) if !url.is_empty() => serde_json::json!({
+    let (image_repo, image_tag) = parse_image_ref(image)?;
+    let workspace_value = match (git, mount) {
+        (Some(url), None) if !url.is_empty() => serde_json::json!({
             "kind": "git",
             "url": url,
             "branch": branch,
             "read_only": read_only,
         }),
+        (None, Some(spec)) if !spec.is_empty() => {
+            let (host_path, guest_path) = parse_mount_spec(spec)?;
+            serde_json::json!({
+                "kind": "local_mount",
+                "host_path": host_path,
+                "guest_path": guest_path,
+                "read_only": read_only,
+            })
+        }
+        (None, None) => serde_json::json!({"kind": "empty"}),
+        (Some(_), Some(_)) => {
+            // clap's `group = "workspace_kind"` makes this unreachable
+            // at the CLI surface; the explicit handling here just keeps
+            // future direct callers honest.
+            return Err(CliError::Other(
+                "--git and --mount are mutually exclusive".into(),
+            ));
+        }
         _ => serde_json::json!({"kind": "empty"}),
     };
     let harness_value = match harness {
@@ -558,7 +595,14 @@ async fn session_create(
         name => serde_json::json!({"kind": "builtin", "name": name}),
     };
     let mut payload = serde_json::Map::new();
-    payload.insert("image".into(), image_value);
+    payload.insert(
+        "image".into(),
+        serde_json::json!({
+            "kind": "registry",
+            "repo": image_repo,
+            "tag": image_tag,
+        }),
+    );
     payload.insert("workspace".into(), workspace_value);
     payload.insert("harness".into(), harness_value);
     if let Some(u) = user_id {
