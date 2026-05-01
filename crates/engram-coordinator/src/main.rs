@@ -98,6 +98,17 @@ struct Cli {
     /// Default `127.0.0.1:0` lets the OS pick a free port.
     #[arg(long, env = "ENGRAM_HARNESS_LISTEN_ADDR", default_value = "127.0.0.1:0")]
     harness_listen_addr: std::net::SocketAddr,
+
+    /// Host-side directory of harness binaries. Mounted read-only
+    /// into every sandbox at `/run/engram/harnesses`. Default
+    /// `./var/engram/harnesses`; populate via `just install-harnesses`
+    /// in dev or by deploy automation in prod.
+    #[arg(
+        long,
+        env = "ENGRAM_HARNESSES_DIR",
+        default_value = "./var/engram/harnesses"
+    )]
+    harnesses_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -130,6 +141,7 @@ async fn main() -> Result<(), CoordinatorError> {
             .cloned()
             .collect(),
         harness_listen_addr: cli.harness_listen_addr,
+        harnesses_dir: cli.harnesses_dir.clone(),
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)
@@ -299,6 +311,15 @@ async fn main() -> Result<(), CoordinatorError> {
     // etc. via a config flag (next round).
     let secrets: Arc<dyn SecretStore> = Arc::new(EnvSecretStore::new());
     let images = ImageRegistry::new(cli.local_path.join("images"));
+    let harnesses = Arc::new(
+        engram_coordinator::harness_registry::HarnessRegistry::from_dir(cfg.harnesses_dir.clone())
+            .map_err(|e| {
+                CoordinatorError::Config(format!(
+                    "harness registry scan ({}): {e}",
+                    cfg.harnesses_dir.display()
+                ))
+            })?,
+    );
 
     let services = Services {
         meta: Arc::new(pg),
@@ -306,6 +327,7 @@ async fn main() -> Result<(), CoordinatorError> {
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets,
         images,
+        harnesses,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await

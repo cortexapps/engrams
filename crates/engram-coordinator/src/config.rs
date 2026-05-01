@@ -31,6 +31,14 @@ pub struct CoordinatorConfig {
     /// pick a free port; the coordinator reads back the bound address
     /// and plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
+
+    /// Host-side directory containing the harness binaries the coord
+    /// will offer at session create. Mounted read-only into every
+    /// sandbox via virtio-fs (or symlink, on Process). Default
+    /// `<local_path>/harnesses`. Operators populate this at deploy
+    /// time — `just install-harnesses` is the dev convenience that
+    /// builds the workspace harnesses and links them into place.
+    pub harnesses_dir: PathBuf,
 }
 
 impl Default for CoordinatorConfig {
@@ -54,6 +62,7 @@ impl Default for CoordinatorConfig {
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),
+            harnesses_dir: PathBuf::from("./var/engram/harnesses"),
         }
     }
 }

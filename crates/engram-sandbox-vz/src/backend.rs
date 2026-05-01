@@ -210,13 +210,30 @@ where
     })
 }
 
+/// Map a guest path to the virtio-fs tag the init shim mounts it
+/// under. v1 supports two well-known paths; anything else is
+/// rejected so a typo is caught at create time rather than
+/// silently leaving a mount unwired.
+fn derive_mount_tag(guest_path: &std::path::Path) -> Result<String, String> {
+    match guest_path.to_str() {
+        Some("/run/engram/harnesses") => Ok("engram-harnesses".into()),
+        Some("/workspace") => Ok("engram-workspace".into()),
+        other => Err(format!(
+            "VZ backend has no virtio-fs tag mapping for guest_path `{}`. \
+             Supported: /run/engram/harnesses, /workspace",
+            other.unwrap_or("<non-utf8>")
+        )),
+    }
+}
+
 #[async_trait]
 impl SandboxBackend for VzBackend {
     fn supports_local_mount(&self) -> bool {
         // Apple Virtualization.framework ships a virtio-fs device
         // (`VZVirtioFileSystemDeviceConfiguration`); LocalMount is
-        // wired through `SandboxSpec.mounts`. The plumbing landed
-        // alongside the wire shape in phase 2.
+        // wired through `SandboxSpec.mounts`. The init shim mounts
+        // the well-known tags (`engram-harnesses`, `engram-workspace`)
+        // at boot.
         true
     }
 
@@ -277,12 +294,26 @@ impl SandboxBackend for VzBackend {
             "vz: cloned bake rootfs to per-sandbox path"
         );
 
-        let vm_cfg = VmConfig::new(
+        let mut vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
             memory_mib,
             vcpus,
         );
+        // Translate generic `SandboxSpec.mounts` into VZ's
+        // `VirtiofsMount` shape. The tag is derived from
+        // `guest_path` so the init shim can mount each at its
+        // target path. Unknown guest_paths are rejected
+        // (`derive_mount_tag` enforces the closed set).
+        for mount in &spec.mounts {
+            let tag = derive_mount_tag(&mount.guest_path).map_err(SandboxError::InvalidSpec)?;
+            vm_cfg.mounts.push(crate::vm::VirtiofsMount {
+                tag,
+                host_path: mount.host_path.clone(),
+                guest_path: mount.guest_path.clone(),
+                read_only: mount.read_only,
+            });
+        }
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
@@ -539,12 +570,24 @@ impl SandboxBackend for VzBackend {
         // containerization framework uses it. The
         // bootstrap-supervisor pattern + Claude's `--resume`
         // hand off conversation continuity across the boot.
-        let vm_cfg = VmConfig::new(
+        let mut vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
             memory_mib,
             vcpus,
         );
+        // Carry mounts forward from the snapshot's spec — the
+        // harness substrate and any LocalMount need to re-mount on
+        // resume too.
+        for mount in &manifest.spec.mounts {
+            let tag = derive_mount_tag(&mount.guest_path).map_err(SandboxError::InvalidSpec)?;
+            vm_cfg.mounts.push(crate::vm::VirtiofsMount {
+                tag,
+                host_path: mount.host_path.clone(),
+                guest_path: mount.guest_path.clone(),
+                read_only: mount.read_only,
+            });
+        }
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
         if let Err(e) = vm.start().await {
             let _ = tokio::fs::remove_file(&rootfs_path).await;

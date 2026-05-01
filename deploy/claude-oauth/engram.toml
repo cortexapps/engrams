@@ -16,11 +16,7 @@ allow_hosts = ["api.anthropic.com"]
 default = "deny"
 allow_hosts = ["api.anthropic.com", "registry.npmjs.org"]
 
-# Harness adapters baked into this image. The session-create API
-# resolves `HarnessSpec::Builtin{name="claude"}` to the guest_path
-# below; the baker copies the host binary supplied via
-# `--inject-harness claude=<path>` to that location.
-[[harness]]
-name = "claude"
-guest_path = "/sbin/engram-harness-claude"
-description = "Wraps the in-VM `claude` CLI with engram-bootstrap"
+# Harness binaries are NOT baked into this image. They live host-side
+# in `cfg.harnesses_dir` (default `./var/engram/harnesses/`) and are
+# mounted into every sandbox via virtio-fs at `/run/engram/harnesses/`.
+# Pick one at session-create with `--harness <name>`.

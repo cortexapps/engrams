@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { createSession } from '../api';
 import { useImages } from '../hooks/useImages';
+import { useHarnesses } from '../hooks/useHarnesses';
 import { SectionHead } from './HostManifest';
 import type { HarnessSpec, ImageDescriptor, WorkspaceSpec } from '../types';
 
@@ -23,6 +24,7 @@ export interface NewSessionFormProps {
 
 export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const { data: images, isLoading, error: loadError } = useImages(true);
+  const { data: harnesses } = useHarnesses(true);
   const qc = useQueryClient();
 
   // ---- IMAGE ----
@@ -50,26 +52,27 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const [harnessKind, setHarnessKind] = useState<HarnessKind>('none');
   const [harnessName, setHarnessName] = useState<string>('');
 
-  // Reset harness + secrets when image changes — both are scoped per
-  // image. Any in-flight choice loses its meaning.
+  // Reset secrets when image changes — secret schema is per-image.
+  // Harness selection is NOT reset — harnesses live above images now,
+  // deployment-wide via the host's harness registry, so a session's
+  // harness choice survives image swaps.
   useEffect(() => {
-    setHarnessKind('none');
-    setHarnessName('');
     setSecrets({});
     setError(null);
   }, [selectedKey]);
 
-  // If the selected image lacks the chosen builtin, drop back to none.
+  // If the host registry no longer offers the chosen harness (operator
+  // removed a binary), drop back to none.
   useEffect(() => {
     if (
       harnessKind === 'builtin' &&
-      selected &&
-      !selected.harnesses.some((h) => h.name === harnessName)
+      harnesses &&
+      !harnesses.some((h) => h.name === harnessName)
     ) {
       setHarnessKind('none');
       setHarnessName('');
     }
-  }, [selected, harnessKind, harnessName]);
+  }, [harnesses, harnessKind, harnessName]);
 
   // ---- PROMPT (only meaningful when harness != none) ----
   const [prompt, setPrompt] = useState('');
@@ -322,7 +325,7 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
                   className="ledger-input font-display"
                 >
                   <option value="__none__">none</option>
-                  {selected?.harnesses.map((h) => (
+                  {harnesses?.map((h) => (
                     <option key={h.name} value={h.name}>
                       builtin: {h.name}
                       {h.description ? ` — ${h.description}` : ''}
@@ -330,12 +333,12 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
                   ))}
                 </select>
               </Field>
-              {selected && selected.harnesses.length === 0 && (
+              {harnesses && harnesses.length === 0 && (
                 <p
                   className="font-display italic text-[0.85rem] -mt-1"
                   style={{ color: 'var(--color-ink-quiet)' }}
                 >
-                  this image has no built-in harnesses; sessions run as plain shells
+                  no harnesses registered on this host; sessions run as plain shells
                 </p>
               )}
               {harnessKind === 'builtin' && (

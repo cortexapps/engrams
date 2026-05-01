@@ -85,6 +85,9 @@ export interface RequiredSecret {
   allow_hosts: string[];
 }
 
+/** Harness available on this deployment — read from `/api/harnesses`,
+ * which lists the host's `cfg.harnesses_dir` (deployment-wide, not
+ * per-image). */
 export interface HarnessDescriptor {
   name: string;
   description: string | null;
@@ -98,8 +101,6 @@ export interface ImageDescriptor {
   /** "literal" or "broker" — broker images reject browser-pasted secrets. */
   secret_mode: string;
   required_secrets: RequiredSecret[];
-  /** Builtin harnesses baked into this image's rootfs. */
-  harnesses: HarnessDescriptor[];
   /**
    * Whether this deployment's sandbox backend supports
    * `WorkspaceSpec.local_mount`. False on Firecracker; true on

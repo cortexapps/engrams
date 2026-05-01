@@ -283,34 +283,19 @@ async fn resume_from_fc_snapshot(
     // an idle-evict. Tracked alongside `build_dev_agent`'s base_env
     // arg, which was added when the create-time secret-delivery
     // gap was fixed.
-    // Re-resolve the image so we can hand `resolve_harness` the
-    // manifest + rootfs dir again. If the image vanished from the
-    // registry post-bake (rare), fall through to "no agent" — the
-    // VM is up, the user can still drive it via exec / shell, and
-    // the next prompt's ensure_active path can retry.
+    // `resolve_harness` reads from the host registry; no need to
+    // re-load the image manifest here.
     let resume_base_env: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let resolved = state
-        .services
-        .images
-        .load(session.image.repo(), session.image.tag())
-        .await
-        .ok();
-    let agent_opt = if let Some(resolved) = resolved.as_ref() {
-        crate::api::sessions::resolve_harness(
-            &state,
-            &resolved.manifest,
-            resolved,
-            &session.harness,
-            id,
-            None,
-            &resume_base_env,
-        )
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
+    let agent_opt = crate::api::sessions::resolve_harness(
+        &state,
+        &session.harness,
+        id,
+        None,
+        &resume_base_env,
+    )
+    .ok()
+    .flatten();
     if let Some(agent) = agent_opt {
         if let Err(e) = state
             .services

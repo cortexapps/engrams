@@ -229,59 +229,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_engram_toml_with_harness_block() {
-        // Round-trip the source-side `[[harness]]` block through the
-        // split-and-reparse logic to confirm it lands on the manifest
-        // half (not lost as a "build" section).
-        let cfg = EngramRepoConfig::parse(
+    fn parse_engram_toml_rejects_stale_harness_block() {
+        // `[[harness]]` was retired when harness binaries moved to a
+        // host-side directory mounted into every sandbox via
+        // virtio-fs. ImageManifest's `deny_unknown_fields` catches
+        // a stale engram.toml that still carries the block, failing
+        // at parse rather than silently shipping an inert image.
+        let res = EngramRepoConfig::parse(
             r#"
             name = "claude-oauth"
 
             [[harness]]
             name = "claude"
             guest_path = "/sbin/engram-harness-claude"
-            description = "Claude Code adapter"
-
-            [[harness]]
-            name = "noop"
-            guest_path = "/sbin/engram-harness-noop"
-
-            [build]
-            dockerfile = "Dockerfile"
             "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.manifest.harnesses.len(), 2);
-        assert_eq!(cfg.manifest.harnesses[0].name, "claude");
-        assert_eq!(
-            cfg.manifest.harnesses[0].guest_path,
-            "/sbin/engram-harness-claude"
         );
-        assert_eq!(
-            cfg.manifest.harnesses[0].description.as_deref(),
-            Some("Claude Code adapter")
-        );
-        assert_eq!(cfg.manifest.harnesses[1].name, "noop");
-    }
-
-    #[test]
-    fn rendered_manifest_includes_harness_entries() {
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-            [[harness]]
-            name = "claude"
-            guest_path = "/sbin/h"
-            "#,
-        )
-        .unwrap();
-        let rendered = toml::to_string(&cfg.to_manifest()).unwrap();
-        assert!(
-            rendered.contains("[[harness]]"),
-            "rendered manifest must carry [[harness]] entries; got:\n{rendered}",
-        );
-        assert!(rendered.contains("name = \"claude\""));
-        assert!(rendered.contains("guest_path = \"/sbin/h\""));
+        assert!(res.is_err(), "stale [[harness]] block must be rejected");
     }
 
     #[test]

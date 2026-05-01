@@ -284,6 +284,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets: Arc::new(InMemorySecretStore::new()),
         images: ImageRegistry::new(images_dir),
+        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
@@ -378,6 +379,7 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets: Arc::new(InMemorySecretStore::new()),
         images: ImageRegistry::new(images_dir),
+        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),

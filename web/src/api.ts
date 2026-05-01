@@ -1,5 +1,6 @@
 import type {
   CreateSessionResponse,
+  HarnessDescriptor,
   HarnessSpec,
   ImageDescriptor,
   ImageRef,
@@ -58,6 +59,9 @@ export const fetchSession = (id: string) =>
   getJSON<Session>(`/sessions/${id}`);
 
 export const fetchImages = () => getJSON<ImageDescriptor[]>('/api/images');
+
+export const fetchHarnesses = () =>
+  getJSON<HarnessDescriptor[]>('/api/harnesses');
 
 export interface CreateSessionInput {
   image: ImageRef;

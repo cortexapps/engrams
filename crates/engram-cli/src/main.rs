@@ -235,17 +235,12 @@ enum ImageCmd {
         /// `/sbin/engram-bootstrap`. The default init shim spawns
         /// it in the background; it listens on vsock 1025 for a
         /// `BootstrapLaunch` from the host and exec's the per-
-        /// session agent (e.g. a harness adapter). Pair with
-        /// `--inject-harness-noop` (or another harness binary) so
-        /// bootstrap has something to exec into.
+        /// session harness over the virtio-fs mount at
+        /// `/run/engram/harnesses/`. Harness binaries themselves
+        /// are no longer baked into images — they live host-side
+        /// in `cfg.harnesses_dir`.
         #[arg(long)]
         inject_bootstrap: Option<PathBuf>,
-
-        /// Inject a harness adapter binary at `/sbin/<name>`. Repeat
-        /// for multiple. Format: `name=path`, e.g.
-        /// `engram-harness-noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop`.
-        #[arg(long, value_parser = parse_harness_binary)]
-        inject_harness: Vec<(String, PathBuf)>,
 
         /// Which `engram-transport` impl the in-VM binaries should
         /// select at runtime. The init shim writes
@@ -265,16 +260,6 @@ enum ImageCmd {
 
 fn parse_transport(s: &str) -> Result<engram_image_builder::Transport, String> {
     engram_image_builder::Transport::parse(s)
-}
-
-fn parse_harness_binary(s: &str) -> Result<(String, PathBuf), String> {
-    let (name, path) = s
-        .split_once('=')
-        .ok_or_else(|| format!("expected `name=path`, got `{s}`"))?;
-    if name.is_empty() || name.contains('/') {
-        return Err(format!("name `{name}` must be a single path component"));
-    }
-    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 fn parse_image_format(s: &str) -> Result<Format, String> {
@@ -396,7 +381,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 format,
                 inject_agent,
                 inject_bootstrap,
-                inject_harness,
                 transport,
             } => {
                 image_build(
@@ -408,7 +392,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     *format,
                     inject_agent.as_deref(),
                     inject_bootstrap.as_deref(),
-                    inject_harness,
                     *transport,
                 )
                 .await
@@ -1090,7 +1073,6 @@ async fn image_build(
     format: Format,
     inject_agent: Option<&Path>,
     inject_bootstrap: Option<&Path>,
-    inject_harness: &[(String, PathBuf)],
     transport: engram_image_builder::Transport,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
@@ -1106,7 +1088,6 @@ async fn image_build(
         transport,
         init_script: None,
         bootstrap_binary: inject_bootstrap.map(|p| p.to_path_buf()),
-        harness_binaries: inject_harness.to_vec(),
     });
     let req = BuildRequest {
         source: source.to_path_buf(),

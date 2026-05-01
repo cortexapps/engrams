@@ -106,15 +106,10 @@ pub struct AgentInjection {
     /// `/sbin/engram-bootstrap` (chmod 0755) and the default init
     /// shim spawns it in the background before exec'ing agentd.
     /// Required for any image that wants to run a harness over the
-    /// Phase 4 in-VM transport; safe to omit for images that only
-    /// need the exec channel.
+    /// in-VM transport; safe to omit for images that only need the
+    /// exec channel.
     #[allow(dead_code)] // surfaced via this struct's field so callers can construct it
     pub bootstrap_binary: Option<PathBuf>,
-    /// Harness adapter binaries to inject. Each entry is
-    /// `(guest_filename, host_path)`. Bootstrap exec's whatever
-    /// path the host's `start_agent` carries in
-    /// `BootstrapLaunch::argv[0]` — usually one of these.
-    pub harness_binaries: Vec<(String, PathBuf)>,
 }
 
 /// Which `engram-transport` implementation the in-VM binaries
@@ -208,6 +203,14 @@ mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
+# virtio-fs mounts. The host configures one VZVirtioFileSystemDevice
+# per declared mount with a known tag; mount each at its target if
+# the device is actually present. `mount` returns non-zero if the
+# tag has no device — silently skip in that case so images that
+# don't (yet) have a harness directory boot fine.
+mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
+mount -t virtio engram-harnesses /run/engram/harnesses 2>/dev/null || true
+mount -t virtio engram-workspace /workspace 2>/dev/null || true
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
@@ -442,17 +445,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Docker(format!("export: {e}")))?;
 
-        // Optional: inject engram-agentd + an init shim before we
-        // pack to ext4. Done after docker export so the rootfs the
-        // user described in their Dockerfile is the base; we just
-        // overlay our agent on top. The injection step also drives
-        // which `[[harness]]` entries land in `manifest.toml` —
-        // every binary we copy in must be discoverable from the
-        // manifest so the coord can resolve `HarnessSpec::Builtin`
-        // names at session-create time.
-        let mut effective_manifest = cfg.to_manifest();
+        // Optional: inject engram-agentd + bootstrap + an init shim
+        // before we pack to ext4. Done after docker export so the
+        // rootfs the user described in their Dockerfile is the base;
+        // we just overlay our agent / bootstrap on top. Harness
+        // binaries are NOT baked here — they live host-side in
+        // `cfg.harnesses_dir` and are mounted into every sandbox
+        // via virtio-fs at `/run/engram/harnesses`.
+        let effective_manifest = cfg.to_manifest();
         if let Some(injection) = &req.agent_injection {
-            inject_agent(&rootfs_dir, injection, &mut effective_manifest).await?;
+            inject_agent(&rootfs_dir, injection).await?;
         }
 
         let manifest_path = image_dir.join("manifest.toml");
@@ -521,17 +523,13 @@ fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError>
 /// Mirrors the layout the kernel boot args expect:
 /// `init=/sbin/engram-init`.
 ///
-/// `manifest` is mutated in place: harness binaries provided via the
-/// CLI flag (`AgentInjection.harness_binaries`) that aren't already
-/// declared in `[[harness]]` are appended as synthetic entries with
-/// the default `/sbin/<name>` guest path and a deprecation warning.
-/// Declared entries with no matching CLI flag (host binary missing)
-/// are removed from the manifest — the coord must never advertise a
-/// harness whose binary isn't in the rootfs.
+/// Harness binaries used to be baked here too. They've moved
+/// host-side: `cfg.harnesses_dir` is mounted into every sandbox at
+/// `/run/engram/harnesses` via virtio-fs, so the rootfs no longer
+/// carries them.
 async fn inject_agent(
     rootfs_dir: &Path,
     injection: &AgentInjection,
-    manifest: &mut ImageManifest,
 ) -> Result<(), BuildError> {
     if !injection.agent_binary.exists() {
         return Err(BuildError::Config(format!(
@@ -557,62 +555,6 @@ async fn inject_agent(
         }
         let dst = rootfs_dir.join("sbin/engram-bootstrap");
         install_file(bootstrap, &dst, "bootstrap").await?;
-    }
-
-    // Every `--inject-harness <name>=<host_path>` must point at a
-    // `[[harness]]` declaration in engram.toml — the manifest is the
-    // single source of truth for what the runtime advertises and
-    // where the binary lands. Hard error rather than synthesise an
-    // entry: the operator's request and the image's contract have
-    // disagreed and we want them to notice.
-    let mut copied_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (name, src) in &injection.harness_binaries {
-        if !src.exists() {
-            return Err(BuildError::Config(format!(
-                "harness_binary {} does not exist (intended for harness `{name}`)",
-                src.display()
-            )));
-        }
-        if name.contains('/') || name.is_empty() {
-            return Err(BuildError::InvalidPath(format!(
-                "harness_binary guest filename `{name}` must be a single path component"
-            )));
-        }
-        let entry = manifest.harnesses.iter().find(|h| h.name == *name).ok_or_else(|| {
-            let declared: Vec<&str> = manifest
-                .harnesses
-                .iter()
-                .map(|h| h.name.as_str())
-                .collect();
-            BuildError::Config(format!(
-                "harness `{name}` provided via --inject-harness but is not declared in \
-                 engram.toml's [[harness]] block (declared: {declared:?}). Add a \
-                 [[harness]] entry with the same `name` and the desired `guest_path`."
-            ))
-        })?;
-        let rel = entry.guest_path.trim_start_matches('/');
-        if rel.is_empty() {
-            return Err(BuildError::InvalidPath(format!(
-                "harness `{name}` has empty guest_path"
-            )));
-        }
-        let dst = rootfs_dir.join(rel);
-        install_file(src, &dst, "harness").await?;
-        copied_names.insert(name.clone());
-    }
-
-    // Drop any manifest entries whose binary wasn't supplied — the
-    // manifest must only advertise harnesses that actually exist in
-    // the rootfs. Surfacing this via tracing rather than a hard error
-    // because a user may legitimately want to bake a slimmed-down
-    // image with only some of the declared harnesses.
-    let pre = manifest.harnesses.len();
-    manifest.harnesses.retain(|h| copied_names.contains(&h.name));
-    if manifest.harnesses.len() < pre {
-        tracing::info!(
-            dropped = pre - manifest.harnesses.len(),
-            "dropped declared [[harness]] entries with no --inject-harness binary",
-        );
     }
 
     match &injection.init_script {

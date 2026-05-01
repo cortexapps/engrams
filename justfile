@@ -94,7 +94,7 @@ db-reset:
 # `engram image build --inject-agent <agentd-musl-binary> --format ext4`
 # so the in-VM agent is present. Without it `session exec` will
 # hang waiting for vsock to come up.
-dev-firecracker: db-up
+dev-firecracker: db-up install-harnesses
     : "${ENGRAM_KERNEL_IMAGE_PATH:?set ENGRAM_KERNEL_IMAGE_PATH to a vmlinux on this host}"
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
@@ -108,10 +108,39 @@ dev-firecracker: db-up
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
+# Build all harness binaries for the host's guest architecture and
+# symlink them into `./var/engram/harnesses/` — the directory the
+# coord scans on startup and mounts read-only into every sandbox at
+# `/run/engram/harnesses` via virtio-fs. After this runs, `engram
+# session create --harness <name>` works for any of {claude, noop}
+# without re-baking images. Idempotent. Must re-run after pulling
+# new harness code.
+#
+# Cross-compiles for aarch64-unknown-linux-musl on macOS (VZ guests)
+# and x86_64-unknown-linux-musl on Linux (FC guests) — both produce
+# Linux binaries since the harness runs inside the guest VM, not on
+# the host.
+install-harnesses:
+    @mkdir -p ./var/engram/harnesses
+    @if [ "$(uname -s)" = "Darwin" ]; then \
+        TARGET=aarch64-unknown-linux-musl ; \
+    else \
+        TARGET=x86_64-unknown-linux-musl ; \
+    fi ; \
+    rustup target add $TARGET >/dev/null 2>&1 || true ; \
+    cargo build -p engram-harness-noop   --target $TARGET --release ; \
+    cargo build -p engram-harness-claude --target $TARGET --release ; \
+    ln -sf "$(pwd)/target/$TARGET/release/engram-harness-noop"   ./var/engram/harnesses/noop ; \
+    ln -sf "$(pwd)/target/$TARGET/release/engram-harness-claude" ./var/engram/harnesses/claude ; \
+    echo "harnesses installed at ./var/engram/harnesses/" ; \
+    ls -la ./var/engram/harnesses/
+
 # Bake a tiny Firecracker image (debian-slim + engram-agentd +
-# engram-bootstrap + engram-harness-noop) for the `local://demo`
-# repo and register it under `./var/engram/images/`. The repo name
-# passed to `engram image build` must match what the session-create
+# engram-bootstrap) for the `local://demo` repo and register it
+# under `./var/engram/images/`. Harness binaries are NOT baked
+# in — they live in `./var/engram/harnesses/` and get mounted into
+# every sandbox at runtime via virtio-fs. The repo name passed to
+# `engram image build` must match what the session-create
 # body will carry (`local://demo`), because the image registry
 # resolves images by literal repo string.
 #
@@ -124,11 +153,9 @@ dev-firecracker: db-up
 fc-bake-demo:
     cargo build -p engram-agentd     --target x86_64-unknown-linux-musl --release
     cargo build -p engram-bootstrap  --target x86_64-unknown-linux-musl --release
-    cargo build -p engram-harness-noop --target x86_64-unknown-linux-musl --release
     mkdir -p ./var/fc-bake
     printf 'FROM debian:bookworm-slim\n' > ./var/fc-bake/Dockerfile
-    printf 'name = "local-demo"\n\n[[harness]]\nname = "noop"\nguest_path = "/sbin/engram-harness-noop"\n' \
-        > ./var/fc-bake/engram.toml
+    printf 'name = "local-demo"\n' > ./var/fc-bake/engram.toml
     cargo run -p engram-cli -- image build \
         --repo local://demo \
         --tag warm-1 \
@@ -136,8 +163,7 @@ fc-bake-demo:
         --format ext4 \
         --images-dir ./var/engram/images \
         --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop
+        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap
 
 # Bake a Firecracker image containing the real Claude Code CLI plus
 # engram-agentd / engram-bootstrap / engram-harness-claude.
@@ -165,7 +191,6 @@ fc-bake-demo:
 fc-bake-claude:
     cargo build -p engram-agentd         --target x86_64-unknown-linux-musl --release
     cargo build -p engram-bootstrap      --target x86_64-unknown-linux-musl --release
-    cargo build -p engram-harness-claude --target x86_64-unknown-linux-musl --release
     mkdir -p ./var/fc-bake-claude
     cp deploy/fc-bake-claude/Dockerfile  ./var/fc-bake-claude/Dockerfile
     cp deploy/fc-bake-claude/engram.toml ./var/fc-bake-claude/engram.toml
@@ -176,8 +201,7 @@ fc-bake-claude:
         --format ext4 \
         --images-dir ./var/engram/images \
         --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   claude=target/x86_64-unknown-linux-musl/release/engram-harness-claude
+        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap
 
 # ------------------------------------------------------------------
 # Apple Silicon — Virtualization.framework backend
@@ -228,7 +252,7 @@ vz-test: vz-codesign
 #
 # The recipe codesigns the coord binary first; without the
 # entitlement VZ refuses to instantiate any VM.
-dev-vz: db-up vz-codesign
+dev-vz: db-up vz-codesign install-harnesses
     @if [ "$(uname -s)" != "Darwin" ]; then \
         echo "dev-vz only runs on macOS"; exit 1; \
     fi
@@ -284,11 +308,9 @@ vz-bake-demo:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     cargo build -p engram-agentd       --target aarch64-unknown-linux-musl --release
     cargo build -p engram-bootstrap    --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-harness-noop --target aarch64-unknown-linux-musl --release
     mkdir -p ./var/vz-bake
     printf 'FROM --platform=linux/arm64 debian:bookworm-slim\n' > ./var/vz-bake/Dockerfile
-    printf 'name = "vz-demo"\n\n[[harness]]\nname = "noop"\nguest_path = "/sbin/engram-harness-noop"\n' \
-        > ./var/vz-bake/engram.toml
+    printf 'name = "vz-demo"\n' > ./var/vz-bake/engram.toml
     PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
     cargo run -p engram-cli -- image build \
         --repo local://demo \
@@ -298,8 +320,7 @@ vz-bake-demo:
         --images-dir ./var/engram/images \
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   noop=target/aarch64-unknown-linux-musl/release/engram-harness-noop
+        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
 
 # Bake the Claude image for VZ — arm64 sibling of fc-bake-claude.
 # Reuses the same Dockerfile / engram.toml under deploy/fc-bake-claude/
@@ -309,7 +330,6 @@ vz-bake-claude:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     cargo build -p engram-agentd         --target aarch64-unknown-linux-musl --release
     cargo build -p engram-bootstrap      --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-harness-claude --target aarch64-unknown-linux-musl --release
     mkdir -p ./var/vz-bake-claude
     cp deploy/fc-bake-claude/Dockerfile  ./var/vz-bake-claude/Dockerfile
     cp deploy/fc-bake-claude/engram.toml ./var/vz-bake-claude/engram.toml
@@ -322,8 +342,7 @@ vz-bake-claude:
         --images-dir ./var/engram/images \
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
+        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
 
 # Bake an OAuth-authenticated Claude image for VZ. Same Dockerfile as
 # `vz-bake-claude` (Claude Code CLI on node:20-slim, arm64), but the
@@ -343,7 +362,6 @@ vz-bake-claude-oauth:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     cargo build -p engram-agentd         --target aarch64-unknown-linux-musl --release
     cargo build -p engram-bootstrap      --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-harness-claude --target aarch64-unknown-linux-musl --release
     mkdir -p ./var/vz-bake-claude-oauth
     cp deploy/claude-oauth/Dockerfile  ./var/vz-bake-claude-oauth/Dockerfile
     cp deploy/claude-oauth/engram.toml ./var/vz-bake-claude-oauth/engram.toml
@@ -356,8 +374,7 @@ vz-bake-claude-oauth:
         --images-dir ./var/engram/images \
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
+        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
 
 # Run the coordinator wired for the OAuth-authenticated Claude image.
 # Same as `dev-vz` but pre-flight-checks `CLAUDE_CODE_OAUTH_TOKEN` so
@@ -369,7 +386,7 @@ vz-bake-claude-oauth:
 #     curl -X POST http://localhost:8090/sessions \
 #         -H 'content-type: application/json' \
 #         -d '{"repo":"local://claude-oauth","branch":"main","prompt":"hi"}'
-dev-vz-claude-oauth: db-up vz-codesign
+dev-vz-claude-oauth: db-up vz-codesign install-harnesses
     @if [ "$(uname -s)" != "Darwin" ]; then \
         echo "dev-vz-claude-oauth only runs on macOS"; exit 1; \
     fi

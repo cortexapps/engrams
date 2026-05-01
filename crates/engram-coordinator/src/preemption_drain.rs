@@ -349,6 +349,7 @@ mod tests {
             sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
             secrets: Arc::new(InMemorySecretStore::new()),
             images: ImageRegistry::new(images_dir),
+            harnesses: Arc::new(crate::harness_registry::HarnessRegistry::empty()),
         };
         let cfg = CoordinatorConfig {
             local_path,

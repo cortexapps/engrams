@@ -19,6 +19,7 @@ pub mod idle_evictor;
 pub mod image_registry;
 pub mod pg_listener;
 pub mod preemption_drain;
+pub mod harness_registry;
 pub mod scheduler;
 pub mod state;
 pub mod workspace;
@@ -36,6 +37,11 @@ pub struct Services {
     pub sandbox: Arc<dyn SandboxBackend>,
     pub secrets: Arc<dyn SecretStore>,
     pub images: image_registry::ImageRegistry,
+    /// Host-side harness registry — the closed set of
+    /// `HarnessSpec::Builtin{name}` values a session may request.
+    /// Resolved from `cfg.harnesses_dir` at startup; mounted into
+    /// every sandbox's `/run/engram/harnesses` via virtio-fs.
+    pub harnesses: Arc<harness_registry::HarnessRegistry>,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.

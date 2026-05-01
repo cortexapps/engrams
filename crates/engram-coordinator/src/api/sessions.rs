@@ -6,7 +6,7 @@ use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
 use engram_core::types::session::{HarnessSpec, ImageRef, WorkspaceSpec};
-use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionStatus};
+use engram_core::types::{SecretMode, Session, SessionSpec, SessionStatus};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
@@ -131,8 +131,6 @@ pub async fn create_session(
     State(state): State<SharedState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    use crate::config::SandboxBackendChoice;
-
     // -------- 0. Validate orthogonal axes --------
     // `harness=None + non-empty prompt` is meaningless: there's no
     // agent to consume the prompt. Silent drop hides the bug; reject
@@ -177,16 +175,23 @@ pub async fn create_session(
     };
     let manifest = resolved.manifest.clone();
 
-    // Validate the harness against the image manifest. Builtin names
-    // are scoped per-image — a session asking for `claude` on an
-    // image that doesn't bake `claude` is a 400, not a runtime
-    // surprise.
+    // Validate the harness against the *host* registry. Harnesses
+    // live above the image now (mounted via virtio-fs from
+    // `cfg.harnesses_dir` at `/run/engram/harnesses`) so the closed
+    // set of valid names is deployment-wide, not per-image.
     if let HarnessSpec::Builtin { name } = &req.harness {
-        if !manifest.harnesses.iter().any(|h| h.name == *name) {
-            let available: Vec<&str> = manifest.harnesses.iter().map(|h| h.name.as_str()).collect();
+        if state.services.harnesses.lookup(name).is_none() {
+            let available: Vec<&str> = state
+                .services
+                .harnesses
+                .entries()
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect();
             return Err(ApiError::BadRequest(format!(
-                "image `{image_repo}:{image_tag}` does not bake harness `{name}` \
-                 (available: {available:?})"
+                "no harness `{name}` registered on this host (available: {available:?}). \
+                 Drop the binary in `cfg.harnesses_dir` (default \
+                 `./var/engram/harnesses/`) and restart the coord."
             )));
         }
     }
@@ -233,29 +238,44 @@ pub async fn create_session(
 
     let agent_for_session = resolve_harness(
         &state,
-        &manifest,
-        &resolved,
         &req.harness,
         session_id,
         req.prompt.as_deref(),
         &spec_env,
     )?;
 
-    // LocalMount workspaces wire host paths into the spec at create
-    // time so the backend's virtio-fs / bind layer sees them before
-    // the VM boots; Empty / Git workspaces don't need mounts.
-    let mounts: Vec<engram_core::types::sandbox::MountSpec> = match &req.workspace {
-        WorkspaceSpec::LocalMount {
-            host_path,
-            guest_path,
-            read_only,
-        } => vec![engram_core::types::sandbox::MountSpec {
+    // Mounts wired into the SandboxSpec at create time so the
+    // backend's virtio-fs / bind layer sees them before VM boot:
+    //
+    //   1. Harness substrate at `/run/engram/harnesses` (read-only).
+    //      Always present when the host has any harnesses registered;
+    //      the `[[harness]]` block in engram.toml is gone — harness
+    //      binaries live above the image now, on the host. The
+    //      bootstrap supervisor exec's `/run/engram/harnesses/<name>`
+    //      for `HarnessSpec::Builtin{name}`.
+    //   2. Optional `LocalMount` workspace if the session asked for
+    //      one.
+    let mut mounts: Vec<engram_core::types::sandbox::MountSpec> = Vec::new();
+    if !state.services.harnesses.entries().is_empty() {
+        mounts.push(engram_core::types::sandbox::MountSpec {
+            host_path: state.services.harnesses.host_dir().to_path_buf(),
+            guest_path: crate::harness_registry::HarnessRegistry::guest_mount_path()
+                .to_path_buf(),
+            read_only: true,
+        });
+    }
+    if let WorkspaceSpec::LocalMount {
+        host_path,
+        guest_path,
+        read_only,
+    } = &req.workspace
+    {
+        mounts.push(engram_core::types::sandbox::MountSpec {
             host_path: host_path.clone(),
             guest_path: guest_path.clone(),
             read_only: *read_only,
-        }],
-        _ => Vec::new(),
-    };
+        });
+    }
 
     let vm_spec = VmSpec {
         image: image_tag.clone(),
@@ -504,44 +524,37 @@ pub async fn delete_session(
 }
 
 /// Phase-0 transition shim. Translate the legacy `repo` URL scheme
-/// Resolve a session's [`HarnessSpec`] against the image manifest +
-/// the resolved image dir, building the [`AgentSpec`] the backend
-/// will spawn at `start_agent` time. `None` is returned for
-/// `HarnessSpec::None` — the sandbox boots with no agent, leaving
-/// the user to drive it via the in-browser shell or `engram exec`.
+/// Resolve a session's [`HarnessSpec`] against the host's harness
+/// registry, building the [`AgentSpec`] the backend will spawn at
+/// `start_agent` time. `None` is returned for `HarnessSpec::None` —
+/// the sandbox boots with no agent, leaving the user to drive it
+/// via the in-browser shell or `engram exec`.
 ///
-/// Builtin harnesses live at `manifest.harnesses[].guest_path`
-/// inside the rootfs. Two argv shapes depending on backend:
-/// - `Process`: `--connect host:port`. The binary is exec'd as a
-///   host subprocess so `argv[0]` is the *host* path (the image
-///   registry's exported `<rootfs_dir>` + the manifest's
-///   `guest_path`).
-/// - `Firecracker` / `VZ`: `--vsock-host <port>`. The in-VM bootstrap
-///   exec's the binary inside the rootfs so `argv[0]` is the
-///   manifest's `guest_path` directly.
+/// The host's harness directory (`cfg.harnesses_dir`) is mounted
+/// read-only into every sandbox at `/run/engram/harnesses` via
+/// virtio-fs. Two argv shapes depending on backend:
+/// - `HostTcp` (Process): `argv[0]` is the host path of the binary
+///   inside `cfg.harnesses_dir`; the harness dials TCP loopback on
+///   `--connect`.
+/// - `Vsock` (FC/VZ): `argv[0]` is `/run/engram/harnesses/<name>`,
+///   exec'd inside the VM over the virtio-fs mount; the harness
+///   dials AF_VSOCK on `--vsock-host`.
 pub(crate) fn resolve_harness(
     state: &SharedState,
-    manifest: &ImageManifest,
-    resolved_image: &crate::image_registry::ResolvedImage,
     spec: &HarnessSpec,
     session_id: SessionId,
     initial_prompt: Option<&str>,
     base_env: &HashMap<String, String>,
 ) -> Result<Option<engram_core::types::sandbox::AgentSpec>, ApiError> {
-    use crate::config::SandboxBackendChoice;
     let name = match spec {
         HarnessSpec::None => return Ok(None),
         HarnessSpec::Builtin { name } => name,
     };
-    let entry = manifest
-        .harnesses
-        .iter()
-        .find(|h| h.name == *name)
-        .ok_or_else(|| {
-            ApiError::Internal(format!(
-                "harness `{name}` validated as available but vanished from manifest"
-            ))
-        })?;
+    let entry = state.services.harnesses.lookup(name).ok_or_else(|| {
+        ApiError::Internal(format!(
+            "harness `{name}` validated against host registry but vanished mid-create"
+        ))
+    })?;
 
     let mut env: HashMap<String, String> = base_env.clone();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
@@ -560,9 +573,8 @@ pub(crate) fn resolve_harness(
                 }
             };
             env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
-            let host_path = host_tcp_harness_host_path(resolved_image, &entry.guest_path)?;
             vec![
-                host_path,
+                entry.host_path.to_string_lossy().into_owned(),
                 "--connect".into(),
                 addr.to_string(),
                 "--session-id".into(),
@@ -572,7 +584,7 @@ pub(crate) fn resolve_harness(
         engram_core::traits::HarnessDial::Vsock => {
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
-                entry.guest_path.clone(),
+                crate::harness_registry::HarnessRegistry::guest_argv0(name),
                 "--vsock-host".into(),
                 port.to_string(),
                 "--session-id".into(),
@@ -581,31 +593,4 @@ pub(crate) fn resolve_harness(
         }
     };
     Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
-}
-
-/// Resolve `guest_path` (e.g. `/sbin/engram-harness-claude`) against
-/// the image's exported rootfs directory so a `HostTcp`-dialing
-/// backend can exec it as a host subprocess. The image registry
-/// stores the rootfs at `<images_dir>/<repo>/<tag>/rootfs/`; strip
-/// the leading `/` from `guest_path` and join.
-fn host_tcp_harness_host_path(
-    resolved: &crate::image_registry::ResolvedImage,
-    guest_path: &str,
-) -> Result<String, ApiError> {
-    use crate::image_registry::Rootfs;
-    let rel = guest_path.trim_start_matches('/');
-    if rel.is_empty() {
-        return Err(ApiError::BadRequest("harness `guest_path` is empty".into()));
-    }
-    match &resolved.rootfs {
-        Rootfs::Directory(dir) => Ok(dir.join(rel).to_string_lossy().into_owned()),
-        Rootfs::Ext4Image(_) => Err(ApiError::Internal(
-            "HostTcp-dialing backend cannot exec a harness baked into an ext4 rootfs; \
-             rebuild the image with `--format directory`"
-                .into(),
-        )),
-        Rootfs::None => Err(ApiError::BadRequest(
-            "image has no rootfs — `harness.builtin` requires a baked binary".into(),
-        )),
-    }
 }

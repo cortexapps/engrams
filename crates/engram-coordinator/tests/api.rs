@@ -314,6 +314,7 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
         sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
         secrets: Arc::new(InMemorySecretStore::new()),
         images: ImageRegistry::new(images_dir),
+        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -361,6 +362,7 @@ impl TestFixture {
             sandbox: backend,
             secrets: Arc::new(secrets),
             images: ImageRegistry::new(images_dir.clone()),
+            harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         };
         let cfg = CoordinatorConfig {
             default_image_version: "warm-bootstrap".into(),
@@ -685,29 +687,18 @@ async fn create_session_prompt_with_no_harness_is_400() {
 
 #[tokio::test]
 async fn create_session_unknown_harness_name_is_400() {
-    // Builtin harness names are scoped per-image — the manifest's
-    // `[[harness]]` list is the source of truth. Asking for one
-    // that isn't baked is a 400.
+    // Harness names live in the host registry now (deployment-wide),
+    // not the image manifest. Asking for one that isn't registered
+    // returns 400. The test fixture's HarnessRegistry is empty so
+    // any builtin name is unknown.
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
-    f.write_image(
-        "claude-img",
-        "warm-1",
-        r#"
-        name = "claude-img"
-        [[harness]]
-        name = "claude"
-        guest_path = "/sbin/engram-harness-claude"
-        "#,
-        &[],
-    );
-    let app = f.app;
+    let app = build_app(store);
     let resp = app
         .oneshot(json_request(
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"claude-img","tag":"warm-1"},
+                "image": {"kind":"registry","repo":"r","tag":"warm-bootstrap"},
                 "workspace": {"kind":"empty"},
                 "harness": {"kind":"builtin","name":"codex"},
             }),
@@ -1980,6 +1971,7 @@ async fn create_session_failure_marks_session_failed() {
         sandbox: Arc::new(AlwaysFailSandbox),
         secrets: Arc::new(InMemorySecretStore::new()),
         images: ImageRegistry::new(images_dir),
+        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
