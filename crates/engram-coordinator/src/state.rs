@@ -971,6 +971,7 @@ pub(crate) mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
+            mounts: Vec::new(),
         }
     }
 
@@ -1093,6 +1094,7 @@ pub(crate) mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
+            mounts: Vec::new(),
         };
         let sandbox_id = backend.create(spec).await.unwrap();
 

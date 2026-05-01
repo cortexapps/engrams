@@ -55,8 +55,16 @@ enum Cmd {
 #[derive(Subcommand, Debug)]
 enum SessionCmd {
     /// Create a new session. Prints the new session_id on stdout.
+    ///
+    /// Legacy `--repo` + `--branch` + `--read-only` flags continue to
+    /// work — the CLI translates them into the orthogonal
+    /// `image` / `workspace` axes the API now requires. New scripts
+    /// should prefer `--image-repo` + `--image-tag` + workspace
+    /// flags so the relationship is explicit.
     Create {
         /// `git+https://...`, `git+ssh://...`, or `local://<name>`.
+        /// Drives both the workspace (Git vs Empty) and — when
+        /// `--image-repo` is omitted — the image registry lookup.
         #[arg(long)]
         repo: String,
         /// Base branch the session forks from (Git sessions). Ignored
@@ -67,7 +75,7 @@ enum SessionCmd {
         #[arg(long)]
         read_only: bool,
         /// Pin the session to a specific image_version (warm-pool tag).
-        /// Defaults to the coord's `--default-image-version`.
+        /// Required since phase 2 unless `--image-tag` is given.
         #[arg(long)]
         image_version: Option<String>,
         /// Free-form user identifier surfaced on the row.
@@ -79,6 +87,11 @@ enum SessionCmd {
         /// that waits for `engram session prompt <id>`.
         #[arg(long)]
         prompt: Option<String>,
+        /// Which baked-in harness to attach. `none` (default) boots
+        /// the VM with no agent; otherwise the value is the manifest
+        /// `[[harness]] name = ...` to attach (e.g. `claude`, `noop`).
+        #[arg(long, default_value = "none")]
+        harness: String,
     },
     /// List sessions in `pending` / `active` / `idle` status.
     List,
@@ -317,6 +330,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 image_version,
                 user_id,
                 prompt,
+                harness,
             } => {
                 session_create(
                     &client,
@@ -327,6 +341,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     image_version.as_deref(),
                     user_id.as_deref(),
                     prompt.as_deref(),
+                    harness,
                     cli.json,
                 )
                 .await
@@ -496,7 +511,6 @@ async fn session_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
@@ -506,17 +520,47 @@ async fn session_create(
     image_version: Option<&str>,
     user_id: Option<&str>,
     prompt: Option<&str>,
+    harness: &str,
     json: bool,
 ) -> Result<(), CliError> {
+    // Translate the legacy CLI flags into the phase-2 wire shape.
+    // The `--repo` flag still drives the workspace/image identity;
+    // `git+...` becomes a Git workspace; everything else (including
+    // `local://...`) becomes Empty. The image registry's `repo` is
+    // the `--repo` value with any `git+` prefix stripped. Bare names
+    // pass through unchanged.
+    let image_repo = repo
+        .strip_prefix("git+")
+        .map(str::to_string)
+        .or_else(|| repo.strip_prefix("local://").map(str::to_string))
+        .unwrap_or_else(|| repo.to_string());
+    let image_tag = image_version.ok_or_else(|| {
+        CliError::Other(
+            "phase 2: --image-version is required (autoresolution removed)".into(),
+        )
+    })?;
+    let image_value = serde_json::json!({
+        "kind": "registry",
+        "repo": image_repo,
+        "tag": image_tag,
+    });
+    let workspace_value = match repo.strip_prefix("git+") {
+        Some(url) if !url.is_empty() => serde_json::json!({
+            "kind": "git",
+            "url": url,
+            "branch": branch,
+            "read_only": read_only,
+        }),
+        _ => serde_json::json!({"kind": "empty"}),
+    };
+    let harness_value = match harness {
+        "none" => serde_json::json!({"kind": "none"}),
+        name => serde_json::json!({"kind": "builtin", "name": name}),
+    };
     let mut payload = serde_json::Map::new();
-    payload.insert("repo".into(), Value::from(repo));
-    payload.insert("branch".into(), Value::from(branch));
-    if read_only {
-        payload.insert("read_only".into(), Value::from(true));
-    }
-    if let Some(v) = image_version {
-        payload.insert("image_version".into(), Value::from(v));
-    }
+    payload.insert("image".into(), image_value);
+    payload.insert("workspace".into(), workspace_value);
+    payload.insert("harness".into(), harness_value);
     if let Some(u) = user_id {
         payload.insert("user_id".into(), Value::from(u));
     }

@@ -21,6 +21,7 @@ pub mod pg_listener;
 pub mod preemption_drain;
 pub mod scheduler;
 pub mod state;
+pub mod workspace;
 
 pub use config::CoordinatorConfig;
 pub use error::ApiError;

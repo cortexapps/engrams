@@ -234,6 +234,15 @@ fn ignored_image() -> ImageVersion {
 fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     let sandbox_dir = tempfile::tempdir().expect("host work_dir").keep();
     let images_dir = tempfile::tempdir().expect("images tmp").keep();
+    // Phase 2 requires every session to declare an explicit image
+    // that resolves in the registry. Seed `demo:warm-test` here so
+    // the wire round-trip's create_session call can reach the
+    // host backend without 400ing on image resolution.
+    {
+        let img_dir = images_dir.join("demo/warm-test");
+        std::fs::create_dir_all(&img_dir).unwrap();
+        std::fs::write(img_dir.join("manifest.toml"), r#"name = "demo""#).unwrap();
+    }
 
     // Wire setup: in-memory mpsc pair stands in for the WS connection.
     let (coord_tx_a, host_rx_a) = futures::channel::mpsc::unbounded::<TungMessage>();
@@ -304,7 +313,13 @@ async fn create_then_exec_round_trips_via_wire() {
                 .method(Method::POST)
                 .uri("/sessions")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"repo":"demo","branch":"main"}"#))
+                .body(Body::from(
+                    r#"{
+                        "image":{"kind":"registry","repo":"demo","tag":"warm-test"},
+                        "workspace":{"kind":"empty"},
+                        "harness":{"kind":"none"}
+                    }"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -381,7 +396,13 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
                 .method(Method::POST)
                 .uri("/sessions")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"repo":"demo","branch":"main"}"#))
+                .body(Body::from(
+                    r#"{
+                        "image":{"kind":"registry","repo":"demo","tag":"warm-test"},
+                        "workspace":{"kind":"empty"},
+                        "harness":{"kind":"none"}
+                    }"#,
+                ))
                 .unwrap(),
         )
         .await

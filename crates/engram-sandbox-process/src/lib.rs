@@ -331,6 +331,7 @@ impl SandboxBackend for ProcessBackend {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
+            mounts: Vec::new(),
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -547,6 +548,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
+            mounts: Vec::new(),
         }
     }
 

@@ -283,21 +283,41 @@ async fn resume_from_fc_snapshot(
     // an idle-evict. Tracked alongside `build_dev_agent`'s base_env
     // arg, which was added when the create-time secret-delivery
     // gap was fixed.
+    // Re-resolve the image so we can hand `resolve_harness` the
+    // manifest + rootfs dir again. If the image vanished from the
+    // registry post-bake (rare), fall through to "no agent" — the
+    // VM is up, the user can still drive it via exec / shell, and
+    // the next prompt's ensure_active path can retry.
     let resume_base_env: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    if let Some(agent) =
-        crate::api::sessions::build_dev_agent(&state, id, None, &resume_base_env)
-    {
+    let resolved = state
+        .services
+        .images
+        .load(session.image.repo(), session.image.tag())
+        .await
+        .ok();
+    let agent_opt = if let Some(resolved) = resolved.as_ref() {
+        crate::api::sessions::resolve_harness(
+            &state,
+            &resolved.manifest,
+            resolved,
+            &session.harness,
+            id,
+            None,
+            &resume_base_env,
+        )
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    if let Some(agent) = agent_opt {
         if let Err(e) = state
             .services
             .sandbox
             .start_agent(new_sandbox_id, agent)
             .await
         {
-            // Best-effort: log loudly but don't fail the resume —
-            // the VM is up and the snapshot succeeded; the agent
-            // relaunch can be retried by the next prompt's
-            // ensure_active path if needed.
             tracing::warn!(
                 session_id = %id,
                 sandbox_id = %new_sandbox_id,

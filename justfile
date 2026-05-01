@@ -75,10 +75,11 @@ db-reset:
 # ------------------------------------------------------------------
 
 # Run the coordinator wired to the subprocess sandbox backend.
-# Postgres must already be up (`just db-up`). Auto-spawns the noop
-# harness on every new session so `engram session log <id>` shows
-# tool-call traffic out of the box. Override which harness via
-# `ENGRAM_DEV_AUTO_AGENT=noop|claude`; unset it to disable auto-spawn.
+# Postgres must already be up (`just db-up`). Phase 2: harness
+# selection moved per-session — pass `--harness noop` (or
+# `--harness claude`) on `engram session create`. The coordinator
+# itself no longer auto-spawns; the legacy `ENGRAM_DEV_AUTO_AGENT`
+# env var is now a no-op.
 dev: db-up dev-build-harness
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
@@ -88,7 +89,6 @@ dev: db-up dev-build-harness
     ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_DEFAULT_IMAGE=warm-bootstrap \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-noop} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
@@ -120,9 +120,6 @@ dev-firecracker: db-up
     ENGRAM_KERNEL_IMAGE_PATH=$ENGRAM_KERNEL_IMAGE_PATH \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-bootstrap} \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-} \
-    ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
-    ENGRAM_DEV_CLAUDE_HARNESS_PATH=${ENGRAM_DEV_CLAUDE_HARNESS_PATH:-/sbin/engram-harness-claude} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
@@ -145,7 +142,8 @@ fc-bake-demo:
     cargo build -p engram-harness-noop --target x86_64-unknown-linux-musl --release
     mkdir -p ./var/fc-bake
     printf 'FROM debian:bookworm-slim\n' > ./var/fc-bake/Dockerfile
-    printf 'name = "local-demo"\n'         > ./var/fc-bake/engram.toml
+    printf 'name = "local-demo"\n\n[[harness]]\nname = "noop"\nguest_path = "/sbin/engram-harness-noop"\n' \
+        > ./var/fc-bake/engram.toml
     cargo run -p engram-cli -- image build \
         --repo local://demo \
         --tag warm-1 \
@@ -154,7 +152,7 @@ fc-bake-demo:
         --images-dir ./var/engram/images \
         --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   engram-harness-noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop
+        --inject-harness   noop=target/x86_64-unknown-linux-musl/release/engram-harness-noop
 
 # Bake a Firecracker image containing the real Claude Code CLI plus
 # engram-agentd / engram-bootstrap / engram-harness-claude.
@@ -191,7 +189,7 @@ fc-bake-claude:
         --images-dir ./var/engram/images \
         --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   engram-harness-claude=target/x86_64-unknown-linux-musl/release/engram-harness-claude
+        --inject-harness   claude=target/x86_64-unknown-linux-musl/release/engram-harness-claude
 
 # ------------------------------------------------------------------
 # Apple Silicon — Virtualization.framework backend
@@ -255,9 +253,6 @@ dev-vz: db-up vz-codesign
     ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinux-arm64} \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-} \
-    ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
-    ENGRAM_DEV_CLAUDE_HARNESS_PATH=${ENGRAM_DEV_CLAUDE_HARNESS_PATH:-/sbin/engram-harness-claude} \
     RUST_LOG=info,engram=debug \
     target/debug/engram-coordinator
 
@@ -402,9 +397,6 @@ dev-vz-claude-oauth: db-up vz-codesign
     ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinux-arm64} \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    ENGRAM_DEV_AUTO_AGENT=claude \
-    ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
-    ENGRAM_DEV_CLAUDE_HARNESS_PATH=${ENGRAM_DEV_CLAUDE_HARNESS_PATH:-/sbin/engram-harness-claude} \
     RUST_LOG=info,engram=debug \
     target/debug/engram-coordinator
 

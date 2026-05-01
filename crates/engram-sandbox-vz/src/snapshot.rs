@@ -130,6 +130,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
+            mounts: Vec::new(),
         }
     }
 

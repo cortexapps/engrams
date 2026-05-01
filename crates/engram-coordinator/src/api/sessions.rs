@@ -98,28 +98,24 @@ fn short_hash(s: &str) -> String {
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
-    pub repo: String,
-    pub branch: String,
-    pub user_id: Option<String>,
-    pub image_version: Option<String>,
-    /// Phase 4: clones the repo at create but never pushes back; no
-    /// checkpoint branch allocated. Defaults to false (writable git
-    /// session for `git+...` repos; ephemeral for `local://`).
+    /// Which baked image to boot. Required.
+    pub image: ImageRef,
+    /// Where the workspace comes from. Required.
+    pub workspace: WorkspaceSpec,
+    /// What agent process (if any) to attach. Defaults to
+    /// `HarnessSpec::None` — boot the VM and let the user drive it
+    /// via the in-browser shell or `engram exec`.
     #[serde(default)]
-    pub read_only: bool,
-    /// Initial prompt for the agent. When set, the harness adapter
-    /// reads `$ENGRAM_INITIAL_PROMPT` at startup and runs it as
-    /// the session's first prompt. None = adapter starts and
-    /// waits for `POST /sessions/:id/prompt`.
+    pub harness: HarnessSpec,
+    pub user_id: Option<String>,
+    /// Initial prompt for the agent. Only meaningful when
+    /// `harness != None`; the API rejects with 400 when set
+    /// alongside `harness = None` (silent drop is a footgun).
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Per-request secret values keyed by env-var name (e.g.
-    /// `CLAUDE_CODE_OAUTH_TOKEN`). Short-circuits the configured
-    /// `SecretStore` for any name in the map. Used by the dashboard's
-    /// "create session" form so a user can paste a credential into
-    /// the browser without exporting it on the host. Only honored
-    /// under `SecretMode::Literal` — broker mode rejects overrides
-    /// because the proxy doesn't know about request-scoped values.
+    /// Per-request secret values keyed by env-var name. Only
+    /// honored under `SecretMode::Literal`; broker-mode images
+    /// reject overrides.
     #[serde(default)]
     pub secrets: Option<HashMap<String, String>>,
 }
@@ -135,51 +131,72 @@ pub async fn create_session(
     State(state): State<SharedState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    if req.repo.is_empty() || req.branch.is_empty() {
+    use crate::config::SandboxBackendChoice;
+
+    // -------- 0. Validate orthogonal axes --------
+    // `harness=None + non-empty prompt` is meaningless: there's no
+    // agent to consume the prompt. Silent drop hides the bug; reject
+    // explicitly so the dashboard / CLI surfaces the mistake.
+    if matches!(req.harness, HarnessSpec::None)
+        && req.prompt.as_deref().map(str::is_empty).unwrap_or(true) == false
+    {
         return Err(ApiError::BadRequest(
-            "`repo` and `branch` are required".into(),
+            "`prompt` requires a `harness` other than `none` — there is no agent to receive it"
+                .into(),
+        ));
+    }
+    // `LocalMount` requires host→guest sharing. FC's virtio-fs
+    // story is future work; reject upfront on FC backends rather
+    // than silently dropping the mount inside the backend. Track
+    // FC parity in the plan's "open questions" §3.
+    if matches!(req.workspace, WorkspaceSpec::LocalMount { .. })
+        && matches!(state.cfg.sandbox_backend, SandboxBackendChoice::Firecracker)
+    {
+        return Err(ApiError::BadRequest(
+            "`workspace.local_mount` requires the VZ or Process backend; this deployment uses Firecracker"
+                .into(),
         ));
     }
 
-    let image_version = match req.image_version.clone() {
-        Some(v) => v,
-        None => match state.services.meta.latest_ready_image(&req.repo).await? {
-            Some(img) => img.tag,
-            None => state.cfg.default_image_version.clone(),
-        },
-    };
+    let ImageRef::Registry { repo: image_repo, tag: image_tag } = req.image.clone();
 
-    // Resolve the image manifest from the registry. If the image
-    // doesn't exist on disk we fall through to a "no image / empty
-    // workdir" sandbox — keeps the bare-bones dev demo (`curl POST
-    // /sessions` with no images set up) working out of the box.
-    let resolved = match state.services.images.load(&req.repo, &image_version).await {
-        Ok(r) => Some(r),
-        Err(ImageError::NotFound { .. }) => None,
+    // -------- 1. Resolve image manifest --------
+    // Image is required and must exist in the registry. The fallback
+    // "no image / empty workdir" path that used to support the bare
+    // `curl POST /sessions` demo is gone — every session declares an
+    // explicit image, full stop.
+    let resolved = match state.services.images.load(&image_repo, &image_tag).await {
+        Ok(r) => r,
+        Err(ImageError::NotFound { .. }) => {
+            return Err(ApiError::BadRequest(format!(
+                "image `{image_repo}:{image_tag}` not found in registry"
+            )));
+        }
         Err(e) => return Err(ApiError::Internal(e.to_string())),
     };
+    let manifest = resolved.manifest.clone();
 
-    let manifest_for_secrets: ImageManifest = resolved
-        .as_ref()
-        .map(|r| r.manifest.clone())
-        .unwrap_or_default();
+    // Validate the harness against the image manifest. Builtin names
+    // are scoped per-image — a session asking for `claude` on an
+    // image that doesn't bake `claude` is a 400, not a runtime
+    // surprise.
+    if let HarnessSpec::Builtin { name } = &req.harness {
+        if !manifest.harnesses.iter().any(|h| h.name == *name) {
+            let available: Vec<&str> = manifest.harnesses.iter().map(|h| h.name.as_str()).collect();
+            return Err(ApiError::BadRequest(format!(
+                "image `{image_repo}:{image_tag}` does not bake harness `{name}` \
+                 (available: {available:?})"
+            )));
+        }
+    }
 
-    // Resolve secrets via the configured SecretStore. Required-but-
-    // missing secrets fail the request (a 500 today; the client
-    // will see `secret <name> not available`). Optional secrets
-    // that aren't present are simply absent from the bundle.
+    // -------- 2. Resolve secrets --------
     let secret_ctx = SecretContext {
-        repo: &req.repo,
-        image_tag: &image_version,
+        repo: &image_repo,
+        image_tag: &image_tag,
     };
-    // Reject browser-supplied secrets for Broker-mode images: the
-    // per-session proxy registers values from the configured store
-    // and has no path for request-scoped overrides. Catching this
-    // here makes the failure mode explicit (400) rather than the
-    // sandbox booting with placeholder env that the proxy can't
-    // substitute.
     if req.secrets.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
-        && manifest_for_secrets.secret_mode != engram_core::types::image::SecretMode::Literal
+        && manifest.secret_mode != engram_core::types::image::SecretMode::Literal
     {
         return Err(ApiError::BadRequest(
             "per-request `secrets` are only supported for `secret_mode = literal` images".into(),
@@ -188,84 +205,71 @@ pub async fn create_session(
     let secret_bundle: SecretBundle = state
         .services
         .secrets
-        .resolve(
-            &secret_ctx,
-            &manifest_for_secrets.secrets,
-            req.secrets.as_ref(),
-        )
+        .resolve(&secret_ctx, &manifest.secrets, req.secrets.as_ref())
         .await
         .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
 
-    // Phase 0 transition: the wire shape still carries the legacy
-    // `repo`/`branch`/`read_only` fields, but the persisted row now
-    // splits these into independent `image` / `workspace` / `harness`
-    // axes. The wire-level rewrite lands in Phase 2; this adapter
-    // is the seam between the two.
-    let workspace = legacy_workspace_from_request(&req.repo, &req.branch, req.read_only)?;
-    let image = ImageRef::Registry {
-        repo: req.repo.clone(),
-        tag: image_version.clone(),
-    };
-    let harness = harness_from_dev_cfg(state.cfg.dev_auto_agent);
     let spec = SessionSpec {
-        image,
-        workspace,
-        harness,
+        image: req.image.clone(),
+        workspace: req.workspace.clone(),
+        harness: req.harness.clone(),
         user_id: req.user_id,
     };
 
-    // 1. Persist the session row first so it has a stable SessionId
-    //    even if sandbox creation fails — the failure is then
-    //    observable as a session row stuck in `failed`.
+    // -------- 3. Persist the row --------
+    // First so it has a stable SessionId even if sandbox creation
+    // fails — the failure is then observable as a row stuck in
+    // `failed`.
     let session_id = state.services.meta.create_session(spec).await?;
 
-    // 2. Build the *anonymous* SandboxSpec — what every sandbox in
-    //    this (repo, image_version) pool gets. Session-specific env
-    //    (ENGRAM_SESSION_ID, etc.) is injected at exec time so pooled
-    //    sandboxes can serve any future session in the bucket.
-    //    Env-var precedence inside the spec (low → high):
-    //      manifest defaults  →  resolved secrets
-    let mut spec_env: HashMap<String, String> = manifest_for_secrets.env.clone();
-    apply_secrets_to_env(
-        &mut spec_env,
-        &secret_bundle,
-        manifest_for_secrets.secret_mode,
-        session_id,
-    );
+    // -------- 4. Build the anonymous SandboxSpec --------
+    // What every sandbox in this image pool gets. Session-specific
+    // env (ENGRAM_SESSION_ID etc.) is injected at exec / start_agent
+    // time so pooled sandboxes can serve any future session in the
+    // bucket.
+    let mut spec_env: HashMap<String, String> = manifest.env.clone();
+    apply_secrets_to_env(&mut spec_env, &secret_bundle, manifest.secret_mode, session_id);
 
-    // Per-session agent argv (carries this session's id, the
-    // attach token in future, the initial prompt). Built here so
-    // `start_agent` can pass it post-create — the warm-pool spec
-    // must NOT carry session-scoped argv or replenished slots
-    // would all attach claiming to be this session.
-    //
-    // The harness inherits manifest env + resolved secrets via
-    // `spec_env` so e.g. ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
-    // are visible to the `claude` child it spawns. Without this the
-    // microVM-backend harness only ever saw ENGRAM_SESSION_ID +
-    // ENGRAM_INITIAL_PROMPT, because BootstrapLaunch carries
-    // `agent.env` only — `vm_spec.env` isn't piped to agentd at
-    // create time on FC/VZ.
-    let agent_for_session =
-        build_dev_agent(&state, session_id, req.prompt.as_deref(), &spec_env);
+    let agent_for_session = resolve_harness(
+        &state,
+        &manifest,
+        &resolved,
+        &req.harness,
+        session_id,
+        req.prompt.as_deref(),
+        &spec_env,
+    )?;
+
+    // LocalMount workspaces wire host paths into the spec at create
+    // time so the backend's virtio-fs / bind layer sees them before
+    // the VM boots; Empty / Git workspaces don't need mounts.
+    let mounts: Vec<engram_core::types::sandbox::MountSpec> = match &req.workspace {
+        WorkspaceSpec::LocalMount {
+            host_path,
+            guest_path,
+            read_only,
+        } => vec![engram_core::types::sandbox::MountSpec {
+            host_path: host_path.clone(),
+            guest_path: guest_path.clone(),
+            read_only: *read_only,
+        }],
+        _ => Vec::new(),
+    };
 
     let vm_spec = VmSpec {
-        image: image_version.clone(),
-        rootfs_source: rootfs_source_from(resolved.as_ref()),
+        image: image_tag.clone(),
+        rootfs_source: rootfs_source_from(Some(&resolved)),
         cpu: CpuLimit {
-            vcpus: manifest_for_secrets
-                .resources
-                .suggested_vcpus
-                .unwrap_or(DEFAULT_VCPUS),
+            vcpus: manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS),
         },
         memory: MemoryLimit {
-            max_mib: manifest_for_secrets
+            max_mib: manifest
                 .resources
                 .suggested_memory_mib
                 .unwrap_or(DEFAULT_MEMORY_MIB),
         },
         disk: DiskLimit {
-            max_gib: manifest_for_secrets
+            max_gib: manifest
                 .resources
                 .suggested_disk_gib
                 .unwrap_or(DEFAULT_DISK_GIB),
@@ -273,17 +277,13 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
+        mounts,
     };
 
-    // 3. Scheduler picks a host based on heartbeat-derived state
-    //    (snapshot affinity → warm-pool match → capacity), then the
-    //    host's `PooledBackend` opportunistically returns a warm slot
-    //    or creates fresh as needed. The pool, replenish loop, and
-    //    spec storage all live host-side now — the coordinator just
-    //    routes.
+    // -------- 5. Schedule + create the sandbox --------
     let ctx = ScheduleContext {
-        repo: &req.repo,
-        image_version: &image_version,
+        repo: &image_repo,
+        image_version: &image_tag,
         prefer_snapshot_id: None,
         memory_mib: Some(vm_spec.memory.max_mib),
     };
@@ -335,18 +335,37 @@ pub async fn create_session(
     state.registry.bind(session_id, sandbox_id);
     // Bind the routing in the hub *before* the agent has a chance
     // to dial. `backend.create()` returns with the sandbox ready
-    // to accept exec but the agent (if any) NOT yet spawned —
-    // the trait splits create from `start_agent` precisely so
-    // this window can be filled with whatever routing setup the
-    // caller needs.
+    // to accept exec but the agent (if any) NOT yet spawned.
     state.harness_hub.bind_session(session_id, sandbox_id);
-    // Now release the agent into the world (if any). Production
-    // sessions today don't declare an agent — `agent_for_session`
-    // is `None` unless `dev_auto_agent` is set.
+
+    // -------- 6. Materialize workspace --------
+    // Runs while the row is still `Pending`. A failure here marks
+    // the row Failed before the user ever sees Active — a clear
+    // "git clone broke" beats a green session with no checkout.
+    if let Err(e) = crate::workspace::materialize(
+        &*state.services.sandbox,
+        sandbox_id,
+        &req.workspace,
+    )
+    .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "workspace materialization failed",
+        );
+        let _ = state
+            .services
+            .meta
+            .set_session_status(session_id, SessionStatus::Failed)
+            .await;
+        state.harness_hub.unbind_session(session_id);
+        return Err(ApiError::Internal(format!("workspace materialization: {e}")));
+    }
+
+    // -------- 7. Start the agent (if any) --------
     if let Some(agent) = agent_for_session {
         if let Err(e) = state.services.sandbox.start_agent(sandbox_id, agent).await {
-            // Agent failed to spawn: surface as Internal but leave
-            // the session row so the caller sees a clear error chain.
             let _ = state
                 .services
                 .meta
@@ -406,7 +425,7 @@ pub async fn create_session(
         Json(CreateSessionResponse {
             session_id,
             status: SessionStatus::Active.as_str(),
-            image_version,
+            image_version: image_tag,
         }),
     ))
 }
@@ -484,104 +503,45 @@ pub async fn delete_session(
 }
 
 /// Phase-0 transition shim. Translate the legacy `repo` URL scheme
-/// (`git+https://...` / `git+ssh://...` / `local://<name>` / bare
-/// label) into the new `WorkspaceSpec`. The wire-level rewrite —
-/// splitting workspace from image identity at the API boundary —
-/// lands in Phase 2; until then this function is the only place the
-/// legacy parsing rules live. Bare labels are accepted and mapped to
-/// `Empty`, matching the lenient behaviour the in-process tests
-/// already relied on.
-fn legacy_workspace_from_request(
-    repo: &str,
-    branch: &str,
-    read_only: bool,
-) -> Result<WorkspaceSpec, ApiError> {
-    if let Some(url) = repo.strip_prefix("git+") {
-        if url.is_empty() {
-            return Err(ApiError::BadRequest(
-                "empty repo URL after `git+` prefix".into(),
-            ));
-        }
-        return Ok(WorkspaceSpec::Git {
-            url: url.to_string(),
-            branch: branch.to_string(),
-            read_only,
-        });
-    }
-    // `local://<name>` was always just a label; nothing was mounted
-    // or cloned. Bare labels (no scheme) get the same treatment.
-    Ok(WorkspaceSpec::Empty)
-}
-
-/// Phase-0 transition shim. Stamp the row's `harness` column from the
-/// global `cfg.dev_auto_agent`. Phase 2 replaces this with a per-
-/// request `HarnessSpec` carried on `CreateSessionRequest`.
-fn harness_from_dev_cfg(dev: Option<crate::config::DevAgent>) -> HarnessSpec {
-    match dev {
-        Some(a) => HarnessSpec::Builtin {
-            name: a.as_str().into(),
-        },
-        None => HarnessSpec::None,
-    }
-}
-
-/// Build the `AgentSpec` for whichever dev harness `cfg.dev_auto_agent`
-/// selects. None when auto-spawn is off (the production default —
-/// real sessions declare their agent inside the rootfs and let
-/// `engram-bootstrap` invoke it).
+/// Resolve a session's [`HarnessSpec`] against the image manifest +
+/// the resolved image dir, building the [`AgentSpec`] the backend
+/// will spawn at `start_agent` time. `None` is returned for
+/// `HarnessSpec::None` — the sandbox boots with no agent, leaving
+/// the user to drive it via the in-browser shell or `engram exec`.
 ///
-/// Two flavors of argv depending on the sandbox backend:
-/// - `Process`: `--connect host:port` (TCP loopback to the
-///    coord-side harness listener).
-/// - `Firecracker`: `--vsock-host <port>` (the in-VM harness dials
-///    AF_VSOCK CID=2 port=1026; FC's vsock UDS routes it to the
-///    coord-side sink registered on the FC backend).
-pub(crate) fn build_dev_agent(
+/// Builtin harnesses live at `manifest.harnesses[].guest_path`
+/// inside the rootfs. Two argv shapes depending on backend:
+/// - `Process`: `--connect host:port`. The binary is exec'd as a
+///   host subprocess so `argv[0]` is the *host* path (the image
+///   registry's exported `<rootfs_dir>` + the manifest's
+///   `guest_path`).
+/// - `Firecracker` / `VZ`: `--vsock-host <port>`. The in-VM bootstrap
+///   exec's the binary inside the rootfs so `argv[0]` is the
+///   manifest's `guest_path` directly.
+pub(crate) fn resolve_harness(
     state: &SharedState,
+    manifest: &ImageManifest,
+    resolved_image: &crate::image_registry::ResolvedImage,
+    spec: &HarnessSpec,
     session_id: SessionId,
     initial_prompt: Option<&str>,
     base_env: &HashMap<String, String>,
-) -> Option<engram_core::types::sandbox::AgentSpec> {
-    use crate::config::{DevAgent, SandboxBackendChoice};
-    let agent = match state.cfg.dev_auto_agent {
-        Some(a) => a,
-        None => {
-            tracing::debug!("build_dev_agent: dev_auto_agent unset");
-            return None;
-        }
+) -> Result<Option<engram_core::types::sandbox::AgentSpec>, ApiError> {
+    use crate::config::SandboxBackendChoice;
+    let name = match spec {
+        HarnessSpec::None => return Ok(None),
+        HarnessSpec::Builtin { name } => name,
     };
-    let bin = match agent {
-        DevAgent::Noop => match state.cfg.dev_noop_harness_path.as_ref() {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    "build_dev_agent: ENGRAM_DEV_AUTO_AGENT=noop but dev_noop_harness_path is unset"
-                );
-                return None;
-            }
-        },
-        DevAgent::Claude => match state.cfg.dev_claude_harness_path.as_ref() {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    "build_dev_agent: ENGRAM_DEV_AUTO_AGENT=claude but dev_claude_harness_path is unset"
-                );
-                return None;
-            }
-        },
-    }
-    .to_string_lossy()
-    .to_string();
-    tracing::debug!(
-        agent = ?agent,
-        bin = %bin,
-        backend = ?state.cfg.sandbox_backend,
-        "build_dev_agent: building AgentSpec"
-    );
-    // Start from the manifest's declared env + resolved secrets so
-    // the harness (and any child it spawns, like `claude`) inherits
-    // ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / etc. Session-
-    // specific keys are inserted last so they win on collision.
+    let entry = manifest
+        .harnesses
+        .iter()
+        .find(|h| h.name == *name)
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "harness `{name}` validated as available but vanished from manifest"
+            ))
+        })?;
+
     let mut env: HashMap<String, String> = base_env.clone();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
     if let Some(prompt) = initial_prompt {
@@ -590,13 +550,18 @@ pub(crate) fn build_dev_agent(
 
     let argv = match state.cfg.sandbox_backend {
         SandboxBackendChoice::Process => {
-            // ProcessBackend dev path — TCP loopback. Look up the
-            // bound port from the harness listener that was
-            // started in lib::run.
-            let addr = (*state.harness_listen_addr.lock())?;
+            let addr = match *state.harness_listen_addr.lock() {
+                Some(addr) => addr,
+                None => {
+                    return Err(ApiError::Internal(
+                        "harness listener not bound (Process backend)".into(),
+                    ));
+                }
+            };
             env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
+            let host_path = process_backend_harness_host_path(resolved_image, &entry.guest_path)?;
             vec![
-                bin,
+                host_path,
                 "--connect".into(),
                 addr.to_string(),
                 "--session-id".into(),
@@ -604,17 +569,9 @@ pub(crate) fn build_dev_agent(
             ]
         }
         SandboxBackendChoice::Firecracker | SandboxBackendChoice::Vz => {
-            // microVM path (FC on Linux/KVM, Apple VZ on macOS) — guest
-            // dials AF_VSOCK CID=2 on the harness port. Inside the
-            // rootfs, `bin` is whatever path `engram image build
-            // --inject-harness <name>=...` landed at, so the host's
-            // `dev_*_harness_path` should point at the in-rootfs path,
-            // not a host filesystem path. The argv shape is identical
-            // for FC and VZ — the bootstrap supervisor consumes the
-            // same `BootstrapLaunch` wire on both backends.
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
-                bin,
+                entry.guest_path.clone(),
                 "--vsock-host".into(),
                 port.to_string(),
                 "--session-id".into(),
@@ -622,5 +579,27 @@ pub(crate) fn build_dev_agent(
             ]
         }
     };
-    Some(engram_core::types::sandbox::AgentSpec { argv, env })
+    Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
+}
+
+fn process_backend_harness_host_path(
+    resolved: &crate::image_registry::ResolvedImage,
+    guest_path: &str,
+) -> Result<String, ApiError> {
+    use crate::image_registry::Rootfs;
+    let rel = guest_path.trim_start_matches('/');
+    if rel.is_empty() {
+        return Err(ApiError::BadRequest("harness `guest_path` is empty".into()));
+    }
+    match &resolved.rootfs {
+        Rootfs::Directory(dir) => Ok(dir.join(rel).to_string_lossy().into_owned()),
+        Rootfs::Ext4Image(_) => Err(ApiError::Internal(
+            "Process backend cannot exec a harness baked into an ext4 rootfs; \
+             rebuild the image with `--format directory`"
+                .into(),
+        )),
+        Rootfs::None => Err(ApiError::BadRequest(
+            "image has no rootfs — `harness.builtin` requires a baked binary".into(),
+        )),
+    }
 }

@@ -299,8 +299,7 @@ impl MetadataStore for MockMetadataStore {
 // ---------------------------------------------------------------------
 
 fn build_app(meta: Arc<MockMetadataStore>) -> axum::Router {
-    let f = TestFixture::new(meta, InMemorySecretStore::new(), 0);
-    f.app
+    TestFixture::new(meta, InMemorySecretStore::new(), 0).app
 }
 
 /// Like `build_app` but seeds the bearer-token allow-list. Used by the
@@ -369,10 +368,18 @@ impl TestFixture {
             ..CoordinatorConfig::default()
         };
         let state = Arc::new(AppState::new(cfg, services));
-        Self {
+        let fx = Self {
             app: api::router(state),
             images_dir,
+        };
+        // Seed baseline images for the repos most tests use against
+        // `api_create_session`. Phase 2 made `image` mandatory — every
+        // test that doesn't explicitly write its own image needs one
+        // of these on disk to clear the registry-lookup gate.
+        for repo in ["r", "warm/test", "cortex/api"] {
+            fx.write_image(repo, "warm-bootstrap", r#"name = "baseline""#, &[]);
         }
+        fx
     }
 
     /// Materialize an image at `<images_dir>/<repo>/<tag>` with the
@@ -417,13 +424,20 @@ fn json_request(method: Method, uri: &str, body: Value) -> Request<Body> {
 
 /// Hit `POST /sessions` against `app` and return the new SessionId.
 /// The router consumes itself per request, so callers need to pass a
-/// fresh clone of the router for any subsequent request.
+/// fresh clone of the router for any subsequent request. Sends the
+/// new orthogonal wire shape with an `Empty` workspace and `None`
+/// harness — any test that needs Git workspaces or an attached
+/// harness sends the request directly.
 async fn api_create_session(app: axum::Router, repo: &str) -> SessionId {
     let resp = app
         .oneshot(json_request(
             Method::POST,
             "/sessions",
-            json!({"repo": repo, "branch": "main"}),
+            json!({
+                "image": {"kind":"registry", "repo": repo, "tag": "warm-bootstrap"},
+                "workspace": {"kind":"empty"},
+                "harness": {"kind":"none"},
+            }),
         ))
         .await
         .unwrap();
@@ -547,7 +561,10 @@ async fn auth_protects_post_endpoints_too() {
         .oneshot(json_request(
             Method::POST,
             "/sessions",
-            json!({"repo": "r", "branch": "main"}),
+            json!({
+                "image": {"kind":"registry","repo":"r","tag":"warm-bootstrap"},
+                "workspace": {"kind":"empty"},
+            }),
         ))
         .await
         .unwrap();
@@ -568,101 +585,136 @@ async fn healthz_returns_ok_status_and_version() {
 }
 
 #[tokio::test]
-async fn create_session_requires_repo_and_branch() {
+async fn create_session_requires_image_and_workspace() {
+    // Phase 2 wire shape: `image` and `workspace` are mandatory.
+    // axum's `Json<T>` extractor surfaces missing required fields
+    // as 422 Unprocessable Entity (rather than 400) — body never
+    // reaches the handler.
     let app = build_app(MockMetadataStore::arc());
     let resp = app
         .oneshot(json_request(
             Method::POST,
             "/sessions",
-            json!({"repo": "", "branch": "main"}),
+            json!({"workspace": {"kind":"empty"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn create_session_with_explicit_image_persists_full_row() {
+    // The "automatic image selection" paths (latest-ready, default
+    // tag) were removed in phase 2 — every session declares an
+    // explicit image. This test locks the new happy path: explicit
+    // image lands, Empty workspace + None harness defaults work,
+    // session transitions to Active.
+    let store = MockMetadataStore::arc();
+    let f = TestFixture::new(store.clone(), InMemorySecretStore::new(), 0);
+    f.write_image("cortex/api", "warm-pinned", r#"name = "cortex-api""#, &[]);
+    let app = f.app;
+
+    let resp = app
+        .oneshot(json_request(
+            Method::POST,
+            "/sessions",
+            json!({
+                "image": {"kind":"registry","repo":"cortex/api","tag":"warm-pinned"},
+                "workspace": {"kind":"empty"},
+                "harness": {"kind":"none"},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(v["image_version"], "warm-pinned");
+    assert_eq!(v["status"], "active");
+    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+    let session = store.get_session(id).await.unwrap();
+    assert_eq!(session.image.repo(), "cortex/api");
+    assert_eq!(session.image.tag(), "warm-pinned");
+    assert_eq!(session.workspace.git_branch(), None);
+    assert!(session.harness.is_none());
+    assert_eq!(session.status, SessionStatus::Active);
+}
+
+#[tokio::test]
+async fn create_session_with_unknown_image_returns_400() {
+    let app = build_app(MockMetadataStore::arc());
+    let resp = app
+        .oneshot(json_request(
+            Method::POST,
+            "/sessions",
+            json!({
+                "image": {"kind":"registry","repo":"never-baked","tag":"x"},
+                "workspace": {"kind":"empty"},
+            }),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let v = body_json(resp.into_body()).await;
-    assert_eq!(v["error"], "bad_request");
     assert!(
-        v["message"].as_str().unwrap().contains("repo"),
-        "error message must call out the missing field"
+        v["message"].as_str().unwrap().contains("not found"),
+        "error must call out the missing image: got {v}",
     );
 }
 
 #[tokio::test]
-async fn create_session_uses_default_image_when_none_ready() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-
+async fn create_session_prompt_with_no_harness_is_400() {
+    // `prompt` requires an agent to receive it. Silent drop is a
+    // footgun — the API rejects with 400 so the dashboard surfaces
+    // the misuse explicitly.
+    let app = build_app(MockMetadataStore::arc());
     let resp = app
         .oneshot(json_request(
             Method::POST,
             "/sessions",
-            json!({"repo": "cortex/api", "branch": "main"}),
+            json!({
+                "image": {"kind":"registry","repo":"r","tag":"warm-bootstrap"},
+                "workspace": {"kind":"empty"},
+                "harness": {"kind":"none"},
+                "prompt": "do the thing",
+            }),
         ))
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["image_version"], "warm-bootstrap");
-    // Once sandbox creation is wired, a successful create transitions
-    // the session past Pending into Active.
-    assert_eq!(v["status"], "active");
-    let id_str = v["session_id"].as_str().unwrap();
-
-    // Round-trip GET /sessions/:id should match what we created.
-    let id: SessionId = id_str.parse().unwrap();
-    let session = store.get_session(id).await.unwrap();
-    assert_eq!(session.image.repo(), "cortex/api");
-    assert_eq!(session.image.tag(), "warm-bootstrap");
-    assert_eq!(session.workspace.git_branch(), None);
-    assert_eq!(session.status, SessionStatus::Active);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn create_session_prefers_latest_ready_image() {
+async fn create_session_unknown_harness_name_is_400() {
+    // Builtin harness names are scoped per-image — the manifest's
+    // `[[harness]]` list is the source of truth. Asking for one
+    // that isn't baked is a 400.
     let store = MockMetadataStore::arc();
-    // A retired older image must NOT be picked up; only Ready counts.
-    store.add_image("cortex/api", "warm-old", ImageStatus::Retired);
-    store.add_image("cortex/api", "warm-2026-04", ImageStatus::Ready);
-    store.add_image("cortex/api", "warm-2026-05", ImageStatus::Ready);
-    let app = build_app(store);
-
+    let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
+    f.write_image(
+        "claude-img",
+        "warm-1",
+        r#"
+        name = "claude-img"
+        [[harness]]
+        name = "claude"
+        guest_path = "/sbin/engram-harness-claude"
+        "#,
+        &[],
+    );
+    let app = f.app;
     let resp = app
         .oneshot(json_request(
             Method::POST,
             "/sessions",
-            json!({"repo": "cortex/api", "branch": "main"}),
+            json!({
+                "image": {"kind":"registry","repo":"claude-img","tag":"warm-1"},
+                "workspace": {"kind":"empty"},
+                "harness": {"kind":"builtin","name":"codex"},
+            }),
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(
-        v["image_version"], "warm-2026-05",
-        "latest Ready image must win over older Ready and Retired ones"
-    );
-}
-
-#[tokio::test]
-async fn create_session_honors_explicit_image_version() {
-    let store = MockMetadataStore::arc();
-    store.add_image("cortex/api", "warm-current", ImageStatus::Ready);
-    let app = build_app(store);
-
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/sessions",
-            json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-pinned"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(
-        v["image_version"], "warm-pinned",
-        "client-supplied image_version overrides the latest_ready lookup"
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1913,13 +1965,21 @@ async fn create_session_failure_marks_session_failed() {
     }
 
     let store = MockMetadataStore::arc();
-    let images_dir = tempfile::tempdir().unwrap();
+    let images_dir = tempfile::tempdir().unwrap().keep();
+    // Seed a `cortex/api:warm-1` image so the create handler clears
+    // the image-resolution gate and we get to the sandbox failure
+    // the test is exercising.
+    {
+        let img_dir = images_dir.join("cortex/api/warm-1");
+        std::fs::create_dir_all(&img_dir).unwrap();
+        std::fs::write(img_dir.join("manifest.toml"), r#"name = "cortex-api""#).unwrap();
+    }
     let services = Services {
         meta: store.clone(),
         cloud: Arc::new(MockCloud::new()),
         sandbox: Arc::new(AlwaysFailSandbox),
         secrets: Arc::new(InMemorySecretStore::new()),
-        images: ImageRegistry::new(images_dir.keep()),
+        images: ImageRegistry::new(images_dir),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -1931,7 +1991,11 @@ async fn create_session_failure_marks_session_failed() {
         .oneshot(json_request(
             Method::POST,
             "/sessions",
-            json!({"repo": "cortex/api", "branch": "main"}),
+            json!({
+                "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+                "workspace": {"kind":"empty"},
+                "harness": {"kind":"none"},
+            }),
         ))
         .await
         .unwrap();
@@ -1975,23 +2039,11 @@ async fn wrong_method_on_known_route_returns_405() {
 // Image manifest + secret resolution + rootfs materialization
 // ---------------------------------------------------------------------
 
-#[tokio::test]
-async fn session_with_no_image_falls_through_to_empty_workdir() {
-    // Bare-bones dev demo: no manifest exists for the requested
-    // (repo, tag), session creation must still work.
-    let app = build_app(MockMetadataStore::arc());
-    let id = api_create_session(app.clone(), "no/image").await;
-
-    let resp = post(
-        app,
-        &format!("/sessions/{id}/exec"),
-        json!({"command": "ls -A | wc -l | tr -d ' '"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "0\n", "no rootfs_source → empty cwd");
-}
+// Phase 2 removed the "no image / empty workdir" fallback path. The
+// `session_with_no_image_falls_through_to_empty_workdir` test that
+// exercised it lived here; it was deleted alongside the fallback
+// because every session now declares an explicit image (verified by
+// `create_session_with_unknown_image_returns_400`).
 
 #[tokio::test]
 async fn manifest_env_lands_in_sandbox_environment() {
@@ -2013,7 +2065,11 @@ async fn manifest_env_lands_in_sandbox_environment() {
     let resp = post(
         app.clone(),
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2051,7 +2107,11 @@ async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
     let resp = post(
         app.clone(),
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     let id: SessionId = body_json(resp.into_body()).await["session_id"]
@@ -2097,7 +2157,11 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
     let resp = post(
         app.clone(),
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2138,7 +2202,11 @@ async fn required_secret_missing_in_store_fails_session_create() {
     let resp = post(
         app,
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     // Required-but-missing secret is a 500 today (it's an
@@ -2177,7 +2245,11 @@ async fn optional_secret_absence_is_silently_ok() {
     let resp = post(
         app.clone(),
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2230,7 +2302,11 @@ async fn broker_mode_emits_placeholders_not_real_values() {
     let resp = post(
         app.clone(),
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     let id: SessionId = body_json(resp.into_body()).await["session_id"]
@@ -2281,7 +2357,11 @@ async fn manifest_resource_hints_override_defaults() {
     let resp = post(
         app,
         "/sessions",
-        json!({"repo": "cortex/api", "branch": "main", "image_version": "warm-1"}),
+        json!({
+            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "workspace": {"kind":"empty"},
+            "harness": {"kind":"none"},
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2737,25 +2817,30 @@ async fn checkpoint_returns_404_for_unknown_session() {
 
 #[tokio::test]
 async fn checkpoint_returns_409_for_readonly_session() {
-    // `read_only: true` on a Git URL → session_kind = Readonly.
-    // No checkpoint branch; endpoint refuses.
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/sessions",
-            json!({
-                "repo": "git+https://github.com/cortex/api.git",
-                "branch": "main",
-                "read_only": true,
-            }),
-        ))
+    // Workspace is `Git { read_only: true }` → session_kind = Readonly.
+    // No checkpoint branch; endpoint refuses. Seed the row directly
+    // via the metadata store (bypassing the API) so the test doesn't
+    // need a reachable remote for `materialize_workspace` to clone
+    // — the assertion is about checkpoint *refusal*, not the
+    // workspace materialization path.
+    let store = MockMetadataStore::arc();
+    let app = build_app(store.clone());
+    let id = store
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
+            },
+            workspace: engram_core::types::session::WorkspaceSpec::Git {
+                url: "https://github.com/cortex/api.git".into(),
+                branch: "main".into(),
+                read_only: true,
+            },
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
 
     let resp = post(app, &format!("/sessions/{id}/checkpoint"), json!({})).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
