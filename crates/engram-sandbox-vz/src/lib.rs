@@ -40,6 +40,9 @@ mod vm;
 mod console_bridge;
 
 #[cfg(target_os = "macos")]
+mod disk;
+
+#[cfg(target_os = "macos")]
 mod snapshot;
 
 #[cfg(target_os = "macos")]

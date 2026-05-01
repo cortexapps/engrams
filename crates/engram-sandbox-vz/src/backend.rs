@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::console_bridge::{port_uds_path, ConsoleBridge};
+use crate::disk::{clone_or_copy, per_sandbox_rootfs_path, SNAPSHOT_ROOTFS_FILENAME};
 use crate::vm::{VmConfig, VzVm};
 
 /// Vsock port engram-agentd binds inside the rootfs. Same number FC
@@ -80,6 +81,11 @@ struct VzSandboxState {
     /// look up the per-port paths without recomputing them.
     #[allow(dead_code)]
     vsock_uds_path: PathBuf,
+    /// Per-sandbox APFS clone of the bake (or snapshot) rootfs.
+    /// Created at `create()` / `restore()` time and removed at
+    /// `destroy()`. The clone is what VZ actually attaches; the
+    /// originating bake / snapshot file stays intact.
+    rootfs_path: PathBuf,
 }
 
 pub struct VzBackend {
@@ -196,7 +202,7 @@ where
 #[async_trait]
 impl SandboxBackend for VzBackend {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        let rootfs = spec.rootfs_source.clone().ok_or_else(|| {
+        let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
                 "VzBackend requires SandboxSpec.rootfs_source — point it at the ext4 \
                  rootfs produced by `just vz-bake-claude`"
@@ -205,11 +211,11 @@ impl SandboxBackend for VzBackend {
         })?;
         // Validate up front rather than letting VZ surface a less
         // specific NSError later.
-        if !rootfs.exists() {
+        if !bake_rootfs.exists() {
             return Err(SandboxError::InvalidSpec(format!(
                 "vz rootfs not found at {} — bake an image with `just vz-bake-claude` and \
                  point SandboxSpec.rootfs_source at it",
-                rootfs.display()
+                bake_rootfs.display()
             )));
         }
 
@@ -225,18 +231,49 @@ impl SandboxBackend for VzBackend {
         };
 
         // Make sure the work_dir exists so the per-sandbox UDS
-        // base path has somewhere to live (the console bridge
-        // binds listeners under it).
+        // base path + per-sandbox rootfs clone have somewhere to
+        // live.
         tokio::fs::create_dir_all(&self.work_dir).await?;
 
-        let vm_cfg = VmConfig::new(self.cfg.kernel_path.clone(), rootfs, memory_mib, vcpus);
+        // Allocate the sandbox id up front so we can name the
+        // per-sandbox rootfs deterministically before VM init.
+        let id = SandboxId::new();
+        let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, id);
+
+        // APFS-clone the bake image into a per-sandbox rootfs.
+        // The clone is COW-backed: ~50 ms even for a 1.7 GB ext4,
+        // and the diverged blocks (whatever this sandbox writes)
+        // are the only ones that consume real disk. This isolates
+        // the sandbox's filesystem from concurrent sandboxes
+        // sharing the same image — the previous design had every
+        // VM attaching the same writable ext4, which would race
+        // and corrupt under concurrency. Also makes clone-based
+        // snapshots possible later (snapshot dir holds another
+        // clone of this file at evict time).
+        clone_or_copy(&bake_rootfs, &rootfs_path).await?;
+        tracing::debug!(
+            sandbox_id = %id,
+            src = %bake_rootfs.display(),
+            dst = %rootfs_path.display(),
+            "vz: cloned bake rootfs to per-sandbox path"
+        );
+
+        let vm_cfg = VmConfig::new(
+            self.cfg.kernel_path.clone(),
+            rootfs_path.clone(),
+            memory_mib,
+            vcpus,
+        );
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
         // return (no half-registered state in the sandboxes map).
-        vm.start().await?;
+        // Also clean up the per-sandbox rootfs we just cloned.
+        if let Err(e) = vm.start().await {
+            let _ = tokio::fs::remove_file(&rootfs_path).await;
+            return Err(e.into());
+        }
 
-        let id = SandboxId::new();
         let vsock_uds_path = self.vsock_uds_path_for(id);
 
         // Wire up the virtio-console UDS bridge. This binds
@@ -254,6 +291,11 @@ impl SandboxBackend for VzBackend {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, sandbox_id = %id, "vz bridge start failed; tearing down VM");
+            // Best-effort cleanup of the cloned rootfs on the
+            // error path. The VM itself drops on the early
+            // return.
+            let path = rootfs_path.clone();
+            tokio::spawn(async move { let _ = tokio::fs::remove_file(path).await; });
             engram_core::SandboxError::from(e)
         })?;
 
@@ -264,6 +306,7 @@ impl SandboxBackend for VzBackend {
                 vm: Arc::new(vm),
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 vsock_uds_path,
+                rootfs_path,
             },
         );
         Ok(id)
@@ -371,9 +414,9 @@ impl SandboxBackend for VzBackend {
         id: SandboxId,
         dest: &Path,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        let (vm, spec) = {
+        let (vm, spec, rootfs_path) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            (live.vm.clone(), live.spec.clone())
+            (live.vm.clone(), live.spec.clone(), live.rootfs_path.clone())
         };
         tokio::fs::create_dir_all(dest).await.map_err(|e| {
             SandboxError::Snapshot(format!(
@@ -381,23 +424,39 @@ impl SandboxBackend for VzBackend {
                 dest.display()
             ))
         })?;
-        // Mirror FC's pause → save → resume sequence so the live
-        // session loses ~no time. Best-effort resume on save
-        // failure so we don't leave the VM stuck Paused.
+
+        // Clone-based snapshot semantics. VZ's
+        // `restoreMachineStateFromURL` is broken upstream for
+        // arm64 Linux guests on macOS (see UTM #6654, Apple
+        // Developer Forum thread 745168, and Apple's own
+        // `containerization` framework which avoids it entirely
+        // — sub-second cold-boot is the canonical path). We
+        // pause the VM (so the guest's page cache settles and
+        // ext4's journal is consistent), APFS-clone the
+        // per-sandbox rootfs into the snapshot dir, and resume.
+        // The clone IS the snapshot — restore re-clones it back
+        // to a fresh per-sandbox file and cold-boots a new VM.
+        // engram-bootstrap's supervisor pattern + Claude's
+        // `--resume <session-id>` (persisted on the rootfs at
+        // /workspace/.engram/claude-session-id) recover
+        // conversation continuity across the cold boot.
         vm.pause().await?;
-        let state_path = crate::snapshot::state_path(dest);
-        let save_result = vm.save(&state_path).await;
+        let snapshot_rootfs = dest.join(SNAPSHOT_ROOTFS_FILENAME);
+        let clone_result = clone_or_copy(&rootfs_path, &snapshot_rootfs).await;
         let resume_result = vm.resume().await;
-        save_result?;
-        // If save succeeded but resume failed, the VM is stuck
+        clone_result.map_err(SandboxError::from)?;
+        // If clone succeeded but resume failed, the VM is stuck
         // paused — surface the resume error so the caller can
-        // try `engram session resume <id>`.
+        // retry. The snapshot is durable on disk regardless.
         resume_result?;
 
-        // Manifest. Image version is recorded so the snapshot
-        // catalog can flag stale-image restores in a future
-        // round.
-        let manifest = crate::snapshot::VzSnapshotManifest::new(id, spec.clone());
+        // Manifest. We rewrite spec.rootfs_source to point at
+        // the snapshot's clone — that's what `restore` should
+        // attach to a fresh VM. The original bake path lives
+        // in `spec.image` for audit purposes.
+        let mut snapshot_spec = spec.clone();
+        snapshot_spec.rootfs_source = Some(snapshot_rootfs.clone());
+        let manifest = crate::snapshot::VzSnapshotManifest::new(id, snapshot_spec);
         let manifest_path = dest.join(crate::snapshot::MANIFEST_FILENAME);
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
             SandboxError::Snapshot(format!("manifest serialize: {e}"))
@@ -410,18 +469,17 @@ impl SandboxBackend for VzBackend {
 
     async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
         let manifest = crate::snapshot::read_manifest(&src).await?;
-        let rootfs = manifest.spec.rootfs_source.clone().ok_or_else(|| {
+        let snapshot_rootfs = manifest.spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::Snapshot(
-                "snapshot manifest missing rootfs_source — cannot restore without an \
-                 attached disk image"
+                "snapshot manifest missing rootfs_source — cannot restore without a \
+                 disk image"
                     .into(),
             )
         })?;
-        if !rootfs.exists() {
+        if !snapshot_rootfs.exists() {
             return Err(SandboxError::Snapshot(format!(
-                "restore: rootfs at {} no longer exists; the bake may have been \
-                 deleted since the snapshot was taken",
-                rootfs.display()
+                "restore: snapshot rootfs at {} no longer exists",
+                snapshot_rootfs.display()
             )));
         }
         let memory_mib = if manifest.spec.memory.max_mib > 0 {
@@ -434,38 +492,46 @@ impl SandboxBackend for VzBackend {
         } else {
             self.cfg.default_vcpus
         };
-        // Build a fresh VzVm whose configuration matches the source.
-        // VZ's restoreMachineStateFromURL requires this — a
-        // mismatched config (different rootfs, different vsock
-        // device count, etc.) returns NSError code "configuration
-        // doesn't match save file."
+
+        // Allocate the new sandbox id up front so we can name
+        // its per-sandbox rootfs deterministically.
+        let new_id = SandboxId::new();
+        tokio::fs::create_dir_all(&self.work_dir).await?;
+        let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
+
+        // Clone the snapshot's rootfs into a fresh per-sandbox
+        // file. The snapshot's clone stays intact (so a forked
+        // session or a re-resume after this one can clone it
+        // again); the new sandbox writes only to its own clone.
+        clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
+        tracing::debug!(
+            sandbox_id = %new_id,
+            src = %snapshot_rootfs.display(),
+            dst = %rootfs_path.display(),
+            "vz: cloned snapshot rootfs to fresh per-sandbox path for cold-resume"
+        );
+
+        // Cold-resume: build a fresh VM with the snapshot's
+        // disk-state and start it. VZ's
+        // restoreMachineStateFromURL is not actually functional
+        // for arm64 Linux guests (see snapshot() comment).
+        // Cold-boot is the canonical path — Apple's own
+        // containerization framework uses it. The
+        // bootstrap-supervisor pattern + Claude's `--resume`
+        // hand off conversation continuity across the boot.
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
-            rootfs,
+            rootfs_path.clone(),
             memory_mib,
             vcpus,
         );
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
-
-        let state_path = crate::snapshot::state_path(&src);
-        if !state_path.exists() {
-            return Err(SandboxError::Snapshot(format!(
-                "restore: VZ state file missing at {}",
-                state_path.display()
-            )));
+        if let Err(e) = vm.start().await {
+            let _ = tokio::fs::remove_file(&rootfs_path).await;
+            return Err(e.into());
         }
 
-        // Restore + resume. After restoreMachineStateFromURL the
-        // VM is in `.paused`; the trait contract is that callers
-        // see a running sandbox, so resume here.
-        vm.restore(&state_path).await?;
-        vm.resume().await?;
-
-        // Allocate a fresh sandbox id (matches FC's behaviour —
-        // the original id only lives in the manifest for audit).
-        let new_id = SandboxId::new();
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
-        tokio::fs::create_dir_all(&self.work_dir).await?;
 
         // Re-bind the virtio-console UDS bridge against the
         // restored VM. The in-VM `engram-bootstrap` supervisor
@@ -488,6 +554,7 @@ impl SandboxBackend for VzBackend {
                 vm: Arc::new(vm),
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 vsock_uds_path,
+                rootfs_path,
             },
         );
         Ok(new_id)
@@ -513,6 +580,19 @@ impl SandboxBackend for VzBackend {
         // observable goal of `destroy` is "this sandbox is gone."
         if let Err(e) = state.vm.stop().await {
             tracing::warn!(error = %e, sandbox_id = %id, "vz stop returned an error; releasing handle anyway");
+        }
+        // Remove the per-sandbox rootfs clone. Best-effort: if
+        // the unlink fails (e.g., file already gone), the next
+        // sandbox with a fresh UUID still gets its own clone, so
+        // we just log and move on. Persistent state lives in
+        // snapshot directories, not here.
+        if let Err(e) = tokio::fs::remove_file(&state.rootfs_path).await {
+            tracing::debug!(
+                error = %e,
+                path = %state.rootfs_path.display(),
+                sandbox_id = %id,
+                "vz: failed to remove per-sandbox rootfs (likely already gone)"
+            );
         }
         // `state` (and the Arc<VzVm> inside) drops here — releases
         // ObjC retains.

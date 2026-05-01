@@ -188,6 +188,19 @@ impl VzVm {
         if let Err(err) = validation {
             return Err(VzError::ConfigInvalid(ns_error_message(&err)));
         }
+        // Apple documents save/restore as unsupported for some
+        // configurations (USB mass storage, bridged network, etc.).
+        // `validateSaveRestoreSupportWithError` says yes/no without
+        // having to actually attempt a restore.
+        let save_restore_check = unsafe { vz_cfg.validateSaveRestoreSupportWithError() };
+        if let Err(err) = save_restore_check {
+            tracing::warn!(
+                error = %ns_error_message(&err),
+                "VM config does NOT support save/restore — snapshot/restore will fail"
+            );
+        } else {
+            tracing::debug!("VM config validated for save/restore support");
+        }
 
         // Construct the VM. Per Apple, init returns `instancetype`
         // and never `nil` for the queue-aware initializer.
@@ -436,15 +449,30 @@ fn build_configuration(
         // CONFIG_VIRTIO_VSOCKETS=y requirement on the rootfs's
         // kernel. The bridge consumes the returned fds after
         // VM start (see console_bridge.rs).
-        let (console_dev, port_fds) =
-            build_console_device().map_err(|e| VzError::ConfigInvalid(e.to_string()))?;
-        let console_dev_super: Retained<
-            objc2_virtualization::VZConsoleDeviceConfiguration,
-        > = Retained::cast_unchecked(console_dev);
-        let console_array: Retained<
-            NSArray<objc2_virtualization::VZConsoleDeviceConfiguration>,
-        > = NSArray::from_retained_slice(&[console_dev_super]);
-        vz_cfg.setConsoleDevices(&console_array);
+        //
+        // ENGRAM_DIAG_NO_CONSOLE=1 (diagnostic-only) skips the
+        // console device entirely so we can test whether
+        // multi-port virtio-console interacts badly with VZ
+        // snapshot/restore. Production never sets this.
+        let port_fds = if std::env::var("ENGRAM_DIAG_NO_CONSOLE").as_deref() == Ok("1") {
+            tracing::warn!(
+                "ENGRAM_DIAG_NO_CONSOLE=1 — building VM without virtio-console multi-port (diagnostic)"
+            );
+            ConsolePortFds {
+                by_port: std::collections::BTreeMap::new(),
+            }
+        } else {
+            let (console_dev, port_fds) =
+                build_console_device().map_err(|e| VzError::ConfigInvalid(e.to_string()))?;
+            let console_dev_super: Retained<
+                objc2_virtualization::VZConsoleDeviceConfiguration,
+            > = Retained::cast_unchecked(console_dev);
+            let console_array: Retained<
+                NSArray<objc2_virtualization::VZConsoleDeviceConfiguration>,
+            > = NSArray::from_retained_slice(&[console_dev_super]);
+            vz_cfg.setConsoleDevices(&console_array);
+            port_fds
+        };
 
         // Serial port: virtio-console wired to host stderr so kernel
         // boot logs + the engram-init shim's output land in the
@@ -488,9 +516,56 @@ fn nsurl_for_path(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&path_string)
 }
 
-/// Extract a UTF-8 message from an NSError.
+/// Extract a UTF-8 message from an NSError, including the
+/// numeric code + domain + a few well-known userInfo strings so
+/// opaque errors (e.g. `restoreMachineStateFromURL` returning the
+/// generic VZErrorRestore=12) can be matched against
+/// `VZErrorCode` constants and Apple's specific failure reasons.
 fn ns_error_message(err: &NSError) -> String {
-    err.localizedDescription().to_string()
+    use objc2::rc::Retained;
+    use objc2_foundation::NSString;
+
+    let desc = err.localizedDescription().to_string();
+    let code = err.code();
+    let domain = err.domain().to_string();
+    let failure_reason = err
+        .localizedFailureReason()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let recovery = err
+        .localizedRecoverySuggestion()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    // Apple frequently nests a more-specific NSError under
+    // `NSUnderlyingError`. Pull it if present — that's where the
+    // real "you asked for X but Y" is.
+    let underlying = {
+        let user_info = err.userInfo();
+        let key = NSString::from_str("NSUnderlyingError");
+        // SAFETY: objectForKey returns Option<Retained<AnyObject>>;
+        // we narrow to NSError if the runtime class matches.
+        let raw: Option<Retained<objc2::runtime::AnyObject>> =
+            user_info.objectForKey(&key);
+        raw.and_then(|obj| obj.downcast::<NSError>().ok())
+            .map(|nested| {
+                let n_desc = nested.localizedDescription().to_string();
+                let n_code = nested.code();
+                let n_domain = nested.domain().to_string();
+                format!("{n_desc} [domain={n_domain} code={n_code}]")
+            })
+            .unwrap_or_default()
+    };
+    let mut out = format!("{desc} [domain={domain} code={code}]");
+    if !failure_reason.is_empty() {
+        out.push_str(&format!(" reason={failure_reason}"));
+    }
+    if !recovery.is_empty() {
+        out.push_str(&format!(" recovery={recovery}"));
+    }
+    if !underlying.is_empty() {
+        out.push_str(&format!(" underlying={underlying}"));
+    }
+    out
 }
 
 #[cfg(test)]

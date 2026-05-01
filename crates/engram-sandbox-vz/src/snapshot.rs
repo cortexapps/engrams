@@ -1,24 +1,26 @@
-//! Snapshot / restore via VZ's `saveMachineStateToURL` /
-//! `restoreMachineStateFromURL` (macOS 14+).
+//! Clone-based snapshot manifest for `engram-sandbox-vz`.
 //!
-//! State-machine contract (per Apple's docs):
-//!   `save`    — VM must be `.paused`. Output is a single file
-//!               carrying memory + device state.
-//!   `restore` — VM must be `.stopped`. After restore, VM is in
-//!               `.paused`; caller must `resume()` to bring it
-//!               online.
+//! VZ's `saveMachineStateToURL` / `restoreMachineStateFromURL`
+//! pair is broken upstream for arm64 Linux guests on macOS:
+//! save succeeds but restore returns generic VZErrorRestore=12
+//! "invalid argument" with no NSUnderlyingError. See UTM #6654,
+//! Apple Developer Forum thread 745168, and the fact that
+//! Apple's own `containerization` framework avoids the API
+//! entirely for Linux. So we don't use it.
 //!
-//! `VzBackend::snapshot` orchestrates pause → save → resume →
-//! manifest.json. `VzBackend::restore` reads the manifest, rebuilds
-//! a `VzVm` from the captured spec, and calls `vm.restore(state.bin)`
-//! followed by `vm.resume()`. Returns a fresh `SandboxId` —
-//! mirrors the FC contract.
+//! Instead, snapshot semantics are clone-based:
+//!   `snapshot` — pause VM → APFS-clone the per-sandbox rootfs
+//!                into the snapshot dir → resume → write manifest.
+//!                The clone IS the snapshot.
+//!   `restore`  — read manifest → APFS-clone snapshot rootfs into
+//!                a fresh per-sandbox file → cold-boot a fresh VM.
+//!                Bootstrap supervisor + Claude `--resume <id>`
+//!                handle conversation continuity across the
+//!                cold boot.
 //!
-//! No UFFD-equivalent on VZ — `restoreMachineStateFromURL` reads
-//! the full state file synchronously. That's a perf trade-off, not
-//! a correctness one.
+//! See `disk.rs` for the clone primitives.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use engram_core::types::ids::{SandboxId, SnapshotId};
@@ -27,11 +29,13 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
 
-/// Persisted next to `state.bin` so restore can reconstruct the
-/// `VzVm` configuration (kernel + rootfs + memory + cpu) exactly as
-/// the source VM had it. Without this, restoring a save file built
-/// against a different rootfs version would be a silent
-/// mis-configuration.
+use crate::disk::SNAPSHOT_ROOTFS_FILENAME;
+
+/// Persisted next to the snapshot's rootfs clone so restore can
+/// reconstruct the `VzVm` configuration (memory, cpu, etc.) exactly
+/// as the source VM had it. The manifest's `spec.rootfs_source`
+/// points at the snapshot's clone (not the original bake) — that's
+/// what restore should attach to a fresh VM.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct VzSnapshotManifest {
     pub(crate) sandbox_id: SandboxId,
@@ -54,19 +58,22 @@ impl VzSnapshotManifest {
     }
 }
 
-/// Filename of the per-snapshot VZ state file under `<dest>/`.
-pub(crate) const STATE_FILENAME: &str = "state.bin";
 /// Filename of the JSON manifest under `<dest>/`.
 pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
 
 /// Build the `SnapshotMetadata` the trait's `snapshot()` returns.
-/// `dest` already contains state.bin and manifest.json.
+/// `dest` already contains the rootfs clone and the manifest.
+/// The reported size is dominated by the rootfs clone — APFS
+/// clones report their nominal size (`stat`'s st_size) rather
+/// than diverged-block usage, so this is a logical-size figure,
+/// not actual disk consumption. Real on-disk usage is much
+/// smaller until the sandbox writes diverging blocks.
 pub(crate) async fn build_metadata(
     dest: &Path,
     image_version: &str,
 ) -> Result<SnapshotMetadata, SandboxError> {
     let mut size_bytes = 0u64;
-    for name in [STATE_FILENAME, MANIFEST_FILENAME] {
+    for name in [SNAPSHOT_ROOTFS_FILENAME, MANIFEST_FILENAME] {
         let p = dest.join(name);
         size_bytes += tokio::fs::metadata(&p)
             .await
@@ -105,16 +112,13 @@ pub(crate) async fn read_manifest(src: &Path) -> Result<VzSnapshotManifest, Sand
     Ok(manifest)
 }
 
-/// Resolve the path to the VZ state file inside `<src>/`.
-pub(crate) fn state_path(src: &Path) -> PathBuf {
-    src.join(STATE_FILENAME)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn fake_spec() -> SandboxSpec {
         SandboxSpec {
