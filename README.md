@@ -2,19 +2,23 @@
 
 Self-hosted, open-source orchestrator for ephemeral AI agent sandboxes.
 
-Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: warm pools, snapshot lifecycle (UFFD-backed restore), multi-host scheduling, and pluggable cloud / blob-storage backends. A subprocess-based dev backend lets the entire orchestration layer run on macOS Apple Silicon during development; production isolation is always Firecracker.
+Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: warm pools, snapshot lifecycle (UFFD-backed restore), multi-host scheduling, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS during development; an Apple Silicon backend (Apple Virtualization.framework) gives Mac devs real microVM isolation locally. Production isolation is always Firecracker.
 
 It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to open source so any organization can run their own without vendor lock-in. See `DESIGN.md` for the full architecture and roadmap.
 
 ## Status
 
-**Phase 1** — orchestration layer end-to-end on the dev backend. The coordinator HTTP API, scheduler, warm pool, blob storage, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → registry rootfs), pluggable secret store (env / dotenv / GCP-stub), and metadata store are real. End-to-end create → exec → delete works locally on macOS Apple Silicon via `engram-sandbox-process`, with per-exec wall-time accounting. CLI covers session list/get/delete/logs and image build.
+**Phase 1 — done.** Orchestration layer end-to-end on the dev backend. Coordinator HTTP API, scheduler, warm pool, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → rootfs), pluggable secret store (env / dotenv / GCP-stub), Postgres metadata store. End-to-end create → exec → delete on macOS via `engram-sandbox-process`. CLI covers session list/get/delete/logs and image build.
 
-**Phase 2 — done.** `engram-sandbox-firecracker` drives real Firecracker microVMs end-to-end: typed HTTP client over the FC unix socket; `create`/`destroy`/`list`/`snapshot`/`restore`/`exec_stream` all wired and exercised by integration tests on a Linux dev VM. `restore` supports both `File` mode (synchronous read of `memory.bin`) and `Uffd` mode (lazy paging via the new `engram-uffd-handler` companion process — sub-100ms resume). `exec_stream` reaches an in-guest `engram-agentd` over Firecracker's vsock proxy; the image baker injects a static-musl agent + init shim into ext4 rootfs images. 292 tests pass on macOS, plus 5 microVM integration tests on the dev VM.
+**Phase 2 — done.** `engram-sandbox-firecracker` drives real Firecracker microVMs end-to-end: typed HTTP client over the FC unix socket; `create`/`destroy`/`list`/`snapshot`/`restore`/`exec_stream` all wired and exercised by integration tests on a Linux dev VM. `restore` supports both `File` mode (synchronous read of `memory.bin`) and `Uffd` mode (lazy paging via `engram-uffd-handler` — sub-100ms resume). `exec_stream` reaches an in-guest `engram-agentd` over Firecracker's vsock proxy; the image baker injects a static-musl agent + init shim into ext4 rootfs images.
 
-**Phase 3 — done.** Multi-host coordinator: host-agents run as a separate binary that dials the coordinator over WebSocket (bincode-over-WS with hand-rolled `request_id` demuxer + W3C trace context per RPC; `--mode=all` keeps single-binary `just dev` working by registering the local backend in-process). The warm `Pool` is host-side (`engram-host-agent::pooled_backend::PooledBackend`), so heartbeats carry real `(ready, target)` per `image_version` and `HostRegistry`'s scheduler ranks by snapshot affinity → warm pool → capacity. Cold-tier blob restore unblocked. `LISTEN/NOTIFY` on `session_events` + `host_dead` lets coordinator replicas re-broadcast events into local SSE subscribers and drop dead hosts in lockstep. `SessionStatus::PendingReassign` + `POST /sessions/:id/migrate` for operator-initiated transitions; the dead-host auto-detector (`crates/engram-coordinator/src/dead_host.rs`) handles the `kill -9 host → migrate within 30s` deliverable, racing replicas via `pg_try_advisory_lock` so exactly one wins each eviction. `sessions.sandbox_id` persistence + `repopulate_routing` on coord startup means Active sessions survive a coordinator restart. New `GET /api/hosts` + `engram host list/get/drain` CLI. 332 tests pass on macOS (up from 292), plus 2 `#[ignore]`'d integration tests gated on a live Postgres. Production hardening (TLS, `HostStatus::Disconnected`, backpressure tuning) lands with Phase 6.
+**Phase 3 — done.** Multi-host coordinator: host-agents run as a separate binary that dials the coordinator over WebSocket (bincode-over-WS with hand-rolled `request_id` demuxer + W3C trace context per RPC; `--mode=all` keeps single-binary `just dev` working by registering the local backend in-process). The warm `Pool` is host-side (`engram-host-agent::pooled_backend::PooledBackend`), so heartbeats carry real `(ready, target)` per `image_version` and `HostRegistry`'s scheduler ranks by snapshot affinity → warm pool → capacity. `LISTEN/NOTIFY` on `session_events` + `host_dead` lets coordinator replicas re-broadcast events into local SSE subscribers and drop dead hosts in lockstep. The dead-host auto-detector (`crates/engram-coordinator/src/dead_host.rs`) handles `kill -9 host → mark Dead within 30s`, racing replicas via `pg_try_advisory_lock` so exactly one wins each eviction. `sessions.sandbox_id` persistence + `repopulate_routing` on coord startup means Active sessions survive a coordinator restart. `GET /api/hosts` + `engram host list/get/drain` CLI shipped. Production hardening (TLS, `HostStatus::Disconnected`, backpressure tuning) lands with Phase 6.
 
-**Phase 4 — versioned conversations + pack hosts.** In progress. Reframes the original "drain VM memory to GCS in 30s" plan around an agent-first model: workspace + transcript are durable via git checkpoints, hot-suspend keeps Firecracker memory snapshots for *local* idle eviction, and cross-host resume reconstructs from `engram/sessions/<id>` branches. Blob storage retired (Track 0); harness protocol + `engram-harness-{proto,noop}` foundations landed (Track A); `RepoUrl`/`SessionKind` + per-session checkpoint branches in the schema (Track C.1+C.2); `checkpoint_session` primitive (Track C.6) + manual `POST /sessions/:id/checkpoint` (Track C.8); auto-checkpoint on `HarnessEvent::Idle` / `RunCompleted` for one commit per completed agent run (Track C.9); cross-host resume via smart-bootstrap (`git fetch + reset` if pre-cloned, `git init + remote + fetch + reset` if empty) so warm-pool images keep sub-second resume even on the cold path (Track C.7). 363 tests pass on macOS via `cargo nextest run`. Tracks B (idle-evictor pack-hosts), D (preemption best-effort flush), F (`engram session log/diff/fork/pr`), and the in-VM `engram-bootstrap` binary still ahead.
+**Phase 4 — done. Versioned conversations + pack hosts + one-shot task runner.** All tracks shipped; ADRs 0001 + 0002 capture the trajectory. Workspace + transcript are durable via git (`engram/sessions/<id>` checkpoint branches per session); hot-suspend keeps Firecracker memory snapshots for *local* idle eviction (Track B); harness protocol (`engram-harness-{proto,noop,claude}`) + in-VM supervisor (`engram-bootstrap`) wired end-to-end; `POST /sessions/:id/checkpoint` (manual) + auto-checkpoint on `HarnessEvent::Idle` / `RunCompleted` for one commit per completed agent run (Track C); preemption best-effort flush (Track D); `engram session {log,diff,fork,checkpoint}` CLI surface (Track F). ADR 0002 retired the cross-host cold-resume code paths in favor of explicit one-shot semantics: a session lives ↔ its FC snapshot, snapshot loss → `Dead` terminal state, caller forks the workspace to continue. The Claude Code adapter (`engram-harness-claude`) shipped as the reference adapter and runs end-to-end against real Firecracker microVMs.
+
+**Phase 4.5 — done (April 2026). Apple Silicon backend.** `engram-sandbox-vz` drives Apple's Virtualization.framework directly from Rust via the `objc2-virtualization` bindings — no Swift driver. Mac contributors get real microVM isolation locally (not just subprocesses). Multi-port virtio-console replaces vsock for the host↔guest control plane (universal kernel support, no `CONFIG_VIRTIO_VSOCKETS=y` requirement) — `engram-transport` is a backend-agnostic trait abstraction over both. APFS `clonefile(2)`-based snapshots replace VZ's broken-upstream `saveMachineStateToURL`/`restoreMachineStateFromURL` pair (~50 ms even for 1.7 GB rootfs); the snapshot is the clone. Cold boot 562 ms, cold resume 746 ms, warm-pool checkout 30 ms — same warm-pool code path as FC. ADR 0003 captures the design.
+
+**389 tests pass** via `cargo nextest run --workspace` (3 ignored: 2 live-Postgres integration tests, 1 entitlement-gated VZ smoke test), plus 5 Firecracker integration tests on the Linux dev VM and 14 VZ unit tests on macOS Apple Silicon.
 
 ## Workspace
 
@@ -22,32 +26,38 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 crates/
   engram-core                       # types, traits, errors. No I/O.
   engram-protocol                   # wire types: bincode-over-WS Frame protocol (coordinator <-> host)
-  engram-harness-proto              # wire types: harness ↔ host vsock channel (HarnessEvent / HarnessCommand)
+  engram-harness-proto              # wire types: harness ↔ host (HarnessEvent / HarnessCommand)
   engram-harness-noop               # first-party test harness (deterministic event cadence, no real agent)
-  engram-coordinator                # binary: HTTP API + scheduler
+  engram-harness-claude             # Claude Code adapter — reference agent harness implementation
+  engram-transport                  # transport abstraction: vsock (FC) / virtio-console (VZ)
+  engram-coordinator                # binary: HTTP API + scheduler + idle evictor
   engram-host-agent                 # binary: per-host daemon (warm pool, harness hub, checkpoint primitive)
   engram-image-builder              # binary: warm-image baker (Directory + Ext4 modes)
   engram-cli                        # binary: ops/admin tool
-  engram-agentd                     # binary: in-guest exec daemon (vsock + UDS)
-  engram-sandbox-firecracker        # SandboxBackend: Firecracker microVMs (production)
+  engram-agentd                     # binary: in-guest exec daemon (transport-agnostic)
+  engram-bootstrap                  # binary: in-guest supervisor (spawns the harness, handles re-attach)
+  engram-sandbox-firecracker        # SandboxBackend: Firecracker microVMs (Linux production)
+  engram-sandbox-vz                 # SandboxBackend: Apple Virtualization.framework (macOS Apple Silicon dev)
   engram-sandbox-process            # SandboxBackend: host subprocesses (DEV ONLY, no isolation)
-  engram-uffd-handler               # binary: userfaultfd page-fault handler for fast snapshot restore
+  engram-uffd-handler               # binary: userfaultfd page-fault handler for fast FC snapshot restore
   engram-cloud-{gcp,static,mock}    # CloudBackend impls
-  engram-storage-{gcs,s3,local}     # BlobStorage impls
   engram-secrets-{dev,gcp}          # SecretStore impls (env/dotenv; GCP Secret Manager)
   engram-postgres                   # MetadataStore impl
 ```
 
+(ADR 0001 retired the `engram-storage-*` (`BlobStorage`) crates entirely; image distribution moves to a Docker registry in Phase 5.)
+
 ## Sandbox backends
 
-The orchestration layer is VMM-agnostic — anything that implements `SandboxBackend` plugs in. We ship two:
+The orchestration layer is VMM-agnostic — anything that implements `SandboxBackend` plugs in. We ship three:
 
 | Backend | Isolation | Snapshots | Where it runs | When to use |
 |---|---|---|---|---|
-| `engram-sandbox-process` | **None** — host subprocess | Tarball of workdir | Anywhere (macOS, Linux) | Local dev. Iterating on the orchestration layer without firing up a VMM. |
-| `engram-sandbox-firecracker` | microVM (KVM) | Full, file-backed or UFFD restore | Linux + KVM | Production. Real isolation, real resource enforcement, real snapshot/restore. |
+| `engram-sandbox-process` | **None** — host subprocess | Tarball of workdir | Anywhere (macOS, Linux) | Iterating on the orchestration layer without firing up a VMM. |
+| `engram-sandbox-vz` | microVM (Hypervisor.framework) | APFS clone of rootfs | macOS 12+ on Apple Silicon | Mac dev with real microVM isolation. Sub-second cold boot, sub-second cold resume. ADR 0003. |
+| `engram-sandbox-firecracker` | microVM (KVM) | FC memory snapshot + UFFD lazy paging | Linux + KVM | Production. Real isolation, real resource enforcement, sub-100ms hot resume. |
 
-The dev backend is for fast iteration; it deliberately doesn't try to mimic production isolation. Use a Linux box (CI, Hetzner, remote dev VM) to validate against Firecracker when fidelity matters.
+`process` and `vz` are dev-side: `process` for the fastest possible iteration loop (no kernel, no VM, plain subprocesses), `vz` for fidelity to the FC code paths (same `engram-bootstrap` supervisor, same `engram-agentd` wire protocol, same warm-pool semantics). Production isolation is always Firecracker.
 
 ## Quick start (dev, macOS or Linux)
 
@@ -100,52 +110,40 @@ just test               # all tests via cargo nextest
 just psql               # psql into the dev Postgres
 just db-reset           # destroy + recreate the dev DB
 just dev-firecracker    # coordinator wired to the Firecracker backend (Linux + KVM only)
+just dev-vz             # coordinator wired to the Apple Silicon backend (macOS only)
 just clean-var          # rm -rf the local sandbox cwds + snapshots
 ```
 
-## Sessions are versioned conversations (Phase 4)
+## Sessions are versioned conversations + one-shot tasks
 
-A session is a unit of agent work. Each session is bound to a writable git repo + base branch on create, and owns a checkpoint branch — `engram/sessions/<session_id>` — on that repo's remote. The agent's progress is durable via that branch, not VM memory.
+A session is one bounded unit of agent work. It's bound to a writable git repo + base branch on create, and owns a checkpoint branch — `engram/sessions/<session_id>` — on that repo's remote. The agent's progress is durable via that branch.
 
-**Lifecycle:**
+**Engram is a one-shot task runner** (ADR 0002). A session lives ↔ its FC memory snapshot:
 
 ```
-POST /sessions {repo: "git+https://...", branch: "main"}
-  → bootstrap clones the repo, agent starts on a warm-pool sandbox
-
-(agent runs, makes tool calls, eventually emits HarnessEvent::Idle)
-  → host-agent's EventSink fires checkpoint_workspace_only
-  → `git push origin engram/sessions/<id>` on the writable repo
-  → SessionEvent::CheckpointPushed broadcast on the SSE bus
-
-POST /sessions/:id/snapshot     # operator: take a hot FC snapshot
-DELETE /sessions/:id/local      # operator: hot-suspend (frees host RAM)
-POST /sessions/:id/resume       # bring back: FC restore if same host alive,
-                                # else fresh sandbox + smart-bootstrap to checkpoint
-POST /sessions/:id/checkpoint   # operator: force a workspace push now
+create → Active                    (live VM)
+       → idle TTL → Idle           (FC snapshot taken, VM destroyed)
+       → next prompt/exec → Active (hot resume from same-host snapshot)
+       ... loop ...
+       → snapshot invalidated      (host crash, disk full, hard TTL)
+       → Dead                      (terminal)
+       → caller forks the workspace if they want to continue
 ```
 
-**Hot vs cold resume.** `POST /sessions/:id/resume` first tries Firecracker memory restore against the snapshot's host (sub-second; in-memory state preserved). If the host is gone, it falls through to **cold resume**: fresh sandbox on the same `image_version`, then `git fetch origin engram/sessions/<id> && git reset --hard FETCH_HEAD`. The bake SHA → checkpoint diff is bounded because resume always uses the *same* image the session was created with — only the agent's own work to apply, not weeks of unrelated drift.
+`POST /sessions/:id/resume` is a same-host operation: hot resume from the FC snapshot if it exists, `410 Gone` (`snapshot_invalidated`) if it doesn't. There is **no cross-host cold resume** — the orchestrator does not race to keep a session alive across host loss. The contract is intentionally narrow: agents externalize their state (workspace files + transcript), so the right durability primitive is git, not VM-memory replication.
 
-**Smart-bootstrap composition with warm pool.** Phase 5's image baker bakes warm-pool images that include a clone of the writable repo at "bake SHA" + dependencies installed + warm daemons. Smart-bootstrap detects whether the sandbox's `/workspace` already has the right clone via `git remote get-url origin`:
+**Auto-checkpoint cadence.** One commit per *completed agent run*. The harness emits `HarnessEvent::Idle` when it finishes a prompt; the host-agent's EventSink fires `checkpoint_workspace_only` (git add/commit/push). Reads as the agent's session log — exactly what you'd `git diff` or open a PR from.
 
-- If yes (warm pool slot): `git fetch + reset --hard FETCH_HEAD` — milliseconds, no full clone, no `npm install` rerun unless deps actually changed.
-- If no (empty cwd or origin diverged): `git init . && git remote add origin <url> && git fetch + reset` — works from any starting state.
-
-This keeps sub-second start times for cold resume on warm-pool slots.
-
-**Auto-checkpoint cadence.** One commit per *completed agent run*, not per tool call. The harness emits `HarnessEvent::Idle` / `RunCompleted` when it finishes a prompt; the EventSink pushes the workspace then. The branch reads as the agent's session log — exactly what you'd `git diff` or PR. Per-tool-call commits would drown the branch in dozens of empty/near-empty pushes per run.
-
-**Checkpoint branches as forkable artifacts.** `engram session fork <id>` (Track F, in progress) creates a new session whose checkpoint branch starts at the source's HEAD — that's how you "continue" a session whose host is gone, or branch a session that went off the rails. The original session's branch keeps existing for inspection / `engram session pr <id>`.
+**Checkpoint branches as forkable artifacts.** `engram session fork <id>` creates a new session whose checkpoint branch starts at the source's HEAD — to continue a Dead session's work, branch a session that went off the rails, or replay from any past `--at <event_idx>`. The original branch keeps existing for inspection.
 
 **What survives what:**
 
-| Failure mode | Workspace files | Conversation log | In-memory state |
+| Event | Workspace files | Conversation log | In-memory state |
 |---|---|---|---|
 | Hot-suspend (idle eviction, same host) | preserved (in `/workspace`) | preserved | preserved (FC snapshot) |
-| Cross-host resume from checkpoint | preserved (checkpoint branch) | preserved (Postgres replay) | lost — agent reruns from last `Idle` |
-| Mid-run preemption (no fresh checkpoint) | last completed run's state | up to last completed run | lost — agent reruns the in-flight prompt |
-| Read-only / `local://` session host loss | lost | preserved | lost — caller restarts |
+| Snapshot invalidated / Dead | recoverable via `engram session fork <id>` | preserved (Postgres replay only — agent does not auto-resume) | lost |
+| Mid-run preemption (no fresh checkpoint) | last completed run's state | up to last completed run | lost |
+| Read-only / `local://` session host loss | lost | preserved | lost |
 
 ## Building images
 
