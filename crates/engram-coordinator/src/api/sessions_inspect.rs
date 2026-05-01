@@ -9,7 +9,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
-use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
+use engram_core::types::session::{checkpoint_branch_for, WorkspaceSpec};
 use engram_core::types::{SessionSpec, SessionStatus};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,10 @@ pub async fn log(
         }
         "workspace" => {
             let (url, branch) = git_target_for(&session)?;
-            let range = format!("{}..{}", session.branch, branch);
+            let base_branch = session.workspace.git_branch().ok_or_else(|| {
+                ApiError::Internal("git session is missing workspace.git.branch".into())
+            })?;
+            let range = format!("{base_branch}..{branch}");
             let pretty = "--pretty=format:%H%x09%aI%x09%an%x09%s";
             let limit_str = format!("-n{limit}");
             let out = state
@@ -136,7 +139,12 @@ pub async fn diff(
 ) -> Result<Response, ApiError> {
     let session = state.services.meta.get_session(id).await?;
     let (url, branch) = git_target_for(&session)?;
-    let vs = params.vs.unwrap_or_else(|| session.branch.clone());
+    let base_branch = session
+        .workspace
+        .git_branch()
+        .ok_or_else(|| ApiError::Internal("git session is missing workspace.git.branch".into()))?
+        .to_string();
+    let vs = params.vs.unwrap_or(base_branch);
     // `<vs>...<branch>` is symmetric-difference: shows what's on
     // <branch> that isn't on <vs>. Right semantics for "what did
     // the agent change relative to base."
@@ -219,23 +227,30 @@ pub async fn fork(
         }
     };
 
-    // Persist the new session row. Same `repo`/`branch`/
-    // `image_version` as the source so the new sandbox lands on
-    // the same warm-pool image at the same bake SHA — the
-    // smart-bootstrap then resets to the new checkpoint branch
-    // we're about to publish.
-    let spec = SessionSpec {
-        repo: src.repo.clone(),
-        branch: src.branch.clone(),
-        user_id: src.user_id.clone(),
-        image_version: Some(src.image_version.clone()),
-        read_only: false,
+    // Persist the new session row. Same `image`/`workspace`/
+    // `harness` as the source so the new sandbox lands on the same
+    // warm-pool image at the same bake SHA — the smart-bootstrap
+    // then resets to the new checkpoint branch we're about to publish.
+    // Forks are always writable (they exist precisely to continue
+    // working on a checkpoint), so override `read_only=false` if the
+    // source was a Readonly Git workspace.
+    let workspace = match &src.workspace {
+        WorkspaceSpec::Git { url, branch, .. } => WorkspaceSpec::Git {
+            url: url.clone(),
+            branch: branch.clone(),
+            read_only: false,
+        },
+        // git_target_for already rejected non-git sessions above, so
+        // this branch is unreachable; fall back defensively.
+        other => other.clone(),
     };
-    let new_id = state
-        .services
-        .meta
-        .create_session(spec, src.image_version.clone())
-        .await?;
+    let spec = SessionSpec {
+        image: src.image.clone(),
+        workspace,
+        harness: src.harness.clone(),
+        user_id: src.user_id.clone(),
+    };
+    let new_id = state.services.meta.create_session(spec).await?;
     let new_branch = checkpoint_branch_for(new_id);
 
     // Publish from_sha as the new session's checkpoint branch on
@@ -280,26 +295,18 @@ pub async fn fork(
 }
 
 fn git_target_for(session: &engram_core::types::Session) -> Result<(String, String), ApiError> {
-    if session.session_kind == SessionKind::Local {
-        return Err(ApiError::Conflict(
-            "session is `local` — no git history to inspect / fork".into(),
-        ));
-    }
-    let url = match &session.repo_url {
-        Some(RepoUrl::Git { url }) => url.clone(),
-        _ => {
-            return Err(ApiError::Internal(
-                "git session is missing a parsed Git repo_url".into(),
-            ))
-        }
-    };
+    let url = session.workspace.git_url().ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no git workspace — nothing to inspect / fork".into(),
+        )
+    })?;
     let branch = session.checkpoint_branch.clone().ok_or_else(|| {
         ApiError::Conflict(
             "session has no checkpoint branch — readonly Git sessions are inspect-only via `vs=`"
                 .into(),
         )
     })?;
-    Ok((url, branch))
+    Ok((url.to_string(), branch))
 }
 
 fn parse_log_lines(out: &str) -> Vec<WorkspaceCommit> {
@@ -383,6 +390,7 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
+    use engram_core::types::session::{HarnessSpec, ImageRef, SessionKind};
     use engram_core::types::Session;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
@@ -496,18 +504,24 @@ mod tests {
 
     fn git_session_with_id(session_id: engram_core::SessionId, remote: &Path) -> Session {
         let branch = checkpoint_branch_for(session_id);
-        let url = format!("{}", remote.display());
+        let url = format!("file://{}", remote.display());
         Session {
             id: session_id,
-            repo: format!("git+file://{url}"),
-            branch: "main".into(),
             user_id: None,
             status: SessionStatus::Active,
-            image_version: "test".into(),
             host_id: None,
             sandbox_id: None,
+            image: ImageRef::Registry {
+                repo: "test/repo".into(),
+                tag: "test".into(),
+            },
+            workspace: WorkspaceSpec::Git {
+                url,
+                branch: "main".into(),
+                read_only: false,
+            },
+            harness: HarnessSpec::None,
             session_kind: SessionKind::Git,
-            repo_url: Some(RepoUrl::Git { url }),
             checkpoint_branch: Some(branch),
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
@@ -627,20 +641,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_workspace_on_local_session_returns_409() {
+    async fn log_workspace_on_ephemeral_session_returns_409() {
         let session = Session {
             id: engram_core::SessionId::new(),
-            repo: "local://hello".into(),
-            branch: "main".into(),
             user_id: None,
             status: SessionStatus::Active,
-            image_version: "test".into(),
             host_id: None,
             sandbox_id: None,
-            session_kind: SessionKind::Local,
-            repo_url: Some(RepoUrl::Local {
-                name: "hello".into(),
-            }),
+            image: ImageRef::Registry {
+                repo: "test/repo".into(),
+                tag: "test".into(),
+            },
+            workspace: WorkspaceSpec::Empty,
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Ephemeral,
             checkpoint_branch: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
@@ -657,7 +671,7 @@ mod tests {
             }),
         )
         .await
-        .expect_err("local sessions have no git history");
+        .expect_err("ephemeral sessions have no git history");
         assert_eq!(err.status(), StatusCode::CONFLICT);
     }
 }

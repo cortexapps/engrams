@@ -49,16 +49,15 @@ async fn cross_replica_event_fan_out() {
     // (coord-B) appends an event against this id; the subscriber on
     // coord-A waits for it.
     let session_id = meta
-        .create_session(
-            SessionSpec {
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
                 repo: "ha-listener-test".into(),
-                branch: "main".into(),
-                user_id: None,
-                image_version: Some("warm-test".into()),
-                read_only: false,
+                tag: "warm-test".into(),
             },
-            "warm-test".into(),
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .expect("create session");
 
@@ -176,16 +175,15 @@ async fn append_session_event_fires_pg_notify() {
         .expect("listen session_events");
 
     let session_id = store
-        .create_session(
-            SessionSpec {
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
                 repo: "ha-notify-test".into(),
-                branch: "main".into(),
-                user_id: None,
-                image_version: Some("warm-test".into()),
-                read_only: false,
+                tag: "warm-test".into(),
             },
-            "warm-test".into(),
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .expect("create");
 

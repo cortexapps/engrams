@@ -13,11 +13,7 @@ use crate::types::snapshot::SnapshotRecord;
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     // ---- sessions ----
-    async fn create_session(
-        &self,
-        spec: SessionSpec,
-        image_version: String,
-    ) -> Result<SessionId, MetaError>;
+    async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
     async fn set_session_status(

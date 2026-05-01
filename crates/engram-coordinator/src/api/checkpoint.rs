@@ -52,15 +52,15 @@ pub async fn checkpoint(
 ) -> Result<Json<CheckpointResponse>, ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
-    // Local / Readonly sessions have no checkpoint branch — refuse
-    // explicitly so callers don't silently no-op.
+    // Ephemeral / Readonly sessions have no checkpoint branch —
+    // refuse explicitly so callers don't silently no-op.
     let branch = match session.session_kind {
         SessionKind::Git => session.checkpoint_branch.clone().ok_or_else(|| {
             ApiError::Internal(
                 "git session is missing its checkpoint_branch — schema invariant broken".into(),
             )
         })?,
-        SessionKind::Local | SessionKind::Readonly => {
+        SessionKind::Ephemeral | SessionKind::Readonly => {
             return Err(ApiError::Conflict(format!(
                 "session is `{}` — only `git` sessions can be checkpointed",
                 session.session_kind.as_str()

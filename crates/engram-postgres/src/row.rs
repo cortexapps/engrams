@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use engram_core::types::session::{RepoUrl, SessionKind};
+use engram_core::types::session::{HarnessSpec, ImageRef, SessionKind, WorkspaceSpec};
 use engram_core::types::{
     HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent,
     Session, SessionStatus, SnapshotRecord,
@@ -26,24 +26,28 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_active_at: DateTime<Utc> = row.try_get("last_active_at").map_err(col_err)?;
     let session_kind: String = row.try_get("session_kind").map_err(col_err)?;
-    let repo_url: Option<String> = row.try_get("repo_url").map_err(col_err)?;
     let checkpoint_branch: Option<String> = row.try_get("checkpoint_branch").map_err(col_err)?;
-    let parsed_repo_url = repo_url
-        .as_deref()
-        .map(RepoUrl::parse)
-        .transpose()
-        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let image_repo: String = row.try_get("image_repo").map_err(col_err)?;
+    let image_tag: String = row.try_get("image_tag").map_err(col_err)?;
+    let workspace_json: serde_json::Value = row.try_get("workspace").map_err(col_err)?;
+    let harness_json: serde_json::Value = row.try_get("harness").map_err(col_err)?;
+    let workspace: WorkspaceSpec = serde_json::from_value(workspace_json)
+        .map_err(|e| MetaError::Serialization(format!("workspace: {e}")))?;
+    let harness: HarnessSpec = serde_json::from_value(harness_json)
+        .map_err(|e| MetaError::Serialization(format!("harness: {e}")))?;
     Ok(Session {
         id: SessionId(id),
-        repo: row.try_get("repo").map_err(col_err)?,
-        branch: row.try_get("branch").map_err(col_err)?,
         user_id: row.try_get("user_id").map_err(col_err)?,
         status: parse_session_status(&status)?,
-        image_version: row.try_get("image_version").map_err(col_err)?,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
+        image: ImageRef::Registry {
+            repo: image_repo,
+            tag: image_tag,
+        },
+        workspace,
+        harness,
         session_kind: SessionKind::parse(&session_kind).map_err(MetaError::Serialization)?,
-        repo_url: parsed_repo_url,
         checkpoint_branch,
         created_at,
         last_active_at,

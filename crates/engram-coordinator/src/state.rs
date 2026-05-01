@@ -728,7 +728,9 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use engram_core::traits::{MetadataStore, SandboxBackend};
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
+    use engram_core::types::session::{
+        checkpoint_branch_for, HarnessSpec, ImageRef, SessionKind, WorkspaceSpec,
+    };
     use engram_core::types::{
         HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SnapshotRecord,
     };
@@ -768,7 +770,6 @@ pub(crate) mod tests {
         async fn create_session(
             &self,
             _: SessionSpec,
-            _: String,
         ) -> Result<engram_core::SessionId, MetaError> {
             unreachable!("create_session not used in state tests")
         }
@@ -983,17 +984,21 @@ pub(crate) mod tests {
         let branch = checkpoint_branch_for(session_id);
         let session = Session {
             id: session_id,
-            repo: format!("git+file://{}", remote.path().display()),
-            branch: "main".into(),
             user_id: None,
             status: engram_core::types::SessionStatus::Active,
-            image_version: "auto-checkpoint-test".into(),
             host_id: None,
             sandbox_id: None,
-            session_kind: SessionKind::Git,
-            repo_url: Some(RepoUrl::Git {
+            image: ImageRef::Registry {
+                repo: "test/repo".into(),
+                tag: "auto-checkpoint-test".into(),
+            },
+            workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
-            }),
+                branch: "main".into(),
+                read_only: false,
+            },
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Git,
             checkpoint_branch: Some(branch.clone()),
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
@@ -1051,24 +1056,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn auto_checkpoint_skips_local_session_silently() {
-        // Local sessions have no checkpoint branch — auto_checkpoint
+    async fn auto_checkpoint_skips_ephemeral_session_silently() {
+        // Ephemeral sessions have no checkpoint branch — auto_checkpoint
         // returns without emitting anything, and no error is logged
         // upward. The bus should see zero events.
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            repo: "local://hello".into(),
-            branch: "main".into(),
             user_id: None,
             status: engram_core::types::SessionStatus::Active,
-            image_version: "test".into(),
             host_id: None,
             sandbox_id: None,
-            session_kind: SessionKind::Local,
-            repo_url: Some(RepoUrl::Local {
-                name: "hello".into(),
-            }),
+            image: ImageRef::Registry {
+                repo: "test/repo".into(),
+                tag: "test".into(),
+            },
+            workspace: WorkspaceSpec::Empty,
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Ephemeral,
             checkpoint_branch: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),

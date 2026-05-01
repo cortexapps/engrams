@@ -46,26 +46,23 @@ struct MiniMeta {
 
 #[async_trait]
 impl MetadataStore for MiniMeta {
-    async fn create_session(
-        &self,
-        spec: SessionSpec,
-        image_version: String,
-    ) -> Result<SessionId, MetaError> {
+    async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
+        use engram_core::types::session::SessionKind;
         let id = SessionId::new();
+        let session_kind = SessionKind::derive(&spec.workspace);
         self.sessions.lock().insert(
             id,
             Session {
                 id,
-                repo: spec.repo,
-                branch: spec.branch,
                 user_id: spec.user_id,
                 status: SessionStatus::Pending,
-                image_version,
                 host_id: None,
                 sandbox_id: None,
                 created_at: Utc::now(),
-                session_kind: engram_core::types::session::SessionKind::Local,
-                repo_url: None,
+                image: spec.image,
+                workspace: spec.workspace,
+                harness: spec.harness,
+                session_kind,
                 checkpoint_branch: None,
                 last_active_at: Utc::now(),
             },

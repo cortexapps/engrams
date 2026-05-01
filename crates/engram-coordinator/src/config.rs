@@ -69,6 +69,15 @@ impl DevAgent {
             other => Err(format!("invalid dev agent: {other} (expected noop|claude)")),
         }
     }
+
+    /// Stable string used for the harness `name` in
+    /// `HarnessSpec::Builtin`. Round-trips with `parse`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Noop => "noop",
+            Self::Claude => "claude",
+        }
+    }
 }
 
 impl Default for CoordinatorConfig {

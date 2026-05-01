@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -34,144 +36,170 @@ impl SessionStatus {
     }
 }
 
-/// User-facing request to create a session.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionSpec {
-    /// `git+https://...` / `git+ssh://...` for git-backed sessions
-    /// (workspace cloned at create time, durable via per-session
-    /// checkpoint branch). `local://<name>` for ephemeral local-only
-    /// sessions used by `just dev` and unit tests — no clone, no
-    /// checkpoint, lost on host loss.
-    pub repo: String,
-    pub branch: String,
-    pub user_id: Option<String>,
-    /// Optional override for the warm image to use. If unset, the
-    /// coordinator picks the latest `ready` version for the repo.
-    pub image_version: Option<String>,
-    /// If true, the session clones its repo but never pushes back —
-    /// no checkpoint branch is allocated. Useful for code-review
-    /// agents that only read. Default false.
-    #[serde(default)]
-    pub read_only: bool,
-}
-
-/// Parsed `repo` field. Created once at session-create time and
-/// stored alongside the raw `repo` string so the original API-shape
-/// stays available for diagnostics / display.
+/// Identifies a baked image. Decoupled from "where the workspace
+/// comes from" — the same image can host git, local-mount, or
+/// empty workspaces. Only the registry-backed variant exists today;
+/// the enum leaves room for a future remote-OCI pull path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RepoUrl {
-    /// `git+https://...` / `git+ssh://...`. The contained string is
-    /// the URL with the `git+` prefix stripped (the form `git` itself
-    /// understands).
-    Git { url: String },
-    /// `local://<name>` — ephemeral local-only mode for dev. `name`
-    /// is just a label; nothing is cloned.
-    Local { name: String },
+pub enum ImageRef {
+    /// `<images_dir>/<repo>/<tag>/` against the local image registry.
+    /// `repo` here is a registry label, not a workspace identity —
+    /// nothing requires it to match `WorkspaceSpec::Git.url`.
+    Registry { repo: String, tag: String },
 }
 
-impl RepoUrl {
-    /// Parse the `repo` field on `POST /sessions`. The grammar is:
-    ///
-    /// - `git+https://...` or `git+ssh://...` → `Git`
-    /// - `local://<name>` → `Local { name }` (name is the path-and-
-    ///   query suffix, intended as a free-form label)
-    /// - Anything else → error. The legacy "any string is fine" shape
-    ///   is intentionally retired here; callers that want the old
-    ///   behaviour use `local://` explicitly.
-    pub fn parse(s: &str) -> Result<Self, RepoUrlError> {
-        if let Some(suffix) = s.strip_prefix("git+") {
-            // Reject empty url right after the prefix.
-            if suffix.is_empty() {
-                return Err(RepoUrlError::Empty);
-            }
-            return Ok(Self::Git {
-                url: suffix.to_string(),
-            });
-        }
-        if let Some(name) = s.strip_prefix("local://") {
-            // Allow empty name — useful for unit-test fixtures where
-            // the session has no real repo identity.
-            return Ok(Self::Local {
-                name: name.to_string(),
-            });
-        }
-        Err(RepoUrlError::UnknownScheme(s.to_string()))
-    }
-
-    /// Render back to the canonical input form. Round-trips through
-    /// `parse`.
-    pub fn as_string(&self) -> String {
+impl ImageRef {
+    pub fn repo(&self) -> &str {
         match self {
-            Self::Git { url } => format!("git+{url}"),
-            Self::Local { name } => format!("local://{name}"),
+            Self::Registry { repo, .. } => repo,
+        }
+    }
+
+    pub fn tag(&self) -> &str {
+        match self {
+            Self::Registry { tag, .. } => tag,
         }
     }
 }
 
-/// Error from [`RepoUrl::parse`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RepoUrlError {
+/// Where the user's code lives inside the VM at session time.
+/// Decoupled from `ImageRef` so a generic image (e.g. `react-toolchain`)
+/// can host any git URL, a host bind-mount, or nothing at all.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceSpec {
+    /// Boot with no workspace overlay. Whatever the image baked is
+    /// what's there. Pairs with `HarnessSpec::None` for the
+    /// "just give me a VM and a shell" mode.
     Empty,
-    UnknownScheme(String),
+
+    /// Clone a remote git repo into the VM at create time. `read_only`
+    /// suppresses the per-session checkpoint branch on the remote.
+    Git {
+        url: String,
+        branch: String,
+        #[serde(default)]
+        read_only: bool,
+    },
+
+    /// Bind a host directory into the VM via virtio-fs (VZ) or a
+    /// symlink (Process). Rejected on the Firecracker backend until
+    /// `virtiofsd` parity lands. `read_only` here is *mount-policy
+    /// only* — there is no remote, so checkpointing is never engaged.
+    LocalMount {
+        host_path: PathBuf,
+        guest_path: PathBuf,
+        #[serde(default)]
+        read_only: bool,
+    },
 }
 
-impl std::fmt::Display for RepoUrlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl WorkspaceSpec {
+    /// True if this workspace participates in the per-session
+    /// checkpoint branch (writable git only).
+    pub fn is_writable_git(&self) -> bool {
+        matches!(
+            self,
+            Self::Git {
+                read_only: false,
+                ..
+            }
+        )
+    }
+
+    /// The git URL of a Git workspace (writable or read-only). `None`
+    /// for non-git workspaces. Used by `engram session log/diff/fork`
+    /// and the checkpoint runner — neither makes sense without a remote.
+    pub fn git_url(&self) -> Option<&str> {
         match self {
-            Self::Empty => write!(f, "empty repo URL after `git+` prefix"),
-            Self::UnknownScheme(s) => write!(
-                f,
-                "unrecognised repo URL `{s}` — expected `git+https://...`, \
-                 `git+ssh://...`, or `local://<name>`"
-            ),
+            Self::Git { url, .. } => Some(url),
+            Self::Empty | Self::LocalMount { .. } => None,
+        }
+    }
+
+    /// Branch name of a Git workspace. `None` for non-git workspaces.
+    pub fn git_branch(&self) -> Option<&str> {
+        match self {
+            Self::Git { branch, .. } => Some(branch),
+            Self::Empty | Self::LocalMount { .. } => None,
         }
     }
 }
 
-impl std::error::Error for RepoUrlError {}
+/// What long-running agent process (if any) attaches to the session.
+/// `None` is the "VM with a shell" mode — engram-bootstrap runs but
+/// never receives a `BootstrapLaunch` frame.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HarnessSpec {
+    #[default]
+    None,
+    /// One of the harnesses declared in the image manifest's
+    /// `harnesses` array. The coordinator validates `name` against
+    /// the manifest at create time and returns 400 on mismatch.
+    Builtin { name: String },
+}
 
-/// What kind of session this is, derived from `repo` and `read_only`
-/// at create time. Persisted as a string; checked across the resume
-/// / checkpoint paths.
+impl HarnessSpec {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// User-facing request to create a session. Three orthogonal axes:
+/// image (immutable rootfs), workspace (where code comes from),
+/// harness (what agent attaches).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionSpec {
+    pub image: ImageRef,
+    pub workspace: WorkspaceSpec,
+    #[serde(default)]
+    pub harness: HarnessSpec,
+    pub user_id: Option<String>,
+}
+
+/// What kind of session this is, derived from `workspace` at create
+/// time. Persisted as a string so future variants extend without a
+/// schema migration. Drives checkpoint behavior:
+/// - `Git` allocates a checkpoint branch and pushes on each checkpoint.
+/// - `Readonly` clones at create but never pushes back.
+/// - `Ephemeral` has no remote — `LocalMount` and `Empty` workspaces
+///   both fall here regardless of their `read_only` flag (the flag is
+///   mount-policy on `LocalMount`, not checkpoint-policy).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
-    /// Real writable git session: clones at create, pushes to
-    /// `engram/sessions/<id>` on checkpoint, durable across host loss.
     Git,
-    /// `local://` ephemeral mode. Conversation events still land in
-    /// Postgres; workspace is lost on host loss.
-    Local,
-    /// Git URL but `read_only = true`: clones at create, never pushes
-    /// back, no checkpoint branch.
     Readonly,
+    Ephemeral,
 }
 
 impl SessionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Git => "git",
-            Self::Local => "local",
             Self::Readonly => "readonly",
+            Self::Ephemeral => "ephemeral",
         }
     }
 
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "git" => Ok(Self::Git),
-            "local" => Ok(Self::Local),
             "readonly" => Ok(Self::Readonly),
+            "ephemeral" => Ok(Self::Ephemeral),
             other => Err(format!("unknown session_kind: {other}")),
         }
     }
 
-    /// Derive the kind from a parsed `repo` URL + the `read_only` flag.
-    pub fn derive(repo: &RepoUrl, read_only: bool) -> Self {
-        match repo {
-            RepoUrl::Local { .. } => Self::Local,
-            RepoUrl::Git { .. } if read_only => Self::Readonly,
-            RepoUrl::Git { .. } => Self::Git,
+    /// Derive the kind from a parsed workspace spec.
+    pub fn derive(workspace: &WorkspaceSpec) -> Self {
+        match workspace {
+            WorkspaceSpec::Empty => Self::Ephemeral,
+            WorkspaceSpec::Git { read_only: true, .. } => Self::Readonly,
+            WorkspaceSpec::Git { .. } => Self::Git,
+            WorkspaceSpec::LocalMount { .. } => Self::Ephemeral,
         }
     }
 }
@@ -186,43 +214,29 @@ pub fn checkpoint_branch_for(session_id: SessionId) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
-    pub repo: String,
-    pub branch: String,
     pub user_id: Option<String>,
     pub status: SessionStatus,
-    pub image_version: String,
     pub host_id: Option<HostId>,
     /// In-memory `SandboxId` of the live sandbox serving this
-    /// session, persisted so a coordinator restart can rebuild its
-    /// in-memory routing maps from `SELECT ... FROM sessions WHERE
-    /// status NOT IN ('completed','failed')`. `None` for sessions in
-    /// `Pending` (sandbox not created yet) / `Idle` (sandbox evicted)
-    /// / `Dead` (host died, awaiting reschedule) /
+    /// session. `None` in `Pending` (sandbox not created yet) /
+    /// `Idle` (sandbox evicted) / `Dead` (host died) /
     /// `Completed` / `Failed`.
     #[serde(default)]
     pub sandbox_id: Option<SandboxId>,
-    /// Phase 4: derived from `SessionSpec::repo` + `read_only` at
-    /// create time. Persisted as a string ("git" | "local" | "readonly")
-    /// so future coordinator versions can extend without a schema
-    /// migration. Defaults to `Local` for backwards-compat with rows
-    /// inserted before the column existed.
-    #[serde(default = "default_session_kind")]
-    pub session_kind: SessionKind,
-    /// Phase 4: parsed `repo` (canonical form). `None` for legacy rows
-    /// that pre-date the column. New rows always populate this.
+    pub image: ImageRef,
+    pub workspace: WorkspaceSpec,
     #[serde(default)]
-    pub repo_url: Option<RepoUrl>,
-    /// Phase 4: `engram/sessions/<id>` for `SessionKind::Git`; `None`
-    /// for Local / Readonly. Set by the coord at session-create time;
+    pub harness: HarnessSpec,
+    /// Derived from `workspace` at create time. Persisted as a
+    /// string so the constraint can be widened in future migrations.
+    pub session_kind: SessionKind,
+    /// `engram/sessions/<id>` for `SessionKind::Git`; `None` for
+    /// `Readonly` / `Ephemeral`. Set by the coord at create time;
     /// stable across resumes.
     #[serde(default)]
     pub checkpoint_branch: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
-}
-
-fn default_session_kind() -> SessionKind {
-    SessionKind::Local
 }
 
 #[cfg(test)]
@@ -253,27 +267,173 @@ mod tests {
             SessionStatus::Failed,
         ] {
             let via_serde = serde_json::to_string(&s).unwrap();
-            // strip the surrounding quotes from the JSON string
             let trimmed = via_serde.trim_matches('"');
             assert_eq!(s.as_str(), trimmed, "as_str must match wire format");
         }
     }
 
     #[test]
-    fn session_roundtrips_through_json() {
+    fn image_ref_accessors() {
+        let img = ImageRef::Registry {
+            repo: "cortex/api".into(),
+            tag: "warm-2026".into(),
+        };
+        assert_eq!(img.repo(), "cortex/api");
+        assert_eq!(img.tag(), "warm-2026");
+    }
+
+    #[test]
+    fn workspace_helpers_match_variants() {
+        let empty = WorkspaceSpec::Empty;
+        assert_eq!(empty.git_url(), None);
+        assert_eq!(empty.git_branch(), None);
+        assert!(!empty.is_writable_git());
+
+        let git_rw = WorkspaceSpec::Git {
+            url: "https://x/y.git".into(),
+            branch: "main".into(),
+            read_only: false,
+        };
+        assert_eq!(git_rw.git_url(), Some("https://x/y.git"));
+        assert_eq!(git_rw.git_branch(), Some("main"));
+        assert!(git_rw.is_writable_git());
+
+        let git_ro = WorkspaceSpec::Git {
+            url: "https://x/y.git".into(),
+            branch: "main".into(),
+            read_only: true,
+        };
+        assert!(!git_ro.is_writable_git());
+
+        let mount = WorkspaceSpec::LocalMount {
+            host_path: "/Users/me/code".into(),
+            guest_path: "/workspace".into(),
+            read_only: false,
+        };
+        assert_eq!(mount.git_url(), None);
+        assert!(!mount.is_writable_git());
+    }
+
+    #[test]
+    fn session_kind_derive_covers_every_workspace_variant() {
+        assert_eq!(
+            SessionKind::derive(&WorkspaceSpec::Empty),
+            SessionKind::Ephemeral
+        );
+        assert_eq!(
+            SessionKind::derive(&WorkspaceSpec::Git {
+                url: "u".into(),
+                branch: "b".into(),
+                read_only: false
+            }),
+            SessionKind::Git
+        );
+        assert_eq!(
+            SessionKind::derive(&WorkspaceSpec::Git {
+                url: "u".into(),
+                branch: "b".into(),
+                read_only: true
+            }),
+            SessionKind::Readonly
+        );
+        // LocalMount is always Ephemeral — the read_only flag here
+        // is mount-policy only, not checkpoint-policy.
+        for ro in [false, true] {
+            assert_eq!(
+                SessionKind::derive(&WorkspaceSpec::LocalMount {
+                    host_path: "/h".into(),
+                    guest_path: "/g".into(),
+                    read_only: ro,
+                }),
+                SessionKind::Ephemeral
+            );
+        }
+    }
+
+    #[test]
+    fn session_kind_round_trips_via_as_str_parse() {
+        for k in [SessionKind::Git, SessionKind::Readonly, SessionKind::Ephemeral] {
+            assert_eq!(SessionKind::parse(k.as_str()).unwrap(), k);
+        }
+        assert!(SessionKind::parse("local").is_err());
+        assert!(SessionKind::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn harness_spec_default_is_none() {
+        assert!(HarnessSpec::default().is_none());
+        assert!(!HarnessSpec::Builtin { name: "claude".into() }.is_none());
+    }
+
+    #[test]
+    fn workspace_spec_round_trips_through_json() {
+        let cases = vec![
+            WorkspaceSpec::Empty,
+            WorkspaceSpec::Git {
+                url: "https://github.com/x/y.git".into(),
+                branch: "main".into(),
+                read_only: false,
+            },
+            WorkspaceSpec::LocalMount {
+                host_path: "/Users/me/code".into(),
+                guest_path: "/workspace".into(),
+                read_only: true,
+            },
+        ];
+        for ws in cases {
+            let blob = serde_json::to_string(&ws).unwrap();
+            let back: WorkspaceSpec = serde_json::from_str(&blob).unwrap();
+            assert_eq!(back, ws);
+        }
+    }
+
+    #[test]
+    fn harness_spec_round_trips_through_json() {
+        let cases = vec![
+            HarnessSpec::None,
+            HarnessSpec::Builtin {
+                name: "claude".into(),
+            },
+        ];
+        for h in cases {
+            let blob = serde_json::to_string(&h).unwrap();
+            let back: HarnessSpec = serde_json::from_str(&blob).unwrap();
+            assert_eq!(back, h);
+        }
+    }
+
+    #[test]
+    fn image_ref_round_trips_through_json() {
+        let img = ImageRef::Registry {
+            repo: "cortex/api".into(),
+            tag: "warm-2026".into(),
+        };
+        let blob = serde_json::to_string(&img).unwrap();
+        let back: ImageRef = serde_json::from_str(&blob).unwrap();
+        assert_eq!(back, img);
+    }
+
+    #[test]
+    fn session_round_trips_through_json() {
         let original = Session {
             id: SessionId::new(),
-            repo: "git+https://github.com/cortex/api.git".into(),
-            branch: "main".into(),
             user_id: Some("u1".into()),
             status: SessionStatus::Active,
-            image_version: "warm-20260101T000000Z".into(),
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
-            session_kind: SessionKind::Git,
-            repo_url: Some(RepoUrl::Git {
+            image: ImageRef::Registry {
+                repo: "cortex/api".into(),
+                tag: "warm-20260101T000000Z".into(),
+            },
+            workspace: WorkspaceSpec::Git {
                 url: "https://github.com/cortex/api.git".into(),
-            }),
+                branch: "main".into(),
+                read_only: false,
+            },
+            harness: HarnessSpec::Builtin {
+                name: "claude".into(),
+            },
+            session_kind: SessionKind::Git,
             checkpoint_branch: Some(checkpoint_branch_for(SessionId::new())),
             created_at: Utc::now(),
             last_active_at: Utc::now(),
@@ -281,79 +441,11 @@ mod tests {
         let blob = serde_json::to_string(&original).unwrap();
         let back: Session = serde_json::from_str(&blob).unwrap();
         assert_eq!(back.id, original.id);
-        assert_eq!(back.repo, original.repo);
-        assert_eq!(back.branch, original.branch);
-        assert_eq!(back.user_id, original.user_id);
-        assert_eq!(back.status, original.status);
-        assert_eq!(back.image_version, original.image_version);
-        assert_eq!(back.host_id, original.host_id);
-        assert_eq!(back.session_kind, SessionKind::Git);
-        assert_eq!(back.repo_url, original.repo_url);
+        assert_eq!(back.image, original.image);
+        assert_eq!(back.workspace, original.workspace);
+        assert_eq!(back.harness, original.harness);
+        assert_eq!(back.session_kind, original.session_kind);
         assert_eq!(back.checkpoint_branch, original.checkpoint_branch);
-    }
-
-    #[test]
-    fn repo_url_parses_git_and_local_schemes() {
-        match RepoUrl::parse("git+https://github.com/cortex/api.git").unwrap() {
-            RepoUrl::Git { url } => assert_eq!(url, "https://github.com/cortex/api.git"),
-            other => panic!("expected Git, got {other:?}"),
-        }
-        match RepoUrl::parse("git+ssh://git@github.com:cortex/api.git").unwrap() {
-            RepoUrl::Git { url } => assert_eq!(url, "ssh://git@github.com:cortex/api.git"),
-            other => panic!("expected Git, got {other:?}"),
-        }
-        match RepoUrl::parse("local://hello").unwrap() {
-            RepoUrl::Local { name } => assert_eq!(name, "hello"),
-            other => panic!("expected Local, got {other:?}"),
-        }
-        // Empty `local://` is permitted (test fixture shape).
-        match RepoUrl::parse("local://").unwrap() {
-            RepoUrl::Local { name } => assert!(name.is_empty()),
-            other => panic!("expected Local, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn repo_url_rejects_unknown_schemes_and_empty() {
-        // The legacy "anything goes" shape (`repo: "hello"`) is now
-        // rejected — callers must say `local://hello` or `git+...`.
-        // Forces explicit intent at the API boundary.
-        assert!(matches!(
-            RepoUrl::parse("hello"),
-            Err(RepoUrlError::UnknownScheme(_))
-        ));
-        assert!(matches!(
-            RepoUrl::parse("https://github.com/foo"),
-            Err(RepoUrlError::UnknownScheme(_))
-        ));
-        assert!(matches!(RepoUrl::parse("git+"), Err(RepoUrlError::Empty)));
-    }
-
-    #[test]
-    fn repo_url_round_trips_via_as_string() {
-        for input in [
-            "git+https://github.com/x/y.git",
-            "git+ssh://git@host/y.git",
-            "local://hello",
-            "local://",
-        ] {
-            let parsed = RepoUrl::parse(input).unwrap();
-            assert_eq!(parsed.as_string(), input);
-        }
-    }
-
-    #[test]
-    fn session_kind_derive_combines_repo_and_read_only() {
-        let git = RepoUrl::Git {
-            url: "https://x/y.git".into(),
-        };
-        let local = RepoUrl::Local { name: "h".into() };
-        assert_eq!(SessionKind::derive(&git, false), SessionKind::Git);
-        assert_eq!(SessionKind::derive(&git, true), SessionKind::Readonly);
-        assert_eq!(SessionKind::derive(&local, false), SessionKind::Local);
-        // `read_only = true` on a Local repo is meaningless but not
-        // an error — kind stays Local.
-        assert_eq!(SessionKind::derive(&local, true), SessionKind::Local);
     }
 
     #[test]
@@ -362,13 +454,5 @@ mod tests {
         let branch = checkpoint_branch_for(id);
         assert!(branch.starts_with("engram/sessions/"));
         assert!(branch.ends_with(&id.to_string()));
-    }
-
-    #[test]
-    fn session_kind_round_trips_via_as_str_parse() {
-        for k in [SessionKind::Git, SessionKind::Local, SessionKind::Readonly] {
-            assert_eq!(SessionKind::parse(k.as_str()).unwrap(), k);
-        }
-        assert!(SessionKind::parse("bogus").is_err());
     }
 }

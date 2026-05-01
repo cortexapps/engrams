@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
+use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 use engram_core::types::{
     HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
     SnapshotRecord,
@@ -59,41 +59,36 @@ fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
 
 #[async_trait]
 impl MetadataStore for PostgresStore {
-    async fn create_session(
-        &self,
-        spec: SessionSpec,
-        image_version: String,
-    ) -> Result<SessionId, MetaError> {
+    async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
-        // Phase 4: parse the repo URL up-front so we persist a
-        // canonical `repo_url`, derive `session_kind`, and allocate
-        // a checkpoint branch for writable git sessions. A malformed
-        // repo string fails the create — caller's bug, surface as
-        // Conflict (not NotFound).
-        let parsed = RepoUrl::parse(&spec.repo).map_err(|e| MetaError::Conflict(e.to_string()))?;
-        let kind = SessionKind::derive(&parsed, spec.read_only);
+        let kind = SessionKind::derive(&spec.workspace);
         let checkpoint_branch = match kind {
             SessionKind::Git => Some(checkpoint_branch_for(SessionId(id))),
-            SessionKind::Local | SessionKind::Readonly => None,
+            SessionKind::Readonly | SessionKind::Ephemeral => None,
         };
+        let workspace_json = serde_json::to_value(&spec.workspace)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let harness_json = serde_json::to_value(&spec.harness)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, repo, branch, user_id, status, image_version, host_id,
-                 session_kind, repo_url, checkpoint_branch,
+                (id, user_id, status, host_id,
+                 image_repo, image_tag, workspace, harness,
+                 session_kind, checkpoint_branch,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $10)
+            VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $10)
             "#,
         )
         .bind(id)
-        .bind(&spec.repo)
-        .bind(&spec.branch)
         .bind(spec.user_id.as_deref())
         .bind(SessionStatus::Pending.as_str())
-        .bind(&image_version)
+        .bind(spec.image.repo())
+        .bind(spec.image.tag())
+        .bind(workspace_json)
+        .bind(harness_json)
         .bind(kind.as_str())
-        .bind(parsed.as_string())
         .bind(checkpoint_branch.as_deref())
         .bind(now)
         .execute(&self.pool)
@@ -105,8 +100,9 @@ impl MetadataStore for PostgresStore {
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, repo, branch, user_id, status, image_version, host_id,
-                   sandbox_id, session_kind, repo_url, checkpoint_branch,
+            SELECT id, user_id, status, host_id, sandbox_id,
+                   image_repo, image_tag, workspace, harness,
+                   session_kind, checkpoint_branch,
                    created_at, last_active_at
             FROM sessions WHERE id = $1
             "#,
@@ -122,8 +118,9 @@ impl MetadataStore for PostgresStore {
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, repo, branch, user_id, status, image_version, host_id,
-                   sandbox_id, session_kind, repo_url, checkpoint_branch,
+            SELECT id, user_id, status, host_id, sandbox_id,
+                   image_repo, image_tag, workspace, harness,
+                   session_kind, checkpoint_branch,
                    created_at, last_active_at
             FROM sessions
             WHERE status IN ('pending','active','idle')

@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
+use engram_core::types::session::{HarnessSpec, ImageRef, WorkspaceSpec};
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionStatus};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -195,22 +196,28 @@ pub async fn create_session(
         .await
         .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
 
-    let spec = SessionSpec {
+    // Phase 0 transition: the wire shape still carries the legacy
+    // `repo`/`branch`/`read_only` fields, but the persisted row now
+    // splits these into independent `image` / `workspace` / `harness`
+    // axes. The wire-level rewrite lands in Phase 2; this adapter
+    // is the seam between the two.
+    let workspace = legacy_workspace_from_request(&req.repo, &req.branch, req.read_only)?;
+    let image = ImageRef::Registry {
         repo: req.repo.clone(),
-        branch: req.branch,
+        tag: image_version.clone(),
+    };
+    let harness = harness_from_dev_cfg(state.cfg.dev_auto_agent);
+    let spec = SessionSpec {
+        image,
+        workspace,
+        harness,
         user_id: req.user_id,
-        image_version: Some(image_version.clone()),
-        read_only: req.read_only,
     };
 
     // 1. Persist the session row first so it has a stable SessionId
     //    even if sandbox creation fails — the failure is then
     //    observable as a session row stuck in `failed`.
-    let session_id = state
-        .services
-        .meta
-        .create_session(spec, image_version.clone())
-        .await?;
+    let session_id = state.services.meta.create_session(spec).await?;
 
     // 2. Build the *anonymous* SandboxSpec — what every sandbox in
     //    this (repo, image_version) pool gets. Session-specific env
@@ -474,6 +481,48 @@ pub async fn delete_session(
         .await?;
     state.harness_hub.unbind_session(id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Phase-0 transition shim. Translate the legacy `repo` URL scheme
+/// (`git+https://...` / `git+ssh://...` / `local://<name>` / bare
+/// label) into the new `WorkspaceSpec`. The wire-level rewrite —
+/// splitting workspace from image identity at the API boundary —
+/// lands in Phase 2; until then this function is the only place the
+/// legacy parsing rules live. Bare labels are accepted and mapped to
+/// `Empty`, matching the lenient behaviour the in-process tests
+/// already relied on.
+fn legacy_workspace_from_request(
+    repo: &str,
+    branch: &str,
+    read_only: bool,
+) -> Result<WorkspaceSpec, ApiError> {
+    if let Some(url) = repo.strip_prefix("git+") {
+        if url.is_empty() {
+            return Err(ApiError::BadRequest(
+                "empty repo URL after `git+` prefix".into(),
+            ));
+        }
+        return Ok(WorkspaceSpec::Git {
+            url: url.to_string(),
+            branch: branch.to_string(),
+            read_only,
+        });
+    }
+    // `local://<name>` was always just a label; nothing was mounted
+    // or cloned. Bare labels (no scheme) get the same treatment.
+    Ok(WorkspaceSpec::Empty)
+}
+
+/// Phase-0 transition shim. Stamp the row's `harness` column from the
+/// global `cfg.dev_auto_agent`. Phase 2 replaces this with a per-
+/// request `HarnessSpec` carried on `CreateSessionRequest`.
+fn harness_from_dev_cfg(dev: Option<crate::config::DevAgent>) -> HarnessSpec {
+    match dev {
+        Some(a) => HarnessSpec::Builtin {
+            name: a.as_str().into(),
+        },
+        None => HarnessSpec::None,
+    }
 }
 
 /// Build the `AgentSpec` for whichever dev harness `cfg.dev_auto_agent`

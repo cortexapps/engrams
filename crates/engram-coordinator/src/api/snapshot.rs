@@ -255,8 +255,8 @@ async fn resume_from_fc_snapshot(
     }
     let session_for_ctx = session.clone();
     let ctx = ScheduleContext {
-        repo: &session_for_ctx.repo,
-        image_version: &session_for_ctx.image_version,
+        repo: session_for_ctx.image.repo(),
+        image_version: session_for_ctx.image.tag(),
         prefer_snapshot_id: Some(record.id),
         memory_mib: None,
     };

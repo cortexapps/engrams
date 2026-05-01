@@ -265,7 +265,9 @@ mod tests {
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::{CloudBackend, SandboxBackend};
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
+    use engram_core::types::session::{
+        checkpoint_branch_for, HarnessSpec, ImageRef, SessionKind, WorkspaceSpec,
+    };
     use engram_core::types::Session;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
@@ -375,17 +377,21 @@ mod tests {
         let branch = checkpoint_branch_for(session_id);
         let session = Session {
             id: session_id,
-            repo: format!("git+file://{}", remote.path().display()),
-            branch: "main".into(),
             user_id: None,
             status: SessionStatus::Active,
-            image_version: "drain-test".into(),
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,
-            session_kind: SessionKind::Git,
-            repo_url: Some(RepoUrl::Git {
+            image: ImageRef::Registry {
+                repo: "test/repo".into(),
+                tag: "drain-test".into(),
+            },
+            workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
-            }),
+                branch: "main".into(),
+                read_only: false,
+            },
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Git,
             checkpoint_branch: Some(branch.clone()),
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
@@ -474,17 +480,21 @@ mod tests {
         let branch = checkpoint_branch_for(session_id);
         let session = Session {
             id: session_id,
-            repo: format!("git+file://{}", remote.path().display()),
-            branch: "main".into(),
             user_id: None,
             status: SessionStatus::Active,
-            image_version: "drain-test".into(),
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,
-            session_kind: SessionKind::Git,
-            repo_url: Some(RepoUrl::Git {
+            image: ImageRef::Registry {
+                repo: "test/repo".into(),
+                tag: "drain-test".into(),
+            },
+            workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
-            }),
+                branch: "main".into(),
+                read_only: false,
+            },
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Git,
             checkpoint_branch: Some(branch.clone()),
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),

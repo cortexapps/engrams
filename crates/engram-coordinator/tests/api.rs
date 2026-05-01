@@ -80,41 +80,26 @@ impl MockMetadataStore {
 
 #[async_trait]
 impl MetadataStore for MockMetadataStore {
-    async fn create_session(
-        &self,
-        spec: SessionSpec,
-        image_version: String,
-    ) -> Result<SessionId, MetaError> {
-        use engram_core::types::session::{checkpoint_branch_for, RepoUrl, SessionKind};
+    async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
+        use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 
         let id = SessionId::new();
-        // Match PostgresStore's behaviour: parse the repo URL,
-        // derive session_kind, allocate a checkpoint branch for
-        // writable Git sessions. Falls back to Local on parse error
-        // so legacy test cases passing bare strings (`repo: "r"`)
-        // continue to work as ephemeral sessions rather than fail
-        // the test setup.
-        let parsed = RepoUrl::parse(&spec.repo).ok();
-        let kind = parsed
-            .as_ref()
-            .map(|p| SessionKind::derive(p, spec.read_only))
-            .unwrap_or(SessionKind::Local);
-        let checkpoint_branch = match kind {
+        let session_kind = SessionKind::derive(&spec.workspace);
+        let checkpoint_branch = match session_kind {
             SessionKind::Git => Some(checkpoint_branch_for(id)),
             _ => None,
         };
         let session = Session {
             id,
-            repo: spec.repo,
-            branch: spec.branch,
             user_id: spec.user_id,
             status: SessionStatus::Pending,
-            image_version,
             host_id: None,
             sandbox_id: None,
             created_at: Utc::now(),
-            session_kind: kind,
-            repo_url: parsed,
+            image: spec.image,
+            workspace: spec.workspace,
+            harness: spec.harness,
+            session_kind,
             checkpoint_branch,
             last_active_at: Utc::now(),
         };
@@ -627,9 +612,9 @@ async fn create_session_uses_default_image_when_none_ready() {
     // Round-trip GET /sessions/:id should match what we created.
     let id: SessionId = id_str.parse().unwrap();
     let session = store.get_session(id).await.unwrap();
-    assert_eq!(session.repo, "cortex/api");
-    assert_eq!(session.branch, "main");
-    assert_eq!(session.image_version, "warm-bootstrap");
+    assert_eq!(session.image.repo(), "cortex/api");
+    assert_eq!(session.image.tag(), "warm-bootstrap");
+    assert_eq!(session.workspace.git_branch(), None);
     assert_eq!(session.status, SessionStatus::Active);
 }
 
@@ -742,13 +727,14 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
         store
             .create_session(
                 SessionSpec {
-                    repo: repo.into(),
-                    branch: "main".into(),
+                    image: engram_core::types::session::ImageRef::Registry {
+                        repo: repo.into(),
+                        tag: "warm-bootstrap".into(),
+                    },
+                    workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                    harness: engram_core::types::session::HarnessSpec::None,
                     user_id: None,
-                    image_version: None,
-                    read_only: false,
                 },
-                "warm-bootstrap".into(),
             )
             .await
             .unwrap()
@@ -794,16 +780,21 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
 async fn list_sessions_serializes_full_session_record() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
                 repo: "cortex/api".into(),
+                tag: "warm-2026-04-27".into(),
+            },
+            workspace: engram_core::types::session::WorkspaceSpec::Git {
+                url: "https://github.com/cortex/api.git".into(),
                 branch: "trunk".into(),
-                user_id: Some("user-42".into()),
-                image_version: None,
                 read_only: false,
             },
-            "warm-2026-04-27".into(),
-        )
+            harness: engram_core::types::session::HarnessSpec::Builtin {
+                name: "claude".into(),
+            },
+            user_id: Some("user-42".into()),
+        })
         .await
         .unwrap();
 
@@ -821,10 +812,16 @@ async fn list_sessions_serializes_full_session_record() {
         .find(|s| s["id"] == id.to_string())
         .expect("created session must be in the list");
     // Lock the wire shape so a CLI / web client can rely on it.
-    assert_eq!(item["repo"], "cortex/api");
-    assert_eq!(item["branch"], "trunk");
+    assert_eq!(item["image"]["kind"], "registry");
+    assert_eq!(item["image"]["repo"], "cortex/api");
+    assert_eq!(item["image"]["tag"], "warm-2026-04-27");
+    assert_eq!(item["workspace"]["kind"], "git");
+    assert_eq!(item["workspace"]["url"], "https://github.com/cortex/api.git");
+    assert_eq!(item["workspace"]["branch"], "trunk");
+    assert_eq!(item["workspace"]["read_only"], false);
+    assert_eq!(item["harness"]["kind"], "builtin");
+    assert_eq!(item["harness"]["name"], "claude");
     assert_eq!(item["user_id"], "user-42");
-    assert_eq!(item["image_version"], "warm-2026-04-27");
     assert_eq!(item["status"], SessionStatus::Pending.as_str());
     assert!(item["created_at"].is_string());
     assert!(item["last_active_at"].is_string());
@@ -836,13 +833,14 @@ async fn delete_session_marks_completed_and_returns_204() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1040,13 +1038,14 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1356,13 +1355,14 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1435,13 +1435,14 @@ async fn evict_local_409_when_session_not_active() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1471,13 +1472,14 @@ async fn resume_410_gone_when_no_snapshot_exists() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1550,13 +1552,14 @@ async fn exec_rejects_request_without_command_or_argv() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1579,13 +1582,14 @@ async fn exec_rejects_empty_argv() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -1781,13 +1785,14 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
     let id = store
         .create_session(
             SessionSpec {
-                repo: "r".into(),
-                branch: "main".into(),
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: "r".into(),
+                    tag: "warm-bootstrap".into(),
+                },
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
-                image_version: None,
-                read_only: false,
             },
-            "warm-bootstrap".into(),
         )
         .await
         .unwrap();
@@ -2700,11 +2705,11 @@ async fn persistent_log_captures_lifecycle_and_exec_kinds() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn checkpoint_returns_409_for_local_session() {
-    // The default test fixture's `repo: "r"` parses as a Local-kind
-    // session (RepoUrl::parse rejects bare strings; the Mock falls
-    // back to Local). Local sessions have no checkpoint branch and
-    // the endpoint must refuse explicitly with 409.
+async fn checkpoint_returns_409_for_ephemeral_session() {
+    // Bare `repo: "r"` lands as a `WorkspaceSpec::Empty` session via
+    // the legacy adapter, which derives `SessionKind::Ephemeral`.
+    // Ephemeral sessions have no checkpoint branch and the endpoint
+    // must refuse explicitly with 409.
     let store = MockMetadataStore::arc();
     let app = build_app(store);
     let id = api_create_session(app.clone(), "r").await;
@@ -2713,7 +2718,7 @@ async fn checkpoint_returns_409_for_local_session() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let v = body_json(resp.into_body()).await;
     assert!(
-        v["message"].as_str().unwrap_or("").contains("local"),
+        v["message"].as_str().unwrap_or("").contains("ephemeral"),
         "error must call out the session_kind: got {v}",
     );
 }
