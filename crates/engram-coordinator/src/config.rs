@@ -12,9 +12,9 @@ pub struct CoordinatorConfig {
     pub local_path: PathBuf,
     pub sandbox_backend: SandboxBackendChoice,
     pub default_image_version: String,
-    /// Target warm-pool size for any (repo, image_version) the
-    /// coordinator has seen a session for. 0 disables the warm pool
-    /// (every session creates a fresh sandbox synchronously).
+    /// Target warm-pool size for any image the coordinator has seen
+    /// a session for. 0 disables the warm pool (every session creates
+    /// a fresh sandbox synchronously).
     pub default_warm_pool_size: u32,
     /// Bearer tokens accepted on protected endpoints. Empty = auth
     /// disabled (dev mode). When non-empty, every request to anything
@@ -26,58 +26,11 @@ pub struct CoordinatorConfig {
     /// the process; for v1 we don't hot-reload.
     pub auth_tokens: Vec<String>,
     /// Local address the harness-channel TCP listener binds to.
-    /// Harnesses spawned via `SandboxSpec::agent` dial this from the
-    /// same host. `127.0.0.1:0` (default) lets the OS pick a free
-    /// port; the coordinator reads back the bound address and
-    /// plumbs it into the agent's env at session-create time.
+    /// Harnesses spawned via `start_agent` on the Process backend dial
+    /// this from the same host. `127.0.0.1:0` (default) lets the OS
+    /// pick a free port; the coordinator reads back the bound address
+    /// and plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
-    /// Path to the dev `engram-harness-noop` binary. When
-    /// `dev_auto_agent = Some(Noop)`, the coordinator stamps this into
-    /// `SandboxSpec::agent.argv[0]` for any new Git/Local session
-    /// that doesn't already declare an agent. None disables
-    /// auto-spawn even when `dev_auto_agent = Some(Noop)`.
-    pub dev_noop_harness_path: Option<PathBuf>,
-    /// Path to the dev `engram-harness-claude` binary. Symmetric to
-    /// `dev_noop_harness_path`. For Firecracker, this is the in-rootfs
-    /// path (typically `/sbin/engram-harness-claude`). For Process,
-    /// it's a host path.
-    pub dev_claude_harness_path: Option<PathBuf>,
-    /// Auto-spawn a harness for every new session in dev. None = off.
-    /// Set via `ENGRAM_DEV_AUTO_AGENT=noop|claude`. Implies the
-    /// corresponding `dev_*_harness_path` is set.
-    pub dev_auto_agent: Option<DevAgent>,
-}
-
-/// Which adapter the dev coordinator auto-spawns inside every new
-/// sandbox. Each variant has a corresponding `dev_*_harness_path`
-/// field that must be set for the auto-spawn to take effect.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DevAgent {
-    /// `engram-harness-noop` — predictable fake tool calls, used for
-    /// integration tests and as the default demo harness.
-    Noop,
-    /// `engram-harness-claude` — wraps the real `claude` CLI, requires
-    /// `ANTHROPIC_API_KEY` in the operator's env.
-    Claude,
-}
-
-impl DevAgent {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "noop" => Ok(Self::Noop),
-            "claude" => Ok(Self::Claude),
-            other => Err(format!("invalid dev agent: {other} (expected noop|claude)")),
-        }
-    }
-
-    /// Stable string used for the harness `name` in
-    /// `HarnessSpec::Builtin`. Round-trips with `parse`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Noop => "noop",
-            Self::Claude => "claude",
-        }
-    }
 }
 
 impl Default for CoordinatorConfig {
@@ -90,9 +43,9 @@ impl Default for CoordinatorConfig {
             local_path: PathBuf::from("./var/engram"),
             sandbox_backend: SandboxBackendChoice::Process,
             default_image_version: "warm-bootstrap".into(),
-            // Modest dev default: one warm sandbox per (repo, image)
-            // so the second session checkout is sub-second. Production
-            // tunes this per-repo via the per-host-agent config.
+            // Modest dev default: one warm sandbox per image so the
+            // second session checkout is sub-second. Production tunes
+            // this per-image via the per-host-agent config.
             default_warm_pool_size: 1,
             // Empty = auth disabled. Production deployments populate
             // this from `ENGRAM_AUTH_TOKENS` (or a future secret-store
@@ -101,9 +54,6 @@ impl Default for CoordinatorConfig {
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),
-            dev_noop_harness_path: None,
-            dev_claude_harness_path: None,
-            dev_auto_agent: None,
         }
     }
 }
