@@ -1,53 +1,64 @@
 //! Host-side harness registry.
 //!
-//! Harness binaries live OUTSIDE images now. The host owns a directory
-//! (configured via `cfg.harnesses_dir`, default `<local_path>/harnesses`)
-//! whose entries are the closed set of `HarnessSpec::Builtin{name}`
-//! values a session can reference. The directory is mounted read-only
-//! into every sandbox via virtio-fs (VZ today, FC after virtiofsd
-//! parity), so the in-VM bootstrap exec's the binary off the shared
-//! mount — no per-image bake step.
+//! Each harness is a *directory* under `cfg.harnesses_dir` containing
+//! at least one file named `harness` (the entry point bootstrap
+//! exec's). Sidecar binaries — Bun-bundled `claude`, future runtime
+//! deps — live alongside in the same directory and are resolved
+//! relative to `argv[0]` by the harness wrapper itself.
 //!
-//! Why this lives at the coord and not on a per-image manifest:
-//! harness selection is a deployment-wide concern (one operator
-//! decides which agents are available across all images / sessions),
-//! whereas image identity is workspace-runtime concern (Java vs Node
-//! vs whatever). Conflating them in `engram.toml` was the original
-//! sin we're undoing here.
+//! Why directories instead of single binaries: it keeps each harness
+//! self-contained. The `claude` harness ships its bundled CLI next to
+//! the wrapper; a future Python-based harness could ship its
+//! interpreter the same way. The image stops needing node / python /
+//! whatever — it only carries what the *workspace* runtime needs.
 //!
-//! The registry is built once at startup by scanning the directory
-//! for executable files. Re-scanning on demand isn't supported in v1
-//! — operators add a binary, restart the coord. Live reload can land
+//! Layout on the host:
+//!
+//! ```text
+//! <cfg.harnesses_dir>/
+//!   claude/
+//!     harness         (engram-harness-claude wrapper)
+//!     claude          (bundled Bun-CLI binary)
+//!   noop/
+//!     harness         (engram-harness-noop wrapper, no sidecar)
+//! ```
+//!
+//! Mounted into every sandbox at `/run/engram/harnesses` read-only.
+//! Bootstrap exec's `/run/engram/harnesses/<name>/harness`.
+//!
+//! The registry scans on startup and re-scanning is not supported
+//! — operators add a pack, restart the coord. Live reload can land
 //! later if it bites.
 
 use std::path::{Path, PathBuf};
 
-/// One harness available on this host. The name is the file stem of
-/// the binary in `harnesses_dir`. Description is currently empty —
-/// future work may parse a sidecar `<name>.toml` if richer metadata
-/// becomes useful.
+/// One harness pack available on this host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HarnessEntry {
     pub name: String,
+    /// Host path to the entry-point binary (`<dir>/harness`). The
+    /// wrapper finds its sidecars relative to `argv[0]`, so we don't
+    /// surface those here.
     pub host_path: PathBuf,
+    /// Free-form one-liner for the dashboard's dropdown label.
     pub description: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct HarnessRegistry {
-    /// Where the binaries live on the host. Mounted into sandboxes
-    /// at [`HarnessRegistry::guest_mount_path`] read-only.
     host_dir: PathBuf,
     entries: Vec<HarnessEntry>,
 }
 
+const ENTRY_POINT_NAME: &str = "harness";
+
 impl HarnessRegistry {
-    /// Build a registry by scanning `host_dir` for executable files.
-    /// Missing dir is not an error — the registry is just empty
-    /// (sessions with `harness=none` still work). Names that
-    /// collide with reserved characters (`/`, leading dot) are
-    /// skipped silently — the operator has filename hygiene to keep
-    /// the namespace clean.
+    /// Build a registry by scanning `host_dir` for harness packs.
+    /// Each subdirectory becomes a harness named after the directory,
+    /// provided it contains an executable file named `harness`. Other
+    /// shapes are skipped silently — operators have filename hygiene
+    /// to keep the namespace clean. A missing `host_dir` is not an
+    /// error: the registry is just empty.
     pub fn from_dir(host_dir: PathBuf) -> std::io::Result<Self> {
         let mut entries = Vec::new();
         if !host_dir.exists() {
@@ -60,21 +71,28 @@ impl HarnessRegistry {
         let read_dir = std::fs::read_dir(&host_dir)?;
         for ent in read_dir {
             let ent = ent?;
-            let path = ent.path();
-            if !path.is_file() {
+            let pack_dir = ent.path();
+            if !pack_dir.is_dir() {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            let Some(name) = pack_dir.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            // Filenames starting with `.` are convention-hidden;
-            // skip so editor swap files / DS_Store don't pollute.
             if name.starts_with('.') {
+                continue;
+            }
+            let entry_point = pack_dir.join(ENTRY_POINT_NAME);
+            if !entry_point.is_file() {
+                tracing::warn!(
+                    name = %name,
+                    expected = %entry_point.display(),
+                    "skipping harness pack: missing `harness` entry-point file",
+                );
                 continue;
             }
             entries.push(HarnessEntry {
                 name: name.to_string(),
-                host_path: path,
+                host_path: entry_point,
                 description: None,
             });
         }
@@ -100,21 +118,16 @@ impl HarnessRegistry {
         &self.entries
     }
 
-    /// Resolve a harness name. Returns the registry entry; the caller
-    /// uses [`HarnessRegistry::guest_mount_path`] to construct the
-    /// in-VM argv since the host path doesn't apply on FC/VZ.
     pub fn lookup(&self, name: &str) -> Option<&HarnessEntry> {
         self.entries.iter().find(|e| e.name == name)
     }
 
-    /// Path on the host the registry is rooted at. Sandboxes mount
-    /// this directory read-only at [`HarnessRegistry::guest_mount_path`].
     pub fn host_dir(&self) -> &Path {
         &self.host_dir
     }
 
-    /// In-VM mount point. The bootstrap supervisor exec's
-    /// `<guest_mount_path>/<name>` for `HarnessSpec::Builtin{name}`.
+    /// In-VM mount point. The pack tree is mounted here read-only;
+    /// `<mount>/<name>/harness` is what bootstrap exec's.
     pub fn guest_mount_path() -> &'static Path {
         Path::new("/run/engram/harnesses")
     }
@@ -122,7 +135,12 @@ impl HarnessRegistry {
     /// Argv[0] for a session asking for `name`. Used by
     /// `resolve_harness` to build the `BootstrapLaunch` payload.
     pub fn guest_argv0(name: &str) -> String {
-        format!("{}/{}", Self::guest_mount_path().display(), name)
+        format!(
+            "{}/{}/{}",
+            Self::guest_mount_path().display(),
+            name,
+            ENTRY_POINT_NAME,
+        )
     }
 }
 
@@ -140,6 +158,16 @@ mod tests {
         std::fs::set_permissions(&p, perms).unwrap();
     }
 
+    /// Build a harness pack: `<dir>/<name>/harness`, plus optional sidecars.
+    fn write_pack(dir: &Path, name: &str, sidecars: &[&str]) {
+        let pack = dir.join(name);
+        std::fs::create_dir_all(&pack).unwrap();
+        write_executable(&pack, ENTRY_POINT_NAME);
+        for s in sidecars {
+            write_executable(&pack, s);
+        }
+    }
+
     #[test]
     fn missing_dir_yields_empty_registry() {
         let reg = HarnessRegistry::from_dir("/nonexistent/path".into()).unwrap();
@@ -148,27 +176,32 @@ mod tests {
     }
 
     #[test]
-    fn scans_directory_and_lists_executable_names() {
+    fn scans_packs_and_lists_them_alphabetically() {
         let dir = TempDir::new().unwrap();
-        write_executable(dir.path(), "claude");
-        write_executable(dir.path(), "noop");
-        write_executable(dir.path(), ".hidden");
+        write_pack(dir.path(), "claude", &["claude"]); // wrapper + sidecar
+        write_pack(dir.path(), "noop", &[]); // wrapper only
+        // Hidden dir: ignored.
+        std::fs::create_dir(dir.path().join(".hidden")).unwrap();
+        // Loose file: ignored (registry only takes dirs).
+        std::fs::write(dir.path().join("loose"), b"").unwrap();
+        // Directory missing the entry point: skipped with a warning.
+        std::fs::create_dir(dir.path().join("malformed")).unwrap();
 
         let reg = HarnessRegistry::from_dir(dir.path().to_path_buf()).unwrap();
         let names: Vec<&str> = reg.entries().iter().map(|e| e.name.as_str()).collect();
-        // sorted, hidden file excluded.
         assert_eq!(names, vec!["claude", "noop"]);
-        assert!(reg.lookup("claude").is_some());
-        assert!(reg.lookup("noop").is_some());
-        assert!(reg.lookup(".hidden").is_none());
-        assert!(reg.lookup("missing").is_none());
+        assert_eq!(
+            reg.lookup("claude").unwrap().host_path,
+            dir.path().join("claude").join(ENTRY_POINT_NAME),
+        );
+        assert!(reg.lookup("malformed").is_none());
     }
 
     #[test]
-    fn guest_argv0_is_under_guest_mount_path() {
+    fn guest_argv0_points_inside_pack_directory() {
         assert_eq!(
             HarnessRegistry::guest_argv0("claude"),
-            "/run/engram/harnesses/claude"
+            "/run/engram/harnesses/claude/harness"
         );
     }
 

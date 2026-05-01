@@ -86,10 +86,35 @@ mod adapter {
         #[arg(long, default_value_t = 1800)]
         pub max_run_secs: u64,
 
-        /// Override the `claude` binary path. Defaults to "claude"
-        /// on PATH inside the rootfs.
-        #[arg(long, default_value = "claude", env = "ENGRAM_CLAUDE_BIN")]
-        pub claude_bin: String,
+        /// Override the `claude` binary path. Default: the sidecar
+        /// next to this wrapper (`<argv[0] dir>/claude`), populated
+        /// by the harness pack's `install-harnesses` step. Override
+        /// via `ENGRAM_CLAUDE_BIN` for dev tweaks (e.g. point at a
+        /// freshly-built `claude` outside the pack).
+        #[arg(long, env = "ENGRAM_CLAUDE_BIN")]
+        pub claude_bin: Option<String>,
+    }
+
+    /// Resolve the `claude` binary path. If the user supplied
+    /// `--claude-bin` / `ENGRAM_CLAUDE_BIN`, honour it verbatim.
+    /// Otherwise look for a sibling named `claude` next to this
+    /// wrapper (the harness pack convention) — falls back to the
+    /// bare name `claude` so $PATH lookup still works in dev shells.
+    fn resolve_claude_bin(override_value: Option<&str>) -> String {
+        if let Some(path) = override_value {
+            return path.to_string();
+        }
+        if let Ok(self_exe) = std::env::current_exe() {
+            if let Some(parent) = self_exe.parent() {
+                let sibling = parent.join("claude");
+                if sibling.exists() {
+                    return sibling.to_string_lossy().into_owned();
+                }
+            }
+        }
+        // Last-resort fallback: the wrapper might be running outside
+        // a pack (dev-mode `cargo run`). Trust $PATH.
+        "claude".into()
     }
 
     pub async fn entry() -> ExitCode {
@@ -100,11 +125,15 @@ mod adapter {
             )
             .init();
 
-        let cli = Cli::parse();
+        let mut cli = Cli::parse();
+        // Materialise the resolved claude binary path so the rest of
+        // the code can treat `cli.claude_bin` as a known value.
+        cli.claude_bin = Some(resolve_claude_bin(cli.claude_bin.as_deref()));
         tracing::info!(
             connect = ?cli.connect,
             vsock_host = ?cli.vsock_host,
             session = %cli.session_id,
+            claude_bin = ?cli.claude_bin,
             "claude harness starting",
         );
 
@@ -371,7 +400,11 @@ mod adapter {
         let argv = build_claude_argv(&resume_id, text);
         tracing::info!(?argv, "spawning claude");
 
-        let mut child = match Command::new(&cli.claude_bin)
+        let claude_bin: &str = cli
+            .claude_bin
+            .as_deref()
+            .expect("claude_bin resolved at entry()");
+        let mut child = match Command::new(claude_bin)
             .args(&argv)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -381,14 +414,14 @@ mod adapter {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = %e, bin = %cli.claude_bin, "spawn claude failed");
+                tracing::error!(error = %e, bin = %claude_bin, "spawn claude failed");
                 let _ = write_event(
                     writer,
                     HarnessEvent::AgentMessage {
                         run_id: "spawn-failed".into(),
                         message_id: format!("spawn-{}", uuid::Uuid::new_v4()),
                         role: AgentRole::System,
-                        text: format!("failed to spawn `{}`: {e}", cli.claude_bin),
+                        text: format!("failed to spawn `{claude_bin}`: {e}"),
                     },
                 )
                 .await;

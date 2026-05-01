@@ -108,32 +108,57 @@ dev-firecracker: db-up install-harnesses
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
-# Build all harness binaries for the host's guest architecture and
-# symlink them into `./var/engram/harnesses/` — the directory the
-# coord scans on startup and mounts read-only into every sandbox at
+# Build the harness packs and lay them out at
+# `./var/engram/harnesses/<name>/` — the directory tree the coord
+# scans on startup and mounts read-only into every sandbox at
 # `/run/engram/harnesses` via virtio-fs. After this runs, `engram
-# session create --harness <name>` works for any of {claude, noop}
-# without re-baking images. Idempotent. Must re-run after pulling
-# new harness code.
+# session create --harness <name>` works for {claude, noop}
+# regardless of which image the session lands on. Idempotent.
 #
-# Cross-compiles for aarch64-unknown-linux-musl on macOS (VZ guests)
-# and x86_64-unknown-linux-musl on Linux (FC guests) — both produce
-# Linux binaries since the harness runs inside the guest VM, not on
-# the host.
+# Pack layout: each `<name>/` carries the wrapper at `harness` plus
+# any sidecars the wrapper needs at runtime. Today only `claude`
+# has a sidecar — Anthropic's bundled-Bun `claude` binary,
+# downloaded from the official releases endpoint.
+#
+# Cross-compiles wrappers for aarch64-unknown-linux-musl on macOS
+# (VZ guests) and x86_64-unknown-linux-musl on Linux (FC guests) —
+# both produce Linux binaries since the harness runs inside the
+# guest VM, not on the host. Downloads the matching bundled
+# `claude` from `downloads.claude.ai/claude-code-releases`.
 install-harnesses:
-    @mkdir -p ./var/engram/harnesses
-    @if [ "$(uname -s)" = "Darwin" ]; then \
+    @set -e; \
+    mkdir -p ./var/engram/harnesses ; \
+    if [ "$(uname -s)" = "Darwin" ]; then \
         TARGET=aarch64-unknown-linux-musl ; \
+        CLAUDE_PLAT=linux-arm64 ; \
     else \
         TARGET=x86_64-unknown-linux-musl ; \
+        CLAUDE_PLAT=linux-x64 ; \
     fi ; \
     rustup target add $TARGET >/dev/null 2>&1 || true ; \
     cargo build -p engram-harness-noop   --target $TARGET --release ; \
     cargo build -p engram-harness-claude --target $TARGET --release ; \
-    cp -p "target/$TARGET/release/engram-harness-noop"   ./var/engram/harnesses/noop ; \
-    cp -p "target/$TARGET/release/engram-harness-claude" ./var/engram/harnesses/claude ; \
+    \
+    mkdir -p ./var/engram/harnesses/noop ; \
+    cp -p "target/$TARGET/release/engram-harness-noop" ./var/engram/harnesses/noop/harness ; \
+    \
+    mkdir -p ./var/engram/harnesses/claude ; \
+    cp -p "target/$TARGET/release/engram-harness-claude" ./var/engram/harnesses/claude/harness ; \
+    CLAUDE_VERSION=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest) ; \
+    CLAUDE_DEST=./var/engram/harnesses/claude/claude ; \
+    if [ ! -f "$CLAUDE_DEST" ] || [ "$(cat ./var/engram/harnesses/claude/.version 2>/dev/null)" != "$CLAUDE_VERSION-$CLAUDE_PLAT" ]; then \
+        echo "downloading claude $CLAUDE_VERSION ($CLAUDE_PLAT) ..." ; \
+        curl -fsSL --retry 3 -o "$CLAUDE_DEST.tmp" \
+            "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$CLAUDE_PLAT/claude" ; \
+        chmod +x "$CLAUDE_DEST.tmp" ; \
+        mv "$CLAUDE_DEST.tmp" "$CLAUDE_DEST" ; \
+        printf "%s-%s\n" "$CLAUDE_VERSION" "$CLAUDE_PLAT" > ./var/engram/harnesses/claude/.version ; \
+    else \
+        echo "claude $CLAUDE_VERSION ($CLAUDE_PLAT) already installed" ; \
+    fi ; \
+    \
     echo "harnesses installed at ./var/engram/harnesses/" ; \
-    ls -la ./var/engram/harnesses/
+    ls -la ./var/engram/harnesses/*/
 
 # Bake a tiny Firecracker image (debian-slim + engram-agentd +
 # engram-bootstrap) for the `local://demo` repo and register it

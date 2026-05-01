@@ -1,10 +1,14 @@
-FROM node:20-slim
+# debian-slim is enough now that the harness's runtime dependencies
+# (Anthropic's bundled-Bun `claude` binary) ship host-side via the
+# harness pack, mounted into every sandbox at
+# `/run/engram/harnesses/claude/`. The image only needs the tools
+# the *workspace* uses — git for the agent's edits, ca-certificates
+# so https calls work.
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-
-RUN npm install -g @anthropic-ai/claude-code
 
 # ttyd: PTY-over-WebSocket server. Used by the dashboard's `SHELL`
 # tab — coordinator proxies a WebSocket from the browser to ttyd
