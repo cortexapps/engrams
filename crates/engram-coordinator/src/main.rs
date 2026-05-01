@@ -210,18 +210,6 @@ async fn main() -> Result<(), CoordinatorError> {
                     ));
                 }
             }
-            // The Process variant is a test-only fixture (see
-            // `SandboxBackendChoice::Process` doc-comment). The CLI
-            // parser already rejects `--sandbox-backend=process`, so
-            // reaching this arm means a caller constructed the enum
-            // directly — which production binaries never do.
-            SandboxBackendChoice::Process => {
-                return Err(CoordinatorError::Config(
-                    "SandboxBackendChoice::Process is a test-only fixture and cannot be \
-                     selected by the production binary"
-                        .into(),
-                ));
-            }
         };
         // Wrap in PooledBackend so warm-pool semantics still apply in
         // --mode=all (the same wrapper that production multi-host

@@ -212,6 +212,14 @@ where
 
 #[async_trait]
 impl SandboxBackend for VzBackend {
+    fn supports_local_mount(&self) -> bool {
+        // Apple Virtualization.framework ships a virtio-fs device
+        // (`VZVirtioFileSystemDeviceConfiguration`); LocalMount is
+        // wired through `SandboxSpec.mounts`. The plumbing landed
+        // alongside the wire shape in phase 2.
+        true
+    }
+
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(

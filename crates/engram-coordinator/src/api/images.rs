@@ -52,20 +52,17 @@ pub struct HarnessDescriptor {
 pub async fn list_images(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<ImageDescriptor>>, ApiError> {
-    use crate::config::SandboxBackendChoice;
     let images = state
         .services
         .images
         .list()
         .await
         .map_err(|e| ApiError::Internal(format!("image registry list: {e}")))?;
-    // LocalMount support is a backend-level capability, not per-image —
-    // resolve it once here and stamp every descriptor with the same
-    // value so the dashboard doesn't need a second endpoint.
-    let supports_local_mount = match state.cfg.sandbox_backend {
-        SandboxBackendChoice::Firecracker => false,
-        SandboxBackendChoice::Process | SandboxBackendChoice::Vz => true,
-    };
+    // LocalMount support is a backend-level capability, not per-image
+    // — resolve it once here from the active backend and stamp every
+    // descriptor with the same value so the dashboard doesn't need a
+    // second endpoint.
+    let supports_local_mount = state.services.sandbox.supports_local_mount();
 
     let descriptors = images
         .into_iter()

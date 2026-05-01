@@ -149,4 +149,38 @@ pub trait SandboxBackend: Send + Sync {
     async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
         None
     }
+
+    /// How a harness process inside this backend's sandbox dials
+    /// back to the host's harness channel. Drives the `argv` shape
+    /// `resolve_harness` builds for the agent. Default is `Vsock`
+    /// (the FC / VZ in-VM model); backends that exec the agent as
+    /// a host subprocess (`engram-sandbox-process`) override to
+    /// `HostTcp`. Centralising this on the trait means the lib's
+    /// session-create logic never has to inspect a
+    /// `SandboxBackendChoice` enum tag.
+    fn harness_dial(&self) -> HarnessDial {
+        HarnessDial::Vsock
+    }
+
+    /// Whether this backend can honour `WorkspaceSpec::LocalMount`
+    /// (host-to-guest directory sharing). Default `false`; backends
+    /// with native sharing (`engram-sandbox-vz` via virtio-fs,
+    /// `engram-sandbox-process` via host symlink) override.
+    /// Surfaced on `GET /api/images` so the dashboard can gray out
+    /// the "local mount" radio without a separate capability call.
+    fn supports_local_mount(&self) -> bool {
+        false
+    }
+}
+
+/// How a harness process inside a sandbox reaches the host-side
+/// harness channel. Backends declare this via
+/// [`SandboxBackend::harness_dial`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessDial {
+    /// Agent dials AF_VSOCK CID=2 from inside a VM. Used by FC + VZ.
+    Vsock,
+    /// Agent runs as a host subprocess and dials TCP loopback. Used
+    /// by `engram-sandbox-process` (the test fixture).
+    HostTcp,
 }

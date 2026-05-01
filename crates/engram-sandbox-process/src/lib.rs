@@ -92,6 +92,18 @@ impl ProcessBackend {
 
 #[async_trait]
 impl SandboxBackend for ProcessBackend {
+    fn harness_dial(&self) -> engram_core::traits::HarnessDial {
+        // Harness exec'd as a host subprocess; dials TCP loopback
+        // back to the coord-side harness listener.
+        engram_core::traits::HarnessDial::HostTcp
+    }
+
+    fn supports_local_mount(&self) -> bool {
+        // Process backend "mounts" via host symlinks — trivially
+        // supported since the sandbox cwd is a host directory.
+        true
+    }
+
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         let id = SandboxId::new();
         let cwd = self.cwd_for(id);

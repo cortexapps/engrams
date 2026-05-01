@@ -41,7 +41,7 @@ impl Default for CoordinatorConfig {
             mode: RunMode::Coordinator,
             cloud_backend: CloudBackendChoice::Static,
             local_path: PathBuf::from("./var/engram"),
-            sandbox_backend: SandboxBackendChoice::Process,
+            sandbox_backend: SandboxBackendChoice::Firecracker,
             default_image_version: "warm-bootstrap".into(),
             // Modest dev default: one warm sandbox per image so the
             // second session checkout is sub-second. Production tunes
@@ -106,20 +106,6 @@ pub enum SandboxBackendChoice {
     /// must carry the `com.apple.security.virtualization` entitlement
     /// (see `just vz-codesign`).
     Vz,
-    /// **Dev / test fixture.** Plain host subprocesses, no isolation.
-    /// Used by the coordinator's integration tests so they can exec
-    /// real commands (`git clone`, `printf hello`) and assert against
-    /// post-exec state without a VMM. Cannot be selected via
-    /// `--sandbox-backend=process` — the parser rejects the string.
-    /// Tests construct it directly via `cfg.sandbox_backend = Process`
-    /// so `resolve_harness` picks the host-subprocess argv shape.
-    ///
-    /// The variant compiles into production binaries today because
-    /// behavioural dispatch in `api/sessions.rs::resolve_harness` and
-    /// `api/images.rs` switches on this enum. A follow-up will lift
-    /// those decisions onto the `SandboxBackend` trait itself; once
-    /// that lands, this variant can be removed entirely.
-    Process,
 }
 
 impl SandboxBackendChoice {
@@ -127,10 +113,9 @@ impl SandboxBackendChoice {
         match s {
             "firecracker" => Ok(Self::Firecracker),
             "vz" => Ok(Self::Vz),
-            // `process` is intentionally not parseable — it's a
-            // test-only fixture, never a deploy choice. See the
-            // variant doc-comment above.
-            other => Err(format!("invalid sandbox backend: {other}")),
+            other => Err(format!(
+                "invalid sandbox backend `{other}` — expected `firecracker` or `vz`"
+            )),
         }
     }
 }
@@ -189,10 +174,10 @@ mod tests {
             SandboxBackendChoice::parse("vz").unwrap(),
             SandboxBackendChoice::Vz,
         );
-        // `process` is the test-only fixture variant; the parser
-        // rejects it so a deployment can't accidentally select a
-        // no-isolation backend via env / CLI. Tests construct it
-        // directly via the enum constant.
+        // `process` was an intermediate-phase variant before harness
+        // dispatch + LocalMount support moved onto the SandboxBackend
+        // trait; the test-only ProcessBackend now reports its own
+        // capabilities and the enum no longer enumerates it.
         assert!(SandboxBackendChoice::parse("process").is_err());
         // microsandbox was a Phase 1 alternative; removed when we
         // committed to Firecracker for production.

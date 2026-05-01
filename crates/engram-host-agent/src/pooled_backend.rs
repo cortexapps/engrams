@@ -61,6 +61,17 @@ impl PooledBackend {
 
 #[async_trait]
 impl SandboxBackend for PooledBackend {
+    // Capability methods proxy to the wrapped backend — the pool is
+    // a thin caching layer; whatever Process / VZ / FC reports
+    // about itself is what callers see.
+    fn harness_dial(&self) -> engram_core::traits::HarnessDial {
+        self.inner.harness_dial()
+    }
+
+    fn supports_local_mount(&self) -> bool {
+        self.inner.supports_local_mount()
+    }
+
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         let key = Self::pool_key(&spec);
 

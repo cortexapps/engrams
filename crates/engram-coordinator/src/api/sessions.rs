@@ -146,14 +146,15 @@ pub async fn create_session(
         ));
     }
     // `LocalMount` requires host→guest sharing. FC's virtio-fs
-    // story is future work; reject upfront on FC backends rather
-    // than silently dropping the mount inside the backend. Track
-    // FC parity in the plan's "open questions" §3.
+    // story is future work; reject upfront when the active backend
+    // doesn't advertise support rather than silently dropping the
+    // mount inside the backend. Track FC parity in the plan's
+    // "open questions" §3.
     if matches!(req.workspace, WorkspaceSpec::LocalMount { .. })
-        && matches!(state.cfg.sandbox_backend, SandboxBackendChoice::Firecracker)
+        && !state.services.sandbox.supports_local_mount()
     {
         return Err(ApiError::BadRequest(
-            "`workspace.local_mount` requires the VZ or Process backend; this deployment uses Firecracker"
+            "`workspace.local_mount` is not supported by the active sandbox backend (typically Firecracker); use VZ or Process"
                 .into(),
         ));
     }
@@ -548,18 +549,18 @@ pub(crate) fn resolve_harness(
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
     }
 
-    let argv = match state.cfg.sandbox_backend {
-        SandboxBackendChoice::Process => {
+    let argv = match state.services.sandbox.harness_dial() {
+        engram_core::traits::HarnessDial::HostTcp => {
             let addr = match *state.harness_listen_addr.lock() {
                 Some(addr) => addr,
                 None => {
                     return Err(ApiError::Internal(
-                        "harness listener not bound (Process backend)".into(),
+                        "harness listener not bound (HostTcp backend)".into(),
                     ));
                 }
             };
             env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
-            let host_path = process_backend_harness_host_path(resolved_image, &entry.guest_path)?;
+            let host_path = host_tcp_harness_host_path(resolved_image, &entry.guest_path)?;
             vec![
                 host_path,
                 "--connect".into(),
@@ -568,7 +569,7 @@ pub(crate) fn resolve_harness(
                 session_id.to_string(),
             ]
         }
-        SandboxBackendChoice::Firecracker | SandboxBackendChoice::Vz => {
+        engram_core::traits::HarnessDial::Vsock => {
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
                 entry.guest_path.clone(),
@@ -582,7 +583,12 @@ pub(crate) fn resolve_harness(
     Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
 }
 
-fn process_backend_harness_host_path(
+/// Resolve `guest_path` (e.g. `/sbin/engram-harness-claude`) against
+/// the image's exported rootfs directory so a `HostTcp`-dialing
+/// backend can exec it as a host subprocess. The image registry
+/// stores the rootfs at `<images_dir>/<repo>/<tag>/rootfs/`; strip
+/// the leading `/` from `guest_path` and join.
+fn host_tcp_harness_host_path(
     resolved: &crate::image_registry::ResolvedImage,
     guest_path: &str,
 ) -> Result<String, ApiError> {
@@ -594,7 +600,7 @@ fn process_backend_harness_host_path(
     match &resolved.rootfs {
         Rootfs::Directory(dir) => Ok(dir.join(rel).to_string_lossy().into_owned()),
         Rootfs::Ext4Image(_) => Err(ApiError::Internal(
-            "Process backend cannot exec a harness baked into an ext4 rootfs; \
+            "HostTcp-dialing backend cannot exec a harness baked into an ext4 rootfs; \
              rebuild the image with `--format directory`"
                 .into(),
         )),
