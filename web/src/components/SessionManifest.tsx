@@ -134,16 +134,20 @@ function sortSessions(sessions: Session[]): Session[] {
 }
 
 function formatRepo(s: Session): string {
-  const branch = s.branch && s.branch !== 'main' ? ` · ${s.branch}` : '';
-  if (s.repo_url) {
-    if (s.repo_url.kind === 'local') {
-      return `local://${s.repo_url.name}${branch}`;
+  switch (s.workspace.kind) {
+    case 'empty':
+      return `${s.image.repo} (empty)`;
+    case 'local_mount':
+      return `${s.image.repo} ← ${s.workspace.host_path}`;
+    case 'git': {
+      const branch =
+        s.workspace.branch && s.workspace.branch !== 'main'
+          ? ` · ${s.workspace.branch}`
+          : '';
+      // Strip the scheme + host prefix for visual density.
+      return `${s.workspace.url.replace(/^https?:\/\/[^/]+\//, '')}${branch}`;
     }
-    // Strip the scheme + host prefix for visual density. Full repo
-    // string is in the raw `s.repo` if needed elsewhere.
-    return `${s.repo_url.url.replace(/^https?:\/\/[^/]+\//, '')}${branch}`;
   }
-  return `${s.repo}${branch}`;
 }
 
 function short(id: string) {

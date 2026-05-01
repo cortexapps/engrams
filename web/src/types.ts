@@ -15,23 +15,35 @@ export type SessionStatus =
   | 'failed'
   | 'dead';
 
-export type SessionKind = 'git' | 'local' | 'readonly';
+export type SessionKind = 'git' | 'readonly' | 'ephemeral';
 
-export type RepoUrl =
-  | { kind: 'git'; url: string }
-  | { kind: 'local'; name: string };
+// Phase 2 wire shape: the three orthogonal session-time axes.
+export type ImageRef = { kind: 'registry'; repo: string; tag: string };
+
+export type WorkspaceSpec =
+  | { kind: 'empty' }
+  | { kind: 'git'; url: string; branch: string; read_only: boolean }
+  | {
+      kind: 'local_mount';
+      host_path: string;
+      guest_path: string;
+      read_only: boolean;
+    };
+
+export type HarnessSpec =
+  | { kind: 'none' }
+  | { kind: 'builtin'; name: string };
 
 export interface Session {
   id: string;
-  repo: string;
-  branch: string;
   user_id: string | null;
   status: SessionStatus;
-  image_version: string;
   host_id: string | null;
   sandbox_id: string | null;
+  image: ImageRef;
+  workspace: WorkspaceSpec;
+  harness: HarnessSpec;
   session_kind: SessionKind;
-  repo_url: RepoUrl | null;
   checkpoint_branch: string | null;
   created_at: string;
   last_active_at: string;
@@ -42,7 +54,6 @@ export interface ListSessionsResponse {
 }
 
 export interface WarmPoolView {
-  repo: string;
   image_version: string;
   ready: number;
   target: number;
@@ -74,6 +85,11 @@ export interface RequiredSecret {
   allow_hosts: string[];
 }
 
+export interface HarnessDescriptor {
+  name: string;
+  description: string | null;
+}
+
 export interface ImageDescriptor {
   repo: string;
   tag: string;
@@ -82,6 +98,15 @@ export interface ImageDescriptor {
   /** "literal" or "broker" — broker images reject browser-pasted secrets. */
   secret_mode: string;
   required_secrets: RequiredSecret[];
+  /** Builtin harnesses baked into this image's rootfs. */
+  harnesses: HarnessDescriptor[];
+  /**
+   * Whether this deployment's sandbox backend supports
+   * `WorkspaceSpec.local_mount`. False on Firecracker; true on
+   * VZ / Process. Surfaced per-image so the form can gray out
+   * the "local mount" radio without a separate /api/host call.
+   */
+  supports_local_mount: boolean;
 }
 
 // ---- Session creation -------------------------------------------------

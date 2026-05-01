@@ -1,9 +1,12 @@
 import type {
   CreateSessionResponse,
+  HarnessSpec,
   ImageDescriptor,
+  ImageRef,
   ListHostsResponse,
   ListSessionsResponse,
   Session,
+  WorkspaceSpec,
 } from './types';
 
 // Same-origin in dev (Vite proxy → :8090). In a hosted prod build,
@@ -57,9 +60,11 @@ export const fetchSession = (id: string) =>
 export const fetchImages = () => getJSON<ImageDescriptor[]>('/api/images');
 
 export interface CreateSessionInput {
-  repo: string;
-  branch: string;
-  image_version?: string;
+  image: ImageRef;
+  workspace: WorkspaceSpec;
+  /** Defaults to `{ kind: "none" }` server-side. */
+  harness?: HarnessSpec;
+  user_id?: string;
   prompt?: string;
   /** Map of env-var name → value. Honored only for SecretMode::Literal images. */
   secrets?: Record<string, string>;

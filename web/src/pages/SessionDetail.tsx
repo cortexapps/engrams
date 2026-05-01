@@ -8,6 +8,18 @@ import { PromptComposer } from '../components/PromptComposer';
 import { TabRow } from '../components/TabRow';
 import { TerminalPane } from '../components/TerminalPane';
 import { relativeTime } from '../components/SessionManifest';
+import type { WorkspaceSpec } from '../types';
+
+function workspaceLabel(ws: WorkspaceSpec): string {
+  switch (ws.kind) {
+    case 'empty':
+      return 'empty';
+    case 'git':
+      return ws.url;
+    case 'local_mount':
+      return `${ws.host_path} → ${ws.guest_path}`;
+  }
+}
 
 type ViewTab = 'transcript' | 'shell' | 'raw';
 
@@ -73,9 +85,17 @@ export function SessionDetail() {
               {session.status}
             </span>
             <span style={{ color: 'var(--color-ink-faded)' }}>·</span>
-            <span className="font-mono text-[0.85rem]">{session.repo}</span>
-            <span style={{ color: 'var(--color-ink-quiet)' }}>·</span>
-            <span className="font-mono text-[0.85rem]">{session.branch}</span>
+            <span className="font-mono text-[0.85rem]">
+              {workspaceLabel(session.workspace)}
+            </span>
+            {session.workspace.kind === 'git' && (
+              <>
+                <span style={{ color: 'var(--color-ink-quiet)' }}>·</span>
+                <span className="font-mono text-[0.85rem]">
+                  {session.workspace.branch}
+                </span>
+              </>
+            )}
           </div>
         )}
 
@@ -84,7 +104,7 @@ export function SessionDetail() {
             className="mt-1 font-mono text-[0.78rem]"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            image {session.image_version} · created{' '}
+            image {session.image.repo}:{session.image.tag} · created{' '}
             {relativeTime(session.created_at)} ago · {events.length} events
           </div>
         )}

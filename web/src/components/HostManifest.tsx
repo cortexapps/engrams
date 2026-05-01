@@ -78,8 +78,7 @@ function HostBlock({ host }: { host: HostView }) {
         <AnimatePresence>
           {host.warm_pools.map((p) => (
             <PoolRow
-              key={`${p.repo}:${p.image_version}`}
-              repo={p.repo}
+              key={p.image_version}
               imageVersion={p.image_version}
               ready={p.ready}
               target={p.target}
@@ -100,12 +99,10 @@ function HostBlock({ host }: { host: HostView }) {
 }
 
 function PoolRow({
-  repo,
   imageVersion,
   ready,
   target,
 }: {
-  repo: string;
   imageVersion: string;
   ready: number;
   target: number;
@@ -124,7 +121,7 @@ function PoolRow({
         className="inline-block"
         style={{ color: 'var(--color-ink-faded)', minWidth: '24ch' }}
       >
-        {imageVersion} · {repo}
+        {imageVersion}
       </span>
       <span className="inline-flex gap-1.5">
         {Array.from({ length: slots }).map((_, i) => (
