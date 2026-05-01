@@ -232,11 +232,11 @@ vz-test: vz-codesign
 # Run the coordinator with the VZ backend.
 #
 # Prereqs (one-time):
-#   1. ENGRAM_VZ_KERNEL_PATH points at an arm64 Linux vmlinuz with
-#      VIRTIO_VSOCK / VIRTIO_BLK / VIRTIO_NET / VIRTIO_CONSOLE
-#      enabled. Default cache path is
-#      ~/.cache/engram-vz-test/vmlinuz-arm64; populate it via
-#      `just vz-bake-kernel` or `just vz-pull-ubuntu-kernel`.
+#   1. ENGRAM_VZ_KERNEL_PATH points at an arm64 Linux vmlinux with
+#      VIRTIO_BLK / VIRTIO_NET / VIRTIO_CONSOLE enabled. Default
+#      cache path is ~/.cache/engram-vz-test/vmlinux-arm64; populate
+#      it via `just vz-pull-kernel` (downloads the Kata Containers
+#      static kernel — same one apple/container uses).
 #   2. `just vz-bake-claude` (or vz-bake-demo) has run, so a
 #      warm-1 image exists for `local://claude-demo`.
 #
@@ -252,7 +252,7 @@ dev-vz: db-up vz-codesign
     ENGRAM_SANDBOX_BACKEND=vz \
     ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
     ENGRAM_LOCAL_PATH=./var/engram \
-    ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinuz-arm64} \
+    ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinux-arm64} \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
     ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-0} \
     ENGRAM_DEV_AUTO_AGENT=${ENGRAM_DEV_AUTO_AGENT:-} \
@@ -261,20 +261,30 @@ dev-vz: db-up vz-codesign
     RUST_LOG=info,engram=debug \
     target/debug/engram-coordinator
 
-# Pull an arm64 Linux kernel from the Ubuntu 24.04 Server cloud
-# image. Faster than building one from upstream sources for first
-# bring-up; replace with `vz-bake-kernel` (build from sources)
-# once we hit a config drift.
-vz-pull-ubuntu-kernel:
-    @mkdir -p $HOME/.cache/engram-vz-test
-    @if [ -f $HOME/.cache/engram-vz-test/vmlinuz-arm64 ]; then \
-        echo "kernel already cached at $HOME/.cache/engram-vz-test/vmlinuz-arm64"; \
-        exit 0; \
-    fi
-    @echo "downloading Ubuntu 24.04 arm64 cloud image kernel ~10MB..."
-    @curl -fSL -o $HOME/.cache/engram-vz-test/vmlinuz-arm64 \
-        https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic
-    @ls -lh $HOME/.cache/engram-vz-test/vmlinuz-arm64
+# Pull the Kata Containers static arm64 kernel. This is the same
+# kernel `apple/container` (Apple's container CLI built on
+# Virtualization.framework) uses by default — Linux 6.18.15 with a
+# VZ-tuned kconfig that strips PCI/ACPI/USB/sound/graphics and ships
+# VIRTIO_BLK/NET/CONSOLE built in. Cold boot is sub-second on
+# Apple Silicon.
+#
+# Replaces the older Ubuntu cloud-image kernel — that one was
+# ~5x slower to boot and has the wrong subsystem mix for VZ. The
+# Kata tarball is ~290 MB; we extract just the kernel (~25 MB) and
+# drop the rest. Cached at `~/.cache/engram-vz-test/vmlinux-arm64`.
+#
+# License: Linux is GPLv2 (redistributable). The Kata release tarball
+# is published as a release artifact on
+# github.com/kata-containers/kata-containers.
+vz-pull-kernel:
+    bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
+
+# Deprecated alias for vz-pull-kernel. The Ubuntu generic kernel
+# we used to pull here boots in ~3-5s and has a kconfig profile
+# that doesn't match VZ's device set (it expects PCI/ACPI which
+# aren't there). Kept for reference; just-pull-kernel handles
+# everything now.
+vz-pull-ubuntu-kernel: vz-pull-kernel
 
 # Bake the noop demo image for the VZ backend. arm64 + virtio-block.
 # Mirror of fc-bake-demo but cross-compiled for aarch64 and built

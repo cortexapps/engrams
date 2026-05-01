@@ -54,14 +54,27 @@ impl VmConfig {
             rootfs_path: rootfs_path.into(),
             memory_mib,
             vcpus,
-            // `init=/sbin/engram-init` mirrors the FC backend's
-            // default — the engram-baked rootfs ships an init shim
-            // at /sbin/engram-init that exec's engram-agentd on
-            // vsock and spawns engram-bootstrap as a supervisor.
-            // Without this, the guest boots /sbin/init (systemd
-            // or none) and nothing listens on vsock 1024/1025.
-            kernel_cmdline:
-                "console=hvc0 root=/dev/vda rw quiet init=/sbin/engram-init".into(),
+            // Boot args tuned for fast VZ cold-boot. Mirrors what
+            // `apple/containerization` uses for its arm64 Linux
+            // guests:
+            //   - `console=hvc0` — kernel logs to virtio-console 0,
+            //     which we wire to host stderr.
+            //   - `tsc=reliable` — skip TSC calibration. Apple's
+            //     hypervisor exposes a stable timestamp counter; the
+            //     calibration loop wastes ~hundreds of ms.
+            //   - `panic=0` — kernel panic stops the VM (host
+            //     observes via vm-stopped event); no auto-reboot.
+            //   - `quiet` — suppresses non-critical kernel logs at
+            //     boot. Pair with a kernel built with
+            //     CONFIG_CONSOLE_LOGLEVEL_QUIET=4 for full silence.
+            //   - `init=/sbin/engram-init` — our minimal init shim
+            //     that mounts /proc /sys /dev, exports
+            //     ENGRAM_TRANSPORT, spawns engram-bootstrap, exec's
+            //     engram-agentd. The bake injects this at
+            //     /sbin/engram-init.
+            kernel_cmdline: "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw \
+                             quiet init=/sbin/engram-init"
+                .into(),
         }
     }
 }
@@ -591,7 +604,7 @@ mod tests {
         let kernel = std::path::PathBuf::from(
             std::env::var("ENGRAM_VZ_KERNEL_PATH").unwrap_or_else(|_| {
                 std::env::var("HOME").unwrap_or_default()
-                    + "/.cache/engram-vz-test/vmlinuz-arm64"
+                    + "/.cache/engram-vz-test/vmlinux-arm64"
             }),
         );
         let rootfs = std::path::PathBuf::from("/tmp/engram-vz-rootfs.ext4");

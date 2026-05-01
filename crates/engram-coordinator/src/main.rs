@@ -74,8 +74,8 @@ struct Cli {
 
     /// Path to an arm64 Linux kernel image VZ (Virtualization.framework)
     /// can boot. Required when `--sandbox-backend=vz`; ignored
-    /// otherwise. Default points at `~/.cache/engram-vz-test/vmlinuz-arm64`,
-    /// the location `just vz-bake-kernel` populates.
+    /// otherwise. Default points at `~/.cache/engram-vz-test/vmlinux-arm64`,
+    /// the location `just vz-pull-kernel` populates.
     #[arg(long, env = "ENGRAM_VZ_KERNEL_PATH")]
     vz_kernel_path: Option<PathBuf>,
 
@@ -241,8 +241,8 @@ async fn main() -> Result<(), CoordinatorError> {
                             CoordinatorError::Config(
                                 "ENGRAM_VZ_KERNEL_PATH (or --vz-kernel-path) is required when \
                                  --sandbox-backend=vz; default location \
-                                 ~/.cache/engram-vz-test/vmlinuz-arm64 does not exist (run \
-                                 `just vz-bake-kernel`)"
+                                 ~/.cache/engram-vz-test/vmlinux-arm64 does not exist (run \
+                                 `just vz-pull-kernel`)"
                                     .into(),
                             )
                         })?;
@@ -388,16 +388,16 @@ fn default_dev_harness_path(bin: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`
-/// boots: `~/.cache/engram-vz-test/vmlinuz-arm64`. Returns `None` if
+/// boots: `~/.cache/engram-vz-test/vmlinux-arm64`. Returns `None` if
 /// `$HOME` isn't set or the file doesn't exist; the caller surfaces
-/// a config error pointing at `just vz-bake-kernel`.
+/// a config error pointing at `just vz-pull-kernel`.
 #[cfg(target_os = "macos")]
 fn default_vz_kernel_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let candidate = std::path::PathBuf::from(home)
         .join(".cache")
         .join("engram-vz-test")
-        .join("vmlinuz-arm64");
+        .join("vmlinux-arm64");
     if candidate.exists() {
         Some(candidate)
     } else {

@@ -42,9 +42,11 @@ const ENGRAM_AGENTD_PORT: u32 = 1024;
 #[derive(Clone, Debug)]
 pub struct VzConfig {
     /// Path to the arm64 Linux kernel image VZ will boot. Must have
-    /// `CONFIG_VIRTIO_VSOCK=y`, `CONFIG_VIRTIO_BLK=y`,
-    /// `CONFIG_VIRTIO_NET=y`, `CONFIG_VIRTIO_CONSOLE=y`. Cached at
-    /// `~/.cache/engram-vz-test/vmlinuz-arm64` by default.
+    /// `CONFIG_VIRTIO_BLK=y`, `CONFIG_VIRTIO_NET=y`,
+    /// `CONFIG_VIRTIO_CONSOLE=y`. Cached at
+    /// `~/.cache/engram-vz-test/vmlinux-arm64` by default. The
+    /// canonical source is `just vz-pull-kernel`, which fetches
+    /// the Kata Containers static kernel.
     pub kernel_path: PathBuf,
     /// Default RAM in MiB applied when `SandboxSpec::memory.max_mib`
     /// is zero or unset. VZ minimum is 128 MiB.

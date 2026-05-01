@@ -38,18 +38,23 @@ in-VM binaries select the transport at runtime via
 `ENGRAM_TRANSPORT=console`, which the bake's `engram-init` shim
 sets automatically.
 
-The standard Ubuntu 24.04 cloud-image kernel works:
-
 ```bash
-just vz-pull-ubuntu-kernel
-# → ~/.cache/engram-vz-test/vmlinuz-arm64 (compressed; uncompress
-#   to vmlinux-arm64 — VZ rejects gzip-wrapped kernels)
-gunzip -k -c ~/.cache/engram-vz-test/vmlinuz-arm64 \
-    > ~/.cache/engram-vz-test/vmlinux-arm64
+just vz-pull-kernel
+# → ~/.cache/engram-vz-test/vmlinux-arm64
 file ~/.cache/engram-vz-test/vmlinux-arm64
 # → "Linux kernel ARM64 boot executable Image"
-export ENGRAM_VZ_KERNEL_PATH=~/.cache/engram-vz-test/vmlinux-arm64
 ```
+
+This pulls the Kata Containers static kernel — the same kernel
+`apple/container` (Apple's container CLI built on
+Virtualization.framework) uses by default. It's Linux 6.12.28
+with a VZ-tuned kconfig: PCI/ACPI/USB/sound/graphics stripped out,
+`VIRTIO_BLK/NET/CONSOLE` built in. Cold-boots in well under a
+second on Apple Silicon.
+
+Why not the Ubuntu cloud-image kernel? It boots ~5x slower (it
+expects PCI/ACPI which VZ doesn't expose) and previously failed
+mysteriously at init time. Use the Kata kernel.
 
 Other working sources (any one works; pick whatever's already on
 the machine):
@@ -163,23 +168,27 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
 - ✅ Multi-port virtio-console bridge: ports 1024 (agentd),
   1025 (bootstrap), 1026 (harness). Universal kernel support —
   no `CONFIG_VIRTIO_VSOCKETS=y` needed.
-- ✅ Snapshot save (`saveMachineStateToURL`) — idle-eviction emits
-  `snapshot_taken` + `evicted` events as expected.
-- ⚠️ Snapshot **restore** (`restoreMachineStateFromURL`) returns
-  `invalid argument` on VZ + multi-port virtio-console. The on-disk
-  rootfs.ext4 mutates while the VM runs (kernel writes to /tmp,
-  /var, etc.) and VZ rejects restoring against a different rootfs
-  byte-state than what was saved. Workarounds: fork-from-Dead for
-  git-backed sessions (drops the snapshot, replays workspace from
-  git); for `local://` sessions, restart with a fresh session.
-  Permanent fix is a follow-up — likely involves attaching the
-  rootfs as read-only with an overlay, or using `VZDiskImageCachingMode`
-  + `VZDiskImageSynchronizationMode` tuning so VZ's snapshot can
-  reattach a mutated disk.
+- ✅ Snapshot/restore via APFS clone of the rootfs. We do **not**
+  use `saveMachineStateToURL`/`restoreMachineStateFromURL`; that
+  pair is broken upstream for arm64 Linux guests on VZ (UTM #6654,
+  Apple DevForum 745168, and Apple's own `containerization`
+  framework avoids the API for the same reason). Instead, snapshot
+  pauses the VM, APFS-clones the per-sandbox rootfs into the
+  snapshot dir, resumes — the clone *is* the snapshot. Restore
+  clones it back into a fresh per-sandbox rootfs and cold-boots a
+  new VM. Bootstrap-as-supervisor + `claude --resume <id>` carry
+  conversation continuity across the cold boot. APFS `clonefile(2)`
+  takes ~50 ms even for a 1.7 GB rootfs, so the snapshot/restore
+  pair stays sub-second.
+- ✅ Per-sandbox rootfs. Each sandbox gets its own
+  `<work_dir>/<sandbox_id>.rootfs.ext4` (cloned from the bake's
+  warm-1 image at `create()`); concurrent sandboxes no longer
+  share a writable disk.
 - ✅ Bake pipeline: aarch64 cross-compile → docker buildx →
   ext4 → 512-byte aligned.
 - ✅ Codesign step.
-- ✅ End-to-end noop + Claude demos run on the standard Ubuntu
-  cloud-image kernel. Verified flow on macOS Apple Silicon:
+- ✅ End-to-end noop + Claude demos run on the Kata Containers
+  static kernel. Verified flow on macOS Apple Silicon:
   `status_changed → run_started → agent_message → run_completed →
-  harness_idle → snapshot_taken → evicted → status_changed`.
+  harness_idle → snapshot_taken → evicted → status_changed →
+  run_started (post-resume)`.
