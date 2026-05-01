@@ -209,8 +209,8 @@ fi
 # tag has no device — silently skip in that case so images that
 # don't (yet) have a harness directory boot fine.
 mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
-mount -t virtio engram-harnesses /run/engram/harnesses 2>/dev/null || true
-mount -t virtio engram-workspace /workspace 2>/dev/null || true
+mount -t virtiofs engram-harnesses /run/engram/harnesses 2>/dev/null || true
+mount -t virtiofs engram-workspace /workspace 2>/dev/null || true
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).

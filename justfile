@@ -130,8 +130,8 @@ install-harnesses:
     rustup target add $TARGET >/dev/null 2>&1 || true ; \
     cargo build -p engram-harness-noop   --target $TARGET --release ; \
     cargo build -p engram-harness-claude --target $TARGET --release ; \
-    ln -sf "$(pwd)/target/$TARGET/release/engram-harness-noop"   ./var/engram/harnesses/noop ; \
-    ln -sf "$(pwd)/target/$TARGET/release/engram-harness-claude" ./var/engram/harnesses/claude ; \
+    cp -p "target/$TARGET/release/engram-harness-noop"   ./var/engram/harnesses/noop ; \
+    cp -p "target/$TARGET/release/engram-harness-claude" ./var/engram/harnesses/claude ; \
     echo "harnesses installed at ./var/engram/harnesses/" ; \
     ls -la ./var/engram/harnesses/
 
