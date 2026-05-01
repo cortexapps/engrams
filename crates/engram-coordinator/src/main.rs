@@ -14,7 +14,6 @@ use engram_core::traits::{CloudBackend, SandboxBackend, SecretStore};
 use engram_core::HostId;
 use engram_postgres::PostgresStore;
 use engram_sandbox_firecracker::FirecrackerBackend;
-use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::EnvSecretStore;
 
 #[derive(Parser, Debug)]
@@ -206,18 +205,22 @@ async fn main() -> Result<(), CoordinatorError> {
                 {
                     return Err(CoordinatorError::Config(
                         "--sandbox-backend=vz only runs on macOS Apple Silicon. Use \
-                         --sandbox-backend=firecracker on Linux or --sandbox-backend=process \
-                         for dev"
+                         --sandbox-backend=firecracker on Linux"
                             .into(),
                     ));
                 }
             }
+            // The Process variant is a test-only fixture (see
+            // `SandboxBackendChoice::Process` doc-comment). The CLI
+            // parser already rejects `--sandbox-backend=process`, so
+            // reaching this arm means a caller constructed the enum
+            // directly — which production binaries never do.
             SandboxBackendChoice::Process => {
-                tracing::warn!(
-                    "starting with --sandbox-backend=process: commands will run as host \
-                     subprocesses with NO isolation. Dev only — production uses --sandbox-backend=firecracker."
-                );
-                Arc::new(ProcessBackend::new(cli.sandbox_work_dir.clone()))
+                return Err(CoordinatorError::Config(
+                    "SandboxBackendChoice::Process is a test-only fixture and cannot be \
+                     selected by the production binary"
+                        .into(),
+                ));
             }
         };
         // Wrap in PooledBackend so warm-pool semantics still apply in

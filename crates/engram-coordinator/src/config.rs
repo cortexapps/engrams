@@ -106,9 +106,19 @@ pub enum SandboxBackendChoice {
     /// must carry the `com.apple.security.virtualization` entitlement
     /// (see `just vz-codesign`).
     Vz,
-    /// Local dev: plain host subprocesses, no isolation. Lets the
-    /// orchestrator run end-to-end on any platform without a VMM.
-    /// NEVER use in deployment.
+    /// **Dev / test fixture.** Plain host subprocesses, no isolation.
+    /// Used by the coordinator's integration tests so they can exec
+    /// real commands (`git clone`, `printf hello`) and assert against
+    /// post-exec state without a VMM. Cannot be selected via
+    /// `--sandbox-backend=process` — the parser rejects the string.
+    /// Tests construct it directly via `cfg.sandbox_backend = Process`
+    /// so `resolve_harness` picks the host-subprocess argv shape.
+    ///
+    /// The variant compiles into production binaries today because
+    /// behavioural dispatch in `api/sessions.rs::resolve_harness` and
+    /// `api/images.rs` switches on this enum. A follow-up will lift
+    /// those decisions onto the `SandboxBackend` trait itself; once
+    /// that lands, this variant can be removed entirely.
     Process,
 }
 
@@ -117,7 +127,9 @@ impl SandboxBackendChoice {
         match s {
             "firecracker" => Ok(Self::Firecracker),
             "vz" => Ok(Self::Vz),
-            "process" => Ok(Self::Process),
+            // `process` is intentionally not parseable — it's a
+            // test-only fixture, never a deploy choice. See the
+            // variant doc-comment above.
             other => Err(format!("invalid sandbox backend: {other}")),
         }
     }
@@ -177,10 +189,11 @@ mod tests {
             SandboxBackendChoice::parse("vz").unwrap(),
             SandboxBackendChoice::Vz,
         );
-        assert_eq!(
-            SandboxBackendChoice::parse("process").unwrap(),
-            SandboxBackendChoice::Process,
-        );
+        // `process` is the test-only fixture variant; the parser
+        // rejects it so a deployment can't accidentally select a
+        // no-isolation backend via env / CLI. Tests construct it
+        // directly via the enum constant.
+        assert!(SandboxBackendChoice::parse("process").is_err());
         // microsandbox was a Phase 1 alternative; removed when we
         // committed to Firecracker for production.
         assert!(SandboxBackendChoice::parse("microsandbox").is_err());

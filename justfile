@@ -74,31 +74,16 @@ db-reset:
 # Coordinator — local dev (subprocess sandbox backend)
 # ------------------------------------------------------------------
 
-# Run the coordinator wired to the subprocess sandbox backend.
-# Postgres must already be up (`just db-up`). Phase 2: harness
-# selection moved per-session — pass `--harness noop` (or
-# `--harness claude`) on `engram session create`. The coordinator
-# itself no longer auto-spawns; the legacy `ENGRAM_DEV_AUTO_AGENT`
-# env var is now a no-op.
-dev: db-up dev-build-harness
-    DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
-    ENGRAM_BIND_ADDR=127.0.0.1:8090 \
-    ENGRAM_MODE=all \
-    ENGRAM_SANDBOX_BACKEND=process \
-    ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
-    ENGRAM_LOCAL_PATH=./var/engram \
-    ENGRAM_DEFAULT_IMAGE=warm-bootstrap \
-    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    RUST_LOG=info,engram=debug \
-    cargo run -p engram-coordinator
-
-# Build the noop-harness binary so `--dev-auto-noop` finds it next
-# to the coordinator's exe. Cheap no-op once it's built.
-dev-build-harness:
-    cargo build -p engram-harness-noop --bin engram-harness-noop
+# The Process backend was demoted to a test-only fixture, so
+# `just dev` (Process-based, single-binary) is gone. Use:
+#   - `just dev-vz`           on macOS Apple Silicon
+#   - `just dev-firecracker`  on Linux + KVM
+# Both run the coordinator with a real VMM; pass
+# `--harness <name>` to `engram session create` for per-session
+# agent selection.
 
 # Run the coordinator wired to the Firecracker backend. Requires
-# Linux + KVM. Will not work on macOS — use `just dev` instead.
+# Linux + KVM. Will not work on macOS — use `just dev-vz` instead.
 #
 # Set ENGRAM_KERNEL_IMAGE_PATH to a vmlinux Firecracker can boot.
 # The fc-test artifact path under ~/.cache/engram-fc-test/ works
