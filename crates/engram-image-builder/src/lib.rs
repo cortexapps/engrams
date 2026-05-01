@@ -191,6 +191,17 @@ set -e
 mount -t proc  proc /proc 2>/dev/null || true
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true
+# DNS for userspace. The kernel handled IP+routes via `ip=dhcp` (see
+# vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
+# we do it here. 192.168.64.1 is the VZ NAT gateway, which Apple's
+# network stack also answers DNS on. 1.1.1.1 is a public fallback in
+# case the gateway resolver is unreachable (e.g. on Linux/FC where
+# the bridge isn't VZ NAT). Writing both is safe — glibc tries them
+# in order. Skip if /etc/resolv.conf already exists (operator override).
+mkdir -p /etc
+if [ ! -s /etc/resolv.conf ]; then
+    printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+fi
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).

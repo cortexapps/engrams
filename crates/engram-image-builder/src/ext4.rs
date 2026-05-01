@@ -137,14 +137,22 @@ impl Ext4Packer for Mke2fsPacker {
 /// ext4 metadata (~3-5%), inode table, journal (~64 MiB by default),
 /// plus headroom for the booted VM to write to /tmp etc.
 ///
-/// Formula: `max(dir_size * 2, dir_size + 128 MiB)`. The doubling
-/// catches small images (a 50 MiB rootfs gets 178 MiB, plenty for
-/// the journal); the +128 MiB minimum catches tiny test images
-/// where 2× doesn't even cover ext4's overhead.
+/// Formula: `max(dir_size * 2, dir_size + 128 MiB)`, rounded up to
+/// a 4 KiB boundary. The doubling catches small images (a 50 MiB
+/// rootfs gets 178 MiB, plenty for the journal); the +128 MiB
+/// minimum catches tiny test images where 2× doesn't even cover
+/// ext4's overhead. The 4 KiB rounding is required by macOS Tahoe's
+/// VZ disk-image attachment, which rejects files that aren't a
+/// multiple of the 512-byte sector size with `VZErrorDomain code=5
+/// "Invalid disk image"`. We pick 4 KiB instead of 512 to match
+/// ext4's default block size — same alignment as a real block
+/// device.
 pub fn recommended_size(dir_size_bytes: u64) -> u64 {
     let twice = dir_size_bytes.saturating_mul(2);
     let plus_128 = dir_size_bytes.saturating_add(128 * 1024 * 1024);
-    twice.max(plus_128)
+    let raw = twice.max(plus_128);
+    const ALIGN: u64 = 4096;
+    raw.saturating_add(ALIGN - 1) & !(ALIGN - 1)
 }
 
 #[cfg(test)]
@@ -175,5 +183,29 @@ mod tests {
     fn recommended_size_does_not_overflow() {
         // Adversarial input doesn't panic.
         assert!(recommended_size(u64::MAX) > 0);
+    }
+
+    #[test]
+    fn recommended_size_is_aligned_to_4kib() {
+        // Awkward source sizes that previously produced a non-sector-
+        // aligned image. 897_419_577 is the exact dir size the Claude
+        // bake hit in the field; before this fix 2× was 1_794_839_154,
+        // 114 bytes shy of sector alignment, and macOS Tahoe's VZ
+        // refused to attach it ("Invalid disk image. The disk image
+        // format is not recognized.").
+        for s in [
+            1u64,
+            511,
+            512,
+            897_419_577,
+            (1 << 30) + 1,
+            (10 * 1024 * 1024) + 7,
+        ] {
+            assert_eq!(
+                recommended_size(s) % 4096,
+                0,
+                "recommended_size({s}) must be 4 KiB aligned for VZ"
+            );
+        }
     }
 }

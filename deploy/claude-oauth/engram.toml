@@ -1,0 +1,17 @@
+name = "claude-oauth"
+description = "Claude Code CLI inside a microVM, authenticated via a long-lived OAuth token from `claude setup-token` instead of an Anthropic API key. Useful when the operator's org doesn't issue API keys but they have a Claude subscription."
+
+# Long-lived OAuth token minted by `claude setup-token` on the host.
+# The in-VM `claude` CLI accepts this in lieu of `ANTHROPIC_API_KEY`
+# for headless auth (it's a `sk-ant-oat01-...` token, ~1y lifetime).
+# Operator must `export CLAUDE_CODE_OAUTH_TOKEN=...` before launching
+# the coordinator (or drop it in the repo `.env` — `set dotenv-load`
+# in the justfile picks it up).
+[secrets.CLAUDE_CODE_OAUTH_TOKEN]
+required = true
+allow_hosts = ["api.anthropic.com"]
+
+# Egress: same allow-list as the API-key image.
+[network]
+default = "deny"
+allow_hosts = ["api.anthropic.com", "registry.npmjs.org"]

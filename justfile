@@ -341,6 +341,73 @@ vz-bake-claude:
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
         --inject-harness   engram-harness-claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
 
+# Bake an OAuth-authenticated Claude image for VZ. Same Dockerfile as
+# `vz-bake-claude` (Claude Code CLI on node:20-slim, arm64), but the
+# manifest declares `CLAUDE_CODE_OAUTH_TOKEN` instead of
+# `ANTHROPIC_API_KEY` — useful when your org doesn't issue API keys
+# but you have a Claude subscription.
+#
+# Registered under `local://claude-oauth` so it lives alongside the
+# API-key flavor (`local://claude-demo`) without collision. Pair with
+# `dev-vz-claude-oauth`.
+#
+# Mint the OAuth token first with:
+#     claude setup-token
+# then `export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...` (or drop it in
+# `.env` at the repo root — the justfile auto-loads it).
+vz-bake-claude-oauth:
+    rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+    cargo build -p engram-agentd         --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap      --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-harness-claude --target aarch64-unknown-linux-musl --release
+    mkdir -p ./var/vz-bake-claude-oauth
+    cp deploy/claude-oauth/Dockerfile  ./var/vz-bake-claude-oauth/Dockerfile
+    cp deploy/claude-oauth/engram.toml ./var/vz-bake-claude-oauth/engram.toml
+    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
+    cargo run -p engram-cli -- image build \
+        --repo local://claude-oauth \
+        --tag warm-1 \
+        --source ./var/vz-bake-claude-oauth \
+        --format ext4 \
+        --images-dir ./var/engram/images \
+        --transport console \
+        --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
+        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
+        --inject-harness   engram-harness-claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
+
+# Run the coordinator wired for the OAuth-authenticated Claude image.
+# Same as `dev-vz` but pre-flight-checks `CLAUDE_CODE_OAUTH_TOKEN` so
+# we fail fast at the recipe instead of returning a 500 from the
+# session-create endpoint.
+#
+# Create sessions against `local://claude-oauth` (NOT `local://claude-demo`):
+#
+#     curl -X POST http://localhost:8090/sessions \
+#         -H 'content-type: application/json' \
+#         -d '{"repo":"local://claude-oauth","branch":"main","prompt":"hi"}'
+dev-vz-claude-oauth: db-up vz-codesign
+    @if [ "$(uname -s)" != "Darwin" ]; then \
+        echo "dev-vz-claude-oauth only runs on macOS"; exit 1; \
+    fi
+    @if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then \
+        echo "CLAUDE_CODE_OAUTH_TOKEN is unset. Run \`claude setup-token\` then export it (or put it in .env)." >&2; \
+        exit 1; \
+    fi
+    DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
+    ENGRAM_BIND_ADDR=127.0.0.1:8090 \
+    ENGRAM_MODE=all \
+    ENGRAM_SANDBOX_BACKEND=vz \
+    ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
+    ENGRAM_LOCAL_PATH=./var/engram \
+    ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinux-arm64} \
+    ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
+    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
+    ENGRAM_DEV_AUTO_AGENT=claude \
+    ENGRAM_DEV_NOOP_HARNESS_PATH=${ENGRAM_DEV_NOOP_HARNESS_PATH:-/sbin/engram-harness-noop} \
+    ENGRAM_DEV_CLAUDE_HARNESS_PATH=${ENGRAM_DEV_CLAUDE_HARNESS_PATH:-/sbin/engram-harness-claude} \
+    RUST_LOG=info,engram=debug \
+    target/debug/engram-coordinator
+
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
 watch:
@@ -363,3 +430,19 @@ smoke-create:
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
     rm -rf ./var
+
+# ------------------------------------------------------------------
+# Web dashboard — read-only live view of the running coordinator.
+# Run alongside `just dev` (or `just dev-vz`) in another terminal;
+# Vite proxies /sessions and /api to 127.0.0.1:8090.
+# ------------------------------------------------------------------
+
+# Install web deps (idempotent — pnpm skips if lockfile is fresh).
+web-install:
+    cd web && pnpm install
+
+# Run the Vite dev server. Defaults to :5173; override with `PORT`
+# (e.g. `PORT=5174 just web`) when 5173 is taken. No production build
+# is wired up yet — the dashboard is a dev-time tool.
+web port='5173': web-install
+    cd web && pnpm dev --port {{port}} --strictPort

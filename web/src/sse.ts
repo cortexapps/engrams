@@ -1,0 +1,85 @@
+import type { IndexedEvent, SessionEvent, SessionEventKind } from './types';
+
+// The native EventSource does not let us pass a Last-Event-ID header
+// directly — but it sends one automatically on auto-reconnect, and we
+// can also pass `?since=N` on first connect to replay from a known
+// point. The coordinator takes the max of `?since=` and the
+// `Last-Event-ID` header, so an explicit `?since` never goes backward
+// across a reconnect.
+
+export interface SseHandlers {
+  onEvent: (e: IndexedEvent) => void;
+  onError?: (err: Event) => void;
+  onLagged?: (missed: number) => void;
+}
+
+/**
+ * Subscribe to `GET /sessions/:id/events`. Returns a `close()` thunk.
+ * `since` defaults to -1 (replay everything from the start of the log).
+ */
+export function subscribeSession(
+  sessionId: string,
+  handlers: SseHandlers,
+  since = -1,
+): () => void {
+  const url = `/sessions/${sessionId}/events?since=${since}`;
+  const es = new EventSource(url);
+
+  const dispatch = (kind: SessionEventKind, ev: MessageEvent) => {
+    const idx = Number(ev.lastEventId);
+    if (!Number.isFinite(idx)) return;
+    let payload: SessionEvent | null = null;
+    try {
+      const raw = JSON.parse(ev.data);
+      // The coordinator emits the SSE `event:` field as the discriminant
+      // string and the `data:` body as the SessionEvent JSON. The body
+      // already carries `type: <kind>`, but be defensive in case a
+      // future shape changes.
+      payload = { ...(raw as Record<string, unknown>), type: kind } as SessionEvent;
+    } catch {
+      return;
+    }
+    handlers.onEvent({ idx, event: payload });
+  };
+
+  // Wire one listener per discriminant so EventSource doesn't deliver
+  // them all through `onmessage` (which only catches frames with no
+  // explicit `event:` field — namely keep-alives).
+  const kinds: SessionEventKind[] = [
+    'status_changed',
+    'exec_started',
+    'exec_completed',
+    'stdout',
+    'stderr',
+    'snapshot_taken',
+    'evicted',
+    'resumed',
+    'checkpoint_pushed',
+    'checkpoint_failed',
+    'run_started',
+    'agent_message',
+    'tool_call_started',
+    'tool_call_completed',
+    'run_completed',
+    'harness_idle',
+  ];
+  for (const kind of kinds) {
+    es.addEventListener(kind, (ev) => dispatch(kind, ev as MessageEvent));
+  }
+
+  // The coordinator surfaces broadcast lag as an `event: lagged` frame.
+  es.addEventListener('lagged', (ev) => {
+    try {
+      const { missed } = JSON.parse((ev as MessageEvent).data) as {
+        missed: number;
+      };
+      handlers.onLagged?.(missed);
+    } catch {
+      /* ignore */
+    }
+  });
+
+  es.onerror = (err) => handlers.onError?.(err);
+
+  return () => es.close();
+}

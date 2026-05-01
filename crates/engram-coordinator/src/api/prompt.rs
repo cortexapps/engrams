@@ -11,10 +11,11 @@
 use axum::extract::{Path, State};
 use axum::Json;
 use engram_core::SessionId;
+use engram_harness_proto::AgentRole;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::state::SharedState;
+use crate::state::{SessionEvent, SharedState};
 
 #[derive(Deserialize)]
 pub struct PromptRequest {
@@ -53,11 +54,36 @@ pub async fn prompt(
         )
     })?;
 
+    let prompt_text = req.text;
     state
         .harness_hub
-        .send_prompt(sandbox_id, req.text)
+        .send_prompt(sandbox_id, prompt_text.clone())
         .await
         .map_err(|e| ApiError::Internal(format!("forward prompt to harness: {e}")))?;
+
+    // Record the user's prompt in the session event log so transcripts
+    // can reconstruct the conversation. The harness adapter never
+    // echoes the prompt back through Claude's stream-json output —
+    // it only translates the *assistant* response — so without this
+    // entry the user's turn is invisible to subscribers. Best-effort:
+    // if the emit fails the harness already has the prompt and will
+    // run it, so we'd rather log and return success than 500 the
+    // caller after a successful forward.
+    if let Err(e) = state
+        .emit(
+            id,
+            SessionEvent::HarnessAgentMessage {
+                run_id: String::new(),
+                message_id: format!("user-{}", uuid::Uuid::new_v4()),
+                role: AgentRole::User,
+                text: prompt_text,
+                at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
+    }
 
     Ok(Json(PromptResponse {
         session_id: id,

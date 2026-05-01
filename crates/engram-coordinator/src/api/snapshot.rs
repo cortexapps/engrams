@@ -275,7 +275,19 @@ async fn resume_from_fc_snapshot(
     // start clean. Resume omits ENGRAM_INITIAL_PROMPT so the
     // adapter goes straight to Idle and waits for the next
     // user prompt instead of replaying the original kickoff.
-    if let Some(agent) = crate::api::sessions::build_dev_agent(&state, id, None) {
+    // TODO(secrets-on-resume): re-resolve the session's manifest +
+    // secret bundle here so the post-resume harness inherits the
+    // same env (incl. ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)
+    // it had at create. Today resume hands the harness an empty
+    // base env, so a `claude`-driven session won't reauth after
+    // an idle-evict. Tracked alongside `build_dev_agent`'s base_env
+    // arg, which was added when the create-time secret-delivery
+    // gap was fixed.
+    let resume_base_env: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Some(agent) =
+        crate::api::sessions::build_dev_agent(&state, id, None, &resume_base_env)
+    {
         if let Err(e) = state
             .services
             .sandbox

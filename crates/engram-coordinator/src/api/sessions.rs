@@ -205,7 +205,16 @@ pub async fn create_session(
     // `start_agent` can pass it post-create — the warm-pool spec
     // must NOT carry session-scoped argv or replenished slots
     // would all attach claiming to be this session.
-    let agent_for_session = build_dev_agent(&state, session_id, req.prompt.as_deref());
+    //
+    // The harness inherits manifest env + resolved secrets via
+    // `spec_env` so e.g. ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+    // are visible to the `claude` child it spawns. Without this the
+    // microVM-backend harness only ever saw ENGRAM_SESSION_ID +
+    // ENGRAM_INITIAL_PROMPT, because BootstrapLaunch carries
+    // `agent.env` only — `vm_spec.env` isn't piped to agentd at
+    // create time on FC/VZ.
+    let agent_for_session =
+        build_dev_agent(&state, session_id, req.prompt.as_deref(), &spec_env);
 
     let vm_spec = VmSpec {
         image: image_version.clone(),
@@ -330,6 +339,35 @@ pub async fn create_session(
         )
         .await?;
 
+    // If the request carried an initial prompt, record it as a
+    // user-role message in the event log. The harness pulls the value
+    // out of `ENGRAM_INITIAL_PROMPT` and runs it without echoing it
+    // back through Claude's stream-json output, so subscribers
+    // (transcripts, dashboards) only see the assistant's reply
+    // otherwise. Mirror the per-prompt path in `prompt.rs`. Best-
+    // effort: a failed emit doesn't roll back session creation.
+    if let Some(text) = req.prompt.as_deref().filter(|s| !s.is_empty()) {
+        if let Err(e) = state
+            .emit(
+                session_id,
+                SessionEvent::HarnessAgentMessage {
+                    run_id: String::new(),
+                    message_id: format!("user-{}", uuid::Uuid::new_v4()),
+                    role: engram_harness_proto::AgentRole::User,
+                    text: text.to_string(),
+                    at: chrono::Utc::now(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "emit initial prompt event failed",
+            );
+        }
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {
@@ -427,6 +465,7 @@ pub(crate) fn build_dev_agent(
     state: &SharedState,
     session_id: SessionId,
     initial_prompt: Option<&str>,
+    base_env: &HashMap<String, String>,
 ) -> Option<engram_core::types::sandbox::AgentSpec> {
     use crate::config::{DevAgent, SandboxBackendChoice};
     let agent = match state.cfg.dev_auto_agent {
@@ -464,7 +503,11 @@ pub(crate) fn build_dev_agent(
         backend = ?state.cfg.sandbox_backend,
         "build_dev_agent: building AgentSpec"
     );
-    let mut env = HashMap::new();
+    // Start from the manifest's declared env + resolved secrets so
+    // the harness (and any child it spawns, like `claude`) inherits
+    // ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / etc. Session-
+    // specific keys are inserted last so they win on collision.
+    let mut env: HashMap<String, String> = base_env.clone();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
     if let Some(prompt) = initial_prompt {
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());

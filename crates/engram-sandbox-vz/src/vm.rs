@@ -72,8 +72,18 @@ impl VmConfig {
             //     ENGRAM_TRANSPORT, spawns engram-bootstrap, exec's
             //     engram-agentd. The bake injects this at
             //     /sbin/engram-init.
+            //   - `ip=dhcp` — Linux's IP_PNP path: kernel itself
+            //     brings up eth0 and DHCPs for an address against
+            //     VZ's NAT before userspace runs. The Kata kernel
+            //     ships with CONFIG_IP_PNP_DHCP=y so this is free.
+            //     Without it the rootfs would need iproute2 +
+            //     dhclient just to get on the network — `node:20-slim`
+            //     and the demo bakes carry neither, so the guest
+            //     was unreachable. The init shim still has to write
+            //     /etc/resolv.conf because IP_PNP doesn't touch the
+            //     userspace resolver.
             kernel_cmdline: "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw \
-                             quiet init=/sbin/engram-init"
+                             quiet init=/sbin/engram-init ip=dhcp"
                 .into(),
         }
     }

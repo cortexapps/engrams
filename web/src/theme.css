@@ -1,0 +1,184 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------
+ * Design tokens — "Lab Notebook"
+ *
+ * The palette is the design. Resist adding more colors. If a new
+ * surface needs differentiation, prefer typography or a hairline rule
+ * over introducing a hue.
+ * ------------------------------------------------------------------ */
+
+@theme {
+  --color-paper: #f4eedf;
+  --color-paper-warm: #efe7d3;
+  --color-ink: #1b1612;
+  --color-ink-faded: #5c544a;
+  --color-ink-quiet: #8a8275;
+  --color-rule: #d9cfb8;
+  --color-rule-faint: #e7decb;
+  --color-amber: #b85c0a; /* "now" */
+  --color-amber-soft: #d8893f;
+  --color-verdigris: #3a6b5c; /* "archived / snapshotted" */
+
+  --font-display:
+    "Newsreader", "Iowan Old Style", "Source Serif 4", Georgia, serif;
+  --font-mono:
+    "JetBrains Mono", "Berkeley Mono", "SF Mono", ui-monospace, monospace;
+
+  --radius-none: 0;
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-display);
+    font-feature-settings: "kern", "liga", "onum";
+    font-variant-numeric: oldstyle-nums proportional-nums;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.55;
+  }
+
+  /* Tabular numerics for everything mono — these are tables, not prose. */
+  .font-mono,
+  code,
+  kbd,
+  samp,
+  pre,
+  [data-tabular] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background-color: var(--color-amber);
+    color: var(--color-paper);
+  }
+
+  /* Hairline rule reused everywhere. */
+  hr {
+    border: 0;
+    border-top: 1px solid var(--color-rule);
+    margin: 0;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Glyphs — keep these as a single class so a status that's animating
+ * between values can cross-fade two <span class="glyph"> children
+ * without inheriting odd line-height side effects.
+ * ------------------------------------------------------------------ */
+.glyph {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum";
+  width: 1ch;
+  text-align: center;
+  line-height: 1;
+}
+
+/* Heartbeat — opacity pulse, ~human resting heartrate (~50 bpm). The
+ * timing is deliberately a touch slow so it reads as "alive, calm",
+ * not "alarm". */
+@keyframes heartbeat {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.glyph-heartbeat {
+  animation: heartbeat 1.2s ease-in-out infinite;
+  color: var(--color-amber);
+}
+
+/* "Just arrived" tint — fades from amber back to ink over ~1.6s. Used
+ * on freshly-rendered chat paragraphs and ticker entries. The animation
+ * runs once on mount; subsequent state changes don't replay it. */
+@keyframes ink-settle {
+  0% {
+    color: var(--color-amber);
+  }
+  100% {
+    color: var(--color-ink);
+  }
+}
+
+.ink-settle {
+  animation: ink-settle 1600ms ease-out forwards;
+}
+
+/* The faint left rule that flanks tool-call asides. */
+.tool-rule {
+  border-left: 1px solid var(--color-rule);
+  padding-left: 0.9rem;
+}
+
+/* Small caps for role labels and section headings. Newsreader has a
+ * proper small-caps feature. */
+.smallcaps {
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+/* The book-column layout used by both pages. Roughly 70ch of prose,
+ * with margins wide enough that role labels and timestamps can hang
+ * off either side without crowding. */
+.book {
+  max-width: 72ch;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+}
+
+@media (min-width: 900px) {
+  .book {
+    padding-inline: 0;
+  }
+}
+
+/* Margin notes — sits in the gutter outside the book column. */
+.margin-note {
+  position: absolute;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--color-ink-quiet);
+  letter-spacing: 0.04em;
+}
+
+.margin-left {
+  left: -7rem;
+  width: 6rem;
+  text-align: right;
+}
+
+.margin-right {
+  right: -6rem;
+  width: 5rem;
+  text-align: left;
+}
+
+@media (max-width: 1024px) {
+  /* On narrow viewports, gutters collapse — show margin notes inline.
+   * They look like a typographic flourish rather than a fallback. */
+  .margin-note {
+    position: static;
+    display: inline-block;
+    width: auto;
+    text-align: left;
+    margin-right: 0.5rem;
+  }
+}
