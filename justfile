@@ -303,7 +303,8 @@ vz-bake-demo:
     cargo build -p engram-harness-noop --target aarch64-unknown-linux-musl --release
     mkdir -p ./var/vz-bake
     printf 'FROM --platform=linux/arm64 debian:bookworm-slim\n' > ./var/vz-bake/Dockerfile
-    printf 'name = "vz-demo"\n'                                 > ./var/vz-bake/engram.toml
+    printf 'name = "vz-demo"\n\n[[harness]]\nname = "noop"\nguest_path = "/sbin/engram-harness-noop"\n' \
+        > ./var/vz-bake/engram.toml
     PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
     cargo run -p engram-cli -- image build \
         --repo local://demo \
@@ -314,7 +315,7 @@ vz-bake-demo:
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   engram-harness-noop=target/aarch64-unknown-linux-musl/release/engram-harness-noop
+        --inject-harness   noop=target/aarch64-unknown-linux-musl/release/engram-harness-noop
 
 # Bake the Claude image for VZ — arm64 sibling of fc-bake-claude.
 # Reuses the same Dockerfile / engram.toml under deploy/fc-bake-claude/
@@ -338,7 +339,7 @@ vz-bake-claude:
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   engram-harness-claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
+        --inject-harness   claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
 
 # Bake an OAuth-authenticated Claude image for VZ. Same Dockerfile as
 # `vz-bake-claude` (Claude Code CLI on node:20-slim, arm64), but the
@@ -372,7 +373,7 @@ vz-bake-claude-oauth:
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap \
-        --inject-harness   engram-harness-claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
+        --inject-harness   claude=target/aarch64-unknown-linux-musl/release/engram-harness-claude
 
 # Run the coordinator wired for the OAuth-authenticated Claude image.
 # Same as `dev-vz` but pre-flight-checks `CLAUDE_CODE_OAUTH_TOKEN` so

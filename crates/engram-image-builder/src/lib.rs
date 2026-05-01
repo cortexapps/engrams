@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::{HarnessEntry, ImageManifest, ImageStatus, ImageVersion};
+use engram_core::types::{ImageManifest, ImageStatus, ImageVersion};
 use engram_core::ImageVersionId;
 
 pub use config::{BuildConfig, EngramRepoConfig};
@@ -559,6 +559,12 @@ async fn inject_agent(
         install_file(bootstrap, &dst, "bootstrap").await?;
     }
 
+    // Every `--inject-harness <name>=<host_path>` must point at a
+    // `[[harness]]` declaration in engram.toml — the manifest is the
+    // single source of truth for what the runtime advertises and
+    // where the binary lands. Hard error rather than synthesise an
+    // entry: the operator's request and the image's contract have
+    // disagreed and we want them to notice.
     let mut copied_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, src) in &injection.harness_binaries {
         if !src.exists() {
@@ -572,32 +578,19 @@ async fn inject_agent(
                 "harness_binary guest filename `{name}` must be a single path component"
             )));
         }
-        // Prefer the guest path declared in `[[harness]]` so the
-        // baker, manifest, and runtime all agree on where the binary
-        // lands. If no entry exists, fall back to the legacy
-        // `/sbin/<name>` convention and synthesize a manifest entry
-        // — but warn so the user knows engram.toml is the source of
-        // truth going forward.
-        let guest_path = match manifest.harnesses.iter().find(|h| h.name == *name) {
-            Some(entry) => entry.guest_path.clone(),
-            None => {
-                let synthesized = format!("/sbin/{name}");
-                tracing::warn!(
-                    name = %name,
-                    guest_path = %synthesized,
-                    "harness `{name}` was injected via --inject-harness but is not declared \
-                     in engram.toml's [[harness]] block; appending a synthetic manifest entry. \
-                     Declare it explicitly to silence this warning.",
-                );
-                manifest.harnesses.push(HarnessEntry {
-                    name: name.clone(),
-                    guest_path: synthesized.clone(),
-                    description: None,
-                });
-                synthesized
-            }
-        };
-        let rel = guest_path.trim_start_matches('/');
+        let entry = manifest.harnesses.iter().find(|h| h.name == *name).ok_or_else(|| {
+            let declared: Vec<&str> = manifest
+                .harnesses
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect();
+            BuildError::Config(format!(
+                "harness `{name}` provided via --inject-harness but is not declared in \
+                 engram.toml's [[harness]] block (declared: {declared:?}). Add a \
+                 [[harness]] entry with the same `name` and the desired `guest_path`."
+            ))
+        })?;
+        let rel = entry.guest_path.trim_start_matches('/');
         if rel.is_empty() {
             return Err(BuildError::InvalidPath(format!(
                 "harness `{name}` has empty guest_path"
