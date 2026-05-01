@@ -6,12 +6,11 @@
 //! the local backend in a `PooledBackend` so warm-pool semantics apply
 //! identically to single-binary dev and multi-host production.
 //!
-//! Pool key is the `image_version` only (i.e. `spec.image`). Two repos
-//! using the same image share warm slots, which is the right behaviour
-//! — the pool's job is to amortise the create-time cost of a given
-//! image, not enforce per-repo isolation. The wire-level
-//! [`engram_protocol::WarmPoolReport`] still has a `repo` field for
-//! diagnostics; we ship it as the same value as `image_version`.
+//! Pool key is `image_version` (i.e. `spec.image`). With image
+//! identity decoupled from workspace identity in phase 2, a single
+//! warm slot serves any session referencing the same image — the
+//! pool's job is to amortise the create-time cost of a given image,
+//! not enforce per-repo isolation.
 
 use std::sync::Arc;
 
@@ -54,12 +53,7 @@ impl PooledBackend {
     }
 
     fn pool_key(spec: &SandboxSpec) -> PoolKey {
-        // `repo` is duplicated as the image_version because the wire
-        // protocol's `WarmPoolReport` carries both fields and the
-        // scheduler matches on `image_version` only (so the diagnostic
-        // `repo` value just needs to be stable / non-empty).
         PoolKey {
-            repo: spec.image.clone(),
             image_version: spec.image.clone(),
         }
     }

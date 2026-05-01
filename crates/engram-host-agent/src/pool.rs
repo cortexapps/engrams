@@ -1,12 +1,20 @@
-//! Warm pool. Per (repo, image_version), keep N microVMs idle so
-//! session checkout is sub-second. Background reconciliation replaces
-//! VMs as they're checked out.
+//! Warm pool. Per `image_version`, keep N microVMs idle so session
+//! checkout is sub-second. Background reconciliation replaces VMs as
+//! they're checked out.
 //!
 //! The pool stores a `SandboxSpec` per key — that's the recipe
 //! `replenish` uses to call `backend.create` for missing slots. Spec
 //! must NOT include session-specific fields (e.g. `ENGRAM_SESSION_ID`
-//! env var); pooled sandboxes are anonymous until checkout, at which
-//! point the per-session env is layered on at exec time.
+//! env var, mounts, harness argv); pooled sandboxes are anonymous
+//! until checkout, at which point per-session env is layered on at
+//! exec time, the workspace is materialized inline, and the harness
+//! is launched via `start_agent`.
+//!
+//! Phase 3: the pool key was historically `(repo, image_version)`.
+//! With image identity now decoupled from workspace, the `repo` was
+//! redundant — image_tag is unique within the registry — so the key
+//! collapsed to just the image tag. A single warm slot can now serve
+//! sessions across any git URL or workspace shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +27,6 @@ use parking_lot::Mutex;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PoolKey {
-    pub repo: String,
     pub image_version: String,
 }
 
@@ -102,7 +109,6 @@ impl Pool {
             .map(|(key, entry)| {
                 let ready = g.ready.get(key).map(|v| v.len() as u32).unwrap_or(0);
                 engram_protocol::WarmPoolReport {
-                    repo: key.repo.clone(),
                     image_version: key.image_version.clone(),
                     ready,
                     target: entry.target,
@@ -189,9 +195,11 @@ mod tests {
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
-    fn key(repo: &str, ver: &str) -> PoolKey {
+    fn key(_repo: &str, ver: &str) -> PoolKey {
+        // `_repo` was the historical second key half; preserved on
+        // the test helper signature so the existing call sites stay
+        // readable.
         PoolKey {
-            repo: repo.into(),
             image_version: ver.into(),
         }
     }
@@ -243,28 +251,33 @@ mod tests {
     }
 
     #[test]
-    fn pool_keys_are_isolated() {
+    fn pool_keys_are_isolated_by_image_version() {
+        // Phase 3: pool key is image_version only. Two sessions
+        // pointing at different `repo`s but the same image share a
+        // pool slot — that's the whole decoupling point. Different
+        // image_versions stay isolated.
         let (p, _d) = pool();
-        let a = key("repo-a", "warm-1");
-        let b = key("repo-b", "warm-1");
-        let c = key("repo-a", "warm-2");
+        let same = key("repo-a", "warm-1");
+        let same_other_repo = key("repo-b", "warm-1");
+        let other_image = key("repo-a", "warm-2");
         let id_a = SandboxId::new();
         let id_b = SandboxId::new();
-        p.push_ready(a.clone(), id_a);
-        p.push_ready(b.clone(), id_b);
+        p.push_ready(same.clone(), id_a);
+        p.push_ready(same_other_repo.clone(), id_b);
 
-        assert_eq!(p.ready_count(&a), 1);
-        assert_eq!(p.ready_count(&b), 1);
+        // Same image, regardless of `_repo` placeholder = same pool.
+        assert_eq!(p.ready_count(&same), 2);
         assert_eq!(
-            p.ready_count(&c),
+            p.ready_count(&other_image),
             0,
             "different image_version is its own pool"
         );
 
-        // Checkout from one key must not drain another.
-        assert_eq!(p.checkout(&a), Some(id_a));
-        assert_eq!(p.ready_count(&b), 1);
-        assert_eq!(p.checkout(&b), Some(id_b));
+        // Both push_ready calls landed in the same bucket; checkout
+        // returns LIFO order.
+        assert_eq!(p.checkout(&same), Some(id_b));
+        assert_eq!(p.checkout(&same), Some(id_a));
+        assert_eq!(p.checkout(&same), None);
     }
 
     #[test]

@@ -530,7 +530,6 @@ mod tests {
                     running_sandboxes: 0,
                 },
                 warm_pools: vec![WarmPoolReport {
-                    repo: "r".into(),
                     image_version: "v".into(),
                     ready: 2,
                     target: 4,
@@ -608,7 +607,6 @@ mod tests {
                     running_sandboxes: 0,
                 },
                 warm_pools: vec![WarmPoolReport {
-                    repo: "r".into(),
                     image_version: "v".into(),
                     ready: 4,
                     target: 4,

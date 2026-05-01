@@ -23,7 +23,11 @@ pub struct HostCapacityReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WarmPoolReport {
-    pub repo: String,
+    /// Image identifier the pool key is bucketed by. Phase 2 made
+    /// images decoupled from workspace identity, so the redundant
+    /// `repo` half of the legacy `(repo, image_version)` key is gone
+    /// — pool slots can serve sessions across many git URLs as long
+    /// as they share an image.
     pub image_version: String,
     pub ready: u32,
     pub target: u32,
@@ -60,7 +64,6 @@ mod tests {
                 running_sandboxes: 7,
             },
             warm_pools: vec![WarmPoolReport {
-                repo: "cortex/api".into(),
                 image_version: "warm-2026-04".into(),
                 ready: 2,
                 target: 4,
@@ -89,7 +92,7 @@ mod tests {
             original.capacity.running_sandboxes
         );
         assert_eq!(back.warm_pools.len(), 1);
-        assert_eq!(back.warm_pools[0].repo, "cortex/api");
+        assert_eq!(back.warm_pools[0].image_version, "warm-2026-04");
         assert_eq!(back.warm_pools[0].ready, 2);
         assert_eq!(back.warm_pools[0].target, 4);
         assert_eq!(back.local_snapshots.len(), 1);

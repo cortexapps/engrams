@@ -108,7 +108,6 @@ pub struct HostView {
 
 #[derive(Serialize)]
 pub struct WarmPoolView {
-    pub repo: String,
     pub image_version: String,
     pub ready: u32,
     pub target: u32,
@@ -131,7 +130,6 @@ impl HostView {
                 .warm_pools
                 .into_iter()
                 .map(|p| WarmPoolView {
-                    repo: p.repo,
                     image_version: p.image_version,
                     ready: p.ready,
                     target: p.target,
