@@ -367,6 +367,14 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
     // single-host scheduler's "no host" path must surface as a 500
     // with a meaningful message rather than silently hanging.
     let images_dir = tempfile::tempdir().expect("images tmp").keep();
+    // Seed `demo:warm-test` on disk so `ImageRegistry::load` resolves;
+    // without this the create_session handler returns 400 from the
+    // image-not-found arm and the no-host path is never exercised.
+    {
+        let img_dir = images_dir.join("demo/warm-test");
+        std::fs::create_dir_all(&img_dir).unwrap();
+        std::fs::write(img_dir.join("manifest.toml"), r#"name = "demo""#).unwrap();
+    }
     let host_registry = Arc::new(HostRegistry::new());
     let meta = Arc::new(MiniMeta::default());
     meta.images
