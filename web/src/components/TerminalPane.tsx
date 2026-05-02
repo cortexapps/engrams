@@ -139,10 +139,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       });
 
       fitAddon = new mod.FitAddon();
-      const t = term as unknown as { loadAddon?: (a: unknown) => void };
-      if (typeof t.loadAddon === 'function') {
-        t.loadAddon(fitAddon);
-      }
+      term.loadAddon(fitAddon);
       term.open(container);
       try {
         fitAddon.fit();
@@ -268,22 +265,15 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       } catch {
         // ignore
       }
-      // ghostty-web's Terminal.dispose() does NOT call wasmTerm.free()
-      // — the WASM grid leaks on unmount, and the next mount's fresh
-      // Terminal allocation lands on top of that leaked memory, so the
-      // renderer paints stale glyphs from the previous bash session.
-      // Free the wasmTerm explicitly first (this is what the library's
-      // own term.reset() does internally) so the heap is clean before
-      // the next mount allocates.
+      // Terminal.dispose() runs cleanupComponents() which already frees
+      // the underlying wasmTerm. Calling wasmTerm.free() ourselves first
+      // double-frees the WASM allocation: small writes survive on the
+      // *next* mount (e.g. `echo X`), but a larger one like the
+      // colorized output of `ls /` hits the corrupted region and throws
+      // `RuntimeError: memory access out of bounds` in term.write,
+      // freezing the canvas while the websocket keeps flowing.
       try {
-        (
-          term as unknown as { wasmTerm?: { free?: () => void } } | null
-        )?.wasmTerm?.free?.();
-      } catch {
-        // ignore
-      }
-      try {
-        (term as unknown as { dispose?: () => void } | null)?.dispose?.();
+        term?.dispose();
       } catch {
         // ignore
       }

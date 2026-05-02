@@ -1,22 +1,26 @@
-// Regression tests for the SHELL-tab "stale glyphs on remount" bug.
+// Regression tests for the SHELL-tab "hangs on remount" bug.
 //
-// Symptom: navigate to a session, type something, leave, come back —
-// the prior bash session's text is still painted, and new typed input
-// visually overwrites those cells. Two root causes:
+// Symptom: open SHELL on an active session, navigate away via SPA,
+// navigate back, click SHELL, type a command — the keystrokes flow
+// over the websocket but no output renders. The underlying error is
+// `RuntimeError: memory access out of bounds` thrown from inside
+// term.write() the first time the new mount tries to render a chunk
+// of any real size (e.g. the colorized output of `ls /`).
 //
-//   1. ghostty-web's WASM allocator hands a freshly-created Terminal
-//      cell-grid memory that overlaps a previous mount's leaked grid.
-//      Our hard-clear escape (\x1b[2J\x1b[3J\x1b[H) must run *after*
-//      fitAddon.fit(), because fit() resizes the grid and cells added
-//      by the resize aren't covered by an earlier clear.
+// Cause: ghostty-web 0.4 Terminal.dispose() already frees the WASM
+// terminal via cleanupComponents(). An earlier version of this
+// component called wasmTerm.free() ourselves first, which made
+// dispose()'s subsequent free a *double-free* — that corrupted the
+// allocator's free list and the next Terminal's grid landed on top
+// of poisoned memory. Small writes survived; a multi-line write hit
+// the corrupted region and threw.
 //
-//   2. ghostty-web's Terminal.dispose() does NOT call wasmTerm.free();
-//      the previous Terminal's grid leaks. We free it ourselves in
-//      cleanup before disposing.
+// The mount-side workaround (clear-after-fit) addresses a separate,
+// older "stale glyphs on remount" bug and is preserved.
 //
-// Both have come back from "fixed" before because nothing pinned the
-// call ordering. These tests assert the order via mock invocation
-// counters so a future refactor that reorders the calls fails loudly.
+// Both bugs have come back from "fixed" before because nothing pinned
+// the cleanup contract. These tests assert it via mock invocation
+// counters so a future refactor fails loudly.
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, render } from '@testing-library/react';
@@ -137,7 +141,7 @@ describe('TerminalPane mount sequence', () => {
 });
 
 describe('TerminalPane unmount sequence', () => {
-  test('frees wasmTerm BEFORE disposing the Terminal (ghostty-web dispose() leaks the grid otherwise)', async () => {
+  test('disposes the Terminal but does NOT call wasmTerm.free() — that path double-frees', async () => {
     const { unmount } = render(<TerminalPane sessionId="s1" />);
     await flush();
 
@@ -147,18 +151,15 @@ describe('TerminalPane unmount sequence', () => {
 
     unmount();
 
-    // All four cleanups must fire.
     expect(ws.close).toHaveBeenCalledTimes(1);
     expect(addon.dispose).toHaveBeenCalledTimes(1);
-    expect(term.wasmTerm.free).toHaveBeenCalledTimes(1);
     expect(term.dispose).toHaveBeenCalledTimes(1);
 
-    // wasmTerm.free() before dispose() — Terminal.dispose() in
-    // ghostty-web doesn't free the WASM grid, so we have to do it
-    // ourselves *while we still hold a reference to wasmTerm*.
-    const freeOrder = term.wasmTerm.free.mock.invocationCallOrder[0];
-    const disposeOrder = term.dispose.mock.invocationCallOrder[0];
-    expect(freeOrder).toBeLessThan(disposeOrder);
+    // Terminal.dispose() runs cleanupComponents() which frees the
+    // wasmTerm itself. Calling it from here too is the double-free
+    // that lands the next mount on a corrupted heap and crashes
+    // term.write() partway through `ls /` output.
+    expect(term.wasmTerm.free).not.toHaveBeenCalled();
   });
 });
 
@@ -191,5 +192,28 @@ describe('TerminalPane remount cycle', () => {
     );
     const clearOrder = secondTerm.write.mock.invocationCallOrder[clearWriteCall];
     expect(fitOrder).toBeLessThan(clearOrder);
+  });
+
+  test('regression: navigate-away-and-back never explicitly frees wasmTerm (would corrupt the next mount)', async () => {
+    // Mirrors the user repro: open SHELL, navigate to overview via
+    // SPA (unmount), navigate back (remount), click SHELL again, type
+    // `ls /`. Pre-fix, the explicit wasmTerm.free() in the unmount
+    // path double-freed against Terminal.dispose()'s own free, and
+    // the second mount's first multi-line write OOB'd inside the
+    // ghostty-web WASM. Asserting the cleanup never touches
+    // wasmTerm.free() pins the contract that prevents it.
+    const { unmount: unmount1 } = render(<TerminalPane sessionId="s1" />);
+    await flush();
+    const firstTerm = MockTerminal.instances.at(-1)!;
+    unmount1();
+    expect(firstTerm.dispose).toHaveBeenCalledTimes(1);
+    expect(firstTerm.wasmTerm.free).not.toHaveBeenCalled();
+
+    const { unmount: unmount2 } = render(<TerminalPane sessionId="s1" />);
+    await flush();
+    const secondTerm = MockTerminal.instances.at(-1)!;
+    unmount2();
+    expect(secondTerm.dispose).toHaveBeenCalledTimes(1);
+    expect(secondTerm.wasmTerm.free).not.toHaveBeenCalled();
   });
 });
