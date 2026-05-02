@@ -227,10 +227,9 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
             className="font-display italic text-[0.85rem]"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            no images registered. bake one with{' '}
-            <code className="font-mono">just vz-bake-claude-oauth</code> —
-            harnesses are now declared in <code className="font-mono">[[harness]]</code>{' '}
-            blocks of <code className="font-mono">engram.toml</code>.
+            no images registered. an operator needs to bake and
+            register one (via <code className="font-mono">engram image build</code>)
+            before sessions can be created.
           </p>
         )}
 
