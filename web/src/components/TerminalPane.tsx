@@ -144,26 +144,24 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
         t.loadAddon(fitAddon);
       }
       term.open(container);
-      // Hard-clear the buffer on every mount. ghostty-web allocates
-      // its WASM cell grid via the Zig allocator, which (in our
-      // testing) returns reused memory regions whose contents are
-      // not zeroed — so the new Terminal can come up with stale
-      // glyphs from a previous mount's bash session already in the
-      // grid, even though canvas + DOM are fresh. Writing the ANSI
-      // clear escapes directly through term.write forces the WASM
-      // parser to walk cells and zero them, then the renderer
-      // repaints empty. \x1b[2J = clear viewport, \x1b[3J = clear
-      // scrollback, \x1b[H = cursor home.
-      try {
-        term.write('\x1b[2J\x1b[3J\x1b[H');
-      } catch {
-        // ignore
-      }
       try {
         fitAddon.fit();
         fitAddon.observeResize();
       } catch {
         // ignore — fit is best-effort
+      }
+      // ghostty-web's WASM allocator can hand a freshly-created
+      // Terminal a cell grid that overlaps a previous mount's leaked
+      // grid memory, so the renderer paints stale glyphs from the
+      // prior bash session. Walk + zero every cell at the *final*
+      // post-fit grid size: \x1b[2J = clear viewport, \x1b[3J = clear
+      // scrollback, \x1b[H = cursor home. Writing this *before* fit()
+      // (an earlier shape of this code) only clears the pre-resize
+      // grid; the cells that fit() adds come back stale.
+      try {
+        term.write('\x1b[2J\x1b[3J\x1b[H');
+      } catch {
+        // ignore
       }
 
       setStatus('connecting');
@@ -267,6 +265,20 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       }
       try {
         fitAddon?.dispose?.();
+      } catch {
+        // ignore
+      }
+      // ghostty-web's Terminal.dispose() does NOT call wasmTerm.free()
+      // — the WASM grid leaks on unmount, and the next mount's fresh
+      // Terminal allocation lands on top of that leaked memory, so the
+      // renderer paints stale glyphs from the previous bash session.
+      // Free the wasmTerm explicitly first (this is what the library's
+      // own term.reset() does internally) so the heap is clean before
+      // the next mount allocates.
+      try {
+        (
+          term as unknown as { wasmTerm?: { free?: () => void } } | null
+        )?.wasmTerm?.free?.();
       } catch {
         // ignore
       }
