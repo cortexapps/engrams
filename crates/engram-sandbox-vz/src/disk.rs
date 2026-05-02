@@ -25,7 +25,6 @@
 //! <session-id>` rehydrates conversation context against
 //! Anthropic's API.
 
-use std::os::fd::AsRawFd;
 use std::path::Path;
 
 /// Errors from the disk-clone layer.
@@ -213,8 +212,3 @@ mod tests {
         assert!(msg.contains("does-not-exist"), "{msg}");
     }
 }
-
-// AsRawFd is unused; keeps the OwnedFd import path coherent if we
-// later need to dup an open fd to clone via fcopyfile.
-#[allow(dead_code)]
-fn _suppress_unused(_x: &dyn AsRawFd) {}

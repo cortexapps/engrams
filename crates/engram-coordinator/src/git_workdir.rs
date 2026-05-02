@@ -125,7 +125,7 @@ impl GitWorkdir {
         // not a concern at the per-deployment scale.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hasher::write(&mut hasher, url.as_bytes());
-        let h = std::hash::Hasher::finish(&mut hasher);
+        let h = std::hash::Hasher::finish(&hasher);
         self.root.join(format!("{h:016x}.git"))
     }
 

@@ -141,6 +141,12 @@ impl HostView {
     }
 }
 
+// `tungstenite::Error` is 136 bytes — defined upstream, every variant
+// counts, and `Result<_, TungsteniteError>` flowing through this
+// closure is the boundary type ConnectedHost::spawn expects. We can't
+// box it locally without a cascading signature change. Allow the
+// `result_large_err` lint at the boundary.
+#[allow(clippy::result_large_err)]
 async fn handle_connection(state: SharedState, socket: WebSocket) {
     // Adapt axum::ws::Message ↔ tungstenite::Message at the boundary so
     // engram_protocol can stay axum-agnostic. We only ever encode/decode

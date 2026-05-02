@@ -136,7 +136,7 @@ pub async fn create_session(
     // agent to consume the prompt. Silent drop hides the bug; reject
     // explicitly so the dashboard / CLI surfaces the mistake.
     if matches!(req.harness, HarnessSpec::None)
-        && req.prompt.as_deref().map(str::is_empty).unwrap_or(true) == false
+        && !req.prompt.as_deref().map(str::is_empty).unwrap_or(true)
     {
         return Err(ApiError::BadRequest(
             "`prompt` requires a `harness` other than `none` — there is no agent to receive it"

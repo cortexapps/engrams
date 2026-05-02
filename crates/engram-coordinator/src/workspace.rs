@@ -57,12 +57,12 @@ pub const DEFAULT_GUEST_WORKSPACE: &str = "/workspace";
 ///
 /// - `Empty`     → no-op. Whatever the image baked is what's there.
 /// - `Git`       → `git clone <url> -b <branch> --single-branch
-///                  /workspace` via `backend.exec` so the rootfs
-///                  acquires a real `.git` dir. Read-only flag
-///                  affects checkpoint behavior, not the clone.
+///   /workspace` via `backend.exec` so the rootfs acquires a real
+///   `.git` dir. Read-only flag affects checkpoint behavior, not the
+///   clone.
 /// - `LocalMount`→ no-op here. The host-to-guest share is wired into
-///                  `SandboxSpec.mounts` at create time; the backend
-///                  has already mounted it.
+///   `SandboxSpec.mounts` at create time; the backend has already
+///   mounted it.
 pub async fn materialize(
     backend: &dyn SandboxBackend,
     sandbox_id: SandboxId,

@@ -862,8 +862,7 @@ pub(crate) mod tests {
                 .snapshots
                 .lock()
                 .iter()
-                .filter(|s| s.session_id == sid)
-                .last()
+                .rfind(|s| s.session_id == sid)
                 .cloned())
         }
         async fn upsert_image_version(&self, _: ImageVersion) -> Result<(), MetaError> {
