@@ -21,7 +21,9 @@
 //! Run: `cargo run -p engram-sandbox-vz --example snapshot_diag`
 //! (codesign first — `just vz-codesign`).
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 #[cfg(not(target_os = "macos"))]
