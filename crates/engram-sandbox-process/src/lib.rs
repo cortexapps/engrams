@@ -183,7 +183,18 @@ impl SandboxBackend for ProcessBackend {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Put the child in its own process group so a timeout kill
+            // can take the whole tree down with a single
+            // `kill(-pgid, SIGKILL)`. Without this, commands like
+            // `sh -c "sleep 30"` on shells that *fork* (Ubuntu's dash
+            // for `-c`, vs bash which execs) leak the inner sleep —
+            // killing the shell leaves the child orphaned, holding
+            // stdout/stderr pipes open, blocking the drain task for
+            // the full natural duration. (Verified failure mode on
+            // Blacksmith Ubuntu runners; macOS+bash and the dev VM's
+            // nix-bash exec the inner command, so the bug was hidden.)
+            .process_group(0);
 
         let mut child = cmd
             .spawn()
@@ -236,34 +247,31 @@ impl SandboxBackend for ProcessBackend {
                     None
                 }
                 Err(_) => {
-                    // Timeout: kill_on_drop fires when `child` is
-                    // dropped at the end of this scope, but be explicit
-                    // so the readers see EOF promptly. Surface the
-                    // outcome of both kill and wait so anomalies (e.g.
-                    // CI runners with restricted PID-namespace
-                    // semantics where SIGKILL doesn't actually reap
-                    // the child) are observable instead of silently
-                    // turning into "timeout took 30s".
+                    // Timeout. Two-stage kill:
+                    //   1. SIGKILL the *process group* so any
+                    //      grandchildren the leader spawned die too.
+                    //      Without this, `sh -c "sleep N"` shells
+                    //      that fork (Ubuntu's dash) leave the inner
+                    //      command alive holding stdout/stderr pipes;
+                    //      the drain task below then waits the full
+                    //      natural duration. The leader is its own
+                    //      pgrp leader thanks to `.process_group(0)`
+                    //      at spawn time, so killpg reaches the whole
+                    //      tree.
+                    //   2. SIGKILL the leader via `child.start_kill()`
+                    //      so tokio reaps it cleanly and `wait()`
+                    //      returns.
                     let pid = child.id();
+                    if let Some(pid) = pid {
+                        let pgrp = nix::unistd::Pid::from_raw(pid as i32);
+                        // ESRCH (group already gone) is fine — best-effort.
+                        let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+                    }
                     if let Err(e) = child.start_kill() {
                         tracing::warn!(error = %e, ?pid, "child.start_kill() after timeout failed");
                     }
-                    let kill_started = std::time::Instant::now();
-                    match child.wait().await {
-                        Ok(status) => {
-                            let took = kill_started.elapsed();
-                            if took > Duration::from_secs(1) {
-                                tracing::warn!(
-                                    ?pid,
-                                    exit = ?status.code(),
-                                    took_ms = took.as_millis() as u64,
-                                    "child.wait() after SIGKILL took >1s — kill may not have propagated",
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, ?pid, "child.wait() after kill failed")
-                        }
+                    if let Err(e) = child.wait().await {
+                        tracing::warn!(error = %e, ?pid, "child.wait() after kill failed");
                     }
                     Some(EXIT_CODE_TIMEOUT)
                 }
