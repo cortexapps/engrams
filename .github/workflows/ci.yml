@@ -14,10 +14,14 @@ name: CI
 #                       the FC image bake chain)
 #   - test-firecracker: every `#[ignore]`'d FC integration test
 #                       (boot, lifecycle, snapshot, snapshot_uffd,
-#                       exec_real_vm). Runs on a Blacksmith Linux
-#                       runner because GHA-hosted runners don't reliably
-#                       expose `/dev/kvm` for nested virt.
+#                       exec_real_vm) under nested virt.
 #   - web:              pnpm install + tsc + vite build + vitest
+#
+# All jobs run on Blacksmith Linux runners
+# (https://docs.blacksmith.sh/blacksmith-runners/overview) — faster
+# CPUs + nested-virt support across the whole matrix, not just the FC
+# job. Tier sizing is per-job (2vcpu for cheap stuff, 4vcpu for
+# Postgres/test runs and KVM workloads).
 
 on:
   push:
@@ -33,7 +37,7 @@ env:
 jobs:
   lint:
     name: fmt + clippy + check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,7 +50,7 @@ jobs:
 
   test-linux:
     name: tests (linux)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     services:
       postgres:
         image: postgres:16
@@ -98,7 +102,7 @@ jobs:
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -130,7 +134,7 @@ jobs:
 
   web:
     name: web (pnpm)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: web
@@ -161,10 +165,11 @@ jobs:
 
   test-firecracker:
     name: tests (firecracker, Linux + KVM)
-    # Blacksmith runners ship with `/dev/kvm` accessible; GHA-hosted
-    # ubuntu runners may have it but require a `chmod 666` dance and
-    # vary by SKU. Mirrors the dev-vm bootstrap (engram-dev) — the
-    # canonical Linux + KVM env for Firecracker development.
+    # Blacksmith exposes `/dev/kvm` via nested virtualization (see
+    # https://docs.blacksmith.sh/blacksmith-runners/overview). Mirrors
+    # the dev-vm bootstrap (engram-dev) — the canonical Linux + KVM
+    # env for Firecracker development. 4vCPU gives boot+lifecycle
+    # tests enough headroom to run microVMs without queuing.
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4

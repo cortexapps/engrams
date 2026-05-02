@@ -26,6 +26,11 @@ name: CI (macOS arm64 / VZ)
 #
 # Linux/FC remains the canonical production gate; this workflow
 # protects the macOS dev-loop surface.
+#
+# Both jobs run on Blacksmith's Apple Silicon M4 runners (see
+# https://docs.blacksmith.sh/blacksmith-runners/overview) — faster
+# than the GitHub-hosted `macos-15` SKU and lets us run the workspace
+# tests on macOS without bleeding minutes.
 
 on:
   push:
@@ -41,7 +46,7 @@ env:
 jobs:
   vz:
     name: engram-sandbox-vz unit tests
-    runs-on: macos-15  # arm64, has Xcode CLT pre-installed
+    runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
     steps:
       - uses: actions/checkout@v4
 
@@ -102,7 +107,7 @@ jobs:
 
   test-macos:
     name: workspace tests (macOS arm64, excl. sandbox-vz)
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
