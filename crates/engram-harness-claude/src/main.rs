@@ -582,7 +582,16 @@ mod adapter {
                         .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
                     *run_id = Some(rid.clone());
                     if let Some(sid) = session_id {
-                        tokio::spawn(async move { write_claude_session_id(&sid).await });
+                        // `translate_jsonl` is sync and is called from
+                        // unit tests outside any tokio runtime. Only
+                        // fire-and-forget the disk write when a runtime
+                        // is actually available; in tests this becomes
+                        // a no-op rather than panicking, and we don't
+                        // accidentally write to `/workspace/.engram` on
+                        // the test host.
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.spawn(async move { write_claude_session_id(&sid).await });
+                        }
                     }
                     out.push(HarnessEvent::RunStarted {
                         run_id: rid,
