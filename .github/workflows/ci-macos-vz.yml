@@ -119,8 +119,12 @@ jobs:
       # macOS-only regressions in cross-platform crates — places where
       # tokio-vsock / userfaultfd platform-gated deps would otherwise
       # surprise us in production on macOS dev loops.
+      # `--no-fail-fast` + `if: always()` so we see every failing test
+      # in one CI run rather than stopping at the first.
       - name: cargo nextest run --workspace --exclude engram-sandbox-vz
-        run: cargo nextest run --workspace --exclude engram-sandbox-vz
+        if: always()
+        run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
 
       - name: cargo test --workspace --exclude engram-sandbox-vz --doc
-        run: cargo test --workspace --exclude engram-sandbox-vz --doc
+        if: always()
+        run: cargo test --workspace --exclude engram-sandbox-vz --doc --no-fail-fast

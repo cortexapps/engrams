@@ -44,9 +44,21 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo check --workspace --all-targets
+
+      # `if: always()` so each gate runs regardless of which earlier
+      # step failed — surfaces fmt + clippy + check failures together
+      # in one CI run instead of forcing a fix-and-rerun loop. The job
+      # still ends red if any step fails (the workflow conclusion is
+      # the worst step's conclusion).
+      - name: cargo fmt --all -- --check
+        if: always()
+        run: cargo fmt --all -- --check
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        if: always()
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo check --workspace --all-targets
+        if: always()
+        run: cargo check --workspace --all-targets
 
   test-linux:
     name: tests (linux)
@@ -81,24 +93,32 @@ jobs:
       # `just check`'s nextest pass — same speedup, same coverage. The
       # engram-image-builder e2e bake test skips itself if `docker` is
       # not on PATH; ubuntu-latest ships Docker, so it runs.
+      #
+      # `--no-fail-fast` reports every failing test instead of stopping
+      # at the first; `if: always()` keeps the doctests + ha_listener
+      # steps below running even if this one fails.
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace
+        if: always()
+        run: cargo nextest run --workspace --no-fail-fast
 
       # nextest doesn't run doctests yet (see justfile note). Ride the
       # vanilla cargo runner for the doc pass.
       - name: cargo test --workspace --doc
-        run: cargo test --workspace --doc
+        if: always()
+        run: cargo test --workspace --doc --no-fail-fast
 
       # Postgres-gated ignored tests — the FC `#[ignore]` set needs KVM
       # so we don't try to run them here. Scoping by `--test` keeps us
       # from accidentally tripping firecracker tests that share the
       # `#[ignore]` bucket.
       - name: ha_listener ignored tests (Postgres NOTIFY/LISTEN)
+        if: always()
         run: |
           cargo nextest run \
             -p engram-coordinator \
             --test ha_listener \
-            --run-ignored ignored-only
+            --run-ignored ignored-only \
+            --no-fail-fast
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
