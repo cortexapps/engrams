@@ -1072,14 +1072,41 @@ The image manifest never carries secret values. At session-create time the coord
 
 Switching backends is a coordinator config flag — no manifest changes. The `ref` field on each `SecretSchema` is opaque to the manifest layer; backends parse their own URL format.
 
+### Two layers of secrets: image vs harness
+
+Secret responsibility is split along the same axis as everything else (workspace runtime vs agent runtime):
+
+- **Image-level secrets** — declared via `[secrets.X]` in the manifest. Things the *workspace* needs: `NPM_TOKEN` for `npm install`, `GITHUB_TOKEN` for `git push`, project-specific build credentials. Schema travels with the image because the secret is intrinsic to running that image's tooling, regardless of who's driving.
+- **Harness-level secrets** — credentials the *agent runtime* needs: `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` for the `claude` harness, future `OPENAI_API_KEY` for a hypothetical `codex` harness. These do **not** belong on the image — the same image hosts whatever harness the operator picks at session-create time, and a harness's auth requirement shouldn't bleed into the image's identity.
+
+Today the harness-level layer is implemented as a **hard-coded UX special case in the dashboard**: when the user picks `harness=claude`, the form shows an OAuth-vs-API-key dropdown and one masked input. Whichever the user picks gets sent under the matching env-var name (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`); the coord folds it into the harness's env literally. Image-level credentials still render their own panel from `manifest.required_secrets`.
+
+The deliberate v1 cutoff is "no harness-pack credential schema." Long-term: each harness pack ships a `pack.toml` declaring its own `[[secret]]` entries (name, allow_hosts, description), `/api/harnesses` returns it alongside name/description, and the form derives the UI instead of hard-coding `claude`. That's the natural finish but doesn't unblock anything in v1, so it stays deferred.
+
 ### Secret modes
 
 `manifest.secret_mode` picks how resolved values reach the guest:
 
-- **`literal`** — real values land as plain env vars. Simple, fast, dev only. Trivial to set up; secrets are visible to anyone with code execution inside the sandbox.
-- **`broker`** — random placeholders (`engram_ph_<sessionId>_<hash>`) land as env vars; a per-session network proxy substitutes the real value only on outbound HTTPS requests whose host matches `schema.allow_hosts` / `schema.allow_host_patterns`. The agent process never sees the real credential, so prompt-injection exfiltration attacks fail. Modeled on microsandbox's `Secret.env(..., allow_hosts=...)` design.
+- **`literal`** — real values land as plain env vars. Simple, fast, dev only. Trivial to set up; secrets are visible to anyone with code execution inside the sandbox. Per-request overrides on `POST /sessions { secrets: {…} }` are honoured here (the dashboard's user-pasted values flow through verbatim, and unknown-name overrides are folded into the env directly — they don't have to appear in `manifest.secrets`).
+- **`broker`** — random placeholders (`engram_ph_<sessionId>_<hash>`) land as env vars; a per-session network proxy MitMs outbound HTTPS, terminates TLS using a hostname-derived spoofed leaf cert signed by a per-deployment managed CA, scans `Authorization` / URL params / request bodies for the placeholders, and swaps the real value back in only on calls whose host matches `schema.allow_hosts` / `schema.allow_host_patterns`. The agent process never sees the real credential, so prompt-injection exfiltration attacks fail. Modeled on microsandbox's `Secret.env(..., allow_hosts=...)` design.
 
 The proxy that performs broker-mode substitution is **not yet implemented** — `secret_mode = "broker"` results in unsubstituted placeholders today. Production rollout for Cortex is gated on this. The implementation is sized as its own focused work (~1500 LOC + cert-management plumbing) and tracked under Phase 2's deferred list with the implementation sketch; a half-measure HTTP-only proxy that delivers `allow_hosts` enforcement without actual substitution was considered and rejected — it doesn't deliver what the docstring promises and would need to be replaced wholesale once the real implementation lands.
+
+### Status of the secret pipeline (v1)
+
+Tracking the gap between the design above and what's wired today, so it's explicit what production hardening still owes:
+
+| Piece | Status | What's missing |
+|---|---|---|
+| `[secrets.X]` schema parse + validation | ✅ wired | — |
+| `SecretStore` trait + env / dotenv impls | ✅ wired | — |
+| `Literal` mode injection | ✅ wired | — |
+| Per-request `secrets: {…}` overrides | ✅ wired | — |
+| `Broker` mode placeholder generation | ✅ wired | — |
+| Broker-mode HTTPS proxy + cert injection | ❌ not wired | The whole substitution pipeline (Phase 6 in the verification matrix) |
+| Real secret-manager backend | ❌ stub | `engram-secrets-gcp` is a typed placeholder; `AccessSecretVersion` not yet wired |
+| Harness-pack credential schema | ❌ deferred | `pack.toml` + `/api/harnesses` enrichment; today the dashboard hard-codes `claude` |
+| Per-deployment managed CA cert | ❌ not wired | Bake-time injection into rootfs trust store |
 
 ### Resolution flow
 

@@ -147,7 +147,7 @@ create → Active                    (live VM)
 
 ## Building images
 
-Engram images are baked from a `Dockerfile` + `engram.toml` in your repo. Dockerfiles handle "what's installed"; engram.toml carries engram-specific config (secrets schema, network policy, resources):
+Engram images are baked from a `Dockerfile` + `engram.toml` in your repo. Dockerfiles handle "what's installed"; engram.toml carries engram-specific config — workspace-level secrets schema (NPM_TOKEN, GITHUB_TOKEN, etc.), network policy, resources. Harness-level credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, …) live one layer above the image and aren't declared here; the dashboard handles them per-harness at session-create time. See `DESIGN.md` for the full split.
 
 ```
 my-repo/
@@ -159,11 +159,14 @@ my-repo/
 ```toml
 # engram.toml
 name = "cortex-api"
-secret_mode = "literal"   # use "broker" in production
+secret_mode = "literal"   # use "broker" in production (proxy not yet wired — see DESIGN.md)
 
 [env]
 NODE_ENV = "development"
 
+# Workspace-level secret. The agent's `git push` to the checkpoint
+# branch needs this; harness creds (Claude OAuth / API key) belong
+# above the image, not here.
 [secrets.GITHUB_TOKEN]
 allow_hosts = ["api.github.com"]
 required = true
