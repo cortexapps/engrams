@@ -173,14 +173,17 @@ impl DockerRunner for DockerCli {
         // `docker export <id> | tar -x -C <dest>` — let the shell
         // handle the pipe so we don't have to plumb fds ourselves.
         // `set -o pipefail` so an export failure surfaces even if tar
-        // happens to succeed first.
+        // happens to succeed first. Pinned to bash because Debian /
+        // Ubuntu's `/bin/sh` is dash, which rejects `pipefail`
+        // ("Illegal option -o pipefail"); bash is universally
+        // available on Linux runners we ship to.
         let pipeline = format!(
             "set -e; set -o pipefail; {bin} export {cid} | tar -x -C {dest}",
             bin = shell_escape(self.binary_str()),
             cid = shell_escape(container_id),
             dest = shell_escape(&dest.to_string_lossy()),
         );
-        let mut cmd = Command::new("sh");
+        let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(&pipeline);
         run_to_completion(cmd, "docker export | tar -x").await
     }
