@@ -111,6 +111,13 @@ jobs:
       # so we don't try to run them here. Scoping by `--test` keeps us
       # from accidentally tripping firecracker tests that share the
       # `#[ignore]` bucket.
+      #
+      # `--test-threads=1` is load-bearing: the two ha_listener tests
+      # both LISTEN on the `session_events` channel of the same
+      # Postgres database. Run in parallel they cross-talk — test B's
+      # listener catches test A's NOTIFY, the session_id assertion
+      # fires on the wrong row. Production has one listener per
+      # coordinator, so this is purely a test-harness artifact.
       - name: ha_listener ignored tests (Postgres NOTIFY/LISTEN)
         if: always()
         run: |
@@ -118,7 +125,8 @@ jobs:
             -p engram-coordinator \
             --test ha_listener \
             --run-ignored ignored-only \
-            --no-fail-fast
+            --no-fail-fast \
+            --test-threads=1
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
@@ -231,10 +239,28 @@ jobs:
           firecracker --version
 
       # snapshot_uffd opens /dev/userfaultfd directly (FC 1.10+
-      # behavior). Default mode is 0600 root-only; mirror the udev
-      # rule the dev-vm bootstrap installs.
-      - name: Relax /dev/userfaultfd permissions
-        run: sudo chmod 0666 /dev/userfaultfd 2>/dev/null || true
+      # behavior). Two things can block this on a hosted runner:
+      #
+      #   1. /dev/userfaultfd is mode 0600 root-only — relax to 0666.
+      #   2. vm.unprivileged_userfaultfd=0 — flip to 1 so non-root
+      #      processes can call userfaultfd(2). Required when FC runs
+      #      as the runner user, not root.
+      #
+      # Dump diagnostic state too so a failing snapshot_uffd has data
+      # to debug from (kernel version, sysctl, device permissions).
+      - name: UFFD setup + diagnostics
+        run: |
+          echo "=== uname -r ==="
+          uname -r
+          echo "=== /dev/userfaultfd ==="
+          ls -l /dev/userfaultfd 2>&1 || echo "MISSING"
+          echo "=== sysctl vm.unprivileged_userfaultfd (before) ==="
+          sysctl vm.unprivileged_userfaultfd 2>&1 || echo "(sysctl not present)"
+          echo "=== set vm.unprivileged_userfaultfd=1 ==="
+          sudo sysctl -w vm.unprivileged_userfaultfd=1 2>&1 || echo "(sysctl write failed)"
+          echo "=== relax /dev/userfaultfd permissions ==="
+          sudo chmod 0666 /dev/userfaultfd 2>&1 || echo "chmod failed (device missing?)"
+          ls -l /dev/userfaultfd 2>&1 || true
 
       # Drop the cached kernel + ubuntu rootfs into ~/.cache/engram-fc-test
       # and emit the `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` env vars that

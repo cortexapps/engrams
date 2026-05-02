@@ -238,9 +238,33 @@ impl SandboxBackend for ProcessBackend {
                 Err(_) => {
                     // Timeout: kill_on_drop fires when `child` is
                     // dropped at the end of this scope, but be explicit
-                    // so the readers see EOF promptly.
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    // so the readers see EOF promptly. Surface the
+                    // outcome of both kill and wait so anomalies (e.g.
+                    // CI runners with restricted PID-namespace
+                    // semantics where SIGKILL doesn't actually reap
+                    // the child) are observable instead of silently
+                    // turning into "timeout took 30s".
+                    let pid = child.id();
+                    if let Err(e) = child.start_kill() {
+                        tracing::warn!(error = %e, ?pid, "child.start_kill() after timeout failed");
+                    }
+                    let kill_started = std::time::Instant::now();
+                    match child.wait().await {
+                        Ok(status) => {
+                            let took = kill_started.elapsed();
+                            if took > Duration::from_secs(1) {
+                                tracing::warn!(
+                                    ?pid,
+                                    exit = ?status.code(),
+                                    took_ms = took.as_millis() as u64,
+                                    "child.wait() after SIGKILL took >1s — kill may not have propagated",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, ?pid, "child.wait() after kill failed")
+                        }
+                    }
                     Some(EXIT_CODE_TIMEOUT)
                 }
             };
