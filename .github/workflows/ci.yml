@@ -343,68 +343,68 @@ jobs:
       # Diagnostics for `snapshot_uffd`, which fails with FC's UFFD
       # handshake hanging after the socket connect (handler logs
       # "Firecracker connected; awaiting handshake" then nothing for
-      # 10s). Re-runs the test in isolation while strace'ing FC, then
-      # dumps the strace tail + the test's firecracker.log/uffd-handler.log
-      # so we can see exactly which syscall FC is stuck on. Drop once
-      # snapshot_uffd is reliably green.
+      # 10s). The test boots two FC instances back-to-back (one for
+      # the original VM, one for the restored VM); the hang is on the
+      # second. Watcher loop attaches strace to *every* FC process
+      # that appears, so the restore-phase one gets traced too.
+      # Drop once snapshot_uffd is reliably green.
       - name: Diagnose snapshot_uffd (failure only)
         if: failure()
         run: |
           set +e
           sudo apt-get install -y -qq strace
+          mkdir -p /tmp/uffd-debug
+          rm -rf /tmp/uffd-debug/*
 
-          # Set up isolation dir so we can find the test's tempdir
-          # afterward (they live in /tmp/.tmp* by default, hard to glob).
-          export TMPDIR=/tmp/uffd-debug
-          mkdir -p $TMPDIR
-          rm -rf $TMPDIR/*
-
-          # Background the test so we can attach strace mid-run.
+          # Watcher: every 0.2s poll for FC processes we haven't
+          # already attached to, attach strace to each. Outputs go to
+          # /tmp/uffd-debug/fc-<pid>.strace.
           (
-            RUST_BACKTRACE=1 cargo nextest run \
-              -p engram-sandbox-firecracker \
-              --test snapshot_uffd \
-              --run-ignored ignored-only \
-              --no-fail-fast --test-threads=1 \
-              -- --nocapture 2>&1 | tee $TMPDIR/test.out
+            seen=""
+            for i in $(seq 1 200); do
+              for pid in $(pgrep -f "firecracker --api-sock" 2>/dev/null); do
+                if ! echo "$seen" | grep -qw "$pid"; then
+                  echo "[$(date +%T)] attaching strace to FC pid $pid"
+                  sudo strace -fp "$pid" -o "/tmp/uffd-debug/fc-$pid.strace" -s 256 \
+                    -e 'trace=openat,ioctl,connect,sendmsg,recvmsg,close,write,mmap' \
+                    >/dev/null 2>&1 &
+                  seen="$seen $pid"
+                fi
+              done
+              sleep 0.2
+            done
           ) &
-          TEST_PID=$!
+          WATCHER_PID=$!
 
-          # Wait for FC to launch under the snapshot_uffd test (it boots
-          # its first VM ~5s in, then snapshots, then `restore` is when
-          # UFFD handshake hangs). We poll every 0.5s for up to 30s.
-          FC_PID=""
-          for i in $(seq 1 60); do
-            FC_PID=$(pgrep -f "firecracker --api-sock" | head -1)
-            [ -n "$FC_PID" ] && break
-            sleep 0.5
-          done
-          if [ -z "$FC_PID" ]; then
-            echo "FC pid never appeared; test must've failed before reaching restore"
-            wait $TEST_PID
-            tail -100 $TMPDIR/test.out
-            exit 0  # diagnostic step, don't mask the original failure
-          fi
-          echo "Attached to firecracker PID $FC_PID"
+          # Run the test foreground.
+          RUST_BACKTRACE=1 cargo nextest run \
+            -p engram-sandbox-firecracker \
+            --test snapshot_uffd \
+            --run-ignored ignored-only \
+            --no-fail-fast --test-threads=1 \
+            -- --nocapture 2>&1 | tee /tmp/uffd-debug/test.out
 
-          # Trace the syscalls we care about for UFFD restore — open
-          # /dev/userfaultfd, ioctl on the fd, sendmsg for SCM_RIGHTS.
-          sudo strace -fp $FC_PID -o $TMPDIR/fc.strace -s 256 \
-            -e 'trace=openat,ioctl,connect,sendmsg,recvmsg,close,mmap' &
-          STRACE_PID=$!
-
-          wait $TEST_PID
-          sudo kill $STRACE_PID 2>/dev/null
+          # Tear down the watcher + any in-flight strace processes.
+          kill $WATCHER_PID 2>/dev/null
+          sudo pkill -f "strace -fp" 2>/dev/null
           sleep 1
 
-          echo "=== last 200 lines of FC strace ==="
-          sudo tail -200 $TMPDIR/fc.strace 2>&1 || true
+          echo "=== strace files captured ==="
+          sudo ls -la /tmp/uffd-debug/fc-*.strace 2>&1 || echo "(none)"
 
-          echo "=== /dev/userfaultfd opens (any) ==="
-          sudo grep -E "openat\(.*userfaultfd|UFFDIO_" $TMPDIR/fc.strace 2>&1 | head -40
-
-          echo "=== sendmsg with SCM_RIGHTS (handshake) ==="
-          sudo grep -E "sendmsg.*SCM_RIGHTS" $TMPDIR/fc.strace 2>&1 || echo "(no SCM_RIGHTS sendmsg observed — handshake never sent)"
+          for f in /tmp/uffd-debug/fc-*.strace; do
+            [ -f "$f" ] || continue
+            echo ""
+            echo "=========================================="
+            echo "=== $f ==="
+            echo "=========================================="
+            echo "--- userfaultfd / UFFDIO_ ops ---"
+            sudo grep -E "userfaultfd|UFFDIO_" "$f" | head -30
+            echo "--- sendmsg / SCM_RIGHTS ---"
+            sudo grep -E "sendmsg|SCM_RIGHTS|cmsg" "$f" | head -10
+            echo "--- last 30 syscalls before hang ---"
+            sudo tail -30 "$f"
+          done
 
           echo "=== test output tail ==="
-          tail -60 $TMPDIR/test.out
+          tail -80 /tmp/uffd-debug/test.out
