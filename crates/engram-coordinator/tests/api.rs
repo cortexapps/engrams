@@ -768,17 +768,15 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
 
     async fn mk(store: &MockMetadataStore, repo: &str) -> SessionId {
         store
-            .create_session(
-                SessionSpec {
-                    image: engram_core::types::session::ImageRef::Registry {
-                        repo: repo.into(),
-                        tag: "warm-bootstrap".into(),
-                    },
-                    workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                    harness: engram_core::types::session::HarnessSpec::None,
-                    user_id: None,
+            .create_session(SessionSpec {
+                image: engram_core::types::session::ImageRef::Registry {
+                    repo: repo.into(),
+                    tag: "warm-bootstrap".into(),
                 },
-            )
+                workspace: engram_core::types::session::WorkspaceSpec::Empty,
+                harness: engram_core::types::session::HarnessSpec::None,
+                user_id: None,
+            })
             .await
             .unwrap()
     }
@@ -859,7 +857,10 @@ async fn list_sessions_serializes_full_session_record() {
     assert_eq!(item["image"]["repo"], "cortex/api");
     assert_eq!(item["image"]["tag"], "warm-2026-04-27");
     assert_eq!(item["workspace"]["kind"], "git");
-    assert_eq!(item["workspace"]["url"], "https://github.com/cortex/api.git");
+    assert_eq!(
+        item["workspace"]["url"],
+        "https://github.com/cortex/api.git"
+    );
     assert_eq!(item["workspace"]["branch"], "trunk");
     assert_eq!(item["workspace"]["read_only"], false);
     assert_eq!(item["harness"]["kind"], "builtin");
@@ -874,17 +875,15 @@ async fn list_sessions_serializes_full_session_record() {
 async fn delete_session_marks_completed_and_returns_204() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
 
@@ -1079,17 +1078,15 @@ async fn exec_stream_returns_404_for_unknown_session() {
 async fn exec_stream_returns_409_when_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     let app = build_app(store);
@@ -1396,17 +1393,15 @@ async fn snapshot_returns_404_for_unknown_session() {
 async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     let app = build_app(store);
@@ -1476,17 +1471,15 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
 async fn evict_local_409_when_session_not_active() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     // Session is Pending (never created sandbox), can't evict.
@@ -1513,17 +1506,15 @@ async fn resume_410_gone_when_no_snapshot_exists() {
     // `engram session fork <id>` to continue from the workspace.
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     store
@@ -1593,17 +1584,15 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
 async fn exec_rejects_request_without_command_or_argv() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     let app = build_app(store);
@@ -1623,17 +1612,15 @@ async fn exec_rejects_request_without_command_or_argv() {
 async fn exec_rejects_empty_argv() {
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     let app = build_app(store);
@@ -1826,17 +1813,15 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
     // session that was snapshotted and not yet resumed.
     let store = MockMetadataStore::arc();
     let id = store
-        .create_session(
-            SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: "r".into(),
-                    tag: "warm-bootstrap".into(),
-                },
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
-                harness: engram_core::types::session::HarnessSpec::None,
-                user_id: None,
+        .create_session(SessionSpec {
+            image: engram_core::types::session::ImageRef::Registry {
+                repo: "r".into(),
+                tag: "warm-bootstrap".into(),
             },
-        )
+            workspace: engram_core::types::session::WorkspaceSpec::Empty,
+            harness: engram_core::types::session::HarnessSpec::None,
+            user_id: None,
+        })
         .await
         .unwrap();
     let app = build_app(store);

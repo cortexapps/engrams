@@ -87,10 +87,7 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
     assert!(matches!(events[0], HarnessEvent::RunStarted { .. }));
     let mut completed_count = 0usize;
     for ev in events.iter() {
-        if let HarnessEvent::ToolCallCompleted {
-            result_summary, ..
-        } = ev
-        {
+        if let HarnessEvent::ToolCallCompleted { result_summary, .. } = ev {
             completed_count += 1;
             assert_eq!(result_summary.as_deref(), Some("noop tool result"));
         }

@@ -78,10 +78,7 @@ pub(crate) async fn build_metadata(
         size_bytes += tokio::fs::metadata(&p)
             .await
             .map_err(|e| {
-                SandboxError::Snapshot(format!(
-                    "stat snapshot artifact {}: {e}",
-                    p.display()
-                ))
+                SandboxError::Snapshot(format!("stat snapshot artifact {}: {e}", p.display()))
             })?
             .len();
     }
@@ -95,12 +92,14 @@ pub(crate) async fn build_metadata(
 
 /// Read + parse the manifest at `<src>/manifest.json`.
 pub(crate) async fn read_manifest(src: &Path) -> Result<VzSnapshotManifest, SandboxError> {
-    let bytes = tokio::fs::read(src.join(MANIFEST_FILENAME)).await.map_err(|e| {
-        SandboxError::Snapshot(format!(
-            "read snapshot manifest {}/{MANIFEST_FILENAME}: {e}",
-            src.display()
-        ))
-    })?;
+    let bytes = tokio::fs::read(src.join(MANIFEST_FILENAME))
+        .await
+        .map_err(|e| {
+            SandboxError::Snapshot(format!(
+                "read snapshot manifest {}/{MANIFEST_FILENAME}: {e}",
+                src.display()
+            ))
+        })?;
     let manifest: VzSnapshotManifest = serde_json::from_slice(&bytes)
         .map_err(|e| SandboxError::Snapshot(format!("parse manifest: {e}")))?;
     if manifest.format != "vz" {
@@ -111,7 +110,6 @@ pub(crate) async fn read_manifest(src: &Path) -> Result<VzSnapshotManifest, Sand
     }
     Ok(manifest)
 }
-
 
 #[cfg(test)]
 mod tests {

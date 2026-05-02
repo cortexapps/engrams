@@ -143,7 +143,9 @@ impl Transport {
         match s.to_ascii_lowercase().as_str() {
             "vsock" => Ok(Self::Vsock),
             "console" | "virtio-console" => Ok(Self::Console),
-            other => Err(format!("invalid transport: {other} (expected vsock|console)")),
+            other => Err(format!(
+                "invalid transport: {other} (expected vsock|console)"
+            )),
         }
     }
 }
@@ -527,10 +529,7 @@ fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError>
 /// host-side: `cfg.harnesses_dir` is mounted into every sandbox at
 /// `/run/engram/harnesses` via virtio-fs, so the rootfs no longer
 /// carries them.
-async fn inject_agent(
-    rootfs_dir: &Path,
-    injection: &AgentInjection,
-) -> Result<(), BuildError> {
+async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(), BuildError> {
     if !injection.agent_binary.exists() {
         return Err(BuildError::Config(format!(
             "agent_binary {} does not exist",

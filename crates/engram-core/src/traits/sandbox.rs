@@ -68,11 +68,7 @@ pub trait SandboxBackend: Send + Sync {
     /// don't yet support agents (Firecracker until
     /// `engram-bootstrap` lands) inherit it; backends that do
     /// (ProcessBackend) override.
-    async fn start_agent(
-        &self,
-        _id: SandboxId,
-        _agent: AgentSpec,
-    ) -> Result<(), SandboxError> {
+    async fn start_agent(&self, _id: SandboxId, _agent: AgentSpec) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `start_agent` yet".into(),
         ))

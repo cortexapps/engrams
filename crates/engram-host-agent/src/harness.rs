@@ -364,11 +364,9 @@ impl HarnessHub {
     ) -> Vec<(SessionId, SandboxId)> {
         let now = Utc::now();
         let soft_cutoff = now
-            - chrono::Duration::from_std(soft_ttl)
-                .unwrap_or_else(|_| chrono::Duration::seconds(0));
+            - chrono::Duration::from_std(soft_ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
         let hard_cutoff = now
-            - chrono::Duration::from_std(hard_ttl)
-                .unwrap_or_else(|_| chrono::Duration::seconds(0));
+            - chrono::Duration::from_std(hard_ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
         let event_at = self.inner.last_event_at.lock();
         let idle_at = self.inner.last_idle_at.lock();
         let conns = self.inner.connections.lock();

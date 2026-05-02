@@ -873,8 +873,13 @@ impl SandboxBackend for FirecrackerBackend {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut sleep = Duration::from_millis(50);
         loop {
-            match Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd.clone())
-                .await
+            match Self::exec_stream_via_fc_vsock(
+                id,
+                &vsock_uds_path,
+                ENGRAM_AGENTD_PORT,
+                cmd.clone(),
+            )
+            .await
             {
                 Ok(s) => return Ok(s),
                 Err(e) => {

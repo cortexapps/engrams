@@ -19,9 +19,7 @@ use engram_agentd::{
 };
 use engram_core::traits::sandbox::{HarnessSink, SandboxBackend};
 use engram_core::types::ids::SandboxId;
-use engram_core::types::sandbox::{
-    AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
-};
+use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use parking_lot::Mutex;
@@ -110,10 +108,7 @@ pub struct VzBackend {
 }
 
 impl VzBackend {
-    pub fn new(
-        work_dir: impl Into<PathBuf>,
-        cfg: VzConfig,
-    ) -> Result<Self, SandboxError> {
+    pub fn new(work_dir: impl Into<PathBuf>, cfg: VzConfig) -> Result<Self, SandboxError> {
         let work_dir = work_dir.into();
         // Validate the kernel exists up-front so misconfiguration
         // surfaces at coord boot rather than at first session create.
@@ -363,20 +358,14 @@ impl SandboxBackend for VzBackend {
         Ok(id)
     }
 
-    async fn start_agent(
-        &self,
-        id: SandboxId,
-        agent: AgentSpec,
-    ) -> Result<(), SandboxError> {
+    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
         tracing::debug!(sandbox_id = %id, argv0 = %agent.argv.first().map(|s| s.as_str()).unwrap_or("<empty>"), "vz start_agent: dialing bootstrap UDS");
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.vsock_uds_path.clone()
         };
-        let bootstrap_uds = port_uds_path(
-            &vsock_uds_path,
-            engram_harness_proto::BOOTSTRAP_VSOCK_PORT,
-        );
+        let bootstrap_uds =
+            port_uds_path(&vsock_uds_path, engram_harness_proto::BOOTSTRAP_VSOCK_PORT);
         // The in-VM bootstrap supervisor takes a few seconds to
         // come up after VM boot — same race FC handles. Retry the
         // dial with backoff for ~15s before giving up. Bridge bind
@@ -391,11 +380,8 @@ impl SandboxBackend for VzBackend {
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(SandboxError::Vm(
-                            format!(
-                                "connect bootstrap UDS {}: {e}",
-                                bootstrap_uds.display()
-                            )
-                            .into(),
+                            format!("connect bootstrap UDS {}: {e}", bootstrap_uds.display())
+                                .into(),
                         ));
                     }
                     tokio::time::sleep(backoff).await;
@@ -410,9 +396,7 @@ impl SandboxBackend for VzBackend {
         tracing::debug!(sandbox_id = %id, "vz start_agent: writing BootstrapLaunch frame");
         engram_harness_proto::write_msg(&mut conn, &launch)
             .await
-            .map_err(|e| {
-                SandboxError::Vm(format!("write BootstrapLaunch: {e}").into())
-            })?;
+            .map_err(|e| SandboxError::Vm(format!("write BootstrapLaunch: {e}").into()))?;
         // Best-effort flush; bootstrap closes its end after exec.
         let _ = conn.shutdown().await;
         tracing::debug!(sandbox_id = %id, "vz start_agent: BootstrapLaunch sent");
@@ -444,11 +428,8 @@ impl SandboxBackend for VzBackend {
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(SandboxError::Vm(
-                            format!(
-                                "connect engram-agentd UDS {}: {e}",
-                                agent_uds.display()
-                            )
-                            .into(),
+                            format!("connect engram-agentd UDS {}: {e}", agent_uds.display())
+                                .into(),
                         ));
                     }
                     tokio::time::sleep(backoff).await;
@@ -460,20 +441,13 @@ impl SandboxBackend for VzBackend {
         drive_exec_protocol(id, reader, writer, cmd).await
     }
 
-    async fn snapshot(
-        &self,
-        id: SandboxId,
-        dest: &Path,
-    ) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
         let (vm, spec, rootfs_path) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             (live.vm.clone(), live.spec.clone(), live.rootfs_path.clone())
         };
         tokio::fs::create_dir_all(dest).await.map_err(|e| {
-            SandboxError::Snapshot(format!(
-                "create snapshot dir {}: {e}",
-                dest.display()
-            ))
+            SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
         })?;
 
         // Clone-based snapshot semantics. VZ's
@@ -509,12 +483,11 @@ impl SandboxBackend for VzBackend {
         snapshot_spec.rootfs_source = Some(snapshot_rootfs.clone());
         let manifest = crate::snapshot::VzSnapshotManifest::new(id, snapshot_spec);
         let manifest_path = dest.join(crate::snapshot::MANIFEST_FILENAME);
-        let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
-            SandboxError::Snapshot(format!("manifest serialize: {e}"))
-        })?;
-        tokio::fs::write(&manifest_path, bytes).await.map_err(|e| {
-            SandboxError::Snapshot(format!("write manifest: {e}"))
-        })?;
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("manifest serialize: {e}")))?;
+        tokio::fs::write(&manifest_path, bytes)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("write manifest: {e}")))?;
         crate::snapshot::build_metadata(dest, &spec.image).await
     }
 
@@ -602,13 +575,9 @@ impl SandboxBackend for VzBackend {
         // backend matches) is reachable via <vsock_uds>_1025 just
         // like a fresh VM.
         let harness_sink = self.harness_sink.lock().clone();
-        let bridge = ConsoleBridge::start(
-            vsock_uds_path.clone(),
-            port_fds,
-            harness_sink,
-        )
-        .await
-        .map_err(SandboxError::from)?;
+        let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink)
+            .await
+            .map_err(SandboxError::from)?;
 
         self.sandboxes.insert(
             new_id,
@@ -752,6 +721,10 @@ mod tests {
         let sid = SandboxId::new();
         let path = backend.vsock_uds_path_for(sid);
         assert_eq!(path.parent().unwrap(), work);
-        assert!(path.file_name().unwrap().to_string_lossy().ends_with(".vsock"));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".vsock"));
     }
 }

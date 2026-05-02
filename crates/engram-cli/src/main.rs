@@ -158,18 +158,13 @@ enum SessionCmd {
     /// Resume an Idle session via its FC snapshot. Dead sessions
     /// can't be resumed (snapshot invalidated) — use
     /// `engram session fork <id>` to continue from the workspace.
-    Resume {
-        id: String,
-    },
+    Resume { id: String },
     /// Force a checkpoint flush on a Git session — Postgres event
     /// + git commit + push to `engram/sessions/<id>`.
     Checkpoint { id: String },
     /// Push a prompt to a running session's agent. Auto-resumes
     /// Idle sessions; 410 Gone for Dead.
-    Prompt {
-        id: String,
-        text: String,
-    },
+    Prompt { id: String, text: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -361,9 +356,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Fork { id, at, title } => {
                 session_fork(&client, &cli.endpoint, id, *at, title.as_deref(), cli.json).await
             }
-            SessionCmd::Resume { id } => {
-                session_resume(&client, &cli.endpoint, id, cli.json).await
-            }
+            SessionCmd::Resume { id } => session_resume(&client, &cli.endpoint, id, cli.json).await,
             SessionCmd::Checkpoint { id } => {
                 session_checkpoint(&client, &cli.endpoint, id, cli.json).await
             }
@@ -457,13 +450,19 @@ async fn session_get(
         return Ok(());
     }
     println!("id              : {}", body["id"].as_str().unwrap_or(""));
-    println!("status          : {}", body["status"].as_str().unwrap_or(""));
+    println!(
+        "status          : {}",
+        body["status"].as_str().unwrap_or("")
+    );
     println!(
         "session_kind    : {}",
         body["session_kind"].as_str().unwrap_or("")
     );
     println!("repo            : {}", body["repo"].as_str().unwrap_or(""));
-    println!("branch          : {}", body["branch"].as_str().unwrap_or(""));
+    println!(
+        "branch          : {}",
+        body["branch"].as_str().unwrap_or("")
+    );
     if let Some(b) = body["checkpoint_branch"].as_str() {
         println!("checkpoint_branch: {b}");
     }
@@ -930,8 +929,8 @@ async fn session_fork(
     if !status.is_success() {
         return Err(CliError::Http(status.as_u16(), body));
     }
-    let parsed: Value = serde_json::from_str(&body)
-        .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&parsed)?);
         return Ok(());
@@ -959,8 +958,8 @@ async fn session_resume(
     if !status.is_success() {
         return Err(CliError::Http(status.as_u16(), body));
     }
-    let parsed: Value = serde_json::from_str(&body)
-        .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&parsed)?);
         return Ok(());
@@ -984,8 +983,8 @@ async fn session_checkpoint(
     if !status.is_success() {
         return Err(CliError::Http(status.as_u16(), body));
     }
-    let parsed: Value = serde_json::from_str(&body)
-        .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&parsed)?);
         return Ok(());

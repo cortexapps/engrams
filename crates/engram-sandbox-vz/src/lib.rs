@@ -69,10 +69,7 @@ mod stub {
     }
 
     impl VzBackend {
-        pub fn new(
-            _work_dir: PathBuf,
-            _cfg: VzConfig,
-        ) -> Result<Self, engram_core::SandboxError> {
+        pub fn new(_work_dir: PathBuf, _cfg: VzConfig) -> Result<Self, engram_core::SandboxError> {
             Err(engram_core::SandboxError::InvalidSpec(
                 "engram-sandbox-vz only runs on macOS — pick --sandbox-backend=process or \
                  --sandbox-backend=firecracker on this host"

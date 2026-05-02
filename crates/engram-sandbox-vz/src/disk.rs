@@ -88,10 +88,7 @@ impl From<DiskError> for engram_core::SandboxError {
 /// Async: `clonefile(2)` is fast but synchronous, so we run it
 /// on the blocking pool. The fallback `std::fs::copy` is also
 /// blocking, hence both go through `spawn_blocking`.
-pub(crate) async fn clone_or_copy(
-    src: &Path,
-    dst: &Path,
-) -> Result<(), DiskError> {
+pub(crate) async fn clone_or_copy(src: &Path, dst: &Path) -> Result<(), DiskError> {
     if !src.exists() {
         return Err(DiskError::SourceMissing(src.to_path_buf()));
     }
@@ -116,16 +113,18 @@ pub(crate) async fn clone_or_copy(
 }
 
 fn clone_or_copy_blocking(src: &Path, dst: &Path) -> Result<(), DiskError> {
-    let src_c = std::ffi::CString::new(src.as_os_str().as_encoded_bytes())
-        .map_err(|e| DiskError::CopyFailed {
+    let src_c = std::ffi::CString::new(src.as_os_str().as_encoded_bytes()).map_err(|e| {
+        DiskError::CopyFailed {
             clone_err: std::io::Error::other(format!("src CString: {e}")),
             copy_err: std::io::Error::other("n/a"),
-        })?;
-    let dst_c = std::ffi::CString::new(dst.as_os_str().as_encoded_bytes())
-        .map_err(|e| DiskError::CopyFailed {
+        }
+    })?;
+    let dst_c = std::ffi::CString::new(dst.as_os_str().as_encoded_bytes()).map_err(|e| {
+        DiskError::CopyFailed {
             clone_err: std::io::Error::other(format!("dst CString: {e}")),
             copy_err: std::io::Error::other("n/a"),
-        })?;
+        }
+    })?;
     // SAFETY: both paths are valid C strings; libc::clonefile
     // accepts NULL flags as 0. On success returns 0; on error
     // returns -1 and sets errno.

@@ -130,7 +130,14 @@ impl SandboxBackend for ProcessBackend {
         if self.agent_children.contains_key(&id) {
             return Ok(());
         }
-        spawn_agent(&self.agent_children, id, &agent, &state.spec.env, &state.cwd).await
+        spawn_agent(
+            &self.agent_children,
+            id,
+            &agent,
+            &state.spec.env,
+            &state.cwd,
+        )
+        .await
     }
 
     async fn exec_stream(

@@ -112,9 +112,7 @@ fn parse_args() -> Result<Args, String> {
                 let v = argv
                     .next()
                     .ok_or_else(|| format!("{arg} requires a value"))?;
-                let port: u32 = v
-                    .parse()
-                    .map_err(|e| format!("{arg} must be a u32: {e}"))?;
+                let port: u32 = v.parse().map_err(|e| format!("{arg} must be a u32: {e}"))?;
                 listen = Some(Listen::Transport(port));
             }
             "--token" => {

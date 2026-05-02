@@ -228,14 +228,7 @@ pub(crate) fn build_console_device(
 fn make_socketpair() -> Result<(OwnedFd, OwnedFd), BridgeError> {
     let mut fds = [0i32; 2];
     // SAFETY: socketpair(2) on a 2-int array is sound.
-    let r = unsafe {
-        libc::socketpair(
-            libc::AF_LOCAL,
-            libc::SOCK_STREAM,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
+    let r = unsafe { libc::socketpair(libc::AF_LOCAL, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     if r != 0 {
         return Err(BridgeError::Pipe(std::io::Error::last_os_error()));
     }
@@ -296,9 +289,7 @@ impl ConsoleBridge {
             if let Some(sink) = harness_sink {
                 tasks.push(tokio::spawn(guest_initiated_pump(fds, Arc::new(sink))));
             } else {
-                tracing::warn!(
-                    "no harness sink registered; dropping port {PORT_HARNESS} pipes"
-                );
+                tracing::warn!("no harness sink registered; dropping port {PORT_HARNESS} pipes");
                 drop(fds);
             }
         }
@@ -589,14 +580,17 @@ mod tests {
             // SAFETY: fd is owned by `a`/`b` which outlive this call.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
             assert!(flags >= 0);
-            assert_ne!(flags & libc::O_NONBLOCK, 0, "socket end should be non-blocking");
+            assert_ne!(
+                flags & libc::O_NONBLOCK,
+                0,
+                "socket end should be non-blocking"
+            );
         }
     }
 
     #[test]
     fn build_console_device_yields_three_ports_with_fds() {
-        let (_device, fds) =
-            build_console_device().expect("device + fds construct");
+        let (_device, fds) = build_console_device().expect("device + fds construct");
         assert_eq!(fds.by_port.len(), 3);
         for &port in &[PORT_AGENTD, PORT_BOOTSTRAP, PORT_HARNESS] {
             assert!(fds.by_port.contains_key(&port));

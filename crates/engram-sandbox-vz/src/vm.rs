@@ -16,16 +16,15 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_foundation::NSFileHandle;
+use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZBootLoader, VZDirectorySharingDeviceConfiguration,
-    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment, VZSerialPortAttachment, VZSerialPortConfiguration,
-    VZSharedDirectory, VZSingleDirectoryShare, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration,
+    VZBootLoader, VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
+    VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZSerialPortAttachment, VZSerialPortConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
 use crate::console_bridge::{build_console_device, ConsolePortFds};
@@ -152,9 +151,7 @@ impl From<VzError> for engram_core::SandboxError {
                 engram_core::SandboxError::InvalidSpec(e.to_string())
             }
             VzError::SaveRestore(_, _) => engram_core::SandboxError::Snapshot(e.to_string()),
-            VzError::Op(_, _) | VzError::Internal(_) => {
-                engram_core::SandboxError::Vm(Box::new(e))
-            }
+            VzError::Op(_, _) | VzError::Internal(_) => engram_core::SandboxError::Vm(Box::new(e)),
         }
     }
 }
@@ -181,7 +178,6 @@ impl<T> std::ops::Deref for Sendable<T> {
         &self.0
     }
 }
-
 
 /// Owned VZ virtual machine.
 ///
@@ -214,8 +210,7 @@ impl VzVm {
     pub fn new(cfg: VmConfig) -> Result<(Self, ConsolePortFds), VzError> {
         // Each VM gets its own serial queue. Label is debug-only —
         // shows up in `Activity Monitor` and `lldb`.
-        let queue =
-            DispatchQueue::new(&format!("engram-vz-{}", uuid::Uuid::new_v4()), None);
+        let queue = DispatchQueue::new(&format!("engram-vz-{}", uuid::Uuid::new_v4()), None);
 
         // Build configuration. None of this needs to be on the
         // queue — the configuration object is plain data; it only
@@ -331,9 +326,7 @@ impl VzVm {
     /// handler back to a tokio oneshot.
     async fn dispatch_op<F>(&self, op: &'static str, schedule: F) -> Result<(), VzError>
     where
-        F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>)
-            + Send
-            + 'static,
+        F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>) + Send + 'static,
     {
         self.run_completion("op", op, schedule).await
     }
@@ -348,9 +341,7 @@ impl VzVm {
         schedule: F,
     ) -> Result<(), VzError>
     where
-        F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>)
-            + Send
-            + 'static,
+        F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>) + Send + 'static,
     {
         self.run_completion("save_restore", op, schedule).await
     }
@@ -369,9 +360,7 @@ impl VzVm {
         schedule: F,
     ) -> Result<(), VzError>
     where
-        F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>)
-            + Send
-            + 'static,
+        F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>) + Send + 'static,
     {
         let (tx, rx) = oneshot::channel::<Result<(), VzError>>();
         let vm = Sendable(self.vm.clone());
@@ -426,16 +415,13 @@ fn build_configuration(
 
         // Boot loader: Linux kernel + commandline.
         let kernel_url = nsurl_for_path(&cfg.kernel_path);
-        let bootloader = VZLinuxBootLoader::initWithKernelURL(
-            VZLinuxBootLoader::alloc(),
-            &kernel_url,
-        );
+        let bootloader =
+            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
         let cmdline = NSString::from_str(&cfg.kernel_cmdline);
         bootloader.setCommandLine(&cmdline);
         // Upcast to VZBootLoader before storing on the cfg, since
         // setBootLoader takes a VZBootLoader.
-        let bootloader_super: Retained<VZBootLoader> =
-            Retained::cast_unchecked(bootloader);
+        let bootloader_super: Retained<VZBootLoader> = Retained::cast_unchecked(bootloader);
         vz_cfg.setBootLoader(Some(&bootloader_super));
 
         // CPU + memory.
@@ -451,9 +437,8 @@ fn build_configuration(
             false,
         )
         .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
-        let attachment_super: Retained<
-            objc2_virtualization::VZStorageDeviceAttachment,
-        > = Retained::cast_unchecked(attachment);
+        let attachment_super: Retained<objc2_virtualization::VZStorageDeviceAttachment> =
+            Retained::cast_unchecked(attachment);
         let block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &attachment_super,
@@ -470,16 +455,13 @@ fn build_configuration(
         // defer it.
         let nat = VZNATNetworkDeviceAttachment::new();
         let net_dev = VZVirtioNetworkDeviceConfiguration::new();
-        let nat_super: Retained<
-            objc2_virtualization::VZNetworkDeviceAttachment,
-        > = Retained::cast_unchecked(nat);
+        let nat_super: Retained<objc2_virtualization::VZNetworkDeviceAttachment> =
+            Retained::cast_unchecked(nat);
         net_dev.setAttachment(Some(&nat_super));
-        let net_dev_super: Retained<
-            objc2_virtualization::VZNetworkDeviceConfiguration,
-        > = Retained::cast_unchecked(net_dev);
-        let network_array: Retained<
-            NSArray<objc2_virtualization::VZNetworkDeviceConfiguration>,
-        > = NSArray::from_retained_slice(&[net_dev_super]);
+        let net_dev_super: Retained<objc2_virtualization::VZNetworkDeviceConfiguration> =
+            Retained::cast_unchecked(net_dev);
+        let network_array: Retained<NSArray<objc2_virtualization::VZNetworkDeviceConfiguration>> =
+            NSArray::from_retained_slice(&[net_dev_super]);
         vz_cfg.setNetworkDevices(&network_array);
 
         // virtio-fs shares for harness substrate + (optionally)
@@ -550,9 +532,8 @@ fn build_configuration(
         } else {
             let (console_dev, port_fds) =
                 build_console_device().map_err(|e| VzError::ConfigInvalid(e.to_string()))?;
-            let console_dev_super: Retained<
-                objc2_virtualization::VZConsoleDeviceConfiguration,
-            > = Retained::cast_unchecked(console_dev);
+            let console_dev_super: Retained<objc2_virtualization::VZConsoleDeviceConfiguration> =
+                Retained::cast_unchecked(console_dev);
             let console_array: Retained<
                 NSArray<objc2_virtualization::VZConsoleDeviceConfiguration>,
             > = NSArray::from_retained_slice(&[console_dev_super]);
@@ -577,11 +558,12 @@ fn build_configuration(
             // STDERR_FILENO = 2. NSFileHandle::fileHandleWithStandardError
             // returns a singleton that wraps the process's fd 2.
             let stderr_handle = NSFileHandle::fileHandleWithStandardError();
-            let attachment = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                VZFileHandleSerialPortAttachment::alloc(),
-                None,
-                Some(&stderr_handle),
-            );
+            let attachment =
+                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                    VZFileHandleSerialPortAttachment::alloc(),
+                    None,
+                    Some(&stderr_handle),
+                );
             let attachment_super: Retained<VZSerialPortAttachment> =
                 Retained::cast_unchecked(attachment);
             serial_cfg.setAttachment(Some(&attachment_super));
@@ -630,8 +612,7 @@ fn ns_error_message(err: &NSError) -> String {
         let key = NSString::from_str("NSUnderlyingError");
         // SAFETY: objectForKey returns Option<Retained<AnyObject>>;
         // we narrow to NSError if the runtime class matches.
-        let raw: Option<Retained<objc2::runtime::AnyObject>> =
-            user_info.objectForKey(&key);
+        let raw: Option<Retained<objc2::runtime::AnyObject>> = user_info.objectForKey(&key);
         raw.and_then(|obj| obj.downcast::<NSError>().ok())
             .map(|nested| {
                 let n_desc = nested.localizedDescription().to_string();
@@ -674,12 +655,10 @@ mod tests {
                 ignored by default. Run with --ignored on a host that \
                 has just vz-bake-kernel + just vz-bake-claude artifacts."]
     fn config_validation_surfaces_clear_error_without_entitlement() {
-        let kernel = std::path::PathBuf::from(
-            std::env::var("ENGRAM_VZ_KERNEL_PATH").unwrap_or_else(|_| {
-                std::env::var("HOME").unwrap_or_default()
-                    + "/.cache/engram-vz-test/vmlinux-arm64"
-            }),
-        );
+        let kernel =
+            std::path::PathBuf::from(std::env::var("ENGRAM_VZ_KERNEL_PATH").unwrap_or_else(|_| {
+                std::env::var("HOME").unwrap_or_default() + "/.cache/engram-vz-test/vmlinux-arm64"
+            }));
         let rootfs = std::path::PathBuf::from("/tmp/engram-vz-rootfs.ext4");
         if !kernel.exists() || !rootfs.exists() {
             eprintln!(

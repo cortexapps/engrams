@@ -91,11 +91,7 @@ impl GitWorkdir {
     /// Run `git -C <dir> <argv>` against the bare clone for `url`.
     /// Errors carry the captured stderr so callers can surface
     /// useful messages.
-    pub async fn run_git(
-        &self,
-        url: &str,
-        argv: &[&str],
-    ) -> Result<GitOutput, GitWorkdirError> {
+    pub async fn run_git(&self, url: &str, argv: &[&str]) -> Result<GitOutput, GitWorkdirError> {
         let dir = self.ensure_clone(url).await?;
         run_git_at(&dir, argv, self.fetch_timeout).await
     }
@@ -112,9 +108,7 @@ impl GitWorkdir {
         branch: &str,
     ) -> Result<(), GitWorkdirError> {
         let refspec = format!("{sha}:refs/heads/{branch}");
-        let out = self
-            .run_git(url, &["push", "origin", &refspec])
-            .await?;
+        let out = self.run_git(url, &["push", "origin", &refspec]).await?;
         if !out.exit_success() {
             return Err(GitWorkdirError::Git {
                 stage: "push".into(),
@@ -168,12 +162,7 @@ impl GitWorkdir {
         // refspec works regardless of how clone was configured.
         let out = run_git_at(
             dir,
-            &[
-                "fetch",
-                "--prune",
-                "origin",
-                "+refs/heads/*:refs/heads/*",
-            ],
+            &["fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*"],
             self.fetch_timeout,
         )
         .await?;
@@ -238,10 +227,7 @@ impl GitOutput {
 pub enum GitWorkdirError {
     Io(String),
     Timeout(Duration),
-    Git {
-        stage: String,
-        stderr: String,
-    },
+    Git { stage: String, stderr: String },
 }
 
 impl std::fmt::Display for GitWorkdirError {
@@ -337,10 +323,7 @@ mod tests {
         // Push a new branch to the remote, then ensure_clone again.
         // The fetch path must pick up the new branch.
         let work = TempDir::new().unwrap();
-        run_host(
-            &["git", "clone", &url, "."],
-            work.path(),
-        );
+        run_host(&["git", "clone", &url, "."], work.path());
         std::fs::write(work.path().join("note.txt"), "v2").unwrap();
         run_host(&["git", "add", "-A"], work.path());
         run_host(
@@ -443,12 +426,7 @@ mod tests {
             .unwrap();
         let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
         run_host(
-            &[
-                "git",
-                "push",
-                "origin",
-                "HEAD:engram/sessions/source",
-            ],
+            &["git", "push", "origin", "HEAD:engram/sessions/source"],
             work.path(),
         );
 

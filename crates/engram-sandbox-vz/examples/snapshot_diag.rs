@@ -49,9 +49,8 @@ async fn real_main() {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.cache/engram-vz-test/vmlinux-arm64")
     });
-    let rootfs = std::env::var("ENGRAM_VZ_ROOTFS_PATH").unwrap_or_else(|_| {
-        "./var/engram/images/local:/demo/warm-1/rootfs.ext4".into()
-    });
+    let rootfs = std::env::var("ENGRAM_VZ_ROOTFS_PATH")
+        .unwrap_or_else(|_| "./var/engram/images/local:/demo/warm-1/rootfs.ext4".into());
     let scratch = std::env::var("ENGRAM_VZ_SCRATCH")
         .unwrap_or_else(|_| "/tmp/engram-vz-snapshot-diag".into());
     let scenario = std::env::var("ENGRAM_DIAG_SCENARIO").unwrap_or_else(|_| "base".into());
@@ -91,9 +90,7 @@ async fn run_scenario(
     _with_console: bool,
 ) {
     use engram_core::traits::SandboxBackend;
-    use engram_core::types::sandbox::{
-        CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
-    };
+    use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -149,10 +146,7 @@ async fn run_scenario(
     // and the rootfs we run from is bytewise stable.
     if std::env::var("ENGRAM_DIAG_FROZEN_DISK").as_deref() == Ok("1") {
         let frozen = snap_dir.join("rootfs.ext4");
-        eprintln!(
-            "[diag] freezing rootfs → {}",
-            frozen.display()
-        );
+        eprintln!("[diag] freezing rootfs → {}", frozen.display());
         // SAFETY: fresh process; clonefile(2) is sound when source +
         // destination paths are valid C strings on the same APFS
         // volume.
@@ -173,8 +167,11 @@ async fn run_scenario(
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["spec"]["rootfs_source"] =
             serde_json::Value::String(frozen.to_string_lossy().into());
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap())
-            .unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
         eprintln!("[diag] manifest rewritten to use frozen rootfs");
     }
 
@@ -185,8 +182,7 @@ async fn run_scenario(
 
         eprintln!("[diag] reconstructing fresh VzBackend; calling restore");
         let cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
-        let backend =
-            engram_sandbox_vz::VzBackend::new(work_dir, cfg).expect("backend rebuild");
+        let backend = engram_sandbox_vz::VzBackend::new(work_dir, cfg).expect("backend rebuild");
         match backend.restore(snap_dir).await {
             Ok(new_id) => {
                 eprintln!("[diag] restore ok! new_id={new_id}");
@@ -216,11 +212,7 @@ async fn run_scenario(
 }
 
 #[cfg(target_os = "macos")]
-async fn run_cold_restore(
-    kernel: &str,
-    rootfs: &str,
-    state_path: &std::path::Path,
-) {
+async fn run_cold_restore(kernel: &str, rootfs: &str, state_path: &std::path::Path) {
     // Same as run_scenario("base") for now — placeholder for a future
     // variant that drops the virtio-console device entirely. Today
     // VzBackend always attaches one, so we'd need a separate code

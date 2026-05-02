@@ -203,11 +203,13 @@ pub async fn fork(
     // the source's checkpoint branch.
     let from_sha = match req.from_event_idx {
         Some(idx) => {
-            let sha = checkpoint_sha_at_or_before(&state, id, idx).await?.ok_or_else(|| {
-                ApiError::Conflict(format!(
-                    "no `checkpoint_pushed` event found at or before idx {idx}"
-                ))
-            })?;
+            let sha = checkpoint_sha_at_or_before(&state, id, idx)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Conflict(format!(
+                        "no `checkpoint_pushed` event found at or before idx {idx}"
+                    ))
+                })?;
             sha
         }
         None => {
@@ -296,9 +298,7 @@ pub async fn fork(
 
 fn git_target_for(session: &engram_core::types::Session) -> Result<(String, String), ApiError> {
     let url = session.workspace.git_url().ok_or_else(|| {
-        ApiError::Conflict(
-            "session has no git workspace — nothing to inspect / fork".into(),
-        )
+        ApiError::Conflict("session has no git workspace — nothing to inspect / fork".into())
     })?;
     let branch = session.checkpoint_branch.clone().ok_or_else(|| {
         ApiError::Conflict(
@@ -484,7 +484,8 @@ mod tests {
 
     fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
         let local = TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
         let host_registry = Arc::new(HostRegistry::new());
         host_registry.register(engram_core::HostId::new(), backend.clone());
         let services = Services {
@@ -535,8 +536,7 @@ mod tests {
         // and the test session reference the same branch name.
         let session_id = engram_core::SessionId::new();
         let session_branch = checkpoint_branch_for(session_id);
-        let remote =
-            seeded_remote_with_session_branch(&session_branch, "agent-output.txt", "v2");
+        let remote = seeded_remote_with_session_branch(&session_branch, "agent-output.txt", "v2");
 
         let session = git_session_with_id(session_id, remote.path());
         let (state, _local) = build_state_for_session(session);

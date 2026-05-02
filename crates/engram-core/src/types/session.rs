@@ -197,7 +197,9 @@ impl SessionKind {
     pub fn derive(workspace: &WorkspaceSpec) -> Self {
         match workspace {
             WorkspaceSpec::Empty => Self::Ephemeral,
-            WorkspaceSpec::Git { read_only: true, .. } => Self::Readonly,
+            WorkspaceSpec::Git {
+                read_only: true, ..
+            } => Self::Readonly,
             WorkspaceSpec::Git { .. } => Self::Git,
             WorkspaceSpec::LocalMount { .. } => Self::Ephemeral,
         }
@@ -352,7 +354,11 @@ mod tests {
 
     #[test]
     fn session_kind_round_trips_via_as_str_parse() {
-        for k in [SessionKind::Git, SessionKind::Readonly, SessionKind::Ephemeral] {
+        for k in [
+            SessionKind::Git,
+            SessionKind::Readonly,
+            SessionKind::Ephemeral,
+        ] {
             assert_eq!(SessionKind::parse(k.as_str()).unwrap(), k);
         }
         assert!(SessionKind::parse("local").is_err());
@@ -362,7 +368,10 @@ mod tests {
     #[test]
     fn harness_spec_default_is_none() {
         assert!(HarnessSpec::default().is_none());
-        assert!(!HarnessSpec::Builtin { name: "claude".into() }.is_none());
+        assert!(!HarnessSpec::Builtin {
+            name: "claude".into()
+        }
+        .is_none());
     }
 
     #[test]

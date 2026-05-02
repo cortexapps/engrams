@@ -157,7 +157,10 @@ pub async fn create_session(
         ));
     }
 
-    let ImageRef::Registry { repo: image_repo, tag: image_tag } = req.image.clone();
+    let ImageRef::Registry {
+        repo: image_repo,
+        tag: image_tag,
+    } = req.image.clone();
 
     // -------- 1. Resolve image manifest --------
     // Image is required and must exist in the registry. The fallback
@@ -234,7 +237,12 @@ pub async fn create_session(
     // time so pooled sandboxes can serve any future session in the
     // bucket.
     let mut spec_env: HashMap<String, String> = manifest.env.clone();
-    apply_secrets_to_env(&mut spec_env, &secret_bundle, manifest.secret_mode, session_id);
+    apply_secrets_to_env(
+        &mut spec_env,
+        &secret_bundle,
+        manifest.secret_mode,
+        session_id,
+    );
 
     // Per-request secrets that don't appear in the image manifest's
     // schema (e.g. harness-supplied creds like CLAUDE_CODE_OAUTH_TOKEN
@@ -280,8 +288,7 @@ pub async fn create_session(
     if !state.services.harnesses.entries().is_empty() {
         mounts.push(engram_core::types::sandbox::MountSpec {
             host_path: state.services.harnesses.host_dir().to_path_buf(),
-            guest_path: crate::harness_registry::HarnessRegistry::guest_mount_path()
-                .to_path_buf(),
+            guest_path: crate::harness_registry::HarnessRegistry::guest_mount_path().to_path_buf(),
             read_only: true,
         });
     }
@@ -384,12 +391,8 @@ pub async fn create_session(
     // Runs while the row is still `Pending`. A failure here marks
     // the row Failed before the user ever sees Active — a clear
     // "git clone broke" beats a green session with no checkout.
-    if let Err(e) = crate::workspace::materialize(
-        &*state.services.sandbox,
-        sandbox_id,
-        &req.workspace,
-    )
-    .await
+    if let Err(e) =
+        crate::workspace::materialize(&*state.services.sandbox, sandbox_id, &req.workspace).await
     {
         tracing::warn!(
             session_id = %session_id,
@@ -402,7 +405,9 @@ pub async fn create_session(
             .set_session_status(session_id, SessionStatus::Failed)
             .await;
         state.harness_hub.unbind_session(session_id);
-        return Err(ApiError::Internal(format!("workspace materialization: {e}")));
+        return Err(ApiError::Internal(format!(
+            "workspace materialization: {e}"
+        )));
     }
 
     // -------- 7. Start the agent (if any) --------

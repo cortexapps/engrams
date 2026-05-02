@@ -29,7 +29,10 @@ pub enum WorkspaceError {
 impl std::fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Exec(e) => write!(f, "backend exec failed during workspace materialization: {e}"),
+            Self::Exec(e) => write!(
+                f,
+                "backend exec failed during workspace materialization: {e}"
+            ),
             Self::Clone { url, code, stderr } => {
                 write!(f, "git clone of `{url}` failed (exit {code:?}): {stderr}")
             }
@@ -68,7 +71,9 @@ pub async fn materialize(
     match spec {
         WorkspaceSpec::Empty => Ok(()),
         WorkspaceSpec::LocalMount { .. } => Ok(()),
-        WorkspaceSpec::Git { url, branch, .. } => clone_into_sandbox(backend, sandbox_id, url, branch).await,
+        WorkspaceSpec::Git { url, branch, .. } => {
+            clone_into_sandbox(backend, sandbox_id, url, branch).await
+        }
     }
 }
 

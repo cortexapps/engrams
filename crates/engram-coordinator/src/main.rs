@@ -96,7 +96,11 @@ struct Cli {
 
     /// Local address the harness-channel TCP listener binds to.
     /// Default `127.0.0.1:0` lets the OS pick a free port.
-    #[arg(long, env = "ENGRAM_HARNESS_LISTEN_ADDR", default_value = "127.0.0.1:0")]
+    #[arg(
+        long,
+        env = "ENGRAM_HARNESS_LISTEN_ADDR",
+        default_value = "127.0.0.1:0"
+    )]
     harness_listen_addr: std::net::SocketAddr,
 
     /// Host-side directory of harness binaries. Mounted read-only
@@ -258,9 +262,7 @@ async fn main() -> Result<(), CoordinatorError> {
             status: engram_core::types::host::HostStatus::Ready,
             last_heartbeat_at: chrono::Utc::now(),
         };
-        if let Err(e) =
-            engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await
-        {
+        if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await {
             return Err(CoordinatorError::Config(format!(
                 "register in-process host in postgres: {e}"
             )));
@@ -286,8 +288,7 @@ async fn main() -> Result<(), CoordinatorError> {
                     status: engram_core::types::host::HostStatus::Ready,
                     last_heartbeat_at: chrono::Utc::now(),
                 };
-                if let Err(e) =
-                    engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
+                if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
                 {
                     tracing::warn!(error = %e, "in-process heartbeat upsert failed");
                 }

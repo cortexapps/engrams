@@ -51,7 +51,10 @@ mod adapter {
     pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 
     #[derive(Parser, Debug)]
-    #[command(name = "engram-harness-claude", about = "Engram adapter for Claude Code")]
+    #[command(
+        name = "engram-harness-claude",
+        about = "Engram adapter for Claude Code"
+    )]
     pub struct Cli {
         /// TCP host:port of the harness hub (ProcessBackend dev path).
         /// Mutually exclusive with `--vsock-host`.
@@ -173,10 +176,8 @@ mod adapter {
                         );
                         return ExitCode::from(1);
                     }
-                    let backoff = std::cmp::min(
-                        MAX_BACKOFF_SECS,
-                        1u64 << consecutive_failures.min(5),
-                    );
+                    let backoff =
+                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                     continue;
                 }
@@ -185,10 +186,8 @@ mod adapter {
                 Outcome::Exit(code) => return code,
                 Outcome::Reconnect { reason } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff = std::cmp::min(
-                        MAX_BACKOFF_SECS,
-                        1u64 << consecutive_failures.min(5),
-                    );
+                    let backoff =
+                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
                     tracing::warn!(
                         reason,
                         consecutive_failures,
@@ -261,16 +260,15 @@ mod adapter {
             &mut writer,
             &HarnessAttach {
                 session_id: cli.session_id,
-                harness_version: format!(
-                    "engram-harness-claude/{}",
-                    env!("CARGO_PKG_VERSION")
-                ),
+                harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
             },
         )
         .await
         {
             tracing::error!(error = %e, "attach write failed");
-            return Outcome::Reconnect { reason: "attach_write" };
+            return Outcome::Reconnect {
+                reason: "attach_write",
+            };
         }
         let ack: HarnessAttachAck = match read_msg(&mut reader).await {
             Ok(a) => a,
@@ -315,7 +313,9 @@ mod adapter {
         if next_prompt.is_none() {
             if write_event(&writer, HarnessEvent::Idle).await.is_err() {
                 reader_task.abort();
-                return Outcome::Reconnect { reason: "idle_write" };
+                return Outcome::Reconnect {
+                    reason: "idle_write",
+                };
             }
         }
 
@@ -339,7 +339,9 @@ mod adapter {
                             // Reader task ended → connection died.
                             // Reconnect rather than exit.
                             reader_task.abort();
-                            return Outcome::Reconnect { reason: "cmd_chan_closed" };
+                            return Outcome::Reconnect {
+                                reason: "cmd_chan_closed",
+                            };
                         }
                     }
                 },
@@ -367,11 +369,15 @@ mod adapter {
             .is_err()
             {
                 reader_task.abort();
-                return Outcome::Reconnect { reason: "run_completed_write" };
+                return Outcome::Reconnect {
+                    reason: "run_completed_write",
+                };
             }
             if write_event(&writer, HarnessEvent::Idle).await.is_err() {
                 reader_task.abort();
-                return Outcome::Reconnect { reason: "idle_write" };
+                return Outcome::Reconnect {
+                    reason: "idle_write",
+                };
             }
 
             if let Some(queued) = outcome.queued_prompt {
@@ -567,8 +573,10 @@ mod adapter {
             "system" => {
                 let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
                 if subtype == "init" {
-                    let session_id =
-                        v.get("session_id").and_then(|s| s.as_str()).map(str::to_string);
+                    let session_id = v
+                        .get("session_id")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string);
                     let rid = session_id
                         .clone()
                         .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
@@ -619,9 +627,9 @@ mod adapter {
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("?")
                                     .to_string();
-                                let args_summary = b.get("input").map(|v| {
-                                    truncate_str(&v.to_string(), MAX_ARGS_SUMMARY_BYTES)
-                                });
+                                let args_summary = b
+                                    .get("input")
+                                    .map(|v| truncate_str(&v.to_string(), MAX_ARGS_SUMMARY_BYTES));
                                 out.push(HarnessEvent::ToolCallStarted {
                                     run_id: rid.clone(),
                                     tool_call_id: tcid,
@@ -661,9 +669,7 @@ mod adapter {
                                 Some(Value::Array(arr)) => arr
                                     .iter()
                                     .filter_map(|c| {
-                                        c.get("text")
-                                            .and_then(|t| t.as_str())
-                                            .map(str::to_string)
+                                        c.get("text").and_then(|t| t.as_str()).map(str::to_string)
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n"),

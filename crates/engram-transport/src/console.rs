@@ -144,8 +144,8 @@ async fn open_port(port: u32) -> io::Result<OwnedFd> {
 }
 
 fn open_blocking(path: &Path) -> io::Result<OwnedFd> {
-    let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(io::Error::other)?;
+    let path_c =
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
     // SAFETY: open(2) with valid CString path; fd ownership is
     // captured by OwnedFd::from_raw_fd below.
     let raw = unsafe {

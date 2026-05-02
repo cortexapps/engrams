@@ -180,7 +180,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_pack(dir.path(), "claude", &["claude"]); // wrapper + sidecar
         write_pack(dir.path(), "noop", &[]); // wrapper only
-        // Hidden dir: ignored.
+                                             // Hidden dir: ignored.
         std::fs::create_dir(dir.path().join(".hidden")).unwrap();
         // Loose file: ignored (registry only takes dirs).
         std::fs::write(dir.path().join("loose"), b"").unwrap();

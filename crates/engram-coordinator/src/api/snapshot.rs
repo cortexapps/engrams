@@ -287,15 +287,10 @@ async fn resume_from_fc_snapshot(
     // re-load the image manifest here.
     let resume_base_env: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let agent_opt = crate::api::sessions::resolve_harness(
-        &state,
-        &session.harness,
-        id,
-        None,
-        &resume_base_env,
-    )
-    .ok()
-    .flatten();
+    let agent_opt =
+        crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
+            .ok()
+            .flatten();
     if let Some(agent) = agent_opt {
         if let Err(e) = state
             .services
@@ -329,7 +324,6 @@ async fn resume_from_fc_snapshot(
         note: "resumed from snapshot",
     })
 }
-
 
 async fn bind_resumed_session(
     state: &SharedState,
@@ -464,4 +458,3 @@ pub async fn evict_local(
         .await?;
     Ok(StatusCode::ACCEPTED)
 }
-

@@ -14,8 +14,8 @@ mod hosts;
 mod images;
 mod prompt;
 mod sessions;
-mod shell;
 mod sessions_inspect;
+mod shell;
 mod snapshot;
 
 pub fn router(state: SharedState) -> Router {
