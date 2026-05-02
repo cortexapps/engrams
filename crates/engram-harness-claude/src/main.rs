@@ -310,13 +310,11 @@ mod adapter {
         // or a queued one rolled over from a dropped connection),
         // we'll run it on this turn. Otherwise emit Idle so the host
         // knows we're waiting.
-        if next_prompt.is_none() {
-            if write_event(&writer, HarnessEvent::Idle).await.is_err() {
-                reader_task.abort();
-                return Outcome::Reconnect {
-                    reason: "idle_write",
-                };
-            }
+        if next_prompt.is_none() && write_event(&writer, HarnessEvent::Idle).await.is_err() {
+            reader_task.abort();
+            return Outcome::Reconnect {
+                reason: "idle_write",
+            };
         }
 
         loop {
