@@ -236,6 +236,27 @@ pub async fn create_session(
     let mut spec_env: HashMap<String, String> = manifest.env.clone();
     apply_secrets_to_env(&mut spec_env, &secret_bundle, manifest.secret_mode, session_id);
 
+    // Per-request secrets that don't appear in the image manifest's
+    // schema (e.g. harness-supplied creds like CLAUDE_CODE_OAUTH_TOKEN
+    // — the demo image declares no `[secrets.*]` blocks) wouldn't
+    // otherwise reach the harness env: `SecretStore::resolve` only
+    // iterates the schema, so override values for unknown names get
+    // silently dropped. Fold them in here, overwriting any same-key
+    // value injected by the manifest's defaults / the secret store —
+    // the user explicitly typed a value into the dashboard for *this*
+    // session, that intent dominates. The broker-mode gate upstream
+    // (line ~204) guarantees overrides only show up under
+    // `SecretMode::Literal`, so passing them through verbatim is
+    // safe — the operator asserted the value, no proxy substitution
+    // contract is implied.
+    if manifest.secret_mode == engram_core::types::image::SecretMode::Literal {
+        if let Some(overrides) = req.secrets.as_ref() {
+            for (name, value) in overrides {
+                spec_env.insert(name.clone(), value.clone());
+            }
+        }
+    }
+
     let agent_for_session = resolve_harness(
         &state,
         &req.harness,
