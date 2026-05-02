@@ -6,6 +6,12 @@
 .env
 .env.*
 !.env.example
+*.token
+*.pem
+*.key
+secrets/
+secrets.*
+credentials.*
 
 # editor
 .idea/
