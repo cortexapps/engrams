@@ -86,9 +86,9 @@ async fn exec_runs_inside_baked_microvm() {
             agent_injection: Some(AgentInjection {
                 agent_binary: agent,
                 vsock_port: ENGRAM_AGENTD_PORT,
+                transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
                 bootstrap_binary: None,
-                harness_binaries: Vec::new(),
             }),
         })
         .await
@@ -119,6 +119,7 @@ async fn exec_runs_inside_baked_microvm() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
+        mounts: Vec::new(),
     };
     let sandbox_id = backend.create(spec).await.expect("create");
 

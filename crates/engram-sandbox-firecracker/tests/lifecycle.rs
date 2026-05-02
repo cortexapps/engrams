@@ -50,6 +50,7 @@ async fn create_list_destroy_round_trip() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
+        mounts: Vec::new(),
     };
 
     // create
