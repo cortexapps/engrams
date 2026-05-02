@@ -40,7 +40,16 @@ async fn snapshot_then_restore_round_trips_microvm() {
         .await
         .expect("clone rootfs into tempdir");
 
-    let backend = FirecrackerBackend::new(work.path(), FirecrackerConfig::with_kernel(env.kernel));
+    // The default `with_kernel` config boots into `/sbin/engram-init`,
+    // which only exists in our agent-baked images. The public
+    // ubuntu-22.04 ext4 rootfs we fetch has no such init, so the
+    // guest kernel panics 1–2s into boot — which is exactly when
+    // the test reaches `snapshot()` and discovers firecracker is
+    // dead. Override the init to a binary that's actually present
+    // in the rootfs so the VM stays alive for the snapshot pause.
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
         image: "fc-snapshot-test".into(),

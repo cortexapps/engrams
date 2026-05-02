@@ -52,6 +52,11 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.uffd_handler_bin = handler;
     cfg.restore_mode = RestoreMode::Uffd;
+    // Public ubuntu-22.04 rootfs has no /sbin/engram-init; default
+    // boot args would kernel-panic 1–2s in. Boot to bash instead so
+    // the VM survives the 2s sleep before snapshot. See snapshot.rs
+    // for the full rationale.
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
