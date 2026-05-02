@@ -1,0 +1,16 @@
+version: 2
+
+# Keep GitHub Actions versions current. Floating tags (`@v4`) are
+# convenient but invisible — when a major version ships a breaking
+# change we want a PR with the diff, not silent drift. Weekly cadence
+# matches how often new action versions actually ship.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One rollup PR per week instead of N PRs across actions.
+      actions:
+        patterns: ["*"]

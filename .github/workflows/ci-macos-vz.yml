@@ -37,6 +37,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
+
+# See ci.yml for rationale (cancel PR-only, keep main runs serial).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,12 +80,16 @@ jobs:
       - name: Codesign with virtualization entitlement
         run: bash crates/engram-sandbox-vz/scripts/codesign.sh debug
 
+      # `if: always()` from this point on so a failure in one VZ-test
+      # step doesn't hide failures in the steps that follow — same
+      # pattern as the `lint` and `test-linux` jobs in ci.yml.
       - name: Run engram-sandbox-vz unit tests (default)
+        if: always()
         # Default test set runs without any external artifacts — the
         # smoke test in vm.rs uses tempfiles and exercises VZ
         # config-build through validateWithError; other tests are
         # pure-Rust unit tests.
-        run: cargo nextest run -p engram-sandbox-vz
+        run: cargo nextest run -p engram-sandbox-vz --no-fail-fast
 
       # Pull the Kata Containers arm64 kernel into the cache path
       # the `#[ignore]`'d live smoke reads (`ENGRAM_VZ_KERNEL_PATH`,
@@ -84,6 +97,7 @@ jobs:
       # `just vz-pull-kernel` invokes locally — pinned URL, ~290 MB
       # tarball, ~25 MB extracted kernel.
       - name: Pull VZ kernel (Kata arm64)
+        if: always()
         run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
 
       # The live smoke also wants `/tmp/engram-vz-rootfs.ext4` on
@@ -92,14 +106,17 @@ jobs:
       # enough to clear the file-existence guard. The test accepts
       # both Ok and ConfigInvalid, so a degenerate rootfs is fine.
       - name: Stage rootfs placeholder
+        if: always()
         run: touch /tmp/engram-vz-rootfs.ext4
 
       - name: Run live VZ smoke (--ignored)
+        if: always()
         # Reuses the codesigned test binaries cargo built earlier;
         # nextest is idempotent against the cached build artifacts.
-        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast
 
       - name: Workspace check (catches downstream-of-VZ regressions)
+        if: always()
         # cargo check on the rest of the workspace ensures the
         # `--sandbox-backend=vz` wiring in engram-coordinator stays
         # green.

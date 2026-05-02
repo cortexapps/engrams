@@ -28,6 +28,21 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
+
+# Cancel an in-progress PR run when a new push lands on the same
+# branch — saves runner minutes during fix-and-rerun cycles. Pushes
+# to `main` are *not* cancelled (we want a CI record per merged
+# commit, even on rapid back-to-back merges).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Default to read-only repo access. No job here writes to the repo
+# (no GH releases, no commit-back, no PR comments), so least
+# privilege.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -207,22 +222,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
 
-      # Defense-in-depth: Blacksmith should already expose /dev/kvm
-      # at 0666, but the bootstrap script in `.claude/skills/dev-vm/
-      # scripts/bootstrap-remote.sh` does the same chmod, so mirror
-      # it. No-op if the device is already world-rw.
-      - name: Ensure /dev/kvm is accessible
+      # /dev/kvm is mode 0660 root:kvm by default on hosted runners;
+      # relax to 0666 so the runner user can boot microVMs without
+      # sudo. /dev/userfaultfd is the same story (FC 1.10+ opens it
+      # directly for UFFD-backed restore), with the additional
+      # `vm.unprivileged_userfaultfd=1` sysctl required so the
+      # non-root process can call userfaultfd(2).
+      - name: Relax KVM + UFFD permissions
         run: |
-          ls -l /dev/kvm
           sudo chmod 0666 /dev/kvm
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          sudo chmod 0666 /dev/userfaultfd
 
       # `mke2fs` (e2fsprogs) is needed by the exec_real_vm test for
       # ext4 packing. `musl-tools` is for the static agentd build that
       # the same test bakes into the rootfs.
-      - name: Install build deps
+      - name: Install build deps (musl-tools, e2fsprogs)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools e2fsprogs
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools e2fsprogs
 
       # Pin to v1.10 to match the `firecracker-ci/v1.10` artifact
       # bucket that fetch-fc-test-artifacts.sh pulls from. Bumping
@@ -237,30 +255,6 @@ jobs:
           tar -xzf /tmp/fc.tgz -C /tmp
           sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
           firecracker --version
-
-      # snapshot_uffd opens /dev/userfaultfd directly (FC 1.10+
-      # behavior). Two things can block this on a hosted runner:
-      #
-      #   1. /dev/userfaultfd is mode 0600 root-only — relax to 0666.
-      #   2. vm.unprivileged_userfaultfd=0 — flip to 1 so non-root
-      #      processes can call userfaultfd(2). Required when FC runs
-      #      as the runner user, not root.
-      #
-      # Dump diagnostic state too so a failing snapshot_uffd has data
-      # to debug from (kernel version, sysctl, device permissions).
-      - name: UFFD setup + diagnostics
-        run: |
-          echo "=== uname -r ==="
-          uname -r
-          echo "=== /dev/userfaultfd ==="
-          ls -l /dev/userfaultfd 2>&1 || echo "MISSING"
-          echo "=== sysctl vm.unprivileged_userfaultfd (before) ==="
-          sysctl vm.unprivileged_userfaultfd 2>&1 || echo "(sysctl not present)"
-          echo "=== set vm.unprivileged_userfaultfd=1 ==="
-          sudo sysctl -w vm.unprivileged_userfaultfd=1 2>&1 || echo "(sysctl write failed)"
-          echo "=== relax /dev/userfaultfd permissions ==="
-          sudo chmod 0666 /dev/userfaultfd 2>&1 || echo "chmod failed (device missing?)"
-          ls -l /dev/userfaultfd 2>&1 || true
 
       # Drop the cached kernel + ubuntu rootfs into ~/.cache/engram-fc-test
       # and emit the `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` env vars that
