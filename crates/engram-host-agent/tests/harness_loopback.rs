@@ -50,13 +50,31 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // Wait for the noop's events to arrive (RunStarted + 3
-    // ToolCallStarted/Completed pairs + Idle = 8 events).
-    for _ in 0..200 {
-        if collected.lock().len() >= 8 {
+    // ToolCallStarted/Completed pairs + Idle = 8 events). Poll on
+    // the *semantic* condition — all 3 ToolCallCompleted received —
+    // rather than a raw len() threshold. The previous `len >= 8`
+    // exit could fire after only 2 completes (with a 7th event
+    // being ToolCallStarted #3), which then races the shutdown
+    // below: shutdown short-circuits the harness before the 3rd
+    // tool call finishes, the assertion downstream sees 2 instead
+    // of 3. Bump the budget to 5 s — this is in-memory loopback,
+    // even slow runners shouldn't take more than tens of ms.
+    let mut tool_completes_seen = 0;
+    for _ in 0..1000 {
+        tool_completes_seen = collected
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::ToolCallCompleted { .. }))
+            .count();
+        if tool_completes_seen >= 3 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    assert!(
+        tool_completes_seen >= 3,
+        "timed out waiting for 3 ToolCallCompleted events; saw {tool_completes_seen}",
+    );
 
     // Hub's last_event_at is updated on every event. Snapshot it
     // BEFORE shutdown — disconnect cleanup wipes the entry by design
