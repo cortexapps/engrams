@@ -29,8 +29,14 @@ pub struct GuestRegionUffdMapping {
     /// `mmap` the whole file once, so the handler does pointer math
     /// `mmap_base + offset + intra_region_offset` to find the source.
     pub offset: u64,
-    /// Page size for this region — typically 4096. We trust whatever
-    /// Firecracker tells us rather than assuming a host default.
+    /// Page size for this region in BYTES, despite the misleading
+    /// wire-field name. FC v1.10 renamed this from `page_size` to
+    /// `page_size_kib` but the *value* is still bytes — upstream's
+    /// `HugePageConfig::page_size_kib()` returns 4096 for normal
+    /// pages and 2 * 1024 * 1024 for 2 MiB hugepages, both byte
+    /// values. We follow the wire name for compatibility but
+    /// `runtime.rs` does pointer math in bytes.
+    #[serde(rename = "page_size_kib")]
     pub page_size: usize,
 }
 
@@ -51,9 +57,10 @@ mod tests {
 
     #[test]
     fn deserializes_upstream_example_body() {
-        // Lifted from the docstring on Firecracker's uffd_utils.rs:
-        // a single 4 KiB region at offset 0.
-        let body = r#"[{"base_host_virt_addr":0,"size":4096,"offset":0,"page_size":4096}]"#;
+        // FC v1.10+ wire format: `page_size_kib` field name. The
+        // serde alias keeps us tolerant of older `page_size`-named
+        // bodies if we ever target an older FC.
+        let body = r#"[{"base_host_virt_addr":0,"size":4096,"offset":0,"page_size_kib":4096}]"#;
         let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(body).unwrap();
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].size, 4096);
@@ -80,8 +87,8 @@ mod tests {
         // around the BIOS hole below 1 MiB). The handler must walk
         // the array, not assume a single region.
         let body = r#"[
-            {"base_host_virt_addr":0,"size":655360,"offset":0,"page_size":4096},
-            {"base_host_virt_addr":1048576,"size":133169152,"offset":655360,"page_size":4096}
+            {"base_host_virt_addr":0,"size":655360,"offset":0,"page_size_kib":4096},
+            {"base_host_virt_addr":1048576,"size":133169152,"offset":655360,"page_size_kib":4096}
         ]"#;
         let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(body).unwrap();
         assert_eq!(mappings.len(), 2);
