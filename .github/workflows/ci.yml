@@ -128,6 +128,16 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
+      # Hold the runner open for 30 minutes when a prior step failed so
+      # the triggering user can SSH in and debug interactively (Blacksmith
+      # provisions an ssh command on the "Setup runner" step). Drop this
+      # block once test-linux is reliably green.
+      - name: Hold runner open for SSH debug
+        if: failure()
+        run: |
+          echo "Job failed — holding runner open for SSH debug. See the 'Setup runner' step for the ssh command."
+          sleep 1800
+
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -301,3 +311,13 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
+
+      # Hold the runner open for 30 minutes when a prior step failed so
+      # the triggering user can SSH in and debug interactively (Blacksmith
+      # provisions an ssh command on the "Setup runner" step). Drop this
+      # block once test-firecracker is reliably green.
+      - name: Hold runner open for SSH debug
+        if: failure()
+        run: |
+          echo "Job failed — holding runner open for SSH debug. See the 'Setup runner' step for the ssh command."
+          sleep 1800
