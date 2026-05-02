@@ -128,15 +128,43 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # Hold the runner open for 30 minutes when a prior step failed so
-      # the triggering user can SSH in and debug interactively (Blacksmith
-      # provisions an ssh command on the "Setup runner" step). Drop this
-      # block once test-linux is reliably green.
-      - name: Hold runner open for SSH debug
+      # Diagnostics that surface why `timeout_kills_runaway_command_and_reports_124`
+      # fails on Blacksmith with elapsed=30s (= the full sleep duration) but
+      # passes on macOS + the dev VM. Captures process-isolation state and
+      # an isolated kill repro. Drop once test-linux is reliably green.
+      - name: Diagnose timeout_kills (failure only)
         if: failure()
         run: |
-          echo "Job failed — holding runner open for SSH debug. See the 'Setup runner' step for the ssh command."
-          sleep 1800
+          set +e
+          echo "=== /proc/self/status (caps + namespaces) ==="
+          grep -E '^(Uid|Gid|CapInh|CapPrm|CapEff|CapBnd|CapAmb|Seccomp|NoNewPrivs|NSpid|NSpgid|NSsid)' /proc/self/status
+          echo "=== /proc/self/ns/ ==="
+          ls -l /proc/self/ns/
+          echo "=== sysctl kernel.yama.ptrace_scope ==="
+          sysctl kernel.yama.ptrace_scope 2>&1 || true
+
+          echo "=== isolated kill repro: spawn sh -c 'sleep 30', kill -KILL, observe ==="
+          ( sh -c 'sleep 30' ) &
+          PID=$!
+          ps -p $PID -o pid,ppid,pgid,sid,stat,cmd 2>&1 || true
+          sleep 0.2
+          kill -KILL $PID
+          rc=$?
+          echo "kill -KILL $PID exit code: $rc"
+          sleep 0.2
+          if kill -0 $PID 2>/dev/null; then
+            echo "PID $PID STILL ALIVE after kill -KILL"
+            ps -p $PID -o pid,ppid,pgid,sid,stat,cmd 2>&1 || true
+          else
+            echo "PID $PID is gone (kill worked)"
+          fi
+          wait $PID 2>/dev/null
+          echo "wait returned: $?"
+
+          echo "=== rerun timeout_kills with --nocapture for stderr ==="
+          cargo test -p engram-sandbox-process \
+            timeout_kills_runaway_command_and_reports_124 \
+            -- --nocapture 2>&1 | tail -40 || true
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
@@ -312,12 +340,71 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # Hold the runner open for 30 minutes when a prior step failed so
-      # the triggering user can SSH in and debug interactively (Blacksmith
-      # provisions an ssh command on the "Setup runner" step). Drop this
-      # block once test-firecracker is reliably green.
-      - name: Hold runner open for SSH debug
+      # Diagnostics for `snapshot_uffd`, which fails with FC's UFFD
+      # handshake hanging after the socket connect (handler logs
+      # "Firecracker connected; awaiting handshake" then nothing for
+      # 10s). Re-runs the test in isolation while strace'ing FC, then
+      # dumps the strace tail + the test's firecracker.log/uffd-handler.log
+      # so we can see exactly which syscall FC is stuck on. Drop once
+      # snapshot_uffd is reliably green.
+      - name: Diagnose snapshot_uffd (failure only)
         if: failure()
         run: |
-          echo "Job failed — holding runner open for SSH debug. See the 'Setup runner' step for the ssh command."
-          sleep 1800
+          set +e
+          sudo apt-get install -y -qq strace
+
+          # Set up isolation dir so we can find the test's tempdir
+          # afterward (they live in /tmp/.tmp* by default, hard to glob).
+          export TMPDIR=/tmp/uffd-debug
+          mkdir -p $TMPDIR
+          rm -rf $TMPDIR/*
+
+          # Background the test so we can attach strace mid-run.
+          (
+            RUST_BACKTRACE=1 cargo nextest run \
+              -p engram-sandbox-firecracker \
+              --test snapshot_uffd \
+              --run-ignored ignored-only \
+              --no-fail-fast --test-threads=1 \
+              -- --nocapture 2>&1 | tee $TMPDIR/test.out
+          ) &
+          TEST_PID=$!
+
+          # Wait for FC to launch under the snapshot_uffd test (it boots
+          # its first VM ~5s in, then snapshots, then `restore` is when
+          # UFFD handshake hangs). We poll every 0.5s for up to 30s.
+          FC_PID=""
+          for i in $(seq 1 60); do
+            FC_PID=$(pgrep -f "firecracker --api-sock" | head -1)
+            [ -n "$FC_PID" ] && break
+            sleep 0.5
+          done
+          if [ -z "$FC_PID" ]; then
+            echo "FC pid never appeared; test must've failed before reaching restore"
+            wait $TEST_PID
+            tail -100 $TMPDIR/test.out
+            exit 0  # diagnostic step, don't mask the original failure
+          fi
+          echo "Attached to firecracker PID $FC_PID"
+
+          # Trace the syscalls we care about for UFFD restore — open
+          # /dev/userfaultfd, ioctl on the fd, sendmsg for SCM_RIGHTS.
+          sudo strace -fp $FC_PID -o $TMPDIR/fc.strace -s 256 \
+            -e 'trace=openat,ioctl,connect,sendmsg,recvmsg,close,mmap' &
+          STRACE_PID=$!
+
+          wait $TEST_PID
+          sudo kill $STRACE_PID 2>/dev/null
+          sleep 1
+
+          echo "=== last 200 lines of FC strace ==="
+          sudo tail -200 $TMPDIR/fc.strace 2>&1 || true
+
+          echo "=== /dev/userfaultfd opens (any) ==="
+          sudo grep -E "openat\(.*userfaultfd|UFFDIO_" $TMPDIR/fc.strace 2>&1 | head -40
+
+          echo "=== sendmsg with SCM_RIGHTS (handshake) ==="
+          sudo grep -E "sendmsg.*SCM_RIGHTS" $TMPDIR/fc.strace 2>&1 || echo "(no SCM_RIGHTS sendmsg observed — handshake never sent)"
+
+          echo "=== test output tail ==="
+          tail -60 $TMPDIR/test.out
