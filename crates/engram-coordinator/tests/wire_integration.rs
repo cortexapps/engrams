@@ -360,6 +360,8 @@ async fn create_then_exec_round_trips_via_wire() {
         .unwrap();
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
 async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
     // Build an AppState with an empty HostRegistry. The Phase 3a
     // single-host scheduler's "no host" path must surface as a 500

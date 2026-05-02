@@ -24,7 +24,7 @@ use engram_core::types::{
     HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent, Session, SessionSpec,
     SessionStatus, SnapshotRecord,
 };
-use engram_core::{HostId, ImageVersionId, MetaError, SessionId};
+use engram_core::{HostId, MetaError, SessionId};
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
 use http_body_util::BodyExt;
@@ -60,21 +60,6 @@ impl MockMetadataStore {
     /// store. Used to assert post-conditions about failed sessions.
     fn all_sessions(&self) -> Vec<Session> {
         self.sessions.lock().values().cloned().collect()
-    }
-
-    fn add_image(&self, repo: &str, tag: &str, status: ImageStatus) {
-        self.images
-            .lock()
-            .entry(repo.to_string())
-            .or_default()
-            .push(ImageVersion {
-                id: ImageVersionId::new(),
-                repo: repo.into(),
-                tag: tag.into(),
-                blob_url: None,
-                status,
-                created_at: Utc::now(),
-            });
     }
 }
 

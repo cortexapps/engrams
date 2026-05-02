@@ -305,7 +305,6 @@ impl SandboxBackend for VzBackend {
             vm_cfg.mounts.push(crate::vm::VirtiofsMount {
                 tag,
                 host_path: mount.host_path.clone(),
-                guest_path: mount.guest_path.clone(),
                 read_only: mount.read_only,
             });
         }
@@ -557,7 +556,6 @@ impl SandboxBackend for VzBackend {
             vm_cfg.mounts.push(crate::vm::VirtiofsMount {
                 tag,
                 host_path: mount.host_path.clone(),
-                guest_path: mount.guest_path.clone(),
                 read_only: mount.read_only,
             });
         }

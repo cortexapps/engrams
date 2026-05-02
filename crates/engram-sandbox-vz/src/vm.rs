@@ -53,7 +53,6 @@ pub(crate) struct VmConfig {
 pub struct VirtiofsMount {
     pub tag: String,
     pub host_path: std::path::PathBuf,
-    pub guest_path: std::path::PathBuf,
     pub read_only: bool,
 }
 
