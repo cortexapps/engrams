@@ -1,5 +1,24 @@
 name: CI
 
+# Linux Rust + web/pnpm gate. The macOS / Apple-Silicon coverage
+# lives in ci-macos-vz.yml; together they form the full CI surface.
+#
+# Surfaces this workflow exercises:
+#   - lint:             cargo fmt --check, cargo clippy -D warnings
+#   - test-linux:       cargo nextest workspace tests + doctests, plus
+#                       the Postgres-gated `ha_listener` ignored tests
+#                       against the postgres service container
+#   - cross-musl:       cross-compile engram-agentd / engram-bootstrap
+#                       / the harness wrappers to
+#                       x86_64-unknown-linux-musl (catches breakage of
+#                       the FC image bake chain)
+#   - test-firecracker: every `#[ignore]`'d FC integration test
+#                       (boot, lifecycle, snapshot, snapshot_uffd,
+#                       exec_real_vm). Runs on a Blacksmith Linux
+#                       runner because GHA-hosted runners don't reliably
+#                       expose `/dev/kvm` for nested virt.
+#   - web:              pnpm install + tsc + vite build + vitest
+
 on:
   push:
     branches: [main]
@@ -12,7 +31,7 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
-  check:
+  lint:
     name: fmt + clippy + check
     runs-on: ubuntu-latest
     steps:
@@ -25,8 +44,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo check --workspace --all-targets
 
-  test:
-    name: tests
+  test-linux:
+    name: tests (linux)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -42,8 +61,183 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
+      # Used by the `#[ignore]`'d ha_listener tests in
+      # crates/engram-coordinator/tests/ha_listener.rs. The tests run
+      # `store.migrate()` themselves before exercising NOTIFY/LISTEN,
+      # so a bare Postgres without engram migrations is fine.
+      ENGRAM_TEST_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # Default (non-ignored) tests across the entire workspace. Mirrors
+      # `just check`'s nextest pass — same speedup, same coverage. The
+      # engram-image-builder e2e bake test skips itself if `docker` is
+      # not on PATH; ubuntu-latest ships Docker, so it runs.
+      - name: cargo nextest run --workspace
+        run: cargo nextest run --workspace
+
+      # nextest doesn't run doctests yet (see justfile note). Ride the
+      # vanilla cargo runner for the doc pass.
+      - name: cargo test --workspace --doc
+        run: cargo test --workspace --doc
+
+      # Postgres-gated ignored tests — the FC `#[ignore]` set needs KVM
+      # so we don't try to run them here. Scoping by `--test` keeps us
+      # from accidentally tripping firecracker tests that share the
+      # `#[ignore]` bucket.
+      - name: ha_listener ignored tests (Postgres NOTIFY/LISTEN)
+        run: |
+          cargo nextest run \
+            -p engram-coordinator \
+            --test ha_listener \
+            --run-ignored ignored-only
+
+  cross-musl-linux:
+    name: cross-compile linux-musl artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Mirrors what `just install-harnesses` and `just fc-bake-demo`
+      # produce on Linux. If any of these stop building the demo bake
+      # path is broken even when the host-target workspace check is
+      # green.
+      - name: build agentd + bootstrap (musl)
+        run: |
+          cargo build \
+            --target x86_64-unknown-linux-musl \
+            --release \
+            -p engram-agentd \
+            -p engram-bootstrap
+
+      - name: build harness wrappers (musl)
+        run: |
+          cargo build \
+            --target x86_64-unknown-linux-musl \
+            --release \
+            -p engram-harness-noop \
+            -p engram-harness-claude
+
+  web:
+    name: web (pnpm)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm build` runs `tsc -b && vite build` — gives us typecheck
+      # AND production bundle validation in one step.
+      - name: pnpm build (tsc -b + vite build)
+        run: pnpm build
+
+      # Vitest. Currently exercises TerminalPane mount/unmount/remount
+      # ordering against a mocked ghostty-web; expand as more components
+      # gain regression tests.
+      - name: pnpm test (vitest)
+        run: pnpm test
+
+  test-firecracker:
+    name: tests (firecracker, Linux + KVM)
+    # Blacksmith runners ship with `/dev/kvm` accessible; GHA-hosted
+    # ubuntu runners may have it but require a `chmod 666` dance and
+    # vary by SKU. Mirrors the dev-vm bootstrap (engram-dev) — the
+    # canonical Linux + KVM env for Firecracker development.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      # Defense-in-depth: Blacksmith should already expose /dev/kvm
+      # at 0666, but the bootstrap script in `.claude/skills/dev-vm/
+      # scripts/bootstrap-remote.sh` does the same chmod, so mirror
+      # it. No-op if the device is already world-rw.
+      - name: Ensure /dev/kvm is accessible
+        run: |
+          ls -l /dev/kvm
+          sudo chmod 0666 /dev/kvm
+
+      # `mke2fs` (e2fsprogs) is needed by the exec_real_vm test for
+      # ext4 packing. `musl-tools` is for the static agentd build that
+      # the same test bakes into the rootfs.
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools e2fsprogs
+
+      # Pin to v1.10 to match the `firecracker-ci/v1.10` artifact
+      # bucket that fetch-fc-test-artifacts.sh pulls from. Bumping
+      # both pins should be a coordinated change — kernel ABI between
+      # the host firecracker binary and the kernel image needs to
+      # match.
+      - name: Install firecracker (v1.10.1)
+        env:
+          FC_VER: v1.10.1
+        run: |
+          curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" -o /tmp/fc.tgz
+          tar -xzf /tmp/fc.tgz -C /tmp
+          sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
+          firecracker --version
+
+      # snapshot_uffd opens /dev/userfaultfd directly (FC 1.10+
+      # behavior). Default mode is 0600 root-only; mirror the udev
+      # rule the dev-vm bootstrap installs.
+      - name: Relax /dev/userfaultfd permissions
+        run: sudo chmod 0666 /dev/userfaultfd 2>/dev/null || true
+
+      # Drop the cached kernel + ubuntu rootfs into ~/.cache/engram-fc-test
+      # and emit the `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` env vars that
+      # `common::fc_preflight()` reads.
+      - name: Fetch FC kernel + rootfs artifacts
+        run: |
+          bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
+            | sed 's/^export //' >> "$GITHUB_ENV"
+
+      # snapshot_uffd needs the host-side handler binary in
+      # `target/debug/` (the test resolves it relative to
+      # CARGO_MANIFEST_DIR).
+      - name: Build engram-uffd-handler
+        run: cargo build -p engram-uffd-handler
+
+      # exec_real_vm bakes a static agent into a rootfs at runtime and
+      # boots it; the binary must be musl-static so it runs against
+      # whatever libc the rootfs ships.
+      - name: Build static engram-agentd (musl)
+        run: cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
+
+      # Run all five `#[ignore]`'d FC integration tests:
+      #   boot, lifecycle, snapshot, snapshot_uffd, exec_real_vm.
+      # `--no-fail-fast` so a regression in one test doesn't hide
+      # regressions in others.
+      - name: Firecracker `#[ignore]` tests
+        run: |
+          cargo nextest run \
+            -p engram-sandbox-firecracker \
+            --run-ignored ignored-only \
+            --no-fail-fast
