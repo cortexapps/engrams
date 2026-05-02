@@ -240,9 +240,18 @@ jobs:
       #   boot, lifecycle, snapshot, snapshot_uffd, exec_real_vm.
       # `--no-fail-fast` so a regression in one test doesn't hide
       # regressions in others.
+      #
+      # `--test-threads=1` is load-bearing: each test creates its own
+      # `FirecrackerBackend`, whose vsock CID allocator restarts at 3
+      # (CIDs are host-global, so concurrent tests collide and the
+      # second VM hits "connect firecracker.sock: Connection refused"
+      # when it can't bind a CID). Production runs one backend per
+      # host so this isn't an issue there. Booting real microVMs is
+      # heavy enough that serial execution is fine.
       - name: Firecracker `#[ignore]` tests
         run: |
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --run-ignored ignored-only \
-            --no-fail-fast
+            --no-fail-fast \
+            --test-threads=1
