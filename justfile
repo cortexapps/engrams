@@ -160,69 +160,31 @@ install-harnesses:
     echo "harnesses installed at ./var/engram/harnesses/" ; \
     ls -la ./var/engram/harnesses/*/
 
-# Bake a tiny Firecracker image (debian-slim + engram-agentd +
-# engram-bootstrap) for the `local://demo` repo and register it
-# under `./var/engram/images/`. Harness binaries are NOT baked
-# in — they live in `./var/engram/harnesses/` and get mounted into
-# every sandbox at runtime via virtio-fs. The repo name passed to
-# `engram image build` must match what the session-create
-# body will carry (`local://demo`), because the image registry
-# resolves images by literal repo string.
-#
-# `--inject-bootstrap` + `--inject-harness` light up the Phase 4
-# harness path on FC: bootstrap listens on vsock 1025 in the guest,
-# the host's `start_agent` pushes a BootstrapLaunch frame, bootstrap
-# exec's the harness, harness dials back via vsock to the harness
-# hub. Without these flags the image is exec-only (no live tool
-# call timeline / idle eviction).
-fc-bake-demo:
-    cargo build -p engram-agentd     --target x86_64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap  --target x86_64-unknown-linux-musl --release
-    mkdir -p ./var/fc-bake
-    printf 'FROM debian:bookworm-slim\n' > ./var/fc-bake/Dockerfile
-    printf 'name = "local-demo"\n' > ./var/fc-bake/engram.toml
-    cargo run -p engram-cli -- image build \
-        --repo local://demo \
-        --tag warm-1 \
-        --source ./var/fc-bake \
-        --format ext4 \
-        --images-dir ./var/engram/images \
-        --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap
-
-# Bake a Firecracker image containing the real Claude Code CLI plus
-# engram-agentd / engram-bootstrap / engram-harness-claude.
-#
-# The base is node:20-slim because Anthropic ships claude as an npm
-# package (`@anthropic-ai/claude-code`). git + ca-certificates are
-# pulled in so Claude can read/write the workspace and reach
-# api.anthropic.com.
-#
-# Image manifest declares ANTHROPIC_API_KEY as a required secret
-# under SecretMode::Literal (the dev default — values land directly
-# in env). The operator must `export ANTHROPIC_API_KEY=sk-...`
-# before `just dev-firecracker` for session-create to succeed; the
-# coordinator's EnvSecretStore reads it from the host process env.
+# Bake the canonical workspace image for Firecracker (Linux + KVM).
+# debian:bookworm-slim + git + ttyd, no harness-specific runtime —
+# any harness in `./var/engram/harnesses/` works against this image
+# (they're mounted into every sandbox via virtio-fs). Image
+# manifest at deploy/demo/engram.toml declares no harness secrets;
+# image-level secrets are reserved for workspace-side things
+# (NPM_TOKEN, GITHUB_TOKEN, etc.).
 #
 # After this recipe, kick off:
 #   ENGRAM_DEFAULT_IMAGE=warm-1 just dev-firecracker
 #
-# Then create a session pointing at the baked image and asking for
-# the `claude` harness (declared in deploy/fc-bake-claude/engram.toml):
-#   engram session create \
-#       --image local://claude-demo:warm-1 \
-#       --harness claude \
-#       --prompt "..."
-fc-bake-claude:
-    cargo build -p engram-agentd         --target x86_64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap      --target x86_64-unknown-linux-musl --release
-    mkdir -p ./var/fc-bake-claude
-    cp deploy/fc-bake-claude/Dockerfile  ./var/fc-bake-claude/Dockerfile
-    cp deploy/fc-bake-claude/engram.toml ./var/fc-bake-claude/engram.toml
+# Then create a session — pass `--harness claude` (or `--harness
+# noop`) to attach an agent. Auth credentials for claude come from
+# the env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) or from
+# the dashboard's session-create form.
+fc-bake-demo:
+    cargo build -p engram-agentd    --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap --target x86_64-unknown-linux-musl --release
+    mkdir -p ./var/fc-bake-demo
+    cp deploy/demo/Dockerfile  ./var/fc-bake-demo/Dockerfile
+    cp deploy/demo/engram.toml ./var/fc-bake-demo/engram.toml
     cargo run -p engram-cli -- image build \
-        --repo local://claude-demo \
+        --repo local://demo \
         --tag warm-1 \
-        --source ./var/fc-bake-claude \
+        --source ./var/fc-bake-demo \
         --format ext4 \
         --images-dir ./var/engram/images \
         --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
@@ -272,8 +234,10 @@ vz-test: vz-codesign
 #      cache path is ~/.cache/engram-vz-test/vmlinux-arm64; populate
 #      it via `just vz-pull-kernel` (downloads the Kata Containers
 #      static kernel — same one apple/container uses).
-#   2. `just vz-bake-claude` (or vz-bake-demo) has run, so a
-#      warm-1 image exists for `local://claude-demo`.
+#   2. `just vz-bake-demo` has run, so a warm-1 image exists for
+#      `local://demo` under `./var/engram/images/`.
+#   3. `just install-harnesses` has run so harness binaries are in
+#      `./var/engram/harnesses/` for virtio-fs mounting.
 #
 # The recipe codesigns the coord binary first; without the
 # entitlement VZ refuses to instantiate any VM.
@@ -329,107 +293,33 @@ vz-pull-ubuntu-kernel: vz-pull-kernel
 # `.cargo/config.toml` wires the cross-linker; the e2fsprogs PATH
 # is added inline by these recipes so a bare `just vz-bake-demo`
 # works without the operator munging their shell profile.
+# Bake the canonical workspace image for VZ (Apple Silicon) — arm64
+# sibling of `fc-bake-demo`. Same Dockerfile under deploy/demo/;
+# only the cross-compile target + e2fsprogs PATH differ. Harness
+# binaries are NOT in the image — drop them in
+# `./var/engram/harnesses/` via `just install-harnesses` and pick
+# at session-create time with `--harness <name>`.
 vz-bake-demo:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
-    cargo build -p engram-agentd       --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap    --target aarch64-unknown-linux-musl --release
-    mkdir -p ./var/vz-bake
-    printf 'FROM --platform=linux/arm64 debian:bookworm-slim\n' > ./var/vz-bake/Dockerfile
-    printf 'name = "vz-demo"\n' > ./var/vz-bake/engram.toml
+    cargo build -p engram-agentd    --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-bootstrap --target aarch64-unknown-linux-musl --release
+    mkdir -p ./var/vz-bake-demo
+    cp deploy/demo/Dockerfile  ./var/vz-bake-demo/Dockerfile
+    cp deploy/demo/engram.toml ./var/vz-bake-demo/engram.toml
+    # Force linux/arm64 base for the docker build on macOS so the
+    # rootfs binaries match the kernel arch.
+    sed -i.bak 's|^FROM debian:|FROM --platform=linux/arm64 debian:|' ./var/vz-bake-demo/Dockerfile
+    rm -f ./var/vz-bake-demo/Dockerfile.bak
     PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
     cargo run -p engram-cli -- image build \
         --repo local://demo \
         --tag warm-1 \
-        --source ./var/vz-bake \
+        --source ./var/vz-bake-demo \
         --format ext4 \
         --images-dir ./var/engram/images \
         --transport console \
         --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
         --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
-
-# Bake the Claude image for VZ — arm64 sibling of fc-bake-claude.
-# Reuses the same Dockerfile / engram.toml under deploy/fc-bake-claude/
-# since the VZ build is architecture-neutral apart from the npm
-# install step (which docker buildx handles via --platform).
-vz-bake-claude:
-    rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
-    cargo build -p engram-agentd         --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap      --target aarch64-unknown-linux-musl --release
-    mkdir -p ./var/vz-bake-claude
-    cp deploy/fc-bake-claude/Dockerfile  ./var/vz-bake-claude/Dockerfile
-    cp deploy/fc-bake-claude/engram.toml ./var/vz-bake-claude/engram.toml
-    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
-    cargo run -p engram-cli -- image build \
-        --repo local://claude-demo \
-        --tag warm-1 \
-        --source ./var/vz-bake-claude \
-        --format ext4 \
-        --images-dir ./var/engram/images \
-        --transport console \
-        --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
-
-# Bake an OAuth-authenticated Claude image for VZ. Same Dockerfile as
-# `vz-bake-claude` (Claude Code CLI on node:20-slim, arm64), but the
-# manifest declares `CLAUDE_CODE_OAUTH_TOKEN` instead of
-# `ANTHROPIC_API_KEY` — useful when your org doesn't issue API keys
-# but you have a Claude subscription.
-#
-# Registered under `local://claude-oauth` so it lives alongside the
-# API-key flavor (`local://claude-demo`) without collision. Pair with
-# `dev-vz-claude-oauth`.
-#
-# Mint the OAuth token first with:
-#     claude setup-token
-# then `export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...` (or drop it in
-# `.env` at the repo root — the justfile auto-loads it).
-vz-bake-claude-oauth:
-    rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
-    cargo build -p engram-agentd         --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap      --target aarch64-unknown-linux-musl --release
-    mkdir -p ./var/vz-bake-claude-oauth
-    cp deploy/claude-oauth/Dockerfile  ./var/vz-bake-claude-oauth/Dockerfile
-    cp deploy/claude-oauth/engram.toml ./var/vz-bake-claude-oauth/engram.toml
-    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
-    cargo run -p engram-cli -- image build \
-        --repo local://claude-oauth \
-        --tag warm-1 \
-        --source ./var/vz-bake-claude-oauth \
-        --format ext4 \
-        --images-dir ./var/engram/images \
-        --transport console \
-        --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
-
-# Run the coordinator wired for the OAuth-authenticated Claude image.
-# Same as `dev-vz` but pre-flight-checks `CLAUDE_CODE_OAUTH_TOKEN` so
-# we fail fast at the recipe instead of returning a 500 from the
-# session-create endpoint.
-#
-# Create sessions against `local://claude-oauth` (NOT `local://claude-demo`):
-#
-#     curl -X POST http://localhost:8090/sessions \
-#         -H 'content-type: application/json' \
-#         -d '{"repo":"local://claude-oauth","branch":"main","prompt":"hi"}'
-dev-vz-claude-oauth: db-up vz-codesign install-harnesses
-    @if [ "$(uname -s)" != "Darwin" ]; then \
-        echo "dev-vz-claude-oauth only runs on macOS"; exit 1; \
-    fi
-    @if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then \
-        echo "CLAUDE_CODE_OAUTH_TOKEN is unset. Run \`claude setup-token\` then export it (or put it in .env)." >&2; \
-        exit 1; \
-    fi
-    DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
-    ENGRAM_BIND_ADDR=127.0.0.1:8090 \
-    ENGRAM_MODE=all \
-    ENGRAM_SANDBOX_BACKEND=vz \
-    ENGRAM_SANDBOX_WORK_DIR=./var/sandboxes \
-    ENGRAM_LOCAL_PATH=./var/engram \
-    ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinux-arm64} \
-    ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
-    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
-    RUST_LOG=info,engram=debug \
-    target/debug/engram-coordinator
 
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
@@ -444,14 +334,13 @@ watch:
 smoke-health:
     curl -s http://localhost:8090/healthz | jq
 
-# POST a session and print the session_id. Phase 2 wire shape:
-# explicit `image` + `workspace` + `harness`. The smoke-create variant
-# requires the bootstrap image — `just dev` seeds it for free.
+# POST a session and print the session_id. Requires the demo image
+# from `just vz-bake-demo` (or `fc-bake-demo`).
 smoke-create:
     curl -s -X POST http://localhost:8090/sessions \
         -H 'content-type: application/json' \
         -d '{ \
-              "image": {"kind":"registry","repo":"hello-world","tag":"warm-bootstrap"}, \
+              "image": {"kind":"registry","repo":"local://demo","tag":"warm-1"}, \
               "workspace": {"kind":"empty"}, \
               "harness": {"kind":"none"} \
             }' | jq
@@ -464,7 +353,7 @@ dev-shell:
     curl -s -X POST http://localhost:8090/sessions \
         -H 'content-type: application/json' \
         -d '{ \
-              "image": {"kind":"registry","repo":"hello-world","tag":"warm-bootstrap"}, \
+              "image": {"kind":"registry","repo":"local://demo","tag":"warm-1"}, \
               "workspace": {"kind":"empty"}, \
               "harness": {"kind":"none"} \
             }' | jq -r '.session_id'

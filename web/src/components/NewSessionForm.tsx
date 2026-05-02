@@ -52,12 +52,13 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const [harnessKind, setHarnessKind] = useState<HarnessKind>('none');
   const [harnessName, setHarnessName] = useState<string>('');
 
-  // Reset secrets when image changes — secret schema is per-image.
-  // Harness selection is NOT reset — harnesses live above images now,
-  // deployment-wide via the host's harness registry, so a session's
-  // harness choice survives image swaps.
+  // Reset image-side secrets when image changes — schema is
+  // per-image. Harness selection (and its credentials) is NOT
+  // reset — harnesses live above images now, deployment-wide via
+  // the host's harness registry, so a session's harness choice
+  // survives image swaps.
   useEffect(() => {
-    setSecrets({});
+    setImageSecrets({});
     setError(null);
   }, [selectedKey]);
 
@@ -78,15 +79,35 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const [prompt, setPrompt] = useState('');
 
   // ---- CREDENTIALS ----
-  const [secrets, setSecrets] = useState<Record<string, string>>({});
+  // Image-declared secrets (NPM_TOKEN, GITHUB_TOKEN, etc.) live in
+  // `imageSecrets`. Harness-specific credentials (today: claude's
+  // OAuth token / API key) live in `harnessSecrets`. Both maps get
+  // merged into the request payload.
+  const [imageSecrets, setImageSecrets] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Claude auth UX (hard-coded; see comment in the JSX section).
+  // The dropdown picks which env-var name the value gets sent under.
+  const [claudeAuthMethod, setClaudeAuthMethod] =
+    useState<'oauth' | 'api_key'>('oauth');
+  const [claudeToken, setClaudeToken] = useState('');
+  const claudeTokenName =
+    claudeAuthMethod === 'oauth'
+      ? 'CLAUDE_CODE_OAUTH_TOKEN'
+      : 'ANTHROPIC_API_KEY';
+
   const isBroker = selected?.secret_mode === 'broker';
-  const requiredSecretsMissing =
+  const imageSecretsMissing =
     selected?.required_secrets
       .filter((s) => s.required)
-      .some((s) => !(secrets[s.name] && secrets[s.name].length > 0)) ?? false;
+      .some((s) => !(imageSecrets[s.name] && imageSecrets[s.name].length > 0)) ?? false;
+  // Claude harness needs *some* token to authenticate; if the user
+  // picked it but didn't paste one, can't submit.
+  const claudeTokenMissing =
+    harnessKind === 'builtin' &&
+    harnessName === 'claude' &&
+    claudeToken.trim().length === 0;
 
   const supportsLocalMount = selected?.supports_local_mount ?? false;
 
@@ -103,7 +124,8 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     workspaceValid &&
     !submitting &&
     !isBroker &&
-    !requiredSecretsMissing;
+    !imageSecretsMissing &&
+    !claudeTokenMissing;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -134,15 +156,24 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       const promptValue =
         harness.kind === 'none' ? undefined : prompt.trim() || undefined;
 
+      // Merge image-declared secrets with the harness's secret
+      // (today only the claude token; one of OAuth or API key,
+      // determined by `claudeAuthMethod`). Sent as a single
+      // `secrets` map; the coord injects them into the harness env.
+      const mergedSecrets: Record<string, string> = { ...imageSecrets };
+      if (harnessKind === 'builtin' && harnessName === 'claude') {
+        mergedSecrets[claudeTokenName] = claudeToken;
+      }
       const res = await createSession({
         image: { kind: 'registry', repo: selected.repo, tag: selected.tag },
         workspace,
         harness,
         prompt: promptValue,
-        secrets: Object.keys(secrets).length > 0 ? secrets : undefined,
+        secrets: Object.keys(mergedSecrets).length > 0 ? mergedSecrets : undefined,
       });
       // Wipe sensitive form state immediately on success.
-      setSecrets({});
+      setImageSecrets({});
+      setClaudeToken('');
       setPrompt('');
       qc.invalidateQueries({ queryKey: ['sessions'] });
       onCreated(res.session_id);
@@ -355,27 +386,76 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
               )}
             </div>
 
-            {/* CREDENTIALS */}
+            {/* IMAGE-LEVEL CREDENTIALS — workspace-side secrets the
+                project's runtime needs (NPM_TOKEN, GITHUB_TOKEN, …).
+                Driven by the image manifest's [secrets.X] blocks. */}
             {selected && selected.required_secrets.length > 0 && (
               <div className="pt-2 space-y-3">
                 <p
                   className="font-mono smallcaps text-[0.65rem]"
                   style={{ color: 'var(--color-ink-quiet)' }}
                 >
-                  CREDENTIALS · paste once · never persisted
+                  IMAGE CREDENTIALS · paste once · never persisted
                 </p>
                 {selected.required_secrets.map((s) => (
                   <SecretField
                     key={s.name}
                     name={s.name}
                     required={s.required}
-                    value={secrets[s.name] ?? ''}
+                    value={imageSecrets[s.name] ?? ''}
                     onChange={(v) =>
-                      setSecrets((prev) => ({ ...prev, [s.name]: v }))
+                      setImageSecrets((prev) => ({ ...prev, [s.name]: v }))
                     }
                     disabled={isBroker}
                   />
                 ))}
+              </div>
+            )}
+
+            {/* HARNESS-LEVEL CREDENTIALS — hard-coded UX for the
+                `claude` harness today. Long-term these should come
+                from the harness pack itself, but for v1 we have one
+                special case: claude needs either an OAuth token
+                (long-lived, from `claude setup-token`) or an API
+                key (sk-ant-...). The dropdown picks the env-var
+                name; whichever's chosen lands as a literal env var
+                injected into the harness process. */}
+            {harnessKind === 'builtin' && harnessName === 'claude' && (
+              <div className="pt-2 space-y-3">
+                <p
+                  className="font-mono smallcaps text-[0.65rem]"
+                  style={{ color: 'var(--color-ink-quiet)' }}
+                >
+                  CLAUDE CREDENTIALS · paste once · never persisted
+                </p>
+                <Field label="auth method">
+                  <select
+                    value={claudeAuthMethod}
+                    onChange={(e) => {
+                      setClaudeAuthMethod(
+                        e.target.value as 'oauth' | 'api_key',
+                      );
+                      // Wipe the previous-method's value so we
+                      // don't ship a stale token under the wrong
+                      // env-var name.
+                      setClaudeToken('');
+                    }}
+                    className="ledger-input font-display"
+                  >
+                    <option value="oauth">
+                      OAuth token — `claude setup-token` (sk-ant-oat01-…)
+                    </option>
+                    <option value="api_key">
+                      API key — sk-ant-api03-…
+                    </option>
+                  </select>
+                </Field>
+                <SecretField
+                  name={claudeTokenName}
+                  required={true}
+                  value={claudeToken}
+                  onChange={setClaudeToken}
+                />
               </div>
             )}
 

@@ -1,0 +1,26 @@
+name = "demo"
+description = "Canonical workspace image: debian:bookworm-slim + git + ttyd. Harness-neutral — the same image hosts any harness in `cfg.harnesses_dir`."
+
+# Image-level secret declarations are for things the *workspace* needs
+# (e.g. NPM_TOKEN for `npm install`, GITHUB_TOKEN for `git push`).
+# Harness credentials (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY,
+# etc.) live one layer above — they're per-harness and travel with
+# the harness pack at `cfg.harnesses_dir/<name>/`, not with the
+# image. The web form has a hard-coded UI for the `claude` harness
+# that asks the user for OAuth or API-key auth at session-create
+# time.
+#
+# Add entries like the example below when your project actually
+# needs them; the demo image declares none.
+#
+# [secrets.GITHUB_TOKEN]
+# required = false
+# allow_hosts = ["github.com", "api.github.com"]
+# description = "Personal access token for git push / GitHub API"
+
+# Egress hints. Today these are advisory (broker mode isn't wired);
+# the demo allows the npm registry so a project's `npm install`
+# can run during the agent's workflow if the workspace wants it.
+[network]
+default = "deny"
+allow_hosts = ["registry.npmjs.org", "github.com", "api.github.com"]
