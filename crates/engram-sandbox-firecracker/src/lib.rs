@@ -310,11 +310,11 @@ impl FirecrackerBackend {
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
     }
 
-    /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`
-    /// + read back `OK <peer>\n`, return the resulting stream now
-    /// directly connected to the guest's listener on `port`.
-    /// Shared between exec (port 1024) and start_agent (port 1025
-    /// for bootstrap).
+    /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
+    /// read back `OK <peer>\n`, and return the resulting stream now
+    /// directly connected to the guest's listener on `port`. Shared
+    /// between exec (port 1024) and start_agent (port 1025 for
+    /// bootstrap).
     async fn connect_fc_vsock(
         vsock_uds_path: &Path,
         port: u32,
