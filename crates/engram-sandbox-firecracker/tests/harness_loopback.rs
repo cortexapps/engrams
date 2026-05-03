@@ -198,6 +198,8 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     let sandbox_spec = SandboxSpec {
         image: "engram-harness-loopback-test".into(),
         rootfs_source: Some(outcome.rootfs_path),
+        image_uri: None,
+        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

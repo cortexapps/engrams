@@ -21,6 +21,7 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId};
 use engram_protocol::WarmPoolReport;
 
+use crate::image_cache::ImageCache;
 use crate::pool::{Pool, PoolKey};
 
 /// Wraps an inner [`SandboxBackend`] with warm-pool semantics. `create`
@@ -34,6 +35,12 @@ pub struct PooledBackend {
     /// `(image_version)`. `0` disables pooling: every session gets a
     /// fresh sandbox.
     default_target: u32,
+    /// Phase 5+: if `Some`, `create()` resolves `spec.image_uri`
+    /// through this cache before delegating to `inner`. Setting the
+    /// cached `rootfs.ext4` path on `spec.rootfs_source` lets the
+    /// existing warm-pool logic and inner backend keep working
+    /// unchanged. `None` is the legacy single-host path.
+    image_cache: Option<ImageCache>,
 }
 
 impl PooledBackend {
@@ -42,7 +49,16 @@ impl PooledBackend {
             pool: Pool::new(inner.clone()),
             inner,
             default_target,
+            image_cache: None,
         }
+    }
+
+    /// Attach an image cache. Calling this after `new()` lets
+    /// `create()` resolve `spec.image_uri` to a cached on-disk path
+    /// before forwarding to the inner backend.
+    pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
+        self.image_cache = Some(cache);
+        self
     }
 
     /// Snapshot the pool's `(ready, target)` counts per image_version
@@ -68,7 +84,34 @@ impl SandboxBackend for PooledBackend {
         self.inner.harness_dial()
     }
 
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        // Phase 5+: resolve OCI image_uri / harness_pack_uri to local
+        // cached paths before warm-pool key derivation. Both paths
+        // overwrite the legacy filesystem fields when set, so the
+        // inner backend keeps working with rootfs_source / harness_
+        // substrate unchanged. On cache miss we pull synchronously;
+        // subsequent sessions for the same digest hit the cache and
+        // pay only the FS cost.
+        if let Some(cache) = &self.image_cache {
+            if let Some(uri) = spec.image_uri.clone() {
+                let cached = cache.ensure_image(&uri).await.map_err(|e| {
+                    SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
+                })?;
+                tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
+                spec.rootfs_source = Some(cached.rootfs_path);
+            }
+            if let Some(uri) = spec.harness_pack_uri.clone() {
+                let cached = cache.ensure_harness(&uri).await.map_err(|e| {
+                    SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
+                })?;
+                tracing::debug!(uri = %uri, digest = %cached.digest, "harness cache hit/pulled");
+                // Substrate path: reuse harness_substrate slot; the
+                // host-agent main wires per-session substrate
+                // building when needed (single-pack case for v1).
+                spec.harness_substrate = Some(cached.pack_dir);
+            }
+        }
+
         let key = Self::pool_key(&spec);
 
         // Warm-slot path: a previously-created sandbox is sitting in
@@ -160,6 +203,8 @@ mod tests {
         SandboxSpec {
             image: image.into(),
             rootfs_source: None,
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },

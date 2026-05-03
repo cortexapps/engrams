@@ -1367,6 +1367,8 @@ mod tests {
         SandboxSpec {
             image: "warm-test".into(),
             rootfs_source: None,
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 256 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },

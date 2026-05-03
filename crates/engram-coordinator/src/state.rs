@@ -1004,6 +1004,8 @@ pub(crate) mod tests {
         SandboxSpec {
             image: "auto-checkpoint-test".into(),
             rootfs_source: Some(rootfs.to_path_buf()),
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
@@ -1128,6 +1130,8 @@ pub(crate) mod tests {
         let spec = SandboxSpec {
             image: "local-test".into(),
             rootfs_source: None,
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },

@@ -27,6 +27,8 @@ fn live_spec() -> SandboxSpec {
     SandboxSpec {
         image: "loopback-test".into(),
         rootfs_source: None,
+        image_uri: None,
+        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 64 },
         disk: DiskLimit { max_gib: 1 },

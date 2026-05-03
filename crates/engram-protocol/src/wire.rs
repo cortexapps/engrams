@@ -34,6 +34,12 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 /// these stitch into real distributed traces; today they at least
 /// give `grep` something common across coord + host logs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+// Phase 5+: SandboxSpec gained image_uri / harness_pack_uri fields,
+// nudging RequestKind::Create over the variant-size threshold. Boxing
+// would change the wire shape (bincode size doesn't change but the
+// lib API does). The trade-off doesn't matter for our throughput —
+// Frame is sent over a WS once per RPC, not at exec-stream cadence.
+#[allow(clippy::large_enum_variant)]
 pub enum Frame {
     Request {
         req_id: u64,
@@ -312,6 +318,8 @@ mod tests {
         let spec = SandboxSpec {
             image: "warm-test".into(),
             rootfs_source: None,
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 2 },
             memory: MemoryLimit { max_mib: 1024 },
             disk: DiskLimit { max_gib: 10 },

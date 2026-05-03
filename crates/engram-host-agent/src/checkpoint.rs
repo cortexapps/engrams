@@ -458,6 +458,8 @@ mod tests {
         SandboxSpec {
             image: "checkpoint-test".into(),
             rootfs_source: Some(rootfs.to_path_buf()),
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },

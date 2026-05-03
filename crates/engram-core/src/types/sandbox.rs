@@ -24,6 +24,20 @@ pub struct SandboxSpec {
     /// from base kernel; useful for bootstrap and tests.
     #[serde(default)]
     pub rootfs_source: Option<PathBuf>,
+    /// Phase 5+: OCI registry URI for the bake image (e.g.
+    /// `gcr.io/cortex/api:warm-X`). When set, the host-agent pulls
+    /// it into its content-addressable cache and uses the cached
+    /// rootfs.ext4 as `rootfs_source`. When `None`, the legacy
+    /// `rootfs_source` path applies as-is — preserves single-host
+    /// dev workflows that pre-bake images into `<local_path>/images/`.
+    #[serde(default)]
+    pub image_uri: Option<String>,
+    /// Phase 5+: OCI registry URI for the harness pack chosen for
+    /// this session (`HarnessSpec::Pack { name }`). When set, the
+    /// host-agent pulls it into its harness cache; when `None`, the
+    /// legacy `harness_substrate` path applies.
+    #[serde(default)]
+    pub harness_pack_uri: Option<String>,
     pub cpu: CpuLimit,
     pub memory: MemoryLimit,
     pub disk: DiskLimit,

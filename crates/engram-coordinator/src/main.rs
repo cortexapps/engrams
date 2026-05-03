@@ -304,8 +304,26 @@ async fn main() -> Result<(), CoordinatorError> {
         // deployments run inside their host-agent process). Without
         // this, single-binary dev would lose sub-second session
         // checkout for repeat (repo, image_version) hits.
+        //
+        // Phase 5+: attach an ImageCache so SandboxSpec.image_uri /
+        // harness_pack_uri get resolved through the OCI puller before
+        // the warm-pool key is derived. Cache root lives under
+        // `<local_path>/oci-cache` so it doesn't collide with the
+        // legacy on-disk image registry tree.
+        let oci_cache_root = cli.local_path.join("oci-cache");
+        let oci_client = engram_oci::OciClient::new(Arc::new(engram_oci::AnonymousResolver));
+        // TODO(phase-5b): swap AnonymousResolver for a Postgres-
+        // backed resolver that decrypts registry_credentials rows
+        // via CredCipher. Anonymous works for public registries and
+        // localhost:5000 in dev; private registries land with the
+        // resolver wiring.
+        let image_cache =
+            engram_host_agent::image_cache::ImageCache::open(oci_cache_root, oci_client)
+                .await
+                .map_err(|e| CoordinatorError::Config(format!("oci cache: {e}")))?;
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new(
-            engram_host_agent::pooled_backend::PooledBackend::new(raw_backend, cli.warm_pool_size),
+            engram_host_agent::pooled_backend::PooledBackend::new(raw_backend, cli.warm_pool_size)
+                .with_image_cache(image_cache),
         );
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions

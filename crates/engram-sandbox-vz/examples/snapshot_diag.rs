@@ -110,6 +110,8 @@ async fn run_scenario(
     let spec = SandboxSpec {
         image: "diag".into(),
         rootfs_source: Some(PathBuf::from(rootfs)),
+        image_uri: None,
+        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 512 },
         disk: DiskLimit { max_gib: 10 },

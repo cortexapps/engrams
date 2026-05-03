@@ -316,9 +316,26 @@ pub async fn create_session(
     let spec_env_for_proxy = spec_env.clone();
     let network_for_proxy = network.clone();
 
+    // Phase 5+: when image_versions.blob_url is non-NULL, pass the
+    // OCI URI through to the host-agent so it pulls + caches the
+    // rootfs.ext4 instead of attaching the legacy on-disk path. Both
+    // fields are co-set during rollout: rootfs_source remains the
+    // legacy fallback, image_uri (when present) wins.
+    let blob_url: Option<String> = state
+        .services
+        .meta
+        .latest_ready_image(&image_repo)
+        .await
+        .ok()
+        .flatten()
+        .filter(|iv| iv.tag == image_tag)
+        .and_then(|iv| iv.blob_url);
+
     let vm_spec = VmSpec {
         image: image_tag.clone(),
         rootfs_source: rootfs_source_from(Some(&resolved)),
+        image_uri: blob_url,
+        harness_pack_uri: None,
         cpu: CpuLimit {
             vcpus: manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS),
         },

@@ -175,6 +175,8 @@ fn stub_spec() -> SandboxSpec {
     SandboxSpec {
         image: String::new(),
         rootfs_source: None,
+        image_uri: None,
+        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 0 },
         memory: MemoryLimit { max_mib: 0 },
         disk: DiskLimit { max_gib: 0 },
@@ -214,6 +216,8 @@ mod tests {
         SandboxSpec {
             image: "warm-test".into(),
             rootfs_source: None,
+            image_uri: None,
+            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
