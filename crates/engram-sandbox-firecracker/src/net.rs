@@ -283,9 +283,11 @@ impl ChainPlan {
             (NetPolicy::LogOnly, NetworkDefault::Deny) => {
                 // Surface what *would* have been blocked so
                 // operators can see if the manifest is missing
-                // entries before flipping to enforce.
+                // entries before flipping to enforce. log-prefix has
+                // no whitespace because the runtime applies rules by
+                // splitting on whitespace; `:` keeps it greppable.
                 out.push(format!(
-                    "-A {comment} -j LOG --log-prefix \"{comment} would-drop \" \
+                    "-A {comment} -j LOG --log-prefix {comment}:would-drop: \
                      -m comment --comment {comment}-log",
                 ));
                 out.push(format!(
@@ -710,6 +712,10 @@ mod tests {
         let plan = ChainPlan::new(id(), cidr, NetworkPolicy::default(), NetPolicy::LogOnly);
         let rendered = plan.create_lines().join("\n");
         assert!(rendered.contains("would-drop"));
+        // log-prefix must not contain whitespace — the runtime
+        // splits on space, and a quoted `--log-prefix "x y "` would
+        // be parsed as multiple args by iptables.
+        assert!(!rendered.contains("would-drop "));
         assert!(rendered.contains("-log-accept"));
         // No final DROP under log_only.
         assert!(!rendered.contains("-deny"));
