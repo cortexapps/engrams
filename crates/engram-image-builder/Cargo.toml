@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 engram-core.workspace = true
+engram-oci.workspace = true
 engram-postgres.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

@@ -54,6 +54,34 @@ db-up:
 db-down:
     docker compose -f deploy/docker-compose.yml down
 
+# Bring up the local OCI registry on http://localhost:5000.
+# Anonymous pull/push, plaintext HTTP. Engram's OCI client only
+# allows HTTP for loopback hosts so this is safe-by-construction.
+registry-up:
+    docker compose -f deploy/docker-compose.yml up -d registry
+
+registry-down:
+    docker compose -f deploy/docker-compose.yml stop registry
+
+# Generate a 32-byte master key (KEK) for envelope-encrypted
+# registry credentials and write it into `.env` for direnv/`just`
+# to pick up. Idempotent: if `.env` already has ENGRAM_KEK_MASTER_KEY
+# set, leaves it alone. Run once per dev box.
+bootstrap:
+    @set -e; \
+    touch .env ; \
+    if grep -q '^ENGRAM_KEK_MASTER_KEY=' .env 2>/dev/null; then \
+        echo "ENGRAM_KEK_MASTER_KEY already present in .env — leaving as-is" ; \
+    else \
+        if command -v openssl >/dev/null 2>&1; then \
+            KEY=$(openssl rand -base64 32) ; \
+        else \
+            KEY=$(head -c 32 /dev/urandom | base64) ; \
+        fi ; \
+        printf 'ENGRAM_KEK_MASTER_KEY=%s\n' "$KEY" >> .env ; \
+        echo "wrote ENGRAM_KEK_MASTER_KEY to .env (32 random bytes, base64)" ; \
+    fi
+
 # psql into the dev Postgres.
 psql:
     docker compose -f deploy/docker-compose.yml exec postgres \
@@ -94,7 +122,7 @@ db-reset:
 # `engram image build --inject-agent <agentd-musl-binary> --format ext4`
 # so the in-VM agent is present. Without it `session exec` will
 # hang waiting for vsock to come up.
-dev-firecracker: db-up install-harnesses
+dev-firecracker: db-up registry-up bootstrap install-harnesses
     : "${ENGRAM_KERNEL_IMAGE_PATH:?set ENGRAM_KERNEL_IMAGE_PATH to a vmlinux on this host}"
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
@@ -241,7 +269,7 @@ vz-test: vz-codesign
 #
 # The recipe codesigns the coord binary first; without the
 # entitlement VZ refuses to instantiate any VM.
-dev-vz: db-up vz-codesign install-harnesses
+dev-vz: db-up registry-up bootstrap vz-codesign install-harnesses
     @if [ "$(uname -s)" != "Darwin" ]; then \
         echo "dev-vz only runs on macOS"; exit 1; \
     fi

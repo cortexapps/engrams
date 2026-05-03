@@ -13,6 +13,7 @@ mod health;
 mod hosts;
 mod images;
 mod prompt;
+mod registries;
 mod sessions;
 mod sessions_inspect;
 mod shell;
@@ -50,7 +51,16 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/hosts/:id", get(hosts::get))
         .route("/api/hosts/:id/drain", post(hosts::drain))
         .route("/api/images", get(images::list_images))
-        .route("/api/harnesses", get(harnesses::list_harnesses))
+        .route(
+            "/api/harnesses",
+            get(harnesses::list_harnesses).post(harnesses::add_harness),
+        )
+        .route("/api/harnesses/:name", delete(harnesses::delete_harness))
+        .route(
+            "/api/registries",
+            get(registries::list_registries).post(registries::add_registry),
+        )
+        .route("/api/registries/:host", delete(registries::delete_registry))
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

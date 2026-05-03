@@ -129,6 +129,44 @@ struct Cli {
     /// no egress filtering (test mode).
     #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 0)]
     egress_proxy_port: u16,
+
+    /// KEK provider for envelope-encrypting registry credentials.
+    /// `env-var` (default) reads a 32-byte key from `--kek-env-var`
+    /// (default name `ENGRAM_KEK_MASTER_KEY`, base64-encoded).
+    /// `gcp-kms` defers wrap/unwrap to a GCP KMS key (stub today).
+    #[arg(long, env = "ENGRAM_KEK_PROVIDER", value_parser = parse_kek_choice, default_value = "env-var")]
+    kek_provider: KekChoice,
+
+    /// Env var name to read the base64-encoded master key from when
+    /// `--kek-provider env-var` is in effect.
+    #[arg(
+        long,
+        env = "ENGRAM_KEK_ENV_VAR",
+        default_value = "ENGRAM_KEK_MASTER_KEY"
+    )]
+    kek_env_var: String,
+
+    /// GCP KMS key resource path (e.g.
+    /// `projects/p/locations/global/keyRings/r/cryptoKeys/k`) when
+    /// `--kek-provider gcp-kms` is in effect. Required for that mode.
+    #[arg(long, env = "ENGRAM_KEK_GCP_RESOURCE")]
+    kek_gcp_resource: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KekChoice {
+    EnvVar,
+    GcpKms,
+}
+
+fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
+    match s {
+        "env" | "env-var" | "envvar" => Ok(KekChoice::EnvVar),
+        "gcp-kms" | "gcp" => Ok(KekChoice::GcpKms),
+        other => Err(format!(
+            "unknown KEK provider `{other}` (expected env-var | gcp-kms)"
+        )),
+    }
 }
 
 #[tokio::main]
@@ -345,6 +383,31 @@ async fn main() -> Result<(), CoordinatorError> {
     // deployments swap these out for `engram-secrets-gcp` / vault /
     // etc. via a config flag (next round).
     let secrets: Arc<dyn SecretStore> = Arc::new(EnvSecretStore::new());
+
+    // KEK provider for envelope-encrypted registry credentials.
+    // Hard-fail at startup if env-var mode is selected and the env
+    // var is missing — encrypting registry passwords with a missing
+    // key has worse failure modes than just refusing to start.
+    let kek: Arc<dyn engram_crypto::MasterKeyProvider> = match cli.kek_provider {
+        KekChoice::EnvVar => Arc::new(
+            engram_crypto::EnvVarKeyProvider::from_env(&cli.kek_env_var).map_err(|e| {
+                CoordinatorError::Config(format!("KEK env-var `{}`: {e}", cli.kek_env_var))
+            })?,
+        ),
+        KekChoice::GcpKms => {
+            let resource = cli.kek_gcp_resource.as_deref().ok_or_else(|| {
+                CoordinatorError::Config(
+                    "--kek-provider gcp-kms requires --kek-gcp-resource".into(),
+                )
+            })?;
+            Arc::new(
+                engram_crypto::GcpKmsProvider::new(resource)
+                    .map_err(|e| CoordinatorError::Config(format!("KEK gcp-kms: {e}")))?,
+            )
+        }
+    };
+    tracing::info!(provider = ?cli.kek_provider, key_id = %kek.key_id(), "KEK initialised");
+
     let images = ImageRegistry::new(cli.local_path.join("images"));
     let harnesses = Arc::new(
         engram_coordinator::harness_registry::HarnessRegistry::from_dir(cfg.harnesses_dir.clone())
@@ -407,6 +470,7 @@ async fn main() -> Result<(), CoordinatorError> {
         cloud,
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets,
+        kek,
         images,
         harnesses,
         harness_substrate,

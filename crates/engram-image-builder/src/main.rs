@@ -20,7 +20,9 @@ use std::path::PathBuf;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
+use engram_oci::{AnonymousResolver, OciClient};
 use engram_postgres::PostgresStore;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "engram-image-builder", version, about)]
@@ -74,6 +76,14 @@ struct BuildOpts {
     /// device image for Firecracker.
     #[arg(long, value_parser = parse_format, default_value = "directory")]
     format: Format,
+
+    /// Push the baked image to a Docker registry as an Engram OCI
+    /// artifact (Phase 5+). Accepts either `host/repo` (auto-appends
+    /// the produced tag) or `host/repo:tag`. Requires `--format ext4`.
+    /// When `--database-url` is also set, the resulting URI lands in
+    /// `image_versions.blob_url`.
+    #[arg(long)]
+    push: Option<String>,
 }
 
 fn parse_format(s: &str) -> Result<Format, String> {
@@ -127,9 +137,26 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
     let outcome = builder.build(&req).await?;
     println!("{}", outcome.image_dir.display());
 
+    // Optional: push to a Docker registry. The `--push` binary CLI
+    // only handles anonymous registries (local registry:2 / public
+    // registries). Authenticated push goes via `engram image push`
+    // which talks to the coordinator and uses its credential store.
+    let blob_url = if let Some(target) = opts.push.as_deref() {
+        let oci = OciClient::new(Arc::new(AnonymousResolver));
+        let push = builder
+            .push_to_registry(&oci, &req, &outcome, target)
+            .await?;
+        tracing::info!(uri = %push.uri, digest = %push.manifest_digest.as_str(), "pushed to registry");
+        Some(push.uri)
+    } else {
+        None
+    };
+
     if let Some(url) = opts.database_url.as_deref() {
         let pg = PostgresStore::connect(url).await?;
-        builder.record_in_metadata(&pg, &req, &outcome).await?;
+        builder
+            .record_in_metadata(&pg, &req, &outcome, blob_url)
+            .await?;
         tracing::info!(repo = %req.repo, tag = %tag, "image_versions row marked Ready");
     } else {
         tracing::info!(

@@ -904,6 +904,46 @@ pub(crate) mod tests {
                 .cloned()
                 .collect())
         }
+        async fn upsert_registry_credential(
+            &self,
+            _: engram_core::types::RegistryCredential,
+        ) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn list_registry_credentials(
+            &self,
+        ) -> Result<Vec<engram_core::types::RegistryCredential>, MetaError> {
+            Ok(Vec::new())
+        }
+        async fn registry_credential_for_host(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::RegistryCredential>, MetaError> {
+            Ok(None)
+        }
+        async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn upsert_harness_pack(
+            &self,
+            _: engram_core::types::HarnessPack,
+        ) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn list_harness_packs(
+            &self,
+        ) -> Result<Vec<engram_core::types::HarnessPack>, MetaError> {
+            Ok(Vec::new())
+        }
+        async fn get_harness_pack(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::HarnessPack>, MetaError> {
+            Ok(None)
+        }
+        async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
+            Ok(())
+        }
     }
 
     fn run_git(args: &[&str], cwd: &Path) {

@@ -126,6 +126,9 @@ async fn build_app_state(
         cloud: Arc::new(MockCloud::new()),
         sandbox: pooled,
         secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
+        kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+            [0u8; 32], "test:v1",
+        )),
         images: ImageRegistry::new(images_dir),
         harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         harness_substrate: None,

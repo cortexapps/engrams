@@ -277,6 +277,44 @@ impl MetadataStore for MockMetadataStore {
             .take(limit.max(0) as usize)
             .collect())
     }
+    async fn upsert_registry_credential(
+        &self,
+        _: engram_core::types::RegistryCredential,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn list_registry_credentials(
+        &self,
+    ) -> Result<Vec<engram_core::types::RegistryCredential>, MetaError> {
+        Ok(Vec::new())
+    }
+    async fn registry_credential_for_host(
+        &self,
+        _: &str,
+    ) -> Result<Option<engram_core::types::RegistryCredential>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn upsert_harness_pack(
+        &self,
+        _: engram_core::types::HarnessPack,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn list_harness_packs(&self) -> Result<Vec<engram_core::types::HarnessPack>, MetaError> {
+        Ok(Vec::new())
+    }
+    async fn get_harness_pack(
+        &self,
+        _: &str,
+    ) -> Result<Option<engram_core::types::HarnessPack>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -298,6 +336,9 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
         cloud: Arc::new(MockCloud::new()),
         sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
         secrets: Arc::new(InMemorySecretStore::new()),
+        kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+            [0u8; 32], "test:v1",
+        )),
         images: ImageRegistry::new(images_dir),
         harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         harness_substrate: None,
@@ -348,6 +389,9 @@ impl TestFixture {
             cloud: Arc::new(MockCloud::new()),
             sandbox: backend,
             secrets: Arc::new(secrets),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
             images: ImageRegistry::new(images_dir.clone()),
             harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
             harness_substrate: None,
@@ -1944,6 +1988,9 @@ async fn create_session_failure_marks_session_failed() {
         cloud: Arc::new(MockCloud::new()),
         sandbox: Arc::new(AlwaysFailSandbox),
         secrets: Arc::new(InMemorySecretStore::new()),
+        kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+            [0u8; 32], "test:v1",
+        )),
         images: ImageRegistry::new(images_dir),
         harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         harness_substrate: None,

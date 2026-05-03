@@ -516,24 +516,106 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
 
     /// Record (or refresh) a `image_versions` row marking the bake as
     /// `Ready`. Callers that don't want a Postgres write skip this.
+    /// `blob_url` is the OCI URI when the bake was pushed to a
+    /// registry (Phase 5+); `None` keeps the legacy on-disk path.
     pub async fn record_in_metadata(
         &self,
         meta: &dyn MetadataStore,
         req: &BuildRequest,
         outcome: &BuildOutcome,
+        blob_url: Option<String>,
     ) -> Result<(), BuildError> {
-        let _ = outcome; // size_bytes / blob_url will be persisted later
+        let _ = outcome; // size_bytes is informational; the row is keyed on (repo, tag).
         meta.upsert_image_version(ImageVersion {
             id: ImageVersionId::new(),
             repo: req.repo.clone(),
             tag: req.tag.clone(),
-            blob_url: None,
+            blob_url,
             status: ImageStatus::Ready,
             created_at: Utc::now(),
         })
         .await
         .map_err(BuildError::Persist)
     }
+
+    /// Push a freshly-baked image (output of [`Self::build`]) to a
+    /// Docker registry as an Engram OCI artifact. Two layers:
+    /// `manifest.toml` and `rootfs.ext4`. Returns the registry URI
+    /// (suitable for storing in `image_versions.blob_url`) and the
+    /// manifest's content digest.
+    ///
+    /// `registry_uri` may be either `host/repo:tag` (use this exact
+    /// reference) or `host/repo` (auto-append `:<req.tag>`). The
+    /// shorter form keeps the `engram image build --push <host/repo>`
+    /// flow tidy.
+    pub async fn push_to_registry(
+        &self,
+        oci: &engram_oci::OciClient,
+        req: &BuildRequest,
+        outcome: &BuildOutcome,
+        registry_uri: &str,
+    ) -> Result<RegistryPush, BuildError> {
+        // Only Ext4 outputs are pushable today — the Directory format
+        // is fundamentally a per-host materialization (file ownership,
+        // overlayfs whiteouts) that doesn't survive a tar+pull. The
+        // rootfs.ext4 file *is* the artifact bytes.
+        if !matches!(req.format, Format::Ext4) {
+            return Err(BuildError::Config(
+                "registry push currently requires --format ext4 (Directory bakes are local-only)"
+                    .into(),
+            ));
+        }
+
+        let full_uri = if registry_uri.contains(':') && !registry_uri.ends_with('/') {
+            // Already has a tag (covers `host:port/repo:tag` and `host/repo:tag`).
+            // Heuristic: a `:` after the last `/` is a tag separator. Otherwise
+            // it's just a port on the host portion.
+            let last_slash = registry_uri.rfind('/').unwrap_or(0);
+            if registry_uri[last_slash..].contains(':') {
+                registry_uri.to_string()
+            } else {
+                format!("{registry_uri}:{}", req.tag)
+            }
+        } else {
+            format!("{registry_uri}:{}", req.tag)
+        };
+
+        let manifest_bytes = tokio::fs::read(&outcome.manifest_path)
+            .await
+            .map_err(BuildError::Io)?;
+        // Tiny config blob for introspection — registries display this
+        // and it makes Engram artifacts easy to recognize in a UI.
+        let config = serde_json::json!({
+            "kind": "engram-image-v1",
+            "format": match req.format { Format::Ext4 => "ext4", Format::Directory => "directory" },
+            "repo":   req.repo,
+            "tag":    req.tag,
+        });
+        let config_bytes = serde_json::to_vec(&config)
+            .map_err(|e| BuildError::Config(format!("config json: {e}")))?;
+
+        let digest = oci
+            .push_image(
+                &full_uri,
+                &manifest_bytes,
+                &outcome.rootfs_path,
+                &config_bytes,
+            )
+            .await
+            .map_err(|e| BuildError::Docker(format!("oci push: {e}")))?;
+
+        Ok(RegistryPush {
+            uri: full_uri,
+            manifest_digest: digest,
+        })
+    }
+}
+
+/// Result of a successful push to an OCI registry.
+#[derive(Clone, Debug)]
+pub struct RegistryPush {
+    pub uri: String,
+    pub manifest_digest: engram_oci::Digest256,
 }
 
 /// Render the manifest as TOML. Strips the `[build]` section since

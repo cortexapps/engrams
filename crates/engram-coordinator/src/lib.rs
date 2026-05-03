@@ -37,6 +37,10 @@ pub struct Services {
     pub cloud: Arc<dyn CloudBackend>,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub secrets: Arc<dyn SecretStore>,
+    /// Master key provider used to wrap/unwrap registry-credential
+    /// DEKs. Initialised from `--kek-provider`. Phase 5+; envelope-
+    /// encrypted creds live in the `registry_credentials` table.
+    pub kek: Arc<dyn engram_crypto::MasterKeyProvider>,
     pub images: image_registry::ImageRegistry,
     /// Host-side harness registry — the closed set of
     /// `HarnessSpec::Builtin{name}` values a session may request.

@@ -50,6 +50,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImageCmd,
     },
+    /// Manage Docker registry credentials (Phase 5+). Credentials
+    /// are envelope-encrypted in Postgres; the password never leaves
+    /// the coordinator in plaintext after the initial POST.
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
+    },
+    /// Manage harness packs registered with the coordinator. Pack
+    /// bytes live in a Docker registry; this surface manages the
+    /// `(name, registry_uri)` index that sessions select by.
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -169,6 +183,64 @@ enum HostCmd {
     /// Flip a host to `draining`. New sessions won't be assigned to
     /// it; in-flight sessions stay (evacuation lands in 3d).
     Drain { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum RegistryCmd {
+    /// Add (or update) a Docker registry credential. The password is
+    /// read from a file (preferred — avoids leaking into shell
+    /// history) or stdin.
+    Add {
+        /// Registry host. Examples: `gcr.io`, `ghcr.io`,
+        /// `123456.dkr.ecr.us-east-1.amazonaws.com`, `localhost:5000`.
+        #[arg(long)]
+        host: String,
+        /// Registry username. For GCP service-account JSON, use
+        /// `_json_key`. For DockerHub PATs, your DockerHub username.
+        #[arg(long)]
+        username: String,
+        /// Path to a file containing the password / PAT / service-
+        /// account JSON. The file's exact contents (minus a single
+        /// trailing newline) are stored as the password.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password_file: Option<PathBuf>,
+        /// Read the password from stdin until EOF. Useful for
+        /// piping (`echo -n $PAT | engram registry add ... --password-stdin`).
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// List registered registry credentials. Never returns passwords.
+    List,
+    /// Remove the credential for a registry host.
+    Rm {
+        /// Registry host to remove (matches `--host` from `add`).
+        host: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HarnessCmd {
+    /// Register a harness pack by name and registry URI. The pack
+    /// bytes must already be pushed to the registry (`engram harness
+    /// push` lands later; for now use `oras push` or the bake
+    /// pipeline). Re-registering the same name updates the URI.
+    Add {
+        /// Logical harness name sessions select by (e.g. `claude`,
+        /// `noop`). Must be unique.
+        #[arg(long)]
+        name: String,
+        /// Full OCI URI, e.g. `gcr.io/cortex/harness-claude:v1.2`.
+        #[arg(long)]
+        registry_uri: String,
+        /// Optional one-line description for the dashboard dropdown.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List registered harness packs. Falls through to the legacy
+    /// host-side scan when no rows exist.
+    List,
+    /// Remove a harness-pack registration.
+    Rm { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -387,6 +459,46 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             HostCmd::List => host_list(&client, &cli.endpoint, cli.json).await,
             HostCmd::Get { id } => host_get(&client, &cli.endpoint, id, cli.json).await,
             HostCmd::Drain { id } => host_drain(&client, &cli.endpoint, id).await,
+        },
+        Cmd::Registry { cmd } => match cmd {
+            RegistryCmd::Add {
+                host,
+                username,
+                password_file,
+                password_stdin,
+            } => {
+                registry_add(
+                    &client,
+                    &cli.endpoint,
+                    host,
+                    username,
+                    password_file.as_deref(),
+                    *password_stdin,
+                    cli.json,
+                )
+                .await
+            }
+            RegistryCmd::List => registry_list(&client, &cli.endpoint, cli.json).await,
+            RegistryCmd::Rm { host } => registry_rm(&client, &cli.endpoint, host).await,
+        },
+        Cmd::Harness { cmd } => match cmd {
+            HarnessCmd::Add {
+                name,
+                registry_uri,
+                description,
+            } => {
+                harness_add(
+                    &client,
+                    &cli.endpoint,
+                    name,
+                    registry_uri,
+                    description.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
+            HarnessCmd::List => harness_list(&client, &cli.endpoint, cli.json).await,
+            HarnessCmd::Rm { name } => harness_rm(&client, &cli.endpoint, name).await,
         },
     }
 }
@@ -1099,6 +1211,221 @@ async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value, CliError
         return Err(CliError::Http(status.as_u16(), body));
     }
     serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))
+}
+
+// ---- registry subcommands ---------------------------------------------
+
+async fn registry_add(
+    client: &reqwest::Client,
+    endpoint: &str,
+    host: &str,
+    username: &str,
+    password_file: Option<&std::path::Path>,
+    password_stdin: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let password = match (password_file, password_stdin) {
+        (Some(path), false) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| CliError::Other(format!("read {}: {e}", path.display())))?;
+            // Strip a single trailing newline if present (common for
+            // `echo "$pat" > file` flows). Other whitespace is left
+            // intact — service-account JSON has internal newlines.
+            raw.strip_suffix('\n').unwrap_or(&raw).to_string()
+        }
+        (None, true) => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| CliError::Other(format!("stdin: {e}")))?;
+            buf.strip_suffix('\n').unwrap_or(&buf).to_string()
+        }
+        (None, false) => {
+            return Err(CliError::Other(
+                "must supply --password-file <path> or --password-stdin".into(),
+            ));
+        }
+        (Some(_), true) => unreachable!("clap conflicts_with"),
+    };
+    if password.is_empty() {
+        return Err(CliError::Other("password is empty".into()));
+    }
+
+    let body = serde_json::json!({
+        "host": host,
+        "username": username,
+        "password": password,
+    });
+    let resp = client
+        .post(format!("{endpoint}/api/registries"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    let resp_body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), resp_body));
+    }
+    if json {
+        println!("{resp_body}");
+    } else {
+        let v: Value = serde_json::from_str(&resp_body)
+            .map_err(|e| CliError::Other(format!("invalid JSON from server: {e}")))?;
+        println!(
+            "added: host={} username={} key_id={}",
+            v["host"].as_str().unwrap_or(""),
+            v["username"].as_str().unwrap_or(""),
+            v["key_id"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn registry_list(
+    client: &reqwest::Client,
+    endpoint: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let body = get_json(client, &format!("{endpoint}/api/registries")).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let empty = Vec::new();
+    let regs = body["registries"].as_array().unwrap_or(&empty);
+    if regs.is_empty() {
+        println!("(no registries configured)");
+        return Ok(());
+    }
+    println!("{:<40}  {:<24}  KEY_ID", "HOST", "USERNAME");
+    for r in regs {
+        println!(
+            "{:<40}  {:<24}  {}",
+            r["registry_host"].as_str().unwrap_or(""),
+            r["username"].as_str().unwrap_or(""),
+            r["key_id"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Result<(), CliError> {
+    // URL-encode the host so `:` in `localhost:5000` survives the path.
+    let encoded = urlencode(host);
+    let resp = client
+        .delete(format!("{endpoint}/api/registries/{encoded}"))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    println!("removed");
+    Ok(())
+}
+
+// ---- harness subcommands ----------------------------------------------
+
+async fn harness_add(
+    client: &reqwest::Client,
+    endpoint: &str,
+    name: &str,
+    registry_uri: &str,
+    description: Option<&str>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut body = serde_json::json!({
+        "name": name,
+        "registry_uri": registry_uri,
+    });
+    if let Some(d) = description {
+        body["description"] = serde_json::Value::String(d.into());
+    }
+    let resp = client
+        .post(format!("{endpoint}/api/harnesses"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    let resp_body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), resp_body));
+    }
+    if json {
+        println!("{resp_body}");
+    } else {
+        let v: Value = serde_json::from_str(&resp_body)
+            .map_err(|e| CliError::Other(format!("invalid JSON from server: {e}")))?;
+        println!(
+            "added: name={} registry_uri={}",
+            v["name"].as_str().unwrap_or(""),
+            v["registry_uri"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn harness_list(
+    client: &reqwest::Client,
+    endpoint: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let body = get_json(client, &format!("{endpoint}/api/harnesses")).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let empty = Vec::new();
+    let harnesses = body.as_array().unwrap_or(&empty);
+    if harnesses.is_empty() {
+        println!("(no harnesses registered)");
+        return Ok(());
+    }
+    println!("{:<24}  {:<60}  DESCRIPTION", "NAME", "REGISTRY_URI");
+    for h in harnesses {
+        let uri = h["registry_uri"].as_str().unwrap_or("(host-resident)");
+        println!(
+            "{:<24}  {:<60}  {}",
+            h["name"].as_str().unwrap_or(""),
+            uri,
+            h["description"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn harness_rm(client: &reqwest::Client, endpoint: &str, name: &str) -> Result<(), CliError> {
+    let resp = client
+        .delete(format!("{endpoint}/api/harnesses/{}", urlencode(name)))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    println!("removed");
+    Ok(())
+}
+
+/// Minimal percent-encoder for the path components that registry/host
+/// names contain (`:`, `/`). Avoids pulling in the `url` crate just
+/// for this — these are always single-segment paths.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 fn truncate(s: &str, max: usize) -> String {

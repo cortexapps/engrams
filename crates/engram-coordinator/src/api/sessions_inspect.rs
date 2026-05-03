@@ -493,6 +493,9 @@ mod tests {
             cloud: Arc::new(MockCloud::new()),
             sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
             secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
             images: ImageRegistry::new(local.path().join("images")),
             harnesses: Arc::new(crate::harness_registry::HarnessRegistry::empty()),
             harness_substrate: None,

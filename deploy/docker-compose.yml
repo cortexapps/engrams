@@ -19,6 +19,20 @@ services:
       timeout: 5s
       retries: 10
 
+  # Local OCI registry for dev. Anonymous pull/push over plaintext HTTP.
+  # Engram's OCI client allows HTTP only when the registry host is a
+  # loopback address, so this is safe-by-construction for dev only.
+  # `engram image build --push localhost:5000/cortex/api` lands here;
+  # `engram session create --image localhost:5000/cortex/api:warm-X`
+  # pulls from here on the host-agent side.
+  registry:
+    image: registry:2
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - engram-registry-data:/var/lib/registry
+
   coordinator:
     build:
       context: ..
@@ -36,6 +50,12 @@ services:
       ENGRAM_CLOUD_BACKEND: static
       ENGRAM_STORAGE_BACKEND: local
       ENGRAM_STORAGE_LOCAL_PATH: /var/engram/snapshots
+      # KEK for envelope-encrypted registry credentials. The host's
+      # `.env` (loaded by `just bootstrap`) provides the value; we
+      # forward it into the container. Hard-fails at startup if
+      # missing — encrypting against a missing key has worse failure
+      # modes than refusing to start.
+      ENGRAM_KEK_MASTER_KEY: ${ENGRAM_KEK_MASTER_KEY:?run `just bootstrap` first to generate a KEK}
       RUST_LOG: info,engram=debug
     ports:
       - "8090:8090"
@@ -45,3 +65,4 @@ services:
 volumes:
   engram-pg-data:
   engram-snap-data:
+  engram-registry-data:
