@@ -967,6 +967,7 @@ dependencies = [
  "engram-core",
  "engram-harness-noop",
  "engram-harness-proto",
+ "engram-image-builder",
  "engram-oci",
  "engram-protocol",
  "engram-sandbox-firecracker",

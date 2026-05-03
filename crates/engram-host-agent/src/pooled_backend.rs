@@ -75,6 +75,25 @@ impl PooledBackend {
     }
 }
 
+/// Pick a stable name for the harness substrate's mount-root
+/// subdirectory. Tries: (1) the env-injected
+/// `ENGRAM_SESSION_HARNESS_NAME` hint set by `resolve_harness` —
+/// the canonical name sessions select by; (2) the last path segment
+/// of the registry URI (drops `:tag`) — robust fallback for paths
+/// the coordinator hasn't annotated. The returned string lands in
+/// `/run/engram/harnesses/<name>/harness` inside the VM, so it must
+/// match what bootstrap exec's against — the env hint guarantees
+/// alignment, the URI fallback is best-effort.
+fn harness_name_for_substrate(spec: &SandboxSpec, uri: &str) -> String {
+    if let Some(name) = spec.env.get("ENGRAM_SESSION_HARNESS_NAME") {
+        return name.clone();
+    }
+    // last segment of `host/path/repo:tag` minus the `:tag`.
+    let last = uri.rsplit('/').next().unwrap_or(uri);
+    let no_tag = last.split(':').next().unwrap_or(last);
+    no_tag.to_string()
+}
+
 #[async_trait]
 impl SandboxBackend for PooledBackend {
     // Capability methods proxy to the wrapped backend — the pool is
@@ -101,14 +120,27 @@ impl SandboxBackend for PooledBackend {
                 spec.rootfs_source = Some(cached.rootfs_path);
             }
             if let Some(uri) = spec.harness_pack_uri.clone() {
-                let cached = cache.ensure_harness(&uri).await.map_err(|e| {
+                // Backends that attach the substrate as a virtio-blk
+                // device (FC, VZ block-device mode) need a real ext4
+                // file at `harness_substrate`. ProcessBackend is
+                // fine with a directory but accepts an ext4 path
+                // too. We resolve the harness name from the spec's
+                // existing `engram_session_harness_name` env hint
+                // when present, falling back to the URI's last path
+                // segment. This keeps the in-VM `/run/engram/
+                // harnesses/<name>/harness` invariant intact.
+                let name = harness_name_for_substrate(&spec, &uri);
+                let cached = cache.ensure_harness_ext4(&uri, &name).await.map_err(|e| {
                     SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
                 })?;
-                tracing::debug!(uri = %uri, digest = %cached.digest, "harness cache hit/pulled");
-                // Substrate path: reuse harness_substrate slot; the
-                // host-agent main wires per-session substrate
-                // building when needed (single-pack case for v1).
-                spec.harness_substrate = Some(cached.pack_dir);
+                tracing::debug!(
+                    uri = %uri,
+                    name = %name,
+                    digest = %cached.digest,
+                    ext4 = %cached.ext4_path.display(),
+                    "harness substrate built"
+                );
+                spec.harness_substrate = Some(cached.ext4_path);
             }
         }
 

@@ -198,6 +198,88 @@ impl ImageCache {
         })
     }
 
+    /// Ensure the harness pack at `uri` is materialised **and**
+    /// packed into a read-only ext4 file shaped for the in-VM mount
+    /// at `/run/engram/harnesses`. Backends that attach the substrate
+    /// as a virtio-blk device (FC; VZ when configured for block-
+    /// device harness mounts) need this; ProcessBackend (dev) is
+    /// happy with the directory.
+    ///
+    /// The substrate is laid out so the bootstrap's
+    /// `/run/engram/harnesses/<name>/harness` path resolves
+    /// correctly: the ext4 root contains a single `<name>/`
+    /// directory whose contents are the pack bytes.
+    ///
+    /// Cached at `harness/sha256/<digest>/<name>.ext4` next to the
+    /// extracted pack — same digest dir, so GC sweeps both atomically.
+    pub async fn ensure_harness_ext4(
+        &self,
+        uri: &str,
+        name: &str,
+    ) -> Result<CachedHarnessExt4, CacheError> {
+        // Reuse the existing pull path. We need the pack contents
+        // on disk before mke2fs can populate from them.
+        let cached = self.ensure_harness(uri).await?;
+        let ext4_path = self
+            .inner
+            .root
+            .join("harness/sha256")
+            .join(strip_sha256_prefix(&cached.digest))
+            .join(format!("{name}.ext4"));
+
+        // Cache hit: ext4 already built. Touch + return.
+        if fs::try_exists(&ext4_path).await.unwrap_or(false) {
+            return Ok(CachedHarnessExt4 {
+                ext4_path,
+                pack_dir: cached.pack_dir,
+                digest: cached.digest,
+            });
+        }
+
+        // Build the staging tree: a tempdir containing a single
+        // `<name>/` symlink pointing at the extracted pack. mke2fs
+        // -d follows symlinks while populating, so this is a copy-
+        // free way to get the right layout inside the resulting
+        // filesystem.
+        let staging = tempfile::tempdir().map_err(CacheError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            unix_fs::symlink(&cached.pack_dir, staging.path().join(name))
+                .map_err(CacheError::Io)?;
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-unix fallback: copy the pack tree under <staging>/<name>/.
+            // We don't actually run on non-unix (FC is Linux-only,
+            // VZ is macOS), but keeping the match exhaustive
+            // prevents accidental drift if we ever do.
+            let dst = staging.path().join(name);
+            fs::create_dir_all(&dst).await.map_err(CacheError::Io)?;
+            copy_dir_recursive(&cached.pack_dir, &dst).await?;
+        }
+
+        // Size the ext4: pack size doubled, +128 MiB minimum, 4 KiB-
+        // aligned. Reusing image-builder's helper keeps the sizing
+        // policy in one place.
+        let pack_bytes = dir_size(&cached.pack_dir).await.unwrap_or(0);
+        let size = engram_image_builder::ext4::recommended_size(pack_bytes);
+
+        // mke2fs -t ext4 -F -d staging dst size.
+        use engram_image_builder::ext4::{Ext4Packer, Mke2fsPacker};
+        let packer = Mke2fsPacker::default();
+        packer
+            .pack(staging.path(), &ext4_path, size)
+            .await
+            .map_err(|e| CacheError::Substrate(format!("mke2fs: {e}")))?;
+
+        Ok(CachedHarnessExt4 {
+            ext4_path,
+            pack_dir: cached.pack_dir,
+            digest: cached.digest,
+        })
+    }
+
     /// Sweep the cache and remove oldest entries until the total
     /// on-disk size of `images/sha256` + `harness/sha256` is below
     /// `budget_bytes`. Returns the number of bytes freed.
@@ -331,10 +413,23 @@ pub struct CachedHarness {
     pub digest: String,
 }
 
+/// A harness pack materialised both as a directory tree (for dev
+/// backends) and as an ext4 file (for FC / VZ block-device mounts).
+/// The ext4 contains a single `<name>/` subdirectory at its root
+/// whose contents are the pack bytes.
+#[derive(Clone, Debug)]
+pub struct CachedHarnessExt4 {
+    pub ext4_path: PathBuf,
+    pub pack_dir: PathBuf,
+    pub digest: String,
+}
+
 #[derive(Debug)]
 pub enum CacheError {
     Io(std::io::Error),
     Oci(OciError),
+    /// Building the harness substrate ext4 (mke2fs / staging) failed.
+    Substrate(String),
 }
 
 impl std::fmt::Display for CacheError {
@@ -342,6 +437,7 @@ impl std::fmt::Display for CacheError {
         match self {
             Self::Io(e) => write!(f, "image cache io: {e}"),
             Self::Oci(e) => write!(f, "image cache oci: {e}"),
+            Self::Substrate(s) => write!(f, "harness substrate build: {s}"),
         }
     }
 }
@@ -351,6 +447,7 @@ impl std::error::Error for CacheError {
         match self {
             Self::Io(e) => Some(e),
             Self::Oci(e) => Some(e),
+            Self::Substrate(_) => None,
         }
     }
 }
@@ -494,5 +591,50 @@ mod tests {
     fn strip_sha256_prefix_handles_both_forms() {
         assert_eq!(strip_sha256_prefix("sha256:abcd"), "abcd");
         assert_eq!(strip_sha256_prefix("abcd"), "abcd");
+    }
+
+    /// `ensure_harness_ext4` should be a cache hit on the second
+    /// call against the same (uri, name). We simulate this without
+    /// running mke2fs (which requires e2fsprogs in PATH) by
+    /// pre-planting the digest dir + a sentinel ext4 file: the
+    /// function's first action is to ensure the harness is pulled
+    /// (unreachable here — no real OCI server) so we instead test
+    /// the cache-hit short-circuit path by populating the URI map
+    /// + the on-disk artifacts in advance.
+    #[tokio::test]
+    async fn ensure_harness_ext4_returns_cache_hit_when_artifact_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ImageCache::open(tmp.path().to_path_buf(), empty_oci())
+            .await
+            .unwrap();
+
+        let digest = "sha256:fakehash1234";
+        let pack_dir = tmp.path().join("harness/sha256/fakehash1234");
+        fs::create_dir_all(&pack_dir).await.unwrap();
+        fs::write(pack_dir.join("harness"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
+        // Pre-plant the ext4 file with a sentinel — the cache-hit
+        // branch returns without invoking mke2fs.
+        let ext4_path = pack_dir.join("claude.ext4");
+        fs::write(&ext4_path, b"sentinel").await.unwrap();
+        // Pre-populate the URI map so `ensure_harness` short-circuits
+        // its own cache hit (avoids the OCI pull).
+        cache
+            .inner
+            .harness_map
+            .lock()
+            .entries
+            .insert("registry.example/claude:v1".into(), digest.into());
+
+        let cached = cache
+            .ensure_harness_ext4("registry.example/claude:v1", "claude")
+            .await
+            .unwrap();
+        assert_eq!(cached.ext4_path, ext4_path);
+        assert_eq!(cached.digest, digest);
+        // The sentinel survives the call (we didn't re-mke2fs).
+        let bytes = fs::read(&cached.ext4_path).await.unwrap();
+        assert_eq!(bytes, b"sentinel");
     }
 }
