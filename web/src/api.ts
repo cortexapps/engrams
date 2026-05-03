@@ -1,10 +1,15 @@
 import type {
+  AddHarnessPackRequest,
+  AddRegistryRequest,
+  AddRegistryResponse,
   CreateSessionResponse,
   HarnessDescriptor,
+  HarnessPackSummary,
   HarnessSpec,
   ImageDescriptor,
   ImageRef,
   ListHostsResponse,
+  ListRegistriesResponse,
   ListSessionsResponse,
   Session,
   WorkspaceSpec,
@@ -43,10 +48,21 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
     }
     throw new Error(detail || `${path} → ${res.status} ${res.statusText}`);
   }
-  // Some endpoints (DELETE-style) return 204. We don't hit those here,
-  // but be safe anyway.
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
+}
+
+async function deleteEmpty(path: string): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = await res.text();
+    } catch {
+      // ignore
+    }
+    throw new Error(detail || `${path} → ${res.status} ${res.statusText}`);
+  }
 }
 
 export const fetchSessions = () =>
@@ -82,3 +98,30 @@ export const sendPrompt = (sessionId: string, text: string) =>
     `/sessions/${sessionId}/prompt`,
     { text },
   );
+
+// ---- Settings · Registries ---------------------------------------------
+
+export const fetchRegistries = () =>
+  getJSON<ListRegistriesResponse>('/api/registries').then((r) => r.registries);
+
+export const addRegistry = (req: AddRegistryRequest) =>
+  postJSON<AddRegistryResponse>('/api/registries', req);
+
+export const deleteRegistry = (host: string) =>
+  deleteEmpty(`/api/registries/${encodeURIComponent(host)}`);
+
+// ---- Settings · Harness packs ------------------------------------------
+//
+// `fetchHarnessPacks` and `fetchHarnesses` hit the same URL today —
+// the response shape is the same, the difference is the *intent*: the
+// session-create form picks names ("show me everything I can attach"),
+// the settings panel CRUDs registry rows ("show me what I've registered").
+// They diverge if we ever split read endpoints.
+export const fetchHarnessPacks = () =>
+  getJSON<HarnessPackSummary[]>('/api/harnesses');
+
+export const addHarnessPack = (req: AddHarnessPackRequest) =>
+  postJSON<HarnessPackSummary>('/api/harnesses', req);
+
+export const deleteHarnessPack = (name: string) =>
+  deleteEmpty(`/api/harnesses/${encodeURIComponent(name)}`);

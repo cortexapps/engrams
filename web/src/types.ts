@@ -196,3 +196,66 @@ export interface IndexedEvent {
   idx: number;
   event: SessionEvent;
 }
+
+// ---- Settings · Registries ---------------------------------------------
+//
+// Polymorphic on `auth_kind`. `Static` carries a username (the
+// password is sealed coordinator-side; ciphertext never leaves the
+// server). `GcpWorkloadIdentity` stores no secret material — runtime
+// IAM identity is the credential. Future siblings (AwsInstanceRole,
+// GcpImpersonateSa, ...) slot in here as new variants without
+// reshaping anything.
+export type RegistryAuthKind = 'static' | 'gcp_workload_identity';
+
+/** Variant-discriminated request body for `POST /api/registries`. The
+ * server `serde(tag = "kind")` decoder matches on these. */
+export type AddRegistryAuth =
+  | { kind: 'static'; username: string; password: string }
+  | { kind: 'gcp_workload_identity'; impersonate_sa?: string | null };
+
+export interface AddRegistryRequest {
+  host: string;
+  auth: AddRegistryAuth;
+}
+
+export interface AddRegistryResponse {
+  id: string;
+  host: string;
+  auth_kind: RegistryAuthKind;
+  /** For `static`: the username. For `gcp_workload_identity`: the
+   * impersonated SA email if any, else null. Always non-secret. */
+  auth_principal: string | null;
+}
+
+/** Wire shape of `GET /api/registries` rows. Never carries secret
+ * material — the coordinator's `RegistryCredentialSummary` redacts
+ * the cipher payload before it reaches the wire. */
+export interface RegistryCredentialSummary {
+  id: string;
+  registry_host: string;
+  auth_kind: RegistryAuthKind;
+  auth_principal: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface ListRegistriesResponse {
+  registries: RegistryCredentialSummary[];
+}
+
+// ---- Settings · Harness packs ------------------------------------------
+
+/** Wire shape of `GET /api/harnesses` rows. `registry_uri` non-null
+ * means the pack is registered in Postgres (Phase 5+); null means it
+ * came from the legacy host-resident scan. */
+export interface HarnessPackSummary {
+  name: string;
+  description: string | null;
+  registry_uri: string | null;
+}
+
+export interface AddHarnessPackRequest {
+  name: string;
+  registry_uri: string;
+  description?: string | null;
+}
