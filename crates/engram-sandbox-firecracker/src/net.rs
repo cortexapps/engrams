@@ -189,7 +189,18 @@ pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
 
     // 3. host-INPUT protection: VMs can't reach the host directly
     //    (no DNS server bound on the gateway, no SSH, no coord HTTP).
-    //    ICMP from any VM to its own gateway is allowed for diagnostics.
+    //    EXCEPT: when proxy mode is on, the iptables REDIRECT in
+    //    PREROUTING rewrites the destination IP to localhost; the
+    //    rewritten packet still has the VM's source IP and hits the
+    //    INPUT chain on its way to the proxy's listening socket. So
+    //    we need an explicit ACCEPT for the proxy port before the
+    //    blanket DROP. Order matters: ACCEPT first, DROP after.
+    if let Some(port) = proxy_port {
+        out.push(format!(
+            "-A INPUT -s {pool} -p tcp --dport {port} -j ACCEPT \
+             -m comment --comment engram-proxy-input",
+        ));
+    }
     out.push(format!(
         "-A INPUT -s {pool} -j DROP -m comment --comment engram-host-input",
     ));
@@ -340,6 +351,26 @@ pub async fn host_startup(proxy_port: Option<u16>) -> Result<(), NetError> {
             "write /proc/sys/net/ipv4/ip_forward".into(),
             e,
         ));
+    }
+    // Required when proxy mode is on: iptables PREROUTING REDIRECT
+    // rewrites a guest-bound 1.2.3.4 destination to 127.0.0.1 (the
+    // proxy's listener). Without `route_localnet`, the kernel marks
+    // any 127.0.0.0/8 destination arriving on a non-loopback
+    // interface as a martian and drops it before INPUT delivery.
+    // Setting `all` covers all current and future TAPs without
+    // having to set it per-interface.
+    if proxy_port.is_some() {
+        if let Err(e) = tokio::fs::write(
+            "/proc/sys/net/ipv4/conf/all/route_localnet",
+            b"1",
+        )
+        .await
+        {
+            return Err(NetError::Spawn(
+                "write /proc/sys/net/ipv4/conf/all/route_localnet".into(),
+                e,
+            ));
+        }
     }
     for line in host_startup_lines(proxy_port) {
         // Idempotency check: replace the leading `-A`/`-I` with `-C`
@@ -509,6 +540,21 @@ mod tests {
         assert!(lines.contains("-i tap-engr-+ -p tcp --dport 443"));
         assert!(lines.contains("--to-port 9443"));
         assert!(lines.contains("engram-default-deny"));
+        assert!(lines.contains("--dport 9443 -j ACCEPT"));
+        assert!(lines.contains("engram-proxy-input"));
+    }
+
+    #[test]
+    fn host_startup_proxy_input_accept_comes_before_drop() {
+        // Ordering matters — ACCEPT before DROP — otherwise the
+        // blanket VM-INPUT drop catches the REDIRECTed proxy
+        // traffic too. The two sit consecutively in the output;
+        // assert ACCEPT line index < DROP line index.
+        let lines = host_startup_lines(Some(9443));
+        let accept_idx = lines.iter().position(|l| l.contains("engram-proxy-input"));
+        let drop_idx = lines.iter().position(|l| l.contains("engram-host-input"));
+        assert!(accept_idx.is_some() && drop_idx.is_some());
+        assert!(accept_idx < drop_idx);
     }
 
     #[test]

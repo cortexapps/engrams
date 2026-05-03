@@ -27,5 +27,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 engram-image-builder.workspace = true
+engram-egress-proxy.workspace = true
 futures.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
 tempfile = "3"

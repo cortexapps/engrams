@@ -445,11 +445,9 @@ async fn build_egress_proxy(cli: &Cli) -> Option<engram_coordinator::EgressProxy
     let mint = Arc::new(engram_egress_proxy::CertMint::new(ca.clone()));
     let bind_addr: std::net::SocketAddr =
         format!("0.0.0.0:{}", cli.egress_proxy_port).parse().unwrap();
-    let proxy = engram_egress_proxy::Proxy::new(engram_egress_proxy::ProxyConfig {
-        bind_addr,
-        registry: registry.clone(),
-        mint,
-    });
+    let proxy = engram_egress_proxy::Proxy::new(
+        engram_egress_proxy::ProxyConfig::new(bind_addr, registry.clone(), mint),
+    );
     tokio::spawn(async move {
         if let Err(e) = proxy.run().await {
             tracing::error!(error = %e, "egress proxy listener exited");

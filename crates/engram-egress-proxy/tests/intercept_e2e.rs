@@ -18,6 +18,7 @@ use engram_egress_proxy::cert_mint::CertMint;
 use engram_egress_proxy::intercept::{self, build_client_config, build_server_config, InterceptError};
 use engram_egress_proxy::policy::HostList;
 use engram_egress_proxy::registry::SecretEntry;
+use engram_egress_proxy::resolver::StaticResolver;
 use parking_lot::Mutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -106,13 +107,17 @@ async fn substitutes_placeholder_in_intercept_path() {
     let secret = entry("engram_ph_xxx_yyy", "sk-real", &["fake-upstream"]);
     let server_cfg_for_task = server_cfg.clone();
     let client_cfg_for_task = client_cfg.clone();
+    let resolver = Arc::new(
+        StaticResolver::new().with("fake-upstream", upstream_addr),
+    );
     let proxy_task = tokio::spawn(async move {
         let secrets: Vec<&SecretEntry> = vec![&secret];
         intercept::run(
             proxy_from_client,
             Vec::new(),
             "fake-upstream",
-            (upstream_addr.ip(), upstream_addr.port()),
+            upstream_addr.port(),
+            resolver,
             &secrets,
             server_cfg_for_task,
             client_cfg_for_task,
@@ -193,13 +198,17 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
     // NOT by the secret's allow_hosts (so substitution skips it
     // and the violation scanner sees the placeholder).
     let secret = entry("engram_ph_xxx_yyy", "sk-real", &["api.openai.com"]);
+    let resolver = Arc::new(
+        StaticResolver::new().with("fake-upstream", upstream_addr),
+    );
     let proxy_task = tokio::spawn(async move {
         let secrets: Vec<&SecretEntry> = vec![&secret];
         intercept::run(
             proxy_from_client,
             Vec::new(),
             "fake-upstream",
-            (upstream_addr.ip(), upstream_addr.port()),
+            upstream_addr.port(),
+            resolver,
             &secrets,
             server_cfg,
             client_cfg,

@@ -23,11 +23,15 @@ pub mod policy;
 pub mod proxy;
 pub mod registry;
 pub mod replayed;
+pub mod resolver;
 pub mod sni;
 pub mod substitute;
 pub mod violation;
 
 pub use proxy::{Proxy, ProxyConfig};
+pub use resolver::{
+    default_resolver, ResolveError, StaticResolver, SystemResolver, UpstreamResolver,
+};
 
 pub use ca::{Ca, CaError};
 pub use cert_mint::{CertMint, MintError};

@@ -34,6 +34,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::cert_mint::CertMint;
 use crate::registry::SecretEntry;
 use crate::replayed::Replayed;
+use crate::resolver::{ResolveError, UpstreamResolver};
 use crate::substitute::{scan_for_violation, substitute};
 
 /// Cap on the request prefix we buffer before falling back to
@@ -48,6 +49,7 @@ pub enum InterceptError {
     Io(std::io::Error),
     Tls(rustls::Error),
     Mint(crate::cert_mint::MintError),
+    Resolve(ResolveError),
     Violation { placeholder: String },
     InvalidServerName(String),
 }
@@ -58,6 +60,7 @@ impl std::fmt::Display for InterceptError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Tls(e) => write!(f, "tls: {e}"),
             Self::Mint(e) => write!(f, "mint: {e}"),
+            Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Violation { placeholder } => {
                 write!(f, "placeholder leak: {placeholder} sent to disallowed host")
             }
@@ -83,6 +86,12 @@ impl From<rustls::Error> for InterceptError {
 impl From<crate::cert_mint::MintError> for InterceptError {
     fn from(e: crate::cert_mint::MintError) -> Self {
         Self::Mint(e)
+    }
+}
+
+impl From<ResolveError> for InterceptError {
+    fn from(e: ResolveError) -> Self {
+        Self::Resolve(e)
     }
 }
 
@@ -196,13 +205,15 @@ impl rustls::server::ResolvesServerCert for SniResolver {
 
 /// Drive a MITM intercept on `client_stream`. Bytes already peeked
 /// during SNI extraction are stitched back at the front via
-/// [`tokio::io::AsyncReadExt::chain`]. On violation, returns
-/// `InterceptError::Violation` so the caller can log + close.
+/// [`crate::replayed::Replayed`]. The upstream is dialed by SNI
+/// through `resolver`, not by guest-supplied IP — see the
+/// `resolver` module for why.
 pub async fn run<C>(
     client_stream: C,
     peeked: Vec<u8>,
     sni: &str,
-    upstream_addr: (std::net::IpAddr, u16),
+    port: u16,
+    resolver: Arc<dyn UpstreamResolver>,
     secrets: &[&SecretEntry],
     server_cfg: Arc<ServerConfig>,
     client_cfg: Arc<ClientConfig>,
@@ -216,10 +227,10 @@ where
     let acceptor = TlsAcceptor::from(server_cfg);
     let mut client_tls = acceptor.accept(stitched).await?;
 
-    // Connect upstream. We dial by IP (the destination recovered via
-    // SO_ORIGINAL_DST) but use the SNI string as the ServerName for
-    // the upstream TLS handshake — that's the host the cert chain
-    // should authenticate.
+    // Resolve upstream by SNI on the host's resolver. The SNI
+    // doubles as the ServerName for the upstream TLS handshake —
+    // that's the host the cert chain should authenticate.
+    let upstream_addr = resolver.resolve(sni, port).await?;
     let upstream_tcp = TcpStream::connect(upstream_addr).await?;
     let connector = TlsConnector::from(client_cfg);
     let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())

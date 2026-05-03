@@ -29,6 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::cert_mint::CertMint;
 use crate::registry::{Decision, Registry};
+use crate::resolver::{default_resolver, UpstreamResolver};
 use crate::{bypass, intercept, sni};
 
 /// How long we'll spend reading the TLS ClientHello before giving up.
@@ -43,6 +44,28 @@ pub struct ProxyConfig {
     pub bind_addr: SocketAddr,
     pub registry: Arc<Registry>,
     pub mint: Arc<CertMint>,
+    /// Resolver for upstream SNI → SocketAddr. Defaults to
+    /// `SystemResolver` (host's DNS). Tests pass a `StaticResolver`
+    /// to point a fixed hostname at a loopback fixture.
+    pub resolver: Arc<dyn UpstreamResolver>,
+}
+
+impl ProxyConfig {
+    /// Convenience constructor: production wiring with the system
+    /// DNS resolver and the bind addr / registry / mint the caller
+    /// provides.
+    pub fn new(
+        bind_addr: SocketAddr,
+        registry: Arc<Registry>,
+        mint: Arc<CertMint>,
+    ) -> Self {
+        Self {
+            bind_addr,
+            registry,
+            mint,
+            resolver: default_resolver(),
+        }
+    }
 }
 
 pub struct Proxy {
@@ -67,6 +90,7 @@ impl Proxy {
         let listener = TcpListener::bind(self.cfg.bind_addr).await?;
         tracing::info!(addr = %self.cfg.bind_addr, "engram-egress-proxy listening");
         let registry = self.cfg.registry.clone();
+        let resolver = self.cfg.resolver.clone();
         let server_cfg = self.server_cfg.clone();
         let client_cfg = self.client_cfg.clone();
         loop {
@@ -78,10 +102,13 @@ impl Proxy {
                 }
             };
             let registry = registry.clone();
+            let resolver = resolver.clone();
             let server_cfg = server_cfg.clone();
             let client_cfg = client_cfg.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, peer, registry, server_cfg, client_cfg).await {
+                if let Err(e) =
+                    handle(stream, peer, registry, resolver, server_cfg, client_cfg).await
+                {
                     tracing::debug!(peer = %peer, error = %e, "connection handler ended with error");
                 }
             });
@@ -93,6 +120,7 @@ async fn handle(
     mut stream: TcpStream,
     peer: SocketAddr,
     registry: Arc<Registry>,
+    resolver: Arc<dyn UpstreamResolver>,
     server_cfg: Arc<rustls::ServerConfig>,
     client_cfg: Arc<rustls::ClientConfig>,
 ) -> Result<(), HandleError> {
@@ -104,25 +132,33 @@ async fn handle(
         .lookup(guest_ip)
         .ok_or(HandleError::NoSession)?;
 
-    let upstream_addr = original_destination(&stream)?;
+    // Pre-REDIRECT destination — useful only for logs. We don't
+    // dial it; the upstream is resolved fresh by SNI on the host.
+    // On non-Linux this errors (no SO_ORIGINAL_DST) — fine, we
+    // just log "unknown".
+    let original_dst = original_destination(&stream).ok();
 
     let (sni, peeked) = sni::peek_sni(&mut stream, SNI_PEEK_BYTES, SNI_PEEK_BUDGET)
         .await
         .map_err(HandleError::SniPeek)?;
+    // The proxy only handles port 443 today (iptables only REDIRECTs
+    // tcp/443). The port the upstream listens on is the same.
+    let port = original_dst.map(|(_, p)| p).unwrap_or(443);
 
     match session.decide(&sni) {
         Decision::Reject => {
             tracing::info!(
                 session_id = %session.session_id,
                 sni = %sni,
+                original_dst = ?original_dst,
                 "egress rejected — destination not in any allow_hosts",
             );
             Ok(())
         }
         Decision::Bypass => {
-            let (up, down) = bypass::relay(stream, upstream_addr, peeked)
+            let (up, down) = bypass::relay(stream, &sni, port, resolver, peeked)
                 .await
-                .map_err(HandleError::Io)?;
+                .map_err(HandleError::Bypass)?;
             tracing::debug!(
                 session_id = %session.session_id,
                 sni = %sni,
@@ -137,7 +173,8 @@ async fn handle(
                 stream,
                 peeked,
                 &sni,
-                upstream_addr,
+                port,
+                resolver,
                 &secrets,
                 server_cfg,
                 client_cfg,
@@ -164,7 +201,7 @@ async fn handle(
 enum HandleError {
     NoSession,
     SniPeek(crate::sni::PeekError),
-    Io(std::io::Error),
+    Bypass(crate::bypass::BypassError),
     Intercept(crate::intercept::InterceptError),
     OriginalDest(std::io::Error),
 }
@@ -174,7 +211,7 @@ impl std::fmt::Display for HandleError {
         match self {
             Self::NoSession => write!(f, "no session for source IP"),
             Self::SniPeek(e) => write!(f, "sni peek: {e}"),
-            Self::Io(e) => write!(f, "io: {e}"),
+            Self::Bypass(e) => write!(f, "bypass: {e}"),
             Self::Intercept(e) => write!(f, "intercept: {e}"),
             Self::OriginalDest(e) => write!(f, "SO_ORIGINAL_DST: {e}"),
         }

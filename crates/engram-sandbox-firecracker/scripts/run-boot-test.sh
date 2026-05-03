@@ -27,7 +27,14 @@ cargo build \
   --release
 
 case "${1:-all}" in
-  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|harness_loopback)
+  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|harness_loopback|host_startup|proxy_e2e)
+    # proxy_e2e + host_startup need root for TAP/iptables. Detect
+    # and re-exec via sudo when not already root.
+    if [ "$1" = "proxy_e2e" ] || [ "$1" = "host_startup" ]; then
+      if [ "$(id -u)" -ne 0 ]; then
+        exec sudo -E env "PATH=$PATH" cargo test -p engram-sandbox-firecracker --test "$1" -- --ignored --nocapture --test-threads=1
+      fi
+    fi
     exec cargo test -p engram-sandbox-firecracker --test "$1" -- --ignored --nocapture
     ;;
   all)
