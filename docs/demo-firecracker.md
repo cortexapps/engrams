@@ -140,16 +140,60 @@ curl -s -X POST http://localhost:8090/sessions/$SID/exec \
 ## Where to look next
 
 - Smart-bootstrap on FC with a real Git repo (`git+https://...`
-  session, observe checkpoint push). Should "just work" against
-  this stack since smart-bootstrap is `git fetch + reset` over
-  the existing exec channel — and the per-VM iptables chain
-  auto-allows the Git URL's host.
+  session, observe checkpoint push). Should "just work" since
+  smart-bootstrap is `git fetch + reset` over the existing exec
+  channel; the egress proxy auto-allows the Git URL's host
+  (auto-augmentation in `api/sessions.rs`).
 - Snapshot size optimization: 4 GiB per snapshot is the
-  default-memory ceiling. Sessions with smaller resource hints
-  in `engram.toml` would produce smaller snapshots.
-- Egress refresher (30-min DNS re-resolve) so long-lived
-  sandboxes catch CDN IP rotation. At create time the chain is
-  populated with a fresh resolve; long sessions need refresh.
+  default-memory ceiling. Sessions with smaller resource hints in
+  `engram.toml` would produce smaller snapshots.
+- VM-level proxy e2e test: the unit + iptables tests cover the
+  proxy in isolation; a future test should exec curl from inside a
+  real sandbox through the iptables REDIRECT and verify the proxy
+  substituted the placeholder. Tricky because the test fake
+  upstream needs a destination reachable through the post-REDIRECT
+  proxy path (a host-side resolver indirection).
 - Restore-time net re-provisioning: snapshot/restore currently
   loses the per-VM /30 (the manifest doesn't carry it). Restored
   sandboxes have no egress until destroyed and re-created.
+
+## Networking + secrets architecture (post-Phase 6)
+
+```
+guest ──┐
+        │ 1. TCP connect to <upstream-ip>:443
+        ▼
+   tap-engr-XXX  (host-side TAP, gateway IP .1, /30)
+        │
+        │ 2. iptables PREROUTING: REDIRECT to 127.0.0.1:9443
+        ▼
+   engram-egress-proxy (host)
+        │ 3. SO_ORIGINAL_DST recovers the upstream IP
+        │ 4. peer_addr → guest IP → SessionState lookup
+        │ 5. Peek SNI from ClientHello
+        │ 6. Decision per (manifest.network ∪ secrets.allow_hosts):
+        │       Reject  → close
+        │       Bypass  → splice (no MITM)
+        │       Intercept → terminate TLS, substitute placeholders
+        │                   from secret_bundle, re-encrypt to upstream
+        ▼
+   real upstream
+```
+
+Iptables only enforces hard isolation:
+- DROP inter-VM (`-s 10.200/16 -d 10.200/16`)
+- DROP VM→RFC1918 / link-local / loopback
+- DROP VM→host-INPUT
+- ACCEPT VM→DNS to 1.1.1.1
+- REDIRECT VM→tcp/443 → proxy (when `--egress-proxy-port` set)
+- DROP everything else (proxy is the only egress when enabled)
+- MASQUERADE on POSTROUTING for return traffic
+
+CA delivery: per-host CA persisted to
+`<work_dir>/egress-proxy/ca.{pem,key}`; the harness substrate
+builder stamps `ca.pem` into the substrate at
+`/.engram-host/ca.pem`; the init shim appends to
+`/etc/ssl/certs/ca-certificates.crt` and exports `SSL_CERT_FILE`
++ `CURL_CA_BUNDLE` + `REQUESTS_CA_BUNDLE` + `NODE_EXTRA_CA_CERTS`
+so glibc, curl, requests, and Node all trust proxy-minted leaves
+before user code runs.

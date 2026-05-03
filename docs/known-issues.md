@@ -121,16 +121,20 @@ scope for the current PR; the shell feature ships as a dev tool.
 
 ## 5. ~~Browser shell only works on the VZ backend~~ (FIXED)
 
-**Resolved** by the FC parity work. FC now provisions a per-VM `/30`
-with a TAP terminated on the host, applies a per-VM iptables chain
-with hard-isolation rules + `manifest.network.allow_hosts`
-enforcement, and overrides `SandboxBackend::guest_ip` to query the
-in-VM agent. The dashboard SHELL tab works against FC sessions.
+**Resolved.** FC now provisions a per-VM `/30` with a TAP
+terminated on the host (no shared bridge, no DHCP, static IP via
+kernel `ip=` cmdline) and overrides `SandboxBackend::guest_ip` so
+the dashboard SHELL tab works.
 
-See `crates/engram-sandbox-firecracker/src/net.rs` for the topology
-(per-VM `/30`, no shared bridge, no DHCP, static IP via kernel `ip=`
-cmdline) and `tests/network_provision.rs` /
-`tests/harness_loopback.rs` for end-to-end coverage.
+`manifest.network.allow_hosts` enforcement moved to a host-side
+TLS-MITM proxy (`engram-egress-proxy`) — see
+`crates/engram-egress-proxy/` for the substitution / SNI peek /
+CA-and-leaf logic and `crates/engram-sandbox-firecracker/src/net.rs`
+for the static iptables ruleset that REDIRECTs VM→tcp/443 to the
+proxy. Coverage: `engram-egress-proxy/tests/intercept_e2e.rs`
+(loopback MITM), `engram-sandbox-firecracker/tests/host_startup.rs`
+(sudo, iptables apply), `tests/harness_loopback.rs` (CA delivery
+via substrate).
 
 ## 6. No system-wide event stream on the coordinator
 
