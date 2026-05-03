@@ -971,6 +971,7 @@ pub(crate) mod tests {
             env: Default::default(),
             workdir: None,
             harness_substrate: None,
+            network: Default::default(),
         }
     }
 
@@ -1094,6 +1095,7 @@ pub(crate) mod tests {
             env: Default::default(),
             workdir: None,
             harness_substrate: None,
+            network: Default::default(),
         };
         let sandbox_id = backend.create(spec).await.unwrap();
 

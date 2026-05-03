@@ -8,6 +8,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use super::ids::SandboxId;
+use super::image::NetworkPolicy;
 
 /// Spec for creating a sandbox via `SandboxBackend::create`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +38,15 @@ pub struct SandboxSpec {
     /// to this sandbox" (e.g. dev/test scaffolding).
     #[serde(default)]
     pub harness_substrate: Option<PathBuf>,
+    /// Per-sandbox egress policy derived from the image manifest's
+    /// `[network]` block plus any session-time augmentation (e.g. a
+    /// `WorkspaceSpec::Git` URL host gets auto-allowed so clone
+    /// works). Backends with hard-isolation networking (FC) translate
+    /// this into iptables rules; backends without (VZ's Apple NAT)
+    /// log a warn-once when `default = Deny` and `allow_hosts` is
+    /// non-empty.
+    #[serde(default)]
+    pub network: NetworkPolicy,
 }
 
 /// Argv + env for the long-running "agent" process (Claude Code,

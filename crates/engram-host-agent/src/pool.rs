@@ -182,6 +182,7 @@ fn stub_spec() -> SandboxSpec {
         env: HashMap::new(),
         workdir: None,
         harness_substrate: None,
+        network: Default::default(),
     }
 }
 
@@ -220,6 +221,7 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             harness_substrate: None,
+            network: Default::default(),
         }
     }
 

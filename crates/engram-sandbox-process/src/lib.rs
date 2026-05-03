@@ -377,6 +377,7 @@ impl SandboxBackend for ProcessBackend {
             env: HashMap::new(),
             workdir: None,
             harness_substrate: None,
+            network: Default::default(),
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -594,6 +595,7 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             harness_substrate: None,
+            network: Default::default(),
         }
     }
 

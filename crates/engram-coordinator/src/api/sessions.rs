@@ -88,6 +88,26 @@ fn apply_secrets_to_env(
     }
 }
 
+/// Extract the hostname from a clone URL so it can be added to the
+/// session's `allow_hosts`. Tolerates `git+https://`, `git@host:path`
+/// (SSH), and plain http(s). Returns `None` for shapes the FC net
+/// layer can't allowlist by name (e.g. `git://`, `file://`).
+fn host_from_url(raw: &str) -> Option<String> {
+    if let Ok(u) = url::Url::parse(raw) {
+        return u.host_str().map(str::to_owned);
+    }
+    // SSH form: `git@github.com:cortex/api.git`. Take the substring
+    // between `@` and the first `:`.
+    if let Some(rest) = raw.strip_prefix("git@").or_else(|| raw.split_once('@').map(|(_, r)| r)) {
+        if let Some((host, _)) = rest.split_once(':') {
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn short_hash(s: &str) -> String {
     // Stable 8-char tag of `s`, just for placeholder uniqueness. Not
     // a security primitive — placeholders aren't sensitive.
@@ -272,6 +292,20 @@ pub async fn create_session(
         .as_ref()
         .map(|s| s.path.clone());
 
+    // Network policy: start from the image manifest's `[network]`
+    // block and auto-augment `allow_hosts` with the Git workspace's
+    // host (so `git clone` can reach it). FC's net layer translates
+    // this into per-VM iptables rules; VZ logs a warn-once because
+    // its Apple-NAT path is opaque.
+    let mut network = manifest.network.clone();
+    if let WorkspaceSpec::Git { url, .. } = &req.workspace {
+        if let Some(host) = host_from_url(url) {
+            if !network.allow_hosts.iter().any(|h| h == &host) {
+                network.allow_hosts.push(host);
+            }
+        }
+    }
+
     let vm_spec = VmSpec {
         image: image_tag.clone(),
         rootfs_source: rootfs_source_from(Some(&resolved)),
@@ -294,6 +328,7 @@ pub async fn create_session(
         env: spec_env,
         workdir: None,
         harness_substrate,
+        network,
     };
 
     // -------- 5. Schedule + create the sandbox --------
@@ -586,4 +621,47 @@ pub(crate) fn resolve_harness(
         }
     };
     Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_from_url;
+
+    #[test]
+    fn host_from_url_https() {
+        assert_eq!(
+            host_from_url("https://github.com/cortex/api.git").as_deref(),
+            Some("github.com"),
+        );
+    }
+
+    #[test]
+    fn host_from_url_http() {
+        assert_eq!(
+            host_from_url("http://gitea.local:3000/me/repo").as_deref(),
+            Some("gitea.local"),
+        );
+    }
+
+    #[test]
+    fn host_from_url_ssh_form() {
+        assert_eq!(
+            host_from_url("git@github.com:cortex/api.git").as_deref(),
+            Some("github.com"),
+        );
+    }
+
+    #[test]
+    fn host_from_url_user_at_host_form() {
+        assert_eq!(
+            host_from_url("alice@gitea.example.com:repo.git").as_deref(),
+            Some("gitea.example.com"),
+        );
+    }
+
+    #[test]
+    fn host_from_url_unhandleable_returns_none() {
+        // Plain `file://` and bare paths can't be allowlisted by host.
+        assert_eq!(host_from_url("/srv/git/repo.git"), None);
+    }
 }

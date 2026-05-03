@@ -51,6 +51,7 @@ async fn create_list_destroy_round_trip() {
         env: HashMap::new(),
         workdir: None,
         harness_substrate: None,
+        network: Default::default(),
     };
 
     // create

@@ -319,6 +319,7 @@ mod tests {
             env: HashMap::from([("K".into(), "V".into())]),
             workdir: Some("/work".into()),
             harness_substrate: None,
+            network: Default::default(),
         };
         let f = Frame::Request {
             req_id: 1,

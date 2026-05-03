@@ -370,6 +370,7 @@ mod tests {
             env: Default::default(),
             workdir: None,
             harness_substrate: None,
+            network: Default::default(),
         }
     }
 

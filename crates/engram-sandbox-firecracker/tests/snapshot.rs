@@ -61,6 +61,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
         env: HashMap::new(),
         workdir: None,
         harness_substrate: None,
+        network: Default::default(),
     };
 
     // Step 1: create

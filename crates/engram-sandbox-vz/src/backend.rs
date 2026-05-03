@@ -205,9 +205,32 @@ where
     })
 }
 
+/// Logged at-most-once per backend instance when a session asks for
+/// egress filtering VZ can't enforce. Apple's
+/// `VZNATNetworkDeviceAttachment` is opaque: the host shares its
+/// networking stack with the guest with no insertable filter, so a
+/// non-empty `manifest.network.allow_hosts` is unenforceable here.
+/// Production isolation lives on FC; VZ stays "open egress, warn".
+fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let restrictive = matches!(
+        network.default,
+        engram_core::types::NetworkDefault::Deny
+    ) && !network.allow_hosts.is_empty();
+    if restrictive && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "VZ does not enforce manifest.network.allow_hosts; macOS's NAT path is \
+             opaque. Sessions on this backend get open egress. Use the Firecracker \
+             backend on Linux for production hard-isolation networking."
+        );
+    }
+}
+
 #[async_trait]
 impl SandboxBackend for VzBackend {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        warn_vz_ignores_allow_hosts_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
                 "VzBackend requires SandboxSpec.rootfs_source — point it at the ext4 \
