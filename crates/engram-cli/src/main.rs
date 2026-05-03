@@ -202,7 +202,7 @@ enum RegistryCmd {
     Add {
         /// Registry host. Examples: `gcr.io`, `ghcr.io`,
         /// `us-east1-docker.pkg.dev`,
-        /// `123456.dkr.ecr.us-east-1.amazonaws.com`, `localhost:5000`.
+        /// `123456.dkr.ecr.us-east-1.amazonaws.com`, `localhost:5001`.
         #[arg(long)]
         host: String,
         /// Authentication kind. Defaults to `static` for backward-
@@ -1385,7 +1385,7 @@ async fn registry_list(
 }
 
 async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Result<(), CliError> {
-    // URL-encode the host so `:` in `localhost:5000` survives the path.
+    // URL-encode the host so `:` in `localhost:5001` survives the path.
     let encoded = urlencode(host);
     let resp = client
         .delete(format!("{endpoint}/api/registries/{encoded}"))
@@ -1418,7 +1418,7 @@ async fn harness_add(
     // push and trust the caller to have already pushed to `--registry-uri`.
     let final_uri: String = match (from, push, registry_uri) {
         (Some(dir), Some(target), None) => {
-            // Anonymous push works for `localhost:5000` and public
+            // Anonymous push works for `localhost:5001` and public
             // registries. Authenticated push goes through the
             // coordinator's encrypted creds — implemented when the
             // host-agent puller lands; for v1 the user pre-runs

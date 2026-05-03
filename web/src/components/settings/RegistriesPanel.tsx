@@ -309,7 +309,7 @@ function AddRegistryForm({
     >
       <SubHead>NEW REGISTRY</SubHead>
 
-      <Field label="host" hint="e.g. ghcr.io · gcr.io · us-east1-docker.pkg.dev · localhost:5000">
+      <Field label="host" hint="e.g. ghcr.io · gcr.io · us-east1-docker.pkg.dev · localhost:5001">
         <input
           type="text"
           value={host}

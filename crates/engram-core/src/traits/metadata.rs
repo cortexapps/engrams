@@ -118,7 +118,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// Look up the credential row for a given registry host. Returns
     /// `None` when no row exists — callers fall back to anonymous
-    /// access (works for public registries and `localhost:5000`).
+    /// access (works for public registries and `localhost:5001`).
     /// When more than one row exists for the same host, returns the
     /// most-recently-updated row.
     async fn registry_credential_for_host(

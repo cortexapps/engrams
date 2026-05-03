@@ -1,10 +1,11 @@
 # Engram dev recipes. Install `just`: https://github.com/casey/just
 #
 # Single-line summary of the dev story:
-#   `just dev` brings up Postgres + the coordinator wired to the
-#   subprocess sandbox backend. Works on macOS Apple Silicon, no nested
-#   virt, no Firecracker. Real isolation comes from
-#   `engram-sandbox-firecracker` on Linux production hosts — see DESIGN.md.
+#   `just dev` runs `tilt up`, which brings up the docker-compose
+#   infra (postgres + OCI registry), one-shots (KEK bootstrap,
+#   harness packs, VZ codesign on Mac), the coordinator (cargo run),
+#   and the web SPA. Visit http://localhost:10350 for the Tilt
+#   dashboard. Backend (VZ vs Firecracker) is auto-selected by arch.
 
 set shell := ["bash", "-cu"]
 set dotenv-load := true
@@ -48,20 +49,20 @@ test-pkg pkg *ARGS:
 
 # Start Postgres only. Coordinator runs via `just dev`.
 db-up:
-    docker compose -f deploy/docker-compose.yml up -d postgres
+    docker compose -f deploy/docker-compose.dev.yml up -d postgres
 
 # Stop the local Postgres.
 db-down:
-    docker compose -f deploy/docker-compose.yml down
+    docker compose -f deploy/docker-compose.dev.yml down
 
-# Bring up the local OCI registry on http://localhost:5000.
+# Bring up the local OCI registry on http://localhost:5001.
 # Anonymous pull/push, plaintext HTTP. Engram's OCI client only
 # allows HTTP for loopback hosts so this is safe-by-construction.
 registry-up:
-    docker compose -f deploy/docker-compose.yml up -d registry
+    docker compose -f deploy/docker-compose.dev.yml up -d registry
 
 registry-down:
-    docker compose -f deploy/docker-compose.yml stop registry
+    docker compose -f deploy/docker-compose.dev.yml stop registry
 
 # Generate a 32-byte master key (KEK) for envelope-encrypted
 # registry credentials and write it into `.env` for direnv/`just`
@@ -84,31 +85,108 @@ bootstrap:
 
 # psql into the dev Postgres.
 psql:
-    docker compose -f deploy/docker-compose.yml exec postgres \
+    docker compose -f deploy/docker-compose.dev.yml exec postgres \
         psql -U engram -d engram
 
 # Apply migrations (sqlx-cli not required — coordinator runs them on
 # startup, but this is useful for ad-hoc psql work).
 migrate:
-    docker compose -f deploy/docker-compose.yml exec -T postgres \
+    docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
         psql -U engram -d engram < deploy/migrations/0001_initial.sql
 
 # Drop the dev DB volume (destructive). Use when migrations diverge.
 db-reset:
-    docker compose -f deploy/docker-compose.yml down -v
+    docker compose -f deploy/docker-compose.dev.yml down -v
     just db-up
 
 # ------------------------------------------------------------------
-# Coordinator — local dev (subprocess sandbox backend)
+# `just dev` — full-stack orchestrated by Tilt.
+#
+# Brings up postgres + OCI registry (docker-compose), runs the KEK
+# + harness one-shots, starts the coordinator (cargo run, manual
+# restart), and starts the web SPA (vite HMR). All processes
+# stream into Tilt's UI at http://localhost:10350.
+#
+# Backend (VZ vs Firecracker) is auto-selected by arch. Mac Apple
+# Silicon → VZ; Linux + KVM x86_64 → Firecracker. Other hosts are
+# rejected with a clear error.
+#
+# Prereqs (one-time):
+#   • `brew install tilt-dev/tap/tilt` (or your platform's install)
+#   • a kernel artifact for the chosen backend — VZ:
+#     `just vz-pull-kernel`; FC: run the fc-test fetch script.
+#     The Tiltfile reads .env / process env for ENGRAM_VZ_KERNEL_PATH
+#     or ENGRAM_KERNEL_IMAGE_PATH and falls back to the standard
+#     cache locations.
+# ------------------------------------------------------------------
+dev:
+    tilt up
+
+# Bring everything down: kill the coordinator + web processes,
+# stop the docker-compose services, leave volumes intact.
+dev-down:
+    tilt down
+
+# Bake an image from a directory containing Dockerfile + engram.toml,
+# then push it to the local OCI registry. Auto-selects cross-compile
+# target + `--transport` flag based on host arch. Tag defaults to
+# `warm-<rfc3339>`; override with `TAG=...`.
+#
+# Usage:
+#   just bake cortex/api ./examples/api
+#   just bake cortex/api .
+#   TAG=warm-2 just bake cortex/api ./examples/api
+#
+# After this, the new image appears in the dashboard's "create
+# session" dropdown immediately (the coordinator polls
+# `image_versions` on every `/api/images` GET) and is pullable via
+# `engram session create --image localhost:5001/<repo>:<tag>`.
+bake repo dir='.':
+    @set -e; \
+    : "$${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"; \
+    if [ "$(uname -s -m)" = "Darwin arm64" ]; then \
+        TARGET=aarch64-unknown-linux-musl; PLATFORM=linux/arm64; TRANSPORT=console; \
+    elif [ "$(uname -s -m)" = "Linux x86_64" ]; then \
+        TARGET=x86_64-unknown-linux-musl; PLATFORM=linux/amd64; TRANSPORT=vsock; \
+    else \
+        echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
+    fi; \
+    rustup target add $$TARGET >/dev/null 2>&1 || true; \
+    cargo build -p engram-agentd    --target $$TARGET --release; \
+    cargo build -p engram-bootstrap --target $$TARGET --release; \
+    TAG="$${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
+    STAGING="./var/bake/{{repo}}"; \
+    rm -rf "$$STAGING"; mkdir -p "$$STAGING"; \
+    cp "{{dir}}/Dockerfile"  "$$STAGING/Dockerfile"; \
+    cp "{{dir}}/engram.toml" "$$STAGING/engram.toml"; \
+    if [ "$$PLATFORM" = "linux/arm64" ]; then \
+        sed -i.bak 's|^FROM \([^ ]*\)$$|FROM --platform=linux/arm64 \1|' "$$STAGING/Dockerfile"; \
+        rm -f "$$STAGING/Dockerfile.bak"; \
+    fi; \
+    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$$PATH" \
+    DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
+    cargo run -p engram-image-builder -- build \
+        --repo {{repo}} \
+        --tag $$TAG \
+        --source $$STAGING \
+        --format ext4 \
+        --transport $$TRANSPORT \
+        --inject-agent     "target/$$TARGET/release/engram-agentd" \
+        --inject-bootstrap "target/$$TARGET/release/engram-bootstrap" \
+        --push localhost:5001/{{repo}}; \
+    echo ""; \
+    echo "✓ pushed localhost:5001/{{repo}}:$$TAG"; \
+    echo "  visible in dashboard's session-create dropdown immediately"
+
+# ------------------------------------------------------------------
+# Lower-level recipes (composed by `just dev` via Tilt; useful
+# directly when you want to skip Tilt or debug a specific layer).
 # ------------------------------------------------------------------
 
-# The Process backend was demoted to a test-only fixture, so
-# `just dev` (Process-based, single-binary) is gone. Use:
-#   - `just dev-vz`           on macOS Apple Silicon
-#   - `just dev-firecracker`  on Linux + KVM
-# Both run the coordinator with a real VMM; pass
-# `--harness <name>` to `engram session create` for per-session
-# agent selection.
+# Note: `just dev-vz` / `just dev-firecracker` predate the Tilt
+# orchestration and run the coordinator standalone (without web,
+# without one-shot supervision). Kept for backwards compat — they
+# still work, but `just dev` is the recommended path.
 
 # Run the coordinator wired to the Firecracker backend. Requires
 # Linux + KVM. Will not work on macOS — use `just dev-vz` instead.

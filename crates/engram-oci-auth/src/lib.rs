@@ -130,7 +130,7 @@ impl PgAuthResolver {
 impl RegistryAuthResolver for PgAuthResolver {
     async fn resolve(&self, host: &str) -> Result<Option<BasicCreds>, OciError> {
         // Look up the row. Missing row = anonymous (works for public
-        // registries and `localhost:5000`).
+        // registries and `localhost:5001`).
         let row = self
             .meta
             .registry_credential_for_host(host)

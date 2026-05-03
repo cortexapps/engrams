@@ -9,11 +9,11 @@
 //!
 //! `#[ignore]`'d by default — requires Postgres reachable at the URL
 //! pointed to by `ENGRAM_TEST_DATABASE_URL` (the local
-//! `deploy/docker-compose.yml` brings one up at
+//! `deploy/docker-compose.dev.yml` brings one up at
 //! `postgres://engram:engram@localhost:5435/engram`). To run:
 //!
 //! ```bash
-//! docker compose -f deploy/docker-compose.yml up -d postgres
+//! docker compose -f deploy/docker-compose.dev.yml up -d postgres
 //! ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
 //!     cargo test -p engram-coordinator --test ha_listener -- --ignored --nocapture
 //! ```
@@ -32,7 +32,7 @@ async fn cross_replica_event_fan_out() {
         Err(_) => {
             eprintln!(
                 "skipping: ENGRAM_TEST_DATABASE_URL not set. Bring up the dev DB with \
-                 `docker compose -f deploy/docker-compose.yml up -d postgres` and re-run with \
+                 `docker compose -f deploy/docker-compose.dev.yml up -d postgres` and re-run with \
                  ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram"
             );
             return;

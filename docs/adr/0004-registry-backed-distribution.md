@@ -119,18 +119,18 @@ all rows are URIs.
 
 `registry_credentials` is the new table holding the envelope-
 encrypted credentials. Lookup is by `registry_host`; missing rows =
-anonymous pull (works for public registries and `localhost:5000`).
+anonymous pull (works for public registries and `localhost:5001`).
 
 ### Local dev
 
-`deploy/docker-compose.yml` runs a `registry:2` service alongside
+`deploy/docker-compose.dev.yml` runs a `registry:2` service alongside
 Postgres. `just dev{-firecracker,-vz}` brings it up automatically.
 The OCI client allows plaintext HTTP only when the registry host is
 `localhost` / `127.0.0.1` / `::1` (matching Docker's
 `--insecure-registry` heuristic) — safe-by-construction; no flag to
 forget.
 
-The dev URL is `localhost:5000/cortex/api:warm-X`, no auth needed.
+The dev URL is `localhost:5001/cortex/api:warm-X`, no auth needed.
 Anywhere else in the world (`gcr.io`, `ghcr.io`, ...) the client
 forces HTTPS and looks up creds in Postgres.
 
@@ -164,7 +164,7 @@ tag are free and concurrent pulls of the same digest from different
 sessions deduplicate naturally.
 
 **Users get a `docker push`-shaped story.** `engram image build
---push localhost:5000/cortex/api` Just Works for dev;
+--push localhost:5001/cortex/api` Just Works for dev;
 `engram image build --push gcr.io/cortex/api` works for prod once
 `engram registry add --host gcr.io ...` is run once per
 deployment. Anyone who's used Docker has the muscle memory.

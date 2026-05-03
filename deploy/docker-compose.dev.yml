@@ -1,0 +1,57 @@
+###############################################################################
+# Local-dev infrastructure: Postgres + the OCI registry.
+#
+# This file is the dev-loop's source of truth — Tilt's `docker_compose()`
+# pulls these services in and the coordinator runs locally via `cargo
+# run` for fast iteration. Production deploys go through a Helm chart
+# (not this file); deliberately splitting the two paths so the dev
+# compose file stays small and obvious.
+#
+# Direct usage (without Tilt):
+#   docker compose -f deploy/docker-compose.dev.yml up -d
+#   docker compose -f deploy/docker-compose.dev.yml down
+###############################################################################
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: engram
+      POSTGRES_PASSWORD: engram
+      POSTGRES_DB: engram
+    ports:
+      # Host-side port shifted off the default 5432 so it doesn't
+      # collide with a system Postgres a developer may already run.
+      # Container-internal port stays at 5432.
+      - "5435:5432"
+    volumes:
+      - engram-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local OCI registry for dev. Anonymous pull/push over plaintext HTTP.
+  # Engram's OCI client allows HTTP only when the registry host is a
+  # loopback address, so this is safe-by-construction for dev only.
+  # `engram image build --push localhost:5001/cortex/api` lands here;
+  # `engram session create --image localhost:5001/cortex/api:warm-X`
+  # pulls from here on the host-agent side.
+  registry:
+    image: registry:2
+    restart: unless-stopped
+    ports:
+      # Host-side port shifted off 5000 because macOS's AirPlay
+      # Receiver (System Settings → AirDrop & Handoff) squats on
+      # 5000 by default — the resulting bind error is one of the
+      # most common dev-onboarding hiccups. Container-internal port
+      # stays at 5000 since registry:2's defaults expect it.
+      - "5001:5000"
+    volumes:
+      - engram-registry-data:/var/lib/registry
+
+volumes:
+  engram-pg-data:
+  engram-registry-data:

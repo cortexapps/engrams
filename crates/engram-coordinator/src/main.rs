@@ -347,7 +347,7 @@ async fn main() -> Result<(), CoordinatorError> {
         // static creds (decrypt under KEK), GCP Workload Identity
         // (token via gcp_auth crate). Missing rows = anonymous,
         // which still works for public registries and
-        // `localhost:5000`.
+        // `localhost:5001`.
         let oci_cache_root = cli.local_path.join("oci-cache");
         let auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver> = Arc::new(
             engram_oci_auth::PgAuthResolver::new(meta_arc.clone(), kek.clone()),
