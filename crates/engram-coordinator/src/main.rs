@@ -120,18 +120,6 @@ struct Cli {
     #[arg(long, env = "ENGRAM_FC_NET_CIDR", default_value = "10.200.0.0")]
     fc_net_cidr: std::net::Ipv4Addr,
 
-    /// Per-VM iptables enforcement mode. `log_only` (the default)
-    /// renders LOG-and-ACCEPT for the final default rule so existing
-    /// manifests that haven't declared their `network.allow_hosts`
-    /// keep working. Flip to `enforce` once they have.
-    #[arg(
-        long,
-        env = "ENGRAM_FC_NET_POLICY",
-        default_value = "log_only",
-        value_parser = engram_sandbox_firecracker::net::NetPolicy::parse,
-    )]
-    fc_net_policy: engram_sandbox_firecracker::net::NetPolicy,
-
     /// TCP port the egress-proxy listens on. iptables PREROUTING
     /// REDIRECTs VM→tcp/443 to this port; the proxy SNI-peeks then
     /// dispatches Reject / Bypass / Intercept per the manifest's
@@ -219,7 +207,11 @@ async fn main() -> Result<(), CoordinatorError> {
                 })?;
                 let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
                 fc_cfg.net_pool = Some(cli.fc_net_cidr);
-                fc_cfg.net_policy = cli.fc_net_policy;
+                fc_cfg.egress_proxy_port = if cli.egress_proxy_port == 0 {
+                    None
+                } else {
+                    Some(cli.egress_proxy_port)
+                };
                 let fc = Arc::new(FirecrackerBackend::new(
                     cli.sandbox_work_dir.clone(),
                     fc_cfg,

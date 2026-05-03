@@ -179,11 +179,12 @@ pub struct FirecrackerConfig {
     /// tests (`tests/lifecycle.rs` etc.) which can't `ip tuntap add`
     /// without `CAP_NET_ADMIN`. Override via `--fc-net-cidr`.
     pub net_pool: Option<std::net::Ipv4Addr>,
-    /// Soft-launch switch for the per-VM iptables policy. `LogOnly`
-    /// (the default) renders LOG-and-ACCEPT for the final default
-    /// rule so existing manifests that haven't declared their
-    /// `allow_hosts` keep working; flip to `Enforce` once they have.
-    pub net_policy: net::NetPolicy,
+    /// TCP port the host-side egress proxy listens on. When `Some`,
+    /// `host_startup` REDIRECTs VM→tcp/443 to this port and applies
+    /// a default-deny on FORWARD so the proxy is the only egress
+    /// path. When `None` (test/dev), VMs get open egress with the
+    /// standard hard-isolation drops.
+    pub egress_proxy_port: Option<u16>,
 }
 
 /// Backing-memory strategy for `restore`.
@@ -210,7 +211,7 @@ impl FirecrackerConfig {
     pub fn with_kernel(kernel_image_path: impl Into<PathBuf>) -> Self {
         Self {
             net_pool: Some("10.200.0.0".parse().unwrap()),
-            net_policy: net::NetPolicy::default(),
+            egress_proxy_port: None,
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
                 .into(),
@@ -308,7 +309,9 @@ impl FirecrackerBackend {
         if self.config.net_pool.is_none() {
             return Ok(());
         }
-        net::host_startup().await.map_err(SandboxError::from)
+        net::host_startup(self.config.egress_proxy_port)
+            .await
+            .map_err(SandboxError::from)
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -561,15 +564,7 @@ impl FirecrackerBackend {
         // host-side state. Skipped entirely when networking is
         // disabled (tests).
         let net_setup = if self.config.net_pool.is_some() {
-            Some(
-                net::provision(
-                    sandbox_id,
-                    &self.net_allocator,
-                    spec.network.clone(),
-                    self.config.net_policy,
-                )
-                .await?,
-            )
+            Some(net::provision(sandbox_id, &self.net_allocator).await?)
         } else {
             None
         };
@@ -1362,7 +1357,7 @@ mod tests {
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: RestoreMode::File,
             net_pool: None,
-            net_policy: net::NetPolicy::default(),
+            egress_proxy_port: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }

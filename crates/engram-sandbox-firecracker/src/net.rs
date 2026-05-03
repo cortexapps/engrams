@@ -7,35 +7,21 @@
 //! the kernel `ip=` cmdline (`CONFIG_IP_PNP_*=y`) — no DHCP server
 //! on the host, less attack surface.
 //!
-//! Egress is filtered through a per-VM iptables chain
-//! `engram-sb-<id>` so each sandbox's policy is a scoped, yankable
-//! object. The chain layers:
-//!
-//! 1. **Hard isolation** (always on): DROP traffic into RFC1918,
-//!    link-local, loopback. The global FORWARD rule `-s 10.200/16
-//!    -d 10.200/16 DROP` covers inter-VM blocking once.
-//! 2. **DNS allow** for `1.1.1.1:53` UDP+TCP — the only
-//!    unconditional egress. Everything else has to be in
-//!    `allow_hosts`.
-//! 3. **Resolved `manifest.network.allow_hosts`** — at create time
-//!    we resolve each entry to IPv4s and ACCEPT them. Refresh task
-//!    (separate module) re-resolves periodically to catch CDN
-//!    rotation.
-//! 4. **Final default** — DROP if `default = Deny` and
-//!    `policy = Enforce`; LOG-and-ACCEPT under `LogOnly` so the PR
-//!    can ship without breaking sessions whose manifests haven't
-//!    declared their outbound destinations.
-//!
-//! Pure-Rust types here (`NetworkAllocator`, `IptablesRules`,
-//! `tap_name_for`) are unit-tested on macOS; the runtime that
-//! actually creates TAPs and shells out to `iptables` lives in
-//! `lib.rs` under `#[cfg(target_os = "linux")]`.
+//! **Policy enforcement lives at the egress proxy, not iptables.**
+//! Earlier iterations applied a per-VM iptables chain with the
+//! `manifest.network.allow_hosts` list resolved to IPs; that
+//! suffered from DNS re-resolve drift and duplicated the secret
+//! broker's hostname allowlist at a different layer (L3 vs L7).
+//! The proxy is now the single source of truth: iptables shrinks to
+//! a static ruleset applied once at host-agent startup that drops
+//! everything except VM→proxy and VM→DNS, plus standard hard-isolation
+//! drops (RFC1918, link-local, loopback, inter-VM). Per-VM
+//! provisioning is now just TAP creation.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use engram_core::types::ids::SandboxId;
-use engram_core::types::{NetworkDefault, NetworkPolicy};
 
 /// One `/30` carved from the engram pool. Per RFC 3021 a /30 has 4
 /// addresses: network, gateway, guest, broadcast. We assign:
@@ -127,9 +113,6 @@ impl NetworkAllocator {
     }
 
     pub fn alloc(&mut self) -> Result<VmCidr, AllocError> {
-        // Recycled slots first — keeps the address space dense
-        // (lower /30s come back into rotation before we burn fresh
-        // ones at the high end).
         let slot = if let Some(s) = self.free.pop() {
             s
         } else if self.next < self.pool_size {
@@ -167,210 +150,94 @@ impl NetworkAllocator {
 
 /// Linux's `IFNAMSIZ` is 16 — including the trailing NUL. So
 /// interface names are limited to 15 chars. `tap-engr-` is 9 chars,
-/// leaving 6 for the sandbox ID prefix. UUIDs are unique enough at
-/// 6 hex chars within a single host's lifetime.
+/// leaving 6 for the sandbox ID prefix.
 pub fn tap_name_for(sandbox_id: SandboxId) -> String {
     let s = sandbox_id.to_string();
-    // SandboxId stringifies as a UUID; take the first 6 hex chars.
     let prefix: String = s.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
     format!("tap-engr-{prefix}")
 }
 
-/// What the host-agent does to the per-VM iptables chain when the
-/// final default rule is reached. `LogOnly` ships in this PR's
-/// rollout; `Enforce` flips the switch once in-tree manifests
-/// declare their `allow_hosts`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NetPolicy {
-    LogOnly,
-    Enforce,
-}
+/// Static iptables ruleset applied once per host-agent at startup.
+/// All policy lives at the proxy now; iptables is hard isolation +
+/// proxy-redirect only.
+///
+/// `proxy_port`: when Some, REDIRECT VM→tcp/443 to that port (the
+/// proxy runs on `127.0.0.1:port` per the coord wiring) AND apply a
+/// final FORWARD DROP so the proxy is the only egress path. When
+/// None (test/dev mode), VM egress to the public internet is
+/// allowed under the standard MASQUERADE; only host-LAN and
+/// inter-VM traffic is dropped.
+pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
+    let pool = ENGRAM_POOL_CIDR;
+    let mut out = Vec::new();
 
-impl Default for NetPolicy {
-    fn default() -> Self {
-        Self::LogOnly
-    }
-}
-
-impl NetPolicy {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "log_only" | "log-only" => Ok(Self::LogOnly),
-            "enforce" => Ok(Self::Enforce),
-            other => Err(format!(
-                "unknown engram fc-net-policy `{other}` — expected log_only|enforce"
-            )),
-        }
-    }
-}
-
-/// String-builder for the per-VM iptables ruleset. Render-only
-/// (no shell-out) so it's unit-testable on macOS. The runtime
-/// applies these by spawning `iptables` per line.
-#[derive(Clone, Debug)]
-pub struct ChainPlan {
-    pub chain_name: String,
-    pub vm_cidr: VmCidr,
-    pub allow_ips: Vec<(Ipv4Addr, String)>,
-    pub network: NetworkPolicy,
-    pub host_policy: NetPolicy,
-}
-
-impl ChainPlan {
-    pub fn new(
-        sandbox_id: SandboxId,
-        vm_cidr: VmCidr,
-        network: NetworkPolicy,
-        host_policy: NetPolicy,
-    ) -> Self {
-        Self {
-            chain_name: chain_name_for(sandbox_id),
-            vm_cidr,
-            allow_ips: Vec::new(),
-            network,
-            host_policy,
-        }
-    }
-
-    pub fn with_allow_ips(mut self, ips: Vec<(Ipv4Addr, String)>) -> Self {
-        self.allow_ips = ips;
-        self
-    }
-
-    /// Lines to apply at `create` time. Each line is a single
-    /// `iptables ...` invocation (without the `iptables` binary
-    /// prefix — the runtime adds that).
-    pub fn create_lines(&self) -> Vec<String> {
-        let comment = &self.chain_name;
-        let cidr = self.vm_cidr.cidr_str();
-        let host = self.vm_cidr.host();
-        let mut out = Vec::new();
-
-        // Build the per-VM chain.
-        out.push(format!("-N {comment}"));
-
-        // 1. Hard-isolation drops (host LAN protection).
-        for net in HOST_LAN_BLOCK {
-            out.push(format!(
-                "-A {comment} -d {net} -j DROP -m comment --comment {comment}-lan",
-            ));
-        }
-
-        // 2. DNS allow to public resolver.
-        for proto in ["udp", "tcp"] {
-            out.push(format!(
-                "-A {comment} -p {proto} --dport 53 -d {dns} -j ACCEPT \
-                 -m comment --comment {comment}-dns",
-                dns = PUBLIC_DNS,
-            ));
-        }
-
-        // 3. Resolved allow_hosts.
-        for (ip, hostname) in &self.allow_ips {
-            out.push(format!(
-                "-A {comment} -d {ip} -j ACCEPT \
-                 -m comment --comment {comment}-allow-{hostname}",
-            ));
-        }
-
-        // 4. Final default.
-        match (self.host_policy, self.network.default) {
-            (NetPolicy::Enforce, NetworkDefault::Deny) => {
-                out.push(format!(
-                    "-A {comment} -j DROP -m comment --comment {comment}-deny",
-                ));
-            }
-            (NetPolicy::LogOnly, NetworkDefault::Deny) => {
-                // Surface what *would* have been blocked so
-                // operators can see if the manifest is missing
-                // entries before flipping to enforce. log-prefix has
-                // no whitespace because the runtime applies rules by
-                // splitting on whitespace; `:` keeps it greppable.
-                out.push(format!(
-                    "-A {comment} -j LOG --log-prefix {comment}:would-drop: \
-                     -m comment --comment {comment}-log",
-                ));
-                out.push(format!(
-                    "-A {comment} -j ACCEPT -m comment --comment {comment}-log-accept",
-                ));
-            }
-            (_, NetworkDefault::Allow) => {
-                out.push(format!(
-                    "-A {comment} -j ACCEPT -m comment --comment {comment}-allow",
-                ));
-            }
-        }
-
-        // Wire FORWARD + INPUT + NAT.
-        out.push(format!(
-            "-I FORWARD -s {cidr} -j {comment} -m comment --comment {comment}",
-        ));
-        out.push(format!(
-            "-I INPUT -s {cidr} -j DROP -m comment --comment {comment}-host-input",
-        ));
-        out.push(format!(
-            "-I INPUT -s {cidr} -d {host} -p icmp -j ACCEPT \
-             -m comment --comment {comment}-icmp",
-        ));
-        out.push(format!(
-            "-t nat -A POSTROUTING -s {cidr} ! -d {pool} -j MASQUERADE \
-             -m comment --comment {comment}-masq",
-            pool = ENGRAM_POOL_CIDR,
-        ));
-
-        out
-    }
-
-    /// Lines to apply at `destroy` time. Reverses each insert and
-    /// flushes/deletes the per-VM chain.
-    pub fn destroy_lines(&self) -> Vec<String> {
-        let comment = &self.chain_name;
-        let cidr = self.vm_cidr.cidr_str();
-        let host = self.vm_cidr.host();
-        vec![
-            format!(
-                "-t nat -D POSTROUTING -s {cidr} ! -d {pool} -j MASQUERADE \
-                 -m comment --comment {comment}-masq",
-                pool = ENGRAM_POOL_CIDR,
-            ),
-            format!(
-                "-D INPUT -s {cidr} -d {host} -p icmp -j ACCEPT \
-                 -m comment --comment {comment}-icmp",
-            ),
-            format!(
-                "-D INPUT -s {cidr} -j DROP -m comment --comment {comment}-host-input",
-            ),
-            format!(
-                "-D FORWARD -s {cidr} -j {comment} -m comment --comment {comment}",
-            ),
-            format!("-F {comment}"),
-            format!("-X {comment}"),
-        ]
-    }
-}
-
-/// Lines applied once at host-agent startup. Idempotent — operators
-/// who restart the coord don't double up the rules. The runtime
-/// dedupes by checking for the comment tag before inserting.
-pub fn host_startup_lines() -> Vec<String> {
-    vec![format!(
+    // 1. Inter-VM block — once. (-I prepends so this beats anything
+    //    distro-installed.)
+    out.push(format!(
         "-I FORWARD 1 -s {pool} -d {pool} -j DROP \
          -m comment --comment engram-isolate-vm-vm",
-        pool = ENGRAM_POOL_CIDR,
-    )]
-}
+    ));
 
-fn chain_name_for(sandbox_id: SandboxId) -> String {
-    let s = sandbox_id.to_string();
-    // Take 12 hex chars — 64 bits of entropy is plenty for chain
-    // uniqueness inside a single host. iptables chain names are
-    // capped at 28 chars; "engram-sb-" is 10, leaving 18.
-    let prefix: String = s
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .take(12)
-        .collect();
-    format!("engram-sb-{prefix}")
+    // 2. Host-LAN protection: VMs can't reach RFC1918 / link-local
+    //    / loopback (the host's own private networks are off-limits).
+    for net in HOST_LAN_BLOCK {
+        out.push(format!(
+            "-A FORWARD -s {pool} -d {net} -j DROP \
+             -m comment --comment engram-host-lan",
+        ));
+    }
+
+    // 3. host-INPUT protection: VMs can't reach the host directly
+    //    (no DNS server bound on the gateway, no SSH, no coord HTTP).
+    //    ICMP from any VM to its own gateway is allowed for diagnostics.
+    out.push(format!(
+        "-A INPUT -s {pool} -j DROP -m comment --comment engram-host-input",
+    ));
+
+    // 4. DNS allow to public resolver. The guest's resolv.conf points
+    //    at 1.1.1.1; the proxy resolves hostnames itself, so DNS
+    //    inside the VM only happens for app-level lookups.
+    out.push(format!(
+        "-A FORWARD -s {pool} -p udp --dport 53 -d {PUBLIC_DNS} \
+         -j ACCEPT -m comment --comment engram-dns",
+    ));
+    out.push(format!(
+        "-A FORWARD -s {pool} -p tcp --dport 53 -d {PUBLIC_DNS} \
+         -j ACCEPT -m comment --comment engram-dns",
+    ));
+
+    if let Some(port) = proxy_port {
+        // 5a. PROXY mode: REDIRECT VM→tcp/443 to the local proxy
+        //     port. -t nat -A PREROUTING with -i tap-engr-+ matches
+        //     any of our TAPs (the `+` is iptables' wildcard).
+        out.push(format!(
+            "-t nat -A PREROUTING -i tap-engr-+ -p tcp --dport 443 \
+             -j REDIRECT --to-port {port} \
+             -m comment --comment engram-proxy-redirect",
+        ));
+        // 5b. After the REDIRECT, the connection is destined for
+        //     the host's local socket; iptables FORWARD doesn't
+        //     see it. So we don't need a separate ACCEPT for that
+        //     traffic. We DO still want to forbid any *other*
+        //     egress: drop everything else from the pool.
+        out.push(format!(
+            "-A FORWARD -s {pool} -j DROP \
+             -m comment --comment engram-default-deny",
+        ));
+    } else {
+        // 5c. NO-PROXY mode: allow non-LAN egress (the host-LAN
+        //     drops above already filtered). MASQUERADE is what
+        //     makes return traffic come back to the right VM.
+    }
+
+    // 6. MASQUERADE on POSTROUTING — required regardless of proxy
+    //    mode for return traffic to reach the VM.
+    out.push(format!(
+        "-t nat -A POSTROUTING -s {pool} ! -d {pool} -j MASQUERADE \
+         -m comment --comment engram-masq",
+    ));
+
+    out
 }
 
 /// Default engram CIDR. Operators override via
@@ -389,12 +256,13 @@ const HOST_LAN_BLOCK: &[&str] = &[
 ];
 
 /// Per-sandbox network state stashed on `LiveSandbox` so destroy
-/// can release the slot and tear down the host-side rules.
+/// can release the slot and delete the TAP. No iptables per-VM —
+/// all policy is global (applied once at host_startup) or at the
+/// proxy.
 #[derive(Clone, Debug)]
 pub struct NetSetup {
     pub vm_cidr: VmCidr,
     pub tap_name: String,
-    pub plan: ChainPlan,
 }
 
 /// Errors from the Linux runtime layer. Distinct from `SandboxError`
@@ -404,7 +272,6 @@ pub struct NetSetup {
 pub enum NetError {
     Spawn(String, std::io::Error),
     Failed { cmd: String, status: i32, stderr: String },
-    Resolve(String, std::io::Error),
     Alloc(AllocError),
 }
 
@@ -415,7 +282,6 @@ impl std::fmt::Display for NetError {
             Self::Failed { cmd, status, stderr } => {
                 write!(f, "{cmd} exited with status {status}: {stderr}")
             }
-            Self::Resolve(host, e) => write!(f, "resolve {host}: {e}"),
             Self::Alloc(e) => write!(f, "alloc: {e}"),
         }
     }
@@ -438,40 +304,6 @@ impl std::fmt::Display for StringError {
 }
 impl std::error::Error for StringError {}
 
-/// Resolve each `manifest.network.allow_hosts` entry to its current
-/// IPv4s. Hostnames are paired with `:443` for the lookup (resolver
-/// requires a port even if we discard it). Failures don't fail the
-/// sandbox create — we log + skip the entry, leaving its IP set
-/// empty (the egress refresher's next tick will retry).
-pub async fn resolve_allow_hosts(hosts: &[String]) -> Vec<(Ipv4Addr, String)> {
-    let mut out = Vec::new();
-    for host in hosts {
-        let target = format!("{host}:443");
-        let result = tokio::net::lookup_host(target).await;
-        match result {
-            Ok(addrs) => {
-                for addr in addrs {
-                    if let std::net::IpAddr::V4(v4) = addr.ip() {
-                        out.push((v4, host.clone()));
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    %host,
-                    error = %e,
-                    "allow_hosts resolve failed; entry will be retried by the egress refresher",
-                );
-            }
-        }
-    }
-    out
-}
-
-/// Run a single `iptables`/`ip` command. Stdout discarded; stderr
-/// captured for error reporting. The runtime spawns these one at a
-/// time — the command set is small enough that batching isn't worth
-/// the complexity (and `iptables-restore` would lock for everyone).
 #[cfg(target_os = "linux")]
 async fn run_cmd(bin: &str, args: &[&str]) -> Result<(), NetError> {
     let mut cmd = tokio::process::Command::new(bin);
@@ -490,22 +322,17 @@ async fn run_cmd(bin: &str, args: &[&str]) -> Result<(), NetError> {
     Ok(())
 }
 
-/// Run an iptables rule line — split on whitespace and exec.
-/// `engram-sb-...` chain names and dotted-quad IPs are
-/// whitespace-free, so split-on-space is safe for the rule shapes
-/// `ChainPlan` produces.
 #[cfg(target_os = "linux")]
 async fn run_iptables(line: &str) -> Result<(), NetError> {
     let argv: Vec<&str> = line.split_whitespace().collect();
     run_cmd("iptables", &argv).await
 }
 
-/// Apply once-per-host startup rules + enable IP forwarding.
-/// Idempotent: each rule has a unique `--comment` tag, and we
-/// check-then-insert so a coord restart doesn't double up.
+/// Apply the static ruleset. Idempotent — each rule has a unique
+/// `--comment` tag and we check-then-insert so a coord restart
+/// doesn't double up.
 #[cfg(target_os = "linux")]
-pub async fn host_startup() -> Result<(), NetError> {
-    // Enable forwarding via /proc/sys (kernel-level toggle).
+pub async fn host_startup(proxy_port: Option<u16>) -> Result<(), NetError> {
     if let Err(e) =
         tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await
     {
@@ -514,16 +341,16 @@ pub async fn host_startup() -> Result<(), NetError> {
             e,
         ));
     }
-
-    for line in host_startup_lines() {
-        // Try a check first (`-C`) — if the rule exists, skip insert.
-        let check_argv: Vec<String> = line
-            .replace("-I FORWARD 1", "-C FORWARD")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        let check_argv_ref: Vec<&str> = check_argv.iter().map(|s| s.as_str()).collect();
-        let exists = run_cmd("iptables", &check_argv_ref).await.is_ok();
+    for line in host_startup_lines(proxy_port) {
+        // Idempotency check: replace the leading `-A`/`-I` with `-C`
+        // (or skip altogether for non-rule meta commands like
+        // create-chain — none of our lines do that today). Order:
+        // `-I FORWARD 1` and `-I INPUT` need a check, NAT-table
+        // inserts need `-t nat -C`. We let iptables tell us via its
+        // exit code: success on -C means "exists, skip insert."
+        let normalized = check_form(&line);
+        let argv: Vec<&str> = normalized.split_whitespace().collect();
+        let exists = run_cmd("iptables", &argv).await.is_ok();
         if !exists {
             run_iptables(&line).await?;
         }
@@ -531,74 +358,52 @@ pub async fn host_startup() -> Result<(), NetError> {
     Ok(())
 }
 
+/// Convert an `-I/-A`-style line into its `-C` (check) twin. We do
+/// the swap textually to avoid duplicating the rule construction.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn check_form(line: &str) -> String {
+    line.replacen("-I FORWARD 1", "-C FORWARD", 1)
+        .replacen("-A FORWARD", "-C FORWARD", 1)
+        .replacen("-A INPUT", "-C INPUT", 1)
+        .replacen("-t nat -A PREROUTING", "-t nat -C PREROUTING", 1)
+        .replacen("-t nat -A POSTROUTING", "-t nat -C POSTROUTING", 1)
+}
+
 /// Provision the host-side networking for a fresh sandbox: alloc
-/// /30, create TAP, assign gateway IP, build per-VM iptables chain.
-/// Returns the [`NetSetup`] the caller stashes on `LiveSandbox`.
+/// a /30, create the TAP, assign the gateway IP, bring it up.
+/// All policy is global; this is just the wire.
 #[cfg(target_os = "linux")]
 pub async fn provision(
     sandbox_id: SandboxId,
     allocator: &parking_lot::Mutex<NetworkAllocator>,
-    network: NetworkPolicy,
-    host_policy: NetPolicy,
 ) -> Result<NetSetup, NetError> {
-    let vm_cidr = allocator
-        .lock()
-        .alloc()
-        .map_err(NetError::Alloc)?;
+    let vm_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
     let tap_name = tap_name_for(sandbox_id);
     let host_addr = format!("{}/30", vm_cidr.host());
 
-    // Create the TAP. `tuntap add ... mode tap` is idempotent on
-    // first failure (returns non-zero if the device already exists),
-    // so we delete first to be safe — leftovers from a previous
-    // crashed sandbox would otherwise wedge create.
     let _ = run_cmd("ip", &["link", "delete", &tap_name]).await;
     run_cmd("ip", &["tuntap", "add", &tap_name, "mode", "tap"]).await?;
     run_cmd("ip", &["addr", "add", &host_addr, "dev", &tap_name]).await?;
     run_cmd("ip", &["link", "set", "dev", &tap_name, "up"]).await?;
 
-    // Resolve allow_hosts now so the chain gets ACCEPT rules for
-    // current IPs. The egress refresher's job is keeping these
-    // honest as DNS rotates.
-    let allow_ips = resolve_allow_hosts(&network.allow_hosts).await;
-    let plan = ChainPlan::new(sandbox_id, vm_cidr, network, host_policy)
-        .with_allow_ips(allow_ips);
-    for line in plan.create_lines() {
-        run_iptables(&line).await?;
-    }
-
-    Ok(NetSetup {
-        vm_cidr,
-        tap_name,
-        plan,
-    })
+    Ok(NetSetup { vm_cidr, tap_name })
 }
 
-/// Tear down the host-side networking. Best-effort: each step's
-/// failure logs but doesn't stop the rest, since the VM is dead and
-/// we want to release as many resources as possible.
+/// Tear down the host-side networking. Best-effort.
 #[cfg(target_os = "linux")]
 pub async fn teardown(
     setup: &NetSetup,
     allocator: &parking_lot::Mutex<NetworkAllocator>,
 ) {
-    for line in setup.plan.destroy_lines() {
-        if let Err(e) = run_iptables(&line).await {
-            tracing::debug!(rule = %line, error = %e, "iptables teardown rule failed");
-        }
-    }
     if let Err(e) = run_cmd("ip", &["link", "delete", &setup.tap_name]).await {
         tracing::debug!(tap = %setup.tap_name, error = %e, "tap delete failed");
     }
     allocator.lock().free(setup.vm_cidr);
 }
 
-// Non-Linux stubs so the rest of the crate compiles cross-platform
-// (macOS dev — the FC backend impl itself is also Linux-gated, but
-// keeping these as plain `unimplemented!` would surface in
-// `cargo check --workspace` runs on Mac).
+// Non-Linux stubs.
 #[cfg(not(target_os = "linux"))]
-pub async fn host_startup() -> Result<(), NetError> {
+pub async fn host_startup(_proxy_port: Option<u16>) -> Result<(), NetError> {
     Err(NetError::Spawn(
         "host_startup".into(),
         std::io::Error::new(
@@ -612,8 +417,6 @@ pub async fn host_startup() -> Result<(), NetError> {
 pub async fn provision(
     _sandbox_id: SandboxId,
     _allocator: &parking_lot::Mutex<NetworkAllocator>,
-    _network: NetworkPolicy,
-    _host_policy: NetPolicy,
 ) -> Result<NetSetup, NetError> {
     Err(NetError::Spawn(
         "provision".into(),
@@ -676,12 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn allocator_pool_size_is_16384() {
-        let a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
-        assert_eq!(a.pool_size, 16384);
-    }
-
-    #[test]
     fn tap_name_fits_in_ifnamsiz() {
         let n = tap_name_for(id());
         assert!(n.len() <= 15, "tap name {n} too long for IFNAMSIZ");
@@ -689,77 +486,44 @@ mod tests {
     }
 
     #[test]
-    fn chain_plan_renders_default_deny_under_enforce() {
-        let cidr = VmCidr::new(Ipv4Addr::from_str("10.200.4.0").unwrap());
-        let plan = ChainPlan::new(id(), cidr, NetworkPolicy::default(), NetPolicy::Enforce);
-        let rendered = plan.create_lines().join("\n");
-        // Hard-isolation rules.
-        assert!(rendered.contains("-d 10.0.0.0/8 -j DROP"));
-        assert!(rendered.contains("-d 192.168.0.0/16 -j DROP"));
-        // DNS allow.
-        assert!(rendered.contains("-p udp --dport 53 -d 1.1.1.1 -j ACCEPT"));
-        // Final deny.
-        assert!(rendered.contains("-deny"));
-        assert!(!rendered.contains("would-drop"));
-        // FORWARD wire-up + MASQUERADE.
-        assert!(rendered.contains("-I FORWARD -s 10.200.4.0/30"));
-        assert!(rendered.contains("MASQUERADE"));
-    }
-
-    #[test]
-    fn chain_plan_renders_log_only_under_log_policy() {
-        let cidr = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
-        let plan = ChainPlan::new(id(), cidr, NetworkPolicy::default(), NetPolicy::LogOnly);
-        let rendered = plan.create_lines().join("\n");
-        assert!(rendered.contains("would-drop"));
-        // log-prefix must not contain whitespace — the runtime
-        // splits on space, and a quoted `--log-prefix "x y "` would
-        // be parsed as multiple args by iptables.
-        assert!(!rendered.contains("would-drop "));
-        assert!(rendered.contains("-log-accept"));
-        // No final DROP under log_only.
-        assert!(!rendered.contains("-deny"));
-    }
-
-    #[test]
-    fn chain_plan_includes_resolved_allow_hosts() {
-        let cidr = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
-        let mut policy = NetworkPolicy::default();
-        policy.allow_hosts = vec!["api.github.com".into()];
-        let plan = ChainPlan::new(id(), cidr, policy, NetPolicy::Enforce).with_allow_ips(vec![
-            (Ipv4Addr::from_str("140.82.114.6").unwrap(), "api.github.com".into()),
-        ]);
-        let rendered = plan.create_lines().join("\n");
-        assert!(rendered.contains("-d 140.82.114.6 -j ACCEPT"));
-        assert!(rendered.contains("-allow-api.github.com"));
-    }
-
-    #[test]
-    fn chain_plan_destroy_lines_undo_create_lines() {
-        let cidr = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
-        let plan = ChainPlan::new(id(), cidr, NetworkPolicy::default(), NetPolicy::Enforce);
-        let destroy = plan.destroy_lines().join("\n");
-        // Symmetric -D for FORWARD/INPUT/POSTROUTING; -F + -X to
-        // tear down the chain itself.
-        assert!(destroy.contains("-D FORWARD"));
-        assert!(destroy.contains("-D INPUT"));
-        assert!(destroy.contains("-D POSTROUTING"));
-        assert!(destroy.contains("-F engram-sb-"));
-        assert!(destroy.contains("-X engram-sb-"));
-    }
-
-    #[test]
-    fn host_startup_lines_block_inter_vm() {
-        let lines = host_startup_lines().join("\n");
+    fn host_startup_no_proxy_drops_lan_but_allows_internet() {
+        let lines = host_startup_lines(None).join("\n");
+        // Inter-VM block.
         assert!(lines.contains("-s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP"));
-        assert!(lines.contains("engram-isolate-vm-vm"));
+        // Host-LAN drops.
+        assert!(lines.contains("-d 10.0.0.0/8 -j DROP"));
+        assert!(lines.contains("-d 192.168.0.0/16 -j DROP"));
+        // DNS allow.
+        assert!(lines.contains("--dport 53 -d 1.1.1.1"));
+        // No proxy redirect.
+        assert!(!lines.contains("REDIRECT"));
+        // No final default-deny — internet egress is open.
+        assert!(!lines.contains("engram-default-deny"));
+        // MASQUERADE present so return traffic reaches the VM.
+        assert!(lines.contains("MASQUERADE"));
     }
 
     #[test]
-    fn net_policy_parses_both_forms() {
-        assert_eq!(NetPolicy::parse("enforce"), Ok(NetPolicy::Enforce));
-        assert_eq!(NetPolicy::parse("log_only"), Ok(NetPolicy::LogOnly));
-        assert_eq!(NetPolicy::parse("log-only"), Ok(NetPolicy::LogOnly));
-        assert!(NetPolicy::parse("strict").is_err());
+    fn host_startup_with_proxy_redirects_443_and_default_denies() {
+        let lines = host_startup_lines(Some(9443)).join("\n");
+        assert!(lines.contains("-i tap-engr-+ -p tcp --dport 443"));
+        assert!(lines.contains("--to-port 9443"));
+        assert!(lines.contains("engram-default-deny"));
+    }
+
+    #[test]
+    fn check_form_swaps_insert_for_check() {
+        assert_eq!(
+            check_form("-I FORWARD 1 -s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP"),
+            "-C FORWARD -s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP",
+        );
+        assert_eq!(
+            check_form("-A INPUT -s 10.200.0.0/16 -j DROP"),
+            "-C INPUT -s 10.200.0.0/16 -j DROP",
+        );
+        assert_eq!(
+            check_form("-t nat -A POSTROUTING -s 10.200.0.0/16 -j MASQUERADE"),
+            "-t nat -C POSTROUTING -s 10.200.0.0/16 -j MASQUERADE",
+        );
     }
 }

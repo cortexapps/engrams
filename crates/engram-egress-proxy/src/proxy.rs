@@ -193,7 +193,7 @@ fn original_destination(stream: &TcpStream) -> Result<(IpAddr, u16), HandleError
     {
         let sock = socket2::SockRef::from(stream);
         let dst = sock
-            .original_dst()
+            .original_dst_v4()
             .map_err(HandleError::OriginalDest)?;
         if let Some(v4) = dst.as_socket_ipv4() {
             return Ok((IpAddr::V4(*v4.ip()), v4.port()));
