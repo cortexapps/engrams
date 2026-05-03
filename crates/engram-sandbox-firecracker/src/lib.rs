@@ -95,6 +95,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
+pub mod net;
 
 pub use client::{
     ActionType, BootSource, DriveConfig, FirecrackerClient, MachineConfig, SnapshotPaths, VmState,
