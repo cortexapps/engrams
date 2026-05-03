@@ -16,13 +16,21 @@ What this exercises:
 What this also exercises (after the harness path landed):
 - Harness-driven flow on Firecracker: in-VM `engram-bootstrap`
   listens on vsock 1025; the host's `start_agent` pushes a
-  `BootstrapLaunch` frame; bootstrap exec's
-  `/sbin/engram-harness-noop`; the harness dials AF_VSOCK
-  CID=2 port=1026 back to a per-sandbox UDS the FC backend
-  pre-bound; events land in `session_events` and drive
-  the same `harness_hub.idle_sandboxes(ttl)` path used by
-  ProcessBackend. Idle eviction fires automatically after
-  60s without harness events.
+  `BootstrapLaunch` frame; bootstrap exec's the harness from
+  `/run/engram/harnesses/<name>/harness` (mounted from the
+  read-only ext4 substrate attached as `/dev/vdb`); the harness
+  dials AF_VSOCK CID=2 port=1026 back to a per-sandbox UDS the
+  FC backend pre-bound; events land in `session_events` and
+  drive the same `harness_hub.idle_sandboxes(ttl)` path used by
+  ProcessBackend. Idle eviction fires automatically after 60s
+  without harness events. End-to-end coverage in
+  `crates/engram-sandbox-firecracker/tests/harness_loopback.rs`.
+- Per-VM hard-isolation networking: each sandbox gets its own
+  `/30` from the engram pool (default `10.200.0.0/16`), a TAP on
+  the host, and an iptables chain enforcing
+  `manifest.network.allow_hosts`. No shared L2, no DHCP server,
+  no host-LAN reachability from the guest. SHELL tab works.
+  Coverage in `tests/network_provision.rs` (run with sudo).
 - Auto-resume on the FC path: a session that idle-evicted
   comes back via FC's UFFD-backed snapshot restore on the
   next `exec`, transparent to the caller.
@@ -134,10 +142,14 @@ curl -s -X POST http://localhost:8090/sessions/$SID/exec \
 - Smart-bootstrap on FC with a real Git repo (`git+https://...`
   session, observe checkpoint push). Should "just work" against
   this stack since smart-bootstrap is `git fetch + reset` over
-  the existing exec channel.
-- Phase 5: `engram-bootstrap` inside the rootfs so harness-
-  driven flow (auto-noop, idle eviction, auto-checkpoint) works
-  on FC. Until then, idle eviction is a no-op for FC sessions.
+  the existing exec channel — and the per-VM iptables chain
+  auto-allows the Git URL's host.
 - Snapshot size optimization: 4 GiB per snapshot is the
   default-memory ceiling. Sessions with smaller resource hints
   in `engram.toml` would produce smaller snapshots.
+- Egress refresher (30-min DNS re-resolve) so long-lived
+  sandboxes catch CDN IP rotation. At create time the chain is
+  populated with a fresh resolve; long sessions need refresh.
+- Restore-time net re-provisioning: snapshot/restore currently
+  loses the per-VM /30 (the manifest doesn't carry it). Restored
+  sandboxes have no egress until destroyed and re-created.

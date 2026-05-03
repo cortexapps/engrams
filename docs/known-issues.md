@@ -119,24 +119,18 @@ shell capability token issued at create-time and verified on the
 upgrade — same shape as the existing harness attach token. Out of
 scope for the current PR; the shell feature ships as a dev tool.
 
-## 5. Browser shell only works on the VZ backend
+## 5. ~~Browser shell only works on the VZ backend~~ (FIXED)
 
-**File**: `crates/engram-sandbox-firecracker/src/lib.rs:498-574` —
-`create_in_jail` configures `machine-config`, `boot-source`, `drives`,
-and `vsock` but never calls `put_network_interfaces`. As a result,
-FC guests have no `eth0`, no DHCP, no IP routing from the host —
-nothing for the shell proxy to dial.
+**Resolved** by the FC parity work. FC now provisions a per-VM `/30`
+with a TAP terminated on the host, applies a per-VM iptables chain
+with hard-isolation rules + `manifest.network.allow_hosts`
+enforcement, and overrides `SandboxBackend::guest_ip` to query the
+in-VM agent. The dashboard SHELL tab works against FC sessions.
 
-`SandboxBackend::guest_ip` returns `None` from the trait default,
-which `FirecrackerBackend` inherits. The dashboard surfaces this as
-`shell unavailable for this session` and skips opening the WebSocket.
-
-**Fix**: wire TAP networking on FC. Provision a TAP device per
-sandbox, call `PUT /network-interfaces/{id}` on the FC HTTP API, add
-`ip=dhcp` to the kernel cmdline (matching VZ), and have agentd report
-the lease back via the existing `WireRequest::GuestIp` verb. ~4–5
-days. Tracking out-of-band — there's no FC-on-Linux production
-deployment depending on it yet.
+See `crates/engram-sandbox-firecracker/src/net.rs` for the topology
+(per-VM `/30`, no shared bridge, no DHCP, static IP via kernel `ip=`
+cmdline) and `tests/network_provision.rs` /
+`tests/harness_loopback.rs` for end-to-end coverage.
 
 ## 6. No system-wide event stream on the coordinator
 
