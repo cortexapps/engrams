@@ -12,8 +12,8 @@ use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 use engram_core::types::{
-    HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
-    SnapshotRecord,
+    HarnessPack, HostRecord, HostStatus, ImageVersion, PersistedEvent, RegistryCredential, Session,
+    SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -514,5 +514,154 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         rows.iter().map(row::persisted_event_from_row).collect()
+    }
+
+    // ---------- registry credentials ----------
+
+    async fn upsert_registry_credential(&self, cred: RegistryCredential) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO registry_credentials
+                (id, registry_host, username,
+                 wrapped_dek, nonce, ciphertext, key_id,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
+            ON CONFLICT (registry_host, username) DO UPDATE SET
+                wrapped_dek = EXCLUDED.wrapped_dek,
+                nonce       = EXCLUDED.nonce,
+                ciphertext  = EXCLUDED.ciphertext,
+                key_id      = EXCLUDED.key_id,
+                updated_at  = NOW()
+            "#,
+        )
+        .bind(cred.id)
+        .bind(&cred.registry_host)
+        .bind(&cred.username)
+        .bind(&cred.wrapped_dek)
+        .bind(&cred.nonce)
+        .bind(&cred.ciphertext)
+        .bind(&cred.key_id)
+        .bind(cred.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_registry_credentials(&self) -> Result<Vec<RegistryCredential>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, registry_host, username,
+                   wrapped_dek, nonce, ciphertext, key_id,
+                   created_at, updated_at
+              FROM registry_credentials
+             ORDER BY registry_host, username
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::registry_credential_from_row).collect()
+    }
+
+    async fn registry_credential_for_host(
+        &self,
+        registry_host: &str,
+    ) -> Result<Option<RegistryCredential>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, registry_host, username,
+                   wrapped_dek, nonce, ciphertext, key_id,
+                   created_at, updated_at
+              FROM registry_credentials
+             WHERE registry_host = $1
+             ORDER BY COALESCE(updated_at, created_at) DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(registry_host)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::registry_credential_from_row(&r))
+            .transpose()
+    }
+
+    async fn delete_registry_credential(&self, registry_host: &str) -> Result<(), MetaError> {
+        let res = sqlx::query("DELETE FROM registry_credentials WHERE registry_host = $1")
+            .bind(registry_host)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ---------- harness packs ----------
+
+    async fn upsert_harness_pack(&self, pack: HarnessPack) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO harness_packs
+                (id, name, registry_uri, description, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NULL)
+            ON CONFLICT (name) DO UPDATE SET
+                registry_uri = EXCLUDED.registry_uri,
+                description  = EXCLUDED.description,
+                updated_at   = NOW()
+            "#,
+        )
+        .bind(pack.id)
+        .bind(&pack.name)
+        .bind(&pack.registry_uri)
+        .bind(pack.description.as_deref())
+        .bind(pack.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, registry_uri, description, created_at, updated_at
+              FROM harness_packs
+             ORDER BY name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::harness_pack_from_row).collect()
+    }
+
+    async fn get_harness_pack(&self, name: &str) -> Result<Option<HarnessPack>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, registry_uri, description, created_at, updated_at
+              FROM harness_packs
+             WHERE name = $1
+            "#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::harness_pack_from_row(&r)).transpose()
+    }
+
+    async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError> {
+        let res = sqlx::query("DELETE FROM harness_packs WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
     }
 }

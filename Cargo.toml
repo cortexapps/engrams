@@ -24,6 +24,8 @@ members = [
     "crates/engram-secrets-gcp",
     "crates/engram-postgres",
     "crates/engram-egress-proxy",
+    "crates/engram-crypto",
+    "crates/engram-oci",
 ]
 
 [workspace.package]
@@ -57,6 +59,8 @@ engram-image-builder = { path = "crates/engram-image-builder" }
 engram-agentd = { path = "crates/engram-agentd" }
 engram-uffd-handler = { path = "crates/engram-uffd-handler" }
 engram-egress-proxy = { path = "crates/engram-egress-proxy" }
+engram-crypto = { path = "crates/engram-crypto" }
+engram-oci = { path = "crates/engram-oci" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }

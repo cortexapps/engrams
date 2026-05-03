@@ -5,6 +5,7 @@ use crate::types::event::PersistedEvent;
 use crate::types::host::{HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::image::ImageVersion;
+use crate::types::registry::{HarnessPack, RegistryCredential};
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
 
@@ -103,4 +104,34 @@ pub trait MetadataStore: Send + Sync {
         since: i64,
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError>;
+
+    // ---- registry credentials (Phase 5) ----
+
+    /// Insert or replace a registry credential row. The
+    /// `wrapped_dek` / `nonce` / `ciphertext` come from
+    /// `engram-crypto::CredCipher::seal`. `(registry_host, username)`
+    /// is the natural key — re-adding the same pair updates the
+    /// cipher fields in place.
+    async fn upsert_registry_credential(&self, cred: RegistryCredential) -> Result<(), MetaError>;
+
+    async fn list_registry_credentials(&self) -> Result<Vec<RegistryCredential>, MetaError>;
+
+    /// Look up the credential row for a given registry host. Returns
+    /// `None` when no row exists — callers fall back to anonymous
+    /// access (works for public registries and `localhost:5000`).
+    /// When more than one row exists for the same host, returns the
+    /// most-recently-updated row.
+    async fn registry_credential_for_host(
+        &self,
+        registry_host: &str,
+    ) -> Result<Option<RegistryCredential>, MetaError>;
+
+    async fn delete_registry_credential(&self, registry_host: &str) -> Result<(), MetaError>;
+
+    // ---- harness packs (Phase 5) ----
+
+    async fn upsert_harness_pack(&self, pack: HarnessPack) -> Result<(), MetaError>;
+    async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError>;
+    async fn get_harness_pack(&self, name: &str) -> Result<Option<HarnessPack>, MetaError>;
+    async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError>;
 }

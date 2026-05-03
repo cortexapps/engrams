@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use engram_core::types::session::{HarnessSpec, ImageRef, SessionKind, WorkspaceSpec};
 use engram_core::types::{
-    HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent,
-    Session, SessionStatus, SnapshotRecord,
+    HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus, ImageVersion,
+    PersistedEvent, RegistryCredential, Session, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, ImageVersionId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
@@ -120,6 +120,37 @@ pub(crate) fn image_from_row(row: &PgRow) -> Result<ImageVersion, MetaError> {
         blob_url: row.try_get("blob_url").map_err(col_err)?,
         status: parse_image_status(&status)?,
         created_at,
+    })
+}
+
+pub(crate) fn registry_credential_from_row(row: &PgRow) -> Result<RegistryCredential, MetaError> {
+    let id: Uuid = row.try_get("id").map_err(col_err)?;
+    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
+    let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
+    Ok(RegistryCredential {
+        id,
+        registry_host: row.try_get("registry_host").map_err(col_err)?,
+        username: row.try_get("username").map_err(col_err)?,
+        wrapped_dek: row.try_get("wrapped_dek").map_err(col_err)?,
+        nonce: row.try_get("nonce").map_err(col_err)?,
+        ciphertext: row.try_get("ciphertext").map_err(col_err)?,
+        key_id: row.try_get("key_id").map_err(col_err)?,
+        created_at,
+        updated_at,
+    })
+}
+
+pub(crate) fn harness_pack_from_row(row: &PgRow) -> Result<HarnessPack, MetaError> {
+    let id: Uuid = row.try_get("id").map_err(col_err)?;
+    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
+    let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
+    Ok(HarnessPack {
+        id,
+        name: row.try_get("name").map_err(col_err)?,
+        registry_uri: row.try_get("registry_uri").map_err(col_err)?,
+        description: row.try_get("description").map_err(col_err)?,
+        created_at,
+        updated_at,
     })
 }
 

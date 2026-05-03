@@ -1,0 +1,25 @@
+[package]
+name = "engram-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Envelope encryption (KEK->DEK) for Engram. KEK providers: env-var, GCP KMS (stub)."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde = { workspace = true, optional = true }
+tracing.workspace = true
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
