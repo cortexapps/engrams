@@ -194,7 +194,21 @@ Track C: Local dev — `registry:2` in docker-compose, `just
 bootstrap` for KEK generation, `just dev-{vz,firecracker}` brings
 the registry up automatically.
 
-Track D (deferred): Host-agent pull path — content-addressable
-cache, OCI client wired into `SandboxBackend::create`, per-session
-single-harness substrate rebuild on harness change. Coordinator
-falls back to legacy on-disk paths until host-agent track lands.
+Track D: Host-agent pull path — content-addressable cache, OCI
+client wired into `SandboxBackend::create`, per-session single-
+harness substrate ext4 build (mke2fs from a `<name>/` symlink
+staging tree). Coordinator falls back to legacy on-disk paths
+when `image_versions.blob_url` is NULL or `harness_packs` has no
+matching row.
+
+Track E (5b): Polymorphic auth — `RegistryAuthSpec` enum dispatches
+between static (envelope-encrypted in Postgres) and cloud-IAM
+kinds (today: GCP Workload Identity via the `gcp_auth` crate).
+AWS instance role / cross-account assume-role / GCP impersonation
+slot in as new variants without schema migration. New crate
+`engram-oci-auth` composes engram-oci/engram-core/engram-crypto
+into a single `PgAuthResolver` that the coordinator wires into the
+OCI client. ADR 0004 amended to reflect the SaaS-shape decision:
+"every registry has the same credential shape" was the wrong
+framing; we now model registry auth as variant-discriminated and
+let the variant decide whether stored secret material exists.

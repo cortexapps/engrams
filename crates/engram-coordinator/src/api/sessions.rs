@@ -193,22 +193,52 @@ pub async fn create_session(
     // live above the image now (mounted via virtio-fs from
     // `cfg.harnesses_dir` at `/run/engram/harnesses`) so the closed
     // set of valid names is deployment-wide, not per-image.
-    if let HarnessSpec::Builtin { name } = &req.harness {
-        if state.services.harnesses.lookup(name).is_none() {
-            let available: Vec<&str> = state
-                .services
-                .harnesses
-                .entries()
-                .iter()
-                .map(|h| h.name.as_str())
-                .collect();
-            return Err(ApiError::BadRequest(format!(
-                "no harness `{name}` registered on this host (available: {available:?}). \
-                 Drop the binary in `cfg.harnesses_dir` (default \
-                 `./var/engram/harnesses/`) and restart the coord."
-            )));
+    // Phase 5+: harness packs may be Postgres-registered (registry-
+    // backed) or legacy host-resident. Postgres rows take precedence;
+    // legacy scan covers single-host dev boxes that haven't migrated.
+    // We validate now so the error path at session-create is clear,
+    // and stash the resolved registry URI (if any) for the
+    // SandboxSpec construction below.
+    let harness_pack_uri: Option<String> = if let HarnessSpec::Builtin { name } = &req.harness {
+        let registry_pack = state
+            .services
+            .meta
+            .get_harness_pack(name)
+            .await
+            .map_err(|e| ApiError::Internal(format!("harness lookup: {e}")))?;
+        match registry_pack {
+            Some(p) => Some(p.registry_uri),
+            None => {
+                // Fall back to the legacy host-resident registry.
+                if state.services.harnesses.lookup(name).is_none() {
+                    let pg_available: Vec<String> = state
+                        .services
+                        .meta
+                        .list_harness_packs()
+                        .await
+                        .map(|v| v.into_iter().map(|p| p.name).collect())
+                        .unwrap_or_default();
+                    let host_available: Vec<&str> = state
+                        .services
+                        .harnesses
+                        .entries()
+                        .iter()
+                        .map(|h| h.name.as_str())
+                        .collect();
+                    return Err(ApiError::BadRequest(format!(
+                        "no harness `{name}` registered. \
+                         Postgres harness_packs: {pg_available:?}; \
+                         host-resident: {host_available:?}. \
+                         Add via `engram harness add` or drop the binary \
+                         in `cfg.harnesses_dir` and restart the coord."
+                    )));
+                }
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
 
     // -------- 2. Resolve secrets --------
     let secret_ctx = SecretContext {
@@ -331,11 +361,21 @@ pub async fn create_session(
         .filter(|iv| iv.tag == image_tag)
         .and_then(|iv| iv.blob_url);
 
+    // When the harness comes from the registry, the host-agent
+    // builds its own per-session substrate from the URI. Suppress
+    // the legacy substrate path so the host-agent doesn't mount
+    // both — the OCI puller's substrate wins.
+    let harness_substrate_for_spec = if harness_pack_uri.is_some() {
+        None
+    } else {
+        harness_substrate
+    };
+
     let vm_spec = VmSpec {
         image: image_tag.clone(),
         rootfs_source: rootfs_source_from(Some(&resolved)),
         image_uri: blob_url,
-        harness_pack_uri: None,
+        harness_pack_uri,
         cpu: CpuLimit {
             vcpus: manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS),
         },
@@ -354,7 +394,7 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
-        harness_substrate,
+        harness_substrate: harness_substrate_for_spec,
         network,
     };
 
