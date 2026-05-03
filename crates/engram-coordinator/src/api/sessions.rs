@@ -98,7 +98,10 @@ fn host_from_url(raw: &str) -> Option<String> {
     }
     // SSH form: `git@github.com:cortex/api.git`. Take the substring
     // between `@` and the first `:`.
-    if let Some(rest) = raw.strip_prefix("git@").or_else(|| raw.split_once('@').map(|(_, r)| r)) {
+    if let Some(rest) = raw
+        .strip_prefix("git@")
+        .or_else(|| raw.split_once('@').map(|(_, r)| r))
+    {
         if let Some((host, _)) = rest.split_once(':') {
             if !host.is_empty() {
                 return Some(host.to_string());

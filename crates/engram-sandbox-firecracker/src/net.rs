@@ -153,7 +153,11 @@ impl NetworkAllocator {
 /// leaving 6 for the sandbox ID prefix.
 pub fn tap_name_for(sandbox_id: SandboxId) -> String {
     let s = sandbox_id.to_string();
-    let prefix: String = s.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
+    let prefix: String = s
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(6)
+        .collect();
     format!("tap-engr-{prefix}")
 }
 
@@ -282,7 +286,11 @@ pub struct NetSetup {
 #[derive(Debug)]
 pub enum NetError {
     Spawn(String, std::io::Error),
-    Failed { cmd: String, status: i32, stderr: String },
+    Failed {
+        cmd: String,
+        status: i32,
+        stderr: String,
+    },
     Alloc(AllocError),
 }
 
@@ -290,7 +298,11 @@ impl std::fmt::Display for NetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(cmd, e) => write!(f, "spawn {cmd}: {e}"),
-            Self::Failed { cmd, status, stderr } => {
+            Self::Failed {
+                cmd,
+                status,
+                stderr,
+            } => {
                 write!(f, "{cmd} exited with status {status}: {stderr}")
             }
             Self::Alloc(e) => write!(f, "alloc: {e}"),
@@ -344,9 +356,7 @@ async fn run_iptables(line: &str) -> Result<(), NetError> {
 /// doesn't double up.
 #[cfg(target_os = "linux")]
 pub async fn host_startup(proxy_port: Option<u16>) -> Result<(), NetError> {
-    if let Err(e) =
-        tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await
-    {
+    if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await {
         return Err(NetError::Spawn(
             "write /proc/sys/net/ipv4/ip_forward".into(),
             e,
@@ -360,12 +370,7 @@ pub async fn host_startup(proxy_port: Option<u16>) -> Result<(), NetError> {
     // Setting `all` covers all current and future TAPs without
     // having to set it per-interface.
     if proxy_port.is_some() {
-        if let Err(e) = tokio::fs::write(
-            "/proc/sys/net/ipv4/conf/all/route_localnet",
-            b"1",
-        )
-        .await
-        {
+        if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", b"1").await {
             return Err(NetError::Spawn(
                 "write /proc/sys/net/ipv4/conf/all/route_localnet".into(),
                 e,
@@ -422,10 +427,7 @@ pub async fn provision(
 
 /// Tear down the host-side networking. Best-effort.
 #[cfg(target_os = "linux")]
-pub async fn teardown(
-    setup: &NetSetup,
-    allocator: &parking_lot::Mutex<NetworkAllocator>,
-) {
+pub async fn teardown(setup: &NetSetup, allocator: &parking_lot::Mutex<NetworkAllocator>) {
     if let Err(e) = run_cmd("ip", &["link", "delete", &setup.tap_name]).await {
         tracing::debug!(tap = %setup.tap_name, error = %e, "tap delete failed");
     }

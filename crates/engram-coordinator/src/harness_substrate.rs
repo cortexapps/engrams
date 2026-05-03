@@ -255,9 +255,15 @@ mod tests {
     #[tokio::test]
     async fn hash_dir_is_stable_for_same_content() {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(tmp.path().join("a")).await.unwrap();
-        tokio::fs::write(tmp.path().join("a/x"), b"hello").await.unwrap();
-        tokio::fs::write(tmp.path().join("y"), b"world").await.unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("a"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("a/x"), b"hello")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("y"), b"world")
+            .await
+            .unwrap();
 
         let h1 = hash_dir(tmp.path()).await.unwrap();
         let h2 = hash_dir(tmp.path()).await.unwrap();
@@ -293,9 +299,13 @@ mod tests {
     #[tokio::test]
     async fn build_returns_none_for_missing_dir_and_no_ca() {
         let work = tempfile::tempdir().unwrap();
-        let s = build(Path::new("/nonexistent/engram-harnesses"), work.path(), None)
-            .await
-            .unwrap();
+        let s = build(
+            Path::new("/nonexistent/engram-harnesses"),
+            work.path(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(s.is_none());
     }
 

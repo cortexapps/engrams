@@ -214,10 +214,8 @@ where
 fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
-    let restrictive = matches!(
-        network.default,
-        engram_core::types::NetworkDefault::Deny
-    ) && !network.allow_hosts.is_empty();
+    let restrictive = matches!(network.default, engram_core::types::NetworkDefault::Deny)
+        && !network.allow_hosts.is_empty();
     if restrictive && !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "VZ does not enforce manifest.network.allow_hosts; macOS's NAT path is \

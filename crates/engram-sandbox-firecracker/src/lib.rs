@@ -287,10 +287,10 @@ impl FirecrackerBackend {
         // Allocator over the configured pool; falls back to a
         // throwaway 0.0.0.0 pool when networking is disabled (the
         // allocator is created but never consulted in that mode).
-        let pool = config.net_pool.unwrap_or_else(|| "0.0.0.0".parse().unwrap());
-        let net_allocator = Arc::new(parking_lot::Mutex::new(
-            net::NetworkAllocator::new(pool),
-        ));
+        let pool = config
+            .net_pool
+            .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+        let net_allocator = Arc::new(parking_lot::Mutex::new(net::NetworkAllocator::new(pool)));
         Self {
             work_dir: work_dir.into(),
             config,
@@ -595,9 +595,10 @@ impl FirecrackerBackend {
         spec: SandboxSpec,
         net_setup: Option<&net::NetSetup>,
     ) -> Result<(), SandboxError> {
-        let rootfs = spec.rootfs_source.clone().ok_or_else(|| {
-            SandboxError::InvalidSpec("rootfs_source missing".into())
-        })?;
+        let rootfs = spec
+            .rootfs_source
+            .clone()
+            .ok_or_else(|| SandboxError::InvalidSpec("rootfs_source missing".into()))?;
         let (socket, child) = self.spawn_firecracker(jail_dir).await?;
 
         // Configure + start. Any failure here means the Child gets
@@ -1160,10 +1161,7 @@ impl SandboxBackend for FirecrackerBackend {
             api.put_action(ActionType::SendCtrlAltDel).await?;
             // Wait for the firecracker process to exit on its own.
             // `Child::wait` returns once the process is reaped.
-            live.child
-                .wait()
-                .await
-                .map_err(SandboxError::from)
+            live.child.wait().await.map_err(SandboxError::from)
         };
         match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful).await {
             Ok(Ok(_)) => {
@@ -1254,9 +1252,12 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
         let fut = async {
-            let mut conn =
-                Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await.ok()?;
-            engram_agentd::write_msg(&mut conn, &WireRequest::GuestIp).await.ok()?;
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .ok()?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::GuestIp)
+                .await
+                .ok()?;
             let resp: engram_agentd::WireResponse =
                 engram_agentd::read_msg(&mut conn).await.ok()?;
             match resp {

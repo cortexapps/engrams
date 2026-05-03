@@ -27,12 +27,10 @@
 /// placeholders are short (~30 bytes) and there are few per session
 /// (typically <10), so this is cheap. Returns the first match.
 pub fn first_match<'a>(buf: &[u8], placeholders: &'a [&str]) -> Option<&'a str> {
-    for ph in placeholders {
-        if memmem(buf, ph.as_bytes()) {
-            return Some(ph);
-        }
-    }
-    None
+    placeholders
+        .iter()
+        .find(|ph| memmem(buf, ph.as_bytes()))
+        .copied()
 }
 
 /// `memchr::memmem` would be a better choice for production, but we
@@ -54,7 +52,7 @@ mod tests {
     fn finds_placeholder_in_body() {
         let body = b"POST /v1/chat HTTP/1.1\r\nAuthorization: Bearer engram_ph_abc_def\r\n\r\n";
         let placeholders = ["engram_ph_abc_def", "engram_ph_xxx_yyy"];
-        let placeholders: Vec<&str> = placeholders.iter().copied().collect();
+        let placeholders: Vec<&str> = placeholders.to_vec();
         assert_eq!(first_match(body, &placeholders), Some("engram_ph_abc_def"));
     }
 

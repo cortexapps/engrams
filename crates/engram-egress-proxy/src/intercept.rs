@@ -25,8 +25,8 @@
 
 use std::sync::Arc;
 
-use rustls::{ClientConfig, ServerConfig};
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -42,7 +42,7 @@ use crate::substitute::{scan_for_violation, substitute};
 /// JSON bodies are tens of KiB at the high end. Streaming uploads
 /// past this mark just don't get scanned (and a streaming upload
 /// with a placeholder at byte 1M+1 is not a realistic attack).
-const SCAN_BUDGET: usize = 1 * 1024 * 1024;
+const SCAN_BUDGET: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum InterceptError {
@@ -208,6 +208,7 @@ impl rustls::server::ResolvesServerCert for SniResolver {
 /// [`crate::replayed::Replayed`]. The upstream is dialed by SNI
 /// through `resolver`, not by guest-supplied IP — see the
 /// `resolver` module for why.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<C>(
     client_stream: C,
     peeked: Vec<u8>,

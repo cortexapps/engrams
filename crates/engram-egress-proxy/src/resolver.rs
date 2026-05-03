@@ -14,7 +14,7 @@
 //! loopback fake-upstream without owning a real DNS name.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 #[async_trait::async_trait]
@@ -56,7 +56,7 @@ impl UpstreamResolver for SystemResolver {
         let target = format!("{host}:{port}");
         let mut addrs = tokio::net::lookup_host(target).await?;
         for a in addrs.by_ref() {
-            if let IpAddr::V4(_) = a.ip() {
+            if a.ip().is_ipv4() {
                 return Ok(a);
             }
         }

@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
-use rustls::crypto::ring::sign::any_supported_type;
 
 use crate::ca::Ca;
 
@@ -56,31 +56,23 @@ impl CertMint {
             dn.push(DnType::CommonName, hostname);
             dn
         };
-        params.subject_alt_names = vec![SanType::DnsName(
-            hostname
-                .to_string()
-                .try_into()
-                .map_err(|_| MintError::Rcgen(format!("invalid hostname `{hostname}`")))?,
-        )];
+        params.subject_alt_names =
+            vec![SanType::DnsName(hostname.to_string().try_into().map_err(
+                |_| MintError::Rcgen(format!("invalid hostname `{hostname}`")),
+            )?)];
         // 25h validity — slightly over a day so we don't churn at
         // exactly the same wall-clock time tomorrow.
         use chrono::Datelike;
         let now = chrono::Utc::now();
         let earlier = now - chrono::Duration::minutes(5);
         let later = now + chrono::Duration::hours(25);
-        params.not_before = rcgen::date_time_ymd(
-            earlier.year(),
-            earlier.month() as u8,
-            earlier.day() as u8,
-        );
-        params.not_after = rcgen::date_time_ymd(
-            later.year(),
-            later.month() as u8,
-            later.day() as u8,
-        );
+        params.not_before =
+            rcgen::date_time_ymd(earlier.year(), earlier.month() as u8, earlier.day() as u8);
+        params.not_after =
+            rcgen::date_time_ymd(later.year(), later.month() as u8, later.day() as u8);
 
-        let leaf_kp = KeyPair::generate()
-            .map_err(|e| MintError::Rcgen(format!("leaf keygen: {e}")))?;
+        let leaf_kp =
+            KeyPair::generate().map_err(|e| MintError::Rcgen(format!("leaf keygen: {e}")))?;
         // Reload the CA's certificate from its persisted PEM. The CA
         // keeps its KeyPair + Params (regenerable cert), but rcgen's
         // sign API takes a `&Certificate` value, not `&Params` — so
@@ -98,8 +90,7 @@ impl CertMint {
         let leaf_der = leaf.der().to_vec();
         let key_der = leaf_kp.serialize_der();
         let cert = CertificateDer::from(leaf_der);
-        let key: PrivateKeyDer<'static> =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+        let key: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
         let signing_key = any_supported_type(&key)
             .map_err(|e| MintError::Rustls(format!("any_supported_type: {e}")))?;
         Ok(Arc::new(CertifiedKey::new(vec![cert], signing_key)))

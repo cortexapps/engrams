@@ -450,9 +450,8 @@ fn build_configuration(
                 true,
             )
             .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
-            let sub_attachment_super: Retained<
-                objc2_virtualization::VZStorageDeviceAttachment,
-            > = Retained::cast_unchecked(sub_attachment);
+            let sub_attachment_super: Retained<objc2_virtualization::VZStorageDeviceAttachment> =
+                Retained::cast_unchecked(sub_attachment);
             let sub_block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),
                 &sub_attachment_super,

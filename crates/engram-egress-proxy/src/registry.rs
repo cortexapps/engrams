@@ -118,7 +118,10 @@ impl SessionState {
     /// destined for a non-allowed host is a footgun even if the
     /// connection itself is otherwise allowed.
     pub fn all_placeholders(&self) -> Vec<&str> {
-        self.secrets.iter().map(|s| s.placeholder.as_str()).collect()
+        self.secrets
+            .iter()
+            .map(|s| s.placeholder.as_str())
+            .collect()
     }
 }
 
@@ -156,7 +159,10 @@ mod tests {
 
     #[test]
     fn decision_intercept_when_secret_allows() {
-        assert!(matches!(state().decide("api.openai.com"), Decision::Intercept(_)));
+        assert!(matches!(
+            state().decide("api.openai.com"),
+            Decision::Intercept(_)
+        ));
     }
 
     #[test]

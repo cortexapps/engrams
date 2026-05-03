@@ -168,8 +168,7 @@ fn iptables_cleanup() {
         let Some(rest) = line.strip_prefix("-A ") else {
             continue;
         };
-        let mut argv =
-            vec!["-t".to_string(), current_table.clone(), "-D".to_string()];
+        let mut argv = vec!["-t".to_string(), current_table.clone(), "-D".to_string()];
         argv.extend(rest.split_whitespace().map(str::to_string));
         let _ = std::process::Command::new("iptables").args(&argv).output();
     }
@@ -212,14 +211,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     // ---- 2. Spin up the fake upstream + StaticResolver pointing at it ----
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let upstream_addr = fake_upstream(captured.clone()).await;
-    let resolver = Arc::new(
-        engram_egress_proxy::StaticResolver::new().with(TEST_HOST, upstream_addr),
-    );
+    let resolver =
+        Arc::new(engram_egress_proxy::StaticResolver::new().with(TEST_HOST, upstream_addr));
 
     let proxy_port: u16 = 19443;
     let proxy_bind: SocketAddr = format!("0.0.0.0:{proxy_port}").parse().unwrap();
-    let mut proxy_cfg =
-        engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
+    let mut proxy_cfg = engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
     proxy_cfg.resolver = resolver;
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
     tokio::spawn(async move {
@@ -322,8 +319,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     let secret = engram_egress_proxy::SecretEntry {
         placeholder: "engram_ph_e2e_xxx".into(),
         real_value: "sk-real-secret-from-host".into(),
-        allow: engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[])
-            .unwrap(),
+        allow: engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap(),
     };
     let network_allow =
         engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap();
@@ -374,14 +370,20 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     if exit != Some(0) {
         let ipt = std::process::Command::new("iptables-save").output();
         if let Ok(o) = ipt {
-            eprintln!("--- iptables-save ---\n{}\n--- end ---", String::from_utf8_lossy(&o.stdout));
+            eprintln!(
+                "--- iptables-save ---\n{}\n--- end ---",
+                String::from_utf8_lossy(&o.stdout)
+            );
         }
         let taps = std::process::Command::new("sh")
             .arg("-c")
             .arg("ip a | grep -B 1 -A 5 tap-engr-")
             .output();
         if let Ok(o) = taps {
-            eprintln!("--- host TAPs ---\n{}\n--- end ---", String::from_utf8_lossy(&o.stdout));
+            eprintln!(
+                "--- host TAPs ---\n{}\n--- end ---",
+                String::from_utf8_lossy(&o.stdout)
+            );
         }
     }
 

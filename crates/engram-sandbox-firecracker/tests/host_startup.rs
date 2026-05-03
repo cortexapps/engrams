@@ -21,8 +21,7 @@
 use engram_sandbox_firecracker::net::host_startup;
 
 fn require_root() -> bool {
-    let status =
-        std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
     let line = status
         .lines()
         .find(|l| l.starts_with("Uid:"))
@@ -73,9 +72,7 @@ fn cleanup() {
         };
         let mut argv = vec!["-t".to_string(), current_table.clone(), "-D".to_string()];
         argv.extend(rest.split_whitespace().map(str::to_string));
-        let _ = std::process::Command::new("iptables")
-            .args(&argv)
-            .output();
+        let _ = std::process::Command::new("iptables").args(&argv).output();
     }
 }
 
@@ -92,9 +89,15 @@ async fn host_startup_no_proxy_is_idempotent_and_lacks_redirect() {
 
     let dump = iptables_save();
     // Hard-isolation rules present.
-    assert!(dump.contains("engram-isolate-vm-vm"), "missing inter-VM block");
+    assert!(
+        dump.contains("engram-isolate-vm-vm"),
+        "missing inter-VM block"
+    );
     assert!(dump.contains("engram-host-lan"), "missing host-LAN drops");
-    assert!(dump.contains("engram-host-input"), "missing host-INPUT drop");
+    assert!(
+        dump.contains("engram-host-input"),
+        "missing host-INPUT drop"
+    );
     assert!(dump.contains("engram-dns"), "missing DNS allow");
     assert!(dump.contains("engram-masq"), "missing MASQUERADE");
     // No proxy mode → no REDIRECT, no default-deny.

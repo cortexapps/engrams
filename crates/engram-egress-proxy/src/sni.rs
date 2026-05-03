@@ -185,8 +185,9 @@ mod tests {
     async fn extracts_sni_from_well_formed_client_hello() {
         let bytes = client_hello_with_sni("api.github.com");
         let mut cur = Cursor::new(bytes.clone());
-        let (sni, replay) =
-            peek_sni(&mut cur, 16 * 1024, Duration::from_secs(1)).await.unwrap();
+        let (sni, replay) = peek_sni(&mut cur, 16 * 1024, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(sni, "api.github.com");
         assert_eq!(replay, bytes);
     }
@@ -195,7 +196,9 @@ mod tests {
     async fn lowercases_sni() {
         let bytes = client_hello_with_sni("API.GitHub.COM");
         let mut cur = Cursor::new(bytes);
-        let (sni, _) = peek_sni(&mut cur, 16 * 1024, Duration::from_secs(1)).await.unwrap();
+        let (sni, _) = peek_sni(&mut cur, 16 * 1024, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(sni, "api.github.com");
     }
 
@@ -210,7 +213,9 @@ mod tests {
         // test is "non-TLS data does not produce a successful
         // SNI extraction."
         let mut cur = Cursor::new(b"GET / HTTP/1.1\r\n\r\n".to_vec());
-        let err = peek_sni(&mut cur, 16 * 1024, Duration::from_secs(1)).await.unwrap_err();
+        let err = peek_sni(&mut cur, 16 * 1024, Duration::from_secs(1))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             PeekError::MalformedClientHello | PeekError::NotClientHello | PeekError::Eof,
@@ -221,7 +226,9 @@ mod tests {
     async fn times_out_on_truncated_client_hello() {
         // Send only the record header, never complete the body.
         let mut cur = Cursor::new(vec![0x16, 0x03, 0x01, 0x01, 0x00]);
-        let err = peek_sni(&mut cur, 16 * 1024, Duration::from_millis(50)).await.unwrap_err();
+        let err = peek_sni(&mut cur, 16 * 1024, Duration::from_millis(50))
+            .await
+            .unwrap_err();
         assert!(matches!(err, PeekError::Timeout | PeekError::Eof));
     }
 }

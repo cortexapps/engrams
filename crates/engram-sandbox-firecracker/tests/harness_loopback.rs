@@ -28,14 +28,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::sandbox::{
-    AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
-};
+use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::SandboxId;
 use engram_harness_proto::HarnessEvent;
 use engram_image_builder::{
-    AgentInjection, BuildRequest, Builder, DockerCli, Ext4Packer, Format, Mke2fsPacker,
-    Transport,
+    AgentInjection, BuildRequest, Builder, DockerCli, Ext4Packer, Format, Mke2fsPacker, Transport,
 };
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
@@ -57,7 +54,9 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
 
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
-    let musl = target_root.join("x86_64-unknown-linux-musl").join("release");
+    let musl = target_root
+        .join("x86_64-unknown-linux-musl")
+        .join("release");
     let agent_bin = musl.join("engram-agentd");
     let bootstrap_bin = musl.join("engram-bootstrap");
     let noop_bin = musl.join("engram-harness-noop");
@@ -136,8 +135,7 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     // for ext4 metadata + room to grow. A 16 MiB minimum prevents
     // mke2fs from rejecting tiny images.
     let dir_size = std::fs::metadata(pack_dir.join("harness")).unwrap().len();
-    let substrate_size =
-        engram_image_builder::recommended_size(dir_size).max(16 * 1024 * 1024);
+    let substrate_size = engram_image_builder::recommended_size(dir_size).max(16 * 1024 * 1024);
     Mke2fsPacker::default()
         .pack(substrate_src.path(), &substrate_path, substrate_size)
         .await
@@ -168,15 +166,14 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
         tokio::spawn(async move {
             let mut stream = stream;
             let (mut reader, mut writer) = tokio::io::split(stream.as_mut());
-            let _attach: engram_harness_proto::HarnessAttach = match
-                engram_harness_proto::read_msg(&mut reader).await
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("test sink: handshake read failed: {e}");
-                    return;
-                }
-            };
+            let _attach: engram_harness_proto::HarnessAttach =
+                match engram_harness_proto::read_msg(&mut reader).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("test sink: handshake read failed: {e}");
+                        return;
+                    }
+                };
             let ack = engram_harness_proto::HarnessAttachAck {
                 ok: true,
                 message: None,
@@ -186,10 +183,8 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
                 return;
             }
             while let Ok(frame) =
-                engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(
-                    &mut reader,
-                )
-                .await
+                engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader)
+                    .await
             {
                 if let engram_harness_proto::HarnessFrame::Event(ev) = frame {
                     collected.lock().push(ev);

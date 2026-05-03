@@ -77,8 +77,8 @@ impl Ca {
     fn generate_and_persist(cert_path: &Path, key_path: &Path) -> Result<Self, CaError> {
         let params = build_params();
 
-        let key_pair = KeyPair::generate()
-            .map_err(|e| CaError::Rcgen(format!("ca keygen: {e}")))?;
+        let key_pair =
+            KeyPair::generate().map_err(|e| CaError::Rcgen(format!("ca keygen: {e}")))?;
         let cert = params
             .clone()
             .self_signed(&key_pair)
@@ -112,10 +112,8 @@ fn build_params() -> CertificateParams {
     use chrono::Datelike;
     let now = chrono::Utc::now();
     let later = now + chrono::Duration::days(3650);
-    params.not_before =
-        rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
-    params.not_after =
-        rcgen::date_time_ymd(later.year(), later.month() as u8, later.day() as u8);
+    params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
+    params.not_after = rcgen::date_time_ymd(later.year(), later.month() as u8, later.day() as u8);
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![
         rcgen::KeyUsagePurpose::KeyCertSign,

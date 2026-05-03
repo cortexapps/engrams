@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use engram_egress_proxy::ca::Ca;
 use engram_egress_proxy::cert_mint::CertMint;
-use engram_egress_proxy::intercept::{self, build_client_config, build_server_config, InterceptError};
+use engram_egress_proxy::intercept::{
+    self, build_client_config, build_server_config, InterceptError,
+};
 use engram_egress_proxy::policy::HostList;
 use engram_egress_proxy::registry::SecretEntry;
 use engram_egress_proxy::resolver::StaticResolver;
@@ -107,9 +109,7 @@ async fn substitutes_placeholder_in_intercept_path() {
     let secret = entry("engram_ph_xxx_yyy", "sk-real", &["fake-upstream"]);
     let server_cfg_for_task = server_cfg.clone();
     let client_cfg_for_task = client_cfg.clone();
-    let resolver = Arc::new(
-        StaticResolver::new().with("fake-upstream", upstream_addr),
-    );
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
         let secrets: Vec<&SecretEntry> = vec![&secret];
         intercept::run(
@@ -139,9 +139,11 @@ async fn substitutes_placeholder_in_intercept_path() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(cli_cfg));
-    let server_name: rustls::pki_types::ServerName<'static> =
-        "fake-upstream".try_into().unwrap();
-    let mut tls_client = connector.connect(server_name, client_to_proxy).await.unwrap();
+    let server_name: rustls::pki_types::ServerName<'static> = "fake-upstream".try_into().unwrap();
+    let mut tls_client = connector
+        .connect(server_name, client_to_proxy)
+        .await
+        .unwrap();
 
     tls_client
         .write_all(
@@ -198,9 +200,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
     // NOT by the secret's allow_hosts (so substitution skips it
     // and the violation scanner sees the placeholder).
     let secret = entry("engram_ph_xxx_yyy", "sk-real", &["api.openai.com"]);
-    let resolver = Arc::new(
-        StaticResolver::new().with("fake-upstream", upstream_addr),
-    );
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
         let secrets: Vec<&SecretEntry> = vec![&secret];
         intercept::run(
@@ -227,9 +227,11 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(cli_cfg));
-    let server_name: rustls::pki_types::ServerName<'static> =
-        "fake-upstream".try_into().unwrap();
-    let mut tls_client = connector.connect(server_name, client_to_proxy).await.unwrap();
+    let server_name: rustls::pki_types::ServerName<'static> = "fake-upstream".try_into().unwrap();
+    let mut tls_client = connector
+        .connect(server_name, client_to_proxy)
+        .await
+        .unwrap();
     tls_client
         .write_all(
             b"POST / HTTP/1.1\r\nHost: fake-upstream\r\nAuthorization: Bearer engram_ph_xxx_yyy\r\n\r\n",

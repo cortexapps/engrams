@@ -54,11 +54,7 @@ impl ProxyConfig {
     /// Convenience constructor: production wiring with the system
     /// DNS resolver and the bind addr / registry / mint the caller
     /// provides.
-    pub fn new(
-        bind_addr: SocketAddr,
-        registry: Arc<Registry>,
-        mint: Arc<CertMint>,
-    ) -> Self {
+    pub fn new(bind_addr: SocketAddr, registry: Arc<Registry>, mint: Arc<CertMint>) -> Self {
         Self {
             bind_addr,
             registry,
@@ -128,9 +124,7 @@ async fn handle(
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => return Err(HandleError::NoSession),
     };
-    let session = registry
-        .lookup(guest_ip)
-        .ok_or(HandleError::NoSession)?;
+    let session = registry.lookup(guest_ip).ok_or(HandleError::NoSession)?;
 
     // Pre-REDIRECT destination — useful only for logs. We don't
     // dial it; the upstream is resolved fresh by SNI on the host.
@@ -170,14 +164,7 @@ async fn handle(
         }
         Decision::Intercept(secrets) => {
             let result = intercept::run(
-                stream,
-                peeked,
-                &sni,
-                port,
-                resolver,
-                &secrets,
-                server_cfg,
-                client_cfg,
+                stream, peeked, &sni, port, resolver, &secrets, server_cfg, client_cfg,
             )
             .await;
             match result {
@@ -229,9 +216,7 @@ fn original_destination(stream: &TcpStream) -> Result<(IpAddr, u16), HandleError
     #[cfg(target_os = "linux")]
     {
         let sock = socket2::SockRef::from(stream);
-        let dst = sock
-            .original_dst_v4()
-            .map_err(HandleError::OriginalDest)?;
+        let dst = sock.original_dst_v4().map_err(HandleError::OriginalDest)?;
         if let Some(v4) = dst.as_socket_ipv4() {
             return Ok((IpAddr::V4(*v4.ip()), v4.port()));
         }
