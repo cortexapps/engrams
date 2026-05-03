@@ -14,7 +14,10 @@ name: CI
 #                       the FC image bake chain)
 #   - test-firecracker: every `#[ignore]`'d FC integration test
 #                       (boot, lifecycle, snapshot, snapshot_uffd,
-#                       exec_real_vm) under nested virt.
+#                       exec_real_vm, harness_loopback) under nested
+#                       virt, plus the root-required suite
+#                       (host_startup, proxy_e2e) under sudo for
+#                       iptables + TAP creation.
 #   - web:              pnpm install + tsc + vite build + vitest
 #
 # All jobs run on Blacksmith Linux runners
@@ -270,16 +273,25 @@ jobs:
       - name: Build engram-uffd-handler
         run: cargo build -p engram-uffd-handler
 
-      # exec_real_vm bakes a static agent into a rootfs at runtime and
-      # boots it; the binary must be musl-static so it runs against
-      # whatever libc the rootfs ships.
-      - name: Build static engram-agentd (musl)
-        run: cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
+      # exec_real_vm + harness_loopback bake static binaries into a
+      # rootfs at runtime and boot it; the binaries must be musl-static
+      # so they run against whatever libc the rootfs ships. proxy_e2e
+      # additionally needs engram-bootstrap and engram-harness-noop
+      # statically linked for the harness path it shares with
+      # harness_loopback.
+      - name: Build static musl binaries (agentd / bootstrap / noop)
+        run: |
+          cargo build \
+            -p engram-agentd \
+            -p engram-bootstrap \
+            -p engram-harness-noop \
+            --target x86_64-unknown-linux-musl \
+            --release
 
-      # Run all five `#[ignore]`'d FC integration tests:
-      #   boot, lifecycle, snapshot, snapshot_uffd, exec_real_vm.
-      # `--no-fail-fast` so a regression in one test doesn't hide
-      # regressions in others.
+      # Run the `#[ignore]`'d FC integration tests that don't need
+      # root: boot, lifecycle, snapshot, snapshot_uffd, exec_real_vm,
+      # harness_loopback. `--no-fail-fast` so a regression in one test
+      # doesn't hide regressions in others.
       #
       # `--test-threads=1` is load-bearing: each test creates its own
       # `FirecrackerBackend`, whose vsock CID allocator restarts at 3
@@ -288,10 +300,47 @@ jobs:
       # when it can't bind a CID). Production runs one backend per
       # host so this isn't an issue there. Booting real microVMs is
       # heavy enough that serial execution is fine.
-      - name: Firecracker `#[ignore]` tests
+      #
+      # We name the test binaries explicitly (rather than
+      # `--run-ignored ignored-only`) because the root-required
+      # tests (host_startup, proxy_e2e) live in the same crate and
+      # would otherwise be invoked here only to short-circuit via
+      # their `require_root()` SKIP path — leaving the gap silent.
+      - name: Firecracker `#[ignore]` tests (unprivileged)
         run: |
           cargo nextest run \
             -p engram-sandbox-firecracker \
+            --test boot \
+            --test lifecycle \
+            --test snapshot \
+            --test snapshot_uffd \
+            --test exec_real_vm \
+            --test harness_loopback \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
+
+      # Root-required tests: host_startup applies real iptables rules,
+      # proxy_e2e provisions a TAP device and runs the full
+      # guest→TAP→REDIRECT→proxy→upstream chain. Both need
+      # CAP_NET_ADMIN, which on Blacksmith runners means sudo. We
+      # `-E` to keep the cargo / rustc env (CARGO_HOME, RUSTUP_HOME,
+      # PATH) so the binary can be found, and chown back at the end
+      # so the rust-cache action can read /target without permission
+      # errors. Docker buildx scratchpad (~/.docker/buildx) also gets
+      # touched by proxy_e2e's image bake; cleanup includes it.
+      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e)
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-sandbox-firecracker \
+            --test host_startup \
+            --test proxy_e2e \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+        # Run after either success or failure so cache write doesn't
+        # trip on root-owned files.
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
