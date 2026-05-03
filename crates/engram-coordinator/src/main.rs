@@ -208,7 +208,7 @@ async fn main() -> Result<(), CoordinatorError> {
                     )
                 })?;
                 let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-                fc_cfg.net_pool = cli.fc_net_cidr;
+                fc_cfg.net_pool = Some(cli.fc_net_cidr);
                 fc_cfg.net_policy = cli.fc_net_policy;
                 let fc = Arc::new(FirecrackerBackend::new(
                     cli.sandbox_work_dir.clone(),

@@ -172,10 +172,13 @@ pub struct FirecrackerConfig {
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
     /// Engram CIDR pool — every sandbox gets a unique /30 carved out
-    /// of this. Defaults to `10.200.0.0/16` (16k slots). Operators
-    /// override via `--fc-net-cidr` if they're already using
-    /// `10.200.0.0/16` for something else on the host.
-    pub net_pool: std::net::Ipv4Addr,
+    /// of this. `Some(10.200.0.0)` (the default) provisions per-VM
+    /// TAPs + iptables rules; production deployments always want
+    /// this. `None` skips all networking provisioning, leaving the
+    /// guest with no `eth0`. Used by the unprivileged integration
+    /// tests (`tests/lifecycle.rs` etc.) which can't `ip tuntap add`
+    /// without `CAP_NET_ADMIN`. Override via `--fc-net-cidr`.
+    pub net_pool: Option<std::net::Ipv4Addr>,
     /// Soft-launch switch for the per-VM iptables policy. `LogOnly`
     /// (the default) renders LOG-and-ACCEPT for the final default
     /// rule so existing manifests that haven't declared their
@@ -205,9 +208,8 @@ impl FirecrackerConfig {
     /// the guest. Override `default_boot_args` after construction if
     /// you're booting an image that handles agent launch differently.
     pub fn with_kernel(kernel_image_path: impl Into<PathBuf>) -> Self {
-        let net_pool: std::net::Ipv4Addr = "10.200.0.0".parse().unwrap();
         Self {
-            net_pool,
+            net_pool: Some("10.200.0.0".parse().unwrap()),
             net_policy: net::NetPolicy::default(),
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
@@ -281,8 +283,12 @@ pub struct FirecrackerBackend {
 
 impl FirecrackerBackend {
     pub fn new(work_dir: impl Into<PathBuf>, config: FirecrackerConfig) -> Self {
+        // Allocator over the configured pool; falls back to a
+        // throwaway 0.0.0.0 pool when networking is disabled (the
+        // allocator is created but never consulted in that mode).
+        let pool = config.net_pool.unwrap_or_else(|| "0.0.0.0".parse().unwrap());
         let net_allocator = Arc::new(parking_lot::Mutex::new(
-            net::NetworkAllocator::new(config.net_pool),
+            net::NetworkAllocator::new(pool),
         ));
         Self {
             work_dir: work_dir.into(),
@@ -296,9 +302,12 @@ impl FirecrackerBackend {
 
     /// Apply once-per-host networking setup: enable IP forwarding,
     /// install the inter-VM block rule. Idempotent — safe to call
-    /// from a coordinator restart. Linux-only; on macOS this is a
-    /// no-op since the FC backend itself doesn't run.
+    /// from a coordinator restart. No-op when `config.net_pool` is
+    /// None (tests / disabled-networking deployments).
     pub async fn host_startup(&self) -> Result<(), SandboxError> {
+        if self.config.net_pool.is_none() {
+            return Ok(());
+        }
         net::host_startup().await.map_err(SandboxError::from)
     }
 
@@ -549,22 +558,31 @@ impl FirecrackerBackend {
         // inside a closure so any failure between here and the
         // `LiveSandbox` insert tears down the TAP + iptables rules
         // and frees the /30 — otherwise a failed create would leak
-        // host-side state.
-        let net_setup = net::provision(
-            sandbox_id,
-            &self.net_allocator,
-            spec.network.clone(),
-            self.config.net_policy,
-        )
-        .await?;
+        // host-side state. Skipped entirely when networking is
+        // disabled (tests).
+        let net_setup = if self.config.net_pool.is_some() {
+            Some(
+                net::provision(
+                    sandbox_id,
+                    &self.net_allocator,
+                    spec.network.clone(),
+                    self.config.net_policy,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         let result = self
-            .create_in_jail_after_net(sandbox_id, jail_dir, spec, &net_setup)
+            .create_in_jail_after_net(sandbox_id, jail_dir, spec, net_setup.as_ref())
             .await;
         match result {
             Ok(()) => Ok(()),
             Err(e) => {
-                net::teardown(&net_setup, &self.net_allocator).await;
+                if let Some(setup) = net_setup.as_ref() {
+                    net::teardown(setup, &self.net_allocator).await;
+                }
                 Err(e)
             }
         }
@@ -580,7 +598,7 @@ impl FirecrackerBackend {
         sandbox_id: SandboxId,
         jail_dir: &Path,
         spec: SandboxSpec,
-        net_setup: &net::NetSetup,
+        net_setup: Option<&net::NetSetup>,
     ) -> Result<(), SandboxError> {
         let rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec("rootfs_source missing".into())
@@ -601,13 +619,16 @@ impl FirecrackerBackend {
         .await?;
         // Append the per-sandbox `ip=...` to the kernel cmdline so
         // CONFIG_IP_PNP brings up eth0 with the guest's static
-        // address before init runs. The base default_boot_args ends
-        // with `init=/sbin/engram-init`; our addition rides after it.
-        let boot_args = format!(
-            "{} {}",
-            self.config.default_boot_args.trim_end(),
-            net_setup.vm_cidr.kernel_ip_arg(),
-        );
+        // address before init runs. Skipped when networking is
+        // disabled — the guest boots without an eth0.
+        let boot_args = match net_setup {
+            Some(setup) => format!(
+                "{} {}",
+                self.config.default_boot_args.trim_end(),
+                setup.vm_cidr.kernel_ip_arg(),
+            ),
+            None => self.config.default_boot_args.clone(),
+        };
         api.put_boot_source(&BootSource {
             kernel_image_path: self.config.kernel_image_path.to_string_lossy().into_owned(),
             boot_args,
@@ -643,14 +664,15 @@ impl FirecrackerBackend {
         // virtio-net: bind FC to the TAP we provisioned above. The
         // TAP already has the host-side gateway IP and is admin-up,
         // so FC just opens it and bridges the virtio-net frontend
-        // onto it. iface_id "eth0" is by convention; the kernel
-        // names devices in attach order anyway.
-        api.put_network_interface(&NetworkInterface {
-            iface_id: "eth0".into(),
-            host_dev_name: net_setup.tap_name.clone(),
-            guest_mac: None,
-        })
-        .await?;
+        // onto it. Skipped when networking is disabled.
+        if let Some(setup) = net_setup {
+            api.put_network_interface(&NetworkInterface {
+                iface_id: "eth0".into(),
+                host_dev_name: setup.tap_name.clone(),
+                guest_mac: None,
+            })
+            .await?;
+        }
 
         // Vsock — must be configured BEFORE InstanceStart. Firecracker
         // creates the host-side UDS at vsock_uds_path; host→guest
@@ -695,7 +717,7 @@ impl FirecrackerBackend {
                 state,
                 child,
                 uffd_handler: None,
-                net: Some(net_setup.clone()),
+                net: net_setup.cloned(),
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
@@ -1339,7 +1361,7 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: RestoreMode::File,
-            net_pool: "10.200.0.0".parse().unwrap(),
+            net_pool: None,
             net_policy: net::NetPolicy::default(),
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)

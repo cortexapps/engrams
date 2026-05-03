@@ -50,6 +50,8 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         .expect("clone rootfs into tempdir");
 
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // Unprivileged test — see lifecycle.rs comment.
+    cfg.net_pool = None;
     cfg.uffd_handler_bin = handler;
     cfg.restore_mode = RestoreMode::Uffd;
     // Public ubuntu-22.04 rootfs has no /sbin/engram-init; default

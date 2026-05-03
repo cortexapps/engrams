@@ -48,6 +48,8 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // dead. Override the init to a binary that's actually present
     // in the rootfs so the VM stays alive for the snapshot pause.
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // Unprivileged test — see lifecycle.rs comment.
+    cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
 

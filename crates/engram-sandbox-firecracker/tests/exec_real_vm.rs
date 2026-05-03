@@ -102,6 +102,8 @@ async fn exec_runs_inside_baked_microvm() {
     // ---- 2. Set up FC backend, boot the microVM ----
     let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // Unprivileged test — see lifecycle.rs comment.
+    cfg.net_pool = None;
     // Boot directly into our init shim. Without this the kernel
     // would try to exec /sbin/init (debian's systemd) which we
     // don't have configured.

@@ -39,7 +39,12 @@ async fn create_list_destroy_round_trip() {
         .await
         .expect("clone rootfs into tempdir");
 
-    let backend = FirecrackerBackend::new(work.path(), FirecrackerConfig::with_kernel(env.kernel));
+    // Tests run unprivileged — disable per-VM TAP/iptables provisioning
+    // (CAP_NET_ADMIN required) so the lifecycle round-trip exercises
+    // FC's create/destroy contract without depending on root.
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
         image: "fc-lifecycle-test".into(),
