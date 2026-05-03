@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -143,19 +144,6 @@ pub async fn create_session(
                 .into(),
         ));
     }
-    // `LocalMount` requires host→guest sharing. FC's virtio-fs
-    // story is future work; reject upfront when the active backend
-    // doesn't advertise support rather than silently dropping the
-    // mount inside the backend. Track FC parity in the plan's
-    // "open questions" §3.
-    if matches!(req.workspace, WorkspaceSpec::LocalMount { .. })
-        && !state.services.sandbox.supports_local_mount()
-    {
-        return Err(ApiError::BadRequest(
-            "`workspace.local_mount` is not supported by the active sandbox backend (typically Firecracker); use VZ or Process"
-                .into(),
-        ));
-    }
 
     let ImageRef::Registry {
         repo: image_repo,
@@ -273,37 +261,16 @@ pub async fn create_session(
         &spec_env,
     )?;
 
-    // Mounts wired into the SandboxSpec at create time so the
-    // backend's virtio-fs / bind layer sees them before VM boot:
-    //
-    //   1. Harness substrate at `/run/engram/harnesses` (read-only).
-    //      Always present when the host has any harnesses registered;
-    //      the `[[harness]]` block in engram.toml is gone — harness
-    //      binaries live above the image now, on the host. The
-    //      bootstrap supervisor exec's `/run/engram/harnesses/<name>`
-    //      for `HarnessSpec::Builtin{name}`.
-    //   2. Optional `LocalMount` workspace if the session asked for
-    //      one.
-    let mut mounts: Vec<engram_core::types::sandbox::MountSpec> = Vec::new();
-    if !state.services.harnesses.entries().is_empty() {
-        mounts.push(engram_core::types::sandbox::MountSpec {
-            host_path: state.services.harnesses.host_dir().to_path_buf(),
-            guest_path: crate::harness_registry::HarnessRegistry::guest_mount_path().to_path_buf(),
-            read_only: true,
-        });
-    }
-    if let WorkspaceSpec::LocalMount {
-        host_path,
-        guest_path,
-        read_only,
-    } = &req.workspace
-    {
-        mounts.push(engram_core::types::sandbox::MountSpec {
-            host_path: host_path.clone(),
-            guest_path: guest_path.clone(),
-            read_only: *read_only,
-        });
-    }
+    // Harness substrate: read-only ext4 image of `cfg.harnesses_dir`,
+    // built once at coordinator startup. Backends attach it as the
+    // second virtio-blk drive (`/dev/vdb`); the init shim mounts it
+    // at `/run/engram/harnesses`. `None` when the substrate failed
+    // to build at startup (logged) or the dir is empty.
+    let harness_substrate: Option<PathBuf> = state
+        .services
+        .harness_substrate
+        .as_ref()
+        .map(|s| s.path.clone());
 
     let vm_spec = VmSpec {
         image: image_tag.clone(),
@@ -326,7 +293,7 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
-        mounts,
+        harness_substrate,
     };
 
     // -------- 5. Schedule + create the sandbox --------

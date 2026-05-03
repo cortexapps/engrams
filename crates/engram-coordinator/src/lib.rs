@@ -15,6 +15,7 @@ pub mod dead_host;
 pub mod error;
 pub mod git_workdir;
 pub mod harness_registry;
+pub mod harness_substrate;
 pub mod host_registry;
 pub mod idle_evictor;
 pub mod image_registry;
@@ -39,9 +40,15 @@ pub struct Services {
     pub images: image_registry::ImageRegistry,
     /// Host-side harness registry — the closed set of
     /// `HarnessSpec::Builtin{name}` values a session may request.
-    /// Resolved from `cfg.harnesses_dir` at startup; mounted into
-    /// every sandbox's `/run/engram/harnesses` via virtio-fs.
+    /// Resolved from `cfg.harnesses_dir` at startup; visible inside
+    /// every sandbox at `/run/engram/harnesses` via the substrate
+    /// below.
     pub harnesses: Arc<harness_registry::HarnessRegistry>,
+    /// Read-only ext4 image of `cfg.harnesses_dir`, attached as the
+    /// second virtio-blk drive on every sandbox. `None` means "no
+    /// harnesses to make available" (empty registry, or substrate
+    /// build failed at startup — logged but non-fatal).
+    pub harness_substrate: Option<harness_substrate::Substrate>,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.

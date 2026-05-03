@@ -298,12 +298,9 @@ impl std::error::Error for StringError {}
 impl SandboxBackend for HostRegistry {
     // Capability methods report a deployment-wide answer — they're
     // queried before a per-session host pick happens (e.g. by
-    // `resolve_harness` and `GET /api/images`), so we assume all
-    // registered hosts agree on the answer. In --mode=all there's
-    // exactly one host, which is unambiguous; in --mode=coordinator
-    // with mixed-backend hosts the answer is the conservative
-    // intersection (`supports_local_mount` returns true only if
-    // EVERY host supports it).
+    // `resolve_harness`), so we assume all registered hosts agree on
+    // the answer. In --mode=all there's exactly one host; in
+    // --mode=coordinator with mixed-backend hosts the first host wins.
     fn harness_dial(&self) -> engram_core::traits::HarnessDial {
         // First registered host's value; default Vsock when empty
         // (no hosts yet — the API will fail before reaching here for
@@ -313,19 +310,6 @@ impl SandboxBackend for HostRegistry {
             .next()
             .map(|entry| entry.value().backend.harness_dial())
             .unwrap_or(engram_core::traits::HarnessDial::Vsock)
-    }
-
-    fn supports_local_mount(&self) -> bool {
-        // All-hosts-agree (intersection). An empty registry returns
-        // false — there's no host to serve a LocalMount session.
-        let mut iter = self.hosts.iter();
-        let Some(first) = iter.next() else {
-            return false;
-        };
-        if !first.value().backend.supports_local_mount() {
-            return false;
-        }
-        iter.all(|entry| entry.value().backend.supports_local_mount())
     }
 
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
@@ -419,7 +403,7 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 

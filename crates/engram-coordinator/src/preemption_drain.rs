@@ -350,6 +350,7 @@ mod tests {
             secrets: Arc::new(InMemorySecretStore::new()),
             images: ImageRegistry::new(images_dir),
             harnesses: Arc::new(crate::harness_registry::HarnessRegistry::empty()),
+            harness_substrate: None,
         };
         let cfg = CoordinatorConfig {
             local_path,
@@ -368,7 +369,7 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 

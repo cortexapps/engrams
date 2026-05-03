@@ -137,8 +137,6 @@ function formatRepo(s: Session): string {
   switch (s.workspace.kind) {
     case 'empty':
       return `${s.image.repo} (empty)`;
-    case 'local_mount':
-      return `${s.image.repo} ← ${s.workspace.host_path}`;
     case 'git': {
       const branch =
         s.workspace.branch && s.workspace.branch !== 'main'

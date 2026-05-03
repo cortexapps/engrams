@@ -22,13 +22,7 @@ export type ImageRef = { kind: 'registry'; repo: string; tag: string };
 
 export type WorkspaceSpec =
   | { kind: 'empty' }
-  | { kind: 'git'; url: string; branch: string; read_only: boolean }
-  | {
-      kind: 'local_mount';
-      host_path: string;
-      guest_path: string;
-      read_only: boolean;
-    };
+  | { kind: 'git'; url: string; branch: string; read_only: boolean };
 
 export type HarnessSpec =
   | { kind: 'none' }
@@ -101,13 +95,6 @@ export interface ImageDescriptor {
   /** "literal" or "broker" — broker images reject browser-pasted secrets. */
   secret_mode: string;
   required_secrets: RequiredSecret[];
-  /**
-   * Whether this deployment's sandbox backend supports
-   * `WorkspaceSpec.local_mount`. False on Firecracker; true on
-   * VZ / Process. Surfaced per-image so the form can gray out
-   * the "local mount" radio without a separate /api/host call.
-   */
-  supports_local_mount: boolean;
 }
 
 // ---- Session creation -------------------------------------------------

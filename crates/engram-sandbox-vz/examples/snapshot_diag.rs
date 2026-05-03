@@ -116,7 +116,7 @@ async fn run_scenario(
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        mounts: Vec::new(),
+        harness_substrate: None,
     };
 
     eprintln!("[diag] backend.create — booting VM");

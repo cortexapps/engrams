@@ -184,9 +184,9 @@ mod tests {
             SandboxBackendChoice::Vz,
         );
         // `process` was an intermediate-phase variant before harness
-        // dispatch + LocalMount support moved onto the SandboxBackend
-        // trait; the test-only ProcessBackend now reports its own
-        // capabilities and the enum no longer enumerates it.
+        // dispatch moved onto the SandboxBackend trait; the test-only
+        // ProcessBackend now reports its own capabilities and the enum
+        // no longer enumerates it.
         assert!(SandboxBackendChoice::parse("process").is_err());
         // microsandbox was a Phase 1 alternative; removed when we
         // committed to Firecracker for production.

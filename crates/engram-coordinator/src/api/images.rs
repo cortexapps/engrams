@@ -27,14 +27,6 @@ pub struct ImageDescriptor {
     /// is just so the UI can disable the inputs up front).
     pub secret_mode: String,
     pub required_secrets: Vec<RequiredSecret>,
-    /// Whether this deployment's sandbox backend supports
-    /// `WorkspaceSpec::LocalMount`. Driven by the active backend —
-    /// false on Firecracker (until virtiofsd parity lands), true on
-    /// VZ / Process. Same value on every descriptor (it's a
-    /// host-level capability), surfaced here so the form can gray
-    /// out the "local mount" radio without a separate `/api/host`
-    /// round-trip.
-    pub supports_local_mount: bool,
 }
 
 #[derive(Serialize)]
@@ -53,7 +45,6 @@ pub async fn list_images(
         .list()
         .await
         .map_err(|e| ApiError::Internal(format!("image registry list: {e}")))?;
-    let supports_local_mount = state.services.sandbox.supports_local_mount();
 
     let descriptors = images
         .into_iter()
@@ -79,7 +70,6 @@ pub async fn list_images(
                 description: img.manifest.description,
                 secret_mode: secret_mode.to_string(),
                 required_secrets,
-                supports_local_mount,
             }
         })
         .collect();

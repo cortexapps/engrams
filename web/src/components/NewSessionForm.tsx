@@ -14,7 +14,7 @@ import type { HarnessSpec, ImageDescriptor, WorkspaceSpec } from '../types';
 // drives the harness dropdown (builtin names are scoped per-image) and
 // the credentials section (secret schema is per-image).
 
-type WorkspaceKind = 'empty' | 'git' | 'local_mount';
+type WorkspaceKind = 'empty' | 'git';
 type HarnessKind = 'none' | 'builtin';
 
 export interface NewSessionFormProps {
@@ -44,9 +44,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const [gitUrl, setGitUrl] = useState('');
   const [gitBranch, setGitBranch] = useState('main');
   const [gitReadOnly, setGitReadOnly] = useState(false);
-  const [hostPath, setHostPath] = useState('');
-  const [guestPath, setGuestPath] = useState('/workspace');
-  const [mountReadOnly, setMountReadOnly] = useState(false);
 
   // ---- HARNESS ----
   const [harnessKind, setHarnessKind] = useState<HarnessKind>('none');
@@ -109,15 +106,9 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     harnessName === 'claude' &&
     claudeToken.trim().length === 0;
 
-  const supportsLocalMount = selected?.supports_local_mount ?? false;
-
   const workspaceValid =
     workspaceKind === 'empty' ||
-    (workspaceKind === 'git' && gitUrl.trim().length > 0 && gitBranch.trim().length > 0) ||
-    (workspaceKind === 'local_mount' &&
-      hostPath.trim().length > 0 &&
-      guestPath.trim().length > 0 &&
-      supportsLocalMount);
+    (workspaceKind === 'git' && gitUrl.trim().length > 0 && gitBranch.trim().length > 0);
 
   const canSubmit =
     !!selected &&
@@ -136,19 +127,12 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       const workspace: WorkspaceSpec =
         workspaceKind === 'empty'
           ? { kind: 'empty' }
-          : workspaceKind === 'git'
-            ? {
-                kind: 'git',
-                url: gitUrl.trim(),
-                branch: gitBranch.trim(),
-                read_only: gitReadOnly,
-              }
-            : {
-                kind: 'local_mount',
-                host_path: hostPath.trim(),
-                guest_path: guestPath.trim(),
-                read_only: mountReadOnly,
-              };
+          : {
+              kind: 'git',
+              url: gitUrl.trim(),
+              branch: gitBranch.trim(),
+              read_only: gitReadOnly,
+            };
       const harness: HarnessSpec =
         harnessKind === 'none' || !harnessName
           ? { kind: 'none' }
@@ -270,14 +254,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
                 options={[
                   { value: 'empty', label: 'empty' },
                   { value: 'git', label: 'git' },
-                  {
-                    value: 'local_mount',
-                    label: 'local mount',
-                    disabled: !supportsLocalMount,
-                    title: !supportsLocalMount
-                      ? 'Local mount requires the VZ or Process backend. This deployment uses Firecracker.'
-                      : undefined,
-                  },
                 ]}
               />
               {workspaceKind === 'git' && (
@@ -304,33 +280,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
                     label="read only"
                     checked={gitReadOnly}
                     onChange={setGitReadOnly}
-                  />
-                </>
-              )}
-              {workspaceKind === 'local_mount' && (
-                <>
-                  <Field label="host path">
-                    <input
-                      type="text"
-                      value={hostPath}
-                      onChange={(e) => setHostPath(e.target.value)}
-                      className="ledger-input font-mono"
-                      placeholder="/Users/me/code"
-                    />
-                  </Field>
-                  <Field label="guest path">
-                    <input
-                      type="text"
-                      value={guestPath}
-                      onChange={(e) => setGuestPath(e.target.value)}
-                      className="ledger-input font-mono"
-                      placeholder="/workspace"
-                    />
-                  </Field>
-                  <CheckRow
-                    label="read only"
-                    checked={mountReadOnly}
-                    onChange={setMountReadOnly}
                   />
                 </>
               )}

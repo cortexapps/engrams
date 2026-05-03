@@ -68,7 +68,7 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        mounts: Vec::new(),
+        harness_substrate: None,
     };
 
     let original_id = backend.create(spec).await.expect("create");

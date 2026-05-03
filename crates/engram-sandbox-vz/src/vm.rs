@@ -19,12 +19,11 @@ use objc2::AnyThread;
 use objc2_foundation::NSFileHandle;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZBootLoader, VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
-    VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
-    VZSerialPortAttachment, VZSerialPortConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
-    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
+    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSerialPortAttachment,
+    VZSerialPortConfiguration, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
 use crate::console_bridge::{build_console_device, ConsolePortFds};
@@ -38,22 +37,13 @@ pub(crate) struct VmConfig {
     pub memory_mib: u32,
     pub vcpus: u32,
     /// Linux kernel command line. Default points root at /dev/vda
-    /// (the first virtio-block device, which is the only one we
-    /// attach) and routes the console to hvc0.
+    /// (the first virtio-block device) and routes the console to hvc0.
     pub kernel_cmdline: String,
-    /// Virtio-fs shares to attach to the VM. Each maps a host
-    /// directory at `host_path` to a virtio-fs device with `tag`;
-    /// the guest mounts via `mount -t virtio <tag> <guest_path>`.
-    /// The guest_path is carried so the init shim can mount it.
-    pub mounts: Vec<VirtiofsMount>,
-}
-
-/// One virtio-fs share configured on the VM.
-#[derive(Clone, Debug)]
-pub struct VirtiofsMount {
-    pub tag: String,
-    pub host_path: std::path::PathBuf,
-    pub read_only: bool,
+    /// Optional read-only ext4 image attached as the second
+    /// virtio-blk drive (`/dev/vdb`). The init shim mounts it at
+    /// `/run/engram/harnesses`. Same wire as the FC backend so the
+    /// production code path is exercised in dev.
+    pub harness_substrate: Option<std::path::PathBuf>,
 }
 
 impl VmConfig {
@@ -99,7 +89,7 @@ impl VmConfig {
             kernel_cmdline: "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw \
                              quiet init=/sbin/engram-init ip=dhcp"
                 .into(),
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 }
@@ -427,8 +417,16 @@ fn build_configuration(
         vz_cfg.setCPUCount(cfg.vcpus as objc2_foundation::NSUInteger);
         vz_cfg.setMemorySize((cfg.memory_mib as u64) * 1024 * 1024);
 
-        // Storage: virtio-block on the rootfs.ext4. Read-write so
-        // the guest can mutate /workspace state during the session.
+        // Storage devices, in attach order so `/dev/vda` is the
+        // rootfs and (when present) `/dev/vdb` is the harness
+        // substrate:
+        //   - rootfs.ext4 — read-write, so the guest can mutate
+        //     /workspace state during the session.
+        //   - harness-substrate.img — read-only ext4 image of the
+        //     host's `cfg.harnesses_dir`. Init shim mounts it at
+        //     `/run/engram/harnesses`. Same wire as the FC backend.
+        let mut storage: Vec<Retained<VZStorageDeviceConfiguration>> = Vec::with_capacity(2);
+
         let rootfs_url = nsurl_for_path(&cfg.rootfs_path);
         let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
             VZDiskImageStorageDeviceAttachment::alloc(),
@@ -442,10 +440,28 @@ fn build_configuration(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &attachment_super,
         );
-        let block_dev_super: Retained<VZStorageDeviceConfiguration> =
-            Retained::cast_unchecked(block_dev);
+        storage.push(Retained::cast_unchecked(block_dev));
+
+        if let Some(substrate_path) = cfg.harness_substrate.as_ref() {
+            let substrate_url = nsurl_for_path(substrate_path);
+            let sub_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &substrate_url,
+                true,
+            )
+            .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
+            let sub_attachment_super: Retained<
+                objc2_virtualization::VZStorageDeviceAttachment,
+            > = Retained::cast_unchecked(sub_attachment);
+            let sub_block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &sub_attachment_super,
+            );
+            storage.push(Retained::cast_unchecked(sub_block_dev));
+        }
+
         let storage_array: Retained<NSArray<VZStorageDeviceConfiguration>> =
-            NSArray::from_retained_slice(&[block_dev_super]);
+            NSArray::from_retained_slice(&storage);
         vz_cfg.setStorageDevices(&storage_array);
 
         // Network: NAT (the macOS host shares its network with the
@@ -463,51 +479,10 @@ fn build_configuration(
             NSArray::from_retained_slice(&[net_dev_super]);
         vz_cfg.setNetworkDevices(&network_array);
 
-        // virtio-fs shares for harness substrate + (optionally)
-        // LocalMount workspaces. Each `mount` becomes a
-        // `VZVirtioFileSystemDeviceConfiguration` with a unique tag
-        // the guest's init shim mounts via
-        // `mount -t virtio <tag> <guest_path>`.
-        if !cfg.mounts.is_empty() {
-            let mut fs_devs: Vec<
-                Retained<objc2_virtualization::VZDirectorySharingDeviceConfiguration>,
-            > = Vec::with_capacity(cfg.mounts.len());
-            for mount in &cfg.mounts {
-                let host_url = nsurl_for_path(&mount.host_path);
-                let shared_dir = VZSharedDirectory::initWithURL_readOnly(
-                    VZSharedDirectory::alloc(),
-                    &host_url,
-                    mount.read_only,
-                );
-                let share = VZSingleDirectoryShare::initWithDirectory(
-                    VZSingleDirectoryShare::alloc(),
-                    &shared_dir,
-                );
-                let share_super: Retained<objc2_virtualization::VZDirectoryShare> =
-                    Retained::cast_unchecked(share);
-                let tag_ns = NSString::from_str(&mount.tag);
-                VZVirtioFileSystemDeviceConfiguration::validateTag_error(&tag_ns).map_err(
-                    |err| {
-                        VzError::ConfigInvalid(format!(
-                            "virtio-fs tag `{}` rejected: {}",
-                            mount.tag,
-                            ns_error_message(&err),
-                        ))
-                    },
-                )?;
-                let fs_dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-                    VZVirtioFileSystemDeviceConfiguration::alloc(),
-                    &tag_ns,
-                );
-                fs_dev.setShare(Some(&share_super));
-                let fs_dev_super: Retained<VZDirectorySharingDeviceConfiguration> =
-                    Retained::cast_unchecked(fs_dev);
-                fs_devs.push(fs_dev_super);
-            }
-            let fs_array: Retained<NSArray<VZDirectorySharingDeviceConfiguration>> =
-                NSArray::from_retained_slice(&fs_devs);
-            vz_cfg.setDirectorySharingDevices(&fs_array);
-        }
+        // virtio-fs is no longer used — the harness substrate is now
+        // attached as a read-only virtio-blk image (task 2 of the FC
+        // parity work), and `WorkspaceSpec::LocalMount` is gone.
+        // The directory-sharing device path stays unset.
 
         // Multi-port virtio-console for the host↔guest control
         // channels (agentd, bootstrap, harness). Replaces the

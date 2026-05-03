@@ -30,24 +30,13 @@ pub struct SandboxSpec {
     pub ttl: Option<Duration>,
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
-    /// Host-side directories shared into the guest (virtio-fs on VZ,
-    /// bind/symlink on Process). Empty for FC until virtio-fs parity
-    /// lands — backends MUST reject a non-empty list rather than
-    /// silently ignore. Driven by `WorkspaceSpec::LocalMount` at
-    /// session-create time.
+    /// Path on the host to a read-only ext4 image of `cfg.harnesses_dir`,
+    /// built once at host-agent startup. Backends attach it as the
+    /// second virtio-blk drive (`/dev/vdb`); the init shim mounts it
+    /// at `/run/engram/harnesses`. `None` means "no harnesses available
+    /// to this sandbox" (e.g. dev/test scaffolding).
     #[serde(default)]
-    pub mounts: Vec<MountSpec>,
-}
-
-/// One host directory mounted into the guest. The coordinator builds
-/// these from `WorkspaceSpec::LocalMount` at session-create time;
-/// the backend wires them into its sharing layer.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MountSpec {
-    pub host_path: PathBuf,
-    pub guest_path: PathBuf,
-    #[serde(default)]
-    pub read_only: bool,
+    pub harness_substrate: Option<PathBuf>,
 }
 
 /// Argv + env for the long-running "agent" process (Claude Code,

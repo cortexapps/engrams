@@ -205,14 +205,17 @@ mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
-# virtio-fs mounts. The host configures one VZVirtioFileSystemDevice
-# per declared mount with a known tag; mount each at its target if
-# the device is actually present. `mount` returns non-zero if the
-# tag has no device — silently skip in that case so images that
-# don't (yet) have a harness directory boot fine.
+# Harness substrate: read-only ext4 image attached as the second
+# virtio-blk drive on every sandbox (`/dev/vdb`). Same wire on FC
+# and VZ. The image is built once on the host from `cfg.harnesses_dir`;
+# `engram-bootstrap` exec's `/run/engram/harnesses/<name>/harness`
+# from here. If `/dev/vdb` isn't present (sandbox booted without a
+# substrate), the mkdir leaves an empty dir and the bootstrap
+# harness lookup will fail with a clear message.
 mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
-mount -t virtiofs engram-harnesses /run/engram/harnesses 2>/dev/null || true
-mount -t virtiofs engram-workspace /workspace 2>/dev/null || true
+if [ -b /dev/vdb ]; then
+    mount -t ext4 -o ro /dev/vdb /run/engram/harnesses 2>/dev/null || true
+fi
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).

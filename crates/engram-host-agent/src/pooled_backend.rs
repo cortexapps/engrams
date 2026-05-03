@@ -68,10 +68,6 @@ impl SandboxBackend for PooledBackend {
         self.inner.harness_dial()
     }
 
-    fn supports_local_mount(&self) -> bool {
-        self.inner.supports_local_mount()
-    }
-
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         let key = Self::pool_key(&spec);
 
@@ -170,7 +166,7 @@ mod tests {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 

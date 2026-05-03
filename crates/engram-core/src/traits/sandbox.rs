@@ -157,16 +157,6 @@ pub trait SandboxBackend: Send + Sync {
     fn harness_dial(&self) -> HarnessDial {
         HarnessDial::Vsock
     }
-
-    /// Whether this backend can honour `WorkspaceSpec::LocalMount`
-    /// (host-to-guest directory sharing). Default `false`; backends
-    /// with native sharing (`engram-sandbox-vz` via virtio-fs,
-    /// `engram-sandbox-process` via host symlink) override.
-    /// Surfaced on `GET /api/images` so the dashboard can gray out
-    /// the "local mount" radio without a separate capability call.
-    fn supports_local_mount(&self) -> bool {
-        false
-    }
 }
 
 /// How a harness process inside a sandbox reaches the host-side

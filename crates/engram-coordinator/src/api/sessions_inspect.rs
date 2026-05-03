@@ -495,6 +495,7 @@ mod tests {
             secrets: Arc::new(InMemorySecretStore::new()),
             images: ImageRegistry::new(local.path().join("images")),
             harnesses: Arc::new(crate::harness_registry::HarnessRegistry::empty()),
+            harness_substrate: None,
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),

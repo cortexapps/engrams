@@ -16,8 +16,6 @@ function workspaceLabel(ws: WorkspaceSpec): string {
       return 'empty';
     case 'git':
       return ws.url;
-    case 'local_mount':
-      return `${ws.host_path} → ${ws.guest_path}`;
   }
 }
 

@@ -139,6 +139,12 @@ fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
 /// (hypervisor / loopback / host); user-allocatable starts at 3.
 const FIRST_GUEST_CID: u32 = 3;
 
+/// How long `destroy` waits for the guest to honour SendCtrlAltDel
+/// before escalating to SIGKILL. A healthy debian-slim/ubuntu rootfs
+/// halts within ~1s; 3s leaves room for the page-cache drain at
+/// snapshot time without making a single destroy feel slow.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
 /// here rather than on `SandboxSpec` because it's tied to the host
 /// kernel ABI, not to a specific image — every sandbox on this host
@@ -524,6 +530,22 @@ impl FirecrackerBackend {
             is_read_only: false,
         })
         .await?;
+
+        // Harness substrate: read-only ext4 image of the host's
+        // `cfg.harnesses_dir`, attached as the second virtio-blk
+        // drive (`/dev/vdb`). The init shim mounts it at
+        // `/run/engram/harnesses` so `engram-bootstrap` can exec
+        // `/run/engram/harnesses/<name>/harness`. None when the
+        // host's harness registry is empty.
+        if let Some(substrate_path) = spec.harness_substrate.as_ref() {
+            api.put_drive(&DriveConfig {
+                drive_id: "harnesses".into(),
+                path_on_host: substrate_path.to_string_lossy().into_owned(),
+                is_root_device: false,
+                is_read_only: true,
+            })
+            .await?;
+        }
 
         // Vsock — must be configured BEFORE InstanceStart. Firecracker
         // creates the host-side UDS at vsock_uds_path; host→guest
@@ -988,16 +1010,59 @@ impl SandboxBackend for FirecrackerBackend {
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
         // Idempotent: removing an unknown id is a no-op, matching the
-        // contract ProcessBackend follows. SIGKILL is fine for now —
-        // graceful shutdown via SendCtrlAltDel + timeout is a Phase 3
-        // refinement once the in-guest agent can ack the shutdown.
+        // contract ProcessBackend follows.
         let Some((_, mut live)) = self.sandboxes.remove(&id) else {
             return Ok(());
         };
-        if let Err(e) = live.child.kill().await {
-            tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
+
+        // Try a graceful shutdown first: PUT /actions { SendCtrlAltDel }
+        // tells the guest kernel to halt cleanly via the keyboard
+        // controller's CAD signal, draining the page cache before we
+        // pull the plug. If the guest doesn't respond within
+        // `GRACEFUL_SHUTDOWN_TIMEOUT`, we fall through to SIGKILL.
+        let api = FirecrackerClient::new(&live.state.firecracker_socket);
+        let graceful = async {
+            api.put_action(ActionType::SendCtrlAltDel).await?;
+            // Wait for the firecracker process to exit on its own.
+            // `Child::wait` returns once the process is reaped.
+            live.child
+                .wait()
+                .await
+                .map_err(SandboxError::from)
+        };
+        match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful).await {
+            Ok(Ok(_)) => {
+                tracing::debug!(sandbox_id = %id, "firecracker exited cleanly via SendCtrlAltDel");
+            }
+            Ok(Err(e)) => {
+                // SendCtrlAltDel rejected (FC API rejected the action,
+                // socket closed, etc.) — escalate to SIGKILL. This
+                // also covers the case where the API socket is gone
+                // but the child somehow survives.
+                tracing::debug!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "graceful shutdown failed; escalating to SIGKILL",
+                );
+                if let Err(e) = live.child.kill().await {
+                    tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
+                }
+                let _ = live.child.wait().await;
+            }
+            Err(_) => {
+                // Timeout: guest didn't honour CAD within the grace
+                // window. Force-kill.
+                tracing::debug!(
+                    sandbox_id = %id,
+                    timeout = ?GRACEFUL_SHUTDOWN_TIMEOUT,
+                    "firecracker didn't exit in time; SIGKILLing",
+                );
+                if let Err(e) = live.child.kill().await {
+                    tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
+                }
+                let _ = live.child.wait().await;
+            }
         }
-        let _ = live.child.wait().await;
 
         // UFFD handler (only set on Uffd-mode restore) follows
         // firecracker into oblivion. Its UDS + log live inside
@@ -1123,7 +1188,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 

@@ -98,12 +98,6 @@ impl SandboxBackend for ProcessBackend {
         engram_core::traits::HarnessDial::HostTcp
     }
 
-    fn supports_local_mount(&self) -> bool {
-        // Process backend "mounts" via host symlinks — trivially
-        // supported since the sandbox cwd is a host directory.
-        true
-    }
-
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         let id = SandboxId::new();
         let cwd = self.cwd_for(id);
@@ -382,7 +376,7 @@ impl SandboxBackend for ProcessBackend {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -599,7 +593,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 

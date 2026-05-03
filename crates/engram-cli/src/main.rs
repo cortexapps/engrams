@@ -65,20 +65,12 @@ enum SessionCmd {
         /// Example: `--image cortex/api:warm-2026-04`
         #[arg(long)]
         image: String,
-        /// Clone the given git URL into the workspace. Mutually
-        /// exclusive with `--mount`. Omit both for an `Empty`
-        /// workspace ("just a VM and a shell").
+        /// Clone the given git URL into the workspace. Omit for an
+        /// `Empty` workspace ("just a VM and a shell").
         ///
         /// Example: `--git https://github.com/cortex/api.git`
-        #[arg(long, group = "workspace_kind")]
+        #[arg(long)]
         git: Option<String>,
-        /// Bind a host directory into the guest at `host:guest`.
-        /// Mutually exclusive with `--git`. Rejected on the
-        /// Firecracker backend.
-        ///
-        /// Example: `--mount /Users/me/code:/workspace`
-        #[arg(long, group = "workspace_kind")]
-        mount: Option<String>,
         /// Branch to check out for `--git` workspaces. Ignored
         /// otherwise.
         #[arg(long, default_value = "main")]
@@ -314,7 +306,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Create {
                 image,
                 git,
-                mount,
                 branch,
                 read_only,
                 harness,
@@ -326,7 +317,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     &cli.endpoint,
                     image,
                     git.as_deref(),
-                    mount.as_deref(),
                     branch,
                     *read_only,
                     harness,
@@ -516,27 +506,12 @@ fn parse_image_ref(spec: &str) -> Result<(String, String), CliError> {
     }
 }
 
-/// Split `--mount /host/path:/guest/path` on the first colon. Hosts
-/// path with embedded colons aren't supported (vanishingly rare on
-/// Unix); the user can drop a symlink and point `--mount` at that.
-fn parse_mount_spec(spec: &str) -> Result<(String, String), CliError> {
-    match spec.split_once(':') {
-        Some((host, guest)) if !host.is_empty() && !guest.is_empty() => {
-            Ok((host.to_string(), guest.to_string()))
-        }
-        _ => Err(CliError::Other(format!(
-            "invalid --mount `{spec}` — expected `<host_path>:<guest_path>`"
-        ))),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
     image: &str,
     git: Option<&str>,
-    mount: Option<&str>,
     branch: &str,
     read_only: bool,
     harness: &str,
@@ -545,31 +520,13 @@ async fn session_create(
     json: bool,
 ) -> Result<(), CliError> {
     let (image_repo, image_tag) = parse_image_ref(image)?;
-    let workspace_value = match (git, mount) {
-        (Some(url), None) if !url.is_empty() => serde_json::json!({
+    let workspace_value = match git {
+        Some(url) if !url.is_empty() => serde_json::json!({
             "kind": "git",
             "url": url,
             "branch": branch,
             "read_only": read_only,
         }),
-        (None, Some(spec)) if !spec.is_empty() => {
-            let (host_path, guest_path) = parse_mount_spec(spec)?;
-            serde_json::json!({
-                "kind": "local_mount",
-                "host_path": host_path,
-                "guest_path": guest_path,
-                "read_only": read_only,
-            })
-        }
-        (None, None) => serde_json::json!({"kind": "empty"}),
-        (Some(_), Some(_)) => {
-            // clap's `group = "workspace_kind"` makes this unreachable
-            // at the CLI surface; the explicit handling here just keeps
-            // future direct callers honest.
-            return Err(CliError::Other(
-                "--git and --mount are mutually exclusive".into(),
-            ));
-        }
         _ => serde_json::json!({"kind": "empty"}),
     };
     let harness_value = match harness {

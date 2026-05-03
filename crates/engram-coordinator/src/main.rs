@@ -322,6 +322,43 @@ async fn main() -> Result<(), CoordinatorError> {
             })?,
     );
 
+    // Build the harness substrate — a read-only ext4 image of
+    // `cfg.harnesses_dir` that every sandbox attaches as `/dev/vdb`.
+    // Best-effort at startup: if mke2fs is missing or the dir is
+    // empty, we proceed with `None` and sessions just don't see
+    // harnesses (`/run/engram/harnesses` stays empty in the guest).
+    let substrate_work_dir = cli.local_path.join("harness-substrate");
+    let harness_substrate = match engram_coordinator::harness_substrate::build(
+        &cfg.harnesses_dir,
+        &substrate_work_dir,
+    )
+    .await
+    {
+        Ok(s) => {
+            if let Some(ref s) = s {
+                tracing::info!(
+                    path = %s.path.display(),
+                    hash = %s.hash,
+                    "harness substrate built"
+                );
+            } else {
+                tracing::info!(
+                    harnesses_dir = %cfg.harnesses_dir.display(),
+                    "harness substrate skipped: directory empty or missing"
+                );
+            }
+            s
+        }
+        Err(e) => {
+            tracing::warn!(
+                harnesses_dir = %cfg.harnesses_dir.display(),
+                error = %e,
+                "harness substrate build failed; sessions will boot without /run/engram/harnesses"
+            );
+            None
+        }
+    };
+
     let services = Services {
         meta: Arc::new(pg),
         cloud,
@@ -329,6 +366,7 @@ async fn main() -> Result<(), CoordinatorError> {
         secrets,
         images,
         harnesses,
+        harness_substrate,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await

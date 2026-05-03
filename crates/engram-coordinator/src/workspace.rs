@@ -48,21 +48,18 @@ impl From<SandboxError> for WorkspaceError {
     }
 }
 
-/// The guest path where Git / LocalMount workspaces land. Hard-coded
-/// for v1 — future iterations may make it configurable per image.
+/// The guest path where the workspace lives. Hard-coded for v1 —
+/// future iterations may make it configurable per image.
 pub const DEFAULT_GUEST_WORKSPACE: &str = "/workspace";
 
 /// Bring up the workspace for a freshly-created sandbox, observing
 /// the variant of `WorkspaceSpec`:
 ///
-/// - `Empty`     → no-op. Whatever the image baked is what's there.
-/// - `Git`       → `git clone <url> -b <branch> --single-branch
+/// - `Empty` → no-op. Whatever the image baked is what's there.
+/// - `Git`   → `git clone <url> -b <branch> --single-branch
 ///   /workspace` via `backend.exec` so the rootfs acquires a real
 ///   `.git` dir. Read-only flag affects checkpoint behavior, not the
 ///   clone.
-/// - `LocalMount`→ no-op here. The host-to-guest share is wired into
-///   `SandboxSpec.mounts` at create time; the backend has already
-///   mounted it.
 pub async fn materialize(
     backend: &dyn SandboxBackend,
     sandbox_id: SandboxId,
@@ -70,7 +67,6 @@ pub async fn materialize(
 ) -> Result<(), WorkspaceError> {
     match spec {
         WorkspaceSpec::Empty => Ok(()),
-        WorkspaceSpec::LocalMount { .. } => Ok(()),
         WorkspaceSpec::Git { url, branch, .. } => {
             clone_into_sandbox(backend, sandbox_id, url, branch).await
         }

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +63,7 @@ impl ImageRef {
 
 /// Where the user's code lives inside the VM at session time.
 /// Decoupled from `ImageRef` so a generic image (e.g. `react-toolchain`)
-/// can host any git URL, a host bind-mount, or nothing at all.
+/// can host any git URL or nothing at all.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceSpec {
@@ -79,17 +77,6 @@ pub enum WorkspaceSpec {
     Git {
         url: String,
         branch: String,
-        #[serde(default)]
-        read_only: bool,
-    },
-
-    /// Bind a host directory into the VM via virtio-fs (VZ) or a
-    /// symlink (Process). Rejected on the Firecracker backend until
-    /// `virtiofsd` parity lands. `read_only` here is *mount-policy
-    /// only* — there is no remote, so checkpointing is never engaged.
-    LocalMount {
-        host_path: PathBuf,
-        guest_path: PathBuf,
         #[serde(default)]
         read_only: bool,
     },
@@ -114,7 +101,7 @@ impl WorkspaceSpec {
     pub fn git_url(&self) -> Option<&str> {
         match self {
             Self::Git { url, .. } => Some(url),
-            Self::Empty | Self::LocalMount { .. } => None,
+            Self::Empty => None,
         }
     }
 
@@ -122,7 +109,7 @@ impl WorkspaceSpec {
     pub fn git_branch(&self) -> Option<&str> {
         match self {
             Self::Git { branch, .. } => Some(branch),
-            Self::Empty | Self::LocalMount { .. } => None,
+            Self::Empty => None,
         }
     }
 }
@@ -164,9 +151,7 @@ pub struct SessionSpec {
 /// schema migration. Drives checkpoint behavior:
 /// - `Git` allocates a checkpoint branch and pushes on each checkpoint.
 /// - `Readonly` clones at create but never pushes back.
-/// - `Ephemeral` has no remote — `LocalMount` and `Empty` workspaces
-///   both fall here regardless of their `read_only` flag (the flag is
-///   mount-policy on `LocalMount`, not checkpoint-policy).
+/// - `Ephemeral` has no remote — `Empty` workspaces fall here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
@@ -201,7 +186,6 @@ impl SessionKind {
                 read_only: true, ..
             } => Self::Readonly,
             WorkspaceSpec::Git { .. } => Self::Git,
-            WorkspaceSpec::LocalMount { .. } => Self::Ephemeral,
         }
     }
 }
@@ -306,14 +290,6 @@ mod tests {
             read_only: true,
         };
         assert!(!git_ro.is_writable_git());
-
-        let mount = WorkspaceSpec::LocalMount {
-            host_path: "/Users/me/code".into(),
-            guest_path: "/workspace".into(),
-            read_only: false,
-        };
-        assert_eq!(mount.git_url(), None);
-        assert!(!mount.is_writable_git());
     }
 
     #[test]
@@ -338,18 +314,6 @@ mod tests {
             }),
             SessionKind::Readonly
         );
-        // LocalMount is always Ephemeral — the read_only flag here
-        // is mount-policy only, not checkpoint-policy.
-        for ro in [false, true] {
-            assert_eq!(
-                SessionKind::derive(&WorkspaceSpec::LocalMount {
-                    host_path: "/h".into(),
-                    guest_path: "/g".into(),
-                    read_only: ro,
-                }),
-                SessionKind::Ephemeral
-            );
-        }
     }
 
     #[test]
@@ -383,9 +347,9 @@ mod tests {
                 branch: "main".into(),
                 read_only: false,
             },
-            WorkspaceSpec::LocalMount {
-                host_path: "/Users/me/code".into(),
-                guest_path: "/workspace".into(),
+            WorkspaceSpec::Git {
+                url: "https://github.com/x/y.git".into(),
+                branch: "main".into(),
                 read_only: true,
             },
         ];

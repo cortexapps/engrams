@@ -181,7 +181,7 @@ fn stub_spec() -> SandboxSpec {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        mounts: Vec::new(),
+        harness_substrate: None,
     }
 }
 
@@ -219,7 +219,7 @@ mod tests {
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            mounts: Vec::new(),
+            harness_substrate: None,
         }
     }
 
