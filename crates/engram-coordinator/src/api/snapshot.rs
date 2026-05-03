@@ -432,6 +432,9 @@ pub async fn evict_local(
                 "sandbox destroy failed during evict_local; continuing",
             );
         }
+        if let Some(proxy) = state.services.egress_proxy.as_ref() {
+            proxy.registry.unregister(id);
+        }
     }
 
     // Clear the persisted sandbox_id so a coordinator restart

@@ -66,32 +66,60 @@ impl From<engram_image_builder::Ext4Error> for SubstrateError {
 
 /// Pack `harnesses_dir` into `<work_dir>/harness-substrate.img` and
 /// return a [`Substrate`] handle. If `harnesses_dir` is empty or
-/// missing, returns Ok with an empty hash and a path that doesn't
-/// exist on disk yet — callers should treat
-/// [`is_empty`](Substrate::is_empty) as "no harnesses".
+/// missing, returns Ok(None) (sandboxes still boot, just without
+/// `/run/engram/harnesses`).
+///
+/// `ca_pem`, if Some, gets stamped into the substrate at
+/// `/.engram-host/ca.pem`. The init shim copies it into the guest
+/// trust store at boot so MITM leaves signed by the egress proxy
+/// validate.
 pub async fn build(
     harnesses_dir: &Path,
     work_dir: &Path,
+    ca_pem: Option<&str>,
 ) -> Result<Option<Substrate>, SubstrateError> {
-    if !harnesses_dir.exists() {
+    if !harnesses_dir.exists() && ca_pem.is_none() {
         return Ok(None);
     }
-    let hash = hash_dir(harnesses_dir).await?;
-    if hash.is_empty() {
+    let dir_hash = hash_dir(harnesses_dir).await?;
+    let ca_hash = ca_pem.map(blake_lite).unwrap_or_default();
+    if dir_hash.is_empty() && ca_hash.is_empty() {
         return Ok(None);
     }
+    let hash = format!("{dir_hash}-{ca_hash}");
 
     tokio::fs::create_dir_all(work_dir).await?;
     let image_path = work_dir.join("harness-substrate.img");
 
-    let dir_size = recursive_size(harnesses_dir).await?;
+    // Stage a tempdir we can pack: copy the harnesses tree (if
+    // present) and write the CA at .engram-host/ca.pem (if
+    // present). The packer ignores the stage dir's own metadata —
+    // it just walks the tree.
+    let stage = work_dir.join("stage");
+    if stage.exists() {
+        tokio::fs::remove_dir_all(&stage).await?;
+    }
+    tokio::fs::create_dir_all(&stage).await?;
+    if harnesses_dir.exists() {
+        copy_dir(harnesses_dir, &stage).await?;
+    }
+    if let Some(pem) = ca_pem {
+        let host_meta = stage.join(".engram-host");
+        tokio::fs::create_dir_all(&host_meta).await?;
+        tokio::fs::write(host_meta.join("ca.pem"), pem).await?;
+    }
+
+    let dir_size = recursive_size(&stage).await?;
     if dir_size == 0 {
+        let _ = tokio::fs::remove_dir_all(&stage).await;
         return Ok(None);
     }
     let size = recommended_size(dir_size);
 
     let packer = Mke2fsPacker::default();
-    packer.pack(harnesses_dir, &image_path, size).await?;
+    let pack_result = packer.pack(&stage, &image_path, size).await;
+    let _ = tokio::fs::remove_dir_all(&stage).await;
+    pack_result?;
 
     Ok(Some(Substrate {
         path: image_path,
@@ -99,18 +127,59 @@ pub async fn build(
     }))
 }
 
-/// Re-hash `harnesses_dir` and rebuild only if the hash differs from
-/// `current.hash`. Returns `Ok(None)` if unchanged.
+/// SHA-256 of a string, hex-encoded. Used to mix the CA PEM into
+/// the substrate hash so a CA rotation forces a substrate rebuild.
+fn blake_lite(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+async fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((from, to)) = stack.pop() {
+        tokio::fs::create_dir_all(&to).await?;
+        let mut rd = tokio::fs::read_dir(&from).await?;
+        while let Some(ent) = rd.next_entry().await? {
+            let ft = ent.file_type().await?;
+            let dst_path = to.join(ent.file_name());
+            if ft.is_dir() {
+                stack.push((ent.path(), dst_path));
+            } else if ft.is_file() {
+                tokio::fs::copy(ent.path(), &dst_path).await?;
+                // Preserve executable bit so harness binaries stay
+                // executable inside the guest.
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = tokio::fs::metadata(ent.path()).await {
+                    let mode = meta.permissions().mode();
+                    let _ = tokio::fs::set_permissions(
+                        &dst_path,
+                        std::fs::Permissions::from_mode(mode),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-hash `harnesses_dir` (+ optional CA) and rebuild only if the
+/// hash differs from `current.hash`. Returns `Ok(None)` if unchanged.
 pub async fn refresh(
     harnesses_dir: &Path,
     work_dir: &Path,
+    ca_pem: Option<&str>,
     current: &Substrate,
 ) -> Result<Option<Substrate>, SubstrateError> {
-    let new_hash = hash_dir(harnesses_dir).await?;
+    let dir_hash = hash_dir(harnesses_dir).await?;
+    let ca_hash = ca_pem.map(blake_lite).unwrap_or_default();
+    let new_hash = format!("{dir_hash}-{ca_hash}");
     if new_hash == current.hash {
         return Ok(None);
     }
-    build(harnesses_dir, work_dir).await
+    build(harnesses_dir, work_dir, ca_pem).await
 }
 
 /// Walk `dir` deterministically (sorted) and return `sha256("name\0size\0contents…")`
@@ -214,19 +283,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_returns_none_for_empty_dir() {
+    async fn build_returns_none_for_empty_dir_and_no_ca() {
         let tmp = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let s = build(tmp.path(), work.path()).await.unwrap();
+        let s = build(tmp.path(), work.path(), None).await.unwrap();
         assert!(s.is_none());
     }
 
     #[tokio::test]
-    async fn build_returns_none_for_missing_dir() {
+    async fn build_returns_none_for_missing_dir_and_no_ca() {
         let work = tempfile::tempdir().unwrap();
-        let s = build(Path::new("/nonexistent/engram-harnesses"), work.path())
+        let s = build(Path::new("/nonexistent/engram-harnesses"), work.path(), None)
             .await
             .unwrap();
         assert!(s.is_none());
+    }
+
+    #[test]
+    fn ca_hash_changes_substrate_hash() {
+        let h1 = blake_lite("-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n");
+        let h2 = blake_lite("-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----\n");
+        assert_ne!(h1, h2);
+        let h3 = blake_lite("-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n");
+        assert_eq!(h1, h3);
     }
 }

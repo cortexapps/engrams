@@ -131,6 +131,16 @@ struct Cli {
         value_parser = engram_sandbox_firecracker::net::NetPolicy::parse,
     )]
     fc_net_policy: engram_sandbox_firecracker::net::NetPolicy,
+
+    /// TCP port the egress-proxy listens on. iptables PREROUTING
+    /// REDIRECTs VM→tcp/443 to this port; the proxy SNI-peeks then
+    /// dispatches Reject / Bypass / Intercept per the manifest's
+    /// `[network] allow_hosts` and `[secrets.X] allow_hosts`.
+    /// `0` (default) disables the proxy — the host-startup iptables
+    /// rules also skip the REDIRECT in that case, so VMs run with
+    /// no egress filtering (test mode).
+    #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 0)]
+    egress_proxy_port: u16,
 }
 
 #[tokio::main]
@@ -359,10 +369,19 @@ async fn main() -> Result<(), CoordinatorError> {
     // Best-effort at startup: if mke2fs is missing or the dir is
     // empty, we proceed with `None` and sessions just don't see
     // harnesses (`/run/engram/harnesses` stays empty in the guest).
+    // Build the egress proxy's CA + spawn the proxy task. Best-effort:
+    // if the proxy fails to start (port in use, missing rustls/ring
+    // crypto provider) sessions still get created — the FC backend
+    // will surface "no proxy" as no egress filtering, which is fine
+    // for VZ-on-macOS where this binary runs cross-platform.
+    let egress_proxy = build_egress_proxy(&cli).await;
+
     let substrate_work_dir = cli.local_path.join("harness-substrate");
+    let substrate_ca_pem = egress_proxy.as_ref().map(|p| p.ca.cert_pem.clone());
     let harness_substrate = match engram_coordinator::harness_substrate::build(
         &cfg.harnesses_dir,
         &substrate_work_dir,
+        substrate_ca_pem.as_deref(),
     )
     .await
     {
@@ -399,9 +418,53 @@ async fn main() -> Result<(), CoordinatorError> {
         images,
         harnesses,
         harness_substrate,
+        egress_proxy,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await
+}
+
+/// Generate (or load) the per-host CA, spawn the proxy task on
+/// `cli.egress_proxy_port`, and return the registry handle so
+/// session creation can register/unregister state. Returns None on
+/// failure (logged) or when the proxy is disabled (port=0).
+async fn build_egress_proxy(cli: &Cli) -> Option<engram_coordinator::EgressProxy> {
+    if cli.egress_proxy_port == 0 {
+        tracing::info!("egress proxy disabled (--egress-proxy-port=0)");
+        return None;
+    }
+    let proxy_dir = cli.local_path.join("egress-proxy");
+    let ca = match engram_egress_proxy::Ca::load_or_generate(&proxy_dir) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::warn!(
+                dir = %proxy_dir.display(),
+                error = %e,
+                "egress proxy CA load/generate failed; proxy disabled",
+            );
+            return None;
+        }
+    };
+    // Install the default rustls crypto provider once. Idempotent;
+    // `install_default` returns Err if already set, which we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let registry = Arc::new(engram_egress_proxy::Registry::new());
+    let mint = Arc::new(engram_egress_proxy::CertMint::new(ca.clone()));
+    let bind_addr: std::net::SocketAddr =
+        format!("0.0.0.0:{}", cli.egress_proxy_port).parse().unwrap();
+    let proxy = engram_egress_proxy::Proxy::new(engram_egress_proxy::ProxyConfig {
+        bind_addr,
+        registry: registry.clone(),
+        mint,
+    });
+    tokio::spawn(async move {
+        if let Err(e) = proxy.run().await {
+            tracing::error!(error = %e, "egress proxy listener exited");
+        }
+    });
+    tracing::info!(addr = %bind_addr, "egress proxy spawned");
+    Some(engram_coordinator::EgressProxy { registry, ca })
 }
 
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`

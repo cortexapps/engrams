@@ -129,6 +129,7 @@ async fn build_app_state(
         images: ImageRegistry::new(images_dir),
         harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         harness_substrate: None,
+        egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
         database_url: database_url.to_string(),

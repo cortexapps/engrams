@@ -49,6 +49,20 @@ pub struct Services {
     /// harnesses to make available" (empty registry, or substrate
     /// build failed at startup — logged but non-fatal).
     pub harness_substrate: Option<harness_substrate::Substrate>,
+    /// Per-host TLS-MITM egress proxy. Sessions get registered here
+    /// at create-time so the proxy knows how to dispatch outbound
+    /// HTTPS traffic from each VM. `None` if the proxy isn't enabled
+    /// (`--fc-egress-proxy=disabled`) or failed to start (logged at
+    /// startup, sessions still work but with no egress filtering).
+    pub egress_proxy: Option<EgressProxy>,
+}
+
+/// Coordinator-side handle to the running egress proxy. Owns the
+/// session registry and the persisted CA (so other services like
+/// `harness_substrate::build` can stamp the CA into the substrate).
+pub struct EgressProxy {
+    pub registry: std::sync::Arc<engram_egress_proxy::Registry>,
+    pub ca: std::sync::Arc<engram_egress_proxy::Ca>,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.

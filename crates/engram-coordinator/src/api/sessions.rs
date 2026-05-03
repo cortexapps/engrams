@@ -306,6 +306,13 @@ pub async fn create_session(
         }
     }
 
+    // Clone the env + network policy before they're moved into the
+    // VmSpec — the post-create proxy registration needs to look up
+    // placeholders by name and build the network allow-list. The
+    // borrow checker would otherwise rightly complain.
+    let spec_env_for_proxy = spec_env.clone();
+    let network_for_proxy = network.clone();
+
     let vm_spec = VmSpec {
         image: image_tag.clone(),
         rootfs_source: rootfs_source_from(Some(&resolved)),
@@ -384,6 +391,45 @@ pub async fn create_session(
     };
 
     state.registry.bind(session_id, sandbox_id);
+    // Register with the egress proxy so outbound HTTPS from this
+    // sandbox gets the right per-secret substitution + the right
+    // network.allow_hosts policy. Skipped when the proxy isn't
+    // running (`--egress-proxy-port=0`), or when the backend has
+    // no guest IP for this sandbox (process backend, VZ, etc.).
+    if let Some(proxy) = state.services.egress_proxy.as_ref() {
+        if let Some(guest_ip_str) = state.services.sandbox.guest_ip(sandbox_id).await {
+            if let Ok(guest_ip) = guest_ip_str.parse::<std::net::Ipv4Addr>() {
+                let mut secrets_for_proxy = Vec::new();
+                for (name, resolved) in &secret_bundle.secrets {
+                    let allow = engram_egress_proxy::HostList::from_manifest(
+                        &resolved.schema.allow_hosts,
+                        &resolved.schema.allow_host_patterns,
+                    )
+                    .ok();
+                    let placeholder = spec_env_for_proxy.get(name).cloned();
+                    let (Some(allow), Some(placeholder)) = (allow, placeholder) else {
+                        continue;
+                    };
+                    secrets_for_proxy.push(engram_egress_proxy::SecretEntry {
+                        placeholder,
+                        real_value: resolved.value.clone(),
+                        allow,
+                    });
+                }
+                let network_allow = engram_egress_proxy::HostList::from_manifest(
+                    &network_for_proxy.allow_hosts,
+                    &network_for_proxy.allow_host_patterns,
+                )
+                .unwrap_or_default();
+                proxy.registry.register(engram_egress_proxy::SessionState {
+                    session_id,
+                    guest_ip,
+                    network_allow,
+                    secrets: secrets_for_proxy,
+                });
+            }
+        }
+    }
     // Bind the routing in the hub *before* the agent has a chance
     // to dial. `backend.create()` returns with the sandbox ready
     // to accept exec but the agent (if any) NOT yet spawned.
@@ -523,6 +569,9 @@ pub async fn delete_session(
                 error = %e,
                 "sandbox destroy failed during session delete; continuing",
             );
+        }
+        if let Some(proxy) = state.services.egress_proxy.as_ref() {
+            proxy.registry.unregister(id);
         }
     }
 

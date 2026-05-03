@@ -181,6 +181,9 @@ pub async fn drain_session(
             "preemption drain: destroy failed (expected during shutdown)",
         );
     }
+    if let Some(proxy) = state.services.egress_proxy.as_ref() {
+        proxy.registry.unregister(session_id);
+    }
 
     // Step 3: mark Dead. The caller's resume call later
     // brings the session back on a different host via the git
@@ -351,6 +354,7 @@ mod tests {
             images: ImageRegistry::new(images_dir),
             harnesses: Arc::new(crate::harness_registry::HarnessRegistry::empty()),
             harness_substrate: None,
+            egress_proxy: None,
         };
         let cfg = CoordinatorConfig {
             local_path,

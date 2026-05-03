@@ -286,6 +286,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         images: ImageRegistry::new(images_dir),
         harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         harness_substrate: None,
+        egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
@@ -392,6 +393,7 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         images: ImageRegistry::new(images_dir),
         harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
         harness_substrate: None,
+        egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),

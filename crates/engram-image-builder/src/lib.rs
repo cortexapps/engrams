@@ -216,6 +216,27 @@ mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
 if [ -b /dev/vdb ]; then
     mount -t ext4 -o ro /dev/vdb /run/engram/harnesses 2>/dev/null || true
 fi
+# Engram egress-proxy CA. The host stamps it into the substrate at
+# `/.engram-host/ca.pem`; we append it to the system trust store
+# and export the relevant env vars so glibc, curl, requests, and
+# Node all validate proxy-minted leaves. This must run BEFORE any
+# user code (ttyd / bootstrap / agentd) so the first HTTPS request
+# the harness makes already trusts the proxy. No-op when the proxy
+# isn't deployed (CA file just isn't there).
+if [ -f /run/engram/harnesses/.engram-host/ca.pem ]; then
+    mkdir -p /etc/ssl/certs 2>/dev/null || true
+    if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cat /run/engram/harnesses/.engram-host/ca.pem \
+            >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+    else
+        cp /run/engram/harnesses/.engram-host/ca.pem \
+            /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+    fi
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    export NODE_EXTRA_CA_CERTS=/run/engram/harnesses/.engram-host/ca.pem
+fi
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
