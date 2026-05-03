@@ -207,7 +207,7 @@ impl NetPolicy {
 /// String-builder for the per-VM iptables ruleset. Render-only
 /// (no shell-out) so it's unit-testable on macOS. The runtime
 /// applies these by spawning `iptables` per line.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ChainPlan {
     pub chain_name: String,
     pub vm_cidr: VmCidr,
@@ -385,6 +385,245 @@ const HOST_LAN_BLOCK: &[&str] = &[
     "169.254.0.0/16",
     "127.0.0.0/8",
 ];
+
+/// Per-sandbox network state stashed on `LiveSandbox` so destroy
+/// can release the slot and tear down the host-side rules.
+#[derive(Clone, Debug)]
+pub struct NetSetup {
+    pub vm_cidr: VmCidr,
+    pub tap_name: String,
+    pub plan: ChainPlan,
+}
+
+/// Errors from the Linux runtime layer. Distinct from `SandboxError`
+/// so the caller decides whether to escalate (`create` failure) or
+/// just log (`destroy` best-effort cleanup).
+#[derive(Debug)]
+pub enum NetError {
+    Spawn(String, std::io::Error),
+    Failed { cmd: String, status: i32, stderr: String },
+    Resolve(String, std::io::Error),
+    Alloc(AllocError),
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(cmd, e) => write!(f, "spawn {cmd}: {e}"),
+            Self::Failed { cmd, status, stderr } => {
+                write!(f, "{cmd} exited with status {status}: {stderr}")
+            }
+            Self::Resolve(host, e) => write!(f, "resolve {host}: {e}"),
+            Self::Alloc(e) => write!(f, "alloc: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for NetError {}
+
+impl From<NetError> for engram_core::SandboxError {
+    fn from(e: NetError) -> Self {
+        engram_core::SandboxError::Vm(Box::new(StringError(e.to_string())))
+    }
+}
+
+#[derive(Debug)]
+struct StringError(String);
+impl std::fmt::Display for StringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for StringError {}
+
+/// Resolve each `manifest.network.allow_hosts` entry to its current
+/// IPv4s. Hostnames are paired with `:443` for the lookup (resolver
+/// requires a port even if we discard it). Failures don't fail the
+/// sandbox create — we log + skip the entry, leaving its IP set
+/// empty (the egress refresher's next tick will retry).
+pub async fn resolve_allow_hosts(hosts: &[String]) -> Vec<(Ipv4Addr, String)> {
+    let mut out = Vec::new();
+    for host in hosts {
+        let target = format!("{host}:443");
+        let result = tokio::net::lookup_host(target).await;
+        match result {
+            Ok(addrs) => {
+                for addr in addrs {
+                    if let std::net::IpAddr::V4(v4) = addr.ip() {
+                        out.push((v4, host.clone()));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %host,
+                    error = %e,
+                    "allow_hosts resolve failed; entry will be retried by the egress refresher",
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Run a single `iptables`/`ip` command. Stdout discarded; stderr
+/// captured for error reporting. The runtime spawns these one at a
+/// time — the command set is small enough that batching isn't worth
+/// the complexity (and `iptables-restore` would lock for everyone).
+#[cfg(target_os = "linux")]
+async fn run_cmd(bin: &str, args: &[&str]) -> Result<(), NetError> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args);
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| NetError::Spawn(bin.to_string(), e))?;
+    if !output.status.success() {
+        return Err(NetError::Failed {
+            cmd: format!("{bin} {}", args.join(" ")),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Run an iptables rule line — split on whitespace and exec.
+/// `engram-sb-...` chain names and dotted-quad IPs are
+/// whitespace-free, so split-on-space is safe for the rule shapes
+/// `ChainPlan` produces.
+#[cfg(target_os = "linux")]
+async fn run_iptables(line: &str) -> Result<(), NetError> {
+    let argv: Vec<&str> = line.split_whitespace().collect();
+    run_cmd("iptables", &argv).await
+}
+
+/// Apply once-per-host startup rules + enable IP forwarding.
+/// Idempotent: each rule has a unique `--comment` tag, and we
+/// check-then-insert so a coord restart doesn't double up.
+#[cfg(target_os = "linux")]
+pub async fn host_startup() -> Result<(), NetError> {
+    // Enable forwarding via /proc/sys (kernel-level toggle).
+    if let Err(e) =
+        tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await
+    {
+        return Err(NetError::Spawn(
+            "write /proc/sys/net/ipv4/ip_forward".into(),
+            e,
+        ));
+    }
+
+    for line in host_startup_lines() {
+        // Try a check first (`-C`) — if the rule exists, skip insert.
+        let check_argv: Vec<String> = line
+            .replace("-I FORWARD 1", "-C FORWARD")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let check_argv_ref: Vec<&str> = check_argv.iter().map(|s| s.as_str()).collect();
+        let exists = run_cmd("iptables", &check_argv_ref).await.is_ok();
+        if !exists {
+            run_iptables(&line).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Provision the host-side networking for a fresh sandbox: alloc
+/// /30, create TAP, assign gateway IP, build per-VM iptables chain.
+/// Returns the [`NetSetup`] the caller stashes on `LiveSandbox`.
+#[cfg(target_os = "linux")]
+pub async fn provision(
+    sandbox_id: SandboxId,
+    allocator: &parking_lot::Mutex<NetworkAllocator>,
+    network: NetworkPolicy,
+    host_policy: NetPolicy,
+) -> Result<NetSetup, NetError> {
+    let vm_cidr = allocator
+        .lock()
+        .alloc()
+        .map_err(NetError::Alloc)?;
+    let tap_name = tap_name_for(sandbox_id);
+    let host_addr = format!("{}/30", vm_cidr.host());
+
+    // Create the TAP. `tuntap add ... mode tap` is idempotent on
+    // first failure (returns non-zero if the device already exists),
+    // so we delete first to be safe — leftovers from a previous
+    // crashed sandbox would otherwise wedge create.
+    let _ = run_cmd("ip", &["link", "delete", &tap_name]).await;
+    run_cmd("ip", &["tuntap", "add", &tap_name, "mode", "tap"]).await?;
+    run_cmd("ip", &["addr", "add", &host_addr, "dev", &tap_name]).await?;
+    run_cmd("ip", &["link", "set", "dev", &tap_name, "up"]).await?;
+
+    // Resolve allow_hosts now so the chain gets ACCEPT rules for
+    // current IPs. The egress refresher's job is keeping these
+    // honest as DNS rotates.
+    let allow_ips = resolve_allow_hosts(&network.allow_hosts).await;
+    let plan = ChainPlan::new(sandbox_id, vm_cidr, network, host_policy)
+        .with_allow_ips(allow_ips);
+    for line in plan.create_lines() {
+        run_iptables(&line).await?;
+    }
+
+    Ok(NetSetup {
+        vm_cidr,
+        tap_name,
+        plan,
+    })
+}
+
+/// Tear down the host-side networking. Best-effort: each step's
+/// failure logs but doesn't stop the rest, since the VM is dead and
+/// we want to release as many resources as possible.
+#[cfg(target_os = "linux")]
+pub async fn teardown(
+    setup: &NetSetup,
+    allocator: &parking_lot::Mutex<NetworkAllocator>,
+) {
+    for line in setup.plan.destroy_lines() {
+        if let Err(e) = run_iptables(&line).await {
+            tracing::debug!(rule = %line, error = %e, "iptables teardown rule failed");
+        }
+    }
+    if let Err(e) = run_cmd("ip", &["link", "delete", &setup.tap_name]).await {
+        tracing::debug!(tap = %setup.tap_name, error = %e, "tap delete failed");
+    }
+    allocator.lock().free(setup.vm_cidr);
+}
+
+// Non-Linux stubs so the rest of the crate compiles cross-platform
+// (macOS dev — the FC backend impl itself is also Linux-gated, but
+// keeping these as plain `unimplemented!` would surface in
+// `cargo check --workspace` runs on Mac).
+#[cfg(not(target_os = "linux"))]
+pub async fn host_startup() -> Result<(), NetError> {
+    Err(NetError::Spawn(
+        "host_startup".into(),
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "FC networking is Linux-only",
+        ),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn provision(
+    _sandbox_id: SandboxId,
+    _allocator: &parking_lot::Mutex<NetworkAllocator>,
+    _network: NetworkPolicy,
+    _host_policy: NetPolicy,
+) -> Result<NetSetup, NetError> {
+    Err(NetError::Spawn(
+        "provision".into(),
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "FC networking is Linux-only",
+        ),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn teardown(_setup: &NetSetup, _allocator: &parking_lot::Mutex<NetworkAllocator>) {}
 
 #[cfg(test)]
 mod tests {

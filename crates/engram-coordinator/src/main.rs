@@ -113,6 +113,24 @@ struct Cli {
         default_value = "./var/engram/harnesses"
     )]
     harnesses_dir: PathBuf,
+
+    /// Engram CIDR pool — every Firecracker sandbox gets a unique
+    /// /30 carved from this. Defaults to 10.200.0.0/16 (16k slots).
+    /// Override if you're already using 10.200.0.0/16 on this host.
+    #[arg(long, env = "ENGRAM_FC_NET_CIDR", default_value = "10.200.0.0")]
+    fc_net_cidr: std::net::Ipv4Addr,
+
+    /// Per-VM iptables enforcement mode. `log_only` (the default)
+    /// renders LOG-and-ACCEPT for the final default rule so existing
+    /// manifests that haven't declared their `network.allow_hosts`
+    /// keep working. Flip to `enforce` once they have.
+    #[arg(
+        long,
+        env = "ENGRAM_FC_NET_POLICY",
+        default_value = "log_only",
+        value_parser = engram_sandbox_firecracker::net::NetPolicy::parse,
+    )]
+    fc_net_policy: engram_sandbox_firecracker::net::NetPolicy,
 }
 
 #[tokio::main]
@@ -189,11 +207,25 @@ async fn main() -> Result<(), CoordinatorError> {
                             .into(),
                     )
                 })?;
-                let fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-                Arc::new(FirecrackerBackend::new(
+                let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
+                fc_cfg.net_pool = cli.fc_net_cidr;
+                fc_cfg.net_policy = cli.fc_net_policy;
+                let fc = Arc::new(FirecrackerBackend::new(
                     cli.sandbox_work_dir.clone(),
                     fc_cfg,
-                ))
+                ));
+                // Apply once-per-host iptables setup: enable IP
+                // forwarding + install the inter-VM DROP rule.
+                // Idempotent — safe across coord restarts.
+                if let Err(e) = fc.host_startup().await {
+                    tracing::warn!(
+                        error = %e,
+                        "FC host_startup failed; per-VM networking will fail at session create. \
+                         Check that the coord runs as root (or with CAP_NET_ADMIN) and \
+                         iptables/ip are on PATH."
+                    );
+                }
+                fc as Arc<dyn SandboxBackend>
             }
             SandboxBackendChoice::Vz => {
                 #[cfg(target_os = "macos")]

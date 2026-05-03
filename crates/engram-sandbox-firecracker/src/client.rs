@@ -108,6 +108,19 @@ impl FirecrackerClient {
         self.put("/vsock", vsock).await
     }
 
+    /// `PUT /network-interfaces/{iface_id}` — attach a virtio-net
+    /// device backed by a host TAP. The TAP must already exist
+    /// (created via `ip tuntap add` before this call). Firecracker
+    /// surfaces the device to the guest as `eth0` for the first
+    /// configured interface.
+    pub async fn put_network_interface(
+        &self,
+        iface: &NetworkInterface,
+    ) -> Result<(), SandboxError> {
+        let path = format!("/network-interfaces/{}", iface.iface_id);
+        self.put(&path, iface).await
+    }
+
     /// `PUT /actions` — `InstanceStart`, `SendCtrlAltDel`, etc.
     pub async fn put_action(&self, action: ActionType) -> Result<(), SandboxError> {
         let body = ActionBody {
@@ -447,6 +460,21 @@ pub struct VsockConfig {
     /// Host-side Unix socket where the agent connects. Firecracker
     /// proxies guest→host vsock connections to this UDS.
     pub uds_path: String,
+}
+
+/// `PUT /network-interfaces/{iface_id}` payload. The TAP at
+/// `host_dev_name` must exist on the host already; Firecracker
+/// opens it (CAP_NET_ADMIN required) and binds the virtio-net
+/// frontend to it. `guest_mac` is optional — Firecracker generates
+/// one if omitted, but pinning it makes guest-side udev rules and
+/// debugging easier.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NetworkInterface {
+    pub iface_id: String,
+    pub host_dev_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guest_mac: Option<String>,
 }
 
 /// `PATCH /vm` payload. PascalCase variant names match Firecracker's
