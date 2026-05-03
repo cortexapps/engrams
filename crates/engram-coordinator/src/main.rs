@@ -208,6 +208,38 @@ async fn main() -> Result<(), CoordinatorError> {
     pg.migrate()
         .await
         .map_err(|e| CoordinatorError::Config(format!("migrate: {e}")))?;
+    // Trait-object Arc shared with both the OCI auth resolver
+    // (constructed below, before the sandbox backend) and
+    // `Services.meta` (further down). PostgresStore wraps a sqlx
+    // PgPool that's already cheaply cloneable, so duplicating into
+    // the Arc + keeping a local handle for direct trait calls (the
+    // host-row heartbeat loop below) is free.
+    let meta_arc: Arc<dyn engram_core::traits::MetadataStore> = Arc::new(pg.clone());
+
+    // KEK provider for envelope-encrypted registry credentials.
+    // Built early so the OCI auth resolver can reference it.
+    // Hard-fail at startup if env-var mode is selected and the env
+    // var is missing — encrypting registry passwords with a missing
+    // key has worse failure modes than just refusing to start.
+    let kek: Arc<dyn engram_crypto::MasterKeyProvider> = match cli.kek_provider {
+        KekChoice::EnvVar => Arc::new(
+            engram_crypto::EnvVarKeyProvider::from_env(&cli.kek_env_var).map_err(|e| {
+                CoordinatorError::Config(format!("KEK env-var `{}`: {e}", cli.kek_env_var))
+            })?,
+        ),
+        KekChoice::GcpKms => {
+            let resource = cli.kek_gcp_resource.as_deref().ok_or_else(|| {
+                CoordinatorError::Config(
+                    "--kek-provider gcp-kms requires --kek-gcp-resource".into(),
+                )
+            })?;
+            Arc::new(
+                engram_crypto::GcpKmsProvider::new(resource)
+                    .map_err(|e| CoordinatorError::Config(format!("KEK gcp-kms: {e}")))?,
+            )
+        }
+    };
+    tracing::info!(provider = ?cli.kek_provider, key_id = %kek.key_id(), "KEK initialised");
 
     let cloud: Arc<dyn CloudBackend> = match cli.cloud_backend {
         CloudBackendChoice::Static => Arc::new(
@@ -310,13 +342,17 @@ async fn main() -> Result<(), CoordinatorError> {
         // the warm-pool key is derived. Cache root lives under
         // `<local_path>/oci-cache` so it doesn't collide with the
         // legacy on-disk image registry tree.
+        //
+        // Auth: PgAuthResolver dispatches per `auth_kind` —
+        // static creds (decrypt under KEK), GCP Workload Identity
+        // (token via gcp_auth crate). Missing rows = anonymous,
+        // which still works for public registries and
+        // `localhost:5000`.
         let oci_cache_root = cli.local_path.join("oci-cache");
-        let oci_client = engram_oci::OciClient::new(Arc::new(engram_oci::AnonymousResolver));
-        // TODO(phase-5b): swap AnonymousResolver for a Postgres-
-        // backed resolver that decrypts registry_credentials rows
-        // via CredCipher. Anonymous works for public registries and
-        // localhost:5000 in dev; private registries land with the
-        // resolver wiring.
+        let auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver> = Arc::new(
+            engram_oci_auth::PgAuthResolver::new(meta_arc.clone(), kek.clone()),
+        );
+        let oci_client = engram_oci::OciClient::new(auth_resolver);
         let image_cache =
             engram_host_agent::image_cache::ImageCache::open(oci_cache_root, oci_client)
                 .await
@@ -402,29 +438,9 @@ async fn main() -> Result<(), CoordinatorError> {
     // etc. via a config flag (next round).
     let secrets: Arc<dyn SecretStore> = Arc::new(EnvSecretStore::new());
 
-    // KEK provider for envelope-encrypted registry credentials.
-    // Hard-fail at startup if env-var mode is selected and the env
-    // var is missing — encrypting registry passwords with a missing
-    // key has worse failure modes than just refusing to start.
-    let kek: Arc<dyn engram_crypto::MasterKeyProvider> = match cli.kek_provider {
-        KekChoice::EnvVar => Arc::new(
-            engram_crypto::EnvVarKeyProvider::from_env(&cli.kek_env_var).map_err(|e| {
-                CoordinatorError::Config(format!("KEK env-var `{}`: {e}", cli.kek_env_var))
-            })?,
-        ),
-        KekChoice::GcpKms => {
-            let resource = cli.kek_gcp_resource.as_deref().ok_or_else(|| {
-                CoordinatorError::Config(
-                    "--kek-provider gcp-kms requires --kek-gcp-resource".into(),
-                )
-            })?;
-            Arc::new(
-                engram_crypto::GcpKmsProvider::new(resource)
-                    .map_err(|e| CoordinatorError::Config(format!("KEK gcp-kms: {e}")))?,
-            )
-        }
-    };
-    tracing::info!(provider = ?cli.kek_provider, key_id = %kek.key_id(), "KEK initialised");
+    // KEK + meta_arc were constructed up-front so the OCI auth
+    // resolver could reference them. They flow through to Services
+    // here unchanged.
 
     let images = ImageRegistry::new(cli.local_path.join("images"));
     let harnesses = Arc::new(
@@ -484,7 +500,7 @@ async fn main() -> Result<(), CoordinatorError> {
     };
 
     let services = Services {
-        meta: Arc::new(pg),
+        meta: meta_arc.clone(),
         cloud,
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets,

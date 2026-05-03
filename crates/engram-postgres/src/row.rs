@@ -127,14 +127,30 @@ pub(crate) fn registry_credential_from_row(row: &PgRow) -> Result<RegistryCreden
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
+    let registry_host: String = row.try_get("registry_host").map_err(col_err)?;
+    let auth_kind: String = row.try_get("auth_kind").map_err(col_err)?;
+    let auth_config: serde_json::Value = row.try_get("auth_config").map_err(col_err)?;
+    // The JSONB payload was written by `serde_json::to_value(&auth)`
+    // upstream, so it's already in the `serde(tag = "kind")` shape.
+    // We sanity-check that the typed `auth_kind` column matches the
+    // JSON's `kind` field — drift here means a write went around the
+    // typed Rust path (raw SQL? schema bug?) and we'd rather fail
+    // loud than silently dispatch on the wrong variant.
+    let json_kind = auth_config
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if json_kind != auth_kind {
+        return Err(MetaError::Serialization(format!(
+            "registry_credentials row {id}: auth_kind column = {auth_kind:?} but auth_config.kind = {json_kind:?}"
+        )));
+    }
+    let auth = serde_json::from_value(auth_config)
+        .map_err(|e| MetaError::Serialization(format!("auth_config decode: {e}")))?;
     Ok(RegistryCredential {
         id,
-        registry_host: row.try_get("registry_host").map_err(col_err)?,
-        username: row.try_get("username").map_err(col_err)?,
-        wrapped_dek: row.try_get("wrapped_dek").map_err(col_err)?,
-        nonce: row.try_get("nonce").map_err(col_err)?,
-        ciphertext: row.try_get("ciphertext").map_err(col_err)?,
-        key_id: row.try_get("key_id").map_err(col_err)?,
+        registry_host,
+        auth,
         created_at,
         updated_at,
     })

@@ -1,0 +1,32 @@
+[package]
+name = "engram-oci-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Auth-strategy resolvers for engram-oci. Postgres-backed static creds + cloud-IAM (GCP WI today; AWS / impersonation-SA designed-in)."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+engram-crypto.workspace = true
+engram-oci.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+# GCP Workload Identity / metadata-server / impersonation. The
+# `gcp_auth` crate detects the runtime (GKE / GCE / Cloud Run /
+# gcloud CLI / SA file) and produces tokens with caching. ~30 transitive
+# deps; localized to this crate so coordinator's main tree doesn't
+# pull GCP unless the resolver is wired.
+gcp_auth = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+uuid = { workspace = true }

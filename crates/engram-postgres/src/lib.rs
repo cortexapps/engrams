@@ -519,28 +519,32 @@ impl MetadataStore for PostgresStore {
     // ---------- registry credentials ----------
 
     async fn upsert_registry_credential(&self, cred: RegistryCredential) -> Result<(), MetaError> {
+        // The polymorphic schema stores `auth_kind` as a typed column
+        // (so SQL can `WHERE auth_kind = 'static'` without JSON
+        // probing) and the variant payload as JSONB. We round-trip
+        // the payload through `serde_json::to_value(&cred.auth)` —
+        // the `serde(tag = "kind")` rendering on `RegistryAuthSpec`
+        // produces a JSON object whose `kind` field already matches
+        // the typed column, so the two are kept in sync.
+        let auth_kind = cred.auth.kind();
+        let auth_config = serde_json::to_value(&cred.auth)
+            .map_err(|e| MetaError::Serialization(format!("auth_config: {e}")))?;
         sqlx::query(
             r#"
             INSERT INTO registry_credentials
-                (id, registry_host, username,
-                 wrapped_dek, nonce, ciphertext, key_id,
+                (id, registry_host, auth_kind, auth_config,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
-            ON CONFLICT (registry_host, username) DO UPDATE SET
-                wrapped_dek = EXCLUDED.wrapped_dek,
-                nonce       = EXCLUDED.nonce,
-                ciphertext  = EXCLUDED.ciphertext,
-                key_id      = EXCLUDED.key_id,
+            VALUES ($1, $2, $3, $4, $5, NULL)
+            ON CONFLICT (registry_host) DO UPDATE SET
+                auth_kind   = EXCLUDED.auth_kind,
+                auth_config = EXCLUDED.auth_config,
                 updated_at  = NOW()
             "#,
         )
         .bind(cred.id)
         .bind(&cred.registry_host)
-        .bind(&cred.username)
-        .bind(&cred.wrapped_dek)
-        .bind(&cred.nonce)
-        .bind(&cred.ciphertext)
-        .bind(&cred.key_id)
+        .bind(auth_kind)
+        .bind(auth_config)
         .bind(cred.created_at)
         .execute(&self.pool)
         .await
@@ -551,11 +555,10 @@ impl MetadataStore for PostgresStore {
     async fn list_registry_credentials(&self) -> Result<Vec<RegistryCredential>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, registry_host, username,
-                   wrapped_dek, nonce, ciphertext, key_id,
+            SELECT id, registry_host, auth_kind, auth_config,
                    created_at, updated_at
               FROM registry_credentials
-             ORDER BY registry_host, username
+             ORDER BY registry_host
             "#,
         )
         .fetch_all(&self.pool)
@@ -570,12 +573,10 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Option<RegistryCredential>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, registry_host, username,
-                   wrapped_dek, nonce, ciphertext, key_id,
+            SELECT id, registry_host, auth_kind, auth_config,
                    created_at, updated_at
               FROM registry_credentials
              WHERE registry_host = $1
-             ORDER BY COALESCE(updated_at, created_at) DESC
              LIMIT 1
             "#,
         )

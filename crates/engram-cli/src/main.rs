@@ -187,27 +187,44 @@ enum HostCmd {
 
 #[derive(Subcommand, Debug)]
 enum RegistryCmd {
-    /// Add (or update) a Docker registry credential. The password is
-    /// read from a file (preferred — avoids leaking into shell
-    /// history) or stdin.
+    /// Add (or update) a Docker registry credential. Two auth kinds
+    /// today; the schema is designed for AWS instance role and
+    /// service-account impersonation to slot in later as siblings.
+    ///
+    /// - `--auth-kind static` (default): paste a username + password
+    ///   / PAT / service-account JSON. Sealed under the deployment
+    ///   KEK, decrypted on each pull.
+    /// - `--auth-kind gcp-workload-identity`: Engram's host-agent
+    ///   uses its ambient GCP identity (GKE WI, GCE/Cloud Run SA)
+    ///   to fetch a short-lived OAuth token per pull. No stored
+    ///   password. `--impersonate-sa <email>` chains identity
+    ///   through IAM Credentials API (deferred — schema-ready).
     Add {
         /// Registry host. Examples: `gcr.io`, `ghcr.io`,
+        /// `us-east1-docker.pkg.dev`,
         /// `123456.dkr.ecr.us-east-1.amazonaws.com`, `localhost:5000`.
         #[arg(long)]
         host: String,
-        /// Registry username. For GCP service-account JSON, use
-        /// `_json_key`. For DockerHub PATs, your DockerHub username.
-        #[arg(long)]
-        username: String,
-        /// Path to a file containing the password / PAT / service-
-        /// account JSON. The file's exact contents (minus a single
-        /// trailing newline) are stored as the password.
+        /// Authentication kind. Defaults to `static` for backward-
+        /// compat with the original v1 surface.
+        #[arg(long, default_value = "static")]
+        auth_kind: String,
+        /// Static-only: registry username. For GCP SA-JSON-keys, use
+        /// the literal string `_json_key`.
+        #[arg(long, required_if_eq("auth_kind", "static"))]
+        username: Option<String>,
+        /// Static-only: path to a file containing the password / PAT
+        /// / service-account JSON. Trailing newline is stripped.
         #[arg(long, conflicts_with = "password_stdin")]
         password_file: Option<PathBuf>,
-        /// Read the password from stdin until EOF. Useful for
-        /// piping (`echo -n $PAT | engram registry add ... --password-stdin`).
+        /// Static-only: read the password from stdin until EOF.
         #[arg(long)]
         password_stdin: bool,
+        /// GCP-WI-only: impersonate this service account via IAM
+        /// Credentials API. Omit for ambient-identity (the common
+        /// case — same SA the host-agent runs under).
+        #[arg(long)]
+        impersonate_sa: Option<String>,
     },
     /// List registered registry credentials. Never returns passwords.
     List,
@@ -482,17 +499,21 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
         Cmd::Registry { cmd } => match cmd {
             RegistryCmd::Add {
                 host,
+                auth_kind,
                 username,
                 password_file,
                 password_stdin,
+                impersonate_sa,
             } => {
                 registry_add(
                     &client,
                     &cli.endpoint,
                     host,
-                    username,
+                    auth_kind,
+                    username.as_deref(),
                     password_file.as_deref(),
                     *password_stdin,
+                    impersonate_sa.as_deref(),
                     cli.json,
                 )
                 .await
@@ -1238,48 +1259,77 @@ async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value, CliError
 
 // ---- registry subcommands ---------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn registry_add(
     client: &reqwest::Client,
     endpoint: &str,
     host: &str,
-    username: &str,
+    auth_kind: &str,
+    username: Option<&str>,
     password_file: Option<&std::path::Path>,
     password_stdin: bool,
+    impersonate_sa: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    let password = match (password_file, password_stdin) {
-        (Some(path), false) => {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| CliError::Other(format!("read {}: {e}", path.display())))?;
-            // Strip a single trailing newline if present (common for
-            // `echo "$pat" > file` flows). Other whitespace is left
-            // intact — service-account JSON has internal newlines.
-            raw.strip_suffix('\n').unwrap_or(&raw).to_string()
+    // Per-kind validation + auth-payload assembly. Shape mirrors the
+    // server's `AddRegistryAuth` discriminated enum (serde tag = "kind").
+    let auth = match auth_kind {
+        "static" => {
+            let username = username
+                .ok_or_else(|| CliError::Other("--auth-kind static requires --username".into()))?;
+            let password = match (password_file, password_stdin) {
+                (Some(path), false) => {
+                    let raw = std::fs::read_to_string(path)
+                        .map_err(|e| CliError::Other(format!("read {}: {e}", path.display())))?;
+                    // Strip a single trailing newline if present
+                    // (common for `echo "$pat" > file` flows). Other
+                    // whitespace is left intact — service-account
+                    // JSON has internal newlines.
+                    raw.strip_suffix('\n').unwrap_or(&raw).to_string()
+                }
+                (None, true) => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| CliError::Other(format!("stdin: {e}")))?;
+                    buf.strip_suffix('\n').unwrap_or(&buf).to_string()
+                }
+                (None, false) => {
+                    return Err(CliError::Other(
+                        "static auth requires --password-file <path> or --password-stdin".into(),
+                    ));
+                }
+                (Some(_), true) => unreachable!("clap conflicts_with"),
+            };
+            if password.is_empty() {
+                return Err(CliError::Other("password is empty".into()));
+            }
+            serde_json::json!({
+                "kind": "static",
+                "username": username,
+                "password": password,
+            })
         }
-        (None, true) => {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| CliError::Other(format!("stdin: {e}")))?;
-            buf.strip_suffix('\n').unwrap_or(&buf).to_string()
+        "gcp-workload-identity" | "gcp_workload_identity" => {
+            // No secret material; the host-agent's ambient GCP
+            // identity is the credential. `--impersonate-sa` chains
+            // identity to a target SA via IAM Credentials API
+            // (server-side support deferred — schema is ready).
+            let mut obj = serde_json::json!({ "kind": "gcp_workload_identity" });
+            if let Some(sa) = impersonate_sa {
+                obj["impersonate_sa"] = serde_json::Value::String(sa.into());
+            }
+            obj
         }
-        (None, false) => {
-            return Err(CliError::Other(
-                "must supply --password-file <path> or --password-stdin".into(),
-            ));
+        other => {
+            return Err(CliError::Other(format!(
+                "unknown --auth-kind `{other}` (expected: static | gcp-workload-identity)"
+            )));
         }
-        (Some(_), true) => unreachable!("clap conflicts_with"),
     };
-    if password.is_empty() {
-        return Err(CliError::Other("password is empty".into()));
-    }
 
-    let body = serde_json::json!({
-        "host": host,
-        "username": username,
-        "password": password,
-    });
+    let body = serde_json::json!({ "host": host, "auth": auth });
     let resp = client
         .post(format!("{endpoint}/api/registries"))
         .header("content-type", "application/json")
@@ -1297,10 +1347,10 @@ async fn registry_add(
         let v: Value = serde_json::from_str(&resp_body)
             .map_err(|e| CliError::Other(format!("invalid JSON from server: {e}")))?;
         println!(
-            "added: host={} username={} key_id={}",
+            "added: host={} auth_kind={} principal={}",
             v["host"].as_str().unwrap_or(""),
-            v["username"].as_str().unwrap_or(""),
-            v["key_id"].as_str().unwrap_or(""),
+            v["auth_kind"].as_str().unwrap_or(""),
+            v["auth_principal"].as_str().unwrap_or("(none)"),
         );
     }
     Ok(())
@@ -1322,13 +1372,13 @@ async fn registry_list(
         println!("(no registries configured)");
         return Ok(());
     }
-    println!("{:<40}  {:<24}  KEY_ID", "HOST", "USERNAME");
+    println!("{:<40}  {:<24}  PRINCIPAL", "HOST", "AUTH_KIND");
     for r in regs {
         println!(
             "{:<40}  {:<24}  {}",
             r["registry_host"].as_str().unwrap_or(""),
-            r["username"].as_str().unwrap_or(""),
-            r["key_id"].as_str().unwrap_or(""),
+            r["auth_kind"].as_str().unwrap_or(""),
+            r["auth_principal"].as_str().unwrap_or("(none)"),
         );
     }
     Ok(())

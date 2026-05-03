@@ -26,6 +26,7 @@ members = [
     "crates/engram-egress-proxy",
     "crates/engram-crypto",
     "crates/engram-oci",
+    "crates/engram-oci-auth",
 ]
 
 [workspace.package]
@@ -61,6 +62,7 @@ engram-uffd-handler = { path = "crates/engram-uffd-handler" }
 engram-egress-proxy = { path = "crates/engram-egress-proxy" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-oci = { path = "crates/engram-oci" }
+engram-oci-auth = { path = "crates/engram-oci-auth" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }
