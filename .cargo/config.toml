@@ -16,6 +16,16 @@
 
 [target.x86_64-unknown-linux-musl]
 linker = "x86_64-linux-musl-gcc"
+# Force a fully static binary (no PT_INTERP). Rust's musl target
+# defaults to PIE which embeds a dynamic-linker reference at
+# `/lib/ld-musl-x86_64.so.1`; that path doesn't exist in our test
+# rootfs (debian-slim ships glibc, not musl), so the kernel fails
+# the exec with "not found" before init even starts.
+# `relocation-model=static` drops the interpreter; combined with
+# `crt-static` (the target's default since Rust 1.57) it produces a
+# binary that runs in a vanilla rootfs. See rust-lang/rust#72703.
+rustflags = ["-C", "relocation-model=static"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "relocation-model=static"]
