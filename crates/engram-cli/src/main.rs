@@ -350,6 +350,17 @@ enum ImageCmd {
         /// every Linux kernel.
         #[arg(long, value_parser = parse_transport, default_value = "vsock")]
         transport: engram_image_builder::Transport,
+
+        /// Push the baked image to a Docker registry as an Engram OCI
+        /// artifact. Accepts either `host/repo` (auto-appends the
+        /// produced tag) or `host/repo:tag`. Format must be `ext4`.
+        ///
+        /// The bake step intentionally does NOT touch Postgres — once
+        /// pushed, an image is reachable to engram by URI alone (the
+        /// host-agent pulls via the auth resolver). Engram learns
+        /// about the image when a session references its URI.
+        #[arg(long)]
+        push: Option<String>,
     },
 }
 
@@ -473,6 +484,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 inject_agent,
                 inject_bootstrap,
                 transport,
+                push,
             } => {
                 image_build(
                     repo,
@@ -484,6 +496,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     inject_agent.as_deref(),
                     inject_bootstrap.as_deref(),
                     *transport,
+                    push.as_deref(),
                 )
                 .await
             }
@@ -1186,6 +1199,7 @@ async fn image_build(
     inject_agent: Option<&Path>,
     inject_bootstrap: Option<&Path>,
     transport: engram_image_builder::Transport,
+    push: Option<&str>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
@@ -1225,6 +1239,29 @@ async fn image_build(
         dir = outcome.image_dir.display(),
         size = outcome.size_bytes,
     );
+
+    // Optional push to OCI registry. The bake step intentionally does
+    // NOT touch Postgres — once pushed, the image is reachable to
+    // engram by URI alone. The auth resolver wired into the host-
+    // agent's OCI client handles credential lookup at pull time.
+    // Anonymous push works for `localhost:5001` and other public
+    // registries; private targets need a `docker login`-equivalent
+    // upstream of this command (the CLI itself doesn't auth pushes).
+    if let Some(target) = push {
+        let oci = engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ));
+        let push = builder
+            .push_to_registry(&oci, &req, &outcome, target)
+            .await
+            .map_err(|e| CliError::Other(format!("push: {e}")))?;
+        println!(
+            "✓ pushed {uri} (digest {digest})",
+            uri = push.uri,
+            digest = push.manifest_digest.as_str(),
+        );
+    }
+
     Ok(())
 }
 

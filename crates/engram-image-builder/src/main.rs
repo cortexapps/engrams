@@ -21,7 +21,6 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
 use engram_oci::{AnonymousResolver, OciClient};
-use engram_postgres::PostgresStore;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -61,12 +60,6 @@ struct BuildOpts {
     )]
     images_dir: PathBuf,
 
-    /// Optional. If set, upserts the produced `image_versions` row.
-    /// Without it the bake is filesystem-only (handy for `engram-cli
-    /// image build` against a coordinator-less workspace).
-    #[arg(long, env = "DATABASE_URL")]
-    database_url: Option<String>,
-
     /// Override the docker binary (e.g. `podman`).
     #[arg(long, env = "ENGRAM_DOCKER_BIN")]
     docker_bin: Option<String>,
@@ -78,10 +71,12 @@ struct BuildOpts {
     format: Format,
 
     /// Push the baked image to a Docker registry as an Engram OCI
-    /// artifact (Phase 5+). Accepts either `host/repo` (auto-appends
-    /// the produced tag) or `host/repo:tag`. Requires `--format ext4`.
-    /// When `--database-url` is also set, the resulting URI lands in
-    /// `image_versions.blob_url`.
+    /// artifact. Accepts either `host/repo` (auto-appends the produced
+    /// tag) or `host/repo:tag`. Requires `--format ext4`.
+    ///
+    /// The bake step intentionally does NOT touch Postgres — once
+    /// pushed, an image is reachable to engram by URI alone (the
+    /// host-agent pulls via the auth resolver at session-create time).
     #[arg(long)]
     push: Option<String>,
 }
@@ -139,31 +134,15 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
 
     // Optional: push to a Docker registry. The `--push` binary CLI
     // only handles anonymous registries (local registry:2 / public
-    // registries). Authenticated push goes via `engram image push`
-    // which talks to the coordinator and uses its credential store.
-    let blob_url = if let Some(target) = opts.push.as_deref() {
+    // registries). Authenticated push to a private registry needs
+    // a `docker login`-equivalent upstream of this command — the
+    // baker doesn't carry credentials.
+    if let Some(target) = opts.push.as_deref() {
         let oci = OciClient::new(Arc::new(AnonymousResolver));
         let push = builder
             .push_to_registry(&oci, &req, &outcome, target)
             .await?;
         tracing::info!(uri = %push.uri, digest = %push.manifest_digest.as_str(), "pushed to registry");
-        Some(push.uri)
-    } else {
-        None
-    };
-
-    if let Some(url) = opts.database_url.as_deref() {
-        let pg = PostgresStore::connect(url).await?;
-        builder
-            .record_in_metadata(&pg, &req, &outcome, blob_url)
-            .await?;
-        tracing::info!(repo = %req.repo, tag = %tag, "image_versions row marked Ready");
-    } else {
-        tracing::info!(
-            repo = %req.repo,
-            tag = %tag,
-            "DATABASE_URL not set — skipping metadata write (filesystem-only bake)",
-        );
     }
 
     Ok(())

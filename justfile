@@ -143,7 +143,7 @@ dev-down:
 # `engram session create --image localhost:5001/<repo>:<tag>`.
 bake repo dir='.':
     @set -e; \
-    : "$${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"; \
+    : "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"; \
     if [ "$(uname -s -m)" = "Darwin arm64" ]; then \
         TARGET=aarch64-unknown-linux-musl; PLATFORM=linux/arm64; TRANSPORT=console; \
     elif [ "$(uname -s -m)" = "Linux x86_64" ]; then \
@@ -151,32 +151,32 @@ bake repo dir='.':
     else \
         echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
     fi; \
-    rustup target add $$TARGET >/dev/null 2>&1 || true; \
-    cargo build -p engram-agentd    --target $$TARGET --release; \
-    cargo build -p engram-bootstrap --target $$TARGET --release; \
-    TAG="$${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
+    rustup target add $TARGET >/dev/null 2>&1 || true; \
+    cargo build -p engram-agentd    --target $TARGET --release; \
+    cargo build -p engram-bootstrap --target $TARGET --release; \
+    TAG="${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
     STAGING="./var/bake/{{repo}}"; \
-    rm -rf "$$STAGING"; mkdir -p "$$STAGING"; \
-    cp "{{dir}}/Dockerfile"  "$$STAGING/Dockerfile"; \
-    cp "{{dir}}/engram.toml" "$$STAGING/engram.toml"; \
-    if [ "$$PLATFORM" = "linux/arm64" ]; then \
-        sed -i.bak 's|^FROM \([^ ]*\)$$|FROM --platform=linux/arm64 \1|' "$$STAGING/Dockerfile"; \
-        rm -f "$$STAGING/Dockerfile.bak"; \
+    rm -rf "$STAGING"; mkdir -p "$STAGING"; \
+    cp "{{dir}}/Dockerfile"  "$STAGING/Dockerfile"; \
+    cp "{{dir}}/engram.toml" "$STAGING/engram.toml"; \
+    if [ "$PLATFORM" = "linux/arm64" ]; then \
+        sed -i.bak 's|^FROM \([^ ]*\)$|FROM --platform=linux/arm64 \1|' "$STAGING/Dockerfile"; \
+        rm -f "$STAGING/Dockerfile.bak"; \
     fi; \
-    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$$PATH" \
-    DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
-    cargo run -p engram-image-builder -- build \
+    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
+    cargo run -p engram-cli -- image build \
         --repo {{repo}} \
-        --tag $$TAG \
-        --source $$STAGING \
+        --tag $TAG \
+        --source $STAGING \
         --format ext4 \
-        --transport $$TRANSPORT \
-        --inject-agent     "target/$$TARGET/release/engram-agentd" \
-        --inject-bootstrap "target/$$TARGET/release/engram-bootstrap" \
+        --images-dir ./var/bake/_staging \
+        --transport $TRANSPORT \
+        --inject-agent     "target/$TARGET/release/engram-agentd" \
+        --inject-bootstrap "target/$TARGET/release/engram-bootstrap" \
         --push localhost:5001/{{repo}}; \
     echo ""; \
-    echo "✓ pushed localhost:5001/{{repo}}:$$TAG"; \
-    echo "  visible in dashboard's session-create dropdown immediately"
+    echo "✓ pushed localhost:5001/{{repo}}:$TAG"; \
+    echo "  use it: engram session create --image localhost:5001/{{repo}}:$TAG ..."
 
 # ------------------------------------------------------------------
 # Lower-level recipes (composed by `just dev` via Tilt; useful
