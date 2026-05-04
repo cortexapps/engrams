@@ -75,6 +75,12 @@ pub enum RegistryAuthSpec {
         #[serde(default)]
         impersonate_sa: Option<String>,
     },
+    /// Public registries that don't require any auth at all (Docker
+    /// Hub public images, ghcr.io public, the local dev registry,
+    /// etc.). Stored as a row primarily so the dashboard can list
+    /// the host and the operator can later upgrade it to a `Static`
+    /// or `GcpWorkloadIdentity` entry without losing the host name.
+    Anonymous,
 }
 
 impl RegistryAuthSpec {
@@ -85,6 +91,7 @@ impl RegistryAuthSpec {
         match self {
             Self::Static { .. } => "static",
             Self::GcpWorkloadIdentity { .. } => "gcp_workload_identity",
+            Self::Anonymous => "anonymous",
         }
     }
 }
@@ -113,6 +120,7 @@ impl From<RegistryCredential> for RegistryCredentialSummary {
             RegistryAuthSpec::GcpWorkloadIdentity { impersonate_sa } => {
                 ("gcp_workload_identity", impersonate_sa.clone())
             }
+            RegistryAuthSpec::Anonymous => ("anonymous", None),
         };
         Self {
             id: c.id,
@@ -178,6 +186,29 @@ pub struct EnabledImageSummary {
     pub manifest_description: Option<String>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+impl From<EnabledImage> for EnabledImageSummary {
+    fn from(row: EnabledImage) -> Self {
+        // Try to lift display fields out of the parsed manifest. A
+        // parse failure here just leaves them None — the row stays
+        // in the list so an operator can still disable it; the
+        // dashboard falls back to rendering `image_uri` only.
+        let manifest: Option<crate::types::ImageManifest> = toml::from_str(&row.manifest_toml).ok();
+        let (manifest_name, manifest_description) = match manifest {
+            Some(m) => (Some(m.name), m.description),
+            None => (None, None),
+        };
+        Self {
+            id: row.id,
+            image_uri: row.image_uri,
+            manifest_digest: row.manifest_digest,
+            manifest_name,
+            manifest_description,
+            last_refreshed_at: row.last_refreshed_at,
+            created_at: row.created_at,
+        }
+    }
 }
 
 #[cfg(test)]

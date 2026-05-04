@@ -48,6 +48,10 @@ pub enum AddRegistryAuth {
         #[serde(default)]
         impersonate_sa: Option<String>,
     },
+    /// Public registry — no auth material to store. Stored as a row
+    /// so the dashboard's catalog browser can list the host and so
+    /// `enabled_images` POST can validate against a known set.
+    Anonymous,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +114,7 @@ pub async fn add_registry(
             // valid "configure now, deploy host-agent later" flow.
             RegistryAuthSpec::GcpWorkloadIdentity { impersonate_sa }
         }
+        AddRegistryAuth::Anonymous => RegistryAuthSpec::Anonymous,
     };
 
     let cred = RegistryCredential {

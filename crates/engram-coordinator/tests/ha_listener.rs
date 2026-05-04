@@ -127,6 +127,9 @@ async fn build_app_state(
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {

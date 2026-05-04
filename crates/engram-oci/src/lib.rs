@@ -65,6 +65,7 @@ impl RegistryAuthResolver for AnonymousResolver {
 
 /// Wraps `oci-client::Client` with Engram-specific push/pull verbs
 /// and credential resolution.
+#[derive(Clone)]
 pub struct OciClient {
     inner: Client,
     auth: Arc<dyn RegistryAuthResolver>,
@@ -214,6 +215,55 @@ impl OciClient {
             rootfs_path,
             manifest_digest: Digest256(data.digest.unwrap_or_default()),
         })
+    }
+
+    /// Fetch only the engram manifest.toml layer of an engram image
+    /// artifact, plus its top-level manifest digest. Skips the
+    /// rootfs.ext4 layer entirely — the registry's `pull` returns the
+    /// full layer set, but we drop the rootfs blob without writing it.
+    /// Returns `(manifest_bytes, manifest_digest)`.
+    ///
+    /// Used by the coordinator's `/api/enabled-images` POST handler:
+    /// when an operator enables an image, we cache its parsed
+    /// manifest on the row so session-create has zero registry I/O.
+    /// `oci-distribution`'s `pull` is a single round-trip for the
+    /// index + all layer blobs, so we still pay one fetch for the
+    /// rootfs bytes — but we don't write them anywhere, and on a
+    /// public registry that's a wash. The savings vs. a full
+    /// `pull_image()` are storage (no rootfs.ext4 file written) and
+    /// cleanup (no temp dir to manage).
+    pub async fn pull_engram_manifest_only(
+        &self,
+        uri: &str,
+    ) -> Result<(Vec<u8>, Digest256), OciError> {
+        let reference: Reference = uri
+            .parse()
+            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
+        let client = Self::client_for(&reference);
+        let auth = self.auth_for(&reference).await?;
+
+        let accepted = vec![
+            ENGRAM_MANIFEST_MEDIA_TYPE,
+            ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
+            OCI_IMAGE_MEDIA_TYPE,
+        ];
+        let data = client
+            .pull(&reference, &auth, accepted)
+            .await
+            .map_err(|e| OciError::Distribution(e.to_string()))?;
+
+        let manifest_layer = data
+            .layers
+            .iter()
+            .find(|l| l.media_type == ENGRAM_MANIFEST_MEDIA_TYPE)
+            .ok_or_else(|| {
+                OciError::Distribution("pulled artifact missing engram manifest layer".into())
+            })?;
+
+        Ok((
+            manifest_layer.data.clone(),
+            Digest256(data.digest.unwrap_or_default()),
+        ))
     }
 
     /// Push a harness pack artifact. Tars + gzips `pack_dir` and pushes

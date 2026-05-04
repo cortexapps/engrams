@@ -349,6 +349,9 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
@@ -479,6 +482,9 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {

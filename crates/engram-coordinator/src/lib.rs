@@ -41,6 +41,12 @@ pub struct Services {
     /// encrypted creds live in the `registry_credentials` table.
     pub kek: Arc<dyn engram_crypto::MasterKeyProvider>,
     pub images: image_registry::ImageRegistry,
+    /// OCI client for pulling registry artifacts. Used by
+    /// `/api/enabled-images` POST/refresh to fetch the manifest.toml
+    /// at enable time so session-create has zero registry I/O. Shared
+    /// with the host-agent's `image_cache` in `--mode=all` so one
+    /// auth-resolver cache backs both.
+    pub oci: Arc<engram_oci::OciClient>,
     /// Per-host TLS-MITM egress proxy. Sessions get registered here
     /// at create-time so the proxy knows how to dispatch outbound
     /// HTTPS traffic from each VM. `None` if the proxy isn't enabled

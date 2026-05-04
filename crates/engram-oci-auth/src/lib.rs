@@ -122,6 +122,16 @@ impl PgAuthResolver {
                     })?;
                 Ok(Arc::new(strategy))
             }
+            RegistryAuthSpec::Anonymous => {
+                // Resolve short-circuits before reaching this site —
+                // it's an internal invariant rather than a user-
+                // visible error path. Reachable only if a future caller
+                // routes Anonymous through `build_strategy`.
+                Err(OciError::Distribution(
+                    "Anonymous auth is short-circuited in resolve(); should not reach build_strategy"
+                        .into(),
+                ))
+            }
         }
     }
 }
@@ -139,6 +149,14 @@ impl RegistryAuthResolver for PgAuthResolver {
         let Some(row) = row else {
             return Ok(None);
         };
+
+        // `Anonymous` rows exist primarily so the dashboard can list
+        // the host; they carry no auth material. Short-circuit here so
+        // the OCI client falls through to anonymous pull just like a
+        // missing row would.
+        if matches!(row.auth, RegistryAuthSpec::Anonymous) {
+            return Ok(None);
+        }
 
         // Get-or-build strategy. We hold the lock only for the
         // map mutation — strategy construction can call into

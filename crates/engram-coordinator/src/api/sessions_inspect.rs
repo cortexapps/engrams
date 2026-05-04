@@ -497,6 +497,9 @@ mod tests {
                 [0u8; 32], "test:v1",
             )),
             images: ImageRegistry::new(local.path().join("images")),
+            oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
             egress_proxy: None,
         };
         let cfg = CoordinatorConfig {

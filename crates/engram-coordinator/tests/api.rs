@@ -363,6 +363,9 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
@@ -415,6 +418,9 @@ impl TestFixture {
                 [0u8; 32], "test:v1",
             )),
             images: ImageRegistry::new(images_dir.clone()),
+            oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
             egress_proxy: None,
         };
         let cfg = CoordinatorConfig {
@@ -2026,6 +2032,9 @@ async fn create_session_failure_marks_session_failed() {
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {

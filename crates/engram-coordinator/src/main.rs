@@ -229,6 +229,16 @@ async fn main() -> Result<(), CoordinatorError> {
     };
     tracing::info!(provider = ?cli.kek_provider, key_id = %kek.key_id(), "KEK initialised");
 
+    // Build the OCI client up-front. The same instance is shared by
+    // (a) the host-agent's image_cache in `--mode=all`, and (b) the
+    // coordinator's `/api/enabled-images` enable + refresh handlers.
+    // PgAuthResolver dispatches per `auth_kind` — static (decrypt
+    // under KEK), GCP Workload Identity, anonymous (short-circuited).
+    let auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver> = Arc::new(
+        engram_oci_auth::PgAuthResolver::new(meta_arc.clone(), kek.clone()),
+    );
+    let oci_client = Arc::new(engram_oci::OciClient::new(auth_resolver));
+
     let cloud: Arc<dyn CloudBackend> = match cli.cloud_backend {
         CloudBackendChoice::Static => Arc::new(
             StaticCloud::detect()
@@ -329,20 +339,11 @@ async fn main() -> Result<(), CoordinatorError> {
         // harness_pack_uri get resolved through the OCI puller before
         // the warm-pool key is derived. Cache root lives under
         // `<local_path>/oci-cache` so it doesn't collide with the
-        // legacy on-disk image registry tree.
-        //
-        // Auth: PgAuthResolver dispatches per `auth_kind` —
-        // static creds (decrypt under KEK), GCP Workload Identity
-        // (token via gcp_auth crate). Missing rows = anonymous,
-        // which still works for public registries and
-        // `localhost:5001`.
+        // legacy on-disk image registry tree. Reuses the OCI client
+        // built up-front (also shared with `/api/enabled-images`).
         let oci_cache_root = cli.local_path.join("oci-cache");
-        let auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver> = Arc::new(
-            engram_oci_auth::PgAuthResolver::new(meta_arc.clone(), kek.clone()),
-        );
-        let oci_client = engram_oci::OciClient::new(auth_resolver);
         let image_cache =
-            engram_host_agent::image_cache::ImageCache::open(oci_cache_root, oci_client)
+            engram_host_agent::image_cache::ImageCache::open(oci_cache_root, (*oci_client).clone())
                 .await
                 .map_err(|e| CoordinatorError::Config(format!("oci cache: {e}")))?;
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new(
@@ -446,6 +447,7 @@ async fn main() -> Result<(), CoordinatorError> {
         secrets,
         kek,
         images,
+        oci: oci_client,
         egress_proxy,
     };
 

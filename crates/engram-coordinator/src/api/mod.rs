@@ -6,6 +6,7 @@ use crate::state::SharedState;
 
 pub mod auth;
 mod checkpoint;
+mod enabled_images;
 mod events;
 mod exec;
 mod harnesses;
@@ -61,6 +62,18 @@ pub fn router(state: SharedState) -> Router {
             get(registries::list_registries).post(registries::add_registry),
         )
         .route("/api/registries/:host", delete(registries::delete_registry))
+        .route(
+            "/api/enabled-images",
+            get(enabled_images::list_enabled_images).post(enabled_images::enable_image),
+        )
+        .route(
+            "/api/enabled-images/refresh",
+            post(enabled_images::refresh_enabled_image),
+        )
+        .route(
+            "/api/enabled-images/disable",
+            post(enabled_images::disable_enabled_image),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

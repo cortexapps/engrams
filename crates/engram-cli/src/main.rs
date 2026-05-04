@@ -281,8 +281,30 @@ enum HarnessCmd {
 
 #[derive(Subcommand, Debug)]
 enum ImageCmd {
-    List {
-        repo: String,
+    /// List the operator-curated set of enabled images on the
+    /// coordinator. Sessions may only reference URIs in this set.
+    List,
+    /// Enable an image: tell the coordinator to fetch and cache the
+    /// engram manifest from the given OCI URI so sessions can
+    /// reference it. The bytes must already exist at the URI (push
+    /// via `engram image build --push <uri>`).
+    Enable {
+        /// Full OCI URI: `<host>[:port]/<repo>:<tag>`.
+        #[arg(long)]
+        uri: String,
+    },
+    /// Disable an image. Removes the row; the artifact in the
+    /// registry is untouched.
+    Disable {
+        #[arg(long)]
+        uri: String,
+    },
+    /// Re-fetch the manifest layer for an already-enabled image.
+    /// Useful when a moved tag (e.g. `:latest`) now resolves to a new
+    /// digest.
+    Refresh {
+        #[arg(long)]
+        uri: String,
     },
     /// Bake an image from a Dockerfile + engram.toml in the source repo.
     Build {
@@ -390,10 +412,6 @@ async fn main() -> ExitCode {
 
     match run(&cli).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(CliError::NotImplemented(what)) => {
-            eprintln!("engram-cli: `{what}` is not implemented yet.");
-            ExitCode::from(2)
-        }
         Err(CliError::Http(status, body)) => {
             eprintln!("engram-cli: server returned {status}: {body}");
             ExitCode::from(1)
@@ -407,7 +425,6 @@ async fn main() -> ExitCode {
 
 #[derive(Debug)]
 enum CliError {
-    NotImplemented(String),
     Http(u16, String),
     Other(String),
 }
@@ -500,9 +517,10 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 )
                 .await
             }
-            ImageCmd::List { .. } => Err(CliError::NotImplemented(
-                "image list — coordinator endpoint not yet exposed".into(),
-            )),
+            ImageCmd::List => image_list(&client, &cli.endpoint, cli.json).await,
+            ImageCmd::Enable { uri } => image_enable(&client, &cli.endpoint, uri, cli.json).await,
+            ImageCmd::Disable { uri } => image_disable(&client, &cli.endpoint, uri).await,
+            ImageCmd::Refresh { uri } => image_refresh(&client, &cli.endpoint, uri, cli.json).await,
         },
         Cmd::Host { cmd } => match cmd {
             HostCmd::List => host_list(&client, &cli.endpoint, cli.json).await,
@@ -1555,6 +1573,109 @@ async fn harness_rm(client: &reqwest::Client, endpoint: &str, name: &str) -> Res
         return Err(CliError::Http(status.as_u16(), body));
     }
     println!("removed");
+    Ok(())
+}
+
+// ---- enabled-images subcommands ---------------------------------------
+
+async fn image_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Result<(), CliError> {
+    let body = get_json(client, &format!("{endpoint}/api/enabled-images")).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let empty = Vec::new();
+    let images = body["images"].as_array().unwrap_or(&empty);
+    if images.is_empty() {
+        println!("(no images enabled — `engram image enable --uri <uri>` to add one)");
+        return Ok(());
+    }
+    println!("{:<48}  {:<22}  DIGEST", "URI", "NAME",);
+    for img in images {
+        println!(
+            "{:<48}  {:<22}  {}",
+            img["image_uri"].as_str().unwrap_or(""),
+            img["manifest_name"].as_str().unwrap_or("(unparsed)"),
+            img["manifest_digest"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn image_enable(
+    client: &reqwest::Client,
+    endpoint: &str,
+    uri: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/api/enabled-images"))
+        .json(&serde_json::json!({ "image_uri": uri }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    if json {
+        println!("{body}");
+    } else {
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        println!(
+            "enabled: uri={} digest={}",
+            v["image_uri"].as_str().unwrap_or(uri),
+            v["manifest_digest"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn image_disable(
+    client: &reqwest::Client,
+    endpoint: &str,
+    uri: &str,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/api/enabled-images/disable"))
+        .json(&serde_json::json!({ "image_uri": uri }))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    println!("disabled");
+    Ok(())
+}
+
+async fn image_refresh(
+    client: &reqwest::Client,
+    endpoint: &str,
+    uri: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/api/enabled-images/refresh"))
+        .json(&serde_json::json!({ "image_uri": uri }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    if json {
+        println!("{body}");
+    } else {
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        println!(
+            "refreshed: uri={} digest={}",
+            v["image_uri"].as_str().unwrap_or(uri),
+            v["manifest_digest"].as_str().unwrap_or(""),
+        );
+    }
     Ok(())
 }
 

@@ -63,6 +63,7 @@ use tower::ServiceExt;
 struct MockMetadataStore {
     registries: Mutex<HashMap<String, RegistryCredential>>,
     harness_packs: Mutex<HashMap<String, HarnessPack>>,
+    enabled_images: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
 }
 
 impl MockMetadataStore {
@@ -200,23 +201,29 @@ impl MetadataStore for MockMetadataStore {
     }
     async fn upsert_enabled_image(
         &self,
-        _: engram_core::types::EnabledImage,
+        ei: engram_core::types::EnabledImage,
     ) -> Result<(), MetaError> {
+        self.enabled_images.lock().insert(ei.image_uri.clone(), ei);
         Ok(())
     }
     async fn list_enabled_images(
         &self,
     ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
-        Ok(Vec::new())
+        let mut v: Vec<_> = self.enabled_images.lock().values().cloned().collect();
+        v.sort_by(|a, b| a.image_uri.cmp(&b.image_uri));
+        Ok(v)
     }
     async fn get_enabled_image(
         &self,
-        _: &str,
+        uri: &str,
     ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        Ok(None)
+        Ok(self.enabled_images.lock().get(uri).cloned())
     }
-    async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
+    async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
+        match self.enabled_images.lock().remove(uri) {
+            Some(_) => Ok(()),
+            None => Err(MetaError::NotFound),
+        }
     }
 }
 
@@ -240,6 +247,9 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
             [0xab; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
@@ -658,4 +668,179 @@ async fn upsert_replaces_in_place_for_same_host() {
     // ON CONFLICT (registry_host) DO UPDATE has the same effect.
     let all = meta.list_registry_credentials().await.unwrap();
     assert_eq!(all.len(), 1);
+}
+
+// ---------------------------------------------------------------------
+// Stage C: /api/enabled-images
+//
+// The `enable_image` path makes a real OCI pull, so end-to-end
+// coverage of POST lives in `registry_e2e.rs` (testcontainers-backed).
+// Here we exercise list/disable, plus the validation surface — the
+// paths that don't need a live registry.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_enabled_images_returns_seeded_rows_sorted() {
+    // We bypass POST (which requires a real registry) and seed the
+    // store directly via the trait. The list endpoint then exercises
+    // the EnabledImage → EnabledImageSummary lift, including manifest
+    // parsing for the `manifest_name` / `manifest_description` fields.
+    let (app, meta) = build_app();
+    let now = chrono::Utc::now();
+    for (uri, name) in [
+        ("ghcr.io/cortex/api:warm-1", "cortex-api"),
+        ("localhost:5001/demo:v3", "demo"),
+    ] {
+        meta.upsert_enabled_image(engram_core::types::EnabledImage {
+            id: uuid::Uuid::new_v4(),
+            image_uri: uri.into(),
+            manifest_toml: format!("name = \"{name}\"\ndescription = \"hello\"\n"),
+            manifest_digest: "sha256:beefcafe".into(),
+            last_refreshed_at: now,
+            created_at: now,
+            updated_at: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let (status, body) = send(&app, Method::GET, "/api/enabled-images", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let images = body["images"].as_array().expect("images array");
+    assert_eq!(images.len(), 2);
+    // Lift surfaces the parsed manifest name/description.
+    assert_eq!(images[0]["manifest_name"], "cortex-api");
+    assert_eq!(images[0]["manifest_description"], "hello");
+    // The summary must NEVER include the raw manifest_toml — the
+    // dashboard renders from the lifted fields.
+    assert!(
+        images[0].get("manifest_toml").is_none(),
+        "summary must drop manifest_toml: {}",
+        images[0]
+    );
+}
+
+#[tokio::test]
+async fn disable_enabled_image_404s_when_missing() {
+    let (app, _) = build_app();
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/enabled-images/disable",
+        Some(json!({ "image_uri": "ghcr.io/never/enabled:v1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("is not enabled"),
+        "error must call out the missing enable: got {body}",
+    );
+}
+
+#[tokio::test]
+async fn disable_enabled_image_204_then_idempotent_404() {
+    let (app, meta) = build_app();
+    let now = chrono::Utc::now();
+    meta.upsert_enabled_image(engram_core::types::EnabledImage {
+        id: uuid::Uuid::new_v4(),
+        image_uri: "ghcr.io/cortex/api:warm-1".into(),
+        manifest_toml: "name = \"cortex-api\"\n".into(),
+        manifest_digest: "sha256:abc".into(),
+        last_refreshed_at: now,
+        created_at: now,
+        updated_at: None,
+    })
+    .await
+    .unwrap();
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/enabled-images/disable",
+        Some(json!({ "image_uri": "ghcr.io/cortex/api:warm-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/enabled-images/disable",
+        Some(json!({ "image_uri": "ghcr.io/cortex/api:warm-1" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "second disable on the same URI must be a clear 404",
+    );
+}
+
+#[tokio::test]
+async fn refresh_404s_when_image_was_never_enabled() {
+    // Refresh is *not* an alias for enable — we want operators to
+    // explicitly opt an image into the catalog before refreshing it.
+    let (app, _) = build_app();
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/enabled-images/refresh",
+        Some(json!({ "image_uri": "ghcr.io/cortex/api:never-touched" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("is not enabled"),
+        "refresh must steer the operator to the enable path: got {body}",
+    );
+}
+
+#[tokio::test]
+async fn enable_image_rejects_empty_uri() {
+    let (app, _) = build_app();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/enabled-images",
+        Some(json!({ "image_uri": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn anonymous_registry_round_trips() {
+    // Stage C added `Anonymous` as a first-class auth_kind so public
+    // registries can show up in the dashboard without storing fake
+    // credentials. POST without password fields, GET sees the row,
+    // never echoes any cipher material (there is none to echo).
+    let (app, _) = build_app();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/registries",
+        Some(json!({
+            "host": "ghcr.io",
+            "auth": { "kind": "anonymous" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = send(&app, Method::GET, "/api/registries", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let regs = body["registries"].as_array().unwrap();
+    assert_eq!(regs.len(), 1);
+    assert_eq!(regs[0]["registry_host"], "ghcr.io");
+    assert_eq!(regs[0]["auth_kind"], "anonymous");
+    assert!(
+        regs[0]["auth_principal"].is_null(),
+        "anonymous has no principal"
+    );
 }
