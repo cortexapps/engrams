@@ -58,13 +58,13 @@ function Header() {
           fontStyle: 'italic',
         }}
       >
-        engrams
+        sessions
       </h1>
       <p
         className="font-mono smallcaps text-[0.7rem] mt-2"
         style={{ color: 'var(--color-ink-quiet)' }}
       >
-        a live record · refreshing every second · {now}
+        polling every second · {now}
       </p>
       <hr className="mt-6" />
     </header>
