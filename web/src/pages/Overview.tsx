@@ -58,7 +58,7 @@ function Header() {
           fontStyle: 'italic',
         }}
       >
-        sessions
+        engrams
       </h1>
       <p
         className="font-mono smallcaps text-[0.7rem] mt-2"
