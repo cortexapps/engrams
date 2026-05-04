@@ -39,6 +39,7 @@ use tower::ServiceExt;
 struct MiniMeta {
     sessions: Mutex<HashMap<SessionId, Session>>,
     images: Mutex<HashMap<String, Vec<ImageVersion>>>,
+    enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_idx: Mutex<HashMap<SessionId, i64>>,
     snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
@@ -252,6 +253,28 @@ impl MetadataStore for MiniMeta {
     async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
+    async fn upsert_enabled_image(
+        &self,
+        ei: engram_core::types::EnabledImage,
+    ) -> Result<(), MetaError> {
+        self.enabled.lock().insert(ei.image_uri.clone(), ei);
+        Ok(())
+    }
+    async fn list_enabled_images(
+        &self,
+    ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
+        Ok(self.enabled.lock().values().cloned().collect())
+    }
+    async fn get_enabled_image(
+        &self,
+        uri: &str,
+    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+        Ok(self.enabled.lock().get(uri).cloned())
+    }
+    async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
+        self.enabled.lock().remove(uri);
+        Ok(())
+    }
 }
 
 fn ignored_image() -> ImageVersion {
@@ -315,6 +338,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         .entry("demo".into())
         .or_default()
         .push(ignored_image());
+    seed_enabled(&meta, "demo:warm-test", r#"name = "demo""#);
 
     let services = Services {
         meta,
@@ -338,6 +362,27 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     (api::router(state), serve_handle)
 }
 
+/// Seed a `demo:warm-test` row directly so create_session clears the
+/// enabled-images gate without going through `/api/enabled-images`.
+fn seed_enabled(meta: &MiniMeta, uri: &str, manifest_toml: &str) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut h);
+    let now = chrono::Utc::now();
+    meta.enabled.lock().insert(
+        uri.to_string(),
+        engram_core::types::EnabledImage {
+            id: uuid::Uuid::new_v4(),
+            image_uri: uri.to_string(),
+            manifest_toml: manifest_toml.to_string(),
+            manifest_digest: format!("sha256:{:08x}", h.finish()),
+            last_refreshed_at: now,
+            created_at: now,
+            updated_at: None,
+        },
+    );
+}
+
 async fn body_json(body: Body) -> Value {
     let bytes = body.collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -359,7 +404,7 @@ async fn create_then_exec_round_trips_via_wire() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "image":{"kind":"registry","repo":"demo","tag":"warm-test"},
+                        "image": "demo:warm-test",
                         "workspace":{"kind":"empty"},
                         "harness":{"kind":"none"}
                     }"#,
@@ -425,6 +470,7 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         .entry("demo".into())
         .or_default()
         .push(ignored_image());
+    seed_enabled(&meta, "demo:warm-test", r#"name = "demo""#);
 
     let services = Services {
         meta,
@@ -458,7 +504,7 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "image":{"kind":"registry","repo":"demo","tag":"warm-test"},
+                        "image": "demo:warm-test",
                         "workspace":{"kind":"empty"},
                         "harness":{"kind":"none"}
                     }"#,

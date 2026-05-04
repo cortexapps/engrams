@@ -1248,9 +1248,7 @@ async fn image_build(
     // registries; private targets need a `docker login`-equivalent
     // upstream of this command (the CLI itself doesn't auth pushes).
     if let Some(target) = push {
-        let oci = engram_oci::OciClient::new(std::sync::Arc::new(
-            engram_oci::AnonymousResolver,
-        ));
+        let oci = engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::AnonymousResolver));
         let push = builder
             .push_to_registry(&oci, &req, &outcome, target)
             .await

@@ -298,7 +298,7 @@ mod tests {
     use engram_cloud_mock::MockCloud;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
     use engram_core::types::session::{
-        checkpoint_branch_for, HarnessSpec, ImageRef, SessionKind, WorkspaceSpec,
+        checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
     };
     use engram_core::types::{Session, SessionStatus};
     use engram_sandbox_process::ProcessBackend;
@@ -420,10 +420,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: None,
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "evict-test".into(),
-            },
+            image: "test/repo:evict-test".into(),
             workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
                 branch: "main".into(),
@@ -540,10 +537,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: None,
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "evict-test".into(),
-            },
+            image: "test/repo:evict-test".into(),
             workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
             session_kind: SessionKind::Ephemeral,

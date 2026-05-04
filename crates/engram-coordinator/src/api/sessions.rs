@@ -6,14 +6,13 @@ use axum::http::StatusCode;
 use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
-use engram_core::types::session::{HarnessSpec, ImageRef, WorkspaceSpec};
-use engram_core::types::{SecretMode, Session, SessionSpec, SessionStatus};
+use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef, WorkspaceSpec};
+use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionStatus};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
-use crate::image_registry::{ImageError, Rootfs};
 use crate::state::{SessionEvent, SharedState};
 
 /// Default sandbox sizing for sessions created without explicit limits.
@@ -21,19 +20,6 @@ use crate::state::{SessionEvent, SharedState};
 const DEFAULT_VCPUS: u32 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 const DEFAULT_DISK_GIB: u32 = 20;
-
-/// Materialize the resolved image's rootfs (if any) into the sandbox
-/// spec's `rootfs_source`. ProcessBackend reads this and copies the
-/// directory; FirecrackerBackend will eventually attach the .ext4.
-fn rootfs_source_from(
-    resolved: Option<&crate::image_registry::ResolvedImage>,
-) -> Option<std::path::PathBuf> {
-    match resolved.map(|r| &r.rootfs)? {
-        Rootfs::Directory(p) => Some(p.clone()),
-        Rootfs::Ext4Image(p) => Some(p.clone()),
-        Rootfs::None => None,
-    }
-}
 
 /// Inject resolved secrets into the sandbox env according to the
 /// manifest's `secret_mode`.
@@ -168,26 +154,36 @@ pub async fn create_session(
         ));
     }
 
-    let ImageRef::Registry {
-        repo: image_repo,
-        tag: image_tag,
-    } = req.image.clone();
-
-    // -------- 1. Resolve image manifest --------
-    // Image is required and must exist in the registry. The fallback
-    // "no image / empty workdir" path that used to support the bare
-    // `curl POST /sessions` demo is gone — every session declares an
-    // explicit image, full stop.
-    let resolved = match state.services.images.load(&image_repo, &image_tag).await {
-        Ok(r) => r,
-        Err(ImageError::NotFound { .. }) => {
-            return Err(ApiError::BadRequest(format!(
-                "image `{image_repo}:{image_tag}` not found in registry"
-            )));
-        }
-        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    let image_uri: ImageRef = req.image.clone();
+    let (image_repo, image_tag) = {
+        let (r, t) = split_image_ref(&image_uri);
+        (r.to_string(), t.to_string())
     };
-    let manifest = resolved.manifest.clone();
+
+    // -------- 1. Look up the manifest from `enabled_images` --------
+    // The session's image must be enabled before sessions can
+    // reference it. The `enabled_images` row carries the
+    // manifest.toml fetched at enable time; session-create has zero
+    // network dependency on the manifest path.
+    let enabled = state
+        .services
+        .meta
+        .get_enabled_image(&image_uri)
+        .await
+        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "image `{image_uri}` is not enabled. \
+                 Operators enable images via POST /api/enabled-images \
+                 (or the dashboard's Settings → Images panel) before \
+                 sessions can reference them."
+            ))
+        })?;
+    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
+        ApiError::Internal(format!(
+            "stored manifest for {image_uri} failed to parse: {e}"
+        ))
+    })?;
 
     // Validate the harness against the *host* registry. Harnesses
     // live above the image now (mounted via virtio-fs from
@@ -346,21 +342,10 @@ pub async fn create_session(
     let spec_env_for_proxy = spec_env.clone();
     let network_for_proxy = network.clone();
 
-    // Phase 5+: when image_versions.blob_url is non-NULL, pass the
-    // OCI URI through to the host-agent so it pulls + caches the
-    // rootfs.ext4 instead of attaching the legacy on-disk path. Both
-    // fields are co-set during rollout: rootfs_source remains the
-    // legacy fallback, image_uri (when present) wins.
-    let blob_url: Option<String> = state
-        .services
-        .meta
-        .latest_ready_image(&image_repo)
-        .await
-        .ok()
-        .flatten()
-        .filter(|iv| iv.tag == image_tag)
-        .and_then(|iv| iv.blob_url);
-
+    // The image URI is the host-agent's pull target. The rootfs is
+    // pulled from the registry on first use and cached locally;
+    // there's no filesystem-resident "rootfs_source" anymore.
+    //
     // When the harness comes from the registry, the host-agent
     // builds its own per-session substrate from the URI. Suppress
     // the legacy substrate path so the host-agent doesn't mount
@@ -372,9 +357,9 @@ pub async fn create_session(
     };
 
     let vm_spec = VmSpec {
-        image: image_tag.clone(),
-        rootfs_source: rootfs_source_from(Some(&resolved)),
-        image_uri: blob_url,
+        image: image_uri.clone(),
+        rootfs_source: None,
+        image_uri: Some(image_uri.clone()),
         harness_pack_uri,
         cpu: CpuLimit {
             vcpus: manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS),

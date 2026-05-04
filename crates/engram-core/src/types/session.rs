@@ -34,31 +34,38 @@ impl SessionStatus {
     }
 }
 
-/// Identifies a baked image. Decoupled from "where the workspace
-/// comes from" — the same image can host git, local-mount, or
-/// empty workspaces. Only the registry-backed variant exists today;
-/// the enum leaves room for a future remote-OCI pull path.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ImageRef {
-    /// `<images_dir>/<repo>/<tag>/` against the local image registry.
-    /// `repo` here is a registry label, not a workspace identity —
-    /// nothing requires it to match `WorkspaceSpec::Git.url`.
-    Registry { repo: String, tag: String },
-}
+/// Full OCI reference (registry host + repo path + tag) for the
+/// image this session boots from. Examples:
+///   - `ghcr.io/cortex/api:warm-2026-01-01T00:00:00Z`
+///   - `localhost:5001/cortex/api:warm-X` (dev registry)
+///   - `us-east1-docker.pkg.dev/proj/repo/img:v1` (GAR)
+///
+/// Engram doesn't maintain a curated catalog at the `(repo, tag)`
+/// granularity — operators explicitly enable URIs via
+/// `enabled_images`, sessions reference them by the full URI, and
+/// the host-agent pulls them via the auth resolver.
+pub type ImageRef = String;
 
-impl ImageRef {
-    pub fn repo(&self) -> &str {
-        match self {
-            Self::Registry { repo, .. } => repo,
+/// Split a `host[:port]/repo[/path]:tag` reference into
+/// `(host_and_path, tag)`. Used by `SecretContext` namespacing and
+/// `SnapshotRecord` labelling — places that want either the path
+/// portion (without the tag) or just the tag.
+///
+/// Returns `(uri, "")` if there's no `:tag` suffix (a digest-only
+/// reference uses `@sha256:...` syntax which we don't decompose
+/// here).
+pub fn split_image_ref(uri: &str) -> (&str, &str) {
+    // Find the LAST ':' AFTER the last '/' — protects against
+    // splitting on the registry's port (e.g. `localhost:5001/...`).
+    if let Some(slash) = uri.rfind('/') {
+        if let Some(colon_in_tail) = uri[slash..].rfind(':') {
+            let cut = slash + colon_in_tail;
+            return (&uri[..cut], &uri[cut + 1..]);
         }
+    } else if let Some(colon) = uri.rfind(':') {
+        return (&uri[..colon], &uri[colon + 1..]);
     }
-
-    pub fn tag(&self) -> &str {
-        match self {
-            Self::Registry { tag, .. } => tag,
-        }
-    }
+    (uri, "")
 }
 
 /// Where the user's code lives inside the VM at session time.
@@ -259,13 +266,22 @@ mod tests {
     }
 
     #[test]
-    fn image_ref_accessors() {
-        let img = ImageRef::Registry {
-            repo: "cortex/api".into(),
-            tag: "warm-2026".into(),
-        };
-        assert_eq!(img.repo(), "cortex/api");
-        assert_eq!(img.tag(), "warm-2026");
+    fn split_image_ref_handles_typical_shapes() {
+        // GHCR-style: host + multi-segment repo + tag.
+        let (rest, tag) = split_image_ref("ghcr.io/cortex/api:warm-2026");
+        assert_eq!(rest, "ghcr.io/cortex/api");
+        assert_eq!(tag, "warm-2026");
+
+        // Local registry with port — port colon must NOT be treated
+        // as the tag separator.
+        let (rest, tag) = split_image_ref("localhost:5001/cortex/api:warm-X");
+        assert_eq!(rest, "localhost:5001/cortex/api");
+        assert_eq!(tag, "warm-X");
+
+        // No tag → returns whole input as `rest`, empty `tag`.
+        let (rest, tag) = split_image_ref("ghcr.io/cortex/api");
+        assert_eq!(rest, "ghcr.io/cortex/api");
+        assert_eq!(tag, "");
     }
 
     #[test]
@@ -377,11 +393,12 @@ mod tests {
 
     #[test]
     fn image_ref_round_trips_through_json() {
-        let img = ImageRef::Registry {
-            repo: "cortex/api".into(),
-            tag: "warm-2026".into(),
-        };
+        // ImageRef is now a flat String URI; serialization is just
+        // the string. Pin the wire shape so changes that move it
+        // back to a tagged enum fail loudly.
+        let img: ImageRef = "ghcr.io/cortex/api:warm-2026".to_string();
         let blob = serde_json::to_string(&img).unwrap();
+        assert_eq!(blob, "\"ghcr.io/cortex/api:warm-2026\"");
         let back: ImageRef = serde_json::from_str(&blob).unwrap();
         assert_eq!(back, img);
     }
@@ -394,10 +411,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
-            image: ImageRef::Registry {
-                repo: "cortex/api".into(),
-                tag: "warm-20260101T000000Z".into(),
-            },
+            image: "ghcr.io/cortex/api:warm-20260101T000000Z".into(),
             workspace: WorkspaceSpec::Git {
                 url: "https://github.com/cortex/api.git".into(),
                 branch: "main".into(),

@@ -313,6 +313,26 @@ mod tests {
         async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
             Ok(())
         }
+        async fn upsert_enabled_image(
+            &self,
+            _: engram_core::types::EnabledImage,
+        ) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn list_enabled_images(
+            &self,
+        ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
+            Ok(Vec::new())
+        }
+        async fn get_enabled_image(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+            Ok(None)
+        }
+        async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
+            Ok(())
+        }
     }
 
     fn test_kek() -> Arc<dyn MasterKeyProvider> {

@@ -269,7 +269,7 @@ mod tests {
     use engram_core::traits::{CloudBackend, SandboxBackend};
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
     use engram_core::types::session::{
-        checkpoint_branch_for, HarnessSpec, ImageRef, SessionKind, WorkspaceSpec,
+        checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
     };
     use engram_core::types::Session;
     use engram_sandbox_process::ProcessBackend;
@@ -394,10 +394,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "drain-test".into(),
-            },
+            image: "test/repo:drain-test".into(),
             workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
                 branch: "main".into(),
@@ -497,10 +494,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "drain-test".into(),
-            },
+            image: "test/repo:drain-test".into(),
             workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
                 branch: "main".into(),

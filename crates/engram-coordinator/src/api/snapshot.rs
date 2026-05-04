@@ -254,9 +254,15 @@ async fn resume_from_fc_snapshot(
         ));
     }
     let session_for_ctx = session.clone();
+    // ScheduleContext keys warm-pool affinity by `(repo, tag)`. With
+    // raw-URI image refs we split here for the affinity hint —
+    // `repo` becomes `host[:port]/repo[/path]`, `image_version`
+    // becomes the tag.
+    let (image_repo, image_tag) =
+        engram_core::types::session::split_image_ref(&session_for_ctx.image);
     let ctx = ScheduleContext {
-        repo: session_for_ctx.image.repo(),
-        image_version: session_for_ctx.image.tag(),
+        repo: image_repo,
+        image_version: image_tag,
         prefer_snapshot_id: Some(record.id),
         memory_mib: None,
     };

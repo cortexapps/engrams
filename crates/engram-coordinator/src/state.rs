@@ -729,7 +729,7 @@ pub(crate) mod tests {
     use engram_core::traits::{MetadataStore, SandboxBackend};
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
     use engram_core::types::session::{
-        checkpoint_branch_for, HarnessSpec, ImageRef, SessionKind, WorkspaceSpec,
+        checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
     };
     use engram_core::types::{
         HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SnapshotRecord,
@@ -944,6 +944,26 @@ pub(crate) mod tests {
         async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
             Ok(())
         }
+        async fn upsert_enabled_image(
+            &self,
+            _: engram_core::types::EnabledImage,
+        ) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn list_enabled_images(
+            &self,
+        ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
+            Ok(Vec::new())
+        }
+        async fn get_enabled_image(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+            Ok(None)
+        }
+        async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
+            Ok(())
+        }
     }
 
     fn run_git(args: &[&str], cwd: &Path) {
@@ -1031,10 +1051,7 @@ pub(crate) mod tests {
             status: engram_core::types::SessionStatus::Active,
             host_id: None,
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "auto-checkpoint-test".into(),
-            },
+            image: "test/repo:auto-checkpoint-test".into(),
             workspace: WorkspaceSpec::Git {
                 url: format!("file://{}", remote.path().display()),
                 branch: "main".into(),
@@ -1110,10 +1127,7 @@ pub(crate) mod tests {
             status: engram_core::types::SessionStatus::Active,
             host_id: None,
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "test".into(),
-            },
+            image: "test/repo:test".into(),
             workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
             session_kind: SessionKind::Ephemeral,

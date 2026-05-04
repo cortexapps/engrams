@@ -43,6 +43,7 @@ struct MockMetadataStore {
     sessions: Mutex<HashMap<SessionId, Session>>,
     snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
     images: Mutex<HashMap<String, Vec<ImageVersion>>>,
+    enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_event_idx: Mutex<HashMap<SessionId, i64>>,
 }
@@ -315,6 +316,28 @@ impl MetadataStore for MockMetadataStore {
     async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
+    async fn upsert_enabled_image(
+        &self,
+        ei: engram_core::types::EnabledImage,
+    ) -> Result<(), MetaError> {
+        self.enabled.lock().insert(ei.image_uri.clone(), ei);
+        Ok(())
+    }
+    async fn list_enabled_images(
+        &self,
+    ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
+        Ok(self.enabled.lock().values().cloned().collect())
+    }
+    async fn get_enabled_image(
+        &self,
+        uri: &str,
+    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+        Ok(self.enabled.lock().get(uri).cloned())
+    }
+    async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
+        self.enabled.lock().remove(uri);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -360,6 +383,7 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
 struct TestFixture {
     app: axum::Router,
     images_dir: std::path::PathBuf,
+    meta: Arc<MockMetadataStore>,
 }
 
 impl TestFixture {
@@ -385,7 +409,7 @@ impl TestFixture {
             engram_host_agent::pooled_backend::PooledBackend::new(raw, warm_pool_size),
         );
         let services = Services {
-            meta,
+            meta: meta.clone(),
             cloud: Arc::new(MockCloud::new()),
             sandbox: backend,
             secrets: Arc::new(secrets),
@@ -406,6 +430,7 @@ impl TestFixture {
         let fx = Self {
             app: api::router(state),
             images_dir,
+            meta: meta.clone(),
         };
         // Seed baseline images for the repos most tests use against
         // `api_create_session`. Phase 2 made `image` mandatory — every
@@ -435,7 +460,55 @@ impl TestFixture {
                 std::fs::write(full, contents).unwrap();
             }
         }
+        // Seed the enabled_images row so the new strict path in
+        // create_session can resolve the manifest. Production stores
+        // both `repo:tag` URIs and a digest; tests don't care, so we
+        // synthesize a deterministic digest from the URI.
+        let uri = format!("{repo}:{tag}");
+        let digest = format!("sha256:{:08x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            uri.hash(&mut h);
+            h.finish()
+        });
+        let now = chrono::Utc::now();
+        self.meta.enabled.lock().insert(
+            uri.clone(),
+            engram_core::types::EnabledImage {
+                id: uuid::Uuid::new_v4(),
+                image_uri: uri,
+                manifest_toml: manifest_toml.to_string(),
+                manifest_digest: digest,
+                last_refreshed_at: now,
+                created_at: now,
+                updated_at: None,
+            },
+        );
     }
+}
+
+/// Seed an `enabled_images` row directly into the mock store. Tests
+/// that don't go through `TestFixture::write_image` (e.g. those wiring
+/// a custom backend) can use this to clear the strict image-resolution
+/// gate without spinning up the full fixture.
+fn seed_enabled(store: &MockMetadataStore, uri: &str, manifest_toml: &str) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut h);
+    let digest = format!("sha256:{:08x}", h.finish());
+    let now = chrono::Utc::now();
+    store.enabled.lock().insert(
+        uri.to_string(),
+        engram_core::types::EnabledImage {
+            id: uuid::Uuid::new_v4(),
+            image_uri: uri.to_string(),
+            manifest_toml: manifest_toml.to_string(),
+            manifest_digest: digest,
+            last_refreshed_at: now,
+            created_at: now,
+            updated_at: None,
+        },
+    );
 }
 
 async fn body_json(body: Body) -> Value {
@@ -469,7 +542,7 @@ async fn api_create_session(app: axum::Router, repo: &str) -> SessionId {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry", "repo": repo, "tag": "warm-bootstrap"},
+                "image": format!("{repo}:warm-bootstrap"),
                 "workspace": {"kind":"empty"},
                 "harness": {"kind":"none"},
             }),
@@ -597,7 +670,7 @@ async fn auth_protects_post_endpoints_too() {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"r","tag":"warm-bootstrap"},
+                "image": "r:warm-bootstrap",
                 "workspace": {"kind":"empty"},
             }),
         ))
@@ -654,7 +727,7 @@ async fn create_session_with_explicit_image_persists_full_row() {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"cortex/api","tag":"warm-pinned"},
+                "image": "cortex/api:warm-pinned",
                 "workspace": {"kind":"empty"},
                 "harness": {"kind":"none"},
             }),
@@ -667,8 +740,7 @@ async fn create_session_with_explicit_image_persists_full_row() {
     assert_eq!(v["status"], "active");
     let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
     let session = store.get_session(id).await.unwrap();
-    assert_eq!(session.image.repo(), "cortex/api");
-    assert_eq!(session.image.tag(), "warm-pinned");
+    assert_eq!(session.image, "cortex/api:warm-pinned");
     assert_eq!(session.workspace.git_branch(), None);
     assert!(session.harness.is_none());
     assert_eq!(session.status, SessionStatus::Active);
@@ -682,7 +754,7 @@ async fn create_session_with_unknown_image_returns_400() {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"never-baked","tag":"x"},
+                "image": "never-baked:x",
                 "workspace": {"kind":"empty"},
             }),
         ))
@@ -691,8 +763,8 @@ async fn create_session_with_unknown_image_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let v = body_json(resp.into_body()).await;
     assert!(
-        v["message"].as_str().unwrap().contains("not found"),
-        "error must call out the missing image: got {v}",
+        v["message"].as_str().unwrap().contains("not enabled"),
+        "error must call out the unenabled image: got {v}",
     );
 }
 
@@ -707,7 +779,7 @@ async fn create_session_prompt_with_no_harness_is_400() {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"r","tag":"warm-bootstrap"},
+                "image": "r:warm-bootstrap",
                 "workspace": {"kind":"empty"},
                 "harness": {"kind":"none"},
                 "prompt": "do the thing",
@@ -731,7 +803,7 @@ async fn create_session_unknown_harness_name_is_400() {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"r","tag":"warm-bootstrap"},
+                "image": "r:warm-bootstrap",
                 "workspace": {"kind":"empty"},
                 "harness": {"kind":"builtin","name":"codex"},
             }),
@@ -802,10 +874,7 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
     async fn mk(store: &MockMetadataStore, repo: &str) -> SessionId {
         store
             .create_session(SessionSpec {
-                image: engram_core::types::session::ImageRef::Registry {
-                    repo: repo.into(),
-                    tag: "warm-bootstrap".into(),
-                },
+                image: format!("{repo}:warm-bootstrap"),
                 workspace: engram_core::types::session::WorkspaceSpec::Empty,
                 harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
@@ -855,10 +924,7 @@ async fn list_sessions_serializes_full_session_record() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "cortex/api".into(),
-                tag: "warm-2026-04-27".into(),
-            },
+            image: "cortex/api:warm-2026-04-27".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Git {
                 url: "https://github.com/cortex/api.git".into(),
                 branch: "trunk".into(),
@@ -886,9 +952,9 @@ async fn list_sessions_serializes_full_session_record() {
         .find(|s| s["id"] == id.to_string())
         .expect("created session must be in the list");
     // Lock the wire shape so a CLI / web client can rely on it.
-    assert_eq!(item["image"]["kind"], "registry");
-    assert_eq!(item["image"]["repo"], "cortex/api");
-    assert_eq!(item["image"]["tag"], "warm-2026-04-27");
+    // Stage B1: image is now a flat OCI URI string, not a discriminated
+    // {kind, repo, tag} object.
+    assert_eq!(item["image"], "cortex/api:warm-2026-04-27");
     assert_eq!(item["workspace"]["kind"], "git");
     assert_eq!(
         item["workspace"]["url"],
@@ -909,10 +975,7 @@ async fn delete_session_marks_completed_and_returns_204() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1112,10 +1175,7 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1427,10 +1487,7 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1505,10 +1562,7 @@ async fn evict_local_409_when_session_not_active() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1540,10 +1594,7 @@ async fn resume_410_gone_when_no_snapshot_exists() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1618,10 +1669,7 @@ async fn exec_rejects_request_without_command_or_argv() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1646,10 +1694,7 @@ async fn exec_rejects_empty_argv() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1847,10 +1892,7 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -1975,14 +2017,10 @@ async fn create_session_failure_marks_session_failed() {
 
     let store = MockMetadataStore::arc();
     let images_dir = tempfile::tempdir().unwrap().keep();
-    // Seed a `cortex/api:warm-1` image so the create handler clears
-    // the image-resolution gate and we get to the sandbox failure
-    // the test is exercising.
-    {
-        let img_dir = images_dir.join("cortex/api/warm-1");
-        std::fs::create_dir_all(&img_dir).unwrap();
-        std::fs::write(img_dir.join("manifest.toml"), r#"name = "cortex-api""#).unwrap();
-    }
+    // Seed a `cortex/api:warm-1` enabled_images row so the create
+    // handler clears the image-resolution gate and we get to the
+    // sandbox failure the test is exercising.
+    seed_enabled(&store, "cortex/api:warm-1", r#"name = "cortex-api""#);
     let services = Services {
         meta: store.clone(),
         cloud: Arc::new(MockCloud::new()),
@@ -2007,7 +2045,7 @@ async fn create_session_failure_marks_session_failed() {
             Method::POST,
             "/sessions",
             json!({
-                "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+                "image": "cortex/api:warm-1",
                 "workspace": {"kind":"empty"},
                 "harness": {"kind":"none"},
             }),
@@ -2081,7 +2119,7 @@ async fn manifest_env_lands_in_sandbox_environment() {
         app.clone(),
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2104,7 +2142,15 @@ async fn manifest_env_lands_in_sandbox_environment() {
     assert_eq!(v["stdout"], "from-manifest");
 }
 
+// Stage B1 made the coordinator stateless w.r.t. image data — rootfs
+// now flows from the registry through the host-agent's content-
+// addressable cache, not from a filesystem `Rootfs::Directory`. There's
+// no in-process registry in this unit-test harness, so the
+// "materialize files into cwd" assertion can't be exercised here. The
+// equivalent end-to-end coverage lives in `tests/registry_e2e.rs` (a
+// real `registry:2` testcontainer).
 #[tokio::test]
+#[ignore = "rootfs is registry-pulled post-Stage-B1; covered by registry_e2e.rs"]
 async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
     let store = MockMetadataStore::arc();
     let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
@@ -2123,7 +2169,7 @@ async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
         app.clone(),
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2173,7 +2219,7 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
         app.clone(),
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2218,7 +2264,7 @@ async fn required_secret_missing_in_store_fails_session_create() {
         app,
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2261,7 +2307,7 @@ async fn optional_secret_absence_is_silently_ok() {
         app.clone(),
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2318,7 +2364,7 @@ async fn broker_mode_emits_placeholders_not_real_values() {
         app.clone(),
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2373,7 +2419,7 @@ async fn manifest_resource_hints_override_defaults() {
         app,
         "/sessions",
         json!({
-            "image": {"kind":"registry","repo":"cortex/api","tag":"warm-1"},
+            "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
             "harness": {"kind":"none"},
         }),
@@ -2842,10 +2888,7 @@ async fn checkpoint_returns_409_for_readonly_session() {
     let app = build_app(store.clone());
     let id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "r".into(),
-                tag: "warm-bootstrap".into(),
-            },
+            image: "r:warm-bootstrap".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Git {
                 url: "https://github.com/cortex/api.git".into(),
                 branch: "main".into(),

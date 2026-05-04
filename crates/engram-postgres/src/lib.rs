@@ -12,8 +12,8 @@ use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 use engram_core::types::{
-    HarnessPack, HostRecord, HostStatus, ImageVersion, PersistedEvent, RegistryCredential, Session,
-    SessionSpec, SessionStatus, SnapshotRecord,
+    EnabledImage, HarnessPack, HostRecord, HostStatus, ImageVersion, PersistedEvent,
+    RegistryCredential, Session, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -75,17 +75,16 @@ impl MetadataStore for PostgresStore {
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id,
-                 image_repo, image_tag, workspace, harness,
+                 image_uri, workspace, harness,
                  session_kind, checkpoint_branch,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $10)
+            VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $9)
             "#,
         )
         .bind(id)
         .bind(spec.user_id.as_deref())
         .bind(SessionStatus::Pending.as_str())
-        .bind(spec.image.repo())
-        .bind(spec.image.tag())
+        .bind(&spec.image)
         .bind(workspace_json)
         .bind(harness_json)
         .bind(kind.as_str())
@@ -101,7 +100,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_repo, image_tag, workspace, harness,
+                   image_uri, workspace, harness,
                    session_kind, checkpoint_branch,
                    created_at, last_active_at
             FROM sessions WHERE id = $1
@@ -119,7 +118,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_repo, image_tag, workspace, harness,
+                   image_uri, workspace, harness,
                    session_kind, checkpoint_branch,
                    created_at, last_active_at
             FROM sessions
@@ -657,6 +656,77 @@ impl MetadataStore for PostgresStore {
     async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError> {
         let res = sqlx::query("DELETE FROM harness_packs WHERE name = $1")
             .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ---------- enabled images ----------
+
+    async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO enabled_images
+                (id, image_uri, manifest_toml, manifest_digest,
+                 last_refreshed_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NULL)
+            ON CONFLICT (image_uri) DO UPDATE SET
+                manifest_toml     = EXCLUDED.manifest_toml,
+                manifest_digest   = EXCLUDED.manifest_digest,
+                last_refreshed_at = EXCLUDED.last_refreshed_at,
+                updated_at        = NOW()
+            "#,
+        )
+        .bind(image.id)
+        .bind(&image.image_uri)
+        .bind(&image.manifest_toml)
+        .bind(&image.manifest_digest)
+        .bind(image.last_refreshed_at)
+        .bind(image.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_toml, manifest_digest,
+                   last_refreshed_at, created_at, updated_at
+              FROM enabled_images
+             ORDER BY image_uri
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::enabled_image_from_row).collect()
+    }
+
+    async fn get_enabled_image(&self, image_uri: &str) -> Result<Option<EnabledImage>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_toml, manifest_digest,
+                   last_refreshed_at, created_at, updated_at
+              FROM enabled_images
+             WHERE image_uri = $1
+            "#,
+        )
+        .bind(image_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enabled_image_from_row(&r)).transpose()
+    }
+
+    async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError> {
+        let res = sqlx::query("DELETE FROM enabled_images WHERE image_uri = $1")
+            .bind(image_uri)
             .execute(&self.pool)
             .await
             .map_err(db_err)?;

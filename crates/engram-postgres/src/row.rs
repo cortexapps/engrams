@@ -4,10 +4,10 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use engram_core::types::session::{HarnessSpec, ImageRef, SessionKind, WorkspaceSpec};
+use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
 use engram_core::types::{
-    HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus, ImageVersion,
-    PersistedEvent, RegistryCredential, Session, SessionStatus, SnapshotRecord,
+    EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus,
+    ImageVersion, PersistedEvent, RegistryCredential, Session, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, ImageVersionId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
@@ -27,8 +27,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let last_active_at: DateTime<Utc> = row.try_get("last_active_at").map_err(col_err)?;
     let session_kind: String = row.try_get("session_kind").map_err(col_err)?;
     let checkpoint_branch: Option<String> = row.try_get("checkpoint_branch").map_err(col_err)?;
-    let image_repo: String = row.try_get("image_repo").map_err(col_err)?;
-    let image_tag: String = row.try_get("image_tag").map_err(col_err)?;
+    let image_uri: String = row.try_get("image_uri").map_err(col_err)?;
     let workspace_json: serde_json::Value = row.try_get("workspace").map_err(col_err)?;
     let harness_json: serde_json::Value = row.try_get("harness").map_err(col_err)?;
     let workspace: WorkspaceSpec = serde_json::from_value(workspace_json)
@@ -41,10 +40,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         status: parse_session_status(&status)?,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
-        image: ImageRef::Registry {
-            repo: image_repo,
-            tag: image_tag,
-        },
+        image: image_uri,
         workspace,
         harness,
         session_kind: SessionKind::parse(&session_kind).map_err(MetaError::Serialization)?,
@@ -151,6 +147,22 @@ pub(crate) fn registry_credential_from_row(row: &PgRow) -> Result<RegistryCreden
         id,
         registry_host,
         auth,
+        created_at,
+        updated_at,
+    })
+}
+
+pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaError> {
+    let id: Uuid = row.try_get("id").map_err(col_err)?;
+    let last_refreshed_at: DateTime<Utc> = row.try_get("last_refreshed_at").map_err(col_err)?;
+    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
+    let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
+    Ok(EnabledImage {
+        id,
+        image_uri: row.try_get("image_uri").map_err(col_err)?,
+        manifest_toml: row.try_get("manifest_toml").map_err(col_err)?,
+        manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
+        last_refreshed_at,
         created_at,
         updated_at,
     })

@@ -137,6 +137,49 @@ pub struct HarnessPack {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// One row in `enabled_images`. The manifest content is fetched
+/// from the registry at enable time and stored on the row, so
+/// session-create has zero network dependency on the manifest path
+/// — the host-agent still pulls the rootfs blob, but that's lazy
+/// and cached separately by digest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnabledImage {
+    pub id: Uuid,
+    /// Full OCI reference: `host[:port]/repo[/path]:tag`.
+    pub image_uri: String,
+    /// Verbatim `manifest.toml` from the registry — parsed at use
+    /// site rather than persisted as JSON, since the upstream
+    /// `ImageManifest` carries `deny_unknown_fields` and we want
+    /// the original byte-for-byte representation when refreshing.
+    pub manifest_toml: String,
+    /// `sha256:...` digest of the OCI manifest layer holding the
+    /// toml. Used to short-circuit refresh: if the registry's tag
+    /// still resolves to the same digest, the row is already current.
+    pub manifest_digest: String,
+    pub last_refreshed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Public summary view used by `GET /api/enabled-images`. Strips
+/// the raw `manifest_toml` blob (clients re-render via the parsed
+/// `ImageManifest` fields they care about — name, description,
+/// secret schemas).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnabledImageSummary {
+    pub id: Uuid,
+    pub image_uri: String,
+    pub manifest_digest: String,
+    /// Parsed manifest name/description/secret-schemas — what the
+    /// dashboard renders. Decoupled from the raw toml so a
+    /// hand-edited row that fails to parse can still report a
+    /// fallback summary.
+    pub manifest_name: Option<String>,
+    pub manifest_description: Option<String>,
+    pub last_refreshed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

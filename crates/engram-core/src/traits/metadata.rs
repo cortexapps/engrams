@@ -5,7 +5,7 @@ use crate::types::event::PersistedEvent;
 use crate::types::host::{HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::image::ImageVersion;
-use crate::types::registry::{HarnessPack, RegistryCredential};
+use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential};
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
 
@@ -134,4 +134,17 @@ pub trait MetadataStore: Send + Sync {
     async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError>;
     async fn get_harness_pack(&self, name: &str) -> Result<Option<HarnessPack>, MetaError>;
     async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError>;
+
+    // ---- enabled images (Phase 5b) ----
+    //
+    // Curated allowlist of image URIs that sessions may reference.
+    // Manifest is fetched at enable time and persisted on the row,
+    // so session-create has zero network dependency on the manifest
+    // path. The host-agent still pulls the rootfs blob on first use,
+    // but that's lazy + cached separately by digest.
+
+    async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError>;
+    async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError>;
+    async fn get_enabled_image(&self, image_uri: &str) -> Result<Option<EnabledImage>, MetaError>;
+    async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
 }

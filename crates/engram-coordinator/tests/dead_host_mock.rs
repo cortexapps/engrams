@@ -196,16 +196,33 @@ impl MetadataStore for MiniMeta {
     async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
+    async fn upsert_enabled_image(
+        &self,
+        _: engram_core::types::EnabledImage,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn list_enabled_images(
+        &self,
+    ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
+        Ok(Vec::new())
+    }
+    async fn get_enabled_image(
+        &self,
+        _: &str,
+    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
+        Ok(())
+    }
 }
 
 async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionStatus) -> SessionId {
-    use engram_core::types::session::{HarnessSpec, ImageRef, WorkspaceSpec};
+    use engram_core::types::session::{HarnessSpec, WorkspaceSpec};
     let id = meta
         .create_session(SessionSpec {
-            image: ImageRef::Registry {
-                repo: "demo".into(),
-                tag: "warm-test".into(),
-            },
+            image: "localhost:5001/demo:warm-test".into(),
             workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
             user_id: None,

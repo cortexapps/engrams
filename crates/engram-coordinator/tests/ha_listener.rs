@@ -50,10 +50,7 @@ async fn cross_replica_event_fan_out() {
     // coord-A waits for it.
     let session_id = meta
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "ha-listener-test".into(),
-                tag: "warm-test".into(),
-            },
+            image: "ha-listener-test:warm-test".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
@@ -182,10 +179,7 @@ async fn append_session_event_fires_pg_notify() {
 
     let session_id = store
         .create_session(SessionSpec {
-            image: engram_core::types::session::ImageRef::Registry {
-                repo: "ha-notify-test".into(),
-                tag: "warm-test".into(),
-            },
+            image: "ha-notify-test:warm-test".into(),
             workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,

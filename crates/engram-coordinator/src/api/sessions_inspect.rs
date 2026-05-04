@@ -390,7 +390,7 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
-    use engram_core::types::session::{HarnessSpec, ImageRef, SessionKind};
+    use engram_core::types::session::{HarnessSpec, SessionKind};
     use engram_core::types::Session;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
@@ -518,10 +518,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: None,
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "test".into(),
-            },
+            image: "test/repo:test".into(),
             workspace: WorkspaceSpec::Git {
                 url,
                 branch: "main".into(),
@@ -654,10 +651,7 @@ mod tests {
             status: SessionStatus::Active,
             host_id: None,
             sandbox_id: None,
-            image: ImageRef::Registry {
-                repo: "test/repo".into(),
-                tag: "test".into(),
-            },
+            image: "test/repo:test".into(),
             workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
             session_kind: SessionKind::Ephemeral,
