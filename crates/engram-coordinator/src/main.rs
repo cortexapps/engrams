@@ -103,17 +103,6 @@ struct Cli {
     )]
     harness_listen_addr: std::net::SocketAddr,
 
-    /// Host-side directory of harness binaries. Mounted read-only
-    /// into every sandbox at `/run/engram/harnesses`. Default
-    /// `./var/engram/harnesses`; populate via `just install-harnesses`
-    /// in dev or by deploy automation in prod.
-    #[arg(
-        long,
-        env = "ENGRAM_HARNESSES_DIR",
-        default_value = "./var/engram/harnesses"
-    )]
-    harnesses_dir: PathBuf,
-
     /// Engram CIDR pool — every Firecracker sandbox gets a unique
     /// /30 carved from this. Defaults to 10.200.0.0/16 (16k slots).
     /// Override if you're already using 10.200.0.0/16 on this host.
@@ -199,7 +188,6 @@ async fn main() -> Result<(), CoordinatorError> {
             .cloned()
             .collect(),
         harness_listen_addr: cli.harness_listen_addr,
-        harnesses_dir: cli.harnesses_dir.clone(),
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)
@@ -443,61 +431,13 @@ async fn main() -> Result<(), CoordinatorError> {
     // here unchanged.
 
     let images = ImageRegistry::new(cli.local_path.join("images"));
-    let harnesses = Arc::new(
-        engram_coordinator::harness_registry::HarnessRegistry::from_dir(cfg.harnesses_dir.clone())
-            .map_err(|e| {
-                CoordinatorError::Config(format!(
-                    "harness registry scan ({}): {e}",
-                    cfg.harnesses_dir.display()
-                ))
-            })?,
-    );
 
-    // Build the harness substrate — a read-only ext4 image of
-    // `cfg.harnesses_dir` that every sandbox attaches as `/dev/vdb`.
-    // Best-effort at startup: if mke2fs is missing or the dir is
-    // empty, we proceed with `None` and sessions just don't see
-    // harnesses (`/run/engram/harnesses` stays empty in the guest).
     // Build the egress proxy's CA + spawn the proxy task. Best-effort:
     // if the proxy fails to start (port in use, missing rustls/ring
     // crypto provider) sessions still get created — the FC backend
     // will surface "no proxy" as no egress filtering, which is fine
     // for VZ-on-macOS where this binary runs cross-platform.
     let egress_proxy = build_egress_proxy(&cli).await;
-
-    let substrate_work_dir = cli.local_path.join("harness-substrate");
-    let substrate_ca_pem = egress_proxy.as_ref().map(|p| p.ca.cert_pem.clone());
-    let harness_substrate = match engram_coordinator::harness_substrate::build(
-        &cfg.harnesses_dir,
-        &substrate_work_dir,
-        substrate_ca_pem.as_deref(),
-    )
-    .await
-    {
-        Ok(s) => {
-            if let Some(ref s) = s {
-                tracing::info!(
-                    path = %s.path.display(),
-                    hash = %s.hash,
-                    "harness substrate built"
-                );
-            } else {
-                tracing::info!(
-                    harnesses_dir = %cfg.harnesses_dir.display(),
-                    "harness substrate skipped: directory empty or missing"
-                );
-            }
-            s
-        }
-        Err(e) => {
-            tracing::warn!(
-                harnesses_dir = %cfg.harnesses_dir.display(),
-                error = %e,
-                "harness substrate build failed; sessions will boot without /run/engram/harnesses"
-            );
-            None
-        }
-    };
 
     let services = Services {
         meta: meta_arc.clone(),
@@ -506,8 +446,6 @@ async fn main() -> Result<(), CoordinatorError> {
         secrets,
         kek,
         images,
-        harnesses,
-        harness_substrate,
         egress_proxy,
     };
 

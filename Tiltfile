@@ -114,22 +114,15 @@ dc_resource('registry',
     links=['http://localhost:5001/v2/_catalog'])
 
 # ----------------------------------------------------------------
-# Setup one-shots: KEK + harness packs + (Mac only) codesign.
+# Setup one-shots: KEK + (Mac only) codesign.
+#
+# Harness packs are pushed to the local registry and registered with
+# the coordinator manually via `just bake-harness <name>` (Stage B2:
+# host-resident harnesses gone, registry-only).
 # ----------------------------------------------------------------
 
 local_resource('bootstrap',
     cmd='just bootstrap',
-    labels=['setup'])
-
-local_resource('install-harnesses',
-    cmd='just install-harnesses',
-    # Re-run when harness sources change. The Claude binary download
-    # is gated inside the recipe by a version check, so this stays
-    # cheap on the cached path.
-    deps=[
-        'crates/engram-harness-noop/src',
-        'crates/engram-harness-claude/src',
-    ],
     labels=['setup'])
 
 if needs_codesign:
@@ -168,7 +161,7 @@ coord_env = {
     'RUST_LOG': 'info,engram=debug',
 }
 
-coord_deps = ['postgres', 'registry', 'bootstrap', 'install-harnesses']
+coord_deps = ['postgres', 'registry', 'bootstrap']
 if needs_codesign:
     coord_deps.append('vz-codesign')
 

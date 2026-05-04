@@ -14,8 +14,7 @@ pub mod config;
 pub mod dead_host;
 pub mod error;
 pub mod git_workdir;
-pub mod harness_registry;
-pub mod harness_substrate;
+pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_evictor;
 pub mod image_registry;
@@ -42,17 +41,6 @@ pub struct Services {
     /// encrypted creds live in the `registry_credentials` table.
     pub kek: Arc<dyn engram_crypto::MasterKeyProvider>,
     pub images: image_registry::ImageRegistry,
-    /// Host-side harness registry — the closed set of
-    /// `HarnessSpec::Builtin{name}` values a session may request.
-    /// Resolved from `cfg.harnesses_dir` at startup; visible inside
-    /// every sandbox at `/run/engram/harnesses` via the substrate
-    /// below.
-    pub harnesses: Arc<harness_registry::HarnessRegistry>,
-    /// Read-only ext4 image of `cfg.harnesses_dir`, attached as the
-    /// second virtio-blk drive on every sandbox. `None` means "no
-    /// harnesses to make available" (empty registry, or substrate
-    /// build failed at startup — logged but non-fatal).
-    pub harness_substrate: Option<harness_substrate::Substrate>,
     /// Per-host TLS-MITM egress proxy. Sessions get registered here
     /// at create-time so the proxy knows how to dispatch outbound
     /// HTTPS traffic from each VM. `None` if the proxy isn't enabled
@@ -62,8 +50,9 @@ pub struct Services {
 }
 
 /// Coordinator-side handle to the running egress proxy. Owns the
-/// session registry and the persisted CA (so other services like
-/// `harness_substrate::build` can stamp the CA into the substrate).
+/// session registry and the persisted CA (host-agents fetch the CA
+/// at session-create time and bake it into the per-session harness
+/// substrate so VMs trust the proxy's MITM cert).
 pub struct EgressProxy {
     pub registry: std::sync::Arc<engram_egress_proxy::Registry>,
     pub ca: std::sync::Arc<engram_egress_proxy::Ca>,

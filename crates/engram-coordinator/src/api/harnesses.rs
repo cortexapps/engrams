@@ -1,13 +1,10 @@
 //! `/api/harnesses` — list / register / delete harness packs.
 //!
-//! Phase 5: harness packs live in a Docker registry and are indexed
+//! Stage B2: harness packs live in a Docker registry and are indexed
 //! by Postgres `harness_packs` rows. This module owns the CRUD
 //! surface; the host-agent pulls the pack at session-create time and
-//! mounts it into the sandbox.
-//!
-//! Backwards compatibility: when no rows exist in `harness_packs`,
-//! we fall back to the legacy host-side scan of `cfg.harnesses_dir`
-//! so single-host dev keeps working without registering anything.
+//! assembles a per-session ext4 substrate that gets mounted into the
+//! sandbox at `/run/engram/harnesses`.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -25,9 +22,7 @@ use crate::state::SharedState;
 pub struct HarnessDescriptor {
     pub name: String,
     pub description: Option<String>,
-    /// `Some(uri)` if the pack is registry-backed; `None` if it's a
-    /// host-resident legacy pack (Phase 4).
-    pub registry_uri: Option<String>,
+    pub registry_uri: String,
 }
 
 #[derive(Deserialize)]
@@ -40,32 +35,13 @@ pub struct AddHarnessRequest {
 pub async fn list_harnesses(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<HarnessDescriptor>>, ApiError> {
-    // Postgres-backed harnesses are the authoritative source when any
-    // exist. They override the legacy host-side scan to avoid name
-    // collisions across coordinator replicas with different on-disk
-    // packs.
-    let pg_packs = state.services.meta.list_harness_packs().await?;
-    if !pg_packs.is_empty() {
-        let descriptors = pg_packs
-            .into_iter()
-            .map(|p| HarnessDescriptor {
-                name: p.name,
-                description: p.description,
-                registry_uri: Some(p.registry_uri),
-            })
-            .collect();
-        return Ok(Json(descriptors));
-    }
-
-    let descriptors = state
-        .services
-        .harnesses
-        .entries()
-        .iter()
-        .map(|h| HarnessDescriptor {
-            name: h.name.clone(),
-            description: h.description.clone(),
-            registry_uri: None,
+    let packs = state.services.meta.list_harness_packs().await?;
+    let descriptors = packs
+        .into_iter()
+        .map(|p| HarnessDescriptor {
+            name: p.name,
+            description: p.description,
+            registry_uri: p.registry_uri,
         })
         .collect();
     Ok(Json(descriptors))
@@ -103,7 +79,7 @@ pub async fn add_harness(
         Json(HarnessDescriptor {
             name: pack.name,
             description: pack.description,
-            registry_uri: Some(pack.registry_uri),
+            registry_uri: pack.registry_uri,
         }),
     ))
 }

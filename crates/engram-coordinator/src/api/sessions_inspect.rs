@@ -497,8 +497,6 @@ mod tests {
                 [0u8; 32], "test:v1",
             )),
             images: ImageRegistry::new(local.path().join("images")),
-            harnesses: Arc::new(crate::harness_registry::HarnessRegistry::empty()),
-            harness_substrate: None,
             egress_proxy: None,
         };
         let cfg = CoordinatorConfig {

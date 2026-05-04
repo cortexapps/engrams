@@ -11,9 +11,11 @@ local disk:
 - Bake images at `<local_path>/images/<repo>/<tag>/{manifest.toml,
   rootfs.ext4}`. Coordinator scanned this tree for the dashboard and
   resolved `(repo, tag)` to a filesystem path at session-create time.
-- Harness packs at `<harnesses_dir>/<name>/{harness, sidecars...}`.
-  Scanned once at startup and packed into a single substrate ext4
-  mounted into every sandbox.
+- Harness packs at `<harnesses_dir>/<name>/{harness, sidecars...}`,
+  scanned once at startup and packed into a single substrate ext4
+  mounted into every sandbox. (Stage B2 dropped this entirely —
+  harnesses now flow from the registry through the host-agent's cache
+  into a per-session substrate; see Track D.)
 
 This was the right shape for a single-coordinator dev story but
 breaks down for production:
@@ -114,8 +116,10 @@ on-disk path applies. This lets the change land incrementally —
 deploy the new code, push the first image, drop the disk path when
 all rows are URIs.
 
-`harness_packs` is a new table; when empty, the legacy
-`HarnessRegistry::from_dir` scan applies.
+`harness_packs` is the only source of harnesses. Stage B2 dropped
+the legacy host-resident scan — there is no longer a `harnesses_dir`
+config or a `HarnessRegistry::from_dir` fallback. Sessions
+referencing an unregistered harness fail at create time.
 
 `registry_credentials` is the new table holding the envelope-
 encrypted credentials. Lookup is by `registry_host`; missing rows =
@@ -197,9 +201,9 @@ the registry up automatically.
 Track D: Host-agent pull path — content-addressable cache, OCI
 client wired into `SandboxBackend::create`, per-session single-
 harness substrate ext4 build (mke2fs from a `<name>/` symlink
-staging tree). Coordinator falls back to legacy on-disk paths
-when `image_versions.blob_url` is NULL or `harness_packs` has no
-matching row.
+staging tree). Stage B2 made this the only path: harness packs
+must be Postgres-registered before sessions can reference them
+(no host-resident fallback).
 
 Track E (5b): Polymorphic auth — `RegistryAuthSpec` enum dispatches
 between static (envelope-encrypted in Postgres) and cloud-IAM

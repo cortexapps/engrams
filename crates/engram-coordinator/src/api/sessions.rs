@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -185,51 +184,33 @@ pub async fn create_session(
         ))
     })?;
 
-    // Validate the harness against the *host* registry. Harnesses
-    // live above the image now (mounted via virtio-fs from
-    // `cfg.harnesses_dir` at `/run/engram/harnesses`) so the closed
-    // set of valid names is deployment-wide, not per-image.
-    // Phase 5+: harness packs may be Postgres-registered (registry-
-    // backed) or legacy host-resident. Postgres rows take precedence;
-    // legacy scan covers single-host dev boxes that haven't migrated.
-    // We validate now so the error path at session-create is clear,
-    // and stash the resolved registry URI (if any) for the
-    // SandboxSpec construction below.
+    // Validate the harness against the Postgres `harness_packs`
+    // registry. Stage B2 dropped the host-resident scan — every harness
+    // is registry-backed; the host-agent pulls the OCI artifact on
+    // first use and assembles a per-session substrate that gets
+    // mounted at `/run/engram/harnesses`. We resolve to the registry
+    // URI now so the SandboxSpec carries it down to the host-agent.
     let harness_pack_uri: Option<String> = if let HarnessSpec::Builtin { name } = &req.harness {
-        let registry_pack = state
+        let pack = state
             .services
             .meta
             .get_harness_pack(name)
             .await
             .map_err(|e| ApiError::Internal(format!("harness lookup: {e}")))?;
-        match registry_pack {
+        match pack {
             Some(p) => Some(p.registry_uri),
             None => {
-                // Fall back to the legacy host-resident registry.
-                if state.services.harnesses.lookup(name).is_none() {
-                    let pg_available: Vec<String> = state
-                        .services
-                        .meta
-                        .list_harness_packs()
-                        .await
-                        .map(|v| v.into_iter().map(|p| p.name).collect())
-                        .unwrap_or_default();
-                    let host_available: Vec<&str> = state
-                        .services
-                        .harnesses
-                        .entries()
-                        .iter()
-                        .map(|h| h.name.as_str())
-                        .collect();
-                    return Err(ApiError::BadRequest(format!(
-                        "no harness `{name}` registered. \
-                         Postgres harness_packs: {pg_available:?}; \
-                         host-resident: {host_available:?}. \
-                         Add via `engram harness add` or drop the binary \
-                         in `cfg.harnesses_dir` and restart the coord."
-                    )));
-                }
-                None
+                let available: Vec<String> = state
+                    .services
+                    .meta
+                    .list_harness_packs()
+                    .await
+                    .map(|v| v.into_iter().map(|p| p.name).collect())
+                    .unwrap_or_default();
+                return Err(ApiError::BadRequest(format!(
+                    "no harness `{name}` registered. Available: {available:?}. \
+                     Register via `engram harness add --name {name} --push <registry/repo:tag>`."
+                )));
             }
         }
     } else {
@@ -310,17 +291,6 @@ pub async fn create_session(
         &spec_env,
     )?;
 
-    // Harness substrate: read-only ext4 image of `cfg.harnesses_dir`,
-    // built once at coordinator startup. Backends attach it as the
-    // second virtio-blk drive (`/dev/vdb`); the init shim mounts it
-    // at `/run/engram/harnesses`. `None` when the substrate failed
-    // to build at startup (logged) or the dir is empty.
-    let harness_substrate: Option<PathBuf> = state
-        .services
-        .harness_substrate
-        .as_ref()
-        .map(|s| s.path.clone());
-
     // Network policy: start from the image manifest's `[network]`
     // block and auto-augment `allow_hosts` with the Git workspace's
     // host (so `git clone` can reach it). FC's net layer translates
@@ -343,19 +313,10 @@ pub async fn create_session(
     let network_for_proxy = network.clone();
 
     // The image URI is the host-agent's pull target. The rootfs is
-    // pulled from the registry on first use and cached locally;
-    // there's no filesystem-resident "rootfs_source" anymore.
-    //
-    // When the harness comes from the registry, the host-agent
-    // builds its own per-session substrate from the URI. Suppress
-    // the legacy substrate path so the host-agent doesn't mount
-    // both — the OCI puller's substrate wins.
-    let harness_substrate_for_spec = if harness_pack_uri.is_some() {
-        None
-    } else {
-        harness_substrate
-    };
-
+    // pulled from the registry on first use and cached locally; there's
+    // no filesystem-resident "rootfs_source" anymore. The harness pack
+    // — when one is requested — flows through the same OCI puller and
+    // gets assembled into a per-session substrate by the host-agent.
     let vm_spec = VmSpec {
         image: image_uri.clone(),
         rootfs_source: None,
@@ -379,7 +340,7 @@ pub async fn create_session(
         ttl: None,
         env: spec_env,
         workdir: None,
-        harness_substrate: harness_substrate_for_spec,
+        harness_substrate: None,
         network,
     };
 
@@ -652,14 +613,15 @@ pub async fn delete_session(
 /// the sandbox boots with no agent, leaving the user to drive it
 /// via the in-browser shell or `engram exec`.
 ///
-/// The host's harness directory (`cfg.harnesses_dir`) is mounted
-/// read-only into every sandbox at `/run/engram/harnesses` via
-/// virtio-fs. Two argv shapes depending on backend:
-/// - `HostTcp` (Process): `argv[0]` is the host path of the binary
-///   inside `cfg.harnesses_dir`; the harness dials TCP loopback on
-///   `--connect`.
+/// Stage B2 made harnesses registry-only: the host-agent pulls the
+/// pack on first use into its content-addressable cache and assembles
+/// a per-session ext4 substrate that the VM mounts at
+/// `/run/engram/harnesses`. Two argv shapes depending on backend:
+/// - `HostTcp` (Process): `argv[0]` is the guest path; the host-agent
+///   rewrites it to its local cache path before launching, and the
+///   harness dials TCP loopback on `--connect`.
 /// - `Vsock` (FC/VZ): `argv[0]` is `/run/engram/harnesses/<name>`,
-///   exec'd inside the VM over the virtio-fs mount; the harness
+///   exec'd inside the VM over the substrate mount; the harness
 ///   dials AF_VSOCK on `--vsock-host`.
 pub(crate) fn resolve_harness(
     state: &SharedState,
@@ -672,11 +634,6 @@ pub(crate) fn resolve_harness(
         HarnessSpec::None => return Ok(None),
         HarnessSpec::Builtin { name } => name,
     };
-    let entry = state.services.harnesses.lookup(name).ok_or_else(|| {
-        ApiError::Internal(format!(
-            "harness `{name}` validated against host registry but vanished mid-create"
-        ))
-    })?;
 
     let mut env: HashMap<String, String> = base_env.clone();
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
@@ -684,6 +641,7 @@ pub(crate) fn resolve_harness(
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
     }
 
+    let guest_path = crate::harness_paths::guest_argv0(name);
     let argv = match state.services.sandbox.harness_dial() {
         engram_core::traits::HarnessDial::HostTcp => {
             let addr = match *state.harness_listen_addr.lock() {
@@ -696,7 +654,7 @@ pub(crate) fn resolve_harness(
             };
             env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
             vec![
-                entry.host_path.to_string_lossy().into_owned(),
+                guest_path,
                 "--connect".into(),
                 addr.to_string(),
                 "--session-id".into(),
@@ -706,7 +664,7 @@ pub(crate) fn resolve_harness(
         engram_core::traits::HarnessDial::Vsock => {
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
-                crate::harness_registry::HarnessRegistry::guest_argv0(name),
+                guest_path,
                 "--vsock-host".into(),
                 port.to_string(),
                 "--session-id".into(),

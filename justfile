@@ -200,7 +200,7 @@ bake repo dir='.':
 # `engram image build --inject-agent <agentd-musl-binary> --format ext4`
 # so the in-VM agent is present. Without it `session exec` will
 # hang waiting for vsock to come up.
-dev-firecracker: db-up registry-up bootstrap install-harnesses
+dev-firecracker: db-up registry-up bootstrap
     : "${ENGRAM_KERNEL_IMAGE_PATH:?set ENGRAM_KERNEL_IMAGE_PATH to a vmlinux on this host}"
     DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
     ENGRAM_BIND_ADDR=127.0.0.1:8090 \
@@ -214,26 +214,25 @@ dev-firecracker: db-up registry-up bootstrap install-harnesses
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
-# Build the harness packs and lay them out at
-# `./var/engram/harnesses/<name>/` — the directory tree the coord
-# scans on startup and mounts read-only into every sandbox at
-# `/run/engram/harnesses` via virtio-fs. After this runs, `engram
-# session create --harness <name>` works for {claude, noop}
-# regardless of which image the session lands on. Idempotent.
+# Build a harness pack and push it to the local OCI registry as
+# `localhost:5001/cortex/harness-<name>:<tag>`. The coordinator picks
+# it up at session-create time by way of the `harness_packs` Postgres
+# row (registered separately via `engram harness add`). After this
+# runs, `engram harness add --name <name> --registry-uri ...` makes
+# `engram session create --harness <name>` work end-to-end.
 #
-# Pack layout: each `<name>/` carries the wrapper at `harness` plus
-# any sidecars the wrapper needs at runtime. Today only `claude`
-# has a sidecar — Anthropic's bundled-Bun `claude` binary,
-# downloaded from the official releases endpoint.
-#
-# Cross-compiles wrappers for aarch64-unknown-linux-musl on macOS
+# Cross-compiles the wrapper for aarch64-unknown-linux-musl on macOS
 # (VZ guests) and x86_64-unknown-linux-musl on Linux (FC guests) —
 # both produce Linux binaries since the harness runs inside the
-# guest VM, not on the host. Downloads the matching bundled
-# `claude` from `downloads.claude.ai/claude-code-releases`.
-install-harnesses:
+# guest VM, not on the host. For `claude`, also downloads the
+# matching bundled CLI from `downloads.claude.ai/claude-code-releases`
+# and bundles it into the OCI artifact alongside the wrapper.
+#
+# Usage:
+#   just bake-harness noop  v1
+#   just bake-harness claude v1
+bake-harness NAME TAG="v1":
     @set -e; \
-    mkdir -p ./var/engram/harnesses ; \
     if [ "$(uname -s)" = "Darwin" ]; then \
         TARGET=aarch64-unknown-linux-musl ; \
         CLAUDE_PLAT=linux-arm64 ; \
@@ -242,29 +241,19 @@ install-harnesses:
         CLAUDE_PLAT=linux-x64 ; \
     fi ; \
     rustup target add $TARGET >/dev/null 2>&1 || true ; \
-    cargo build -p engram-harness-noop   --target $TARGET --release ; \
-    cargo build -p engram-harness-claude --target $TARGET --release ; \
-    \
-    mkdir -p ./var/engram/harnesses/noop ; \
-    cp -p "target/$TARGET/release/engram-harness-noop" ./var/engram/harnesses/noop/harness ; \
-    \
-    mkdir -p ./var/engram/harnesses/claude ; \
-    cp -p "target/$TARGET/release/engram-harness-claude" ./var/engram/harnesses/claude/harness ; \
-    CLAUDE_VERSION=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest) ; \
-    CLAUDE_DEST=./var/engram/harnesses/claude/claude ; \
-    if [ ! -f "$CLAUDE_DEST" ] || [ "$(cat ./var/engram/harnesses/claude/.version 2>/dev/null)" != "$CLAUDE_VERSION-$CLAUDE_PLAT" ]; then \
+    STAGE=$(mktemp -d) ; \
+    cargo build -p engram-harness-{{NAME}} --target $TARGET --release ; \
+    cp -p "target/$TARGET/release/engram-harness-{{NAME}}" "$STAGE/harness" ; \
+    if [ "{{NAME}}" = "claude" ]; then \
+        CLAUDE_VERSION=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest) ; \
         echo "downloading claude $CLAUDE_VERSION ($CLAUDE_PLAT) ..." ; \
-        curl -fsSL --retry 3 -o "$CLAUDE_DEST.tmp" \
+        curl -fsSL --retry 3 -o "$STAGE/claude" \
             "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$CLAUDE_PLAT/claude" ; \
-        chmod +x "$CLAUDE_DEST.tmp" ; \
-        mv "$CLAUDE_DEST.tmp" "$CLAUDE_DEST" ; \
-        printf "%s-%s\n" "$CLAUDE_VERSION" "$CLAUDE_PLAT" > ./var/engram/harnesses/claude/.version ; \
-    else \
-        echo "claude $CLAUDE_VERSION ($CLAUDE_PLAT) already installed" ; \
+        chmod +x "$STAGE/claude" ; \
     fi ; \
-    \
-    echo "harnesses installed at ./var/engram/harnesses/" ; \
-    ls -la ./var/engram/harnesses/*/
+    URI=localhost:5001/cortex/harness-{{NAME}}:{{TAG}} ; \
+    cargo run -p engram-cli -- harness add --name {{NAME}} --from "$STAGE" --push "$URI" ; \
+    rm -rf "$STAGE"
 
 # Bake the canonical workspace image for Firecracker (Linux + KVM).
 # debian:bookworm-slim + git + ttyd, no harness-specific runtime —
@@ -342,12 +331,13 @@ vz-test: vz-codesign
 #      static kernel — same one apple/container uses).
 #   2. `just vz-bake-demo` has run, so a warm-1 image exists for
 #      `local://demo` under `./var/engram/images/`.
-#   3. `just install-harnesses` has run so harness binaries are in
-#      `./var/engram/harnesses/` for virtio-fs mounting.
+#   3. Any harness pack you want to use has been baked + registered
+#      via `just bake-harness <name>` (pushes to the local registry
+#      AND registers a `harness_packs` row).
 #
 # The recipe codesigns the coord binary first; without the
 # entitlement VZ refuses to instantiate any VM.
-dev-vz: db-up registry-up bootstrap vz-codesign install-harnesses
+dev-vz: db-up registry-up bootstrap vz-codesign
     @if [ "$(uname -s)" != "Darwin" ]; then \
         echo "dev-vz only runs on macOS"; exit 1; \
     fi
@@ -403,8 +393,8 @@ vz-pull-ubuntu-kernel: vz-pull-kernel
 # sibling of `fc-bake-demo`. Same Dockerfile under deploy/demo/;
 # only the cross-compile target + e2fsprogs PATH differ. Harness
 # binaries are NOT in the image — drop them in
-# `./var/engram/harnesses/` via `just install-harnesses` and pick
-# at session-create time with `--harness <name>`.
+# the registry via `just bake-harness <name>` (registers automatically)
+# and pick at session-create time with `--harness <name>`.
 vz-bake-demo:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     cargo build -p engram-agentd    --target aarch64-unknown-linux-musl --release

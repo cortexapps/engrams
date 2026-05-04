@@ -32,10 +32,13 @@ pub struct SandboxSpec {
     /// dev workflows that pre-bake images into `<local_path>/images/`.
     #[serde(default)]
     pub image_uri: Option<String>,
-    /// Phase 5+: OCI registry URI for the harness pack chosen for
-    /// this session (`HarnessSpec::Pack { name }`). When set, the
-    /// host-agent pulls it into its harness cache; when `None`, the
-    /// legacy `harness_substrate` path applies.
+    /// OCI registry URI for the harness pack chosen for this session
+    /// (`HarnessSpec::Builtin { name }`). The coordinator resolves
+    /// the name → URI from the `harness_packs` Postgres table at
+    /// session-create time; the host-agent pulls the artifact into
+    /// its content-addressable cache and assembles
+    /// `harness_substrate` below from it. `None` for sessions with
+    /// `HarnessSpec::None`.
     #[serde(default)]
     pub harness_pack_uri: Option<String>,
     pub cpu: CpuLimit,
@@ -45,11 +48,13 @@ pub struct SandboxSpec {
     pub ttl: Option<Duration>,
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
-    /// Path on the host to a read-only ext4 image of `cfg.harnesses_dir`,
-    /// built once at host-agent startup. Backends attach it as the
+    /// Path on the host to a read-only ext4 image of the per-session
+    /// harness pack tree. Built lazily by the host-agent from the OCI
+    /// pack pulled via `harness_pack_uri`. Backends attach it as the
     /// second virtio-blk drive (`/dev/vdb`); the init shim mounts it
-    /// at `/run/engram/harnesses`. `None` means "no harnesses available
-    /// to this sandbox" (e.g. dev/test scaffolding).
+    /// at `/run/engram/harnesses`. `None` means "no harness substrate
+    /// for this sandbox" (e.g. `HarnessSpec::None` sessions, or
+    /// dev/test scaffolding).
     #[serde(default)]
     pub harness_substrate: Option<PathBuf>,
     /// Per-sandbox egress policy derived from the image manifest's

@@ -363,8 +363,6 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
-        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
-        harness_substrate: None,
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
@@ -417,8 +415,6 @@ impl TestFixture {
                 [0u8; 32], "test:v1",
             )),
             images: ImageRegistry::new(images_dir.clone()),
-            harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
-            harness_substrate: None,
             egress_proxy: None,
         };
         let cfg = CoordinatorConfig {
@@ -2030,8 +2026,6 @@ async fn create_session_failure_marks_session_failed() {
             [0u8; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
-        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
-        harness_substrate: None,
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {

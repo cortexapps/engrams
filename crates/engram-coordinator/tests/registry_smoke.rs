@@ -240,8 +240,6 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
             [0xab; 32], "test:v1",
         )),
         images: ImageRegistry::new(images_dir),
-        harnesses: Arc::new(engram_coordinator::harness_registry::HarnessRegistry::empty()),
-        harness_substrate: None,
         egress_proxy: None,
     };
     let cfg = CoordinatorConfig {
@@ -572,11 +570,10 @@ async fn add_harness_pack_round_trip() {
 }
 
 #[tokio::test]
-async fn list_harnesses_prefers_postgres_over_legacy_scan() {
-    // Empty Postgres harness_packs + empty host-resident registry =
-    // empty list. Adding one Postgres row makes it appear, with the
-    // registry_uri populated (the load-bearing signal that the row
-    // came from the Postgres path, not the legacy disk scan).
+async fn list_harnesses_returns_registry_packs() {
+    // Empty Postgres harness_packs = empty list. Adding one row makes
+    // it appear with its registry_uri intact. Stage B2 dropped the
+    // legacy host-resident scan; Postgres is now the only source.
     let (app, _) = build_app();
     let (status, resp) = send(&app, Method::GET, "/api/harnesses", None).await;
     assert_eq!(status, StatusCode::OK);
