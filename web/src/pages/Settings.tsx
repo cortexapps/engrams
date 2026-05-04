@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { NavLink, Outlet, useLocation } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 
 // Settings layout — the second top-level page next to the Overview.
 // Same `book` column, same hairline rule under the header. The tab
@@ -53,6 +53,10 @@ export function Settings() {
 }
 
 function Header({ subtitle }: { subtitle: string }) {
+  // Breadcrumb H1: "engrams › settings". The "engrams" portion is
+  // link-styled and clickable home; "settings" is the active page,
+  // styled at full ink. This is the only "back to overview"
+  // affordance — clean, discoverable, no orphan corner element.
   return (
     <header className="mb-8">
       <h1
@@ -65,6 +69,28 @@ function Header({ subtitle }: { subtitle: string }) {
           fontStyle: 'italic',
         }}
       >
+        <Link
+          to="/"
+          aria-label="back to sessions"
+          className="breadcrumb-home"
+          style={{
+            color: 'var(--color-ink-faded)',
+            textDecoration: 'none',
+            transition: 'color 200ms ease-out',
+          }}
+        >
+          engrams
+        </Link>
+        <span
+          aria-hidden
+          style={{
+            color: 'var(--color-ink-quiet)',
+            margin: '0 0.4em',
+            fontStyle: 'normal',
+          }}
+        >
+          ›
+        </span>
         settings
       </h1>
       <motion.p

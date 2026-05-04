@@ -225,3 +225,15 @@ select.ledger-input {
     margin-right: 0.5rem;
   }
 }
+
+/* Breadcrumb-home affordance — the "engrams" prefix in inner-page
+ * H1s. Sits at ink-faded; hovering darkens to ink and surfaces a
+ * 1px underline at typeset offset. The styling lives here (not
+ * inline) so the :hover state isn't lost to React's per-render
+ * style object diffing. */
+.breadcrumb-home:hover {
+  color: var(--color-ink) !important;
+  text-decoration: underline !important;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}

@@ -1,7 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { UserChip } from './components/UserChip';
-import { Wordmark } from './components/Wordmark';
 import { Overview } from './pages/Overview';
 import { SessionDetail } from './pages/SessionDetail';
 import { Settings } from './pages/Settings';
@@ -22,11 +21,10 @@ export function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
-        {/* Both the wordmark (top-left, links to /) and the user
-            chip (top-right) are rendered above the routed pages so
-            they survive route transitions and stay anchored to the
-            viewport corners. */}
-        <Wordmark />
+        {/* User chip is the only persistent corner element. The
+            "back to overview" affordance lives in inner pages'
+            H1 prefix ("engrams › settings"), not as separate
+            chrome — see Settings.tsx. */}
         <UserChip />
         <Routes>
           <Route path="/" element={<Overview />} />
