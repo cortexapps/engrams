@@ -458,10 +458,18 @@ fn harness_event_sink(
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     sandbox: Arc<dyn engram_core::traits::SandboxBackend>,
 ) -> EventSink {
+    // Per-session cache of the most-recent forwarded event kind. Used
+    // to drop a `harness_idle` that would land back-to-back with
+    // another `harness_idle`: the claude harness re-announces Idle on
+    // every reconnect (a protocol "ready for prompts" signal), so an
+    // evict/resume cycle on an already-idle session would otherwise
+    // append a redundant idle to the log on every cycle.
+    let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
     Arc::new(move |session_id, sandbox_id, ev| {
         let events = events.clone();
         let meta = meta.clone();
         let sandbox = sandbox.clone();
+        let last_kind = last_kind.clone();
         Box::new(Box::pin(async move {
             // 1. Always forward the event into session_events (live
             //    SSE / Web UI / Slackbot timeline).
@@ -469,6 +477,22 @@ fn harness_event_sink(
                 matches!(ev, HarnessEvent::Idle | HarnessEvent::RunCompleted { .. });
             let session_event = SessionEvent::from_harness(ev, Utc::now());
             let kind = session_event.kind();
+
+            // Drop a back-to-back duplicate `harness_idle`. The
+            // upstream TTL bookkeeping in HarnessHub::reader_loop
+            // already saw the event, so suppressing it here only
+            // affects the persisted log + SSE bus. Auto-checkpoint
+            // also short-circuits: nothing has changed since the last
+            // idle, so re-running it would be pure cost.
+            if kind == "harness_idle"
+                && last_kind
+                    .get(&session_id)
+                    .map(|v| *v == "harness_idle")
+                    .unwrap_or(false)
+            {
+                return;
+            }
+
             let payload = match serde_json::to_value(&session_event) {
                 Ok(v) => v,
                 Err(e) => {
@@ -478,6 +502,7 @@ fn harness_event_sink(
             };
             match meta.append_session_event(session_id, kind, payload).await {
                 Ok(idx) => {
+                    last_kind.insert(session_id, kind);
                     events.publish(
                         session_id,
                         IndexedEvent {
@@ -1174,5 +1199,71 @@ pub(crate) mod tests {
         // Nothing emitted within a generous deadline.
         let recv = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
         assert!(recv.is_err(), "Local session must not produce events");
+    }
+
+    #[tokio::test]
+    async fn harness_event_sink_dedupes_back_to_back_idles() {
+        // The claude harness re-emits Idle on every reconnect (e.g.
+        // after an evict/resume cycle on an already-idle session).
+        // Persisting each one would litter the timeline with redundant
+        // "awaiting prompt" markers; the sink drops the duplicates.
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: engram_core::types::SessionStatus::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:idle-dedup".into(),
+            workspace: WorkspaceSpec::Empty,
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Ephemeral,
+            checkpoint_branch: None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+        let mini = Arc::new(MiniMeta::new(session));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+
+        let sandbox_root = TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
+        let sandbox_id = engram_core::SandboxId::new();
+
+        let bus = Arc::new(SessionEventBus::default());
+        let sink = super::harness_event_sink(bus.clone(), meta.clone(), backend.clone());
+
+        // Three back-to-back idles: only the first should land.
+        for _ in 0..3 {
+            sink(session_id, sandbox_id, HarnessEvent::Idle).await;
+        }
+        {
+            let events = mini.events.lock();
+            assert_eq!(events.len(), 1, "consecutive idles must collapse");
+            assert_eq!(events[0].kind, "harness_idle");
+        }
+
+        // A non-idle event resets the dedup state — the next Idle is
+        // a real transition and must persist.
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-1".into(),
+                prompt_summary: None,
+            },
+        )
+        .await;
+        sink(session_id, sandbox_id, HarnessEvent::Idle).await;
+        sink(session_id, sandbox_id, HarnessEvent::Idle).await;
+
+        let kinds: Vec<String> = mini.events.lock().iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "harness_idle".to_string(),
+                "run_started".to_string(),
+                "harness_idle".to_string(),
+            ],
+        );
     }
 }
