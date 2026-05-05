@@ -82,7 +82,7 @@ export function Transcript({ events }: TranscriptProps) {
       {blocks.map((b) => {
         switch (b.kind) {
           case 'run-start':
-            return <RunBoundary key={b.key} runId={b.runId} prompt={b.prompt} />;
+            return <RunBoundary key={b.key} prompt={b.prompt} />;
           case 'run-end':
             // Soft separator — the next RunBoundary will draw the rule.
             return null;
