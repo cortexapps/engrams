@@ -282,30 +282,48 @@ async fn resume_from_fc_snapshot(
     // adapter goes straight to Idle and waits for the next user
     // prompt instead of replaying the original kickoff.
     //
-    // The base env starts from the per-request `secrets` map sealed
-    // at create time (e.g. CLAUDE_CODE_OAUTH_TOKEN); if the row
-    // doesn't exist (no overrides were submitted, or the session
-    // pre-dates session-secret persistence) we fall back to an
-    // empty map and the harness boots without that env. The
-    // ENGRAM_SESSION_HARNESS_NAME hint that the host-agent reads
-    // for substrate naming is recomputed downstream by
-    // `resolve_harness`.
+    // Build the resume base env in two layers, mirroring create:
     //
-    // TODO(secrets-on-resume-manifest): also re-resolve the image's
-    // manifest-declared `[secrets.*]` schema here via SecretStore.
-    // Today only the per-request override map round-trips.
-    let resume_base_env = match crate::api::sessions::load_session_secrets(&state, id).await {
-        Ok(Some(map)) => map,
-        Ok(None) => std::collections::HashMap::new(),
+    //   1. manifest.env + manifest.[secrets.*] resolved fresh from
+    //      the deployment SecretStore. Re-resolving (vs. snapshotting
+    //      at create) means an operator-driven secret rotation lands
+    //      automatically on the next resume.
+    //   2. per-request `secrets` overrides (CLAUDE_CODE_OAUTH_TOKEN,
+    //      ANTHROPIC_API_KEY, etc.) decrypted from session_secrets.
+    //      These shadow any same-key value from layer 1 — matches
+    //      "the user explicitly typed a value at create" semantics.
+    //
+    // Both layers fail soft: a missing enabled_images row, transient
+    // SecretStore hiccup, or pre-fix session with no sealed row
+    // resume with a thinner env (the pre-fix status quo) instead of
+    // failing the whole resume.
+    let mut resume_base_env =
+        match crate::api::sessions::resolve_manifest_secrets(&state, &session).await {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "resolve_manifest_secrets failed; resume continues without manifest env",
+                );
+                std::collections::HashMap::new()
+            }
+        };
+    match crate::api::sessions::load_session_secrets(&state, id).await {
+        Ok(Some(overrides)) => {
+            for (k, v) in overrides {
+                resume_base_env.insert(k, v);
+            }
+        }
+        Ok(None) => {}
         Err(e) => {
             tracing::warn!(
                 session_id = %id,
                 error = %e,
-                "load_session_secrets failed; resume continues with empty secret env",
+                "load_session_secrets failed; resume continues without per-request overrides",
             );
-            std::collections::HashMap::new()
         }
-    };
+    }
     let agent_opt =
         crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
             .ok()

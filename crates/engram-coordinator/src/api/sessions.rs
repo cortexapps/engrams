@@ -132,6 +132,59 @@ pub(crate) async fn persist_session_secrets(
     Ok(())
 }
 
+/// Re-resolve the image manifest's `[secrets.*]` schema against the
+/// deployment's `SecretStore` for a session, returning the env map
+/// the harness should boot with. Looks up the session's image_uri
+/// in `enabled_images`, parses the cached manifest, calls
+/// `services.secrets.resolve(...)` with the same `(repo, tag)`
+/// context the create path used, and applies the bundle into a
+/// fresh env map via the same `apply_secrets_to_env` rules.
+///
+/// Re-resolving (vs. snapshotting at create) means an operator who
+/// rotates a secret in the deployment's secret store mid-session
+/// sees the new value land on the next resume — surprising the
+/// harness with a stale value would be a bug, not the fix. The
+/// caller is expected to fold per-request overrides
+/// (CLAUDE_CODE_OAUTH_TOKEN, etc.) on top via [`load_session_secrets`].
+pub(crate) async fn resolve_manifest_secrets(
+    state: &SharedState,
+    session: &Session,
+) -> Result<HashMap<String, String>, ApiError> {
+    let enabled = state
+        .services
+        .meta
+        .get_enabled_image(&session.image)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "session image `{}` is no longer enabled; can't re-resolve manifest secrets",
+                session.image,
+            ))
+        })?;
+    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
+        ApiError::Internal(format!(
+            "stored manifest for `{}` failed to parse: {e}",
+            session.image,
+        ))
+    })?;
+    let (repo, tag) = split_image_ref(&session.image);
+    let secret_ctx = SecretContext {
+        repo,
+        image_tag: tag,
+    };
+    // Resume doesn't accept new per-request overrides — those came in
+    // at create time and ride through via load_session_secrets.
+    let bundle: SecretBundle = state
+        .services
+        .secrets
+        .resolve(&secret_ctx, &manifest.secrets, None)
+        .await
+        .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
+    let mut env: HashMap<String, String> = manifest.env.clone();
+    apply_secrets_to_env(&mut env, &bundle, manifest.secret_mode, session.id);
+    Ok(env)
+}
+
 /// Reverse of [`persist_session_secrets`]: fetch the sealed row,
 /// open it under the deployment KEK, and return the original
 /// `(name, value)` map. `Ok(None)` when no row exists (the session
