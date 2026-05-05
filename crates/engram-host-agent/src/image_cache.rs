@@ -237,27 +237,23 @@ impl ImageCache {
         }
 
         // Build the staging tree: a tempdir containing a single
-        // `<name>/` symlink pointing at the extracted pack. mke2fs
-        // -d follows symlinks while populating, so this is a copy-
-        // free way to get the right layout inside the resulting
-        // filesystem.
-        let staging = tempfile::tempdir().map_err(CacheError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs as unix_fs;
-            unix_fs::symlink(&cached.pack_dir, staging.path().join(name))
-                .map_err(CacheError::Io)?;
-        }
-        #[cfg(not(unix))]
-        {
-            // Non-unix fallback: copy the pack tree under <staging>/<name>/.
-            // We don't actually run on non-unix (FC is Linux-only,
-            // VZ is macOS), but keeping the match exhaustive
-            // prevents accidental drift if we ever do.
-            let dst = staging.path().join(name);
-            fs::create_dir_all(&dst).await.map_err(CacheError::Io)?;
-            copy_dir_recursive(&cached.pack_dir, &dst).await?;
-        }
+        // real `<name>/` directory whose contents mirror the pack.
+        // mke2fs `-d` walks the source tree with `lstat`, so a symlink
+        // at the top of the staging tree gets preserved in the
+        // resulting filesystem rather than being dereferenced — which
+        // produces an in-VM dangling link to the host's cache path.
+        // Hardlinks (same FS, zero-copy) avoid duplicating the
+        // bundled CLI bytes; we host the staging tempdir under the
+        // cache root so the hardlink target FS always matches.
+        let staging = tempfile::Builder::new()
+            .prefix("substrate-")
+            .tempdir_in(&self.inner.root)
+            .map_err(CacheError::Io)?;
+        let staging_subdir = staging.path().join(name);
+        fs::create_dir_all(&staging_subdir)
+            .await
+            .map_err(CacheError::Io)?;
+        hardlink_tree(&cached.pack_dir, &staging_subdir).await?;
 
         // Size the ext4: pack size doubled, +128 MiB minimum, 4 KiB-
         // aligned. Reusing image-builder's helper keeps the sizing
@@ -461,6 +457,43 @@ struct GcCandidate {
 
 fn strip_sha256_prefix(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
+}
+
+/// Recursively replicate `src` under `dst` as a tree of hardlinks for
+/// regular files, real directories for directories, and verbatim
+/// symlinks for symlinks. Caller guarantees `dst` exists; entries
+/// land directly inside it (not under `dst/<basename(src)>`).
+///
+/// Used to stage the harness pack for `mke2fs -d` without copying
+/// the bundled CLI bytes. Both `src` and `dst` must be on the same
+/// filesystem (`hard_link` returns EXDEV otherwise) — the caller
+/// places the staging tempdir alongside the cache to guarantee that.
+async fn hardlink_tree(src: &Path, dst: &Path) -> Result<(), CacheError> {
+    let mut rd = fs::read_dir(src).await.map_err(CacheError::Io)?;
+    while let Some(entry) = rd.next_entry().await.map_err(CacheError::Io)? {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type().await.map_err(CacheError::Io)?;
+        if ft.is_dir() {
+            fs::create_dir(&to).await.map_err(CacheError::Io)?;
+            // Boxing keeps the recursive `async fn` future Sized.
+            Box::pin(hardlink_tree(&from, &to)).await?;
+        } else if ft.is_symlink() {
+            let target = fs::read_link(&from).await.map_err(CacheError::Io)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &to).map_err(CacheError::Io)?;
+            #[cfg(not(unix))]
+            {
+                let _ = target;
+                return Err(CacheError::Io(std::io::Error::other(
+                    "symlinks in harness packs require a unix host",
+                )));
+            }
+        } else {
+            fs::hard_link(&from, &to).await.map_err(CacheError::Io)?;
+        }
+    }
+    Ok(())
 }
 
 async fn touch(path: &Path) {
