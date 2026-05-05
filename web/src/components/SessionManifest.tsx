@@ -136,7 +136,11 @@ function sortSessions(sessions: Session[]): Session[] {
 function formatRepo(s: Session): string {
   switch (s.workspace.kind) {
     case 'empty':
-      return `${s.image.repo} (empty)`;
+      // Strip registry host + tag for visual density. Stage B1 made
+      // session.image a flat OCI URI like
+      // `ghcr.io/cortex/api:warm-1`; the panel only has room for the
+      // repo segment.
+      return `${stripImageHost(s.image)} (empty)`;
     case 'git': {
       const branch =
         s.workspace.branch && s.workspace.branch !== 'main'
@@ -146,6 +150,17 @@ function formatRepo(s: Session): string {
       return `${s.workspace.url.replace(/^https?:\/\/[^/]+\//, '')}${branch}`;
     }
   }
+}
+
+/** Drop the leading `<host>/` and trailing `:<tag>` from an OCI URI,
+ * leaving the repo segment ("ghcr.io/cortex/api:warm-1" → "cortex/api").
+ * Falls back to the input verbatim if either delimiter is missing. */
+function stripImageHost(uri: string): string {
+  const slash = uri.indexOf('/');
+  const colon = uri.lastIndexOf(':');
+  const start = slash >= 0 ? slash + 1 : 0;
+  const end = colon > start ? colon : uri.length;
+  return uri.slice(start, end);
 }
 
 function short(id: string) {

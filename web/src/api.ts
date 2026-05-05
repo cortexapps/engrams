@@ -3,11 +3,12 @@ import type {
   AddRegistryRequest,
   AddRegistryResponse,
   CreateSessionResponse,
+  EnabledImageSummary,
   HarnessDescriptor,
   HarnessPackSummary,
   HarnessSpec,
-  ImageDescriptor,
   ImageRef,
+  ListEnabledImagesResponse,
   ListHostsResponse,
   ListRegistriesResponse,
   ListSessionsResponse,
@@ -74,8 +75,6 @@ export const fetchHosts = () =>
 export const fetchSession = (id: string) =>
   getJSON<Session>(`/sessions/${id}`);
 
-export const fetchImages = () => getJSON<ImageDescriptor[]>('/api/images');
-
 export const fetchHarnesses = () =>
   getJSON<HarnessDescriptor[]>('/api/harnesses');
 
@@ -125,3 +124,26 @@ export const addHarnessPack = (req: AddHarnessPackRequest) =>
 
 export const deleteHarnessPack = (name: string) =>
   deleteEmpty(`/api/harnesses/${encodeURIComponent(name)}`);
+
+// ---- Settings · Enabled images ----------------------------------------
+//
+// Image URIs contain `/` and `:` which makes them awkward as path
+// segments; the coordinator takes them in the body for write paths.
+
+export const fetchEnabledImages = () =>
+  getJSON<ListEnabledImagesResponse>('/api/enabled-images').then(
+    (r) => r.images,
+  );
+
+export const enableImage = (imageUri: string) =>
+  postJSON<EnabledImageSummary>('/api/enabled-images', {
+    image_uri: imageUri,
+  });
+
+export const disableImage = (imageUri: string) =>
+  postJSON<void>('/api/enabled-images/disable', { image_uri: imageUri });
+
+export const refreshEnabledImage = (imageUri: string) =>
+  postJSON<EnabledImageSummary>('/api/enabled-images/refresh', {
+    image_uri: imageUri,
+  });

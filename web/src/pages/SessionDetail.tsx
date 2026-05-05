@@ -102,7 +102,7 @@ export function SessionDetail() {
             className="mt-1 font-mono text-[0.78rem]"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            image {session.image.repo}:{session.image.tag} · created{' '}
+            image {session.image} · created{' '}
             {relativeTime(session.created_at)} ago · {events.length} events
           </div>
         )}

@@ -21,6 +21,11 @@ interface Tab {
 
 const TABS: Tab[] = [
   {
+    to: 'images',
+    label: 'Images',
+    hint: 'Curated OCI image URIs sessions may reference',
+  },
+  {
     to: 'registries',
     label: 'Registries',
     hint: 'Docker registry credentials, sealed under the deployment KEK',

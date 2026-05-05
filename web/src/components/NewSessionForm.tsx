@@ -1,11 +1,11 @@
 import { motion } from 'framer-motion';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { createSession } from '../api';
-import { useImages } from '../hooks/useImages';
+import { useEnabledImages } from '../hooks/useEnabledImages';
 import { useHarnesses } from '../hooks/useHarnesses';
 import { SectionHead } from './HostManifest';
-import type { HarnessSpec, ImageDescriptor, WorkspaceSpec } from '../types';
+import type { HarnessSpec, WorkspaceSpec } from '../types';
 
 // "New session" form rendered inline on the Overview page, between the
 // HostManifest and the SessionManifest. Phase 2 made the three session
@@ -23,21 +23,23 @@ export interface NewSessionFormProps {
 }
 
 export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
-  const { data: images, isLoading, error: loadError } = useImages(true);
+  const { data: images, isLoading, error: loadError } = useEnabledImages(true);
   const { data: harnesses } = useHarnesses(true);
   const qc = useQueryClient();
 
   // ---- IMAGE ----
-  const [selectedKey, setSelectedKey] = useState<string>('');
-  const selected = useMemo<ImageDescriptor | undefined>(
-    () => images?.find((img) => imageKey(img) === selectedKey),
-    [images, selectedKey],
-  );
+  // Stage D: image is a flat OCI URI. The picker shows the operator-
+  // curated `enabled_images` set; whatever URI the user selects flows
+  // straight to `POST /sessions { image: "<uri>" }`. Manifest data
+  // (name, description) is read off the cached row so we don't refetch
+  // the registry per render.
+  const [selectedUri, setSelectedUri] = useState<string>('');
+  const selected = images?.find((img) => img.image_uri === selectedUri);
   useEffect(() => {
-    if (!selectedKey && images && images.length > 0) {
-      setSelectedKey(imageKey(images[0]));
+    if (!selectedUri && images && images.length > 0) {
+      setSelectedUri(images[0].image_uri);
     }
-  }, [images, selectedKey]);
+  }, [images, selectedUri]);
 
   // ---- WORKSPACE ----
   const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind>('empty');
@@ -49,15 +51,15 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const [harnessKind, setHarnessKind] = useState<HarnessKind>('none');
   const [harnessName, setHarnessName] = useState<string>('');
 
-  // Reset image-side secrets when image changes — schema is
-  // per-image. Harness selection (and its credentials) is NOT
-  // reset — harnesses live above images now, deployment-wide via
-  // the host's harness registry, so a session's harness choice
-  // survives image swaps.
+  // Clear any prior submit error when the image changes — the
+  // selection itself is the corrective action; we don't want a stale
+  // "image X failed" still on screen for a different image. Harness
+  // selection (and its credentials) is NOT reset — harnesses live
+  // above images, deployment-wide via the registry-backed harness
+  // packs, so a session's harness choice survives image swaps.
   useEffect(() => {
-    setImageSecrets({});
     setError(null);
-  }, [selectedKey]);
+  }, [selectedUri]);
 
   // If the host registry no longer offers the chosen harness (operator
   // removed a binary), drop back to none.
@@ -76,29 +78,26 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const [prompt, setPrompt] = useState('');
 
   // ---- CREDENTIALS ----
-  // Image-declared secrets (NPM_TOKEN, GITHUB_TOKEN, etc.) live in
-  // `imageSecrets`. Harness-specific credentials (today: claude's
-  // OAuth token / API key) live in `harnessSecrets`. Both maps get
-  // merged into the request payload.
-  const [imageSecrets, setImageSecrets] = useState<Record<string, string>>({});
+  // Stage D: the dashboard no longer surfaces image-declared secrets.
+  // The manifest lives server-side on the `enabled_images` row; if an
+  // image needs literal-mode secrets, they're supplied at the deploy
+  // layer (env / KMS / Vault), not pasted in the browser. The form
+  // still surfaces harness-level credentials — today only the Claude
+  // OAuth/API key, which is genuinely a per-session human input.
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Claude auth UX (hard-coded; see comment in the JSX section).
   // The dropdown picks which env-var name the value gets sent under.
-  const [claudeAuthMethod, setClaudeAuthMethod] =
-    useState<'oauth' | 'api_key'>('oauth');
+  const [claudeAuthMethod, setClaudeAuthMethod] = useState<'oauth' | 'api_key'>(
+    'oauth',
+  );
   const [claudeToken, setClaudeToken] = useState('');
   const claudeTokenName =
     claudeAuthMethod === 'oauth'
       ? 'CLAUDE_CODE_OAUTH_TOKEN'
       : 'ANTHROPIC_API_KEY';
 
-  const isBroker = selected?.secret_mode === 'broker';
-  const imageSecretsMissing =
-    selected?.required_secrets
-      .filter((s) => s.required)
-      .some((s) => !(imageSecrets[s.name] && imageSecrets[s.name].length > 0)) ?? false;
   // Claude harness needs *some* token to authenticate; if the user
   // picked it but didn't paste one, can't submit.
   const claudeTokenMissing =
@@ -108,14 +107,14 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
 
   const workspaceValid =
     workspaceKind === 'empty' ||
-    (workspaceKind === 'git' && gitUrl.trim().length > 0 && gitBranch.trim().length > 0);
+    (workspaceKind === 'git' &&
+      gitUrl.trim().length > 0 &&
+      gitBranch.trim().length > 0);
 
   const canSubmit =
     !!selected &&
     workspaceValid &&
     !submitting &&
-    !isBroker &&
-    !imageSecretsMissing &&
     !claudeTokenMissing;
 
   const submit = async (e: React.FormEvent) => {
@@ -140,23 +139,23 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       const promptValue =
         harness.kind === 'none' ? undefined : prompt.trim() || undefined;
 
-      // Merge image-declared secrets with the harness's secret
-      // (today only the claude token; one of OAuth or API key,
-      // determined by `claudeAuthMethod`). Sent as a single
-      // `secrets` map; the coord injects them into the harness env.
-      const mergedSecrets: Record<string, string> = { ...imageSecrets };
+      // Harness-level credentials (today: just the claude token, one
+      // of OAuth or API key per `claudeAuthMethod`). Image-declared
+      // secrets flow through the deploy layer post-Stage-D, not the
+      // dashboard.
+      const mergedSecrets: Record<string, string> = {};
       if (harnessKind === 'builtin' && harnessName === 'claude') {
         mergedSecrets[claudeTokenName] = claudeToken;
       }
       const res = await createSession({
-        image: { kind: 'registry', repo: selected.repo, tag: selected.tag },
+        image: selected.image_uri,
         workspace,
         harness,
         prompt: promptValue,
-        secrets: Object.keys(mergedSecrets).length > 0 ? mergedSecrets : undefined,
+        secrets:
+          Object.keys(mergedSecrets).length > 0 ? mergedSecrets : undefined,
       });
       // Wipe sensitive form state immediately on success.
-      setImageSecrets({});
       setClaudeToken('');
       setPrompt('');
       qc.invalidateQueries({ queryKey: ['sessions'] });
@@ -211,9 +210,16 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
             className="font-display italic text-[0.85rem]"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            no images registered. an operator needs to bake and
-            register one (via <code className="font-mono">engram image build</code>)
-            before sessions can be created.
+            no images enabled. push one with{' '}
+            <code className="font-mono">engram image build --push</code>, then{' '}
+            <a
+              href="/settings/images"
+              className="font-display italic"
+              style={{ color: 'var(--color-amber)' }}
+            >
+              enable
+            </a>{' '}
+            it from settings.
           </p>
         )}
 
@@ -224,23 +230,24 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
               <SubHead>IMAGE</SubHead>
               <Field label="image">
                 <select
-                  value={selectedKey}
-                  onChange={(e) => setSelectedKey(e.target.value)}
+                  value={selectedUri}
+                  onChange={(e) => setSelectedUri(e.target.value)}
                   className="ledger-input font-display"
                 >
                   {images.map((img) => (
-                    <option key={imageKey(img)} value={imageKey(img)}>
-                      {img.repo} · {img.tag}
+                    <option key={img.image_uri} value={img.image_uri}>
+                      {img.image_uri}
+                      {img.manifest_name ? ` — ${img.manifest_name}` : ''}
                     </option>
                   ))}
                 </select>
               </Field>
-              {selected?.description && (
+              {selected?.manifest_description && (
                 <p
                   className="font-display italic text-[0.85rem] -mt-1"
                   style={{ color: 'var(--color-ink-quiet)' }}
                 >
-                  {selected.description}
+                  {selected.manifest_description}
                 </p>
               )}
             </div>
@@ -334,32 +341,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
               )}
             </div>
 
-            {/* IMAGE-LEVEL CREDENTIALS — workspace-side secrets the
-                project's runtime needs (NPM_TOKEN, GITHUB_TOKEN, …).
-                Driven by the image manifest's [secrets.X] blocks. */}
-            {selected && selected.required_secrets.length > 0 && (
-              <div className="pt-2 space-y-3">
-                <p
-                  className="font-mono smallcaps text-[0.65rem]"
-                  style={{ color: 'var(--color-ink-quiet)' }}
-                >
-                  IMAGE CREDENTIALS · paste once · never persisted
-                </p>
-                {selected.required_secrets.map((s) => (
-                  <SecretField
-                    key={s.name}
-                    name={s.name}
-                    required={s.required}
-                    value={imageSecrets[s.name] ?? ''}
-                    onChange={(v) =>
-                      setImageSecrets((prev) => ({ ...prev, [s.name]: v }))
-                    }
-                    disabled={isBroker}
-                  />
-                ))}
-              </div>
-            )}
-
             {/* HARNESS-LEVEL CREDENTIALS — hard-coded UX for the
                 `claude` harness today. Long-term these should come
                 from the harness pack itself, but for v1 we have one
@@ -407,16 +388,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
               </div>
             )}
 
-            {isBroker && (
-              <p
-                className="font-display italic text-[0.85rem]"
-                style={{ color: 'var(--color-ink-faded)' }}
-              >
-                this image uses the broker secret mode — credentials must be
-                provisioned host-side, not pasted here.
-              </p>
-            )}
-
             {error && (
               <p
                 className="font-mono text-[0.78rem]"
@@ -448,10 +419,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       <hr className="mt-6" />
     </motion.section>
   );
-}
-
-function imageKey(img: ImageDescriptor): string {
-  return `${img.repo}::${img.tag}`;
 }
 
 function SubHead({ children }: { children: React.ReactNode }) {

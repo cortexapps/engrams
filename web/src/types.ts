@@ -17,8 +17,11 @@ export type SessionStatus =
 
 export type SessionKind = 'git' | 'readonly' | 'ephemeral';
 
-// Phase 2 wire shape: the three orthogonal session-time axes.
-export type ImageRef = { kind: 'registry'; repo: string; tag: string };
+// Stage B1 wire shape: a session's image is now a flat OCI URI
+// (`<host>[:port]/<repo>:<tag>`). The earlier discriminated
+// `{ kind, repo, tag }` shape is gone — the backend resolves the
+// URI against `enabled_images` at session-create time.
+export type ImageRef = string;
 
 export type WorkspaceSpec =
   | { kind: 'empty' }
@@ -73,28 +76,11 @@ export interface ListHostsResponse {
 
 // ---- Image registry (for the create-session form) ---------------------
 
-export interface RequiredSecret {
-  name: string;
-  required: boolean;
-  allow_hosts: string[];
-}
-
 /** Harness available on this deployment — read from `/api/harnesses`,
- * which lists the host's `cfg.harnesses_dir` (deployment-wide, not
- * per-image). */
+ * a Postgres-backed list of registry-pulled packs. */
 export interface HarnessDescriptor {
   name: string;
   description: string | null;
-}
-
-export interface ImageDescriptor {
-  repo: string;
-  tag: string;
-  name: string;
-  description: string | null;
-  /** "literal" or "broker" — broker images reject browser-pasted secrets. */
-  secret_mode: string;
-  required_secrets: RequiredSecret[];
 }
 
 // ---- Session creation -------------------------------------------------
@@ -205,13 +191,17 @@ export interface IndexedEvent {
 // IAM identity is the credential. Future siblings (AwsInstanceRole,
 // GcpImpersonateSa, ...) slot in here as new variants without
 // reshaping anything.
-export type RegistryAuthKind = 'static' | 'gcp_workload_identity';
+export type RegistryAuthKind =
+  | 'static'
+  | 'gcp_workload_identity'
+  | 'anonymous';
 
 /** Variant-discriminated request body for `POST /api/registries`. The
  * server `serde(tag = "kind")` decoder matches on these. */
 export type AddRegistryAuth =
   | { kind: 'static'; username: string; password: string }
-  | { kind: 'gcp_workload_identity'; impersonate_sa?: string | null };
+  | { kind: 'gcp_workload_identity'; impersonate_sa?: string | null }
+  | { kind: 'anonymous' };
 
 export interface AddRegistryRequest {
   host: string;
@@ -258,4 +248,29 @@ export interface AddHarnessPackRequest {
   name: string;
   registry_uri: string;
   description?: string | null;
+}
+
+// ---- Settings · Enabled images -----------------------------------------
+//
+// Stage C: operators curate the set of OCI image URIs sessions may
+// reference. The coordinator caches each enabled URI's manifest.toml
+// at enable time so session-create has zero registry I/O on the hot
+// path. The dashboard's image picker reads this list (not the legacy
+// filesystem-walking /api/images endpoint).
+
+/** Wire shape of one row from `GET /api/enabled-images`. The raw
+ * manifest.toml is intentionally omitted — clients render via the
+ * lifted `manifest_name` / `manifest_description` fields. */
+export interface EnabledImageSummary {
+  id: string;
+  image_uri: string;
+  manifest_digest: string;
+  manifest_name: string | null;
+  manifest_description: string | null;
+  last_refreshed_at: string;
+  created_at: string;
+}
+
+export interface ListEnabledImagesResponse {
+  images: EnabledImageSummary[];
 }
