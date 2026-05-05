@@ -61,7 +61,6 @@ id_newtype!(SessionId);
 id_newtype!(HostId);
 id_newtype!(SandboxId);
 id_newtype!(SnapshotId);
-id_newtype!(ImageVersionId);
 id_newtype!(MessageId);
 id_newtype!(ToolCallId);
 id_newtype!(AgentCommitId);

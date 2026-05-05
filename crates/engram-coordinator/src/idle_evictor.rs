@@ -291,7 +291,6 @@ mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
     use crate::host_registry::HostRegistry;
-    use crate::image_registry::ImageRegistry;
     use crate::state::tests::MiniMeta;
     use crate::state::AppState;
     use crate::Services;
@@ -365,8 +364,6 @@ mod tests {
     fn build_state_with_session(session: Session, sandbox_root: &Path) -> SharedState {
         let local_path = sandbox_root.join("local");
         std::fs::create_dir_all(&local_path).unwrap();
-        let images_dir = sandbox_root.join("images");
-        std::fs::create_dir_all(&images_dir).unwrap();
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes")));
         let host_registry = Arc::new(HostRegistry::new());
@@ -379,7 +376,6 @@ mod tests {
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",
             )),
-            images: ImageRegistry::new(images_dir),
             oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
                 engram_oci::AnonymousResolver,
             ))),

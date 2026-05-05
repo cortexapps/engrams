@@ -181,8 +181,7 @@ mod tests {
     use super::*;
     use engram_core::types::registry::{HarnessPack, RegistryCredential};
     use engram_core::types::{
-        HostRecord, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
-        SnapshotRecord,
+        HostRecord, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
     };
     use engram_core::{HostId, MetaError, SandboxId, SessionId};
 
@@ -270,12 +269,6 @@ mod tests {
             &self,
             _: SessionId,
         ) -> Result<Option<SnapshotRecord>, MetaError> {
-            Ok(None)
-        }
-        async fn upsert_image_version(&self, _: ImageVersion) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn latest_ready_image(&self, _: &str) -> Result<Option<ImageVersion>, MetaError> {
             Ok(None)
         }
         async fn append_session_event(

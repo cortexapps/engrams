@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
 use engram_core::types::{
-    EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, ImageStatus,
-    ImageVersion, PersistedEvent, RegistryCredential, Session, SessionStatus, SnapshotRecord,
+    EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
+    RegistryCredential, Session, SessionStatus, SnapshotRecord,
 };
-use engram_core::{HostId, ImageVersionId, MetaError, SandboxId, SessionId, SnapshotId};
+use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -101,20 +101,6 @@ pub(crate) fn persisted_event_from_row(row: &PgRow) -> Result<PersistedEvent, Me
         idx,
         kind,
         payload,
-        created_at,
-    })
-}
-
-pub(crate) fn image_from_row(row: &PgRow) -> Result<ImageVersion, MetaError> {
-    let id: Uuid = row.try_get("id").map_err(col_err)?;
-    let status: String = row.try_get("status").map_err(col_err)?;
-    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
-    Ok(ImageVersion {
-        id: ImageVersionId(id),
-        repo: row.try_get("repo").map_err(col_err)?,
-        tag: row.try_get("tag").map_err(col_err)?,
-        blob_url: row.try_get("blob_url").map_err(col_err)?,
-        status: parse_image_status(&status)?,
         created_at,
     })
 }
@@ -211,19 +197,6 @@ fn parse_host_status(s: &str) -> Result<HostStatus, MetaError> {
     })
 }
 
-fn parse_image_status(s: &str) -> Result<ImageStatus, MetaError> {
-    Ok(match s {
-        "building" => ImageStatus::Building,
-        "ready" => ImageStatus::Ready,
-        "retired" => ImageStatus::Retired,
-        other => {
-            return Err(MetaError::Serialization(format!(
-                "unknown image status: {other}"
-            )));
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,18 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn image_status_parses_every_variant() {
-        for (s, expected) in [
-            ("building", ImageStatus::Building),
-            ("ready", ImageStatus::Ready),
-            ("retired", ImageStatus::Retired),
-        ] {
-            assert_eq!(parse_image_status(s).unwrap(), expected);
-            assert_eq!(parse_image_status(expected.as_str()).unwrap(), expected);
-        }
-    }
-
-    #[test]
     fn unknown_session_status_returns_serialization_error() {
         match parse_session_status("running") {
             Err(MetaError::Serialization(msg)) => {
@@ -289,14 +250,6 @@ mod tests {
         ));
         assert!(matches!(
             parse_host_status(""),
-            Err(MetaError::Serialization(_))
-        ));
-    }
-
-    #[test]
-    fn unknown_image_status_returns_serialization_error() {
-        assert!(matches!(
-            parse_image_status("READY"),
             Err(MetaError::Serialization(_))
         ));
     }

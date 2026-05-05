@@ -12,7 +12,6 @@ mod exec;
 mod harnesses;
 mod health;
 mod hosts;
-mod images;
 mod prompt;
 mod registries;
 mod sessions;
@@ -51,7 +50,6 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/hosts", get(hosts::list))
         .route("/api/hosts/:id", get(hosts::get))
         .route("/api/hosts/:id/drain", post(hosts::drain))
-        .route("/api/images", get(images::list_images))
         .route(
             "/api/harnesses",
             get(harnesses::list_harnesses).post(harnesses::add_harness),

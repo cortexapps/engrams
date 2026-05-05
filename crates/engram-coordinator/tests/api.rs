@@ -17,12 +17,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use engram_cloud_mock::MockCloud;
-use engram_coordinator::image_registry::ImageRegistry;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent, Session, SessionSpec,
-    SessionStatus, SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SessionId};
 use engram_sandbox_process::ProcessBackend;
@@ -42,7 +40,6 @@ use tower::ServiceExt;
 struct MockMetadataStore {
     sessions: Mutex<HashMap<SessionId, Session>>,
     snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
-    images: Mutex<HashMap<String, Vec<ImageVersion>>>,
     enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_event_idx: Mutex<HashMap<SessionId, i64>>,
@@ -215,24 +212,6 @@ impl MetadataStore for MockMetadataStore {
             .and_then(|v| v.last().cloned()))
     }
 
-    async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
-        self.images
-            .lock()
-            .entry(version.repo.clone())
-            .or_default()
-            .push(version);
-        Ok(())
-    }
-
-    async fn latest_ready_image(&self, repo: &str) -> Result<Option<ImageVersion>, MetaError> {
-        Ok(self.images.lock().get(repo).and_then(|v| {
-            v.iter()
-                .rev()
-                .find(|i| matches!(i.status, ImageStatus::Ready))
-                .cloned()
-        }))
-    }
-
     async fn append_session_event(
         &self,
         session_id: SessionId,
@@ -353,7 +332,6 @@ fn build_app(meta: Arc<MockMetadataStore>) -> axum::Router {
 /// list (auth-disabled).
 fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> axum::Router {
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
-    let images_dir = tempfile::tempdir().expect("images tempdir").keep();
     let services = Services {
         meta,
         cloud: Arc::new(MockCloud::new()),
@@ -362,7 +340,6 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
         )),
-        images: ImageRegistry::new(images_dir),
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
@@ -378,12 +355,11 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
     api::router(state)
 }
 
-/// Test fixture exposing the on-disk paths and stores so individual
-/// tests can populate images/secrets before exercising the API.
-/// The default `build_app` discards these (most tests don't care).
+/// Test fixture exposing the meta store so individual tests can
+/// populate images / secrets before exercising the API. The default
+/// `build_app` discards the handle (most tests don't care).
 struct TestFixture {
     app: axum::Router,
-    images_dir: std::path::PathBuf,
     meta: Arc<MockMetadataStore>,
 }
 
@@ -398,7 +374,6 @@ impl TestFixture {
         // router needs to outlive this function — the OS cleans up
         // `/tmp` later.
         let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
-        let images_dir = tempfile::tempdir().expect("images tempdir").keep();
         // Match production wiring: the host-side PooledBackend wraps
         // the real backend so warm-pool semantics (checkout / configure /
         // replenish) work the same way the multi-host setup runs them.
@@ -417,7 +392,6 @@ impl TestFixture {
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",
             )),
-            images: ImageRegistry::new(images_dir.clone()),
             oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
                 engram_oci::AnonymousResolver,
             ))),
@@ -431,61 +405,27 @@ impl TestFixture {
         let state = Arc::new(AppState::new(cfg, services));
         let fx = Self {
             app: api::router(state),
-            images_dir,
             meta: meta.clone(),
         };
         // Seed baseline images for the repos most tests use against
-        // `api_create_session`. Phase 2 made `image` mandatory — every
-        // test that doesn't explicitly write its own image needs one
-        // of these on disk to clear the registry-lookup gate.
+        // `api_create_session`. Stage B1 made `image` resolve via
+        // `enabled_images`; every test that doesn't explicitly enable
+        // its own image needs one of these in the mock store to clear
+        // the lookup gate.
         for repo in ["r", "warm/test", "cortex/api"] {
-            fx.write_image(repo, "warm-bootstrap", r#"name = "baseline""#, &[]);
+            fx.write_image(repo, "warm-bootstrap", r#"name = "baseline""#);
         }
         fx
     }
 
-    /// Materialize an image at `<images_dir>/<repo>/<tag>` with the
-    /// given manifest TOML and an optional rootfs directory tree
-    /// (each entry is `(relative_path, contents)`).
-    fn write_image(&self, repo: &str, tag: &str, manifest_toml: &str, rootfs: &[(&str, &[u8])]) {
-        let img_dir = self.images_dir.join(repo).join(tag);
-        std::fs::create_dir_all(&img_dir).unwrap();
-        std::fs::write(img_dir.join("manifest.toml"), manifest_toml).unwrap();
-        if !rootfs.is_empty() {
-            let rootfs_dir = img_dir.join("rootfs");
-            std::fs::create_dir_all(&rootfs_dir).unwrap();
-            for (path, contents) in rootfs {
-                let full = rootfs_dir.join(path);
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent).unwrap();
-                }
-                std::fs::write(full, contents).unwrap();
-            }
-        }
-        // Seed the enabled_images row so the new strict path in
-        // create_session can resolve the manifest. Production stores
-        // both `repo:tag` URIs and a digest; tests don't care, so we
-        // synthesize a deterministic digest from the URI.
+    /// Seed an `enabled_images` row in the mock store. The `rootfs`
+    /// parameter is gone post-Stage-E — sandbox content flows from
+    /// the registry through the host-agent's cache, not from the
+    /// coordinator's filesystem. Tests retain `write_image` for
+    /// continuity; the body is a thin wrapper over `seed_enabled`.
+    fn write_image(&self, repo: &str, tag: &str, manifest_toml: &str) {
         let uri = format!("{repo}:{tag}");
-        let digest = format!("sha256:{:08x}", {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            uri.hash(&mut h);
-            h.finish()
-        });
-        let now = chrono::Utc::now();
-        self.meta.enabled.lock().insert(
-            uri.clone(),
-            engram_core::types::EnabledImage {
-                id: uuid::Uuid::new_v4(),
-                image_uri: uri,
-                manifest_toml: manifest_toml.to_string(),
-                manifest_digest: digest,
-                last_refreshed_at: now,
-                created_at: now,
-                updated_at: None,
-            },
-        );
+        seed_enabled(&self.meta, &uri, manifest_toml);
     }
 }
 
@@ -721,7 +661,7 @@ async fn create_session_with_explicit_image_persists_full_row() {
     // session transitions to Active.
     let store = MockMetadataStore::arc();
     let f = TestFixture::new(store.clone(), InMemorySecretStore::new(), 0);
-    f.write_image("cortex/api", "warm-pinned", r#"name = "cortex-api""#, &[]);
+    f.write_image("cortex/api", "warm-pinned", r#"name = "cortex-api""#);
     let app = f.app;
 
     let resp = app
@@ -2018,7 +1958,6 @@ async fn create_session_failure_marks_session_failed() {
     }
 
     let store = MockMetadataStore::arc();
-    let images_dir = tempfile::tempdir().unwrap().keep();
     // Seed a `cortex/api:warm-1` enabled_images row so the create
     // handler clears the image-resolution gate and we get to the
     // sandbox failure the test is exercising.
@@ -2031,7 +1970,6 @@ async fn create_session_failure_marks_session_failed() {
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
         )),
-        images: ImageRegistry::new(images_dir),
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
@@ -2114,7 +2052,6 @@ async fn manifest_env_lands_in_sandbox_environment() {
             PYTHONUNBUFFERED = "1"
             ENGRAM_TEST_MARKER = "from-manifest"
         "#,
-        &[],
     );
     let app = f.app;
 
@@ -2157,15 +2094,7 @@ async fn manifest_env_lands_in_sandbox_environment() {
 async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
     let store = MockMetadataStore::arc();
     let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
-    f.write_image(
-        "cortex/api",
-        "warm-1",
-        r#"name = "cortex-api""#,
-        &[
-            ("README.md", b"# starter\n"),
-            ("scripts/setup.sh", b"#!/bin/sh\necho ok\n"),
-        ],
-    );
+    f.write_image("cortex/api", "warm-1", r#"name = "cortex-api""#);
     let app = f.app;
 
     let resp = post(
@@ -2214,7 +2143,6 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
             allow_hosts = ["api.github.com"]
             required = true
         "#,
-        &[],
     );
     let app = f.app;
 
@@ -2259,7 +2187,6 @@ async fn required_secret_missing_in_store_fails_session_create() {
             allow_hosts = ["api.github.com"]
             required = true
         "#,
-        &[],
     );
     let app = f.app;
 
@@ -2302,7 +2229,6 @@ async fn optional_secret_absence_is_silently_ok() {
             allow_hosts = ["api.example.com"]
             required = false
         "#,
-        &[],
     );
     let app = f.app;
 
@@ -2359,7 +2285,6 @@ async fn broker_mode_emits_placeholders_not_real_values() {
             allow_hosts = ["api.github.com"]
             required = true
         "#,
-        &[],
     );
     let app = f.app;
 
@@ -2410,7 +2335,6 @@ async fn manifest_resource_hints_override_defaults() {
             suggested_memory_mib = 8192
             suggested_vcpus = 4
         "#,
-        &[],
     );
     let app = f.app;
 

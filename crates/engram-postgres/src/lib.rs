@@ -12,8 +12,8 @@ use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 use engram_core::types::{
-    EnabledImage, HarnessPack, HostRecord, HostStatus, ImageVersion, PersistedEvent,
-    RegistryCredential, Session, SessionSpec, SessionStatus, SnapshotRecord,
+    EnabledImage, HarnessPack, HostRecord, HostStatus, PersistedEvent, RegistryCredential, Session,
+    SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -396,45 +396,6 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         row.map(|r| row::snapshot_from_row(&r)).transpose()
-    }
-
-    async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO image_versions (id, repo, tag, blob_url, status, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (repo, tag) DO UPDATE SET
-                blob_url   = EXCLUDED.blob_url,
-                status     = EXCLUDED.status,
-                updated_at = NOW()
-            "#,
-        )
-        .bind(version.id.as_uuid())
-        .bind(&version.repo)
-        .bind(&version.tag)
-        .bind(version.blob_url.as_deref())
-        .bind(version.status.as_str())
-        .bind(version.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn latest_ready_image(&self, repo: &str) -> Result<Option<ImageVersion>, MetaError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, repo, tag, blob_url, status, created_at
-            FROM image_versions
-            WHERE repo = $1 AND status = 'ready'
-            ORDER BY created_at DESC LIMIT 1
-            "#,
-        )
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row.map(|r| row::image_from_row(&r)).transpose()
     }
 
     async fn append_session_event(

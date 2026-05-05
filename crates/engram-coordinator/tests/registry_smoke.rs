@@ -37,13 +37,11 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use engram_cloud_mock::MockCloud;
-use engram_coordinator::image_registry::ImageRegistry;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::registry::{HarnessPack, RegistryAuthSpec, RegistryCredential};
 use engram_core::types::{
-    HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
-    SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use engram_sandbox_process::ProcessBackend;
@@ -130,12 +128,6 @@ impl MetadataStore for MockMetadataStore {
         &self,
         _: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(None)
-    }
-    async fn upsert_image_version(&self, _: ImageVersion) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn latest_ready_image(&self, _: &str) -> Result<Option<ImageVersion>, MetaError> {
         Ok(None)
     }
     async fn append_session_event(
@@ -237,7 +229,6 @@ impl MetadataStore for MockMetadataStore {
 fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
     let meta = MockMetadataStore::arc();
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
-    let images_dir = tempfile::tempdir().expect("images tempdir").keep();
     let services = Services {
         meta: meta.clone(),
         cloud: Arc::new(MockCloud::new()),
@@ -246,7 +237,6 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0xab; 32], "test:v1",
         )),
-        images: ImageRegistry::new(images_dir),
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),

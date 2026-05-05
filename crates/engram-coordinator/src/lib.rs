@@ -17,7 +17,6 @@ pub mod git_workdir;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_evictor;
-pub mod image_registry;
 pub mod pg_listener;
 pub mod preemption_drain;
 pub mod scheduler;
@@ -40,7 +39,6 @@ pub struct Services {
     /// DEKs. Initialised from `--kek-provider`. Phase 5+; envelope-
     /// encrypted creds live in the `registry_credentials` table.
     pub kek: Arc<dyn engram_crypto::MasterKeyProvider>,
-    pub images: image_registry::ImageRegistry,
     /// OCI client for pulling registry artifacts. Used by
     /// `/api/enabled-images` POST/refresh to fetch the manifest.toml
     /// at enable time so session-create has zero registry I/O. Shared

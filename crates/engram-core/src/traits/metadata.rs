@@ -4,7 +4,6 @@ use crate::error::MetaError;
 use crate::types::event::PersistedEvent;
 use crate::types::host::{HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
-use crate::types::image::ImageVersion;
 use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential};
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
@@ -74,10 +73,6 @@ pub trait MetadataStore: Send + Sync {
         &self,
         sid: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError>;
-
-    // ---- images ----
-    async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError>;
-    async fn latest_ready_image(&self, repo: &str) -> Result<Option<ImageVersion>, MetaError>;
 
     // ---- session event log ----
 

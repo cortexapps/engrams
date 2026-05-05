@@ -732,7 +732,7 @@ pub(crate) mod tests {
         checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
     };
     use engram_core::types::{
-        HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SnapshotRecord,
+        HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SnapshotRecord,
     };
     use engram_core::{HostId, MetaError};
     use engram_sandbox_process::ProcessBackend;
@@ -864,12 +864,6 @@ pub(crate) mod tests {
                 .iter()
                 .rfind(|s| s.session_id == sid)
                 .cloned())
-        }
-        async fn upsert_image_version(&self, _: ImageVersion) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn latest_ready_image(&self, _: &str) -> Result<Option<ImageVersion>, MetaError> {
-            Ok(None)
         }
         async fn append_session_event(
             &self,

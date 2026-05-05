@@ -7,7 +7,6 @@ use engram_cloud_mock::MockCloud;
 use engram_cloud_static::StaticCloud;
 use engram_coordinator::{
     config::{CloudBackendChoice, RunMode, SandboxBackendChoice},
-    image_registry::ImageRegistry,
     CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
 use engram_core::traits::{CloudBackend, SandboxBackend, SecretStore};
@@ -421,17 +420,14 @@ async fn main() -> Result<(), CoordinatorError> {
     }
 
     // Default dev wiring: env-var-backed SecretStore (pulls
-    // `$GITHUB_TOKEN` etc. from the host shell), filesystem-backed
-    // ImageRegistry under `<local_path>/images`. Production
-    // deployments swap these out for `engram-secrets-gcp` / vault /
+    // `$GITHUB_TOKEN` etc. from the host shell). Production
+    // deployments swap this out for `engram-secrets-gcp` / vault /
     // etc. via a config flag (next round).
     let secrets: Arc<dyn SecretStore> = Arc::new(EnvSecretStore::new());
 
     // KEK + meta_arc were constructed up-front so the OCI auth
     // resolver could reference them. They flow through to Services
     // here unchanged.
-
-    let images = ImageRegistry::new(cli.local_path.join("images"));
 
     // Build the egress proxy's CA + spawn the proxy task. Best-effort:
     // if the proxy fails to start (port in use, missing rustls/ring
@@ -446,7 +442,6 @@ async fn main() -> Result<(), CoordinatorError> {
         sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
         secrets,
         kek,
-        images,
         oci: oci_client,
         egress_proxy,
     };

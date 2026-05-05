@@ -15,14 +15,12 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use engram_cloud_mock::MockCloud;
-use engram_coordinator::image_registry::ImageRegistry;
 use engram_coordinator::{api, AppState, CoordinatorConfig, HostRegistry, Services};
 use engram_core::traits::{MetadataStore, SandboxBackend};
 use engram_core::types::{
-    HostRecord, HostStatus, ImageStatus, ImageVersion, PersistedEvent, Session, SessionSpec,
-    SessionStatus, SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
 };
-use engram_core::{HostId, ImageVersionId, MetaError, SessionId};
+use engram_core::{HostId, MetaError, SessionId};
 use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
 use engram_protocol::server::HostSession;
 use engram_sandbox_process::ProcessBackend;
@@ -38,7 +36,6 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct MiniMeta {
     sessions: Mutex<HashMap<SessionId, Session>>,
-    images: Mutex<HashMap<String, Vec<ImageVersion>>>,
     enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_idx: Mutex<HashMap<SessionId, i64>>,
@@ -165,21 +162,6 @@ impl MetadataStore for MiniMeta {
             .get(&id)
             .and_then(|v| v.last().cloned()))
     }
-    async fn upsert_image_version(&self, version: ImageVersion) -> Result<(), MetaError> {
-        self.images
-            .lock()
-            .entry(version.repo.clone())
-            .or_default()
-            .push(version);
-        Ok(())
-    }
-    async fn latest_ready_image(&self, repo: &str) -> Result<Option<ImageVersion>, MetaError> {
-        Ok(self
-            .images
-            .lock()
-            .get(repo)
-            .and_then(|v| v.iter().rfind(|i| i.status == ImageStatus::Ready).cloned()))
-    }
     async fn append_session_event(
         &self,
         sid: SessionId,
@@ -277,33 +259,15 @@ impl MetadataStore for MiniMeta {
     }
 }
 
-fn ignored_image() -> ImageVersion {
-    ImageVersion {
-        id: ImageVersionId::new(),
-        repo: "demo".into(),
-        tag: "warm-test".into(),
-        blob_url: None,
-        status: ImageStatus::Ready,
-        created_at: Utc::now(),
-    }
-}
-
 /// Build an AppState whose services.sandbox routes through a HostRegistry
 /// → wire → ProcessBackend chain. Exercises the same path a real
 /// `--mode=coordinator` + `engram-host-agent` deployment uses, just
 /// without an actual TCP/WS handshake (mpsc channels carry the frames).
 fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     let sandbox_dir = tempfile::tempdir().expect("host work_dir").keep();
-    let images_dir = tempfile::tempdir().expect("images tmp").keep();
-    // Phase 2 requires every session to declare an explicit image
-    // that resolves in the registry. Seed `demo:warm-test` here so
-    // the wire round-trip's create_session call can reach the
-    // host backend without 400ing on image resolution.
-    {
-        let img_dir = images_dir.join("demo/warm-test");
-        std::fs::create_dir_all(&img_dir).unwrap();
-        std::fs::write(img_dir.join("manifest.toml"), r#"name = "demo""#).unwrap();
-    }
+    // Stage B1+ requires every session to declare an image URI that
+    // resolves in `enabled_images`. The `seed_enabled()` call below
+    // seeds the row before we hand the meta store to Services.
 
     // Wire setup: in-memory mpsc pair stands in for the WS connection.
     let (coord_tx_a, host_rx_a) = futures::channel::mpsc::unbounded::<TungMessage>();
@@ -333,11 +297,6 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     host_registry.register(HostId::new(), remote);
 
     let meta = Arc::new(MiniMeta::default());
-    meta.images
-        .lock()
-        .entry("demo".into())
-        .or_default()
-        .push(ignored_image());
     seed_enabled(&meta, "demo:warm-test", r#"name = "demo""#);
 
     let services = Services {
@@ -348,7 +307,6 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
         )),
-        images: ImageRegistry::new(images_dir),
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
@@ -454,23 +412,12 @@ async fn create_then_exec_round_trips_via_wire() {
 async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
     // Build an AppState with an empty HostRegistry. The Phase 3a
     // single-host scheduler's "no host" path must surface as a 500
-    // with a meaningful message rather than silently hanging.
-    let images_dir = tempfile::tempdir().expect("images tmp").keep();
-    // Seed `demo:warm-test` on disk so `ImageRegistry::load` resolves;
-    // without this the create_session handler returns 400 from the
-    // image-not-found arm and the no-host path is never exercised.
-    {
-        let img_dir = images_dir.join("demo/warm-test");
-        std::fs::create_dir_all(&img_dir).unwrap();
-        std::fs::write(img_dir.join("manifest.toml"), r#"name = "demo""#).unwrap();
-    }
+    // with a meaningful message rather than silently hanging. The
+    // image is seeded via `seed_enabled()` below so the create
+    // handler clears the image-resolution gate and we get to the
+    // no-host failure the test is exercising.
     let host_registry = Arc::new(HostRegistry::new());
     let meta = Arc::new(MiniMeta::default());
-    meta.images
-        .lock()
-        .entry("demo".into())
-        .or_default()
-        .push(ignored_image());
     seed_enabled(&meta, "demo:warm-test", r#"name = "demo""#);
 
     let services = Services {
@@ -481,7 +428,6 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
         )),
-        images: ImageRegistry::new(images_dir),
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),

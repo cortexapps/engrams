@@ -1,38 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-use super::ids::ImageVersionId;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ImageStatus {
-    Building,
-    Ready,
-    Retired,
-}
-
-impl ImageStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Building => "building",
-            Self::Ready => "ready",
-            Self::Retired => "retired",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ImageVersion {
-    pub id: ImageVersionId,
-    pub repo: String,
-    /// Tag of the form `warm-<timestamp>`.
-    pub tag: String,
-    pub blob_url: Option<String>,
-    pub status: ImageStatus,
-    pub created_at: DateTime<Utc>,
-}
 
 // ---------------------------------------------------------------------
 // ImageManifest — the per-image declarative spec.

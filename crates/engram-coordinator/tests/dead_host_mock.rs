@@ -14,8 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    HostRecord, HostStatus, ImageVersion, PersistedEvent, Session, SessionSpec, SessionStatus,
-    SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SessionId};
 use parking_lot::Mutex;
@@ -134,12 +133,6 @@ impl MetadataStore for MiniMeta {
         &self,
         _id: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(None)
-    }
-    async fn upsert_image_version(&self, _v: ImageVersion) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn latest_ready_image(&self, _r: &str) -> Result<Option<ImageVersion>, MetaError> {
         Ok(None)
     }
     async fn append_session_event(

@@ -384,7 +384,6 @@ mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
     use crate::host_registry::HostRegistry;
-    use crate::image_registry::ImageRegistry;
     use crate::state::tests::MiniMeta;
     use crate::state::AppState;
     use crate::Services;
@@ -496,7 +495,6 @@ mod tests {
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",
             )),
-            images: ImageRegistry::new(local.path().join("images")),
             oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
                 engram_oci::AnonymousResolver,
             ))),

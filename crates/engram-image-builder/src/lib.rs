@@ -30,10 +30,7 @@ pub mod ext4;
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
-use engram_core::traits::MetadataStore;
-use engram_core::types::{ImageManifest, ImageStatus, ImageVersion};
-use engram_core::ImageVersionId;
+use engram_core::types::ImageManifest;
 
 pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
@@ -298,7 +295,6 @@ pub enum BuildError {
     Io(std::io::Error),
     Docker(String),
     Ext4(Ext4Error),
-    Persist(engram_core::MetaError),
     InvalidPath(String),
 }
 
@@ -309,7 +305,6 @@ impl std::fmt::Display for BuildError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Docker(m) => write!(f, "docker: {m}"),
             Self::Ext4(e) => write!(f, "ext4: {e}"),
-            Self::Persist(e) => write!(f, "metadata: {e}"),
             Self::InvalidPath(p) => write!(f, "invalid path: {p}"),
         }
     }
@@ -320,7 +315,6 @@ impl std::error::Error for BuildError {
         match self {
             Self::Io(e) => Some(e),
             Self::Ext4(e) => Some(e),
-            Self::Persist(e) => Some(e),
             _ => None,
         }
     }
@@ -339,9 +333,11 @@ impl From<Ext4Error> for BuildError {
 }
 
 /// The baker. Composed of a [`DockerRunner`] (mockable) for `docker
-/// build/create/export`, an [`Ext4Packer`] (mockable) for the
-/// `Format::Ext4` step, and optionally a [`MetadataStore`] for
-/// recording the produced row.
+/// build/create/export` and an [`Ext4Packer`] (mockable) for the
+/// `Format::Ext4` step. Stage A decoupled bake from Postgres; baked
+/// artifacts are pushed to the registry via [`Self::push_image`] and
+/// the coordinator's `/api/enabled-images` POST handler enables them
+/// — the builder never touches a `MetadataStore`.
 pub struct Builder<D: DockerRunner, P: Ext4Packer = Mke2fsPacker> {
     docker: D,
     packer: P,
@@ -512,30 +508,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             rootfs_path,
             size_bytes: total_size,
         })
-    }
-
-    /// Record (or refresh) a `image_versions` row marking the bake as
-    /// `Ready`. Callers that don't want a Postgres write skip this.
-    /// `blob_url` is the OCI URI when the bake was pushed to a
-    /// registry (Phase 5+); `None` keeps the legacy on-disk path.
-    pub async fn record_in_metadata(
-        &self,
-        meta: &dyn MetadataStore,
-        req: &BuildRequest,
-        outcome: &BuildOutcome,
-        blob_url: Option<String>,
-    ) -> Result<(), BuildError> {
-        let _ = outcome; // size_bytes is informational; the row is keyed on (repo, tag).
-        meta.upsert_image_version(ImageVersion {
-            id: ImageVersionId::new(),
-            repo: req.repo.clone(),
-            tag: req.tag.clone(),
-            blob_url,
-            status: ImageStatus::Ready,
-            created_at: Utc::now(),
-        })
-        .await
-        .map_err(BuildError::Persist)
     }
 
     /// Push a freshly-baked image (output of [`Self::build`]) to a

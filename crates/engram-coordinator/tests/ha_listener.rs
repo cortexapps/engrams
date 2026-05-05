@@ -106,11 +106,9 @@ async fn build_app_state(
     database_url: &str,
 ) -> Arc<engram_coordinator::AppState> {
     use engram_cloud_mock::MockCloud;
-    use engram_coordinator::image_registry::ImageRegistry;
     use engram_coordinator::{AppState, CoordinatorConfig, HostRegistry, Services};
 
     let work_dir = tempfile::tempdir().expect("work dir").keep();
-    let images_dir = tempfile::tempdir().expect("images dir").keep();
 
     let raw: Arc<dyn engram_core::traits::SandboxBackend> =
         Arc::new(engram_sandbox_process::ProcessBackend::new(work_dir));
@@ -126,7 +124,6 @@ async fn build_app_state(
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
         )),
-        images: ImageRegistry::new(images_dir),
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
