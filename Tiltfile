@@ -8,9 +8,8 @@
 #   └──────────────────────────────────────────────────┘
 #   ┌─ local processes ────────────────────────────────┐
 #   │  bootstrap          one-shot — writes KEK to .env │
-#   │  install-harnesses  one-shot — cross-compiles + pulls Claude │
-#   │  vz-codesign        one-shot — Mac only           │
-#   │  coordinator        cargo run, manual restart     │
+#   │  coordinator        cargo run (Linux) or          │
+#   │                     build+codesign+exec (Mac)     │
 #   │  web                pnpm dev, vite HMR in-process │
 #   └──────────────────────────────────────────────────┘
 #
@@ -125,17 +124,6 @@ local_resource('bootstrap',
     cmd='just bootstrap',
     labels=['setup'])
 
-if needs_codesign:
-    local_resource('vz-codesign',
-        cmd='just vz-codesign',
-        # Re-codesign after a coordinator-binary change so the
-        # entitlement sticks across rebuilds.
-        deps=[
-            'crates/engram-coordinator/src',
-            'crates/engram-sandbox-vz/src',
-        ],
-        labels=['setup'])
-
 # ----------------------------------------------------------------
 # Coordinator (cargo run, manual restart).
 #
@@ -145,6 +133,13 @@ if needs_codesign:
 # code changes — we don't auto-restart because losing warm-pool
 # state on every save during dev is more expensive than the
 # benefit of "edits are live".
+#
+# On macOS the build → codesign → exec sequence is atomic: cargo
+# rebuild produces fresh unsigned bytes, so codesign has to run
+# AFTER the build but BEFORE the exec. Splitting into separate Tilt
+# resources broke that ordering (codesign would run, then `cargo
+# run` would rebuild and overwrite the signature). Inlining keeps
+# the chain tight.
 # ----------------------------------------------------------------
 
 coord_env = {
@@ -161,14 +156,19 @@ coord_env = {
     'RUST_LOG': 'info,engram=debug',
 }
 
-coord_deps = ['postgres', 'registry', 'bootstrap']
 if needs_codesign:
-    coord_deps.append('vz-codesign')
+    coord_serve_cmd = (
+        'cargo build -p engram-coordinator && ' +
+        'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
+        'exec ./target/debug/engram-coordinator'
+    )
+else:
+    coord_serve_cmd = 'cargo run -p engram-coordinator'
 
 local_resource('coordinator',
-    serve_cmd='cargo run -p engram-coordinator',
+    serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    resource_deps=coord_deps,
+    resource_deps=['postgres', 'registry', 'bootstrap'],
     readiness_probe=probe(
         period_secs=2,
         timeout_secs=2,
@@ -207,6 +207,6 @@ local_resource('web',
     auto_init=True)
 
 # Resources are grouped in the Tilt UI by `labels` above:
-# infra (postgres, registry) → setup (bootstrap, harnesses, codesign)
-# → app (coordinator, web). Click any one to jump to its log stream
-# / readiness state / restart button.
+# infra (postgres, registry) → setup (bootstrap) → app (coordinator,
+# web). Click any one to jump to its log stream / readiness state /
+# restart button.
