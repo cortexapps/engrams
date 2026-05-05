@@ -92,18 +92,46 @@ impl Ext4Packer for Mke2fsPacker {
         dst_image: &Path,
         size_bytes: u64,
     ) -> Result<(), Ext4Error> {
+        // Atomic write: format into `<dst>.tmp` and rename on success.
+        // On any error path (missing binary, mke2fs failure, IO), the
+        // tmp file gets cleaned up so the next attempt starts fresh.
+        // Without this, a missing-binary failure leaves the
+        // preallocated zero-padded file at `dst_image`, which downstream
+        // cache-presence checks happily mistake for a built artifact —
+        // the VM then mounts a block of zeros as ext4 and the harness
+        // never appears.
+        let mut tmp = dst_image.to_path_buf();
+        tmp.as_mut_os_string().push(".tmp");
+
         // 1. Truncate / preallocate. mke2fs reads the file's size to
         //    decide how big to make the filesystem; we want exactly
         //    `size_bytes`.
-        let f = tokio::fs::File::create(dst_image).await?;
+        let f = tokio::fs::File::create(&tmp).await?;
         f.set_len(size_bytes).await?;
         drop(f);
 
-        // 2. Format + populate in one mke2fs call.
-        //    `-t ext4`   filesystem type
-        //    `-F`        force overwrite (file already exists)
-        //    `-d <dir>`  populate from this directory at create time
-        //    `-q`        quiet on stdout (errors still go to stderr)
+        // 2. Format + populate in one mke2fs call. Best-effort cleanup
+        //    of the tmp file on any failure path; ignore cleanup errors
+        //    since the original mke2fs error is what the caller cares
+        //    about.
+        let result = self.run_mke2fs(src_dir, &tmp).await;
+        if let Err(e) = result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+
+        // 3. Atomic rename. Only after this returns Ok does the cache
+        //    presence check on `dst_image` start returning true.
+        tokio::fs::rename(&tmp, dst_image).await?;
+        Ok(())
+    }
+}
+
+impl Mke2fsPacker {
+    /// Inner mke2fs invocation, factored out so the caller can wrap
+    /// the failure path in tmp-file cleanup without duplicating
+    /// argument construction.
+    async fn run_mke2fs(&self, src_dir: &Path, dst_image: &Path) -> Result<(), Ext4Error> {
         let output = tokio::process::Command::new(&self.bin)
             .arg("-t")
             .arg("ext4")

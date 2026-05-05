@@ -156,6 +156,15 @@ coord_env = {
     'RUST_LOG': 'info,engram=debug',
 }
 
+# `mke2fs` is keg-only under homebrew/e2fsprogs, so it isn't on the
+# default PATH on Apple Silicon. The host-agent's harness substrate
+# builder shells out to it, so the coordinator process needs it
+# resolvable. Mirror what `just bake` does and prepend the keg path.
+if 'Darwin' in uname_str:
+    coord_env['PATH'] = (
+        '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
+    )
+
 if needs_codesign:
     coord_serve_cmd = (
         'cargo build -p engram-coordinator && ' +
