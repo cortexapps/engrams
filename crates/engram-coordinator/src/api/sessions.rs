@@ -283,6 +283,18 @@ pub async fn create_session(
         }
     }
 
+    // The host-agent's `pooled_backend` reads this env hint to pick
+    // the substrate's mount-root subdir name. Without it, it falls
+    // back to the URI's last path segment (`harness-claude` for
+    // `localhost:5001/cortex/harness-claude:v1`) — but the in-VM
+    // bootstrap exec's `/run/engram/harnesses/<name>/harness` using
+    // the user-supplied harness name (`claude`), so the two paths
+    // diverge and the harness binary doesn't get found at boot. The
+    // env hint pins the host-agent to the canonical name.
+    if let HarnessSpec::Builtin { name } = &req.harness {
+        spec_env.insert("ENGRAM_SESSION_HARNESS_NAME".into(), name.clone());
+    }
+
     let agent_for_session = resolve_harness(
         &state,
         &req.harness,
