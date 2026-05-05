@@ -215,11 +215,11 @@ dev-firecracker: db-up registry-up bootstrap
     cargo run -p engram-coordinator
 
 # Build a harness pack and push it to the local OCI registry as
-# `localhost:5001/cortex/harness-<name>:<tag>`. The coordinator picks
-# it up at session-create time by way of the `harness_packs` Postgres
-# row (registered separately via `engram harness add`). After this
-# runs, `engram harness add --name <name> --registry-uri ...` makes
-# `engram session create --harness <name>` work end-to-end.
+# `localhost:5001/cortex/harness-<name>:<tag>`. **Registry-only** —
+# this recipe deliberately does NOT touch Postgres. After it
+# finishes, register the pack with the coordinator via the dashboard
+# (Settings → Harnesses) or `engram harness add --name <name>
+# --registry-uri ...`. Same separation as `just bake` for images.
 #
 # Cross-compiles the wrapper for aarch64-unknown-linux-musl on macOS
 # (VZ guests) and x86_64-unknown-linux-musl on Linux (FC guests) —
@@ -252,7 +252,7 @@ bake-harness NAME TAG="v1":
         chmod +x "$STAGE/claude" ; \
     fi ; \
     URI=localhost:5001/cortex/harness-{{NAME}}:{{TAG}} ; \
-    cargo run -p engram-cli -- harness add --name {{NAME}} --from "$STAGE" --push "$URI" ; \
+    cargo run -p engram-cli -- harness push --from "$STAGE" --to "$URI" ; \
     rm -rf "$STAGE"
 
 # Bake the canonical workspace image for Firecracker (Linux + KVM).

@@ -237,14 +237,27 @@ enum RegistryCmd {
 
 #[derive(Subcommand, Debug)]
 enum HarnessCmd {
-    /// Register a harness pack by name. Two modes:
-    ///
-    /// - `--from <local-dir> --push <uri>` — tar+gzip the directory,
-    ///   push it as an OCI artifact, then register `(name, uri)`.
-    ///   Symmetric with `engram image build --push`.
-    /// - `--registry-uri <uri>` — register an already-pushed pack
-    ///   (e.g. one your CI pipeline pushed via `oras`). The bytes
-    ///   must already exist at the URI.
+    /// Tar+gzip a local pack directory and push it as an OCI artifact
+    /// to the registry. Pure registry-side work — no Postgres write,
+    /// no coordinator API call. Symmetric with `engram image build
+    /// --push`. After the push, register the pack with the
+    /// coordinator via `engram harness add` (or the dashboard's
+    /// Settings → Harnesses panel).
+    Push {
+        /// Local directory containing the pack: at least an
+        /// executable `harness` entry-point, plus any sidecars the
+        /// wrapper exec's at runtime (bundled CLI binaries, etc.).
+        #[arg(long)]
+        from: PathBuf,
+        /// Destination OCI URI, e.g.
+        /// `localhost:5001/cortex/harness-claude:v1` or
+        /// `gcr.io/cortex/harness-claude:v1.2`.
+        #[arg(long)]
+        to: String,
+    },
+    /// Register an already-pushed harness pack with the coordinator.
+    /// POSTs to `/api/harnesses`; this is the only path that writes a
+    /// `harness_packs` row.
     ///
     /// Re-registering the same name updates the URI in place.
     Add {
@@ -252,26 +265,14 @@ enum HarnessCmd {
         /// `noop`). Must be unique.
         #[arg(long)]
         name: String,
-        /// Local directory containing the harness pack: at least an
-        /// executable `harness` entry-point, plus any sidecars the
-        /// wrapper exec's at runtime (bundled CLI binaries, etc.).
-        /// Required when using `--push`.
-        #[arg(long, requires = "push")]
-        from: Option<PathBuf>,
-        /// Push the local pack to this OCI URI before registering.
-        /// Conflicts with `--registry-uri` (use one or the other).
-        #[arg(long, conflicts_with = "registry_uri")]
-        push: Option<String>,
         /// Already-pushed OCI URI, e.g. `gcr.io/cortex/harness-claude:v1.2`.
-        /// Conflicts with `--push` / `--from`.
-        #[arg(long, conflicts_with_all = ["push", "from"])]
-        registry_uri: Option<String>,
+        #[arg(long)]
+        registry_uri: String,
         /// Optional one-line description for the dashboard dropdown.
         #[arg(long)]
         description: Option<String>,
     },
-    /// List registered harness packs. Falls through to the legacy
-    /// host-side scan when no rows exist.
+    /// List registered harness packs.
     List,
     /// Remove a harness-pack registration. Does not delete the
     /// artifact in the registry — only un-registers it from the
@@ -553,10 +554,9 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             RegistryCmd::Rm { host } => registry_rm(&client, &cli.endpoint, host).await,
         },
         Cmd::Harness { cmd } => match cmd {
+            HarnessCmd::Push { from, to } => harness_push(from, to).await,
             HarnessCmd::Add {
                 name,
-                from,
-                push,
                 registry_uri,
                 description,
             } => {
@@ -564,9 +564,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     &client,
                     &cli.endpoint,
                     name,
-                    from.as_deref(),
-                    push.as_deref(),
-                    registry_uri.as_deref(),
+                    registry_uri,
                     description.as_deref(),
                     cli.json,
                 )
@@ -1455,55 +1453,44 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
 
 // ---- harness subcommands ----------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+/// Tar+gzip a local pack directory and push it as an OCI artifact.
+/// Pure registry-side work — no API call, no Postgres write. Mirrors
+/// the `engram image build --push` shape so bake-and-register stay
+/// independent operations.
+///
+/// Anonymous push works for `localhost:5001` and public registries.
+/// For authenticated registries the user pre-runs `docker login` (or
+/// pushes via `oras`) — wiring `engram harness push` through the
+/// coordinator's encrypted creds resolver lands when that's
+/// genuinely needed.
+async fn harness_push(from: &Path, to: &str) -> Result<(), CliError> {
+    let oci = engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::AnonymousResolver));
+    tracing::info!(uri = %to, dir = %from.display(), "pushing harness pack");
+    let digest = oci
+        .push_harness(to, from)
+        .await
+        .map_err(|e| CliError::Other(format!("oci push: {e}")))?;
+    println!("✓ pushed {to}");
+    println!("  digest: {}", digest.as_str());
+    println!();
+    println!("  register it with the coordinator:");
+    println!("    engram harness add --name <name> --registry-uri {to}");
+    println!("  or in the dashboard:");
+    println!("    http://localhost:5173/settings/harnesses");
+    Ok(())
+}
+
 async fn harness_add(
     client: &reqwest::Client,
     endpoint: &str,
     name: &str,
-    from: Option<&Path>,
-    push: Option<&str>,
-    registry_uri: Option<&str>,
+    registry_uri: &str,
     description: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    // Resolve which URI ends up in `harness_packs.registry_uri`. Two
-    // paths: tar+push the local dir to `--push <uri>`, or skip the
-    // push and trust the caller to have already pushed to `--registry-uri`.
-    let final_uri: String = match (from, push, registry_uri) {
-        (Some(dir), Some(target), None) => {
-            // Anonymous push works for `localhost:5001` and public
-            // registries. Authenticated push goes through the
-            // coordinator's encrypted creds — implemented when the
-            // host-agent puller lands; for v1 the user pre-runs
-            // `docker login` or pushes via `oras` for non-public
-            // registries and uses `--registry-uri` instead.
-            let oci =
-                engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::AnonymousResolver));
-            let full_uri = if target.contains(':') {
-                target.to_string()
-            } else {
-                format!("{target}:{name}-latest")
-            };
-            tracing::info!(uri = %full_uri, dir = %dir.display(), "pushing harness pack");
-            let digest = oci
-                .push_harness(&full_uri, dir)
-                .await
-                .map_err(|e| CliError::Other(format!("oci push: {e}")))?;
-            tracing::info!(digest = %digest.as_str(), "harness pack pushed");
-            full_uri
-        }
-        (None, None, Some(uri)) => uri.to_string(),
-        (None, None, None) => {
-            return Err(CliError::Other(
-                "must supply either `--from <dir> --push <uri>` or `--registry-uri <uri>`".into(),
-            ));
-        }
-        _ => unreachable!("clap conflicts_with"),
-    };
-
     let mut body = serde_json::json!({
         "name": name,
-        "registry_uri": final_uri,
+        "registry_uri": registry_uri,
     });
     if let Some(d) = description {
         body["description"] = serde_json::Value::String(d.into());
