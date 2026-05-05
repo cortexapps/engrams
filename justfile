@@ -246,10 +246,19 @@ bake-harness NAME TAG="v1":
     cp -p "target/$TARGET/release/engram-harness-{{NAME}}" "$STAGE/harness" ; \
     if [ "{{NAME}}" = "claude" ]; then \
         CLAUDE_VERSION=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest) ; \
-        echo "downloading claude $CLAUDE_VERSION ($CLAUDE_PLAT) ..." ; \
-        curl -fsSL --retry 3 -o "$STAGE/claude" \
-            "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$CLAUDE_PLAT/claude" ; \
-        chmod +x "$STAGE/claude" ; \
+        CACHE_DIR="$HOME/.cache/engram-claude-cli/$CLAUDE_VERSION/$CLAUDE_PLAT" ; \
+        CACHED="$CACHE_DIR/claude" ; \
+        if [ -x "$CACHED" ]; then \
+            echo "using cached claude $CLAUDE_VERSION ($CLAUDE_PLAT) from $CACHED" ; \
+        else \
+            echo "downloading claude $CLAUDE_VERSION ($CLAUDE_PLAT) -> $CACHED ..." ; \
+            mkdir -p "$CACHE_DIR" ; \
+            curl -fsSL --retry 3 -o "$CACHED.tmp" \
+                "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$CLAUDE_PLAT/claude" ; \
+            chmod +x "$CACHED.tmp" ; \
+            mv "$CACHED.tmp" "$CACHED" ; \
+        fi ; \
+        cp -p "$CACHED" "$STAGE/claude" ; \
     fi ; \
     URI=localhost:5001/cortex/harness-{{NAME}}:{{TAG}} ; \
     cargo run -p engram-cli -- harness push --from "$STAGE" --to "$URI" ; \

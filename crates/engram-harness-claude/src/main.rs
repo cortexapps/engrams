@@ -6,9 +6,14 @@
 //! host pushes a `BootstrapLaunch` describing this binary.
 //!
 //! Strategy: child-per-prompt. Per `Prompt` command, spawn `claude
-//! --print --output-format stream-json [--resume <claude_id>]
-//! "<text>"`, parse stdout JSONL line-by-line, translate to
-//! `HarnessEvent`s, child exits, await next prompt.
+//! --print --output-format stream-json --dangerously-skip-permissions
+//! [--resume <claude_id>] "<text>"`, parse stdout JSONL line-by-line,
+//! translate to `HarnessEvent`s, child exits, await next prompt.
+//!
+//! `--dangerously-skip-permissions` is mandatory: there's no human in
+//! the VM to answer permission prompts, and `--print` mode aborts
+//! with exit 1 the first time a tool needs approval otherwise. The
+//! sandbox is the safety boundary, not Claude's per-tool consent.
 //!
 //! The first run captures Claude's auto-generated session id and
 //! stashes it in `/workspace/.engram/claude-session-id` so
@@ -75,8 +80,12 @@ mod adapter {
         pub session_id: SessionId,
 
         /// Cap on tool calls per run. Adapter logs and stops on
-        /// excess; hard cost backstop.
-        #[arg(long, default_value_t = 50)]
+        /// excess; hard cost backstop. Default is intentionally
+        /// permissive — the VM is the safety boundary, and a long
+        /// autonomous run can easily make thousands of tool calls
+        /// across a multi-hour task. Tighten per-deployment via
+        /// `--max-tool-calls` if you need a stricter ceiling.
+        #[arg(long, default_value_t = 100_000)]
         pub max_tool_calls: u32,
 
         /// Per-tool-call wall-clock cap (seconds). Reserved.
@@ -85,8 +94,11 @@ mod adapter {
 
         /// Whole-run wall-clock cap (seconds). After this the
         /// adapter SIGTERMs `claude` and emits
-        /// `RunCompleted{ok:false}`.
-        #[arg(long, default_value_t = 1800)]
+        /// `RunCompleted{ok:false}`. Default is 24h: an autonomous
+        /// agent in an isolated VM is expected to be able to grind
+        /// on a task for many hours without the wrapper killing it
+        /// out from under it. Tighten per-deployment if needed.
+        #[arg(long, default_value_t = 86_400)]
         pub max_run_secs: u64,
 
         /// Override the `claude` binary path. Default: the sidecar
@@ -410,6 +422,22 @@ mod adapter {
             .expect("claude_bin resolved at entry()");
         let mut child = match Command::new(claude_bin)
             .args(&argv)
+            // Long-run knobs for unattended Claude inside a VM.
+            // Bash defaults (2min default / 10min cap) silently
+            // kill long builds and tests; bump to 30min/2h. The
+            // nonessential-traffic toggle disables the autoupdater,
+            // bug-command, and telemetry background calls — the VM
+            // typically has no outbound to those endpoints anyway,
+            // and they cause spurious failures on long runs.
+            // `IS_SANDBOX=1` is the documented escape hatch for
+            // Claude's root-check: with --dangerously-skip-permissions
+            // the CLI otherwise refuses to start as root, which is
+            // exactly how it runs inside our VM. The VM itself is
+            // the security boundary.
+            .env("BASH_DEFAULT_TIMEOUT_MS", "1800000")
+            .env("BASH_MAX_TIMEOUT_MS", "7200000")
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("IS_SANDBOX", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -516,6 +544,11 @@ mod adapter {
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
+            // No human in the VM to approve tool calls; `--print`
+            // aborts with exit 1 the first time a tool needs
+            // approval otherwise. The VM itself is the safety
+            // boundary.
+            "--dangerously-skip-permissions".into(),
         ];
         if let Some(id) = resume_id {
             argv.push("--resume".into());
