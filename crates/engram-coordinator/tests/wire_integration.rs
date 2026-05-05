@@ -257,6 +257,21 @@ impl MetadataStore for MiniMeta {
         self.enabled.lock().remove(uri);
         Ok(())
     }
+    async fn upsert_session_secrets(
+        &self,
+        _: engram_core::types::SessionSecrets,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn get_session_secrets(
+        &self,
+        _: SessionId,
+    ) -> Result<Option<engram_core::types::SessionSecrets>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
 }
 
 /// Build an AppState whose services.sandbox routes through a HostRegistry

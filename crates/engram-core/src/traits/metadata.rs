@@ -4,7 +4,7 @@ use crate::error::MetaError;
 use crate::types::event::PersistedEvent;
 use crate::types::host::{HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
-use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential};
+use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential, SessionSecrets};
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
 
@@ -142,4 +142,19 @@ pub trait MetadataStore: Send + Sync {
     async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError>;
     async fn get_enabled_image(&self, image_uri: &str) -> Result<Option<EnabledImage>, MetaError>;
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
+
+    // ---- session secrets ----
+    //
+    // Per-request `secrets` overrides supplied at session-create,
+    // sealed under the deployment KEK. The resume path opens the
+    // sealed blob to rebuild the post-resume harness's launch env;
+    // without persistence the in-VM bootstrap respawns a Claude
+    // child with no OAuth token and the user gets re-prompted to
+    // log in.
+    async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError>;
+    async fn get_session_secrets(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionSecrets>, MetaError>;
+    async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError>;
 }

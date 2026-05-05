@@ -279,20 +279,33 @@ async fn resume_from_fc_snapshot(
     // can't notice (vsock reads on a half-open connection block
     // forever). A fresh BootstrapLaunch is the in-VM signal to
     // start clean. Resume omits ENGRAM_INITIAL_PROMPT so the
-    // adapter goes straight to Idle and waits for the next
-    // user prompt instead of replaying the original kickoff.
-    // TODO(secrets-on-resume): re-resolve the session's manifest +
-    // secret bundle here so the post-resume harness inherits the
-    // same env (incl. ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)
-    // it had at create. Today resume hands the harness an empty
-    // base env, so a `claude`-driven session won't reauth after
-    // an idle-evict. Tracked alongside `build_dev_agent`'s base_env
-    // arg, which was added when the create-time secret-delivery
-    // gap was fixed.
-    // `resolve_harness` reads from the host registry; no need to
-    // re-load the image manifest here.
-    let resume_base_env: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // adapter goes straight to Idle and waits for the next user
+    // prompt instead of replaying the original kickoff.
+    //
+    // The base env starts from the per-request `secrets` map sealed
+    // at create time (e.g. CLAUDE_CODE_OAUTH_TOKEN); if the row
+    // doesn't exist (no overrides were submitted, or the session
+    // pre-dates session-secret persistence) we fall back to an
+    // empty map and the harness boots without that env. The
+    // ENGRAM_SESSION_HARNESS_NAME hint that the host-agent reads
+    // for substrate naming is recomputed downstream by
+    // `resolve_harness`.
+    //
+    // TODO(secrets-on-resume-manifest): also re-resolve the image's
+    // manifest-declared `[secrets.*]` schema here via SecretStore.
+    // Today only the per-request override map round-trips.
+    let resume_base_env = match crate::api::sessions::load_session_secrets(&state, id).await {
+        Ok(Some(map)) => map,
+        Ok(None) => std::collections::HashMap::new(),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "load_session_secrets failed; resume continues with empty secret env",
+            );
+            std::collections::HashMap::new()
+        }
+    };
     let agent_opt =
         crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
             .ok()

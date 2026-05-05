@@ -13,7 +13,7 @@ use engram_core::traits::MetadataStore;
 use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 use engram_core::types::{
     EnabledImage, HarnessPack, HostRecord, HostStatus, PersistedEvent, RegistryCredential, Session,
-    SessionSpec, SessionStatus, SnapshotRecord,
+    SessionSecrets, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -694,6 +694,62 @@ impl MetadataStore for PostgresStore {
         if res.rows_affected() == 0 {
             return Err(MetaError::NotFound);
         }
+        Ok(())
+    }
+
+    async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO session_secrets
+                (session_id, wrapped_dek, nonce, ciphertext, key_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (session_id) DO UPDATE SET
+                wrapped_dek = EXCLUDED.wrapped_dek,
+                nonce       = EXCLUDED.nonce,
+                ciphertext  = EXCLUDED.ciphertext,
+                key_id      = EXCLUDED.key_id,
+                created_at  = EXCLUDED.created_at
+            "#,
+        )
+        .bind(secrets.session_id.as_uuid())
+        .bind(&secrets.wrapped_dek)
+        .bind(&secrets.nonce)
+        .bind(&secrets.ciphertext)
+        .bind(&secrets.key_id)
+        .bind(secrets.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_secrets(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionSecrets>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT session_id, wrapped_dek, nonce, ciphertext, key_id, created_at
+            FROM session_secrets
+            WHERE session_id = $1
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::session_secrets_from_row(&r)).transpose()
+    }
+
+    async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM session_secrets WHERE session_id = $1")
+            .bind(session_id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        // Idempotent: missing row is fine. Caller deletes on
+        // session-terminate; if there were never overrides, no row
+        // ever existed.
         Ok(())
     }
 }

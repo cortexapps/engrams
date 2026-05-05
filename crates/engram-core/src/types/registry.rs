@@ -145,6 +145,31 @@ pub struct HarnessPack {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// One row in `session_secrets`: the per-request `secrets` map a
+/// dashboard / CLI client supplied at session-create time, sealed
+/// under the deployment KEK so resume can put the same env back on
+/// the post-resume harness child. The plaintext is a JSON-encoded
+/// `HashMap<String, String>`; the ciphertext is AES-GCM, with the
+/// DEK wrapped via the KEK (same shape as `registry_credentials`).
+///
+/// Lifetime: written once at session-create when overrides are
+/// supplied, read once per resume, deleted via the table's
+/// `ON DELETE CASCADE` on `sessions(id)`. The coordinator never
+/// echoes the row in any list endpoint.
+#[derive(Clone, Debug)]
+pub struct SessionSecrets {
+    pub session_id: crate::SessionId,
+    pub wrapped_dek: Vec<u8>,
+    /// 12-byte AES-GCM nonce, stored as `bytea`. The crypto crate's
+    /// `SealedCred` types this as `[u8; 12]`; the trait surface uses
+    /// `Vec<u8>` for trivial DB round-tripping and the conversion
+    /// happens at the call sites.
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub key_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// One row in `enabled_images`. The manifest content is fetched
 /// from the registry at enable time and stored on the row, so
 /// session-create has zero network dependency on the manifest path

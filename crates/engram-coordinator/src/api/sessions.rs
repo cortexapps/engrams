@@ -105,6 +105,67 @@ fn short_hash(s: &str) -> String {
     format!("{:08x}", h.finish() & 0xffff_ffff)
 }
 
+/// Seal the per-request `secrets` overrides under the deployment KEK
+/// and persist them keyed by `session_id`. Plaintext is JSON-encoded.
+/// Caller is expected to have validated `overrides` is non-empty.
+pub(crate) async fn persist_session_secrets(
+    state: &SharedState,
+    session_id: SessionId,
+    overrides: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    let plaintext = serde_json::to_vec(overrides)
+        .map_err(|e| ApiError::Internal(format!("serialize session secrets: {e}")))?;
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let sealed = cipher
+        .seal(&plaintext)
+        .await
+        .map_err(|e| ApiError::Internal(format!("seal session secrets: {e}")))?;
+    let row = engram_core::types::registry::SessionSecrets {
+        session_id,
+        wrapped_dek: sealed.wrapped_dek,
+        nonce: sealed.nonce.to_vec(),
+        ciphertext: sealed.ciphertext,
+        key_id: sealed.key_id,
+        created_at: chrono::Utc::now(),
+    };
+    state.services.meta.upsert_session_secrets(row).await?;
+    Ok(())
+}
+
+/// Reverse of [`persist_session_secrets`]: fetch the sealed row,
+/// open it under the deployment KEK, and return the original
+/// `(name, value)` map. `Ok(None)` when no row exists (the session
+/// either had no overrides at create or was created before this
+/// persistence path landed).
+pub(crate) async fn load_session_secrets(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Result<Option<HashMap<String, String>>, ApiError> {
+    let row = state.services.meta.get_session_secrets(session_id).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let nonce: [u8; 12] = row
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| ApiError::Internal("session_secrets.nonce wrong length".into()))?;
+    let sealed = engram_crypto::SealedCred {
+        wrapped_dek: row.wrapped_dek,
+        nonce,
+        ciphertext: row.ciphertext,
+        key_id: row.key_id,
+    };
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let plaintext = cipher
+        .open(&sealed)
+        .await
+        .map_err(|e| ApiError::Internal(format!("open session secrets: {e}")))?;
+    let map: HashMap<String, String> = serde_json::from_slice(&plaintext)
+        .map_err(|e| ApiError::Internal(format!("deserialize session secrets: {e}")))?;
+    Ok(Some(map))
+}
+
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
     /// Which baked image to boot. Required.
@@ -279,6 +340,22 @@ pub async fn create_session(
         if let Some(overrides) = req.secrets.as_ref() {
             for (name, value) in overrides {
                 spec_env.insert(name.clone(), value.clone());
+            }
+            // Persist the overrides sealed under the deployment KEK so
+            // resume can rebuild the post-resume harness's launch env.
+            // Without this, an idle-then-active transition (auto-
+            // resume on the next prompt) respawns the harness child
+            // with no secret env — Claude prompts the user to log in
+            // again. Skipped when overrides is empty so we don't
+            // create empty rows.
+            if !overrides.is_empty() {
+                if let Err(e) = persist_session_secrets(&state, session_id, overrides).await {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "session secrets persistence failed; resume will lose secrets",
+                    );
+                }
             }
         }
     }

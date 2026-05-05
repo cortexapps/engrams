@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
 use engram_core::types::{
     EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionStatus, SnapshotRecord,
+    RegistryCredential, Session, SessionSecrets, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
@@ -151,6 +151,19 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         last_refreshed_at,
         created_at,
         updated_at,
+    })
+}
+
+pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, MetaError> {
+    let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
+    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
+    Ok(SessionSecrets {
+        session_id: SessionId(session_id),
+        wrapped_dek: row.try_get("wrapped_dek").map_err(col_err)?,
+        nonce: row.try_get("nonce").map_err(col_err)?,
+        ciphertext: row.try_get("ciphertext").map_err(col_err)?,
+        key_id: row.try_get("key_id").map_err(col_err)?,
+        created_at,
     })
 }
 
