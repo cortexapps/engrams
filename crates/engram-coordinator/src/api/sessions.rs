@@ -478,19 +478,6 @@ pub async fn create_session(
 
     // -------- 7. Start the agent (if any) --------
     if let Some(agent) = agent_for_session {
-        // Log the env keys (NOT values — secrets pass through here)
-        // sent to bootstrap so a missing var is debuggable without
-        // attaching to the in-VM process. The keys are non-secret
-        // (CLAUDE_CODE_OAUTH_TOKEN as a name is well-known); the
-        // *values* never reach this log.
-        let env_keys: Vec<&str> = agent.env.keys().map(String::as_str).collect();
-        tracing::info!(
-            sandbox_id = %sandbox_id,
-            session_id = %session_id,
-            argc = agent.argv.len(),
-            env_keys = ?env_keys,
-            "start_agent: dispatching to backend",
-        );
         if let Err(e) = state.services.sandbox.start_agent(sandbox_id, agent).await {
             let _ = state
                 .services

@@ -442,15 +442,13 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    tracing::info!("hub: awaiting attach from harness");
     let attach: HarnessAttach = match read_msg(&mut reader).await {
         Ok(a) => a,
         Err(e) => {
-            tracing::warn!(error = %e, "harness handshake read failed (no session bound)");
+            tracing::debug!(error = %e, "harness handshake read failed (no session bound)");
             return;
         }
     };
-    tracing::info!(session_id = %attach.session_id, "hub: attach received; looking up sandbox");
     let bound = {
         // Scope the guard so it drops before the AsyncWrite below.
         // parking_lot guards aren't Send, and the writer may be
