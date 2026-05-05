@@ -287,6 +287,7 @@ impl ConsoleBridge {
 
         if let Some(fds) = by_port.remove(&PORT_HARNESS) {
             if let Some(sink) = harness_sink {
+                tracing::info!(port = PORT_HARNESS, "vz console: harness pump starting");
                 tasks.push(tokio::spawn(guest_initiated_pump(fds, Arc::new(sink))));
             } else {
                 tracing::warn!("no harness sink registered; dropping port {PORT_HARNESS} pipes");
@@ -423,12 +424,21 @@ async fn guest_initiated_pump(fds: HostPortFds, sink: Arc<HarnessSink>) {
     let (sink_half, vz_half) = tokio::io::duplex(64 * 1024);
     let stream: HarnessByteStream = Box::pin(sink_half);
     sink(stream);
+    tracing::info!("vz console: harness sink installed; pumping bytes");
 
     let (mut v_r, mut v_w) = tokio::io::split(vz_half);
     let (mut p_r, mut p_w) = (reader, writer);
+    let g_to_h = async {
+        let n = tokio::io::copy(&mut p_r, &mut v_w).await;
+        tracing::info!(?n, "vz console: harness pump guest→host ended");
+    };
+    let h_to_g = async {
+        let n = tokio::io::copy(&mut v_r, &mut p_w).await;
+        tracing::info!(?n, "vz console: harness pump host→guest ended");
+    };
     tokio::select! {
-        _ = tokio::io::copy(&mut v_r, &mut p_w) => {},
-        _ = tokio::io::copy(&mut p_r, &mut v_w) => {},
+        _ = g_to_h => {},
+        _ = h_to_g => {},
     }
 }
 
