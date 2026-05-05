@@ -372,6 +372,41 @@ impl SandboxBackend for VzBackend {
                 }
             }
         };
+
+        // Wait for bootstrap to write the readiness byte before
+        // sending the launch. The UDS dial returns the moment the
+        // host pump's UnixListener accepts (which happens at
+        // VM-config time, well before the guest is even booted), so
+        // a write at that point would race the guest port being
+        // opened — on VZ's virtio-console path those early bytes get
+        // dropped. Reading the marker first turns this into an
+        // ordering guarantee: bootstrap accepted → wrote → we read,
+        // so its read pump is definitely consuming.
+        use tokio::io::AsyncReadExt;
+        let mut marker = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut marker)).await {
+            Ok(Ok(_)) => {
+                if marker[0] != engram_harness_proto::BOOTSTRAP_READY_BYTE {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        got = marker[0],
+                        "vz start_agent: unexpected bootstrap marker; proceeding anyway"
+                    );
+                }
+                tracing::debug!(sandbox_id = %id, "vz start_agent: bootstrap ready");
+            }
+            Ok(Err(e)) => {
+                return Err(SandboxError::Vm(
+                    format!("read bootstrap ready marker: {e}").into(),
+                ));
+            }
+            Err(_) => {
+                return Err(SandboxError::Vm(
+                    "timed out waiting for bootstrap ready marker (15s)".into(),
+                ));
+            }
+        }
+
         let launch = engram_harness_proto::BootstrapLaunch {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),

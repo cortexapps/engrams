@@ -51,6 +51,17 @@ pub const HARNESS_VSOCK_PORT: u32 = 1026;
 /// `CONNECT 1025\n` to `<vsock_uds>`).
 pub const BOOTSTRAP_VSOCK_PORT: u32 = 1025;
 
+/// Single-byte readiness marker the in-VM bootstrap supervisor writes
+/// to its accepted stream before reading the [`BootstrapLaunch`]
+/// frame. The host's `start_agent` reads this byte first, then writes
+/// the launch — guaranteeing the guest is actually consuming bytes
+/// when the launch arrives. On virtio-console (VZ), the host's UDS
+/// pump accepts a dial immediately (the listener is bound at VM-
+/// config time), but bytes the host writes before the guest's port
+/// is open get dropped by VZ rather than queued. The byte's value
+/// is arbitrary; the host just checks for "one byte received".
+pub const BOOTSTRAP_READY_BYTE: u8 = 0xEB;
+
 /// Wire shape for the bootstrap-launch frame. The host sends this
 /// once after CONNECTing to [`BOOTSTRAP_VSOCK_PORT`]; bootstrap reads
 /// it, prepares the env, and `exec`s `argv[0]` with the rest as

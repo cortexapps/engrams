@@ -97,6 +97,24 @@ async fn main() -> ExitCode {
         };
         tracing::debug!("accepted host bootstrap connection");
 
+        // Tiny readiness handshake: write a single byte to the host
+        // the moment we open this stream. Without it the host's
+        // start_agent would race the cold-boot bootstrap startup —
+        // on virtio-console (VZ) the host's BootstrapLaunch frame
+        // can arrive before the guest's port is opened, and the
+        // bytes get dropped on the floor (VZ doesn't replay buffered
+        // writes when the guest's port comes up). The host's
+        // start_agent reads this byte before writing the launch
+        // frame, guaranteeing we're ready to consume it.
+        use tokio::io::AsyncWriteExt;
+        if let Err(e) = stream
+            .write_all(&[engram_harness_proto::BOOTSTRAP_READY_BYTE])
+            .await
+        {
+            tracing::warn!(error = %e, "writing bootstrap ready byte failed");
+            continue 'accept;
+        }
+
         // Inner loop: read frames off this stream until EOF. For
         // vsock we typically see one frame per stream then EOF
         // (host closes after writing); for virtio-console the host

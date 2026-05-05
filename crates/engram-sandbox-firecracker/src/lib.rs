@@ -1316,6 +1316,35 @@ impl SandboxBackend for FirecrackerBackend {
             }
         };
 
+        // Wait for bootstrap's readiness marker before writing the
+        // launch. See vz/backend.rs::start_agent for why — same race
+        // shape, slightly different surface (vsock here, virtio-
+        // console there). The marker is a one-byte write bootstrap
+        // does immediately after `listener.accept()` returns.
+        use tokio::io::AsyncReadExt;
+        let mut marker = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut marker)).await {
+            Ok(Ok(_)) => {
+                if marker[0] != engram_harness_proto::BOOTSTRAP_READY_BYTE {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        got = marker[0],
+                        "fc start_agent: unexpected bootstrap marker; proceeding anyway"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                return Err(SandboxError::Vm(
+                    format!("read bootstrap ready marker: {e}").into(),
+                ));
+            }
+            Err(_) => {
+                return Err(SandboxError::Vm(
+                    "timed out waiting for bootstrap ready marker (15s)".into(),
+                ));
+            }
+        }
+
         // Push the BootstrapLaunch frame. The in-guest bootstrap
         // is a long-running supervisor that loops on accept, so a
         // call here also covers post-resume re-launch (the
