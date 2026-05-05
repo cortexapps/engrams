@@ -37,3 +37,4 @@ result-*
 
 # personal Claude Code skills + dev-vm scripts (local-only)
 /.claude/
+.playwright-mcp/
