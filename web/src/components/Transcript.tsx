@@ -60,6 +60,23 @@ export function Transcript({ events }: TranscriptProps) {
     }
   }
 
+  // Only render the *trailing* idle marker. An "awaiting prompt" sitting
+  // mid-history adds nothing — the user has already responded, so the
+  // event log keeps it for forensics but the transcript doesn't show it.
+  // The trailing idle is the last idle block with no later message /
+  // tool / run-start (run-end blocks render as null and don't count).
+  let trailingIdleKey: string | null = null;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const k = blocks[i]!.kind;
+    if (k === 'idle') {
+      trailingIdleKey = blocks[i]!.key;
+      break;
+    }
+    if (k === 'message' || k === 'tool' || k === 'run-start') {
+      break;
+    }
+  }
+
   return (
     <div className="space-y-1">
       {blocks.map((b) => {
@@ -70,6 +87,7 @@ export function Transcript({ events }: TranscriptProps) {
             // Soft separator — the next RunBoundary will draw the rule.
             return null;
           case 'idle':
+            if (b.key !== trailingIdleKey) return null;
             return <IdleMarker key={b.key} />;
           case 'tool':
             return (
