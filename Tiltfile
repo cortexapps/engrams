@@ -178,10 +178,22 @@ local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
     resource_deps=['postgres', 'registry', 'bootstrap'],
+    # Tilt's HTTP probe opens a fresh loopback TCP connection per
+    # tick AND issues an HTTP request that makes the server log it.
+    # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
+    # against an ephemeral range of ~16k ports, and the kernel's
+    # TIME_WAIT GC is lazy enough that a steady probe rate piles up
+    # faster than it drains. Once the pool is full, `connect()`
+    # starts returning EAGAIN ("resource temporarily unavailable")
+    # and the probe enters a self-perpetuating failure mode that
+    # also breaks every other connect to the same port. tcp_socket
+    # is the cheapest probe Tilt offers — still one connect per
+    # tick, but at period_secs=30 the steady-state TW count is
+    # bounded at ~1 per service, well under the threshold.
     readiness_probe=probe(
-        period_secs=2,
+        period_secs=30,
         timeout_secs=2,
-        http_get=http_get_action(port=8090, path='/healthz'),
+        tcp_socket=tcp_socket_action(port=8090),
     ),
     links=[
         link('http://127.0.0.1:8090/healthz', 'healthz'),
@@ -202,10 +214,12 @@ local_resource('coordinator',
 local_resource('web',
     serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
     resource_deps=['coordinator'],
+    # See the coordinator probe above — same loopback port-pool
+    # constraint applies to vite.
     readiness_probe=probe(
-        period_secs=2,
+        period_secs=30,
         timeout_secs=2,
-        http_get=http_get_action(port=5173, path='/'),
+        tcp_socket=tcp_socket_action(port=5173),
     ),
     links=[
         link('http://localhost:5173/', 'overview'),
