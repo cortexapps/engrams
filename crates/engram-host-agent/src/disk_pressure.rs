@@ -62,23 +62,31 @@ impl Default for DiskPressureConfig {
 /// helper rather than a method so the call site (coord main.rs)
 /// stays narrow.
 pub fn config_from_env() -> DiskPressureConfig {
+    config_from(|k| std::env::var(k).ok())
+}
+
+/// Generic over the lookup so tests can pass a deterministic map
+/// instead of mutating process-global env. Two #[test]s used to race
+/// on `ENGRAM_DISK_PRESSURE_THRESHOLD_PCT` under cargo's parallel
+/// runner; this seam removes the shared state entirely.
+fn config_from(get: impl Fn(&str) -> Option<String>) -> DiskPressureConfig {
     let mut cfg = DiskPressureConfig::default();
-    if let Ok(s) = std::env::var("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT") {
+    if let Some(s) = get("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT") {
         if let Ok(v) = s.parse::<u8>() {
             cfg.threshold_pct = v.min(99);
         }
     }
-    if let Ok(s) = std::env::var("ENGRAM_DISK_PRESSURE_HYSTERESIS_PCT") {
+    if let Some(s) = get("ENGRAM_DISK_PRESSURE_HYSTERESIS_PCT") {
         if let Ok(v) = s.parse::<u8>() {
             cfg.hysteresis_pct = v.min(50);
         }
     }
-    if let Ok(s) = std::env::var("ENGRAM_DISK_PRESSURE_POLL_SECS") {
+    if let Some(s) = get("ENGRAM_DISK_PRESSURE_POLL_SECS") {
         if let Ok(v) = s.parse::<u64>() {
             cfg.poll_interval = Duration::from_secs(v.max(5));
         }
     }
-    if let Ok(s) = std::env::var("ENGRAM_DISK_PRESSURE_MAX_FLUSHES") {
+    if let Some(s) = get("ENGRAM_DISK_PRESSURE_MAX_FLUSHES") {
         if let Ok(v) = s.parse::<usize>() {
             cfg.max_flushes_per_tick = v.max(1);
         }
@@ -318,36 +326,54 @@ fn free_pct(_path: &Path) -> Result<f64, DetectorError> {
 mod tests {
     use super::*;
 
+    /// Build a getter from key/value pairs so tests get deterministic,
+    /// per-test maps instead of fighting cargo's parallel runner over
+    /// `ENGRAM_DISK_PRESSURE_*` env vars.
+    fn map_get<'a>(
+        pairs: &'a [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
     #[test]
     fn config_from_env_picks_up_overrides() {
-        // Wrap in serial-style env mutations so `cargo test` parallel
-        // execution doesn't trip on shared process state. We only
-        // touch one env key per assertion + clear at the end.
-        std::env::set_var("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT", "20");
-        std::env::set_var("ENGRAM_DISK_PRESSURE_HYSTERESIS_PCT", "8");
-        std::env::set_var("ENGRAM_DISK_PRESSURE_POLL_SECS", "60");
-        std::env::set_var("ENGRAM_DISK_PRESSURE_MAX_FLUSHES", "2");
-        let cfg = config_from_env();
+        let cfg = config_from(map_get(&[
+            ("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT", "20"),
+            ("ENGRAM_DISK_PRESSURE_HYSTERESIS_PCT", "8"),
+            ("ENGRAM_DISK_PRESSURE_POLL_SECS", "60"),
+            ("ENGRAM_DISK_PRESSURE_MAX_FLUSHES", "2"),
+        ]));
         assert_eq!(cfg.threshold_pct, 20);
         assert_eq!(cfg.hysteresis_pct, 8);
         assert_eq!(cfg.poll_interval.as_secs(), 60);
         assert_eq!(cfg.max_flushes_per_tick, 2);
-        std::env::remove_var("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT");
-        std::env::remove_var("ENGRAM_DISK_PRESSURE_HYSTERESIS_PCT");
-        std::env::remove_var("ENGRAM_DISK_PRESSURE_POLL_SECS");
-        std::env::remove_var("ENGRAM_DISK_PRESSURE_MAX_FLUSHES");
     }
 
     #[test]
     fn config_caps_threshold_at_99() {
-        std::env::set_var("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT", "200");
-        let cfg = config_from_env();
+        let cfg = config_from(map_get(&[("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT", "200")]));
         assert!(
             cfg.threshold_pct <= 99,
             "threshold_pct must be capped: got {}",
             cfg.threshold_pct
         );
-        std::env::remove_var("ENGRAM_DISK_PRESSURE_THRESHOLD_PCT");
+    }
+
+    #[test]
+    fn config_falls_back_to_defaults_when_env_missing() {
+        // Empty map → defaults all the way through. Belt-and-braces
+        // for the parallel-runner refactor: pin defaults explicitly.
+        let cfg = config_from(map_get(&[]));
+        let default = DiskPressureConfig::default();
+        assert_eq!(cfg.threshold_pct, default.threshold_pct);
+        assert_eq!(cfg.hysteresis_pct, default.hysteresis_pct);
+        assert_eq!(cfg.poll_interval, default.poll_interval);
+        assert_eq!(cfg.max_flushes_per_tick, default.max_flushes_per_tick);
     }
 
     #[test]
