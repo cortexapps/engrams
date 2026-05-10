@@ -1,16 +1,74 @@
 version: 2
 
-# Keep GitHub Actions versions current. Floating tags (`@v4`) are
-# convenient but invisible — when a major version ships a breaking
-# change we want a PR with the diff, not silent drift. Weekly cadence
-# matches how often new action versions actually ship.
+# Cadence: weekly across the board.
+#   - Daily creates PR fatigue; monthly misses security windows.
+#   - GitHub Security Advisories ship out-of-band regardless of cadence,
+#     so this is purely about how often *non-security* upgrades land.
+#
+# Grouping strategy:
+#   - Minor + patch bumps are grouped into one rollup PR per ecosystem,
+#     because individually they're rarely interesting to review.
+#   - Major bumps fall *outside* the group and arrive as individual PRs,
+#     because that's where breaking changes hide and the review needs
+#     to happen one crate / package / image at a time.
+
 updates:
+  # GitHub Actions ----------------------------------------------------------
+  # Floating tags (`@v4`) are convenient but invisible — when a major
+  # version ships a breaking change we want a PR with the diff, not
+  # silent drift.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
     groups:
-      # One rollup PR per week instead of N PRs across actions.
       actions:
+        patterns: ["*"]
+
+  # Rust workspace ----------------------------------------------------------
+  # One entry covers every Cargo.toml under the workspace root.
+  # Add explicit `ignore` entries below only when a crate is pinned for a
+  # known reason (MSRV, vendored fork, blocked on upstream PR) — and
+  # leave a comment so future-us knows when to revisit.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Frontend (pnpm) ---------------------------------------------------------
+  # Dependabot reads pnpm-lock.yaml directly via the `npm` ecosystem.
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(web)"
+      include: "scope"
+    groups:
+      web-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Container base images --------------------------------------------------
+  # Matched by case-insensitive substring "dockerfile", so the
+  # `<service>.Dockerfile` files in this directory are picked up.
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      docker-base:
         patterns: ["*"]
