@@ -27,10 +27,10 @@ cargo build \
   --release
 
 case "${1:-all}" in
-  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|harness_loopback|host_startup|proxy_e2e)
-    # proxy_e2e + host_startup need root for TAP/iptables. Detect
-    # and re-exec via sudo when not already root.
-    if [ "$1" = "proxy_e2e" ] || [ "$1" = "host_startup" ]; then
+  boot|lifecycle|snapshot|snapshot_uffd|cold_tier|exec_real_vm|harness_loopback|snapshot_net|host_startup|proxy_e2e)
+    # snapshot_net + proxy_e2e + host_startup need root for TAP/iptables.
+    # Detect and re-exec via sudo when not already root.
+    if [ "$1" = "proxy_e2e" ] || [ "$1" = "host_startup" ] || [ "$1" = "snapshot_net" ]; then
       if [ "$(id -u)" -ne 0 ]; then
         exec sudo -E env "PATH=$PATH" cargo test -p engram-sandbox-firecracker --test "$1" -- --ignored --nocapture --test-threads=1
       fi
@@ -42,11 +42,12 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test lifecycle         -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test snapshot          -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test snapshot_uffd     -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test cold_tier         -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test exec_real_vm      -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test harness_loopback  -- --ignored --nocapture
     ;;
   *)
-    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|harness_loopback|all]" >&2
+    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|cold_tier|exec_real_vm|harness_loopback|snapshot_net|host_startup|proxy_e2e|all]" >&2
     exit 2
     ;;
 esac
