@@ -11,8 +11,8 @@
 //! | `PUT`   | `/machine-config`          | configure on create               |
 //! | `PUT`   | `/boot-source`             | configure on create               |
 //! | `PUT`   | `/drives/{id}`             | attach rootfs / scratch disks     |
-//! | `PUT`   | `/network-interfaces/{id}` | attach TAP (Phase 2 step 2)       |
-//! | `PUT`   | `/vsock`                   | attach virtio-vsock (Phase 2 s2)  |
+//! | `PUT`   | `/network-interfaces/{id}` | attach TAP                        |
+//! | `PUT`   | `/vsock`                   | attach virtio-vsock               |
 //! | `PUT`   | `/actions`                 | `InstanceStart`, `SendCtrlAltDel` |
 //! | `PATCH` | `/vm`                      | `Paused` / `Resumed` (snapshots)  |
 //! | `PUT`   | `/snapshot/create`         | take a Full or Diff snapshot      |

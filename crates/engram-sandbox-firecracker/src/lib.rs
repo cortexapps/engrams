@@ -67,9 +67,6 @@
 //!   `userfaultfd` on the guest's memory region. Resume returns
 //!   immediately; pages stream in lazily on guest fault. This is the
 //!   load-bearing economic of the snapshot-evict mechanic.
-//!
-//! Both are explicit non-goals of this stub — they land with the Phase
-//! 2 implementation. See `DESIGN.md` for the full plan.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -552,9 +549,9 @@ impl FirecrackerBackend {
         jail_dir: &Path,
         spec: SandboxSpec,
     ) -> Result<(), SandboxError> {
-        // Validate the spec carries a usable rootfs. Today we only
-        // accept an ext4 image; a directory rootfs would need to be
-        // packed into ext4 first (image-builder's Phase 2 work).
+        // Validate the spec carries a usable rootfs. We only accept an
+        // ext4 image; a directory rootfs would need to be packed into
+        // ext4 first by the image-builder.
         let rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
                 "FirecrackerBackend.create requires rootfs_source pointing at an ext4 image".into(),
@@ -1095,13 +1092,6 @@ async fn read_tail(path: &Path, max: u64) -> Option<String> {
 #[async_trait]
 impl SandboxBackend for FirecrackerBackend {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        // Phase 4 Track A wired the harness protocol. The
-        // Firecracker path for spawning the in-VM harness adapter
-        // (`engram-bootstrap` reading argv from a file dropped into
-        // the rootfs at create-time) lands with Phase 5's image-baker
-        // changes. Until then, the trait-default `start_agent`
-        // errors with `InvalidSpec` — production sessions don't yet
-        // declare an agent and dev sessions use ProcessBackend.
         let sandbox_id = SandboxId::new();
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
 
