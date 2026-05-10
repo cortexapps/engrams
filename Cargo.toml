@@ -79,7 +79,7 @@ bytes = "1"
 pin-project-lite = "0.2"
 
 # wire codecs
-bincode = "1.3"
+bincode = "3.0"
 
 # http / api
 axum = { version = "0.7", features = ["macros", "ws"] }
