@@ -12,7 +12,13 @@
 set -euo pipefail
 
 EMULATOR="${STORAGE_EMULATOR_HOST:-http://localhost:4443}"
-BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}"
+# Honor either env var so the script works in both contexts:
+#   - Local dev (Tiltfile): sets `ENGRAM_GCS_BUCKET` (the coordinator's
+#     production env var name).
+#   - CI / live tests: set `ENGRAM_TEST_GCS_BUCKET` (the round-trip
+#     test's gating var; deliberately distinct from the prod name so
+#     a misconfigured prod env var doesn't quietly hit a test bucket).
+BUCKET="${ENGRAM_GCS_BUCKET:-${ENGRAM_TEST_GCS_BUCKET:-engram-snapshots-test}}"
 
 # Wait briefly for the emulator to come up. Tilt's resource_deps
 # already gates this script behind the fake-gcs-server container, but

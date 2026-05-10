@@ -100,6 +100,12 @@ jobs:
       # `store.migrate()` themselves before exercising NOTIFY/LISTEN,
       # so a bare Postgres without engram migrations is fine.
       ENGRAM_TEST_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
+      # ADR 0005: the GCS round-trip test in engram-storage-gcs is
+      # gated on these env vars (so it no-ops on hosts without the
+      # emulator). Setting them at the job level so every nextest
+      # invocation in this job exercises the real SDK→emulator path.
+      STORAGE_EMULATOR_HOST: http://localhost:4443
+      ENGRAM_TEST_GCS_BUCKET: engram-snapshots-test
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -107,10 +113,31 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      # GCS emulator for the cold-tier round-trip test. We can't use
+      # `services:` here because github actions service containers
+      # don't let us override the image's CMD — fake-gcs-server's
+      # default uses HTTPS + a host we can't reach. Plain `docker run`
+      # gives us the full CLI surface; mirrors what
+      # `deploy/docker-compose.dev.yml` runs locally.
+      - name: Start fake-gcs-server
+        run: |
+          docker run -d --name fake-gcs-server \
+            -p 4443:4443 \
+            fsouza/fake-gcs-server:1.54.0 \
+            -scheme http -host 0.0.0.0 -port 4443 \
+            -public-host localhost:4443
+
+      # Wait for the emulator to come up + seed the test bucket.
+      # Mirrors `deploy/dev/seed-buckets.sh` exactly so the local +
+      # CI paths share one source of truth.
+      - name: Seed GCS test bucket
+        run: bash deploy/dev/seed-buckets.sh
+
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
       # engram-image-builder e2e bake test skips itself if `docker` is
-      # not on PATH; ubuntu-latest ships Docker, so it runs.
+      # not on PATH; ubuntu-latest ships Docker, so it runs. The
+      # GCS-emulator round-trip uses STORAGE_EMULATOR_HOST set above.
       #
       # `--no-fail-fast` reports every failing test instead of stopping
       # at the first; `if: always()` keeps the doctests + ha_listener
