@@ -37,12 +37,12 @@ async fn exec_runs_inside_baked_microvm() {
         return;
     }
 
-    // Find the statically-linked musl agent. Built by run-boot-test.sh
-    // before this test runs (or manually via
-    //   cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
-    // ). Static-musl is required because the agent runs inside an
-    // arbitrary rootfs (debian, alpine) where Nix's glibc paths from
-    // a dev-shell build don't exist.
+    // The canonical entry point is `scripts/run-boot-test.sh
+    // exec_real_vm`, which rebuilds the musl binaries before calling
+    // cargo test. Direct `cargo test --ignored` skips that and risks
+    // silently running against a stale agent (a wire-protocol change
+    // on the host can leave the cached agent waiting for the wrong
+    // bytes). The SKIP message points at the script.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let agent = target_root
@@ -51,7 +51,11 @@ async fn exec_runs_inside_baked_microvm() {
         .join("engram-agentd");
     if !agent.exists() {
         eprintln!(
-            "SKIP: static-musl engram-agentd not built at {}.\n  Run: cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release",
+            "SKIP: static-musl engram-agentd not built at {}.\n  \
+             Run via the script — it builds the binary fresh:\n    \
+             bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh exec_real_vm\n  \
+             Or build manually:\n    \
+             cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release",
             agent.display(),
         );
         return;

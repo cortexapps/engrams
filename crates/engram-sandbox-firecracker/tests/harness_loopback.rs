@@ -52,6 +52,13 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
         return;
     }
 
+    // The canonical entry point is `scripts/run-boot-test.sh
+    // harness_loopback`, which rebuilds these musl binaries before
+    // calling `cargo test`. Direct `cargo test --ignored` invocations
+    // skip that step and risk silently running against a stale binary
+    // (e.g. an `engram-bootstrap` from before commit 7ba0e61 doesn't
+    // write the readiness byte, leading to a 15s timeout in
+    // `start_agent`). The SKIP message points at the script.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let musl = target_root
@@ -67,8 +74,11 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     ] {
         if !p.exists() {
             eprintln!(
-                "SKIP: {label} not built at {}.\n  Run: cargo build -p {label} \
-                 --target x86_64-unknown-linux-musl --release",
+                "SKIP: {label} not built at {}.\n  \
+                 Run via the script — it builds these binaries fresh:\n    \
+                 bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh harness_loopback\n  \
+                 Or build manually:\n    \
+                 cargo build -p {label} --target x86_64-unknown-linux-musl --release",
                 p.display(),
             );
             return;
@@ -225,10 +235,29 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     env.insert("ENGRAM_NOOP_TOOL_CALLS".into(), "3".into());
     env.insert("ENGRAM_NOOP_INTERVAL_MS".into(), "10".into());
     env.insert("ENGRAM_NOOP_TOOL_CALL_DURATION_MS".into(), "10".into());
-    backend
+    if let Err(e) = backend
         .start_agent(sandbox_id, AgentSpec { argv, env })
         .await
-        .expect("start_agent");
+    {
+        // Without this dump, a start_agent timeout looks like
+        // "the byte didn't arrive" with no way to see why bootstrap
+        // didn't write it. Show the guest console so the in-VM
+        // failure mode (init crashed, bootstrap panicked,
+        // ENGRAM_TRANSPORT misconfigured, etc.) is visible.
+        let jail_dir = work.path().join(sandbox_id.to_string());
+        let log_path = jail_dir.join("firecracker.log");
+        if let Ok(s) = tokio::fs::read_to_string(&log_path).await {
+            eprintln!("--- firecracker.log tail (start_agent failure) ---");
+            for line in s.lines().rev().take(120).collect::<Vec<_>>().iter().rev() {
+                eprintln!("{line}");
+            }
+            eprintln!("--- end firecracker.log ---");
+        } else {
+            eprintln!("(firecracker.log not readable at {})", log_path.display());
+        }
+        let _ = backend.destroy(sandbox_id).await;
+        panic!("start_agent: {e}");
+    }
 
     // ---- 6. Wait for 3 ToolCallCompleted events ----
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

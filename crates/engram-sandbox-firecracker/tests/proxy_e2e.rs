@@ -190,6 +190,10 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     iptables_cleanup();
     delete_stale_taps();
 
+    // Run via `scripts/run-boot-test.sh proxy_e2e` — the script
+    // rebuilds the musl agent first, sidestepping the staleness
+    // footgun where a host-side wire-protocol change ships against a
+    // cached pre-change binary.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let agent_bin = target_root
@@ -197,7 +201,11 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         .join("release")
         .join("engram-agentd");
     if !agent_bin.exists() {
-        eprintln!("SKIP: musl agentd not built");
+        eprintln!(
+            "SKIP: musl agentd not built at {}.\n  \
+             Run: bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh proxy_e2e",
+            agent_bin.display(),
+        );
         return;
     }
 

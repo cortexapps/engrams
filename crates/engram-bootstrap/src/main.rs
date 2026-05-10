@@ -95,7 +95,11 @@ async fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        tracing::debug!("accepted host bootstrap connection");
+        // INFO so the FC console log (the only post-mortem we have
+        // for in-guest hangs) shows whether accept fired. Without
+        // this, a 15s start_agent timeout looks identical whether
+        // bootstrap accepted-but-didn't-write or never-accepted.
+        tracing::info!("accepted host bootstrap connection");
 
         // Tiny readiness handshake: write a single byte to the host
         // the moment we open this stream. Without it the host's
