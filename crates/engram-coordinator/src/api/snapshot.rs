@@ -123,41 +123,51 @@ pub async fn resume(
 /// terminal sessions.
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
-    if session.status == SessionStatus::Idle {
+    // ColdEvicted joins Idle here: both auto-resume on next access.
+    // The cold path is heavier (download + untar) but the caller
+    // shouldn't have to know.
+    if matches!(
+        session.status,
+        SessionStatus::Idle | SessionStatus::ColdEvicted
+    ) {
         resume_session(state.clone(), id).await?;
     }
     // Active / Pending / Dead / Completed / Failed all fall through
     // to the downstream handler. Dead in particular is terminal —
-    // the snapshot is gone, the session can't be brought back; the
-    // caller's only affordance is `engram session fork <id>` to
-    // start fresh from the workspace.
+    // the snapshot is gone from both tiers, the session can't be
+    // brought back.
     Ok(())
 }
 
 async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
-    // Resume is FC-snapshot-only. Active sessions are a no-op the
-    // caller likely didn't mean; Dead sessions can't be resumed —
-    // their snapshot was invalidated and the only affordance is
-    // `engram session fork` to continue from the workspace.
+    // Three-branch dispatcher (ADR 0005 / Stage 6):
+    //   Idle         → hot resume from local NVMe (sub-second)
+    //   ColdEvicted  → cold resume: download blob, untar, restore
+    //                  on any host with capacity
+    //   Dead         → 410 Gone (snapshot invalidated in both tiers)
+    //   anything else → 409
     match session.status {
-        SessionStatus::Idle => {} // happy path
-        SessionStatus::Dead => {
-            return Err(ApiError::Gone(
-                "snapshot_invalidated: session can't be revived; \
-                 use `engram session fork <id>` to continue from the workspace"
-                    .into(),
-            ));
-        }
-        other => {
-            return Err(ApiError::Conflict(format!(
-                "session is {} — only Idle sessions can be resumed",
-                other.as_str()
-            )));
-        }
+        SessionStatus::Idle => resume_from_idle(state, session).await,
+        SessionStatus::ColdEvicted => resume_from_cold(state, session).await,
+        SessionStatus::Dead => Err(ApiError::Gone(
+            "snapshot_invalidated: session can't be revived; \
+             snapshot is gone from both hot and cold tiers"
+                .into(),
+        )),
+        other => Err(ApiError::Conflict(format!(
+            "session is {} — only Idle / ColdEvicted sessions can be resumed",
+            other.as_str()
+        ))),
     }
+}
 
+async fn resume_from_idle(
+    state: SharedState,
+    session: Session,
+) -> Result<SnapshotResponse, ApiError> {
+    let id = session.id;
     // Hot path: a local FC snapshot exists on some host; the
     // snapshot-affinity scheduler routes the restore back to that
     // host. Sub-second hot resume from FC memory.bin.
@@ -167,19 +177,20 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
         .filter(|r| r.local_path.is_some())
         .cloned()
         .ok_or_else(|| {
-            // No usable snapshot. Mark Dead so subsequent calls hit
-            // the 410 path immediately, and surface the same error.
+            // No usable snapshot in the hot tier. The session might
+            // still be recoverable from cold, but to get here the
+            // status is Idle (not ColdEvicted) — so nothing to fall
+            // back to. Mark Dead.
             tracing::warn!(
                 session_id = %id,
-                "resume requested but no FC snapshot is recoverable — marking Dead",
+                "resume requested but no hot snapshot is recoverable — marking Dead",
             );
             ApiError::Gone(
                 "snapshot_invalidated: session can't be revived; \
-                 use `engram session fork <id>` to continue from the workspace"
+                 use `engram session fork <id>` to continue"
                     .into(),
             )
         })?;
-    // Mark Dead async — best-effort, ignore failures.
     let _ = transition_to_dead_if_no_snapshot(&state, id).await;
     resume_from_fc_snapshot(state, session, record).await
 }
@@ -220,6 +231,153 @@ async fn transition_to_dead_if_no_snapshot(
         )
         .await;
     Ok(())
+}
+
+/// Cold-resume path (ADR 0005 / Stage 6). The session's hot
+/// snapshot was flushed to blob storage; reverse the flush:
+/// download from blob, untar to a fresh local directory, then call
+/// `restore_for_session` like the hot path does. The session can
+/// land on any host with capacity — cold resume isn't pinned to
+/// the original snapshot's host (that's the whole point of the
+/// cold tier).
+///
+/// Multi-host follow-up: the picked host may not be `--mode=all`'s
+/// in-process host. A future `Frame::Request::CopyBlobToLocal`
+/// teaches the dialer to drive the unpack on the picked host's own
+/// disk. Today both share `services.blob` + `cfg.local_path`, so
+/// the in-process unpack is correct for the single-host case
+/// `just dev` runs.
+async fn resume_from_cold(
+    state: SharedState,
+    session: Session,
+) -> Result<SnapshotResponse, ApiError> {
+    let id = session.id;
+    let (snap, sealed) = state
+        .services
+        .meta
+        .latest_cold_snapshot_for_session(id)
+        .await?
+        .ok_or_else(|| {
+            // ColdEvicted without a cold snapshot is a state-machine
+            // bug — the only way to land in ColdEvicted is via
+            // flush_to_cold which writes the sealed ref. Surface as
+            // 410 (terminal) rather than 500 since the caller can't
+            // do anything about it; mark the session Dead so future
+            // calls take the 410 fast path.
+            tracing::error!(
+                session_id = %id,
+                "ColdEvicted session has no cold snapshot row — marking Dead",
+            );
+            let _ = std::sync::Arc::clone(&state.services.meta);
+            ApiError::Gone(
+                "snapshot_invalidated: cold-evicted session has no recoverable blob".into(),
+            )
+        })?;
+
+    // Open the sealed blob URL under the deployment KEK.
+    let blob_url = crate::blob::open_blob_ref(&state, &sealed).await?;
+
+    // Pick a fresh per-session staging path. Same layout as the hot
+    // path's snapshot dirs so `restore_for_session` reads from a
+    // familiar location. Wrapped in the snapshot id so concurrent
+    // cold-resume retries against the same session don't collide.
+    let dest = state
+        .snapshot_dir()
+        .join(id.to_string())
+        .join(format!("cold-{}", uuid::Uuid::new_v4()));
+    let bytes = crate::blob::unpack_blob_to_dir(&state.services.blob, &blob_url, &dest).await?;
+    tracing::info!(
+        session_id = %id,
+        snapshot_id = %snap.id,
+        bytes,
+        dest = %dest.display(),
+        "cold snapshot unpacked; proceeding to restore",
+    );
+
+    // From here the path is identical to hot resume: pick a host
+    // (any non-draining host with capacity), call restore, bind the
+    // session, start the agent. Pre-mode=all the picked host could
+    // differ from the snapshot's original host_id; today the
+    // scheduler short-circuits to the in-process backend.
+    let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
+    let ctx = ScheduleContext {
+        repo: image_repo,
+        image_version: image_tag,
+        // Cold resume isn't snapshot-affinity-routed (the original
+        // host may be gone or saturated). Falling back to warm-pool
+        // / capacity ranking is the right shape.
+        prefer_snapshot_id: None,
+        memory_mib: None,
+    };
+    let (host_id, new_sandbox_id) = state.host_registry.restore_for_session(&ctx, dest).await?;
+    bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
+
+    // Same secret re-resolution + start_agent dance as the hot path.
+    let mut resume_base_env = match crate::api::sessions::resolve_manifest_secrets(&state, &session)
+        .await
+    {
+        Ok(env) => env,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "resolve_manifest_secrets failed during cold resume; continuing without manifest env",
+            );
+            std::collections::HashMap::new()
+        }
+    };
+    match crate::api::sessions::load_session_secrets(&state, id).await {
+        Ok(Some(overrides)) => {
+            for (k, v) in overrides {
+                resume_base_env.insert(k, v);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "load_session_secrets failed during cold resume; continuing without per-request overrides",
+            );
+        }
+    }
+    let agent_opt =
+        crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
+            .ok()
+            .flatten();
+    if let Some(agent) = agent_opt {
+        if let Err(e) = state
+            .services
+            .sandbox
+            .start_agent(new_sandbox_id, agent)
+            .await
+        {
+            tracing::warn!(
+                session_id = %id,
+                sandbox_id = %new_sandbox_id,
+                error = %e,
+                "post-cold-resume start_agent failed; harness may not reattach",
+            );
+        }
+    }
+
+    finalize_resume(
+        &state,
+        id,
+        SessionStatus::ColdEvicted,
+        SessionEvent::ColdResumed {
+            snapshot_id: snap.id,
+            at: Utc::now(),
+        },
+    )
+    .await?;
+
+    Ok(SnapshotResponse {
+        session_id: id,
+        snapshot_id: Some(snap.id.to_string()),
+        size_bytes: Some(snap.size_bytes),
+        note: "resumed from cold tier",
+    })
 }
 
 /// Hot-resume path: a local FC snapshot exists, restore it on the

@@ -122,6 +122,88 @@ pub fn snapshot_blob_key(
     format!("engram/snapshots/{host_id}/{snapshot_id}.tar.zst")
 }
 
+/// Stream a blob out of `BlobStorage`, pipe through
+/// `zstd -d | tar -xf -`, materialize the contents at `dest_dir`.
+/// Reverse of the host-agent's flush-side pipeline; same `sh -c`
+/// shell-pipe shape so the system dependencies match.
+///
+/// The destination directory is created if it doesn't exist. The
+/// caller picks a unique path — typically
+/// `<local_path>/snapshots/<session_id>/<new_uuid>/` so concurrent
+/// resumes don't collide.
+///
+/// Returns the number of compressed bytes streamed in (= the blob's
+/// size_bytes), useful for telemetry. The decompressed footprint
+/// lives at `dest_dir`.
+pub(crate) async fn unpack_blob_to_dir(
+    blob: &std::sync::Arc<dyn BlobStorage>,
+    key: &str,
+    dest_dir: &std::path::Path,
+) -> Result<u64, ApiError> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    tokio::fs::create_dir_all(dest_dir)
+        .await
+        .map_err(|e| ApiError::Internal(format!("create dest dir: {e}")))?;
+    let dest_str = dest_dir
+        .to_str()
+        .ok_or_else(|| ApiError::Internal("dest path not valid utf-8".into()))?;
+    if dest_str.contains('\'') || dest_str.chars().any(|c| c.is_control()) {
+        return Err(ApiError::Internal(format!(
+            "dest path contains shell-unsafe chars: {dest_str}"
+        )));
+    }
+
+    let cmd = format!("zstd -d -c | tar -xf - -C '{dest_str}'");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| ApiError::Internal(format!("spawn unpack pipeline: {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("unpack child stdin missing".into()))?;
+
+    use futures::StreamExt;
+    let mut stream = blob
+        .get_streaming(key)
+        .await
+        .map_err(|e| ApiError::Internal(format!("blob get_streaming: {e}")))?;
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| ApiError::Internal(format!("blob stream: {e}")))?;
+        total += bytes.len() as u64;
+        stdin
+            .write_all(&bytes)
+            .await
+            .map_err(|e| ApiError::Internal(format!("unpack stdin write: {e}")))?;
+    }
+    drop(stdin);
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| ApiError::Internal(format!("unpack wait: {e}")))?;
+    if !status.success() {
+        return Err(ApiError::Internal(format!(
+            "zstd|tar exit {status} during unpack"
+        )));
+    }
+    tracing::debug!(
+        key = %key,
+        dest = %dest_dir.display(),
+        bytes = total,
+        "blob unpacked",
+    );
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
