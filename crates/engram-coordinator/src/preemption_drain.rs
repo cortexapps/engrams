@@ -6,23 +6,20 @@
 //! live sessions on this coordinator and runs the drain pipeline in
 //! parallel within the deadline:
 //!
-//!   1. Best-effort `auto_checkpoint` — push the workspace to
-//!      `engram/sessions/<id>` so the agent's last unit of work is
-//!      durable past the VM's death. The empty-diff guard means
-//!      already-checkpointed sessions are a `git status` round-trip.
-//!   2. Best-effort `SandboxBackend::destroy` — release Firecracker
+//!   1. Best-effort `SandboxBackend::destroy` — release Firecracker
 //!      handles cleanly. The VM is about to die anyway; this is just
 //!      hygiene.
-//!   3. Mark the session `Dead`, clear `host_id` +
-//!      `sandbox_id`. The caller decides what to do next via
-//!      `POST /sessions/:id/resume` (cross-host cold resume) or
-//!      `engram session fork` — Engram does *not* auto-resume on
-//!      preemption (that's the documented contract; sessions are
-//!      ephemeral, host loss = caller-driven recovery).
+//!   2. Mark the session `Dead`, clear `host_id` +
+//!      `sandbox_id`. ADR 0002's "host loss → caller forks the
+//!      workspace" contract still applies; ADR 0005 removed the
+//!      git-backed workspace, so callers either accept the loss or
+//!      start a fresh session against the same image.
 //!
-//! Important: this does NOT take an FC memory snapshot. The host's
-//! about to die — a snapshot dies with it. Cross-host durability is
-//! git, not blob-replicated VM memory (see DESIGN.md Phase 4).
+//! Important: this does NOT take a snapshot. Preemption is
+//! seconds-budget; FC memory snapshots are GB-scale and die with the
+//! host anyway. Cold-tier durability (ADR 0005 Stage 5+) is
+//! disk-pressure-driven, not preemption-driven — preemption stays
+//! "session goes Dead."
 //!
 //! `--mode=all` deployment for now: the consumer runs on the
 //! coordinator and drains every active session in metadata. Multi-
@@ -41,7 +38,7 @@ use engram_core::{SandboxId, SessionId};
 use futures::StreamExt;
 use tokio::task::JoinHandle;
 
-use crate::state::{auto_checkpoint, SessionEvent, SharedState};
+use crate::state::{SessionEvent, SharedState};
 
 /// How much of the preemption window to spend on the drain itself,
 /// leaving headroom for the VM's actual shutdown. GCP's default
@@ -135,11 +132,10 @@ async fn run_drain(state: &SharedState, notice: PreemptionNotice) {
     }
 }
 
-/// Drain one session: checkpoint workspace, destroy sandbox, mark
-/// Dead. Pure function over `SharedState`; the caller
-/// (the cloud-signal consumer or, in multi-host production, the
-/// host-agent's preemption handler) wraps it in the appropriate
-/// fan-out.
+/// Drain one session: destroy sandbox, mark Dead. Pure function
+/// over `SharedState`; the caller (the cloud-signal consumer or, in
+/// multi-host production, the host-agent's preemption handler)
+/// wraps it in the appropriate fan-out.
 pub async fn drain_session(
     state: &SharedState,
     session_id: SessionId,
@@ -157,19 +153,7 @@ pub async fn drain_session(
         return Ok(());
     }
 
-    // Step 1: best-effort workspace checkpoint to git. The
-    // empty-diff guard makes this nearly free for sessions whose
-    // last `Idle` already pushed.
-    auto_checkpoint(
-        session_id,
-        sandbox_id,
-        &state.services.meta,
-        &state.services.sandbox,
-        &state.events,
-    )
-    .await;
-
-    // Step 2: best-effort destroy. The VM is about to die — this
+    // Step 1: best-effort destroy. The VM is about to die — this
     // just lets us release Firecracker handles cleanly. Failure is
     // expected sometimes (mid-shutdown FC API may be unresponsive).
     state.registry.unbind(session_id);
@@ -185,9 +169,9 @@ pub async fn drain_session(
         proxy.registry.unregister(session_id);
     }
 
-    // Step 3: mark Dead. The caller's resume call later
-    // brings the session back on a different host via the git
-    // checkpoint branch.
+    // Step 2: mark Dead. ADR 0005: there is no resume path — the
+    // session is gone. Callers either accept the loss or start
+    // fresh.
     if let Err(e) = state
         .services
         .meta
@@ -266,71 +250,13 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::{CloudBackend, SandboxBackend};
-    use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::{
-        checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
-    };
+    use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+    use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
     use engram_core::types::Session;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::path::Path;
-    use std::process::Command as StdCommand;
     use tempfile::TempDir;
-
-    fn run_host(args: &[&str], cwd: &Path) {
-        let out = StdCommand::new(args[0])
-            .args(&args[1..])
-            .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .expect("spawn git");
-        assert!(
-            out.status.success(),
-            "host {} in {} failed: {}",
-            args.join(" "),
-            cwd.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn seed_remote_and_workspace() -> (TempDir, TempDir) {
-        let remote = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        run_host(
-            &["git", "init", "--bare", "--initial-branch=main"],
-            remote.path(),
-        );
-        run_host(&["git", "init", "--initial-branch=main"], workspace.path());
-        run_host(
-            &[
-                "git",
-                "remote",
-                "add",
-                "origin",
-                &format!("{}", remote.path().display()),
-            ],
-            workspace.path(),
-        );
-        run_host(
-            &[
-                "git",
-                "-c",
-                "user.email=t@e.local",
-                "-c",
-                "user.name=t",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-            workspace.path(),
-        );
-        run_host(&["git", "push", "-u", "origin", "main"], workspace.path());
-        (remote, workspace)
-    }
 
     fn build_state_with_session_and_cloud(
         session: Session,
@@ -363,10 +289,27 @@ mod tests {
         Arc::new(AppState::new_with_registry(cfg, services, host_registry))
     }
 
-    fn process_spec(rootfs: &Path) -> SandboxSpec {
+    fn ephemeral_session(id: engram_core::SessionId) -> Session {
+        Session {
+            id,
+            user_id: None,
+            status: SessionStatus::Active,
+            host_id: Some(engram_core::HostId::new()),
+            sandbox_id: None,
+            image: "test/repo:drain-test".into(),
+            workspace: WorkspaceSpec::Empty,
+            harness: HarnessSpec::None,
+            session_kind: SessionKind::Ephemeral,
+            checkpoint_branch: None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        }
+    }
+
+    fn process_spec() -> SandboxSpec {
         SandboxSpec {
             image: "drain-test".into(),
-            rootfs_source: Some(rootfs.to_path_buf()),
+            rootfs_source: None,
             image_uri: None,
             harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
@@ -381,39 +324,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_session_pushes_workspace_and_marks_dead() {
-        let (remote, workspace) = seed_remote_and_workspace();
+    async fn drain_session_destroys_sandbox_and_marks_dead() {
+        // ADR 0005: drain no longer pushes a git checkpoint — it
+        // just destroys the sandbox cleanly and marks the session
+        // Dead. Cold-tier durability is disk-pressure-driven, not
+        // preemption-driven.
         let session_id = engram_core::SessionId::new();
-        let branch = checkpoint_branch_for(session_id);
-        let session = Session {
-            id: session_id,
-            user_id: None,
-            status: SessionStatus::Active,
-            host_id: Some(engram_core::HostId::new()),
-            sandbox_id: None,
-            image: "test/repo:drain-test".into(),
-            workspace: WorkspaceSpec::Git {
-                url: format!("file://{}", remote.path().display()),
-                branch: "main".into(),
-                read_only: false,
-            },
-            harness: HarnessSpec::None,
-            session_kind: SessionKind::Git,
-            checkpoint_branch: Some(branch.clone()),
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-        };
-
         let sandbox_root = TempDir::new().unwrap();
         let cloud: Arc<dyn CloudBackend> = Arc::new(MockCloud::new());
-        let state = build_state_with_session_and_cloud(session, sandbox_root.path(), cloud);
+        let state = build_state_with_session_and_cloud(
+            ephemeral_session(session_id),
+            sandbox_root.path(),
+            cloud,
+        );
 
-        let sandbox_id = state
-            .services
-            .sandbox
-            .create(process_spec(workspace.path()))
-            .await
-            .unwrap();
+        let sandbox_id = state.services.sandbox.create(process_spec()).await.unwrap();
         state.registry.bind(session_id, sandbox_id);
         state
             .services
@@ -422,99 +347,41 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate agent edit: file change since the last checkpoint.
-        let req = ExecRequest {
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "echo preempted-work > preempt-marker.txt".into(),
-            ],
-            stdin: None,
-            env: Default::default(),
-            workdir: None,
-            timeout: Some(Duration::from_secs(5)),
-        };
-        state.services.sandbox.exec(sandbox_id, req).await.unwrap();
-
         drain_session(&state, session_id, sandbox_id)
             .await
             .expect("drain should succeed");
 
-        // Session is Dead with host/sandbox cleared.
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionStatus::Dead);
         assert_eq!(after.host_id, None);
         assert_eq!(after.sandbox_id, None);
         assert_eq!(state.registry.get(session_id), None);
 
-        // The remote got a checkpoint commit on engram/sessions/<id>.
-        let out = StdCommand::new("git")
-            .args(["-C"])
-            .arg(remote.path())
-            .args(["rev-list", "--count", &branch])
-            .output()
-            .unwrap();
-        let count: u32 = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        assert!(
-            count >= 1,
-            "checkpoint branch must have at least one commit (got {count})"
-        );
-
-        // No SnapshotRecord recorded — preemption explicitly skips
-        // FC snapshots since the host's about to die.
         let snaps = state
             .services
             .meta
             .list_snapshots_for_session(session_id)
             .await
             .unwrap();
-        assert!(
-            snaps.is_empty(),
-            "preemption drain must not take FC snapshots"
-        );
+        assert!(snaps.is_empty(), "preemption drain must not take snapshots");
     }
 
     #[tokio::test]
     async fn preemption_signal_drives_drain_end_to_end() {
-        // Wire MockCloud, spawn the drain task, trigger a
-        // preemption notice, assert the active session lands in
-        // Dead within the 25s deadline.
-        let (remote, workspace) = seed_remote_and_workspace();
+        // Wire MockCloud, spawn the drain task, trigger a preemption
+        // notice, assert the active session lands in Dead within the
+        // 25s deadline.
         let session_id = engram_core::SessionId::new();
-        let branch = checkpoint_branch_for(session_id);
-        let session = Session {
-            id: session_id,
-            user_id: None,
-            status: SessionStatus::Active,
-            host_id: Some(engram_core::HostId::new()),
-            sandbox_id: None,
-            image: "test/repo:drain-test".into(),
-            workspace: WorkspaceSpec::Git {
-                url: format!("file://{}", remote.path().display()),
-                branch: "main".into(),
-                read_only: false,
-            },
-            harness: HarnessSpec::None,
-            session_kind: SessionKind::Git,
-            checkpoint_branch: Some(branch.clone()),
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-        };
-
         let sandbox_root = TempDir::new().unwrap();
         let mock_cloud = Arc::new(MockCloud::new());
         let cloud: Arc<dyn CloudBackend> = mock_cloud.clone();
-        let state = build_state_with_session_and_cloud(session, sandbox_root.path(), cloud);
+        let state = build_state_with_session_and_cloud(
+            ephemeral_session(session_id),
+            sandbox_root.path(),
+            cloud,
+        );
 
-        let sandbox_id = state
-            .services
-            .sandbox
-            .create(process_spec(workspace.path()))
-            .await
-            .unwrap();
+        let sandbox_id = state.services.sandbox.create(process_spec()).await.unwrap();
         state.registry.bind(session_id, sandbox_id);
         state
             .services
@@ -544,7 +411,6 @@ mod tests {
             "drain task should transition session within ~2.5s of the signal"
         );
 
-        // Cleanup.
         drain_task.abort();
     }
 }

@@ -5,17 +5,18 @@
 //! last harness event is older than `idle_ttl_secs`, and runs the
 //! suspend pipeline on each:
 //!
-//!   1. **Checkpoint to git** (Track C.9 path) — pushes any tail-end
-//!      workspace changes to `engram/sessions/<id>`. Harmless if the
-//!      auto-checkpoint already fired on `Idle`; the empty-diff guard
-//!      makes this a one-`git status` no-op when nothing changed.
-//!   2. **Take a Firecracker memory snapshot** to local NVMe so the
+//!   1. **Take a Firecracker memory snapshot** to local NVMe so the
 //!      session can be hot-restored on the same host without paying
 //!      cold-clone-and-deps cost.
-//!   3. **Destroy the sandbox** to free host RAM.
-//!   4. **Mark the session `Idle`**, clear its `sandbox_id`, emit
+//!   2. **Destroy the sandbox** to free host RAM.
+//!   3. **Mark the session `Idle`**, clear its `sandbox_id`, emit
 //!      `SnapshotTaken` + `Evicted` + `StatusChanged` events so SSE
 //!      subscribers see the suspension cleanly.
+//!
+//! ADR 0005 retired the workspace-checkpoint pre-step the original
+//! Track C.9 design ran here — every snapshot now ships the rootfs
+//! delta, and (Stage 5+) cold-tier blob durability covers the
+//! cross-host case the git push used to.
 //!
 //! Auto-resume on next request is wired separately (`api/sessions.rs`
 //! exec/exec_stream/SSE handlers): if status is `Idle`, call the
@@ -38,7 +39,7 @@ use engram_core::types::SessionStatus;
 use engram_core::{SandboxId, SessionId};
 use tokio::task::JoinHandle;
 
-use crate::state::{auto_checkpoint, SessionEvent, SharedState};
+use crate::state::{SessionEvent, SharedState};
 
 /// **Soft** idle TTL — a session whose adapter emitted `Idle` and
 /// stayed quiet for this long is hot-suspended. Default 30s tracks
@@ -116,20 +117,7 @@ pub async fn evict_idle_session(
         return Ok(());
     }
 
-    // Step 1: checkpoint workspace. The auto-checkpoint on `Idle`
-    // already pushed at run-completion; this is a safety net for
-    // any tail-end changes. Empty diffs short-circuit before the
-    // commit + push, so the cost is one `git status` round-trip.
-    auto_checkpoint(
-        session_id,
-        sandbox_id,
-        &state.services.meta,
-        &state.services.sandbox,
-        &state.events,
-    )
-    .await;
-
-    // Step 2: take a Firecracker memory snapshot to local NVMe.
+    // Step 1: take a Firecracker memory snapshot to local NVMe.
     // Path layout matches the operator-driven /sessions/:id/snapshot
     // handler so the resume path can find it via the same
     // `local_path` field on SnapshotRecord.
@@ -300,70 +288,12 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::{
-        checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
-    };
+    use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
     use engram_core::types::{Session, SessionStatus};
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::path::Path;
-    use std::process::Command as StdCommand;
     use tempfile::TempDir;
-
-    fn run_host(args: &[&str], cwd: &Path) {
-        let out = StdCommand::new(args[0])
-            .args(&args[1..])
-            .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .expect("spawn git");
-        assert!(
-            out.status.success(),
-            "host {} in {} failed: {}",
-            args.join(" "),
-            cwd.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn seed_remote_and_workspace() -> (TempDir, TempDir) {
-        let remote = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        run_host(
-            &["git", "init", "--bare", "--initial-branch=main"],
-            remote.path(),
-        );
-        run_host(&["git", "init", "--initial-branch=main"], workspace.path());
-        run_host(
-            &[
-                "git",
-                "remote",
-                "add",
-                "origin",
-                &format!("{}", remote.path().display()),
-            ],
-            workspace.path(),
-        );
-        run_host(
-            &[
-                "git",
-                "-c",
-                "user.email=t@e.local",
-                "-c",
-                "user.name=t",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-            workspace.path(),
-        );
-        run_host(&["git", "push", "-u", "origin", "main"], workspace.path());
-        (remote, workspace)
-    }
 
     fn build_state_with_session(session: Session, sandbox_root: &Path) -> SharedState {
         let local_path = sandbox_root.join("local");
@@ -392,10 +322,10 @@ mod tests {
         Arc::new(AppState::new_with_registry(cfg, services, host_registry))
     }
 
-    fn process_spec(rootfs: &Path) -> SandboxSpec {
+    fn process_spec() -> SandboxSpec {
         SandboxSpec {
             image: "evict-test".into(),
-            rootfs_source: Some(rootfs.to_path_buf()),
+            rootfs_source: None,
             image_uri: None,
             harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
@@ -411,10 +341,10 @@ mod tests {
 
     #[tokio::test]
     async fn evict_idle_session_runs_full_pipeline() {
-        let (remote, workspace) = seed_remote_and_workspace();
-
+        // ADR 0005: the eviction pipeline is now snapshot + destroy +
+        // mark-Idle only. The auto-checkpoint pre-step is gone — git
+        // is no longer the platform's durability primitive.
         let session_id = engram_core::SessionId::new();
-        let branch = checkpoint_branch_for(session_id);
         let session = Session {
             id: session_id,
             user_id: None,
@@ -422,14 +352,10 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
-            workspace: WorkspaceSpec::Git {
-                url: format!("file://{}", remote.path().display()),
-                branch: "main".into(),
-                read_only: false,
-            },
+            workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
-            session_kind: SessionKind::Git,
-            checkpoint_branch: Some(branch.clone()),
+            session_kind: SessionKind::Ephemeral,
+            checkpoint_branch: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
         };
@@ -437,16 +363,7 @@ mod tests {
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
 
-        // Create the sandbox via the registry, bind it to the
-        // session, simulate an agent edit. The eviction pipeline
-        // will checkpoint that edit, snapshot the sandbox, destroy
-        // it, and mark the session Idle.
-        let sandbox_id = state
-            .services
-            .sandbox
-            .create(process_spec(workspace.path()))
-            .await
-            .unwrap();
+        let sandbox_id = state.services.sandbox.create(process_spec()).await.unwrap();
         state.registry.bind(session_id, sandbox_id);
         state
             .services
@@ -483,47 +400,27 @@ mod tests {
             .list_snapshots_for_session(session_id)
             .await
             .unwrap();
-        assert_eq!(snaps.len(), 1, "exactly one FC snapshot recorded");
+        assert_eq!(snaps.len(), 1, "exactly one snapshot recorded");
         assert!(snaps[0].local_path.is_some());
 
-        // The remote got a checkpoint commit on `engram/sessions/<id>`.
-        let out = StdCommand::new("git")
-            .args(["-C"])
-            .arg(remote.path())
-            .args(["rev-list", "--count", &branch])
-            .output()
-            .unwrap();
-        let count: u32 = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        assert!(
-            count >= 1,
-            "checkpoint branch must have at least one commit"
-        );
-
-        // The bus saw the right sequence of events. Drain the
-        // subscriber and confirm the kinds.
+        // Drain the bus and confirm the post-checkpoint sequence:
+        // SnapshotTaken / Evicted / StatusChanged.
         let mut kinds: Vec<String> = Vec::new();
         while let Ok(ev) = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
             if let Ok(indexed) = ev {
                 kinds.push(indexed.event.kind().to_string());
             }
         }
-        // CheckpointPushed comes from the auto_checkpoint inside
-        // the eviction pipeline; SnapshotTaken/Evicted/StatusChanged
-        // are emitted by evict_idle_session itself.
-        for required in [
-            "checkpoint_pushed",
-            "snapshot_taken",
-            "evicted",
-            "status_changed",
-        ] {
+        for required in ["snapshot_taken", "evicted", "status_changed"] {
             assert!(
                 kinds.iter().any(|k| k == required),
                 "missing event {required} in {kinds:?}"
             );
         }
+        assert!(
+            !kinds.iter().any(|k| k == "checkpoint_pushed"),
+            "ADR 0005: checkpoint_pushed must no longer be emitted (got {kinds:?})"
+        );
     }
 
     #[tokio::test]

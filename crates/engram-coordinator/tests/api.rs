@@ -2784,69 +2784,62 @@ async fn persistent_log_captures_lifecycle_and_exec_kinds() {
 }
 
 // ---------------------------------------------------------------------
-// POST /sessions/:id/checkpoint  (Phase 4 Track C.8)
+// ADR 0005 retired the checkpoint / fork / diff / log?kind=workspace
+// endpoints along with the platform's git surface. The deleted routes
+// now return 404 because they're no longer registered.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn checkpoint_returns_409_for_ephemeral_session() {
-    // Bare `repo: "r"` lands as a `WorkspaceSpec::Empty` session via
-    // the legacy adapter, which derives `SessionKind::Ephemeral`.
-    // Ephemeral sessions have no checkpoint branch and the endpoint
-    // must refuse explicitly with 409.
+async fn deleted_git_endpoints_return_404() {
     let store = MockMetadataStore::arc();
     let app = build_app(store);
     let id = api_create_session(app.clone(), "r").await;
 
-    let resp = post(app, &format!("/sessions/{id}/checkpoint"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let v = body_json(resp.into_body()).await;
-    assert!(
-        v["message"].as_str().unwrap_or("").contains("ephemeral"),
-        "error must call out the session_kind: got {v}",
-    );
-}
+    for path in [
+        format!("/sessions/{id}/checkpoint"),
+        format!("/sessions/{id}/fork"),
+    ] {
+        let resp = post(app.clone(), &path, json!({})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must be retired"
+        );
+    }
 
-#[tokio::test]
-async fn checkpoint_returns_404_for_unknown_session() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = post(
-        app,
-        &format!("/sessions/{}/checkpoint", SessionId::new()),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn checkpoint_returns_409_for_readonly_session() {
-    // Workspace is `Git { read_only: true }` → session_kind = Readonly.
-    // No checkpoint branch; endpoint refuses. Seed the row directly
-    // via the metadata store (bypassing the API) so the test doesn't
-    // need a reachable remote for `materialize_workspace` to clone
-    // — the assertion is about checkpoint *refusal*, not the
-    // workspace materialization path.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-    let id = store
-        .create_session(SessionSpec {
-            image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Git {
-                url: "https://github.com/cortex/api.git".into(),
-                branch: "main".into(),
-                read_only: true,
-            },
-            harness: engram_core::types::session::HarnessSpec::None,
-            user_id: None,
-        })
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/sessions/{id}/diff"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "diff endpoint must be retired"
+    );
 
-    let resp = post(app, &format!("/sessions/{id}/checkpoint"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let v = body_json(resp.into_body()).await;
-    assert!(
-        v["message"].as_str().unwrap_or("").contains("readonly"),
-        "error must call out the session_kind: got {v}",
+    // log?kind=workspace returns 400 (the route still exists, but
+    // only kind=conversation is supported now).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/sessions/{id}/log?kind=workspace"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "log?kind=workspace must be rejected"
     );
 }

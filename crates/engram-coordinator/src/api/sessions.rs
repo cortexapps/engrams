@@ -6,6 +6,10 @@ use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
 use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef, WorkspaceSpec};
+// `WorkspaceSpec` is still part of the engram-core domain model
+// (Stage 3 retires it). Stage 1 / ADR 0005 dropped the API surface
+// for it: every session is constructed with `WorkspaceSpec::Empty`
+// and the workspace comes from the bake image's `/workspace`.
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionStatus};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -71,29 +75,6 @@ fn apply_secrets_to_env(
             );
         }
     }
-}
-
-/// Extract the hostname from a clone URL so it can be added to the
-/// session's `allow_hosts`. Tolerates `git+https://`, `git@host:path`
-/// (SSH), and plain http(s). Returns `None` for shapes the FC net
-/// layer can't allowlist by name (e.g. `git://`, `file://`).
-fn host_from_url(raw: &str) -> Option<String> {
-    if let Ok(u) = url::Url::parse(raw) {
-        return u.host_str().map(str::to_owned);
-    }
-    // SSH form: `git@github.com:cortex/api.git`. Take the substring
-    // between `@` and the first `:`.
-    if let Some(rest) = raw
-        .strip_prefix("git@")
-        .or_else(|| raw.split_once('@').map(|(_, r)| r))
-    {
-        if let Some((host, _)) = rest.split_once(':') {
-            if !host.is_empty() {
-                return Some(host.to_string());
-            }
-        }
-    }
-    None
 }
 
 fn short_hash(s: &str) -> String {
@@ -223,8 +204,6 @@ pub(crate) async fn load_session_secrets(
 pub struct CreateSessionRequest {
     /// Which baked image to boot. Required.
     pub image: ImageRef,
-    /// Where the workspace comes from. Required.
-    pub workspace: WorkspaceSpec,
     /// What agent process (if any) to attach. Defaults to
     /// `HarnessSpec::None` — boot the VM and let the user drive it
     /// via the in-browser shell or `engram exec`.
@@ -352,7 +331,11 @@ pub async fn create_session(
 
     let spec = SessionSpec {
         image: req.image.clone(),
-        workspace: req.workspace.clone(),
+        // ADR 0005: workspace comes from the bake image; the platform
+        // never clones a repo or materializes anything itself. Every
+        // session is `WorkspaceSpec::Empty` until Stage 3 drops the
+        // type entirely.
+        workspace: WorkspaceSpec::Empty,
         harness: req.harness.clone(),
         user_id: req.user_id,
     };
@@ -433,19 +416,12 @@ pub async fn create_session(
         &spec_env,
     )?;
 
-    // Network policy: start from the image manifest's `[network]`
-    // block and auto-augment `allow_hosts` with the Git workspace's
-    // host (so `git clone` can reach it). FC's net layer translates
-    // this into per-VM iptables rules; VZ logs a warn-once because
-    // its Apple-NAT path is opaque.
-    let mut network = manifest.network.clone();
-    if let WorkspaceSpec::Git { url, .. } = &req.workspace {
-        if let Some(host) = host_from_url(url) {
-            if !network.allow_hosts.iter().any(|h| h == &host) {
-                network.allow_hosts.push(host);
-            }
-        }
-    }
+    // Network policy: image manifest's `[network]` block, verbatim.
+    // ADR 0005 retired the platform's git workspace (no clone URL to
+    // auto-allowlist anymore); agents that need GitHub egress
+    // declare `[network] allow_hosts = ["api.github.com"]` in their
+    // image manifest like any other dependency.
+    let network = manifest.network.clone();
 
     // Clone the env + network policy before they're moved into the
     // VmSpec — the post-create proxy registration needs to look up
@@ -583,30 +559,11 @@ pub async fn create_session(
     // to accept exec but the agent (if any) NOT yet spawned.
     state.harness_hub.bind_session(session_id, sandbox_id);
 
-    // -------- 6. Materialize workspace --------
-    // Runs while the row is still `Pending`. A failure here marks
-    // the row Failed before the user ever sees Active — a clear
-    // "git clone broke" beats a green session with no checkout.
-    if let Err(e) =
-        crate::workspace::materialize(&*state.services.sandbox, sandbox_id, &req.workspace).await
-    {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %e,
-            "workspace materialization failed",
-        );
-        let _ = state
-            .services
-            .meta
-            .set_session_status(session_id, SessionStatus::Failed)
-            .await;
-        state.harness_hub.unbind_session(session_id);
-        return Err(ApiError::Internal(format!(
-            "workspace materialization: {e}"
-        )));
-    }
-
-    // -------- 7. Start the agent (if any) --------
+    // -------- 6. Start the agent (if any) --------
+    //
+    // Workspace materialization is gone (ADR 0005): the bake image's
+    // `/workspace` is the workspace; nothing for the platform to do
+    // here.
     if let Some(agent) = agent_for_session {
         if let Err(e) = state.services.sandbox.start_agent(sandbox_id, agent).await {
             let _ = state
@@ -815,47 +772,4 @@ pub(crate) fn resolve_harness(
         }
     };
     Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::host_from_url;
-
-    #[test]
-    fn host_from_url_https() {
-        assert_eq!(
-            host_from_url("https://github.com/cortex/api.git").as_deref(),
-            Some("github.com"),
-        );
-    }
-
-    #[test]
-    fn host_from_url_http() {
-        assert_eq!(
-            host_from_url("http://gitea.local:3000/me/repo").as_deref(),
-            Some("gitea.local"),
-        );
-    }
-
-    #[test]
-    fn host_from_url_ssh_form() {
-        assert_eq!(
-            host_from_url("git@github.com:cortex/api.git").as_deref(),
-            Some("github.com"),
-        );
-    }
-
-    #[test]
-    fn host_from_url_user_at_host_form() {
-        assert_eq!(
-            host_from_url("alice@gitea.example.com:repo.git").as_deref(),
-            Some("gitea.example.com"),
-        );
-    }
-
-    #[test]
-    fn host_from_url_unhandleable_returns_none() {
-        // Plain `file://` and bare paths can't be allowlisted by host.
-        assert_eq!(host_from_url("/srv/git/repo.git"), None);
-    }
 }

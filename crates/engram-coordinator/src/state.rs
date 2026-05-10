@@ -72,24 +72,6 @@ pub enum SessionEvent {
         snapshot_id: SnapshotId,
         at: DateTime<Utc>,
     },
-    /// Phase 4 (Track C.6): a checkpoint successfully pushed the
-    /// session's workspace to its `engram/sessions/<id>` branch.
-    /// `commit_sha` is the new HEAD on that branch; `harness_acked`
-    /// reflects whether the in-guest harness flushed its transcript
-    /// before the push (false on best-effort/timeout paths — the
-    /// workspace is durable but the transcript may lag one tool call).
-    CheckpointPushed {
-        commit_sha: String,
-        harness_acked: bool,
-        at: DateTime<Utc>,
-    },
-    /// Phase 4 (Track C.6): a checkpoint attempt failed. Surfaces
-    /// the underlying reason (workspace size cap, broken remote,
-    /// missing harness, etc.) for operator forensics.
-    CheckpointFailed {
-        reason: String,
-        at: DateTime<Utc>,
-    },
     /// Phase 4: harness-emitted events. Web UI and Slackbot
     /// subscribe to these to render the agent's play-by-play.
     /// Track B reshape: structured summary fields replace the
@@ -150,8 +132,6 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
-            Self::CheckpointPushed { .. } => "checkpoint_pushed",
-            Self::CheckpointFailed { .. } => "checkpoint_failed",
             Self::HarnessRunStarted { .. } => "run_started",
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
@@ -366,11 +346,6 @@ pub struct AppState {
     /// reads this to plumb `ENGRAM_HARNESS_ADDR` into the spawned
     /// agent's env. `None` until the listener is up.
     pub harness_listen_addr: parking_lot::Mutex<Option<std::net::SocketAddr>>,
-    /// Phase 4 Track F: coord-local bare clones of every writable
-    /// repo Engram has touched, used for `engram session log/diff/
-    /// fork` queries that need git history without involving a
-    /// session sandbox. Lazily clones per repo URL on first query.
-    pub git_workdir: Arc<crate::git_workdir::GitWorkdir>,
 }
 
 impl AppState {
@@ -398,11 +373,7 @@ impl AppState {
         let harness_hub = Arc::new(HarnessHub::new(harness_event_sink(
             events.clone(),
             services.meta.clone(),
-            services.sandbox.clone(),
         )));
-        let git_workdir = Arc::new(crate::git_workdir::GitWorkdir::new(
-            cfg.local_path.join("git-workdirs"),
-        ));
         Self {
             cfg,
             services,
@@ -411,7 +382,6 @@ impl AppState {
             host_registry,
             harness_hub,
             harness_listen_addr: parking_lot::Mutex::new(None),
-            git_workdir,
         }
     }
 
@@ -456,7 +426,6 @@ pub type SharedState = Arc<AppState>;
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
-    sandbox: Arc<dyn engram_core::traits::SandboxBackend>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
     // to drop a `harness_idle` that would land back-to-back with
@@ -465,25 +434,23 @@ fn harness_event_sink(
     // evict/resume cycle on an already-idle session would otherwise
     // append a redundant idle to the log on every cycle.
     let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
-    Arc::new(move |session_id, sandbox_id, ev| {
+    Arc::new(move |session_id, _sandbox_id, ev| {
         let events = events.clone();
         let meta = meta.clone();
-        let sandbox = sandbox.clone();
         let last_kind = last_kind.clone();
         Box::new(Box::pin(async move {
-            // 1. Always forward the event into session_events (live
-            //    SSE / Web UI / Slackbot timeline).
-            let triggers_checkpoint =
-                matches!(ev, HarnessEvent::Idle | HarnessEvent::RunCompleted { .. });
+            // Forward every harness event into session_events for live
+            // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
+            // auto-checkpoint branch this used to trigger on Idle /
+            // RunCompleted; durability moved to hot+cold snapshots,
+            // not git checkpoints.
             let session_event = SessionEvent::from_harness(ev, Utc::now());
             let kind = session_event.kind();
 
             // Drop a back-to-back duplicate `harness_idle`. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
-            // affects the persisted log + SSE bus. Auto-checkpoint
-            // also short-circuits: nothing has changed since the last
-            // idle, so re-running it would be pure cost.
+            // affects the persisted log + SSE bus.
             if kind == "harness_idle"
                 && last_kind
                     .get(&session_id)
@@ -519,112 +486,8 @@ fn harness_event_sink(
                     );
                 }
             }
-
-            // 2. Auto-checkpoint on Idle / RunCompleted for Git
-            //    sessions. Skip the harness round-trip — the agent
-            //    just told us it's idle.
-            if !triggers_checkpoint {
-                return;
-            }
-            auto_checkpoint(session_id, sandbox_id, &meta, &sandbox, &events).await;
         }))
     })
-}
-
-/// Look up the session, decide whether to checkpoint, run the git
-/// push, emit `CheckpointPushed` / `CheckpointFailed`. All best-
-/// effort: failures log + emit a CheckpointFailed event but never
-/// propagate (the event sink can't return an error to the harness).
-pub(crate) async fn auto_checkpoint(
-    session_id: SessionId,
-    sandbox_id: SandboxId,
-    meta: &Arc<dyn engram_core::traits::MetadataStore>,
-    sandbox: &Arc<dyn engram_core::traits::SandboxBackend>,
-    events: &Arc<SessionEventBus>,
-) {
-    let session = match meta.get_session(session_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "auto_checkpoint: get_session failed; skipping",
-            );
-            return;
-        }
-    };
-    if !matches!(
-        session.session_kind,
-        engram_core::types::session::SessionKind::Git
-    ) {
-        return;
-    }
-    let branch = match session.checkpoint_branch.as_deref() {
-        Some(b) => b,
-        None => {
-            tracing::warn!(
-                session_id = %session_id,
-                "auto_checkpoint: git session is missing its checkpoint_branch",
-            );
-            return;
-        }
-    };
-
-    use engram_harness_proto::CheckpointReason;
-    use engram_host_agent::checkpoint::{checkpoint_workspace_only, CheckpointConfig};
-
-    let cfg = CheckpointConfig::default();
-    let outcome = checkpoint_workspace_only(
-        sandbox,
-        sandbox_id,
-        ".",
-        branch,
-        CheckpointReason::RunCompleted,
-        &cfg,
-    )
-    .await;
-
-    let now = Utc::now();
-    let event = match outcome {
-        Ok(o) => match o.commit_sha {
-            Some(sha) => SessionEvent::CheckpointPushed {
-                commit_sha: sha,
-                harness_acked: o.harness_acked,
-                at: now,
-            },
-            None => {
-                // Empty diff — no commit, no push, no event. We
-                // intentionally don't emit a CheckpointPushed for
-                // this case so SSE subscribers only see "real"
-                // checkpoints.
-                return;
-            }
-        },
-        Err(e) => SessionEvent::CheckpointFailed {
-            reason: e.to_string(),
-            at: now,
-        },
-    };
-    let kind = event.kind();
-    let payload = match serde_json::to_value(&event) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "auto_checkpoint event serialize failed");
-            return;
-        }
-    };
-    match meta.append_session_event(session_id, kind, payload).await {
-        Ok(idx) => {
-            events.publish(session_id, IndexedEvent { idx, event });
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "append_session_event for checkpoint result failed",
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -745,27 +608,18 @@ pub(crate) mod tests {
     }
 
     // ---------------------------------------------------------------
-    // auto_checkpoint integration: real ProcessBackend + real git
-    // remote + minimal in-line MetadataStore mock. Verifies that on
-    // a Git session with workspace changes, the auto path commits +
-    // pushes to the checkpoint branch and emits CheckpointPushed.
+    // Harness-event-sink test infrastructure: trait-based
+    // MetadataStore mock used by both this module's dedup test and
+    // the sessions_inspect / api tests below.
     // ---------------------------------------------------------------
     use async_trait::async_trait;
-    use engram_core::traits::{MetadataStore, SandboxBackend};
-    use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::{
-        checkpoint_branch_for, HarnessSpec, SessionKind, WorkspaceSpec,
-    };
+    use engram_core::traits::MetadataStore;
+    use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
     use engram_core::types::{
         HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SnapshotRecord,
     };
     use engram_core::{HostId, MetaError};
-    use engram_sandbox_process::ProcessBackend;
     use parking_lot::Mutex as PlMutex;
-    use std::path::Path;
-    use std::process::Command as StdCommand;
-    use std::time::Duration;
-    use tempfile::TempDir;
 
     /// In-memory MetadataStore for state-level + idle-evictor tests.
     /// Tracks one session's status/host_id/sandbox_id mutably plus a
@@ -1000,207 +854,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn run_git(args: &[&str], cwd: &Path) {
-        let out = StdCommand::new(args[0])
-            .args(&args[1..])
-            .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .expect("spawn git");
-        assert!(
-            out.status.success(),
-            "host {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn seed_remote_and_workspace() -> (TempDir, TempDir) {
-        let remote = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        run_git(
-            &["git", "init", "--bare", "--initial-branch=main"],
-            remote.path(),
-        );
-        run_git(&["git", "init", "--initial-branch=main"], workspace.path());
-        run_git(
-            &[
-                "git",
-                "remote",
-                "add",
-                "origin",
-                &format!("{}", remote.path().display()),
-            ],
-            workspace.path(),
-        );
-        run_git(
-            &[
-                "git",
-                "-c",
-                "user.email=t@e.local",
-                "-c",
-                "user.name=t",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-            workspace.path(),
-        );
-        run_git(&["git", "push", "-u", "origin", "main"], workspace.path());
-        (remote, workspace)
-    }
-
-    fn process_spec(rootfs: &Path) -> SandboxSpec {
-        SandboxSpec {
-            image: "auto-checkpoint-test".into(),
-            rootfs_source: Some(rootfs.to_path_buf()),
-            image_uri: None,
-            harness_pack_uri: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit { max_mib: 256 },
-            disk: DiskLimit { max_gib: 1 },
-            ttl: None,
-            env: Default::default(),
-            workdir: None,
-            harness_substrate: None,
-            network: Default::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn auto_checkpoint_pushes_completed_run_to_checkpoint_branch() {
-        let (remote, workspace) = seed_remote_and_workspace();
-
-        // Build a Git session whose checkpoint_branch is set to the
-        // standard `engram/sessions/<id>` namespace.
-        let session_id = engram_core::SessionId::new();
-        let branch = checkpoint_branch_for(session_id);
-        let session = Session {
-            id: session_id,
-            user_id: None,
-            status: engram_core::types::SessionStatus::Active,
-            host_id: None,
-            sandbox_id: None,
-            image: "test/repo:auto-checkpoint-test".into(),
-            workspace: WorkspaceSpec::Git {
-                url: format!("file://{}", remote.path().display()),
-                branch: "main".into(),
-                read_only: false,
-            },
-            harness: HarnessSpec::None,
-            session_kind: SessionKind::Git,
-            checkpoint_branch: Some(branch.clone()),
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-        };
-        let meta: Arc<dyn MetadataStore> = Arc::new(MiniMeta::new(session));
-
-        // ProcessBackend whose sandbox cwd starts as a clone of the
-        // seed workspace (origin → bare remote).
-        let sandbox_root = TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
-        let sandbox_id = backend
-            .create(process_spec(workspace.path()))
-            .await
-            .unwrap();
-
-        // Simulate the agent making a workspace edit.
-        let req = ExecRequest {
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "echo agent-output > result.txt".into(),
-            ],
-            stdin: None,
-            env: Default::default(),
-            workdir: None,
-            timeout: Some(Duration::from_secs(5)),
-        };
-        backend.exec(sandbox_id, req).await.unwrap();
-
-        let bus = Arc::new(SessionEventBus::default());
-        let mut sub = bus.subscribe(session_id);
-
-        super::auto_checkpoint(session_id, sandbox_id, &meta, &backend, &bus).await;
-
-        // The bus published exactly one CheckpointPushed event with
-        // a non-empty commit_sha matching the remote branch HEAD.
-        let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-            .await
-            .expect("event arrived")
-            .expect("subscriber alive");
-        let commit_sha = match event.event {
-            SessionEvent::CheckpointPushed { commit_sha, .. } => commit_sha,
-            other => panic!("expected CheckpointPushed, got {other:?}"),
-        };
-        assert!(!commit_sha.is_empty());
-
-        let out = StdCommand::new("git")
-            .args(["-C"])
-            .arg(remote.path())
-            .args(["rev-parse", &branch])
-            .output()
-            .expect("rev-parse");
-        let remote_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert_eq!(remote_sha, commit_sha);
-    }
-
-    #[tokio::test]
-    async fn auto_checkpoint_skips_ephemeral_session_silently() {
-        // Ephemeral sessions have no checkpoint branch — auto_checkpoint
-        // returns without emitting anything, and no error is logged
-        // upward. The bus should see zero events.
-        let session_id = engram_core::SessionId::new();
-        let session = Session {
-            id: session_id,
-            user_id: None,
-            status: engram_core::types::SessionStatus::Active,
-            host_id: None,
-            sandbox_id: None,
-            image: "test/repo:test".into(),
-            workspace: WorkspaceSpec::Empty,
-            harness: HarnessSpec::None,
-            session_kind: SessionKind::Ephemeral,
-            checkpoint_branch: None,
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-        };
-        let meta: Arc<dyn MetadataStore> = Arc::new(MiniMeta::new(session));
-
-        // Bare-bones sandbox; we never reach exec_stream because the
-        // session_kind early-returns.
-        let sandbox_root = TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
-        let spec = SandboxSpec {
-            image: "local-test".into(),
-            rootfs_source: None,
-            image_uri: None,
-            harness_pack_uri: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit { max_mib: 64 },
-            disk: DiskLimit { max_gib: 1 },
-            ttl: None,
-            env: Default::default(),
-            workdir: None,
-            harness_substrate: None,
-            network: Default::default(),
-        };
-        let sandbox_id = backend.create(spec).await.unwrap();
-
-        let bus = Arc::new(SessionEventBus::default());
-        let mut sub = bus.subscribe(session_id);
-
-        super::auto_checkpoint(session_id, sandbox_id, &meta, &backend, &bus).await;
-
-        // Nothing emitted within a generous deadline.
-        let recv = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
-        assert!(recv.is_err(), "Local session must not produce events");
-    }
-
     #[tokio::test]
     async fn harness_event_sink_dedupes_back_to_back_idles() {
         // The claude harness re-emits Idle on every reconnect (e.g.
@@ -1225,12 +878,10 @@ pub(crate) mod tests {
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
 
-        let sandbox_root = TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_root.path()));
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus.clone(), meta.clone(), backend.clone());
+        let sink = super::harness_event_sink(bus.clone(), meta.clone());
 
         // Three back-to-back idles: only the first should land.
         for _ in 0..3 {
