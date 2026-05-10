@@ -249,15 +249,39 @@ struct LiveSandbox {
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
 /// carry fields Firecracker doesn't store itself but our trait surface
 /// needs to reconstruct on restore — primarily the original
-/// `SandboxSpec`. Not consumed by Firecracker; entirely ours.
+/// `SandboxSpec`.
 ///
-/// We don't try to make this format stable across major versions
-/// — snapshots have an implicit shelf life tied to a release.
+/// `net` carries the original /30 + TAP name so restore can recreate
+/// the host-side networking the snapshot's `state.bin` expects.
+/// Without it, FC's snapshot load fails when the virtio-net frontend
+/// tries to bind a TAP that doesn't exist on the receiving host.
+///
+/// Not consumed by Firecracker; entirely ours. We don't try to make
+/// this format stable across major versions — snapshots have an
+/// implicit shelf life tied to a release.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FcSnapshotManifest {
     sandbox_id: SandboxId,
     created_at: DateTime<Utc>,
     spec: SandboxSpec,
+    /// `None` when the source VM was created with networking disabled
+    /// (test mode) or when restoring from a pre-net manifest.
+    #[serde(default)]
+    net: Option<FcNetSnapshot>,
+}
+
+/// What we need from the source VM's `NetSetup` to recreate networking
+/// on a restored VM. The `cidr_network` is the /30's network address
+/// (`.0`); the receiving host's `NetworkAllocator::reserve` will
+/// re-claim that slot if free, or fail-soft (no egress) if taken.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FcNetSnapshot {
+    /// `tap-engr-<6 hex>` — see `net::tap_name_for`. Recreated under
+    /// this exact name on restore because FC bakes the TAP name into
+    /// `state.bin`.
+    tap_name: String,
+    /// /30 network address (lowest octet's two LSBs are zero).
+    cidr_network: std::net::Ipv4Addr,
 }
 
 pub struct FirecrackerBackend {
@@ -790,6 +814,26 @@ impl FirecrackerBackend {
         }
 
         let (socket, child) = self.spawn_firecracker(jail_dir).await?;
+
+        // Re-provision the host-side networking BEFORE load_snapshot.
+        // FC's `state.bin` references the original TAP by name on the
+        // virtio-net frontend, and the snapshot load will fail when
+        // FC tries to open a TAP that doesn't exist on the receiving
+        // host. Same-host hot-resume: the original TAP/CIDR were freed
+        // on `destroy()`, so the slot is back in the allocator.
+        // Cross-host cold-resume: the slot may already be taken on
+        // this host, in which case we fail-soft (no egress) rather
+        // than rejecting the restore — the snapshot is still valid,
+        // the VM still boots, the user can re-create to recover egress.
+        let net_setup = match self.reserve_restored_net(manifest.net.as_ref()).await {
+            Ok(setup) => setup,
+            Err(e) => {
+                // We've spawned FC; clean up before bailing.
+                drop(child);
+                return Err(e);
+            }
+        };
+
         let api = FirecrackerClient::new(&socket);
 
         // For UFFD restore, spawn the handler BEFORE PUT /snapshot/load
@@ -797,23 +841,41 @@ impl FirecrackerBackend {
         // takes ownership of the kernel UFFD via SCM_RIGHTS, mmaps
         // memory.bin, and pages it in lazily. Either way the VM is
         // running by the time `load_snapshot*` returns (resume_vm: true).
-        let uffd_handler = match self.config.restore_mode {
-            RestoreMode::File => {
-                api.load_snapshot(&SnapshotPaths {
+        let load_result: Result<Option<Child>, SandboxError> = match self.config.restore_mode {
+            RestoreMode::File => api
+                .load_snapshot(&SnapshotPaths {
                     state_path: state_path.clone(),
                     mem_path: mem_path.clone(),
                 })
-                .await?;
-                None
-            }
+                .await
+                .map(|_| None),
             RestoreMode::Uffd => {
                 let uffd_uds = jail_dir.join("uffd.sock");
                 let _ = tokio::fs::remove_file(&uffd_uds).await;
-                let handler = self
+                match self
                     .spawn_uffd_handler(&uffd_uds, &mem_path, jail_dir)
-                    .await?;
-                api.load_snapshot_uffd(&state_path, &uffd_uds).await?;
-                Some(handler)
+                    .await
+                {
+                    Ok(handler) => api
+                        .load_snapshot_uffd(&state_path, &uffd_uds)
+                        .await
+                        .map(|_| Some(handler)),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        let uffd_handler = match load_result {
+            Ok(h) => h,
+            Err(e) => {
+                // Snapshot load failed: tear down the TAP we provisioned
+                // and free the /30 slot before propagating. Otherwise a
+                // failed restore leaks host-side network state.
+                if let Some(setup) = net_setup.as_ref() {
+                    net::teardown(setup, &self.net_allocator).await;
+                }
+                drop(child);
+                return Err(e);
             }
         };
 
@@ -851,16 +913,7 @@ impl FirecrackerBackend {
                 state,
                 child,
                 uffd_handler,
-                // Restore-time net wiring is not implemented yet —
-                // the manifest doesn't carry the original /30 (we'd
-                // want a different one anyway, the original may be
-                // freed already), and FC's snapshot bakes the TAP
-                // name into state.bin which the host won't have. A
-                // future fix re-provisions a fresh /30 + TAP and
-                // hot-plugs it via vmm.update; out of scope for
-                // this PR. Restored sandboxes therefore have no
-                // egress until destroyed and re-created.
-                net: None,
+                net: net_setup,
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
@@ -872,6 +925,57 @@ impl FirecrackerBackend {
             "firecracker microVM restored from snapshot",
         );
         Ok(())
+    }
+
+    /// Re-allocate the manifest's /30 slot and recreate the TAP under
+    /// the original name. Falls back to `Ok(None)` (no egress) when
+    /// the slot is already in use on this host — that's the cross-host
+    /// cold-resume case where the receiving host's allocator may have
+    /// handed the slot to another VM. `Ok(None)` is also returned when
+    /// the manifest predates the net field (older snapshots) or when
+    /// the source VM was created with networking disabled.
+    async fn reserve_restored_net(
+        &self,
+        snap: Option<&FcNetSnapshot>,
+    ) -> Result<Option<net::NetSetup>, SandboxError> {
+        let Some(snap) = snap else {
+            return Ok(None);
+        };
+        if self.config.net_pool.is_none() {
+            // Receiving host has networking disabled (test mode).
+            // Nothing to reserve, nothing to provision.
+            return Ok(None);
+        }
+        let cidr = net::VmCidr::new(snap.cidr_network);
+        match self.net_allocator.lock().reserve(cidr) {
+            Ok(_) => {}
+            Err(net::AllocError::SlotTaken) => {
+                tracing::warn!(
+                    cidr = %cidr.cidr_str(),
+                    tap = %snap.tap_name,
+                    "restore: original /30 already in use on this host; \
+                     restored sandbox will have no egress until re-created",
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(SandboxError::Vm(
+                    format!("reserve restored /30 {}: {e}", cidr.cidr_str()).into(),
+                ));
+            }
+        }
+        // Slot reserved. If TAP creation fails, return the slot to the
+        // allocator so the next restore attempt can try again rather
+        // than perpetually failing with SlotTaken.
+        match net::provision_with_named_tap(cidr, &snap.tap_name).await {
+            Ok(setup) => Ok(Some(setup)),
+            Err(e) => {
+                self.net_allocator.lock().free(cidr);
+                Err(SandboxError::Vm(
+                    format!("recreate TAP {}: {e}", snap.tap_name).into(),
+                ))
+            }
+        }
     }
 }
 
@@ -1057,11 +1161,16 @@ impl SandboxBackend for FirecrackerBackend {
     async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
         // Read sandbox state under the dashmap guard, drop guard before
         // any await so we don't hold the read lock across an HTTP call.
-        let (socket, spec) = {
+        let (socket, spec, net_snapshot) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            let net_snapshot = live.net.as_ref().map(|setup| FcNetSnapshot {
+                tap_name: setup.tap_name.clone(),
+                cidr_network: setup.vm_cidr.network(),
+            });
             (
                 live.state.firecracker_socket.clone(),
                 live.state.spec.clone(),
+                net_snapshot,
             )
         };
 
@@ -1084,6 +1193,7 @@ impl SandboxBackend for FirecrackerBackend {
             sandbox_id: id,
             created_at,
             spec: spec.clone(),
+            net: net_snapshot,
         };
         let manifest_path = dest.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -1498,6 +1608,50 @@ mod tests {
             }
             other => panic!("expected Snapshot error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn manifest_without_net_field_still_deserializes() {
+        // Old snapshots written before the `net` field landed must
+        // still parse — `serde(default)` lets `net` default to None.
+        let json = r#"{
+            "sandbox_id": "00000000-0000-0000-0000-000000000000",
+            "created_at": "2026-01-01T00:00:00Z",
+            "spec": {
+                "image": "warm-test",
+                "rootfs_source": null,
+                "image_uri": null,
+                "harness_pack_uri": null,
+                "cpu": {"vcpus": 1},
+                "memory": {"max_mib": 256},
+                "disk": {"max_gib": 1},
+                "ttl": null,
+                "env": {},
+                "workdir": null,
+                "harness_substrate": null,
+                "network": {}
+            }
+        }"#;
+        let manifest: FcSnapshotManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.net.is_none());
+    }
+
+    #[test]
+    fn manifest_with_net_field_round_trips() {
+        let manifest = FcSnapshotManifest {
+            sandbox_id: SandboxId::new(),
+            created_at: Utc::now(),
+            spec: spec(),
+            net: Some(FcNetSnapshot {
+                tap_name: "tap-engr-abcdef".into(),
+                cidr_network: std::net::Ipv4Addr::new(10, 200, 0, 4),
+            }),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let parsed: FcSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
+        let net = parsed.net.expect("net field should round-trip");
+        assert_eq!(net.tap_name, "tap-engr-abcdef");
+        assert_eq!(net.cidr_network, std::net::Ipv4Addr::new(10, 200, 0, 4));
     }
 
     #[tokio::test]

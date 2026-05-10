@@ -40,6 +40,12 @@ impl VmCidr {
         Self { network }
     }
 
+    /// `.0` of the /30. Used by the snapshot manifest to record which
+    /// slot the source VM had so restore can re-reserve it.
+    pub fn network(&self) -> Ipv4Addr {
+        self.network
+    }
+
     pub fn host(&self) -> Ipv4Addr {
         let o = self.network.octets();
         Ipv4Addr::new(o[0], o[1], o[2], o[3] | 0b01)
@@ -83,12 +89,24 @@ pub enum AllocError {
     /// The pool's been fully carved up. With a /16 that's 16k
     /// concurrent sandboxes — way past anything the host can host.
     PoolExhausted,
+    /// `reserve()` asked for a slot that's already handed out.
+    /// Cross-host cold resume can hit this when the receiving host's
+    /// allocator already gave the same /30 to another sandbox.
+    SlotTaken,
+    /// `reserve()` asked for a /30 that doesn't fall within this
+    /// allocator's pool (different /16, or alignment off). Treated as
+    /// a hard error rather than skip-with-warn — the manifest must
+    /// have been written by a host configured against a different
+    /// pool, which is a deployment bug, not a routine collision.
+    OutOfPool,
 }
 
 impl std::fmt::Display for AllocError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PoolExhausted => write!(f, "engram CIDR pool exhausted"),
+            Self::SlotTaken => write!(f, "/30 slot already in use"),
+            Self::OutOfPool => write!(f, "/30 outside the engram pool"),
         }
     }
 }
@@ -127,10 +145,42 @@ impl NetworkAllocator {
     }
 
     pub fn free(&mut self, cidr: VmCidr) {
-        let slot = self.slot_for_cidr(cidr);
+        let Some(slot) = self.try_slot_for_cidr(cidr) else {
+            return;
+        };
         if self.in_use.remove(&slot) {
             self.free.push(slot);
         }
+    }
+
+    /// Re-allocate a specific /30 — the path restore takes after the
+    /// snapshot manifest tells it which slot the original VM had. The
+    /// kernel's `ip=` cmdline is baked into `state.bin`, so a restored
+    /// VM has to come back on the same guest IP, which means the same
+    /// /30. Cross-host: if the receiving host happens to have already
+    /// handed out this slot, the caller falls back to no-egress
+    /// rather than failing the restore.
+    pub fn reserve(&mut self, cidr: VmCidr) -> Result<VmCidr, AllocError> {
+        let slot = self.try_slot_for_cidr(cidr).ok_or(AllocError::OutOfPool)?;
+        if slot >= self.pool_size {
+            return Err(AllocError::OutOfPool);
+        }
+        if self.in_use.contains(&slot) {
+            return Err(AllocError::SlotTaken);
+        }
+        if let Some(pos) = self.free.iter().position(|&s| s == slot) {
+            self.free.swap_remove(pos);
+        } else if slot >= self.next {
+            // Bump `next` past the requested slot. Mark intervening
+            // slots as free so a subsequent `alloc()` doesn't skip
+            // them and prematurely exhaust the pool.
+            for s in self.next..slot {
+                self.free.push(s);
+            }
+            self.next = slot + 1;
+        }
+        self.in_use.insert(slot);
+        Ok(cidr)
     }
 
     fn cidr_for_slot(&self, slot: u32) -> Ipv4Addr {
@@ -138,9 +188,19 @@ impl NetworkAllocator {
         Ipv4Addr::from(raw.to_be_bytes())
     }
 
-    fn slot_for_cidr(&self, cidr: VmCidr) -> u32 {
+    /// Inverse of `cidr_for_slot`. Returns None when the CIDR is
+    /// outside the pool or misaligned to a /30 boundary, so a stale
+    /// manifest can't crash the host with subtraction underflow.
+    fn try_slot_for_cidr(&self, cidr: VmCidr) -> Option<u32> {
         let raw = u32::from_be_bytes(cidr.network.octets());
-        (raw - self.pool_base) / 4
+        if raw < self.pool_base {
+            return None;
+        }
+        let off = raw - self.pool_base;
+        if off & 0b11 != 0 {
+            return None;
+        }
+        Some(off / 4)
     }
 
     pub fn live_count(&self) -> usize {
@@ -415,14 +475,31 @@ pub async fn provision(
 ) -> Result<NetSetup, NetError> {
     let vm_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
     let tap_name = tap_name_for(sandbox_id);
+    provision_with_named_tap(vm_cidr, &tap_name).await
+}
+
+/// Restore-time variant: the /30 is already reserved (caller passed
+/// the manifest's slot through `NetworkAllocator::reserve`) and the
+/// TAP name comes from the manifest, not the new sandbox's id. The
+/// guest's `state.bin` was snapshotted with the original TAP name on
+/// the virtio-net frontend, so we have to recreate it under the same
+/// name on the host or FC's snapshot load fails.
+#[cfg(target_os = "linux")]
+pub async fn provision_with_named_tap(
+    vm_cidr: VmCidr,
+    tap_name: &str,
+) -> Result<NetSetup, NetError> {
     let host_addr = format!("{}/30", vm_cidr.host());
 
-    let _ = run_cmd("ip", &["link", "delete", &tap_name]).await;
-    run_cmd("ip", &["tuntap", "add", &tap_name, "mode", "tap"]).await?;
-    run_cmd("ip", &["addr", "add", &host_addr, "dev", &tap_name]).await?;
-    run_cmd("ip", &["link", "set", "dev", &tap_name, "up"]).await?;
+    let _ = run_cmd("ip", &["link", "delete", tap_name]).await;
+    run_cmd("ip", &["tuntap", "add", tap_name, "mode", "tap"]).await?;
+    run_cmd("ip", &["addr", "add", &host_addr, "dev", tap_name]).await?;
+    run_cmd("ip", &["link", "set", "dev", tap_name, "up"]).await?;
 
-    Ok(NetSetup { vm_cidr, tap_name })
+    Ok(NetSetup {
+        vm_cidr,
+        tap_name: tap_name.to_string(),
+    })
 }
 
 /// Tear down the host-side networking. Best-effort.
@@ -453,6 +530,20 @@ pub async fn provision(
 ) -> Result<NetSetup, NetError> {
     Err(NetError::Spawn(
         "provision".into(),
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "FC networking is Linux-only",
+        ),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn provision_with_named_tap(
+    _vm_cidr: VmCidr,
+    _tap_name: &str,
+) -> Result<NetSetup, NetError> {
+    Err(NetError::Spawn(
+        "provision_with_named_tap".into(),
         std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "FC networking is Linux-only",
@@ -509,6 +600,43 @@ mod tests {
         a.free(c0);
         let reused = a.alloc().unwrap();
         assert_eq!(reused.cidr_str(), "10.200.0.0/30");
+    }
+
+    #[test]
+    fn reserve_holds_specific_slot_then_rejects_dupes() {
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        let target = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
+        a.reserve(target).unwrap();
+        // Same slot is now taken.
+        assert!(matches!(a.reserve(target), Err(AllocError::SlotTaken)));
+        // Subsequent alloc skips past the reserved slot via `next`.
+        let c0 = a.alloc().unwrap();
+        assert_eq!(c0.cidr_str(), "10.200.0.0/30");
+        let c2 = a.alloc().unwrap();
+        // 10.200.0.4 is reserved; next alloc should be the next slot
+        // beyond `next` (which we bumped past .4).
+        assert_eq!(c2.cidr_str(), "10.200.0.8/30");
+    }
+
+    #[test]
+    fn reserve_round_trips_through_free() {
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        let target = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        a.reserve(target).unwrap();
+        a.free(target);
+        // After free, the slot is reservable again.
+        a.reserve(target).unwrap();
+    }
+
+    #[test]
+    fn reserve_rejects_out_of_pool() {
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        // Different /16 → not in this allocator's pool.
+        let foreign = VmCidr::new(Ipv4Addr::from_str("10.201.0.0").unwrap());
+        assert!(matches!(a.reserve(foreign), Err(AllocError::OutOfPool)));
+        // Misaligned /30 (lowest two bits set) → not a valid network.
+        let misaligned = VmCidr::new(Ipv4Addr::from_str("10.200.0.5").unwrap());
+        assert!(matches!(a.reserve(misaligned), Err(AllocError::OutOfPool)));
     }
 
     #[test]
