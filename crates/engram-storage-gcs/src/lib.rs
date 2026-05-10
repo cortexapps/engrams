@@ -43,19 +43,32 @@ pub struct GcsBlobStorage {
 }
 
 impl GcsBlobStorage {
-    /// Construct against a bucket. Auth comes from
-    /// `ClientConfig::default().with_auth()` — ADC for production,
-    /// or anonymous + emulator-rewritten endpoints when
-    /// `STORAGE_EMULATOR_HOST` is set. Failing to resolve auth is a
-    /// `BlobError::Config` since it's a deployment misconfiguration,
-    /// not a transient network issue.
+    /// Construct against a bucket. When `STORAGE_EMULATOR_HOST` is
+    /// set, points the client at that endpoint with anonymous auth
+    /// — `fake-gcs-server` for local dev. Otherwise uses ADC against
+    /// production GCS.
+    ///
+    /// Note: `google-cloud-storage` v0.24 does not auto-honor
+    /// `STORAGE_EMULATOR_HOST` (`grep -rn STORAGE_EMULATOR_HOST` in
+    /// the SDK turns up only a `// TODO emulator support` note). We
+    /// thread it through explicitly here.
     pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
-        // The SDK's `with_auth()` short-circuits when
-        // `STORAGE_EMULATOR_HOST` is set; we don't have to branch.
-        let cfg = ClientConfig::default()
-            .with_auth()
-            .await
-            .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))?;
+        let cfg = if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
+            // Emulator mode: anonymous auth + the override endpoint.
+            // Strip a trailing slash so requests don't double up.
+            let endpoint = host.trim_end_matches('/').to_string();
+            tracing::info!(endpoint, "gcs: using STORAGE_EMULATOR_HOST");
+            ClientConfig {
+                storage_endpoint: endpoint,
+                ..ClientConfig::default()
+            }
+            .anonymous()
+        } else {
+            ClientConfig::default()
+                .with_auth()
+                .await
+                .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))?
+        };
         Ok(Self {
             client: Arc::new(Client::new(cfg)),
             bucket: bucket.into(),
@@ -163,5 +176,69 @@ mod tests {
         let _store = GcsBlobStorage::connect("engram-snapshots-test")
             .await
             .expect("connect against emulator");
+    }
+
+    /// End-to-end round-trip against the live emulator: put a body,
+    /// get it back, verify byte-for-byte equality, exists/head agree
+    /// on size, delete is idempotent. Gated on
+    /// `STORAGE_EMULATOR_HOST` + `ENGRAM_TEST_GCS_BUCKET` so it
+    /// no-ops on hosts without docker. Run locally via
+    /// `bash deploy/dev/seed-buckets.sh && \
+    ///  ENGRAM_TEST_GCS_BUCKET=engram-snapshots-test \
+    ///  STORAGE_EMULATOR_HOST=http://localhost:4443 \
+    ///  cargo nextest run -p engram-storage-gcs`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn round_trip_against_emulator() {
+        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+            return;
+        };
+        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
+            return;
+        };
+
+        let store = GcsBlobStorage::connect(bucket)
+            .await
+            .expect("connect against emulator");
+
+        // Use a unique key per run so concurrent test invocations
+        // don't collide on the shared emulator state.
+        let key = format!(
+            "engram/snapshots/test/round-trip-{}.bin",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
+        // Body designed to surface common SDK bugs:
+        //   - Larger than one TCP frame (1 KiB+) so streaming, not
+        //     a single sync flush, is what's exercised.
+        //   - Bytes that include 0x00 + 0xFF + every-other-byte to
+        //     surface any text-mode mangling.
+        let body: Vec<u8> = (0..4096_u16).map(|i| (i % 257) as u8).collect();
+
+        let put_size = store
+            .put(&key, bytes::Bytes::from(body.clone()))
+            .await
+            .expect("put");
+        assert_eq!(put_size, body.len() as u64);
+
+        let head = store.head(&key).await.expect("head");
+        assert_eq!(head.size_bytes, body.len() as u64);
+        assert!(head.etag.is_some(), "GCS responses always include etag");
+
+        let got = store.get(&key).await.expect("get");
+        assert_eq!(&got[..], &body[..], "round-tripped bytes must match");
+
+        // Delete + idempotent re-delete.
+        store.delete(&key).await.expect("delete");
+        assert!(!store.exists(&key).await.unwrap());
+        store
+            .delete(&key)
+            .await
+            .expect("delete on missing key must be idempotent");
+
+        // After delete, get/head should surface NotFound.
+        assert!(matches!(store.head(&key).await, Err(BlobError::NotFound)));
     }
 }

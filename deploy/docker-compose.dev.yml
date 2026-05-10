@@ -63,7 +63,7 @@ services:
   # host-side address rather than the container hostname, which the
   # SDK can't reach.
   fake-gcs-server:
-    image: fsouza/fake-gcs-server:1.49.4
+    image: fsouza/fake-gcs-server:1.54.0
     restart: unless-stopped
     ports:
       - "4443:4443"
