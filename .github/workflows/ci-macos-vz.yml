@@ -37,6 +37,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # See ci.yml for rationale — fires CI on the queue's combined
+  # merge ref so the macOS gate validates the same tree that will
+  # land on main.
+  merge_group:
+    branches: [main]
   workflow_dispatch: {}
 
 # See ci.yml for rationale (cancel PR-only, keep main runs serial).

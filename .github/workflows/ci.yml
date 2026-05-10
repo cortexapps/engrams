@@ -31,6 +31,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # GitHub Merge Queue fires `merge_group` events for the temporary
+  # ref it builds out of (current main + queued PRs combined). Branch
+  # protection blocks the queue from completing until every required
+  # check passes against THIS ref, which is what guarantees main's
+  # HEAD was CI'd against the exact tree being merged.
+  merge_group:
+    branches: [main]
   workflow_dispatch: {}
 
 # Cancel an in-progress PR run when a new push lands on the same
