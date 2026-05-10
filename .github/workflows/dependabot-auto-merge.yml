@@ -1,0 +1,60 @@
+name: Dependabot auto-merge
+
+# Approves and enables auto-merge for Dependabot PRs that are
+# patch- or minor-bumps. Major bumps are intentionally excluded —
+# they're where breaking changes hide and the review needs to
+# happen by hand, one ecosystem at a time.
+#
+# Why both steps in one workflow:
+#   - Branch protection on `main` requires 1 approval. Dependabot
+#     itself can't approve its own PRs, so we approve from the
+#     `github-actions[bot]` actor (different actor from
+#     `dependabot[bot]` — GitHub allows this).
+#   - With approval + green CI, `gh pr merge --auto` closes the
+#     loop: GitHub squashes-and-merges as soon as required checks
+#     pass.
+#
+# Trigger choice — `pull_request` (NOT `pull_request_target`):
+#   Dependabot PRs come from same-repo branches (not forks), so
+#   the GITHUB_TOKEN already has full write context. Using
+#   `pull_request` avoids the `pull_request_target` foot-gun
+#   where untrusted PR code can run with elevated permissions.
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    name: Auto-approve + enable auto-merge (patch/minor)
+    runs-on: ubuntu-latest
+    # Belt-and-suspenders: this job only runs for Dependabot's
+    # actor, but the `if:` makes it impossible for a forked PR or
+    # a misconfigured trigger to ever execute the approval step.
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]'
+
+    steps:
+      - name: Read Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Grouped Dependabot PRs report `update-type` as the
+      # *highest* semver bump in the group, so a group containing
+      # any major bump fails this gate and is left for a human.
+      - name: Approve PR
+        if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.metadata.outputs.update-type)
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr review --approve "$PR_URL" --body "Auto-approved: ${{ steps.metadata.outputs.update-type }} via Dependabot."
+
+      - name: Enable auto-merge (squash)
+        if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.metadata.outputs.update-type)
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
