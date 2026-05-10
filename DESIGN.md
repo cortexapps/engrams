@@ -105,16 +105,18 @@ Snapshot store lives on each host's local NVMe — an FC `memory.bin` for hot re
 
 ## Source-of-truth model
 
-Three layers of state, with explicit durability guarantees (ADR 0001 + 0002):
+Four layers of state, with explicit durability guarantees (ADR 0005 supersedes the git-as-durability framing of ADR 0001):
 
 | Layer | Contents | Durability | On loss |
 |---|---|---|---|
-| **Postgres** | session metadata, `session_events` (conversation log + tool calls), host registry, image versions | permanent (managed/backups) | hard failure — must guard |
-| **Git remote** | workspace files at checkpoint boundaries — `engram/sessions/<id>` branch per session | permanent | hard failure — must guard |
-| **Image registry** | warm-pool base images (Phase 5: Docker registry; today: per-host local files baked from `Dockerfile` + `engram.toml`) | reproducible from Dockerfiles | rebuild |
-| **Snapshot store** | per-host local microVM snapshots (FC `memory.bin` for Linux; APFS rootfs clones for VZ) | host-local only — *not* replicated | session goes `Dead`; caller forks the workspace |
+| **Postgres** | session metadata, `session_events` (conversation log + tool calls), host registry, sealed cold-blob refs | permanent (managed/backups) | hard failure — must guard |
+| **Image registry** | bake images + harness packs as OCI artifacts (ADR 0004); host-agents pull on first use into a content-addressable cache | reproducible from Dockerfiles + push pipelines | rebuild |
+| **Hot snapshot store** | per-host local NVMe — FC `memory.bin` + state file on Linux, APFS rootfs clones on VZ. Sub-second resume on the same host. | host-local only; not replicated | falls back to cold tier if `blob_present`, otherwise the session goes `Dead` |
+| **Cold snapshot store** | tar+zstd of the FC snapshot dir, stored in a `BlobStorage` backend (S3/GCS/local fs); sealed blob URL persisted in Postgres under the deployment KEK | permanent (replicated by the bucket / backed up by the deployment's own policy) | session goes `Dead` (terminal) |
 
-**Design rule**: snapshots are a *cache* of in-memory state, not durable. Sessions live ↔ snapshot lifetime on the host they were created on. Loss = `Dead` terminal state. The conversation log + workspace branch survive (Postgres + git), so the caller can `engram session fork <id>` to start a new session from the workspace.
+**Design rule**: snapshots come in two tiers, with the cold tier as the cross-host durability primitive. Sessions live ↔ snapshot residency in *either* tier. Hot is the fast path; cold survives host loss, disk-pressure flushing, and operator-initiated drains. The conversation log in Postgres survives independently — historical events are queryable forever — but the agent's in-memory state lives or dies with the snapshot pair.
+
+Git is **not** in this table. Agents that want their work to land in a remote do `git push` themselves inside the sandbox using credentials mounted via `[secrets.GITHUB_TOKEN]` (or SSH key); that's a tool the agent uses, not a layer the platform owns.
 
 ---
 
@@ -161,14 +163,22 @@ Three layers of state, with explicit durability guarantees (ADR 0001 + 0002):
 
 ### Snapshot manager (lives inside host agent)
 
-**Single tier — host-local only.** ADR 0001 retired the cold-tier blob replication subsystem; ADR 0002 made session lifetime host-local-bounded by design.
+**Two tiers (ADR 0005)**: hot tier on local NVMe for same-host fast resume, cold tier in `BlobStorage` for cross-host durability. ADR 0001 retired the cold tier; ADR 0005 reintroduced it once the premise shifted from "30-second-preemption replication" (infeasible math) to "minutes-budget disk-pressure flush" (trivial math).
 
-- **FC backend (Linux production)**: `PATCH /vm Paused` + `PUT /snapshot/create` writes a state file + `memory.bin` to local NVMe. Restore via `PUT /snapshot/load` with `backend_type=Uffd` for sub-100ms hot resume on the same host.
-- **VZ backend (macOS dev)**: pause VM → APFS-clone the per-sandbox rootfs into the snapshot dir → resume. The clone is the snapshot. Restore clones it back into a fresh per-sandbox file and cold-boots a new VM (~750 ms total). VZ's native `saveMachineStateToURL`/`restoreMachineStateFromURL` is broken upstream for arm64 Linux guests; ADR 0003 explains.
+- **Hot — FC backend (Linux production)**: `PATCH /vm Paused` + `PUT /snapshot/create` writes a state file + `memory.bin` to local NVMe. Restore via `PUT /snapshot/load` with `backend_type=Uffd` for sub-100ms hot resume on the same host.
+- **Hot — VZ backend (macOS dev)**: pause VM → APFS-clone the per-sandbox rootfs into the snapshot dir → resume. The clone is the snapshot. Restore clones it back into a fresh per-sandbox file and cold-boots a new VM (~750 ms total). VZ's native `saveMachineStateToURL`/`restoreMachineStateFromURL` is broken upstream for arm64 Linux guests; ADR 0003 explains.
+- **Cold — `BlobStorage` (any backend)**: `engram-host-agent::flush::flush_session` runs `sh -c 'tar -cf - -C <snapshot_path> . | zstd -3 -T0'` and pipes stdout to `BlobStorage::put_streaming`. The blob URL is sealed under the deployment KEK and persisted on the snapshot row (`engram-coordinator::blob::seal_blob_ref`). Resume reverses the pipeline: `BlobStorage::get_streaming` → `zstd -d | tar -xf -` into a fresh per-session staging dir → `SandboxBackend::restore`.
 
-**Eviction**: idle TTL crossed → `idle_evictor` snapshots + destroys the VM, marks the session `Idle`. Next prompt/exec/SSE-subscribe triggers `ensure_active`, which auto-resumes from the local snapshot. If the local snapshot is gone (host crashed, disk full, hard TTL passed): session goes `Dead` and `POST /sessions/:id/resume` returns `HTTP 410 Gone`.
+**Hot eviction (idle TTL)**: idle TTL crossed → `idle_evictor` snapshots + destroys the VM, marks the session `Idle`. Next prompt/exec/SSE-subscribe triggers `ensure_active`, which auto-resumes from the local snapshot.
 
-**Schema** (`snapshots` table): `session_id, host_id, local_path, image_version, size_bytes, created_at, last_accessed_at`. (`blob_url`/`replicated_at` columns retired with the blob-replication subsystem.)
+**Cold eviction (disk pressure or admin trigger)**: `engram-host-agent::disk_pressure` polls statvfs; below threshold (default 15% free) it runs the flush primitive on LRU idle sessions. Or operators trigger it explicitly via `POST /api/admin/sessions/:id/flush` / `POST /api/admin/flush-idle`. Implicit + explicit triggers share `flush_session`. Session transitions Idle → ColdEvicted; subsequent `ensure_active` auto-resumes via cold tier.
+
+**Resume dispatcher** (`POST /sessions/:id/resume` and `ensure_active`):
+- `Idle` → hot resume (sub-second, snapshot-affinity-routed to the original host)
+- `ColdEvicted` → cold resume (download + untar + restore on any host with capacity)
+- `Dead` → 410 Gone
+
+**Schema** (`snapshots` table, post-Stage-0 migration `0016`): `session_id, host_id, local_path, image_version, size_bytes, created_at, last_accessed_at, blob_present, replicated_at, wrapped_dek, nonce, ciphertext, key_id`. The four-column sealed-blob-ref quartet matches the `registry_credentials` and `session_secrets` shape from Phase 5b — same `engram-crypto::CredCipher` pipeline.
 
 ### Pool warmer (lives inside host agent)
 
@@ -716,17 +726,20 @@ Order is deliberate: each phase produces something runnable end-to-end. Don't bu
 
 **Deliverable**: stand up coordinator (2 replicas) + 3 hosts; sessions distribute. Kill one host with `kill -9 firecracker-pid` and observe sessions migrate within 30s. Restart a coordinator replica; client SSE streams transparently survive.
 
-### Phase 4 — Versioned conversations + pack hosts ✅
+### Phase 4 — Hot suspend + harness protocol ✅
 
-**Goal**: agent-first durability via git checkpoints + first-class hot/cold suspend mechanics. Phase 4 was originally framed as "drain VM memory snapshots to GCS in the 30s GCP preemption window." That model is mathematically infeasible for realistic workloads (5 sandboxes × 8 GiB ≫ 30s × 250 MB/s) and conflates "preserve VM state" with "preserve agent progress" — different things. The reframe: **agent state is externalized** (workspace files + transcript), so the right durability primitive is git, not blob-replicated memory.
+> **Note**: Phase 4 was originally framed as "agent-first durability via git checkpoints" (ADR 0001 + 0002). Phase 6 / ADR 0005 retired that framing — git is no longer the platform's workspace durability primitive; the cold-tier `BlobStorage` it deleted is back. The hot-suspend / harness-protocol / preemption-drain pieces of Phase 4 stayed; Tracks 0 (blob removal) + C (checkpoint primitive) + F (`engram session {log,diff,fork,checkpoint}`) were unwound.
 
-ADR 0002 then narrowed the contract further: **engram is a one-shot task runner**. A session lives ↔ its FC snapshot. Snapshot loss → `Dead` terminal state. Cross-host cold resume was retired; the caller forks the workspace if they want to continue from a Dead session. This collapsed `PendingReassign` → `Dead`, removed the operator-initiated `POST /sessions/:id/migrate`, removed `?from_event_idx` resume-replay, and surfaced `HTTP 410 Gone` for resume against an invalidated snapshot. ~600 LOC retired; the remaining surface is exactly what's load-bearing.
+**Goal (post-amendment)**: hot-suspend mechanics + the harness protocol. Phase 4 was originally framed as "drain VM memory snapshots to GCS in the 30s GCP preemption window." That model is mathematically infeasible for realistic workloads (5 sandboxes × 8 GiB ≫ 30s × 250 MB/s) — that math holds. ADR 0005's reframe: the relevant deadline is *disk-pressure flushing* (minutes, not seconds), which makes blob-tier durability viable again. See Phase 6.
 
-**Storage split**:
+ADR 0002 narrowed the contract: **engram is a one-shot task runner**. ADR 0005 amends the durability boundary from "session lives ↔ FC snapshot exists on its origin host" to "session lives ↔ snapshot exists somewhere (hot tier or cold tier)." The one-shot semantics still hold — sessions don't infinitely migrate, hot resume stays same-host, `Dead` is terminal — the new shape just moves the Dead boundary to "snapshot lost from both tiers."
 
-- **Postgres `session_events`** is the conversation source of truth. Tool-call-grain harness events land here with their `transcript_delta` bytes; the SSE bus, Web UI, Slackbot, and resume bootstrap consume from this stream.
-- **Git** is the workspace source of truth. Each session owns an `engram/sessions/<id>` checkpoint branch on its writable repo. Checkpoints push the workspace state; resume fetches and resets to the branch.
-- **Blob storage is removed** (Track 0). Snapshots are local-NVMe-only. Image distribution moves to a Docker registry in Phase 5.
+**Storage split (current shape — see Phase 6 / ADR 0005 for the supersession trajectory)**:
+
+- **Postgres `session_events`** is the conversation source of truth. Tool-call-grain harness events land here; the SSE bus, Web UI, Slackbot consume from this stream.
+- **Hot snapshot store** (per-host local NVMe) for sub-second same-host resume.
+- **Cold snapshot store** (`BlobStorage` — S3/GCS/local fs) for cross-host durability under disk pressure / admin flush. Sealed under the deployment KEK in Postgres.
+- ~~Git remote~~ — retired by ADR 0005. Agents that want to push code do it themselves inside the sandbox via mounted credentials; the platform never runs `git push`.
 
 **Two snapshot mechanisms, distinct purposes**:
 

@@ -1,7 +1,37 @@
 # ADR 0001: Sessions are versioned conversations, not migratable VMs
 
-Status: accepted, 2026-04-28
+Status: **superseded by [ADR 0005](./0005-disk-pressure-blob-tier.md), 2026-05-09**
+
+Original status: accepted, 2026-04-28
 Phase: 4
+
+> **Superseded.** ADR 0005 reverses the two load-bearing decisions
+> here:
+>
+> - **"Blob storage is removed entirely"** is gone. The cold-tier
+>   `BlobStorage` subsystem is back, this time as the disk-pressure
+>   flush target rather than a 30-second-preemption-window
+>   replication path.
+> - **"Engram becomes a system for versioned agent conversations"**
+>   with git as the workspace durability primitive is replaced by
+>   "sessions are bake-image sandboxes with hot+cold snapshot
+>   tiers." The conversation log in `session_events` stays, but git
+>   is no longer the platform's workspace persistence — agents push
+>   inside the sandbox using mounted credentials when they want to.
+>
+> What this ADR got right and ADR 0005 keeps:
+>
+> - Live VM migration to blob in a 30-second window is infeasible
+>   (the math holds; ADR 0005 just stopped optimizing for that
+>   premise).
+> - The conversation log lives in Postgres `session_events` — that
+>   stays the source of truth for the agent's play-by-play.
+> - The split between "what the platform persists" vs. "what the
+>   agent does inside the box."
+>
+> Body kept verbatim below for historical context.
+
+---
 
 ## Context
 

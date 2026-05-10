@@ -103,10 +103,15 @@ com.apple.security.virtualization entitlement" — caught by the
 ## Step 4 — exercise the lifecycle
 
 ```bash
+# Pre-req: enable an image (one-time):
+curl -sS -X POST http://127.0.0.1:8090/api/enabled-images \
+    -H 'Content-Type: application/json' \
+    -d '{"image_uri": "localhost:5001/engram/vz-claude:warm-1"}'
+
 SID=$(curl -sS -X POST http://127.0.0.1:8090/sessions \
         -H 'Content-Type: application/json' \
-        -d '{"repo": "local://demo", "branch": "main",
-             "image_version": "warm-1"}' \
+        -d '{"image": "localhost:5001/engram/vz-claude:warm-1",
+             "harness": {"kind": "builtin", "name": "claude"}}' \
       | jq -r .session_id)
 
 # Watch the chat-shaped wire.
@@ -116,7 +121,7 @@ curl -N http://127.0.0.1:8090/sessions/$SID/events
 #   harness_idle
 #   <agent activity if a prompt is fed>
 
-# Send a prompt (claude bake only).
+# Send a prompt.
 curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
     -H 'Content-Type: application/json' \
     -d '{"text": "list /workspace and tell me what you see"}'
@@ -127,19 +132,28 @@ curl http://127.0.0.1:8090/sessions/$SID  # status: idle
 curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
     -H 'Content-Type: application/json' \
     -d '{"text": "still there?"}'
-# VZ restoreMachineStateFromURL fires; bridge re-binds; new harness
-# adapter dials back.
+# Hot resume: VZ rootfs clone restored, bridge re-binds, harness
+# adapter dials back, sub-second.
+
+# ADR 0005 — cold-tier flush + cold resume.
+sleep 35       # back to Idle
+# Explicitly flush (Stage 5 admin endpoint; same primitive Stage 7's
+# disk-pressure detector calls implicitly).
+curl -sS -X POST http://127.0.0.1:8090/api/admin/sessions/$SID/flush
+curl http://127.0.0.1:8090/sessions/$SID  # status: cold_evicted
+# Resume from cold tier — downloads blob, untars, restores on any host.
+curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
+    -d '{"text": "still there after cold flush?"}'
 
 # Force a Dead session (snapshot invalidation).
 sleep 35
 rm -rf var/engram/snapshots/$SID
+# Also clear the cold copy from the blob backend; otherwise resume
+# falls back to cold tier successfully.
+ENGRAM_BLOB_BACKEND=local && rm -rf var/engram/blobs/engram/snapshots/*
 curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
     -d '{"text": "this should fail"}'
 # Expect HTTP 410 Gone with body "snapshot_invalidated".
-
-curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
-# Forks workspace + events into a new session; old conversation is not
-# replayed (one-shot task runner contract).
 ```
 
 ## Diagnostic tips
@@ -196,4 +210,7 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/fork
   static kernel. Verified flow on macOS Apple Silicon:
   `status_changed → run_started → agent_message → run_completed →
   harness_idle → snapshot_taken → evicted → status_changed →
-  run_started (post-resume)`.
+  run_started (post-hot-resume) → ... → cold_evicted →
+  cold_resumed → run_started (post-cold-resume)`. The cold-tier
+  branches (ADR 0005 / Stage 5+) flow through the same harness +
+  bridge wire surface as the hot path.

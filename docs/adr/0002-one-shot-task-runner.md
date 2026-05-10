@@ -1,7 +1,35 @@
 # ADR 0002: Engram is a one-shot agent task runner
 
-Status: accepted, 2026-04-29
+Status: **amended by [ADR 0005](./0005-disk-pressure-blob-tier.md), 2026-05-09**
+
+Original status: accepted, 2026-04-29
 Phase: Phase 4 cleanup, post-Claude-adapter prep
+
+> **Amended.** ADR 0005 widens the durability contract from
+> "session lives ↔ FC snapshot exists on its origin host" to
+> "session lives ↔ snapshot exists somewhere (hot tier on a host's
+> NVMe, or cold tier in blob)." The one-shot semantics this ADR
+> established still hold: sessions don't infinitely migrate, hot
+> resume stays same-host, `Dead` is terminal — the new shape just
+> moves the Dead boundary from "snapshot lost from this host" to
+> "snapshot lost from both tiers."
+>
+> Specifically:
+>
+> - The `Dead` terminal state stays. ADR 0005 widens the
+>   conditions: now you reach Dead only when the cold blob is also
+>   gone (deleted, KEK lost, intentional GC).
+> - `HTTP 410 Gone` on resume against an invalidated snapshot stays.
+> - `engram session fork` is gone (the git surface it depended on
+>   was retired by ADR 0005). Cross-host continuation now happens
+>   automatically via cold resume; no caller-driven fork step.
+> - The harness contract ("emit events while alive; engram doesn't
+>   resurrect you") is unchanged. Cold resume materializes a fresh
+>   sandbox + a fresh harness child — same shape as hot resume.
+>
+> Body kept verbatim below.
+
+---
 
 ## Context
 

@@ -69,36 +69,14 @@ from either step removes `rootfs_path`. Equivalently, use a guard
 struct with `Drop` that unlinks the clone unless explicitly
 `disarm()`d after `vm.start()` succeeds.
 
-## 3. Resume path drops the secret-augmented env
+## 3. ~~Resume path drops the secret-augmented env~~ (FIXED)
 
-**File**: `crates/engram-coordinator/src/api/snapshot.rs` —
-the `build_dev_agent` call inside the resume path (around line 280,
-flagged with a `TODO(secrets-on-resume)` comment).
-
-```rust
-let resume_base_env: HashMap<String, String> = HashMap::new();
-if let Some(agent) =
-    crate::api::sessions::build_dev_agent(&state, id, None, &resume_base_env)
-{ … }
-```
-
-When a session idle-evicts and is later resumed, the harness gets
-re-launched with an empty base env. So `ANTHROPIC_API_KEY` /
-`CLAUDE_CODE_OAUTH_TOKEN` / any other manifest-declared secret is
-absent post-resume — the next prompt will fail with auth errors even
-though create-time worked. The empty HashMap was a placeholder
-introduced when `build_dev_agent` gained its `base_env` argument
-(the fix that landed delivery to create-time). Resume needs the same
-treatment.
-
-**Fix**: at resume, look up the session's `repo` + `image_version`,
-re-load the manifest via the image registry, re-resolve the secret
-bundle through `state.services.secrets.resolve(...)` with the same
-`SecretContext` shape used at create, build a `spec_env` via
-`apply_secrets_to_env`, and pass that into `build_dev_agent` instead
-of the empty map. Ideally factor the create-time secret-resolution
-block out of `api/sessions.rs::create_session` into a helper so both
-paths share it.
+**Resolved.** Commit `2d45a3b` (`fix(resume): re-resolve manifest
+[secrets.*] from SecretStore`) landed the two-layer resume env build:
+manifest secrets re-resolved fresh from the SecretStore + per-request
+overrides decrypted from `session_secrets`. See
+`crates/engram-coordinator/src/api/snapshot.rs::resume_from_fc_snapshot`
++ `resume_from_cold` (which use the same helpers).
 
 ## 4. Browser shell endpoint has no auth gate
 
