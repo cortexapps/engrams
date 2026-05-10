@@ -64,6 +64,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HarnessCmd,
     },
+    /// Admin operations — explicit triggers for primitives whose
+    /// production driver is implicit (disk-pressure detector etc.).
+    /// Auth-gated behind the same bearer token as the rest of the
+    /// API.
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminCmd {
+    /// Force a cold-tier flush of one Idle session's snapshot.
+    /// Errors with 409 if the session isn't Idle (no snapshot to
+    /// flush). Returns the FlushOutcome JSON.
+    Flush { id: String },
+    /// Flush every Idle session in the cluster, in parallel
+    /// (bounded). Useful for "drain before redeploy" + integration
+    /// tests. Returns one entry per session — success or
+    /// per-session error.
+    FlushIdle,
 }
 
 #[derive(Subcommand, Debug)]
@@ -518,7 +539,93 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             HarnessCmd::List => harness_list(&client, &cli.endpoint, cli.json).await,
             HarnessCmd::Rm { name } => harness_rm(&client, &cli.endpoint, name).await,
         },
+        Cmd::Admin { cmd } => match cmd {
+            AdminCmd::Flush { id } => admin_flush(&client, &cli.endpoint, id, cli.json).await,
+            AdminCmd::FlushIdle => admin_flush_idle(&client, &cli.endpoint, cli.json).await,
+        },
     }
+}
+
+// ---- admin subcommands -------------------------------------------------
+
+async fn admin_flush(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/api/admin/sessions/{id}/flush"))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+    println!(
+        "flushed {}: {} bytes in {}ms",
+        parsed["session_id"].as_str().unwrap_or(id),
+        parsed["blob_size_bytes"].as_u64().unwrap_or(0),
+        parsed["took_ms"].as_u64().unwrap_or(0),
+    );
+    Ok(())
+}
+
+async fn admin_flush_idle(
+    client: &reqwest::Client,
+    endpoint: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = client
+        .post(format!("{endpoint}/api/admin/flush-idle"))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Http(status.as_u16(), body));
+    }
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+    let empty = Vec::new();
+    let results = parsed["results"].as_array().unwrap_or(&empty);
+    if results.is_empty() {
+        println!("(no idle sessions to flush)");
+        return Ok(());
+    }
+    let (mut ok, mut err) = (0usize, 0usize);
+    for r in results {
+        if r["ok"].as_bool().unwrap_or(false) {
+            ok += 1;
+            let oc = &r["outcome"];
+            println!(
+                "ok  {} ({} bytes, {}ms)",
+                r["session_id"].as_str().unwrap_or(""),
+                oc["blob_size_bytes"].as_u64().unwrap_or(0),
+                oc["took_ms"].as_u64().unwrap_or(0),
+            );
+        } else {
+            err += 1;
+            println!(
+                "err {}: {}",
+                r["session_id"].as_str().unwrap_or(""),
+                r["error"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    println!("\n{ok} flushed, {err} failed");
+    Ok(())
 }
 
 // ---- session subcommands ------------------------------------------------

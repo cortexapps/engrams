@@ -4,6 +4,7 @@ use axum::Router;
 
 use crate::state::SharedState;
 
+mod admin;
 pub mod auth;
 mod enabled_images;
 mod events;
@@ -68,6 +69,8 @@ pub fn router(state: SharedState) -> Router {
             "/api/enabled-images/disable",
             post(enabled_images::disable_enabled_image),
         )
+        .route("/api/admin/sessions/:id/flush", post(admin::flush_one))
+        .route("/api/admin/flush-idle", post(admin::flush_idle))
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,
