@@ -52,6 +52,31 @@ services:
     volumes:
       - engram-registry-data:/var/lib/registry
 
+  # GCS emulator for cold-tier blob durability (ADR 0005 / Stage 4).
+  # `fake-gcs-server` speaks the GCS JSON API over plaintext HTTP on
+  # port 4443; the Rust SDK rewrites endpoints to it whenever
+  # `STORAGE_EMULATOR_HOST=http://localhost:4443` is in scope. Used by
+  # `just dev` so the cold-tier flush primitive (Stage 5) can be
+  # exercised end-to-end without GCP credentials.
+  #
+  # `-public-host` makes pre-signed URLs / metadata point at the
+  # host-side address rather than the container hostname, which the
+  # SDK can't reach.
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server:1.49.4
+    restart: unless-stopped
+    ports:
+      - "4443:4443"
+    volumes:
+      - engram-fake-gcs-data:/data
+    command: >
+      -scheme http
+      -host 0.0.0.0
+      -port 4443
+      -public-host localhost:4443
+      -data /data
+
 volumes:
   engram-pg-data:
   engram-registry-data:
+  engram-fake-gcs-data:

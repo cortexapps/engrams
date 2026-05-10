@@ -7,9 +7,10 @@
 
 use std::sync::Arc;
 
-use engram_core::traits::{CloudBackend, MetadataStore, SandboxBackend, SecretStore};
+use engram_core::traits::{BlobStorage, CloudBackend, MetadataStore, SandboxBackend, SecretStore};
 
 pub mod api;
+pub mod blob;
 pub mod config;
 pub mod dead_host;
 pub mod error;
@@ -49,6 +50,11 @@ pub struct Services {
     /// (`--fc-egress-proxy=disabled`) or failed to start (logged at
     /// startup, sessions still work but with no egress filtering).
     pub egress_proxy: Option<EgressProxy>,
+    /// Cold-tier blob storage (ADR 0005). Used by the flush primitive
+    /// (Stage 5) and the cross-host cold-resume path (Stage 6).
+    /// Selected at boot via `ENGRAM_BLOB_BACKEND={local,gcs}`;
+    /// defaults to `local` so `just dev` works without cloud creds.
+    pub blob: Arc<dyn BlobStorage>,
 }
 
 /// Coordinator-side handle to the running egress proxy. Owns the

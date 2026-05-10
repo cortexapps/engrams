@@ -264,6 +264,27 @@ impl MetadataStore for MiniMeta {
     ) -> Result<Option<engram_core::types::SessionSecrets>, MetaError> {
         Ok(None)
     }
+    async fn latest_cold_snapshot_for_session(
+        &self,
+        _: SessionId,
+    ) -> Result<Option<(SnapshotRecord, engram_core::traits::SealedBlobRef)>, MetaError> {
+        Ok(None)
+    }
+    async fn flush_to_cold(
+        &self,
+        _: SessionId,
+        _: engram_core::SnapshotId,
+        _: engram_core::traits::SealedBlobRef,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn clear_local_path(&self, _: engram_core::SnapshotId) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn list_idle_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        Ok(Vec::new())
+    }
     async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
         Ok(())
     }
@@ -321,6 +342,9 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
             engram_oci::AnonymousResolver,
         ))),
         egress_proxy: None,
+        blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+            std::env::temp_dir().join("engram-blobs-test"),
+        )),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
@@ -442,6 +466,9 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
             engram_oci::AnonymousResolver,
         ))),
         egress_proxy: None,
+        blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+            std::env::temp_dir().join("engram-blobs-test"),
+        )),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),

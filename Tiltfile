@@ -111,9 +111,15 @@ dc_resource('postgres',
 dc_resource('registry',
     labels=['infra'],
     links=['http://localhost:5001/v2/_catalog'])
+# GCS emulator for cold-tier blob durability (ADR 0005 / Stage 4).
+# The Rust SDK rewrites endpoints to `STORAGE_EMULATOR_HOST` whenever
+# that env var is set; the coordinator + host-agent both honor it.
+dc_resource('fake-gcs-server',
+    labels=['infra'],
+    links=['http://localhost:4443/storage/v1/b'])
 
 # ----------------------------------------------------------------
-# Setup one-shots: KEK + (Mac only) codesign.
+# Setup one-shots: KEK + GCS bucket seed + (Mac only) codesign.
 #
 # Harness packs are pushed to the local registry and registered with
 # the coordinator manually via `just bake-harness <name>` (Stage B2:
@@ -122,6 +128,14 @@ dc_resource('registry',
 
 local_resource('bootstrap',
     cmd='just bootstrap',
+    labels=['setup'])
+
+# Seed the cold-tier blob bucket in fake-gcs-server. Idempotent: the
+# script POSTs the bucket and treats 200, 409, and "already exists"
+# as success. Re-runs on each `tilt up`; cheap.
+local_resource('seed-buckets',
+    cmd='bash deploy/dev/seed-buckets.sh',
+    resource_deps=['fake-gcs-server'],
     labels=['setup'])
 
 # ----------------------------------------------------------------
@@ -153,6 +167,13 @@ coord_env = {
     'ENGRAM_DEFAULT_IMAGE': env_or('ENGRAM_DEFAULT_IMAGE', 'warm-1'),
     'ENGRAM_WARM_POOL_SIZE': env_or('ENGRAM_WARM_POOL_SIZE', '1'),
     'ENGRAM_KEK_MASTER_KEY': env_or('ENGRAM_KEK_MASTER_KEY', ''),
+    # ADR 0005 / Stage 4: cold-tier blob durability. Default to the
+    # local fs backend; flip to `gcs` against the fake-gcs-server
+    # emulator by setting ENGRAM_BLOB_BACKEND=gcs in .env (the seed
+    # script provisions the `engram-snapshots-test` bucket).
+    'ENGRAM_BLOB_BACKEND': env_or('ENGRAM_BLOB_BACKEND', 'local'),
+    'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
+    'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
     'RUST_LOG': 'info,engram=debug',
 }
 
@@ -177,7 +198,7 @@ else:
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    resource_deps=['postgres', 'registry', 'bootstrap'],
+    resource_deps=['postgres', 'registry', 'fake-gcs-server', 'seed-buckets', 'bootstrap'],
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s

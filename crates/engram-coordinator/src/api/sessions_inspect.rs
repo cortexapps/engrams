@@ -112,6 +112,9 @@ mod tests {
                 engram_oci::AnonymousResolver,
             ))),
             egress_proxy: None,
+            blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            )),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),

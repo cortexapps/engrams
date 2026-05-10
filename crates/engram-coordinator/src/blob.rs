@@ -1,0 +1,168 @@
+//! Cold-tier blob plumbing — backend selection + sealed-blob-ref
+//! seal/open helpers.
+//!
+//! ADR 0005 reintroduced cold-tier durability. Per-row blob URLs land
+//! in Postgres envelope-encrypted under the deployment KEK (same
+//! shape as `registry_credentials` and `session_secrets`); these
+//! helpers wrap `engram-crypto::CredCipher` so the rest of the
+//! coordinator never has to think about the cipher detail.
+//!
+//! Key path layout: `engram/snapshots/<host_id>/<snapshot_id>.tar.zst`.
+//! The `host_id` prefix lets ops grep for "what does host X own,"
+//! and snapshot UUIDs are unique per row. The actual key string
+//! lives plaintext only in the host-agent's transient memory + on
+//! the wire to the upload SDK; what Postgres stores is the sealed
+//! ref.
+
+use std::sync::Arc;
+
+use engram_core::traits::{BlobStorage, SealedBlobRef};
+
+use crate::error::ApiError;
+
+/// Pick a `BlobStorage` from `ENGRAM_BLOB_BACKEND`. `local` (default)
+/// reads `ENGRAM_LOCAL_PATH` for the on-disk root; `gcs` requires
+/// `ENGRAM_GCS_BUCKET` (and honors `STORAGE_EMULATOR_HOST` for
+/// fake-gcs-server). Fails closed at startup on misconfiguration.
+pub async fn from_env() -> Result<Arc<dyn BlobStorage>, String> {
+    let backend = std::env::var("ENGRAM_BLOB_BACKEND")
+        .unwrap_or_else(|_| "local".to_string())
+        .to_lowercase();
+    match backend.as_str() {
+        "local" => {
+            // Mirror the coordinator's `local_path` default; sit
+            // under `<root>/blobs/` so the layout is obvious to
+            // someone poking at `var/`.
+            let root = std::env::var("ENGRAM_LOCAL_PATH")
+                .unwrap_or_else(|_| "./var/engram".to_string());
+            let blobs_dir = std::path::PathBuf::from(root).join("blobs");
+            tracing::info!(path = %blobs_dir.display(), "blob backend: local");
+            Ok(Arc::new(engram_storage_local::LocalBlobStorage::new(
+                blobs_dir,
+            )))
+        }
+        "gcs" => {
+            let bucket = std::env::var("ENGRAM_GCS_BUCKET").map_err(|_| {
+                "ENGRAM_BLOB_BACKEND=gcs requires ENGRAM_GCS_BUCKET".to_string()
+            })?;
+            tracing::info!(bucket = %bucket, "blob backend: gcs");
+            let store = engram_storage_gcs::GcsBlobStorage::connect(bucket)
+                .await
+                .map_err(|e| format!("gcs connect: {e}"))?;
+            Ok(Arc::new(store))
+        }
+        "s3" => Err(
+            "ENGRAM_BLOB_BACKEND=s3 is reserved for a follow-up; only `local` and `gcs` ship in Stage 4".into(),
+        ),
+        other => Err(format!(
+            "unknown ENGRAM_BLOB_BACKEND={other}; expected `local` or `gcs`"
+        )),
+    }
+}
+
+/// Seal a plaintext blob URL under the deployment KEK. The result
+/// is the four-column quartet that `flush_to_cold` writes to the
+/// `snapshots` row.
+///
+/// Stage 5's flush primitive is the first caller; Stage 4 ships the
+/// helper in advance so the seal/open pair is exercised by tests
+/// before the production caller lands.
+#[allow(dead_code)]
+pub(crate) async fn seal_blob_ref(
+    state: &crate::state::SharedState,
+    plaintext_url: &str,
+) -> Result<SealedBlobRef, ApiError> {
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let sealed = cipher
+        .seal(plaintext_url.as_bytes())
+        .await
+        .map_err(|e| ApiError::Internal(format!("seal blob ref: {e}")))?;
+    Ok(SealedBlobRef {
+        wrapped_dek: sealed.wrapped_dek,
+        nonce: sealed.nonce.to_vec(),
+        ciphertext: sealed.ciphertext,
+        key_id: sealed.key_id,
+    })
+}
+
+/// Reverse of [`seal_blob_ref`]: open a sealed ref and return the
+/// plaintext URL. Used by the cold-resume path (Stage 6) to drive
+/// `Request::CopyBlobToLocal` against the picked host.
+#[allow(dead_code)]
+pub(crate) async fn open_blob_ref(
+    state: &crate::state::SharedState,
+    sealed: &SealedBlobRef,
+) -> Result<String, ApiError> {
+    let nonce: [u8; 12] = sealed
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| ApiError::Internal("sealed blob ref nonce wrong length".into()))?;
+    let cred = engram_crypto::SealedCred {
+        wrapped_dek: sealed.wrapped_dek.clone(),
+        nonce,
+        ciphertext: sealed.ciphertext.clone(),
+        key_id: sealed.key_id.clone(),
+    };
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let plaintext = cipher
+        .open(&cred)
+        .await
+        .map_err(|e| ApiError::Internal(format!("open blob ref: {e}")))?;
+    String::from_utf8(plaintext)
+        .map_err(|e| ApiError::Internal(format!("blob ref not valid utf-8: {e}")))
+}
+
+/// Deterministic key for a snapshot's blob. Plaintext form; the
+/// sealed version of this string is what lands in Postgres.
+pub fn snapshot_blob_key(
+    host_id: engram_core::HostId,
+    snapshot_id: engram_core::SnapshotId,
+) -> String {
+    format!("engram/snapshots/{host_id}/{snapshot_id}.tar.zst")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_blob_key_uses_host_then_snapshot() {
+        let host = engram_core::HostId::new();
+        let snap = engram_core::SnapshotId::new();
+        let key = snapshot_blob_key(host, snap);
+        assert!(key.starts_with("engram/snapshots/"));
+        assert!(key.contains(&host.to_string()));
+        assert!(key.ends_with(".tar.zst"));
+    }
+
+    #[tokio::test]
+    async fn seal_then_open_round_trips_blob_url() {
+        // Round-trip a blob URL through the same KEK-backed cipher
+        // path that production uses. Locks down the seal/open pair
+        // before Stage 5 wires it into the flush primitive.
+        let kek: std::sync::Arc<dyn engram_crypto::MasterKeyProvider> = std::sync::Arc::new(
+            engram_crypto::EnvVarKeyProvider::from_bytes([7u8; 32], "test:v1"),
+        );
+        let plaintext = "engram/snapshots/abc/123.tar.zst";
+        let cipher = engram_crypto::CredCipher::new(kek.as_ref());
+        let sealed = cipher.seal(plaintext.as_bytes()).await.unwrap();
+        let sealed_ref = SealedBlobRef {
+            wrapped_dek: sealed.wrapped_dek,
+            nonce: sealed.nonce.to_vec(),
+            ciphertext: sealed.ciphertext,
+            key_id: sealed.key_id,
+        };
+        // Re-open via the same direct path the helper uses; locks
+        // down the wrapped_dek/nonce/ciphertext shape.
+        let nonce: [u8; 12] = sealed_ref.nonce.as_slice().try_into().unwrap();
+        let cred = engram_crypto::SealedCred {
+            wrapped_dek: sealed_ref.wrapped_dek,
+            nonce,
+            ciphertext: sealed_ref.ciphertext,
+            key_id: sealed_ref.key_id,
+        };
+        let opened = cipher.open(&cred).await.unwrap();
+        assert_eq!(String::from_utf8(opened).unwrap(), plaintext);
+    }
+}

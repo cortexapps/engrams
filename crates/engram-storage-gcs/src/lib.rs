@@ -1,67 +1,146 @@
-//! GCS-backed [`BlobStorage`] (stub).
+//! GCS-backed [`BlobStorage`].
 //!
-//! Stage 0 ships this as a typed placeholder so the workspace
-//! compiles, the trait surface is reachable, and downstream callers
-//! can route through `Arc<dyn BlobStorage>` without conditional
-//! compilation. Every method returns
-//! `BlobError::Config("engram-storage-gcs is a Stage 0 stub; wire
-//! google-cloud-storage in Stage 4")`.
+//! Wires `google-cloud-storage` v0.24 against the trait. Application
+//! Default Credentials (ADC) by default; emulator support via
+//! `STORAGE_EMULATOR_HOST` (the standard convention `fake-gcs-server`
+//! honors). Returning to ADC after an emulator override is just
+//! unsetting the env var.
 //!
-//! Stage 4 replaces this body with a real `google-cloud-storage` v0.24
-//! client:
-//! - ADC (Application Default Credentials) by default; honors
-//!   `GOOGLE_APPLICATION_CREDENTIALS`.
-//! - Endpoint override via `STORAGE_EMULATOR_HOST` (the standard GCS
-//!   convention, honored by `fake-gcs-server`).
-//! - Resumable uploads above ~5 MB; single-shot below.
-//! - 404 → `BlobError::NotFound`; idempotent delete.
+//! Endpoint resolution:
+//! - `STORAGE_EMULATOR_HOST=http://localhost:4443` → anonymous auth +
+//!   plaintext to that endpoint (used by `just dev`).
+//! - Anywhere else → ADC + production HTTPS.
+//!
+//! Streaming:
+//! - `get_streaming` returns the SDK's native `Stream<Item =
+//!   Result<Bytes, ...>>` directly — no re-buffering, GB-scale memory
+//!   files don't materialize in RAM.
+//! - `put_streaming` currently collects the inbound body to a
+//!   `Vec<u8>` and uses the SDK's `Multipart` upload. Acceptable for
+//!   the fake-gcs-server local tests + modest-sized payloads; Stage 5
+//!   may switch to resumable-upload semantics if profiling shows it's
+//!   worth the complexity for the FC `memory.bin` flush path.
+//!
+//! 404 → [`BlobError::NotFound`]; idempotent delete.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use engram_core::error::BlobError;
 use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream};
+use futures::StreamExt;
+use google_cloud_storage::client::{Client, ClientConfig};
+use google_cloud_storage::http::objects::delete::DeleteObjectRequest;
+use google_cloud_storage::http::objects::download::Range;
+use google_cloud_storage::http::objects::get::GetObjectRequest;
+use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
+use google_cloud_storage::http::Error as GcsHttpError;
 
-const STUB_REASON: &str =
-    "engram-storage-gcs is a Stage 0 stub; wire google-cloud-storage in Stage 4";
-
-/// GCS-backed storage. Stage 0 stub; do not use.
+/// GCS-backed storage. One client per instance, cheap to clone.
 pub struct GcsBlobStorage {
-    /// Bucket name. Read but unused until Stage 4.
-    pub bucket: String,
-    /// Optional emulator host (e.g. `http://localhost:4443` for
-    /// `fake-gcs-server`).
-    pub emulator_host: Option<String>,
+    client: Arc<Client>,
+    bucket: String,
 }
 
 impl GcsBlobStorage {
-    pub fn new(bucket: impl Into<String>) -> Self {
-        Self {
+    /// Construct against a bucket. Auth comes from
+    /// `ClientConfig::default().with_auth()` — ADC for production,
+    /// or anonymous + emulator-rewritten endpoints when
+    /// `STORAGE_EMULATOR_HOST` is set. Failing to resolve auth is a
+    /// `BlobError::Config` since it's a deployment misconfiguration,
+    /// not a transient network issue.
+    pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
+        // The SDK's `with_auth()` short-circuits when
+        // `STORAGE_EMULATOR_HOST` is set; we don't have to branch.
+        let cfg = ClientConfig::default()
+            .with_auth()
+            .await
+            .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))?;
+        Ok(Self {
+            client: Arc::new(Client::new(cfg)),
             bucket: bucket.into(),
-            emulator_host: None,
-        }
+        })
+    }
+}
+
+fn map_http_err(e: GcsHttpError) -> BlobError {
+    match &e {
+        GcsHttpError::Response(resp) if resp.code == 404 => BlobError::NotFound,
+        _ => BlobError::Sdk(Box::new(e)),
     }
 }
 
 #[async_trait]
 impl BlobStorage for GcsBlobStorage {
-    async fn put_streaming(&self, _key: &str, _body: ByteStream) -> Result<u64, BlobError> {
-        Err(BlobError::Config(STUB_REASON.into()))
+    async fn put_streaming(&self, key: &str, mut body: ByteStream) -> Result<u64, BlobError> {
+        // Drain into a Vec<u8>. See the module docstring — fine for
+        // emulator tests and small payloads; the FC flush path may
+        // want resumable uploads in a follow-up.
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        let total = buf.len() as u64;
+        let req = UploadObjectRequest {
+            bucket: self.bucket.clone(),
+            ..Default::default()
+        };
+        let upload_type = UploadType::Simple(Media::new(key.to_string()));
+        self.client
+            .upload_object(&req, buf, &upload_type)
+            .await
+            .map_err(map_http_err)?;
+        tracing::debug!(bucket = %self.bucket, key = %key, bytes = total, "gcs put");
+        Ok(total)
     }
 
-    async fn put(&self, _key: &str, _body: Bytes) -> Result<u64, BlobError> {
-        Err(BlobError::Config(STUB_REASON.into()))
+    async fn get_streaming(&self, key: &str) -> Result<ByteStream, BlobError> {
+        let req = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: key.to_string(),
+            ..Default::default()
+        };
+        let stream = self
+            .client
+            .download_streamed_object(&req, &Range::default())
+            .await
+            .map_err(map_http_err)?;
+        // Re-emit via our ByteStream newtype, mapping the SDK's error
+        // type into our BlobError. The body keeps streaming directly
+        // off the wire — no re-buffering.
+        let mapped = stream.map(|chunk| chunk.map_err(|e| BlobError::Sdk(Box::new(e))));
+        Ok(ByteStream::new(mapped))
     }
 
-    async fn get_streaming(&self, _key: &str) -> Result<ByteStream, BlobError> {
-        Err(BlobError::Config(STUB_REASON.into()))
+    async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
+        let req = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: key.to_string(),
+            ..Default::default()
+        };
+        let obj = self.client.get_object(&req).await.map_err(map_http_err)?;
+        Ok(BlobObjectMeta {
+            size_bytes: obj.size as u64,
+            // GCS exposes both an etag and a generation number; etag
+            // is the standard cross-bucket caller-friendly handle.
+            etag: Some(obj.etag),
+        })
     }
 
-    async fn head(&self, _key: &str) -> Result<BlobObjectMeta, BlobError> {
-        Err(BlobError::Config(STUB_REASON.into()))
-    }
-
-    async fn delete(&self, _key: &str) -> Result<(), BlobError> {
-        Err(BlobError::Config(STUB_REASON.into()))
+    async fn delete(&self, key: &str) -> Result<(), BlobError> {
+        let req = DeleteObjectRequest {
+            bucket: self.bucket.clone(),
+            object: key.to_string(),
+            ..Default::default()
+        };
+        match self.client.delete_object(&req).await {
+            Ok(()) => Ok(()),
+            // Idempotent: missing key is a successful delete.
+            Err(e) => match map_http_err(e) {
+                BlobError::NotFound => Ok(()),
+                other => Err(other),
+            },
+        }
     }
 }
 
@@ -69,13 +148,20 @@ impl BlobStorage for GcsBlobStorage {
 mod tests {
     use super::*;
 
+    /// Smoke test that `connect` doesn't panic when `STORAGE_EMULATOR_HOST`
+    /// is set and the emulator is reachable. Gated on the env var being
+    /// present so it's a no-op in CI environments without docker.
     #[tokio::test(flavor = "current_thread")]
-    async fn stub_methods_return_typed_config_error() {
-        let store = GcsBlobStorage::new("bucket");
-        let err = store.head("k").await.unwrap_err();
-        match err {
-            BlobError::Config(msg) => assert!(msg.contains("Stage 0")),
-            other => panic!("expected Config, got {other}"),
-        }
+    async fn connect_against_emulator_smoke() {
+        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+            // No emulator configured; nothing to verify here.
+            return;
+        };
+        // The bucket itself doesn't have to exist for `connect()` to
+        // succeed — it just has to be a valid string. Bucket creation
+        // is `deploy/dev/seed-buckets.sh`'s job.
+        let _store = GcsBlobStorage::connect("engram-snapshots-test")
+            .await
+            .expect("connect against emulator");
     }
 }

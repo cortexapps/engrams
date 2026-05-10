@@ -436,6 +436,18 @@ async fn main() -> Result<(), CoordinatorError> {
     // for VZ-on-macOS where this binary runs cross-platform.
     let egress_proxy = build_egress_proxy(&cli).await;
 
+    // ADR 0005 / Stage 4: cold-tier blob storage. `local` (default)
+    // writes under `<local_path>/blobs/`; `gcs` requires
+    // `ENGRAM_GCS_BUCKET` and honors `STORAGE_EMULATOR_HOST` for
+    // fake-gcs-server in `just dev`.
+    let blob = match engram_coordinator::blob::from_env().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "blob backend init failed; aborting");
+            std::process::exit(1);
+        }
+    };
+
     let services = Services {
         meta: meta_arc.clone(),
         cloud,
@@ -444,6 +456,7 @@ async fn main() -> Result<(), CoordinatorError> {
         kek,
         oci: oci_client,
         egress_proxy,
+        blob,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await

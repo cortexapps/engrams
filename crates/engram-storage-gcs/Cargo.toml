@@ -13,7 +13,14 @@ workspace = true
 engram-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
+# google-cloud-storage v0.24: ADC + STORAGE_EMULATOR_HOST support;
+# the streaming download path returns a futures Stream natively, so
+# we don't have to re-buffer on the GET side.
+google-cloud-storage = { version = "0.24", default-features = false, features = ["rustls-tls", "auth"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

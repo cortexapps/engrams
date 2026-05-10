@@ -127,6 +127,9 @@ async fn build_app_state(
             engram_oci::AnonymousResolver,
         ))),
         egress_proxy: None,
+        blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+            std::env::temp_dir().join("engram-blobs-test"),
+        )),
     };
     let cfg = CoordinatorConfig {
         database_url: database_url.to_string(),
