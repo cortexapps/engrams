@@ -45,22 +45,47 @@ jobs:
       # Grouped Dependabot PRs report `update-type` as the
       # *highest* semver bump in the group, so a group containing
       # any major bump fails this gate and is left for a human.
-      # `run:` uses a block scalar so colon-space sequences in the
-      # --body string (e.g. "Auto-approved: …") don't get parsed as
-      # YAML mapping keys. Plain scalars look fine to the eye but
-      # break the whole file's parse silently — no workflow runs,
-      # no error surfaced in the GH UI, just blocked PRs.
+      # `update-type` alone is unreliable: fetch-metadata reports
+      # it as `null` for any *grouped* Dependabot PR (even a
+      # single-item group like `docker-base`). The authoritative
+      # source is `updated-dependencies-json` — a JSON array with
+      # one entry per bumped dependency, each carrying its own
+      # updateType. We auto-merge iff every entry is patch or
+      # minor; one major in a group blocks the whole PR for human
+      # review.
+      #
+      # `run:` blocks below use block scalars so colon-space
+      # sequences in --body strings ("Auto-approved: …") don't
+      # corrupt YAML parsing the way they did on 2026-05-10.
+      - name: Decide if PR is auto-mergeable
+        id: decide
+        env:
+          DEPS_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          if [ -z "$DEPS_JSON" ] || [ "$DEPS_JSON" = "[]" ]; then
+            echo "Empty dependency list — skipping auto-merge."
+            echo "auto-merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NON_PATCH_MINOR=$(echo "$DEPS_JSON" | jq '[.[].updateType] | map(select(. != "version-update:semver-patch" and . != "version-update:semver-minor")) | length')
+          if [ "$NON_PATCH_MINOR" -gt 0 ]; then
+            echo "PR contains $NON_PATCH_MINOR non-patch/non-minor bump(s) — leaving for human review."
+            echo "auto-merge=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "All bumps are patch/minor — enabling auto-merge."
+            echo "auto-merge=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Approve PR
-        if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.metadata.outputs.update-type)
+        if: steps.decide.outputs.auto-merge == 'true'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
         run: |
-          gh pr review --approve "$PR_URL" --body "Auto-approved: $UPDATE_TYPE via Dependabot."
+          gh pr review --approve "$PR_URL" --body "Auto-approved: all dependency bumps are patch or minor."
 
       - name: Enable auto-merge (squash)
-        if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.metadata.outputs.update-type)
+        if: steps.decide.outputs.auto-merge == 'true'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
