@@ -11,21 +11,16 @@ export type SessionStatus =
   | 'pending'
   | 'active'
   | 'idle'
+  | 'cold_evicted'
   | 'completed'
   | 'failed'
   | 'dead';
-
-export type SessionKind = 'git' | 'readonly' | 'ephemeral';
 
 // Stage B1 wire shape: a session's image is now a flat OCI URI
 // (`<host>[:port]/<repo>:<tag>`). The earlier discriminated
 // `{ kind, repo, tag }` shape is gone — the backend resolves the
 // URI against `enabled_images` at session-create time.
 export type ImageRef = string;
-
-export type WorkspaceSpec =
-  | { kind: 'empty' }
-  | { kind: 'git'; url: string; branch: string; read_only: boolean };
 
 export type HarnessSpec =
   | { kind: 'none' }
@@ -38,10 +33,7 @@ export interface Session {
   host_id: string | null;
   sandbox_id: string | null;
   image: ImageRef;
-  workspace: WorkspaceSpec;
   harness: HarnessSpec;
-  session_kind: SessionKind;
-  checkpoint_branch: string | null;
   created_at: string;
   last_active_at: string;
 }
@@ -133,13 +125,6 @@ export type SessionEvent =
     }
   | { type: 'evicted'; at: string }
   | { type: 'resumed'; snapshot_id: string; at: string }
-  | {
-      type: 'checkpoint_pushed';
-      commit_sha: string;
-      harness_acked: boolean;
-      at: string;
-    }
-  | { type: 'checkpoint_failed'; reason: string; at: string }
   | {
       type: 'run_started';
       run_id: string;

@@ -70,29 +70,16 @@ enum Cmd {
 enum SessionCmd {
     /// Create a new session. Prints the new session_id on stdout.
     ///
-    /// Three orthogonal axes shape a session: `image`, `workspace`,
-    /// `harness`. The flags below set each one independently —
-    /// matching the `POST /sessions` wire shape exactly.
+    /// Two axes shape a session: `image`, `harness`. The bake image's
+    /// `/workspace` is the workspace; ADR 0005 retired the platform's
+    /// git surface, so agents that want to push code do it themselves
+    /// inside the sandbox using credentials mounted via `[secrets.X]`.
     Create {
-        /// Image to boot, in `repo:tag` form. Required.
+        /// Image to boot, as a flat OCI URI. Required.
         ///
-        /// Example: `--image cortex/api:warm-2026-04`
+        /// Example: `--image ghcr.io/cortex/api:warm-2026-04`
         #[arg(long)]
         image: String,
-        /// Clone the given git URL into the workspace. Omit for an
-        /// `Empty` workspace ("just a VM and a shell").
-        ///
-        /// Example: `--git https://github.com/cortex/api.git`
-        #[arg(long)]
-        git: Option<String>,
-        /// Branch to check out for `--git` workspaces. Ignored
-        /// otherwise.
-        #[arg(long, default_value = "main")]
-        branch: String,
-        /// Make the workspace read-only — for `--git` this also
-        /// suppresses the per-session checkpoint branch.
-        #[arg(long)]
-        read_only: bool,
         /// Which baked-in harness to attach. `none` (default) boots
         /// the VM with no agent; otherwise the value is the manifest
         /// `[[harness]] name = ...` to attach (e.g. `claude`, `noop`).
@@ -131,43 +118,16 @@ enum SessionCmd {
         #[arg(long)]
         since: Option<i64>,
     },
-    /// Show the conversation timeline (`session_events`) or the
-    /// workspace `git log` for a session's checkpoint branch.
+    /// Show the conversation timeline (`session_events`).
     Log {
         id: String,
-        /// `conversation` (default) or `workspace`.
-        #[arg(long, default_value = "conversation")]
-        kind: String,
-        /// Cap on rows / commits returned.
+        /// Cap on rows returned.
         #[arg(long)]
         limit: Option<i64>,
     },
-    /// Show the workspace diff between the session's checkpoint
-    /// branch and `--vs` (defaults to the session's base branch).
-    Diff {
-        id: String,
-        #[arg(long)]
-        vs: Option<String>,
-    },
-    /// Fork a session at HEAD or at `--at <event_idx>`. Creates a
-    /// new session row whose checkpoint branch starts at the
-    /// referenced workspace commit.
-    Fork {
-        id: String,
-        /// Fork point in the source's `session_events` log.
-        /// Defaults to "fork from current HEAD".
-        #[arg(long)]
-        at: Option<i64>,
-        #[arg(long)]
-        title: Option<String>,
-    },
-    /// Resume an Idle session via its FC snapshot. Dead sessions
-    /// can't be resumed (snapshot invalidated) — use
-    /// `engram session fork <id>` to continue from the workspace.
+    /// Resume an Idle session via its hot snapshot. Dead sessions
+    /// can't be resumed (snapshot invalidated).
     Resume { id: String },
-    /// Force a checkpoint flush on a Git session — Postgres event
-    /// + git commit + push to `engram/sessions/<id>`.
-    Checkpoint { id: String },
     /// Push a prompt to a running session's agent. Auto-resumes
     /// Idle sessions; 410 Gone for Dead.
     Prompt { id: String, text: String },
@@ -442,9 +402,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
         Cmd::Session { cmd } => match cmd {
             SessionCmd::Create {
                 image,
-                git,
-                branch,
-                read_only,
                 harness,
                 prompt,
                 user_id,
@@ -453,9 +410,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     &client,
                     &cli.endpoint,
                     image,
-                    git.as_deref(),
-                    branch,
-                    *read_only,
                     harness,
                     prompt.as_deref(),
                     user_id.as_deref(),
@@ -474,19 +428,10 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Logs { id, since } => {
                 session_logs(&client, &cli.endpoint, id, *since).await
             }
-            SessionCmd::Log { id, kind, limit } => {
-                session_log(&client, &cli.endpoint, id, kind, *limit, cli.json).await
-            }
-            SessionCmd::Diff { id, vs } => {
-                session_diff(&client, &cli.endpoint, id, vs.as_deref()).await
-            }
-            SessionCmd::Fork { id, at, title } => {
-                session_fork(&client, &cli.endpoint, id, *at, title.as_deref(), cli.json).await
+            SessionCmd::Log { id, limit } => {
+                session_log(&client, &cli.endpoint, id, *limit, cli.json).await
             }
             SessionCmd::Resume { id } => session_resume(&client, &cli.endpoint, id, cli.json).await,
-            SessionCmd::Checkpoint { id } => {
-                session_checkpoint(&client, &cli.endpoint, id, cli.json).await
-            }
             SessionCmd::Prompt { id, text } => {
                 session_prompt(&client, &cli.endpoint, id, text, cli.json).await
             }
@@ -677,57 +622,22 @@ async fn session_delete(
     Ok(())
 }
 
-/// Split `--image cortex/api:warm-1` on the *last* colon so repo
-/// names containing `:` (rare but legal in registry URLs) don't get
-/// truncated. Returns `(repo, tag)`.
-fn parse_image_ref(spec: &str) -> Result<(String, String), CliError> {
-    match spec.rsplit_once(':') {
-        Some((repo, tag)) if !repo.is_empty() && !tag.is_empty() => {
-            Ok((repo.to_string(), tag.to_string()))
-        }
-        _ => Err(CliError::Other(format!(
-            "invalid --image `{spec}` — expected `<repo>:<tag>`"
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
     image: &str,
-    git: Option<&str>,
-    branch: &str,
-    read_only: bool,
     harness: &str,
     prompt: Option<&str>,
     user_id: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    let (image_repo, image_tag) = parse_image_ref(image)?;
-    let workspace_value = match git {
-        Some(url) if !url.is_empty() => serde_json::json!({
-            "kind": "git",
-            "url": url,
-            "branch": branch,
-            "read_only": read_only,
-        }),
-        _ => serde_json::json!({"kind": "empty"}),
-    };
     let harness_value = match harness {
         "none" => serde_json::json!({"kind": "none"}),
         name => serde_json::json!({"kind": "builtin", "name": name}),
     };
     let mut payload = serde_json::Map::new();
-    payload.insert(
-        "image".into(),
-        serde_json::json!({
-            "kind": "registry",
-            "repo": image_repo,
-            "tag": image_tag,
-        }),
-    );
-    payload.insert("workspace".into(), workspace_value);
+    // Stage B1+: image is a flat OCI URI string.
+    payload.insert("image".into(), Value::from(image));
     payload.insert("harness".into(), harness_value);
     if let Some(u) = user_id {
         payload.insert("user_id".into(), Value::from(u));
@@ -946,11 +856,10 @@ async fn session_log(
     client: &reqwest::Client,
     endpoint: &str,
     id: &str,
-    kind: &str,
     limit: Option<i64>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut url = format!("{endpoint}/sessions/{id}/log?kind={kind}");
+    let mut url = format!("{endpoint}/sessions/{id}/log?kind=conversation");
     if let Some(l) = limit {
         url.push_str(&format!("&limit={l}"));
     }
@@ -959,55 +868,34 @@ async fn session_log(
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
     }
-    let kind_str = body["kind"].as_str().unwrap_or("");
-    if kind_str == "conversation" {
-        let empty = Vec::new();
-        let events = body["events"].as_array().unwrap_or(&empty);
-        if events.is_empty() {
-            println!("(no events)");
-            return Ok(());
-        }
-        println!("{:<6}  {:<28}  {:<25}  PAYLOAD", "IDX", "KIND", "AT");
-        for e in events {
-            let payload = e["payload"].clone();
-            let summary = match payload {
-                Value::Object(map) if !map.is_empty() => {
-                    let pairs: Vec<String> = map
-                        .iter()
-                        .take(3)
-                        .map(|(k, v)| format!("{k}={}", short_value(v)))
-                        .collect();
-                    pairs.join(" ")
-                }
-                Value::Null => String::new(),
-                other => short_value(&other),
-            };
-            println!(
-                "{:<6}  {:<28}  {:<25}  {}",
-                e["idx"].as_i64().unwrap_or(0),
-                truncate(e["kind"].as_str().unwrap_or(""), 28),
-                e["at"].as_str().unwrap_or(""),
-                truncate(&summary, 80),
-            );
-        }
-    } else {
-        // workspace: list of commits
-        let empty = Vec::new();
-        let commits = body["commits"].as_array().unwrap_or(&empty);
-        if commits.is_empty() {
-            println!("(no checkpoint commits)");
-            return Ok(());
-        }
-        for c in commits {
-            let sha = c["sha"].as_str().unwrap_or("");
-            let short: String = sha.chars().take(10).collect();
-            println!(
-                "{short}  {date}  {author}  {message}",
-                date = c["date"].as_str().unwrap_or(""),
-                author = truncate(c["author"].as_str().unwrap_or(""), 24),
-                message = c["message"].as_str().unwrap_or(""),
-            );
-        }
+    let empty = Vec::new();
+    let events = body["events"].as_array().unwrap_or(&empty);
+    if events.is_empty() {
+        println!("(no events)");
+        return Ok(());
+    }
+    println!("{:<6}  {:<28}  {:<25}  PAYLOAD", "IDX", "KIND", "AT");
+    for e in events {
+        let payload = e["payload"].clone();
+        let summary = match payload {
+            Value::Object(map) if !map.is_empty() => {
+                let pairs: Vec<String> = map
+                    .iter()
+                    .take(3)
+                    .map(|(k, v)| format!("{k}={}", short_value(v)))
+                    .collect();
+                pairs.join(" ")
+            }
+            Value::Null => String::new(),
+            other => short_value(&other),
+        };
+        println!(
+            "{:<6}  {:<28}  {:<25}  {}",
+            e["idx"].as_i64().unwrap_or(0),
+            truncate(e["kind"].as_str().unwrap_or(""), 28),
+            e["at"].as_str().unwrap_or(""),
+            truncate(&summary, 80),
+        );
     }
     Ok(())
 }
@@ -1021,70 +909,6 @@ fn short_value(v: &Value) -> String {
         Value::Array(a) => format!("[{} items]", a.len()),
         Value::Object(o) => format!("{{{} keys}}", o.len()),
     }
-}
-
-async fn session_diff(
-    client: &reqwest::Client,
-    endpoint: &str,
-    id: &str,
-    vs: Option<&str>,
-) -> Result<(), CliError> {
-    let mut url = format!("{endpoint}/sessions/{id}/diff");
-    if let Some(v) = vs {
-        // The vs param is a git ref; assume the caller has already
-        // shell-quoted it. URL-encoding could happen here later if
-        // we ever surface refs with awkward characters.
-        url.push_str(&format!("?vs={v}"));
-    }
-    let resp = client.get(url).send().await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    print!("{body}");
-    Ok(())
-}
-
-async fn session_fork(
-    client: &reqwest::Client,
-    endpoint: &str,
-    id: &str,
-    at: Option<i64>,
-    title: Option<&str>,
-    json: bool,
-) -> Result<(), CliError> {
-    let mut payload = serde_json::Map::new();
-    if let Some(idx) = at {
-        payload.insert("from_event_idx".into(), Value::from(idx));
-    }
-    if let Some(t) = title {
-        payload.insert("title".into(), Value::from(t));
-    }
-    let resp = client
-        .post(format!("{endpoint}/sessions/{id}/fork"))
-        .json(&Value::Object(payload))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
-        return Ok(());
-    }
-    println!("forked: {}", parsed["session_id"].as_str().unwrap_or(""));
-    if let Some(branch) = parsed["branch"].as_str() {
-        println!("branch: {branch}");
-    }
-    if let Some(sha) = parsed["from_sha"].as_str() {
-        println!("from  : {sha}");
-    }
-    Ok(())
 }
 
 async fn session_resume(
@@ -1107,35 +931,6 @@ async fn session_resume(
         return Ok(());
     }
     println!("{}", parsed["note"].as_str().unwrap_or("resumed"));
-    Ok(())
-}
-
-async fn session_checkpoint(
-    client: &reqwest::Client,
-    endpoint: &str,
-    id: &str,
-    json: bool,
-) -> Result<(), CliError> {
-    let resp = client
-        .post(format!("{endpoint}/sessions/{id}/checkpoint"))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
-        return Ok(());
-    }
-    if let Some(sha) = parsed["commit_sha"].as_str() {
-        println!("checkpoint: {sha}");
-    } else {
-        println!("checkpoint: (no-op — workspace clean)");
-    }
     Ok(())
 }
 

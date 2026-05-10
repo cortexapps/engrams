@@ -54,8 +54,6 @@ export function subscribeSession(
     'snapshot_taken',
     'evicted',
     'resumed',
-    'checkpoint_pushed',
-    'checkpoint_failed',
     'run_started',
     'agent_message',
     'tool_call_started',

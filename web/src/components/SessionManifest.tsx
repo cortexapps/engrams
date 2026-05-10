@@ -7,6 +7,7 @@ const STATUS_ORDER: Session['status'][] = [
   'active',
   'pending',
   'idle',
+  'cold_evicted',
   'failed',
   'completed',
   'dead',
@@ -73,7 +74,10 @@ export function SessionManifest({
 
 function SessionRow({ session }: { session: Session }) {
   const since = relativeTime(session.last_active_at);
-  const repoLabel = formatRepo(session);
+  // ADR 0005: there's no workspace-level repo/branch on a session
+  // anymore — the bake image is the whole story. Strip the registry
+  // host + tag for visual density.
+  const imageLabel = stripImageHost(session.image);
 
   return (
     <motion.div
@@ -101,7 +105,7 @@ function SessionRow({ session }: { session: Session }) {
           className="font-display"
           style={{ color: 'var(--color-ink-faded)' }}
         >
-          {repoLabel}
+          {imageLabel}
         </span>
         <span
           className="font-mono smallcaps text-[0.7rem]"
@@ -131,25 +135,6 @@ function sortSessions(sessions: Session[]): Session[] {
       new Date(a.last_active_at).getTime()
     );
   });
-}
-
-function formatRepo(s: Session): string {
-  switch (s.workspace.kind) {
-    case 'empty':
-      // Strip registry host + tag for visual density. Stage B1 made
-      // session.image a flat OCI URI like
-      // `ghcr.io/cortex/api:warm-1`; the panel only has room for the
-      // repo segment.
-      return `${stripImageHost(s.image)} (empty)`;
-    case 'git': {
-      const branch =
-        s.workspace.branch && s.workspace.branch !== 'main'
-          ? ` · ${s.workspace.branch}`
-          : '';
-      // Strip the scheme + host prefix for visual density.
-      return `${s.workspace.url.replace(/^https?:\/\/[^/]+\//, '')}${branch}`;
-    }
-  }
 }
 
 /** Drop the leading `<host>/` and trailing `:<tag>` from an OCI URI,

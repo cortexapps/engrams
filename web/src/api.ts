@@ -13,7 +13,6 @@ import type {
   ListRegistriesResponse,
   ListSessionsResponse,
   Session,
-  WorkspaceSpec,
 } from './types';
 
 // Same-origin in dev (Vite proxy → :8090). In a hosted prod build,
@@ -80,7 +79,6 @@ export const fetchHarnesses = () =>
 
 export interface CreateSessionInput {
   image: ImageRef;
-  workspace: WorkspaceSpec;
   /** Defaults to `{ kind: "none" }` server-side. */
   harness?: HarnessSpec;
   user_id?: string;

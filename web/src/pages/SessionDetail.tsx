@@ -8,16 +8,6 @@ import { PromptComposer } from '../components/PromptComposer';
 import { TabRow } from '../components/TabRow';
 import { TerminalPane } from '../components/TerminalPane';
 import { relativeTime } from '../components/SessionManifest';
-import type { WorkspaceSpec } from '../types';
-
-function workspaceLabel(ws: WorkspaceSpec): string {
-  switch (ws.kind) {
-    case 'empty':
-      return 'empty';
-    case 'git':
-      return ws.url;
-  }
-}
 
 type ViewTab = 'transcript' | 'shell' | 'raw';
 
@@ -82,18 +72,6 @@ export function SessionDetail() {
             >
               {session.status}
             </span>
-            <span style={{ color: 'var(--color-ink-faded)' }}>·</span>
-            <span className="font-mono text-[0.85rem]">
-              {workspaceLabel(session.workspace)}
-            </span>
-            {session.workspace.kind === 'git' && (
-              <>
-                <span style={{ color: 'var(--color-ink-quiet)' }}>·</span>
-                <span className="font-mono text-[0.85rem]">
-                  {session.workspace.branch}
-                </span>
-              </>
-            )}
           </div>
         )}
 

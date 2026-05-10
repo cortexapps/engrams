@@ -5,16 +5,13 @@ import { createSession } from '../api';
 import { useEnabledImages } from '../hooks/useEnabledImages';
 import { useHarnesses } from '../hooks/useHarnesses';
 import { SectionHead } from './HostManifest';
-import type { HarnessSpec, WorkspaceSpec } from '../types';
+import type { HarnessSpec } from '../types';
 
 // "New session" form rendered inline on the Overview page, between the
-// HostManifest and the SessionManifest. Phase 2 made the three session
-// axes (image / workspace / harness) orthogonal, so the form has three
-// first-class sections — none hidden behind disclosure. Image selection
-// drives the harness dropdown (builtin names are scoped per-image) and
-// the credentials section (secret schema is per-image).
+// HostManifest and the SessionManifest. ADR 0005 retired the
+// workspace axis: the bake image's `/workspace` is the workspace.
+// Two axes left — image + harness.
 
-type WorkspaceKind = 'empty' | 'git';
 type HarnessKind = 'none' | 'builtin';
 
 export interface NewSessionFormProps {
@@ -40,12 +37,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       setSelectedUri(images[0].image_uri);
     }
   }, [images, selectedUri]);
-
-  // ---- WORKSPACE ----
-  const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind>('empty');
-  const [gitUrl, setGitUrl] = useState('');
-  const [gitBranch, setGitBranch] = useState('main');
-  const [gitReadOnly, setGitReadOnly] = useState(false);
 
   // ---- HARNESS ----
   const [harnessKind, setHarnessKind] = useState<HarnessKind>('none');
@@ -105,17 +96,7 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     harnessName === 'claude' &&
     claudeToken.trim().length === 0;
 
-  const workspaceValid =
-    workspaceKind === 'empty' ||
-    (workspaceKind === 'git' &&
-      gitUrl.trim().length > 0 &&
-      gitBranch.trim().length > 0);
-
-  const canSubmit =
-    !!selected &&
-    workspaceValid &&
-    !submitting &&
-    !claudeTokenMissing;
+  const canSubmit = !!selected && !submitting && !claudeTokenMissing;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -123,15 +104,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     setSubmitting(true);
     setError(null);
     try {
-      const workspace: WorkspaceSpec =
-        workspaceKind === 'empty'
-          ? { kind: 'empty' }
-          : {
-              kind: 'git',
-              url: gitUrl.trim(),
-              branch: gitBranch.trim(),
-              read_only: gitReadOnly,
-            };
       const harness: HarnessSpec =
         harnessKind === 'none' || !harnessName
           ? { kind: 'none' }
@@ -149,7 +121,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       }
       const res = await createSession({
         image: selected.image_uri,
-        workspace,
         harness,
         prompt: promptValue,
         secrets:
@@ -249,46 +220,6 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
                 >
                   {selected.manifest_description}
                 </p>
-              )}
-            </div>
-
-            {/* WORKSPACE */}
-            <div className="space-y-3">
-              <SubHead>WORKSPACE</SubHead>
-              <RadioStrip
-                value={workspaceKind}
-                onChange={(v) => setWorkspaceKind(v)}
-                options={[
-                  { value: 'empty', label: 'empty' },
-                  { value: 'git', label: 'git' },
-                ]}
-              />
-              {workspaceKind === 'git' && (
-                <>
-                  <Field label="url">
-                    <input
-                      type="text"
-                      value={gitUrl}
-                      onChange={(e) => setGitUrl(e.target.value)}
-                      className="ledger-input font-mono"
-                      placeholder="https://github.com/cortex/api.git"
-                    />
-                  </Field>
-                  <Field label="branch">
-                    <input
-                      type="text"
-                      value={gitBranch}
-                      onChange={(e) => setGitBranch(e.target.value)}
-                      className="ledger-input font-mono"
-                      placeholder="main"
-                    />
-                  </Field>
-                  <CheckRow
-                    label="read only"
-                    checked={gitReadOnly}
-                    onChange={setGitReadOnly}
-                  />
-                </>
               )}
             </div>
 
@@ -451,85 +382,6 @@ function Field({
         {label}
       </span>
       {children}
-    </label>
-  );
-}
-
-function CheckRow({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <label
-      className="grid items-baseline gap-x-4"
-      style={{ gridTemplateColumns: '7rem 1fr' }}
-    >
-      <span />
-      <span className="inline-flex items-baseline gap-2 font-mono text-[0.82rem]">
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => onChange(e.target.checked)}
-        />
-        <span>{label}</span>
-      </span>
-    </label>
-  );
-}
-
-function RadioStrip<T extends string>({
-  value,
-  onChange,
-  options,
-}: {
-  value: T;
-  onChange: (v: T) => void;
-  options: {
-    value: T;
-    label: string;
-    disabled?: boolean;
-    title?: string;
-  }[];
-}) {
-  return (
-    <label
-      className="grid items-baseline gap-x-4"
-      style={{ gridTemplateColumns: '7rem 1fr' }}
-    >
-      <span
-        className="font-mono smallcaps text-[0.7rem]"
-        style={{ color: 'var(--color-ink-quiet)' }}
-      >
-        source
-      </span>
-      <div className="flex gap-4">
-        {options.map((opt) => {
-          const selected = opt.value === value;
-          return (
-            <label
-              key={opt.value}
-              title={opt.title}
-              className={`inline-flex items-baseline gap-1.5 font-mono text-[0.82rem] ${
-                opt.disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
-              }`}
-            >
-              <input
-                type="radio"
-                name="workspace_kind"
-                checked={selected}
-                disabled={opt.disabled}
-                onChange={() => !opt.disabled && onChange(opt.value)}
-              />
-              <span>{opt.label}</span>
-            </label>
-          );
-        })}
-      </div>
     </label>
   );
 }

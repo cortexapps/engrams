@@ -145,8 +145,8 @@ describe('NewSessionForm wire contract', () => {
       // Locked: flat string, no kind/repo/tag discriminator.
       expect(body.image).toBe('ghcr.io/cortex/api:warm-1');
       expect(typeof body.image).toBe('string');
-      // Workspace + harness defaults survive the rewrite.
-      expect(body.workspace).toEqual({ kind: 'empty' });
+      // ADR 0005 retired the workspace axis; harness default survives.
+      expect(body.workspace).toBeUndefined();
       expect(body.harness).toEqual({ kind: 'none' });
     });
   });

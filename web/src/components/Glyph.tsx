@@ -67,6 +67,8 @@ function glyphFor(status: SessionStatus): string {
       return '●';
     case 'idle':
       return '◌';
+    case 'cold_evicted':
+      return '◇';
     case 'completed':
       return '✓';
     case 'failed':
@@ -82,6 +84,8 @@ function toneFor(status: SessionStatus): string {
       return 'var(--color-amber)';
     case 'idle':
       return 'var(--color-verdigris)';
+    case 'cold_evicted':
+      return 'var(--color-ink-quiet)';
     case 'pending':
       return 'var(--color-ink-faded)';
     case 'completed':
