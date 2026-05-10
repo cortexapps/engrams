@@ -27,6 +27,9 @@ members = [
     "crates/engram-crypto",
     "crates/engram-oci",
     "crates/engram-oci-auth",
+    "crates/engram-storage-local",
+    "crates/engram-storage-s3",
+    "crates/engram-storage-gcs",
 ]
 
 [workspace.package]
@@ -63,6 +66,9 @@ engram-egress-proxy = { path = "crates/engram-egress-proxy" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-oci = { path = "crates/engram-oci" }
 engram-oci-auth = { path = "crates/engram-oci-auth" }
+engram-storage-local = { path = "crates/engram-storage-local" }
+engram-storage-s3 = { path = "crates/engram-storage-s3" }
+engram-storage-gcs = { path = "crates/engram-storage-gcs" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }
@@ -101,8 +107,11 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 
 # cloud sdks (optional / per-crate)
-# (storage SDKs removed in Phase 4 — durability moved to git;
-#  image distribution moves to Docker registry in Phase 5)
+# (Phase 4 retired the storage SDKs when durability moved to git;
+#  ADR 0005 / Phase 6 reintroduces them — wired in Stage 4 of the
+#  hot+cold snapshot pivot. The S3/GCS impl crates carry the SDK
+#  deps directly so this section stays scoped to genuinely shared
+#  pins.)
 
 # observability
 tracing = "0.1"

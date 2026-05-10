@@ -126,6 +126,51 @@ impl From<std::io::Error> for SandboxError {
     }
 }
 
+// ---------- BlobError (BlobStorage) ----------
+
+#[derive(Debug)]
+pub enum BlobError {
+    /// Key does not exist (404 / NoSuchKey / fs ENOENT).
+    NotFound,
+    /// Underlying SDK or HTTP error.
+    Sdk(BoxError),
+    /// Configuration was invalid or missing (no creds, bad endpoint).
+    Config(String),
+    /// Backend returned an unexpected response shape.
+    Protocol(String),
+    /// Local filesystem error (only the `local` backend; SDK backends
+    /// fold IO errors into `Sdk`).
+    Io(std::io::Error),
+}
+
+impl fmt::Display for BlobError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "blob not found"),
+            Self::Sdk(e) => write!(f, "blob sdk error: {e}"),
+            Self::Config(msg) => write!(f, "blob config error: {msg}"),
+            Self::Protocol(msg) => write!(f, "blob protocol error: {msg}"),
+            Self::Io(e) => write!(f, "blob io error: {e}"),
+        }
+    }
+}
+
+impl StdError for BlobError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Sdk(e) => Some(&**e),
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for BlobError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
 // ---------- SecretError (SecretStore) ----------
 
 #[derive(Debug)]

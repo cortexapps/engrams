@@ -75,6 +75,10 @@ pub async fn snapshot(
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,
         last_accessed_at: now,
+        // Hot-tier-only at create time; the cold-tier flush primitive
+        // (Stage 5) flips these via `MetadataStore::flush_to_cold`.
+        blob_present: false,
+        replicated_at: None,
     };
     state.services.meta.record_snapshot(record).await?;
 

@@ -9,6 +9,9 @@ pub mod error;
 pub mod traits;
 pub mod types;
 
-pub use error::{BackendError, MetaError, SandboxError, SecretError};
-pub use traits::{CloudBackend, MetadataStore, SandboxBackend, SecretStore};
+pub use error::{BackendError, BlobError, MetaError, SandboxError, SecretError};
+pub use traits::{
+    BlobObjectMeta, BlobStorage, ByteStream, CloudBackend, MetadataStore, SandboxBackend,
+    SecretStore,
+};
 pub use types::*;

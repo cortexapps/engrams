@@ -1,0 +1,19 @@
+[package]
+name = "engram-storage-gcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GCS BlobStorage impl. Stage 0 ships a stub returning NotImplemented; Stage 4 wires google-cloud-storage."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

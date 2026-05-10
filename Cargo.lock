@@ -1180,6 +1180,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-storage-gcs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "engram-storage-local"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-core",
+ "futures",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "engram-storage-s3"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engram-transport"
 version = "0.1.0"
 dependencies = [

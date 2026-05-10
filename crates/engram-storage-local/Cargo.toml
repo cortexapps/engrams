@@ -1,0 +1,23 @@
+[package]
+name = "engram-storage-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Filesystem-backed BlobStorage. Dev/test backend; persists under <root>/blobs/."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

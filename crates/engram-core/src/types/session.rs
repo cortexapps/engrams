@@ -9,15 +9,20 @@ pub enum SessionStatus {
     Pending,
     Active,
     Idle,
+    /// The session's hot snapshot was flushed to cold-tier blob
+    /// storage (disk-pressure flush, or admin-triggered explicit
+    /// flush). Resume is still possible — the scheduler picks a host
+    /// with the matching OCI manifest digest cached, downloads the
+    /// blob, untars, restores. Distinct from `Idle` (which means hot
+    /// snapshot still on local NVMe) and `Dead` (terminal — the cold
+    /// blob is gone too). See ADR 0005.
+    ColdEvicted,
     Completed,
     Failed,
-    /// Terminal: the session's FC snapshot is gone (host crashed
-    /// mid-run, disk full, eviction past hard cap, etc.). Engram
-    /// is a one-shot task runner — sessions live ↔ FC-snapshot
-    /// life. The only affordance from Dead is `engram session fork
-    /// <id>` to start a new session with the workspace at the
-    /// last checkpoint SHA. (Renamed from `PendingReassign` when
-    /// the cross-host-resume code path was retired.)
+    /// Terminal: no snapshot remains in either tier (host crashed
+    /// before flush, blob deleted, KEK lost, intentional GC). Engram
+    /// is a one-shot task runner — `Dead` ends the session. Callers
+    /// either accept the loss or start a fresh session.
     Dead,
 }
 
@@ -27,6 +32,7 @@ impl SessionStatus {
             Self::Pending => "pending",
             Self::Active => "active",
             Self::Idle => "idle",
+            Self::ColdEvicted => "cold_evicted",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Dead => "dead",
@@ -256,13 +262,23 @@ mod tests {
             SessionStatus::Pending,
             SessionStatus::Active,
             SessionStatus::Idle,
+            SessionStatus::ColdEvicted,
             SessionStatus::Completed,
             SessionStatus::Failed,
+            SessionStatus::Dead,
         ] {
             let via_serde = serde_json::to_string(&s).unwrap();
             let trimmed = via_serde.trim_matches('"');
             assert_eq!(s.as_str(), trimmed, "as_str must match wire format");
         }
+    }
+
+    #[test]
+    fn cold_evicted_serializes_as_snake_case() {
+        let payload = serde_json::to_value(SessionStatus::ColdEvicted).unwrap();
+        assert_eq!(payload, serde_json::json!("cold_evicted"));
+        let parsed: SessionStatus = serde_json::from_str(r#""cold_evicted""#).unwrap();
+        assert_eq!(parsed, SessionStatus::ColdEvicted);
     }
 
     #[test]

@@ -80,6 +80,11 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     let size_bytes: i64 = row.try_get("size_bytes").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_accessed_at: DateTime<Utc> = row.try_get("last_accessed_at").map_err(col_err)?;
+    // Cold-tier columns added by 0016. Older rows pre-migration default
+    // to "no cold copy" naturally — `blob_present` is NOT NULL DEFAULT
+    // FALSE; `replicated_at` is nullable.
+    let blob_present: bool = row.try_get("blob_present").map_err(col_err)?;
+    let replicated_at: Option<DateTime<Utc>> = row.try_get("replicated_at").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: SessionId(session_id),
@@ -89,6 +94,8 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         size_bytes: size_bytes.max(0) as u64,
         created_at,
         last_accessed_at,
+        blob_present,
+        replicated_at,
     })
 }
 
