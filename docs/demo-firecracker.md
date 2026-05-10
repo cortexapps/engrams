@@ -107,6 +107,52 @@ curl -s -X POST http://localhost:8090/sessions/$SID/exec \
 '
 ```
 
+## Idle eviction → hot resume → cold flush → cold resume
+
+The cycle ADR 0005 (`docs/adr/0005-disk-pressure-blob-tier.md`) is
+designed around. Same wire surface as `docs/demo-vz.md:128-157` runs
+on VZ; FC differs only in that hot resume uses memory.bin (or UFFD)
+rather than an APFS clone.
+
+```
+/dev-vm ssh '
+SID=$(curl -s -X POST http://localhost:8090/sessions \
+  -H "content-type: application/json" \
+  -d "{\"image\":\"localhost:5001/engram/fc-claude:warm-1\",
+       \"harness\":{\"kind\":\"builtin\",\"name\":\"claude\"}}" | jq -r .session_id)
+
+# Idle eviction → hot auto-resume.
+sleep 35       # crosses the 30s soft TTL (ENGRAM_IDLE_TTL_SECS)
+curl http://localhost:8090/sessions/$SID  # status: idle
+curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
+  -H "content-type: application/json" \
+  -d "{\"text\":\"still there?\"}"
+# Hot resume: FC loads memory.bin (or UFFD), bridge re-binds, harness
+# adapter dials back, sub-second.
+
+# ADR 0005 — cold-tier flush + cross-host cold resume.
+sleep 35       # back to Idle
+# Stage 5 admin endpoint; same primitive Stage 7's disk-pressure
+# detector calls implicitly when host disk runs low.
+curl -s -X POST http://localhost:8090/api/admin/sessions/$SID/flush
+curl http://localhost:8090/sessions/$SID  # status: cold_evicted
+
+# Resume from cold tier — downloads blob, untars, restores on any
+# host with capacity. Snapshot-affinity scheduler picked the source
+# host for hot; cold path is host-agnostic.
+curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
+  -d "{\"text\":\"still there after cold flush?\"}"
+
+# Force a Dead session (snapshot invalidation).
+sleep 35
+sudo rm -rf /var/lib/engram/snapshots/$SID
+ENGRAM_BLOB_BACKEND=local sudo rm -rf /var/lib/engram/blobs/engram/snapshots/*
+curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
+  -d "{\"text\":\"this should fail\"}"
+# Expect HTTP 410 Gone with body "snapshot_invalidated".
+'
+```
+
 ## Bugs the demo surfaced (all fixed in this pass)
 
 1. **`engram image build` couldn't bake an FC-usable image.** The
@@ -153,9 +199,12 @@ curl -s -X POST http://localhost:8090/sessions/$SID/exec \
   substituted the placeholder. Tricky because the test fake
   upstream needs a destination reachable through the post-REDIRECT
   proxy path (a host-side resolver indirection).
-- Restore-time net re-provisioning: snapshot/restore currently
-  loses the per-VM /30 (the manifest doesn't carry it). Restored
-  sandboxes have no egress until destroyed and re-created.
+- Coordinator-level idle-evict + auto-resume integration test
+  against the FC backend (today the test surface lives in
+  `crates/engram-coordinator/tests/api.rs` against ProcessBackend;
+  no FC variant). Building it requires a coord-with-FC fixture, a
+  step beyond the existing `TestFixture` shape — deferred until
+  there's a concrete regression to motivate the infrastructure.
 
 ## Networking + secrets architecture (post-Phase 6)
 
