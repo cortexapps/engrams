@@ -265,7 +265,17 @@ struct FcSnapshotManifest {
     /// (test mode) or when restoring from a pre-net manifest.
     #[serde(default)]
     net: Option<FcNetSnapshot>,
+    /// Tag mirroring `VzSnapshotManifest::format` so a cross-VMM
+    /// restore (FC pulling a VZ blob, or vice versa) fails fast with
+    /// a clear message instead of a confusing parse error inside
+    /// load_snapshot. Defaults to empty for snapshots written before
+    /// this field landed; `restore` accepts both `"fc"` and `""` for
+    /// backwards compat.
+    #[serde(default)]
+    format: String,
 }
+
+const MANIFEST_FORMAT_FC: &str = "fc";
 
 /// What we need from the source VM's `NetSetup` to recreate networking
 /// on a restored VM. The `cidr_network` is the /30's network address
@@ -1184,6 +1194,7 @@ impl SandboxBackend for FirecrackerBackend {
             created_at,
             spec: spec.clone(),
             net: net_snapshot,
+            format: MANIFEST_FORMAT_FC.into(),
         };
         let manifest_path = dest.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -1216,6 +1227,19 @@ impl SandboxBackend for FirecrackerBackend {
             .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
         let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
+
+        // Reject cross-VMM restores fast: a VZ blob (`format == "vz"`)
+        // would otherwise reach load_snapshot and fail with a
+        // confusing FC parse error on state.bin. Empty string accepted
+        // for snapshots written before the format field landed; once
+        // those have rotated out a future cleanup can drop the empty
+        // case.
+        if !matches!(manifest.format.as_str(), MANIFEST_FORMAT_FC | "") {
+            return Err(SandboxError::Snapshot(format!(
+                "manifest format {:?} is not 'fc' — cross-VMM restore not supported",
+                manifest.format,
+            )));
+        }
 
         // Always allocate a *fresh* sandbox id — same on-disk state,
         // different lifecycle handle.
@@ -1636,12 +1660,57 @@ mod tests {
                 tap_name: "tap-engr-abcdef".into(),
                 cidr_network: std::net::Ipv4Addr::new(10, 200, 0, 4),
             }),
+            format: MANIFEST_FORMAT_FC.into(),
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: FcSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
         let net = parsed.net.expect("net field should round-trip");
         assert_eq!(net.tap_name, "tap-engr-abcdef");
         assert_eq!(net.cidr_network, std::net::Ipv4Addr::new(10, 200, 0, 4));
+        assert_eq!(parsed.format, MANIFEST_FORMAT_FC);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_vz_format_manifest() {
+        // A blob accidentally tagged with VZ's format must surface
+        // a clear cross-VMM error rather than reaching FC's
+        // load_snapshot with garbage state.bin contents.
+        let (b, _d) = backend();
+        let snap_dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "sandbox_id": "00000000-0000-0000-0000-000000000000",
+            "created_at": "2026-01-01T00:00:00Z",
+            "spec": {
+                "image": "warm-test",
+                "rootfs_source": null,
+                "image_uri": null,
+                "harness_pack_uri": null,
+                "cpu": {"vcpus": 1},
+                "memory": {"max_mib": 256},
+                "disk": {"max_gib": 1},
+                "ttl": null,
+                "env": {},
+                "workdir": null,
+                "harness_substrate": null,
+                "network": {}
+            },
+            "format": "vz"
+        });
+        tokio::fs::write(
+            snap_dir.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+        match b.restore(snap_dir.path().to_path_buf()).await {
+            Err(SandboxError::Snapshot(msg)) => {
+                assert!(
+                    msg.contains("not 'fc'") && msg.contains("cross-VMM"),
+                    "expected cross-VMM error, got: {msg}",
+                );
+            }
+            other => panic!("expected Snapshot error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
