@@ -27,9 +27,7 @@ struct MiniMeta {
 #[async_trait]
 impl MetadataStore for MiniMeta {
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
-        use engram_core::types::session::SessionKind;
         let id = SessionId::new();
-        let session_kind = SessionKind::derive(&spec.workspace);
         self.sessions.lock().insert(
             id,
             Session {
@@ -40,10 +38,7 @@ impl MetadataStore for MiniMeta {
                 sandbox_id: None,
                 created_at: Utc::now(),
                 image: spec.image,
-                workspace: spec.workspace,
                 harness: spec.harness,
-                session_kind,
-                checkpoint_branch: None,
                 last_active_at: Utc::now(),
             },
         );
@@ -227,11 +222,10 @@ impl MetadataStore for MiniMeta {
 }
 
 async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionStatus) -> SessionId {
-    use engram_core::types::session::{HarnessSpec, WorkspaceSpec};
+    use engram_core::types::session::HarnessSpec;
     let id = meta
         .create_session(SessionSpec {
             image: "localhost:5001/demo:warm-test".into(),
-            workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
             user_id: None,
         })

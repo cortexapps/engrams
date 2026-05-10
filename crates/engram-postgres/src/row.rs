@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
+use engram_core::types::session::HarnessSpec;
 use engram_core::types::{
     EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
     RegistryCredential, Session, SessionSecrets, SessionStatus, SnapshotRecord,
@@ -25,13 +25,8 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let status: String = row.try_get("status").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_active_at: DateTime<Utc> = row.try_get("last_active_at").map_err(col_err)?;
-    let session_kind: String = row.try_get("session_kind").map_err(col_err)?;
-    let checkpoint_branch: Option<String> = row.try_get("checkpoint_branch").map_err(col_err)?;
     let image_uri: String = row.try_get("image_uri").map_err(col_err)?;
-    let workspace_json: serde_json::Value = row.try_get("workspace").map_err(col_err)?;
     let harness_json: serde_json::Value = row.try_get("harness").map_err(col_err)?;
-    let workspace: WorkspaceSpec = serde_json::from_value(workspace_json)
-        .map_err(|e| MetaError::Serialization(format!("workspace: {e}")))?;
     let harness: HarnessSpec = serde_json::from_value(harness_json)
         .map_err(|e| MetaError::Serialization(format!("harness: {e}")))?;
     Ok(Session {
@@ -41,10 +36,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
         image: image_uri,
-        workspace,
         harness,
-        session_kind: SessionKind::parse(&session_kind).map_err(MetaError::Serialization)?,
-        checkpoint_branch,
         created_at,
         last_active_at,
     })
@@ -193,6 +185,7 @@ fn parse_session_status(s: &str) -> Result<SessionStatus, MetaError> {
         "pending" => SessionStatus::Pending,
         "active" => SessionStatus::Active,
         "idle" => SessionStatus::Idle,
+        "cold_evicted" => SessionStatus::ColdEvicted,
         "dead" => SessionStatus::Dead,
         "completed" => SessionStatus::Completed,
         "failed" => SessionStatus::Failed,
@@ -230,8 +223,10 @@ mod tests {
             ("pending", SessionStatus::Pending),
             ("active", SessionStatus::Active),
             ("idle", SessionStatus::Idle),
+            ("cold_evicted", SessionStatus::ColdEvicted),
             ("completed", SessionStatus::Completed),
             ("failed", SessionStatus::Failed),
+            ("dead", SessionStatus::Dead),
         ];
         for (s, expected) in variants {
             assert_eq!(parse_session_status(s).unwrap(), expected);

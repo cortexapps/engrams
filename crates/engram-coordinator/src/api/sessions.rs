@@ -5,11 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
-use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef, WorkspaceSpec};
-// `WorkspaceSpec` is still part of the engram-core domain model
-// (Stage 3 retires it). Stage 1 / ADR 0005 dropped the API surface
-// for it: every session is constructed with `WorkspaceSpec::Empty`
-// and the workspace comes from the bake image's `/workspace`.
+use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef};
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionStatus};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -329,13 +325,10 @@ pub async fn create_session(
         .await
         .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
 
+    // ADR 0005: workspace comes from the bake image; the platform
+    // never clones a repo or materializes anything itself.
     let spec = SessionSpec {
         image: req.image.clone(),
-        // ADR 0005: workspace comes from the bake image; the platform
-        // never clones a repo or materializes anything itself. Every
-        // session is `WorkspaceSpec::Empty` until Stage 3 drops the
-        // type entirely.
-        workspace: WorkspaceSpec::Empty,
         harness: req.harness.clone(),
         user_id: req.user_id,
     };

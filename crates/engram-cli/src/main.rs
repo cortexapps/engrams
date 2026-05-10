@@ -574,22 +574,7 @@ async fn session_get(
         "status          : {}",
         body["status"].as_str().unwrap_or("")
     );
-    println!(
-        "session_kind    : {}",
-        body["session_kind"].as_str().unwrap_or("")
-    );
-    println!("repo            : {}", body["repo"].as_str().unwrap_or(""));
-    println!(
-        "branch          : {}",
-        body["branch"].as_str().unwrap_or("")
-    );
-    if let Some(b) = body["checkpoint_branch"].as_str() {
-        println!("checkpoint_branch: {b}");
-    }
-    println!(
-        "image_version   : {}",
-        body["image_version"].as_str().unwrap_or(""),
-    );
+    println!("image           : {}", body["image"].as_str().unwrap_or(""),);
     if let Some(uid) = body["user_id"].as_str() {
         println!("user_id         : {uid}");
     }

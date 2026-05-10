@@ -64,14 +64,7 @@ impl MockMetadataStore {
 #[async_trait]
 impl MetadataStore for MockMetadataStore {
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
-        use engram_core::types::session::{checkpoint_branch_for, SessionKind};
-
         let id = SessionId::new();
-        let session_kind = SessionKind::derive(&spec.workspace);
-        let checkpoint_branch = match session_kind {
-            SessionKind::Git => Some(checkpoint_branch_for(id)),
-            _ => None,
-        };
         let session = Session {
             id,
             user_id: spec.user_id,
@@ -80,10 +73,7 @@ impl MetadataStore for MockMetadataStore {
             sandbox_id: None,
             created_at: Utc::now(),
             image: spec.image,
-            workspace: spec.workspace,
             harness: spec.harness,
-            session_kind,
-            checkpoint_branch,
             last_active_at: Utc::now(),
         };
         self.sessions.lock().insert(id, session);
@@ -698,7 +688,6 @@ async fn create_session_with_explicit_image_persists_full_row() {
     let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
     let session = store.get_session(id).await.unwrap();
     assert_eq!(session.image, "cortex/api:warm-pinned");
-    assert_eq!(session.workspace.git_branch(), None);
     assert!(session.harness.is_none());
     assert_eq!(session.status, SessionStatus::Active);
 }
@@ -832,7 +821,6 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
         store
             .create_session(SessionSpec {
                 image: format!("{repo}:warm-bootstrap"),
-                workspace: engram_core::types::session::WorkspaceSpec::Empty,
                 harness: engram_core::types::session::HarnessSpec::None,
                 user_id: None,
             })
@@ -882,11 +870,6 @@ async fn list_sessions_serializes_full_session_record() {
     let id = store
         .create_session(SessionSpec {
             image: "cortex/api:warm-2026-04-27".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Git {
-                url: "https://github.com/cortex/api.git".into(),
-                branch: "trunk".into(),
-                read_only: false,
-            },
             harness: engram_core::types::session::HarnessSpec::Builtin {
                 name: "claude".into(),
             },
@@ -909,16 +892,13 @@ async fn list_sessions_serializes_full_session_record() {
         .find(|s| s["id"] == id.to_string())
         .expect("created session must be in the list");
     // Lock the wire shape so a CLI / web client can rely on it.
-    // Stage B1: image is now a flat OCI URI string, not a discriminated
-    // {kind, repo, tag} object.
+    // Stage B1: image is a flat OCI URI string. ADR 0005: workspace
+    // is gone; the bake image is the whole story.
     assert_eq!(item["image"], "cortex/api:warm-2026-04-27");
-    assert_eq!(item["workspace"]["kind"], "git");
-    assert_eq!(
-        item["workspace"]["url"],
-        "https://github.com/cortex/api.git"
+    assert!(
+        item.get("workspace").is_none(),
+        "ADR 0005 retired the workspace field"
     );
-    assert_eq!(item["workspace"]["branch"], "trunk");
-    assert_eq!(item["workspace"]["read_only"], false);
     assert_eq!(item["harness"]["kind"], "builtin");
     assert_eq!(item["harness"]["name"], "claude");
     assert_eq!(item["user_id"], "user-42");
@@ -933,7 +913,6 @@ async fn delete_session_marks_completed_and_returns_204() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1133,7 +1112,6 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1445,7 +1423,6 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1520,7 +1497,6 @@ async fn evict_local_409_when_session_not_active() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1552,7 +1528,6 @@ async fn resume_410_gone_when_no_snapshot_exists() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1627,7 +1602,6 @@ async fn exec_rejects_request_without_command_or_argv() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1652,7 +1626,6 @@ async fn exec_rejects_empty_argv() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })
@@ -1850,7 +1823,6 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            workspace: engram_core::types::session::WorkspaceSpec::Empty,
             harness: engram_core::types::session::HarnessSpec::None,
             user_id: None,
         })

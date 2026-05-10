@@ -10,7 +10,6 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::session::{checkpoint_branch_for, SessionKind};
 use engram_core::types::{
     EnabledImage, HarnessPack, HostRecord, HostStatus, PersistedEvent, RegistryCredential, Session,
     SessionSecrets, SessionSpec, SessionStatus, SnapshotRecord,
@@ -62,33 +61,22 @@ impl MetadataStore for PostgresStore {
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
-        let kind = SessionKind::derive(&spec.workspace);
-        let checkpoint_branch = match kind {
-            SessionKind::Git => Some(checkpoint_branch_for(SessionId(id))),
-            SessionKind::Readonly | SessionKind::Ephemeral => None,
-        };
-        let workspace_json = serde_json::to_value(&spec.workspace)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let harness_json = serde_json::to_value(&spec.harness)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         sqlx::query(
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id,
-                 image_uri, workspace, harness,
-                 session_kind, checkpoint_branch,
+                 image_uri, harness,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $9)
+            VALUES ($1, $2, $3, NULL, $4, $5, $6, $6)
             "#,
         )
         .bind(id)
         .bind(spec.user_id.as_deref())
         .bind(SessionStatus::Pending.as_str())
         .bind(&spec.image)
-        .bind(workspace_json)
         .bind(harness_json)
-        .bind(kind.as_str())
-        .bind(checkpoint_branch.as_deref())
         .bind(now)
         .execute(&self.pool)
         .await
@@ -100,8 +88,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, workspace, harness,
-                   session_kind, checkpoint_branch,
+                   image_uri, harness,
                    created_at, last_active_at
             FROM sessions WHERE id = $1
             "#,
@@ -118,8 +105,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, workspace, harness,
-                   session_kind, checkpoint_branch,
+                   image_uri, harness,
                    created_at, last_active_at
             FROM sessions
             WHERE status IN ('pending','active','idle')

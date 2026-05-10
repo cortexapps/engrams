@@ -86,7 +86,7 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
-    use engram_core::types::session::{HarnessSpec, SessionKind, WorkspaceSpec};
+    use engram_core::types::session::HarnessSpec;
     use engram_core::types::Session;
     use engram_core::types::SessionStatus;
     use engram_sandbox_process::ProcessBackend;
@@ -129,10 +129,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:test".into(),
-            workspace: WorkspaceSpec::Empty,
             harness: HarnessSpec::None,
-            session_kind: SessionKind::Ephemeral,
-            checkpoint_branch: None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
         }
