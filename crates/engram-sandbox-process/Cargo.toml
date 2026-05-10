@@ -29,7 +29,7 @@ uuid.workspace = true
 # timeout-and-SIGKILL path (Unix-only). The whole crate is a no-op
 # on Windows; keep it gated to avoid pulling unix-y deps everywhere.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 futures = { workspace = true }
