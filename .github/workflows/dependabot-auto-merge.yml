@@ -45,16 +45,24 @@ jobs:
       # Grouped Dependabot PRs report `update-type` as the
       # *highest* semver bump in the group, so a group containing
       # any major bump fails this gate and is left for a human.
+      # `run:` uses a block scalar so colon-space sequences in the
+      # --body string (e.g. "Auto-approved: …") don't get parsed as
+      # YAML mapping keys. Plain scalars look fine to the eye but
+      # break the whole file's parse silently — no workflow runs,
+      # no error surfaced in the GH UI, just blocked PRs.
       - name: Approve PR
         if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.metadata.outputs.update-type)
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr review --approve "$PR_URL" --body "Auto-approved: ${{ steps.metadata.outputs.update-type }} via Dependabot."
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        run: |
+          gh pr review --approve "$PR_URL" --body "Auto-approved: $UPDATE_TYPE via Dependabot."
 
       - name: Enable auto-merge (squash)
         if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.metadata.outputs.update-type)
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge --auto --squash "$PR_URL"
+        run: |
+          gh pr merge --auto --squash "$PR_URL"
