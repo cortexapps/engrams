@@ -796,6 +796,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-chunk-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "engram-core",
+ "engram-storage-local",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "engram-cli"
 version = "0.1.0"
 dependencies = [

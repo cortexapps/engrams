@@ -5,6 +5,7 @@ members = [
     "crates/engram-protocol",
     "crates/engram-coordinator",
     "crates/engram-host-agent",
+    "crates/engram-chunk-store",
     "crates/engram-image-builder",
     "crates/engram-cli",
     "crates/engram-agentd",
@@ -69,6 +70,7 @@ engram-oci-auth = { path = "crates/engram-oci-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }
 engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
+engram-chunk-store = { path = "crates/engram-chunk-store" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }

@@ -1,0 +1,29 @@
+[package]
+name = "engram-chunk-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-addressed chunked-immutable storage for Engram. Manifests + chunks live in BlobStorage; local NVMe cache fronts hot reads."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+engram-storage-local.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
