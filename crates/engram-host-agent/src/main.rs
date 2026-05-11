@@ -78,6 +78,82 @@ struct Cli {
     /// `just vz-pull-kernel`).
     #[arg(long, env = "ENGRAM_VZ_KERNEL_PATH")]
     vz_kernel_path: Option<PathBuf>,
+
+    /// TCP port the local egress proxy binds. iptables PREROUTING
+    /// REDIRECT on this host sends guest tcp/443 here. `0` (default)
+    /// disables egress filtering entirely: no proxy is spawned, no
+    /// REDIRECT rules are installed, and guests reach the network
+    /// directly. ADR 0006.
+    #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 0)]
+    egress_proxy_port: u16,
+
+    /// Where the host-agent loads the deployment-wide egress-proxy
+    /// CA from. Ignored when `--egress-proxy-port=0`. Production
+    /// uses `gcp-secret-manager` with Workload Identity; dev uses
+    /// `local-disk` (auto-generates on first boot).
+    #[arg(
+        long,
+        env = "ENGRAM_EGRESS_CA_SOURCE",
+        value_parser = parse_ca_source_choice,
+        default_value = "local-disk"
+    )]
+    ca_source: CaSourceChoice,
+
+    /// Name of the env var holding the CA cert PEM when
+    /// `--ca-source=env`. Default `ENGRAM_EGRESS_CA_CERT_PEM`.
+    #[arg(
+        long,
+        env = "ENGRAM_EGRESS_CA_CERT_VAR",
+        default_value = "ENGRAM_EGRESS_CA_CERT_PEM"
+    )]
+    ca_cert_var: String,
+
+    /// Name of the env var holding the CA key PEM when
+    /// `--ca-source=env`. Default `ENGRAM_EGRESS_CA_KEY_PEM`.
+    #[arg(
+        long,
+        env = "ENGRAM_EGRESS_CA_KEY_VAR",
+        default_value = "ENGRAM_EGRESS_CA_KEY_PEM"
+    )]
+    ca_key_var: String,
+
+    /// Directory the local-disk CA loader generates / reads from.
+    /// Only used when `--ca-source=local-disk`. Default
+    /// `<work_dir>/egress-ca`.
+    #[arg(long, env = "ENGRAM_EGRESS_CA_DIR")]
+    ca_dir: Option<PathBuf>,
+
+    /// Fully-qualified Secret Manager path holding the CA cert
+    /// PEM. Required when `--ca-source=gcp-secret-manager`.
+    /// Example: `projects/cortex-prod/secrets/engram-egress-ca-cert/versions/latest`.
+    #[arg(long, env = "ENGRAM_EGRESS_CA_GCP_CERT_SECRET")]
+    ca_gcp_cert_secret: Option<String>,
+
+    /// Fully-qualified Secret Manager path holding the CA key PEM.
+    /// Required when `--ca-source=gcp-secret-manager`.
+    #[arg(long, env = "ENGRAM_EGRESS_CA_GCP_KEY_SECRET")]
+    ca_gcp_key_secret: Option<String>,
+}
+
+/// Choice of CA-loading backend. Extension points: AWS Secrets
+/// Manager, HashiCorp Vault, Azure Key Vault — one variant + one
+/// `CaSource` impl per backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaSourceChoice {
+    Env,
+    LocalDisk,
+    GcpSecretManager,
+}
+
+fn parse_ca_source_choice(s: &str) -> Result<CaSourceChoice, String> {
+    match s {
+        "env" => Ok(CaSourceChoice::Env),
+        "local-disk" => Ok(CaSourceChoice::LocalDisk),
+        "gcp-secret-manager" => Ok(CaSourceChoice::GcpSecretManager),
+        other => Err(format!(
+            "unknown CA source `{other}` (expected env | local-disk | gcp-secret-manager)"
+        )),
+    }
 }
 
 #[tokio::main]
@@ -143,7 +219,56 @@ async fn main() -> Result<(), HostAgentError> {
     };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
-    HostAgent::new(cfg, sandbox, cloud).run().await
+    let mut agent = HostAgent::new(cfg, sandbox, cloud);
+    if cli.egress_proxy_port > 0 {
+        match build_host_egress(&cli).await {
+            Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
+            Err(e) => {
+                tracing::error!(error = %e, "egress proxy spawn failed; aborting");
+                return Err(HostAgentError::Config(format!("egress: {e}")));
+            }
+        }
+    } else {
+        tracing::info!(
+            "egress proxy disabled (--egress-proxy-port=0); guests have unfiltered network access"
+        );
+    }
+    agent.run().await
+}
+
+async fn build_host_egress(cli: &Cli) -> Result<engram_host_agent::egress::HostEgress, String> {
+    use std::sync::Arc;
+    let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
+        CaSourceChoice::Env => Arc::new(engram_egress_proxy::EnvCaSource::new(
+            cli.ca_cert_var.clone(),
+            cli.ca_key_var.clone(),
+        )),
+        CaSourceChoice::LocalDisk => {
+            let dir = cli
+                .ca_dir
+                .clone()
+                .unwrap_or_else(|| cli.work_dir.join("egress-ca"));
+            Arc::new(engram_egress_proxy::LocalDiskCaSource::new(dir))
+        }
+        CaSourceChoice::GcpSecretManager => {
+            let cert = cli.ca_gcp_cert_secret.clone().ok_or_else(|| {
+                "--ca-source=gcp-secret-manager requires --ca-gcp-cert-secret".to_string()
+            })?;
+            let key = cli.ca_gcp_key_secret.clone().ok_or_else(|| {
+                "--ca-source=gcp-secret-manager requires --ca-gcp-key-secret".to_string()
+            })?;
+            Arc::new(
+                engram_secrets_gcp::ca::GcpSecretManagerCaSource::new(cert, key)
+                    .map_err(|e| format!("gcp-secret-manager source: {e}"))?,
+            )
+        }
+    };
+    let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
+        .parse()
+        .map_err(|e| format!("parse bind addr: {e}"))?;
+    engram_host_agent::egress::HostEgress::spawn(source, bind)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Initialise the global tracing subscriber.

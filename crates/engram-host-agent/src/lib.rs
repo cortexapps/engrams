@@ -17,6 +17,7 @@ use engram_core::traits::{CloudBackend, SandboxBackend};
 pub mod config;
 pub mod dialer;
 pub mod disk_pressure;
+pub mod egress;
 pub mod flush;
 pub mod harness;
 pub mod heartbeat;
@@ -32,6 +33,9 @@ pub struct HostAgent {
     pub cfg: HostAgentConfig,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub cloud: Arc<dyn CloudBackend>,
+    /// ADR 0006: local egress proxy. `None` keeps egress unfiltered
+    /// (dev / explicit opt-out via `--egress-proxy-port=0`).
+    pub egress: Option<Arc<egress::HostEgress>>,
 }
 
 impl HostAgent {
@@ -44,7 +48,17 @@ impl HostAgent {
             cfg,
             sandbox,
             cloud,
+            egress: None,
         }
+    }
+
+    /// Attach a local egress proxy. The host-agent will route every
+    /// inbound `notify_session_policy` to this proxy's registry,
+    /// unregister sandboxes on `destroy`, and expose the CA cert
+    /// PEM to substrate-building code paths.
+    pub fn with_egress(mut self, egress: Arc<egress::HostEgress>) -> Self {
+        self.egress = Some(egress);
+        self
     }
 
     /// Run the host agent's background loops until shutdown.
@@ -71,10 +85,16 @@ impl HostAgent {
             // coordinator's scheduler. With this in place the
             // scheduler's warm-pool branch in pick_for_session
             // actually fires instead of falling through to capacity.
-            let pooled = Arc::new(pooled_backend::PooledBackend::new(
-                self.sandbox.clone(),
-                self.cfg.warm_pool_size,
-            ));
+            let pooled = {
+                let mut p = pooled_backend::PooledBackend::new(
+                    self.sandbox.clone(),
+                    self.cfg.warm_pool_size,
+                );
+                if let Some(egress) = self.egress.clone() {
+                    p = p.with_egress(egress);
+                }
+                Arc::new(p)
+            };
             let pooled_for_dialer: Arc<dyn engram_core::traits::SandboxBackend> = pooled.clone();
             let pooled_for_hb = pooled.clone();
             let provider: dialer::HeartbeatProvider = std::sync::Arc::new(move || {

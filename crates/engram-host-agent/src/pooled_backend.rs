@@ -15,12 +15,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use engram_core::traits::SandboxBackend;
+use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::{SandboxError, SandboxId};
+use engram_core::{SandboxError, SandboxId, SessionId};
 use engram_protocol::WarmPoolReport;
 
+use crate::egress::HostEgress;
 use crate::image_cache::ImageCache;
 use crate::pool::{Pool, PoolKey};
 
@@ -41,6 +44,16 @@ pub struct PooledBackend {
     /// existing warm-pool logic and inner backend keep working
     /// unchanged. `None` is the legacy single-host path.
     image_cache: Option<ImageCache>,
+    /// ADR 0006: per-host egress proxy. When attached, incoming
+    /// `notify_session_policy` calls register against the local
+    /// proxy registry and `destroy` unregisters. `None` is the
+    /// "no egress filtering" path (dev or operator opt-out).
+    egress: Option<Arc<HostEgress>>,
+    /// `sandbox_id → session_id` index so `destroy(sandbox_id)` can
+    /// call `Registry::unregister(session_id)`. Populated when a
+    /// policy frame arrives. Skipped for sandboxes never policied
+    /// (warm-pool slots that never bound to a session).
+    egress_sessions: DashMap<SandboxId, SessionId>,
 }
 
 impl PooledBackend {
@@ -50,6 +63,8 @@ impl PooledBackend {
             inner,
             default_target,
             image_cache: None,
+            egress: None,
+            egress_sessions: DashMap::new(),
         }
     }
 
@@ -58,6 +73,15 @@ impl PooledBackend {
     /// before forwarding to the inner backend.
     pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
         self.image_cache = Some(cache);
+        self
+    }
+
+    /// Attach a host-egress proxy. Once set, incoming
+    /// `notify_session_policy` calls register against this proxy's
+    /// registry and `destroy` unregisters. The CA PEM is available
+    /// to substrate-builders via `host_egress.ca_cert_pem`.
+    pub fn with_egress(mut self, egress: Arc<HostEgress>) -> Self {
+        self.egress = Some(egress);
         self
     }
 
@@ -198,6 +222,16 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // Unregister from the local egress proxy first, so any
+        // outstanding traffic from a still-alive guest stops being
+        // rewritten. The destroy below tears down the VM; in the
+        // brief window between the two, a closed-fail-by-default
+        // registry would reject — which is the safe behavior.
+        if let Some(egress) = self.egress.as_ref() {
+            if let Some((_, session_id)) = self.egress_sessions.remove(&id) {
+                egress.registry.unregister(session_id);
+            }
+        }
         self.inner.destroy(id).await
     }
 
@@ -207,6 +241,31 @@ impl SandboxBackend for PooledBackend {
 
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         self.inner.set_harness_sink(sink);
+    }
+
+    async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        let Some(egress) = self.egress.as_ref() else {
+            // No proxy attached — egress is unfiltered. The
+            // coordinator may still send policy frames (the
+            // coordinator-side codepath doesn't know whether a host
+            // happens to have a proxy); silently no-op.
+            tracing::debug!(
+                session_id = %policy.session_id,
+                "notify_session_policy: no local egress proxy, ignoring",
+            );
+            return Ok(());
+        };
+        let sandbox_id = policy.sandbox_id;
+        let session_id = policy.session_id;
+        crate::egress::register_policy(&egress.registry, policy)
+            .map_err(|e| SandboxError::InvalidSpec(format!("translate egress policy: {e}")))?;
+        self.egress_sessions.insert(sandbox_id, session_id);
+        tracing::debug!(
+            %sandbox_id,
+            %session_id,
+            "egress policy registered with local proxy",
+        );
+        Ok(())
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
