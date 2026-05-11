@@ -360,6 +360,18 @@ impl SandboxBackend for HostRegistry {
         backend.start_agent(id, agent).await
     }
 
+    async fn notify_session_policy(
+        &self,
+        policy: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        // Route by `sandbox_id` — the policy targets the host that
+        // owns that sandbox. Looked-up backend dispatches:
+        // RemoteSandboxBackend forwards over its WS; an in-process
+        // local backend applies directly.
+        let backend = self.lookup(policy.sandbox_id)?;
+        backend.notify_session_policy(policy).await
+    }
+
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         // Fan out to every currently-registered host's backend so
         // the FC sandbox listeners can route inbound vsock harness

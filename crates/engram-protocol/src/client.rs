@@ -544,4 +544,20 @@ impl SandboxBackend for RemoteSandboxBackend {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn notify_session_policy(
+        &self,
+        policy: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        // Notify (not unary) — fire-and-forget. WS-frame ordering
+        // guarantees the host processes this before any subsequent
+        // request on the same connection (e.g. start_agent), which is
+        // the sequencing invariant we rely on for ADR 0006.
+        self.host
+            .notify(crate::wire::NotifyKind::SessionEgressPolicy(policy))
+            .await
+            .map_err(|e| {
+                SandboxError::Vm(Box::new(StringError(format!("notify session policy: {e}"))))
+            })
+    }
 }

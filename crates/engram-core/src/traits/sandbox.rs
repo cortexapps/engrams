@@ -7,6 +7,7 @@ use futures::stream::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::SandboxError;
+use crate::types::egress::SessionEgressPolicy;
 use crate::types::ids::SandboxId;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec,
@@ -85,6 +86,27 @@ pub trait SandboxBackend: Send + Sync {
     /// backends shouldn't expect multiple sinks. Pass before any
     /// session-create call so the first dial isn't dropped.
     fn set_harness_sink(&self, _sink: HarnessSink) {}
+
+    /// Push per-session egress policy to the backend. The
+    /// coordinator calls this after `create_for_session` returns,
+    /// once the sandbox's `guest_ip` is known and before
+    /// `start_agent` dispatches — so the harness can't make
+    /// network calls before the local proxy knows the policy.
+    /// WS-frame ordering between this notify and the subsequent
+    /// `start_agent` request is what guarantees the sequencing on
+    /// remote-host backends.
+    ///
+    /// `RemoteSandboxBackend` forwards via the existing WS as a
+    /// `NotifyKind::SessionEgressPolicy`. Local backends apply the
+    /// policy in-process (used by `--mode=all`). Default is a no-op
+    /// for backends with no egress proxy attached (Process /
+    /// in-test fixtures). ADR 0006.
+    async fn notify_session_policy(
+        &self,
+        _policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
 
     /// Run a command in the sandbox and return a stream of stdout/stderr
     /// chunks ending with a single [`ExecEvent::Exit`]. Terminating the

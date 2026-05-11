@@ -11,13 +11,12 @@
 //! it without extra machinery.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use engram_core::types::image::SecretMode;
+use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::SandboxSpec;
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::{HostId, SandboxId, SessionId};
+use engram_core::{HostId, SandboxId};
 use serde::{Deserialize, Serialize};
 
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
@@ -182,48 +181,15 @@ pub enum NotifyKind {
     },
     Heartbeat(Heartbeat),
     HeartbeatAck(HeartbeatAck),
-    /// Coordinator → host. Per-session egress policy that the
-    /// host-agent's local egress proxy registers against the
-    /// session's `guest_ip`. Sent after the sandbox is created
-    /// (so `guest_ip` is known) and before `start_agent` is
-    /// dispatched (so the harness can't make egress calls before
-    /// policy is in place — WS-frame ordering enforces this).
-    /// ADR 0006.
+    /// Coordinator → host. Per-session egress policy the host-agent's
+    /// local egress proxy registers against the session's `guest_ip`.
+    /// Sent after the sandbox is created (so `guest_ip` is known) and
+    /// before `start_agent` is dispatched (so the harness can't make
+    /// egress calls before policy is in place — WS-frame ordering
+    /// enforces this). Payload type lives in `engram-core` so the
+    /// `SandboxBackend` trait can name it without depending on this
+    /// crate. ADR 0006.
     SessionEgressPolicy(SessionEgressPolicy),
-}
-
-/// Per-session policy the host-agent's egress proxy applies. Wire
-/// mirror of [`engram_egress_proxy::SessionState`]; defined here so
-/// `engram-protocol` stays independent of the proxy crate.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionEgressPolicy {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    /// IP the guest VM presents on the host-side tap interface.
-    /// The proxy's registry indexes by this; iptables REDIRECT
-    /// preserves source IP.
-    pub guest_ip: Ipv4Addr,
-    /// Hosts the manifest's `[network].allow_hosts` permits.
-    pub network_allow_hosts: Vec<String>,
-    /// Glob patterns from `[network].allow_host_patterns`.
-    pub network_allow_host_patterns: Vec<String>,
-    /// Per-secret entries (placeholder → real_value with per-secret
-    /// host allow-list). Empty for `SecretMode::Literal` images.
-    pub secrets: Vec<WireSecretEntry>,
-    /// Image's secret delivery mode. The proxy uses this to decide
-    /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
-    pub secret_mode: SecretMode,
-}
-
-/// Wire mirror of [`engram_egress_proxy::SecretEntry`]. Same shape;
-/// re-defined here so the wire format stays explicit and the
-/// engram-protocol crate doesn't depend on engram-egress-proxy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WireSecretEntry {
-    pub placeholder: String,
-    pub real_value: String,
-    pub allow_hosts: Vec<String>,
-    pub allow_host_patterns: Vec<String>,
 }
 
 /// Wire-friendly mirror of [`engram_core::types::sandbox::ExecRequest`].
@@ -396,13 +362,16 @@ mod tests {
 
     #[test]
     fn session_egress_policy_round_trips() {
+        use engram_core::types::egress::EgressSecretEntry;
+        use engram_core::types::image::SecretMode;
+        use engram_core::SessionId;
         let policy = SessionEgressPolicy {
             session_id: SessionId::new(),
             sandbox_id: SandboxId::new(),
             guest_ip: "10.200.1.2".parse().unwrap(),
             network_allow_hosts: vec!["api.github.com".into()],
             network_allow_host_patterns: vec!["*.cortex.io".into()],
-            secrets: vec![WireSecretEntry {
+            secrets: vec![EgressSecretEntry {
                 placeholder: "engram_ph_abc_def".into(),
                 real_value: "ghp_real_secret".into(),
                 allow_hosts: vec!["api.github.com".into()],
