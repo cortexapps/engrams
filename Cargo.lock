@@ -803,6 +803,7 @@ dependencies = [
  "bytes",
  "chrono",
  "engram-core",
+ "engram-storage-gcs",
  "engram-storage-local",
  "futures",
  "parking_lot",

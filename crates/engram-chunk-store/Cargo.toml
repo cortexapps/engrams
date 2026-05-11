@@ -25,5 +25,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 engram-storage-local.workspace = true
+engram-storage-gcs.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

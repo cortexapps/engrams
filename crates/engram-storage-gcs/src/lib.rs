@@ -348,4 +348,85 @@ mod tests {
 
         store.delete(&key).await.expect("delete");
     }
+
+    /// Validates `list_prefix` against fake-gcs-server: writes
+    /// enough keys to force pagination (>1000 per the SDK's
+    /// recommended max), confirms the full set comes back, and
+    /// confirms prefix filtering works as advertised.
+    ///
+    /// Higher-risk-than-local because pagination + prefix
+    /// filtering live in the GCS API surface; local-fs tests can't
+    /// catch a wire-level bug here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_prefix_paginates_against_emulator() {
+        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+            return;
+        };
+        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
+            return;
+        };
+
+        let store = GcsBlobStorage::connect(bucket)
+            .await
+            .expect("connect against emulator");
+
+        // Unique prefix per run so concurrent test invocations and
+        // prior runs don't interfere.
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let prefix = format!("engram/listtest/{run_id}/");
+        let other_prefix = format!("engram/listtest/{run_id}-other/");
+
+        // Write 1500 keys under `prefix` (forces ≥2 list pages with
+        // max_results=1000), plus 5 under `other_prefix` to verify
+        // we don't bleed across.
+        let n = 1500usize;
+        for i in 0..n {
+            let key = format!("{prefix}{i:06}.bin");
+            store
+                .put(&key, bytes::Bytes::from(format!("v{i}")))
+                .await
+                .expect("put");
+        }
+        for i in 0..5 {
+            let key = format!("{other_prefix}{i}.bin");
+            store
+                .put(&key, bytes::Bytes::from_static(b"x"))
+                .await
+                .expect("put");
+        }
+
+        let listed = store.list_prefix(&prefix).await.expect("list_prefix");
+        assert_eq!(
+            listed.len(),
+            n,
+            "expected {n} keys under {prefix}, got {}",
+            listed.len()
+        );
+        // Spot-check ordering doesn't matter; spot-check contents do.
+        let set: std::collections::HashSet<String> = listed.into_iter().collect();
+        for i in 0..n {
+            let expected = format!("{prefix}{i:06}.bin");
+            assert!(
+                set.contains(&expected),
+                "expected key {expected} missing from listing",
+            );
+        }
+        // Nothing from the other prefix.
+        for i in 0..5 {
+            let unwanted = format!("{other_prefix}{i}.bin");
+            assert!(!set.contains(&unwanted));
+        }
+
+        // Cleanup so the emulator's state doesn't grow without bound
+        // across test runs.
+        for i in 0..n {
+            let _ = store.delete(&format!("{prefix}{i:06}.bin")).await;
+        }
+        for i in 0..5 {
+            let _ = store.delete(&format!("{other_prefix}{i}.bin")).await;
+        }
+    }
 }
