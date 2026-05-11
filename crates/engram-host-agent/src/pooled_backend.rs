@@ -69,8 +69,16 @@ impl PooledBackend {
     }
 
     fn pool_key(spec: &SandboxSpec) -> PoolKey {
+        // `rootfs_source` is set by the image cache (OCI path) or
+        // the caller (local:// dev) before this is called — see
+        // `create()`. Two specs with the same `image` tag but
+        // different rootfs files now hash to distinct keys, so the
+        // known-issues-#1 collision (two `local://` repos sharing
+        // `image: "warm-1"` but shipping different rootfs) can't
+        // happen.
         PoolKey {
             image_version: spec.image.clone(),
+            rootfs_source: spec.rootfs_source.clone(),
         }
     }
 }
@@ -306,5 +314,47 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].image_version, "warm-a");
         assert_eq!(reports[1].image_version, "warm-b");
+    }
+
+    #[tokio::test]
+    async fn same_image_tag_but_different_rootfs_does_not_collide() {
+        // Known-issues #1 regression at the PooledBackend layer: two
+        // specs with identical `image` strings but different
+        // `rootfs_source` paths must not share a warm slot. Before
+        // the fix the second `create` would hand back a sandbox
+        // configured with the first spec's rootfs and the harness
+        // would silently load wrong-image binaries.
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
+        let pooled = PooledBackend::new(inner, 1);
+
+        // ProcessBackend materialises `rootfs_source` (it copies a
+        // directory tree into the sandbox cwd), so both paths have
+        // to be real directories. Their contents don't matter for
+        // the pool-key test — only the path strings do.
+        let demo_rootfs = dir.path().join("demo");
+        let oauth_rootfs = dir.path().join("oauth");
+        std::fs::create_dir_all(&demo_rootfs).unwrap();
+        std::fs::create_dir_all(&oauth_rootfs).unwrap();
+
+        let mut demo = live_spec("warm-1");
+        demo.rootfs_source = Some(demo_rootfs);
+        let mut oauth = live_spec("warm-1");
+        oauth.rootfs_source = Some(oauth_rootfs);
+
+        let _ = pooled.create(demo).await.unwrap();
+        let _ = pooled.create(oauth).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Two pool entries, both reported under the same
+        // `image_version` (heartbeat shape is unchanged) but
+        // internally keyed on distinct rootfs paths.
+        let reports = pooled.snapshot_warm_pools();
+        assert_eq!(
+            reports.len(),
+            2,
+            "specs with distinct rootfs must produce two pool entries even when image strings match",
+        );
+        assert!(reports.iter().all(|r| r.image_version == "warm-1"));
     }
 }

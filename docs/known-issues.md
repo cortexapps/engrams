@@ -5,40 +5,23 @@ deadline. Each item has the file/line of the offending code and a
 sketch of the proper fix so a future visitor (you, me, an agent) can
 land it without rediscovering the problem.
 
-## 1. Warm-pool key ignores `repo`
+## 1. ~~Warm-pool key ignores `repo`~~ (FIXED)
 
-**File**: `crates/engram-host-agent/src/pooled_backend.rs:56-65`
+**Resolved.** `PoolKey` now carries `rootfs_source` alongside
+`image_version`. Two specs with the same `image` tag but different
+rootfs paths (the original `local://demo/warm-1` vs
+`local://claude-oauth/warm-1` collision) now hash to distinct keys,
+so the second checkout can't silently return a sandbox configured
+with the first spec's rootfs.
 
-`pool_key` currently builds a `PoolKey` from `spec.image` for both the
-`repo` and `image_version` fields:
+In the OCI production path the image cache rewrites `rootfs_source`
+to a content-addressed digest path before pool keying, so two
+sessions sharing one OCI image_uri still share a single warm slot —
+the original Phase 3 efficiency property is preserved.
 
-```rust
-PoolKey {
-    repo: spec.image.clone(),
-    image_version: spec.image.clone(),
-}
-```
-
-Two repos sharing the same image version (e.g., `local://demo/warm-1`
-and `local://claude-oauth/warm-1`) collide on the pool key and are
-served interchangeably. Worse, `PooledBackend::create` configures the
-pool with the *first* spec it sees for that key, so all subsequent
-checkouts hand back clones of the original `rootfs_source` — even
-when the new request is for a totally different image. We hit this
-during the OAuth bring-up: a session for `local://claude-oauth`
-received a sandbox cloned from `local://demo`'s 228 MiB rootfs,
-booted into a non-Claude image, and silently dropped traffic because
-`/sbin/engram-harness-claude` didn't exist in that rootfs.
-
-**Fix**: include the original `repo` (not `spec.image`) in the
-`PoolKey`, plumbed through from `PooledBackend::create`'s caller. Add
-a regression test that creates two sessions with overlapping
-`image_version` but distinct `repo` and asserts they get different
-sandbox IDs. The comment on the existing `pool_key` ("`repo` is
-duplicated as the image_version because the wire protocol's
-`WarmPoolReport` carries both fields and the scheduler matches on
-`image_version` only") is correct about the wire shape but masks the
-correctness bug.
+Wire shape (`WarmPoolReport`) is unchanged; the disambiguator lives
+entirely host-local. Regression at
+`crates/engram-host-agent/src/pooled_backend.rs::tests::same_image_tag_but_different_rootfs_does_not_collide`.
 
 ## 2. VZ disk-attach failures leak the cloned rootfs
 

@@ -15,8 +15,20 @@
 //! redundant — image_tag is unique within the registry — so the key
 //! collapsed to just the image tag. A single warm slot can now serve
 //! sessions across any git URL or workspace shape.
+//!
+//! Phase 5 correction (known-issues #1): pure `image_version` keying
+//! is wrong when the same human tag (e.g. `warm-1`) is used by two
+//! semantically different images. In the OCI path that's not a
+//! problem — the cache rewrites `rootfs_source` to a content-
+//! addressed digest path before pool keying. In the `local://` dev
+//! path it is: `local://demo/warm-1` and `local://claude-oauth/warm-1`
+//! share the same `image_version` string but ship different rootfs
+//! files. We now key on `(image_version, rootfs_source)` so different
+//! rootfs paths get isolated pools; OCI sessions sharing one digest
+//! still share a single pool slot.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use engram_core::traits::SandboxBackend;
@@ -28,6 +40,11 @@ use parking_lot::Mutex;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PoolKey {
     pub image_version: String,
+    /// Resolved rootfs path (post-image-cache in the OCI path;
+    /// caller-set in `local://` dev). `None` only in tests and
+    /// bootstrap paths. Two specs with the same `image_version` but
+    /// different `rootfs_source` get isolated pools.
+    pub rootfs_source: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -199,11 +216,21 @@ mod tests {
     use engram_sandbox_process::ProcessBackend;
 
     fn key(_repo: &str, ver: &str) -> PoolKey {
-        // `_repo` was the historical second key half; preserved on
-        // the test helper signature so the existing call sites stay
-        // readable.
+        // `_repo` is the historical second key half; the real
+        // disambiguator now is `rootfs_source` (caller-set in
+        // local:// dev, cache-set in OCI). Tests that don't care
+        // about the rootfs path leave it `None` so two `key("a",
+        // "v1")` calls hash equal.
         PoolKey {
             image_version: ver.into(),
+            rootfs_source: None,
+        }
+    }
+
+    fn key_with_rootfs(_repo: &str, ver: &str, rootfs: &str) -> PoolKey {
+        PoolKey {
+            image_version: ver.into(),
+            rootfs_source: Some(PathBuf::from(rootfs)),
         }
     }
 
@@ -257,11 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn pool_keys_are_isolated_by_image_version() {
-        // Phase 3: pool key is image_version only. Two sessions
-        // pointing at different `repo`s but the same image share a
-        // pool slot — that's the whole decoupling point. Different
-        // image_versions stay isolated.
+    fn pool_keys_share_when_image_and_rootfs_match() {
+        // Phase 3: when two sessions resolve to the same content
+        // (same `image_version`, same `rootfs_source`), they share a
+        // warm pool slot — that's the whole decoupling point. The
+        // OCI cache makes this true even across logically distinct
+        // sessions for the same image.
         let (p, _d) = pool();
         let same = key("repo-a", "warm-1");
         let same_other_repo = key("repo-b", "warm-1");
@@ -271,7 +299,7 @@ mod tests {
         p.push_ready(same.clone(), id_a);
         p.push_ready(same_other_repo.clone(), id_b);
 
-        // Same image, regardless of `_repo` placeholder = same pool.
+        // Same `(image, rootfs=None)` shape = same pool.
         assert_eq!(p.ready_count(&same), 2);
         assert_eq!(
             p.ready_count(&other_image),
@@ -284,6 +312,30 @@ mod tests {
         assert_eq!(p.checkout(&same), Some(id_b));
         assert_eq!(p.checkout(&same), Some(id_a));
         assert_eq!(p.checkout(&same), None);
+    }
+
+    #[test]
+    fn pool_keys_are_isolated_by_rootfs_source() {
+        // Known-issues #1 regression: two sessions with the same
+        // `image_version` but distinct `rootfs_source` paths must
+        // land in different pools. Before the fix, both keyed on
+        // just `"warm-1"` and a session for repo-b silently received
+        // a warm slot prepared from repo-a's rootfs.
+        let (p, _d) = pool();
+        let demo = key_with_rootfs("local://demo", "warm-1", "/var/img/demo.ext4");
+        let oauth = key_with_rootfs("local://claude-oauth", "warm-1", "/var/img/oauth.ext4");
+        let demo_id = SandboxId::new();
+        let oauth_id = SandboxId::new();
+        p.push_ready(demo.clone(), demo_id);
+        p.push_ready(oauth.clone(), oauth_id);
+
+        assert_eq!(p.ready_count(&demo), 1);
+        assert_eq!(p.ready_count(&oauth), 1);
+        // Critically: demo's checkout must NOT return oauth's
+        // sandbox, even though both have `image_version == "warm-1"`.
+        assert_eq!(p.checkout(&demo), Some(demo_id));
+        assert_eq!(p.checkout(&oauth), Some(oauth_id));
+        assert_ne!(demo_id, oauth_id);
     }
 
     #[test]
