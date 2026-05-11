@@ -305,23 +305,51 @@ cloud-specific values in `values-gcp.yaml.example` /
 
 ## Phase 9 — Packer + GCP Terraform
 
-**Status: ⬜ pending — IaC only, presumes Rust gaps closed first**
+**Status: 🟡 partial — Packer + 3 core Terraform modules shipped; GKE/Postgres/SecretManager/AR deferred to operator-provided modules**
 
-`deploy/packer/` and `deploy/terraform/gcp/`. Packer image installs
-firecracker + host-agent + chunk daemon + UFFD handler + systemd
-units + drain hook. Terraform module provisions VPC, GKE, Cloud SQL,
-Secret Manager, GCS bucket, Artifact Registry, MIG for FC hosts.
+`deploy/packer/` + `deploy/terraform/gcp/`. The deliberate split:
+own the pieces specific to Engram (chunks bucket, FC host MIG,
+host image build); defer the well-trodden pieces (GKE cluster,
+Cloud SQL Postgres, Artifact Registry) to Google's published
+modules. Reasoning in `deploy/terraform/gcp/README.md`.
 
-- ⬜ `deploy/packer/fc-host-gcp.pkr.hcl` + shared provisioner scripts
-- ⬜ `deploy/terraform/gcp/modules/{network,gke,postgres,secrets,storage,artifact-registry,fc-host-mig,workload-identity}`
-- ⬜ `deploy/terraform/gcp/examples/minimal/` — smallest viable deploy
-- ⬜ `deploy/README.md` — infrastructure contract for other clouds
-- 💤 `deploy/packer/fc-host-aws.pkr.hcl` + Terraform AWS module —
-  contract documented, impl deferred
+- ✅ **Packer manifest** at `deploy/packer/fc-host-gcp.pkr.hcl`
+  + provisioners. Builds a GCE image with Firecracker + the
+  static-musl `engram-host-agent` binary + systemd unit + the
+  drain hook (`engram-drain.sh`). Pins FC version + pulls the
+  binary from a GCS URL the operator's CI populates.
+- ✅ **Terraform modules** (`network`, `storage`,
+  `fc-host-mig`) + `examples/minimal/` wiring them. `terraform
+  validate` + `terraform fmt -check` clean. The example
+  outputs the values the Helm chart's values.yaml needs
+  (chunks bucket name, KEK resource path, coordinator SA email).
+- ✅ **Infrastructure contract** in
+  `deploy/terraform/gcp/README.md` — what Engram needs from the
+  cloud + what operators bring themselves.
+- ⬜ Real `terraform apply` against a live GCP project (have
+  validated HCL syntax + module wiring; haven't actually
+  provisioned the fleet).
+- 💤 `deploy/packer/fc-host-aws.pkr.hcl` + Terraform AWS module
+  — contract documented, impl deferred.
+- 💤 `modules/gke`, `modules/postgres`, `modules/secrets`,
+  `modules/artifact-registry`, `modules/workload-identity` —
+  use Google's published modules instead. The example
+  documents which ones.
+
+**Operator-followup blocker**: per the example's README, the
+Helm chart needs the coord's `SQL` URL, `auth tokens`, and the
+internal LB URL of the coord. The Terraform reference produces
+the IAM scaffolding so a Helm install can chain on top, but the
+operator must (a) run a GKE module separately, (b) populate
+Secret Manager entries with the runtime values, (c) feed the
+coord LB URL back as `coordinator_endpoint` in a second
+`terraform apply`. Documented in the README's "Apply order".
 
 **Critical: this phase can NOT compensate for missing Rust wiring.**
 Setting env vars in a Packer manifest only matters if the binary
-reads them — see standalone host-agent gap below.
+reads them. The host-agent's Tier 3 wiring (commit `80d6841`)
++ the WS-RPC auth (`ad13dc0`) are prerequisites for the Packer
+image actually doing anything useful.
 
 ---
 
