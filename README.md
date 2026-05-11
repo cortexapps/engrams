@@ -8,7 +8,7 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 
 ## Status
 
-**Phase 1 — done.** Orchestration layer end-to-end on the dev backend. Coordinator HTTP API, scheduler, warm pool, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → rootfs), pluggable secret store (env / dotenv / GCP-stub), Postgres metadata store. End-to-end create → exec → delete on macOS via `engram-sandbox-process`. CLI covers session list/get/delete/logs and image build.
+**Phase 1 — done.** Orchestration layer end-to-end on the dev backend. Coordinator HTTP API, scheduler, warm pool, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → rootfs), pluggable secret store (env / dotenv / GCP Secret Manager), Postgres metadata store. End-to-end create → exec → delete on macOS via `engram-sandbox-process`. CLI covers session list/get/delete/logs and image build.
 
 **Phase 2 — done.** `engram-sandbox-firecracker` drives real Firecracker microVMs end-to-end: typed HTTP client over the FC unix socket; `create`/`destroy`/`list`/`snapshot`/`restore`/`exec_stream` all wired and exercised by integration tests on a Linux dev VM. `restore` supports both `File` mode (synchronous read of `memory.bin`) and `Uffd` mode (lazy paging via `engram-uffd-handler` — sub-100ms resume). `exec_stream` reaches an in-guest `engram-agentd` over Firecracker's vsock proxy; the image baker injects a static-musl agent + init shim into ext4 rootfs images.
 
@@ -225,7 +225,7 @@ engram image build --repo <r> --source . --format ext4  # bake ext4 image for Fi
 
 ## Auth
 
-Set `ENGRAM_AUTH_TOKENS` (comma-separated) on the coordinator to require bearer-token auth on every endpoint except `/healthz`. Empty = auth disabled (dev default). The CLI carries `ENGRAM_TOKEN` automatically.
+Set `ENGRAM_AUTH_TOKENS` (comma-separated) on the coordinator to require bearer-token auth on every endpoint except `/healthz` (liveness) and `/readyz` (readiness — Postgres ping; for LB probes). Empty = auth disabled (dev default). The CLI carries `ENGRAM_TOKEN` automatically.
 
 ```bash
 # coordinator
@@ -263,6 +263,18 @@ For agent-baked images, the coordinator needs:
 - A static-musl `engram-agentd` build:
   `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`
 - `init=/sbin/engram-init` in the kernel boot args (set via `FirecrackerConfig::default_boot_args`)
+
+## Production deployment
+
+For multi-host production (coordinator on GKE behind a load balancer, a pool of FC host VMs on GCE), the topology is:
+
+- **`engram-coordinator --mode=coordinator`** as a stateless K8s `Deployment` with N replicas. Reads its bootstrap secrets (DB URL, KEK, egress-proxy CA, registry tokens) from env via projected k8s Secrets. Liveness probe on `/healthz`, readiness probe on `/readyz` (which pings Postgres). Replicas reconcile via `LISTEN/NOTIFY` and `pg_try_advisory_lock`.
+- **`engram-host-agent --sandbox-backend=firecracker`** on each GCE FC host. Self-registers via `ENGRAM_COORDINATOR_ENDPOINT` over WebSocket; the coordinator never has to reach back. Hosts are NAT-friendly and can come and go without inventory changes.
+- **GCP Secret Manager** via Workload Identity (the coordinator's k8s SA mapped to a GCP SA with `roles/secretmanager.secretAccessor`) backs per-image session secret resolution at session-create time (`--secrets-backend=gcp`).
+- **GCS** for cold-tier snapshot durability (`ENGRAM_BLOB_BACKEND=gcs`). Multi-GB FC `memory.bin` flushes stream through `upload_streamed_object` without materialising in host RAM.
+- **`ENGRAM_LOG_FORMAT=json`** on both binaries for Cloud Logging ingestion.
+
+See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK + egress-proxy CA sourcing path, IAM/Workload-Identity wiring, and the operational gaps (idle auto-eviction, host-agent egress topology) still slated for v2 with their workarounds.
 
 ## License
 
