@@ -1,0 +1,48 @@
+# Engram host-agent systemd unit.
+#
+# Reads config from /etc/engram/host-agent.env which the MIG's
+# `startup-script` writes at first boot (it knows the coord
+# endpoint, the GCS bucket, the auth token — all per-environment
+# values that don't belong in the image). EnvironmentFile= is
+# noexec'd by systemd so a write race during startup just delays
+# the unit, not corrupt it.
+#
+# On shutdown systemd fires ExecStop= which runs the drain hook —
+# the coord migrates active sessions off this host before SIGTERM
+# lands on the agent.
+
+[Unit]
+Description=Engram Firecracker host-agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/engram/host-agent.env
+ExecStart=/usr/local/bin/engram-host-agent
+ExecStop=/usr/local/bin/engram-drain.sh
+# Allow up to 5 minutes for graceful drain — sessions migrating
+# off this host take time proportional to memory snapshot size.
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=2s
+
+# Privileges: needs /dev/kvm + CAP_NET_ADMIN for FC TAPs + raw
+# access to bind unprivileged ports for the egress proxy.
+# Production-grade hardening (NoNewPrivileges + read-only root)
+# locks down everything that doesn't need root.
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/engram /run/engram
+# We intentionally do NOT use ProtectKernelTunables / ProtectKernelModules
+# because the host-agent's iptables work needs them, and PrivateDevices
+# would hide /dev/kvm.
+
+# Resource limits: file descriptors for many concurrent FC processes.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
