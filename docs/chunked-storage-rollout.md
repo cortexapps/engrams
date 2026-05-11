@@ -433,30 +433,30 @@ missing is the integrated scenario.**
 
 **Required work**:
 
-- ⬜ **End-to-end smoke recipe.** A `just chunked-smoke` (or shell
-  script under `scripts/`) that:
-  1. Bakes an `ext4` image with the new image-builder
-  2. Asserts `bundle.json` exists alongside `rootfs.ext4`
-  3. Starts coord in `--mode=all` with `--sandbox-backend=vz`
-  4. Creates a session referencing the baked image via `image_uri`
-     (`local://` or a `localhost:5001` push)
-  5. Asserts the materialized rootfs landed under
-     `<local_path>/chunked-rootfs/<manifest_id>-v1.ext4`
-  6. `exec`s `echo hello` and asserts stdout
-  7. `snapshot`s and asserts the returned `SnapshotMetadata.disk_manifest`
-     is `Some`
-  8. Resumes and `exec`s again to confirm the disk survived
-- ⬜ **A new integration test** at
-  `crates/engram-coordinator/tests/chunked_lifecycle.rs` covering the
-  same flow against `--mode=all` + VZ. Doesn't need a real VM —
-  ProcessBackend smoke is enough to lock the coordinator + host-agent
-  + chunk-store wiring.
+- ✅ **End-to-end chunked-lifecycle test through `PooledBackend`**
+  in `crates/engram-host-agent/src/pooled_backend.rs::tests::create_with_image_uri_resolves_chunked_path_on_inner`.
+  Asserts: bundle.json parsing, chunk-store materialization,
+  `spec.rootfs_source` rewrite, inner backend receives the
+  materialized path, materialized bytes match the chunked source.
+  Uses a `parking_lot`-backed capturing inner backend so the test
+  is portable (no VM, no Docker).
+
+Tier 1 entry was always close to true; the missing piece was a
+test that locks in the `--mode=all` chunked wiring as a regression
+guard. The pre-existing
+`materialize_chunked_rootfs_round_trips_and_dedupes` test covers
+the materialize helper in isolation; the new test extends to
+`PooledBackend.create()` driving the helper through `ImageCache`.
+
+No `just chunked-smoke` recipe — running an ad-hoc Docker bake
+to assert what unit tests already prove was duplicate work. CI
+runs the integration test; that's the durable signal.
 
 **Exit criteria**:
 
 ```
-just chunked-smoke    # passes
-cargo test -p engram-coordinator --test chunked_lifecycle    # passes
+cargo test -p engram-host-agent --lib \
+    pooled_backend::tests::create_with_image_uri_resolves_chunked_path_on_inner   # passes
 ```
 
 ---

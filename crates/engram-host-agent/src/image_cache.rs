@@ -379,6 +379,26 @@ impl ImageCache {
         map.lock().entries.get(uri).cloned()
     }
 
+    /// Pre-plant a `(uri, digest)` association in the image map.
+    /// Test-only — lets cross-module tests (e.g. pooled_backend's
+    /// chunked-lifecycle test) drive the cache hit path without
+    /// standing up a real OCI registry.
+    #[cfg(test)]
+    pub(crate) fn prime_image_for_test(&self, uri: &str, digest: &str) {
+        self.inner
+            .image_map
+            .lock()
+            .entries
+            .insert(uri.to_string(), digest.to_string());
+    }
+
+    /// Where the cached artifacts for `digest` land on disk.
+    /// Test-only — keeps the layout details inside this module.
+    #[cfg(test)]
+    pub(crate) fn image_dir_for_test(&self, digest: &str) -> PathBuf {
+        self.image_dir(digest)
+    }
+
     async fn update_map(&self, map: &Mutex<UriMap>, uri: &str, digest: &str) {
         let path = if std::ptr::eq(map, &self.inner.image_map) {
             self.inner.root.join("images/by-uri.json")

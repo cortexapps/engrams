@@ -612,4 +612,172 @@ mod tests {
             "second call must not rewrite the file",
         );
     }
+
+    /// Tier 1 regression guard for the ADR 0007 chunked-lifecycle
+    /// rollout. Exercises the full `PooledBackend::create()` flow with
+    /// a real `ImageCache` + `ChunkStore` wired, asserting that an
+    /// `image_uri`-driven spec lands a chunked-materialized path on
+    /// the inner backend's spec — not the OCI-pulled `rootfs.ext4`.
+    ///
+    /// Covered ground:
+    /// - `ImageCache.ensure_image()` returns a `CachedImage.bundle`
+    ///   when the on-disk artifact carries a `bundle.json`.
+    /// - `PooledBackend.resolve_rootfs()` dispatches to the chunk
+    ///   store rather than the cached file.
+    /// - The materialized file lands at the deterministic content-
+    ///   addressed path, and its bytes match the chunked source.
+    /// - The inner backend's `create()` receives `spec.rootfs_source`
+    ///   pointing at that materialized path.
+    #[tokio::test]
+    async fn create_with_image_uri_resolves_chunked_path_on_inner() {
+        use crate::image_cache::ImageCache;
+        use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
+        use engram_core::traits::SandboxBackend;
+        use engram_core::types::sandbox::{
+            AgentSpec, CpuLimit, DiskLimit, ExecRequest, ExecStream, MemoryLimit,
+        };
+        use engram_core::types::snapshot::SnapshotMetadata;
+        use engram_core::SandboxId;
+        use parking_lot::Mutex as PlMutex;
+        use std::path::{Path, PathBuf};
+
+        // 1. Shared BlobStorage + ChunkStore, mirroring `--mode=all`.
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+
+        // 2. Plant a fake rootfs in the chunk store + produce a
+        //    manifest. Smaller than the materialize round-trip test
+        //    because we just need the wiring to flow, not multi-
+        //    chunk content addressing — that's covered above.
+        let source = tmp.path().join("source.ext4");
+        let bytes: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&source, &bytes).await.unwrap();
+        let manifest = cs
+            .chunk_file(&source, ManifestKind::Disk, None)
+            .await
+            .unwrap();
+        let mref = ManifestRef::new();
+        cs.put_manifest(mref, &manifest).await.unwrap();
+
+        // 3. Stand up an ImageCache rooted under tmp, then plant a
+        //    fake "OCI-pulled" artifact + a uri-map entry pointing at
+        //    it. ensure_image will short-circuit via the cache-hit
+        //    path without attempting a real OCI fetch.
+        let cache_root = tmp.path().join("oci-cache");
+        let oci = engram_oci::OciClient::new(Arc::new(engram_oci::AnonymousResolver));
+        let cache = ImageCache::open(cache_root.clone(), oci).await.unwrap();
+        let digest = "sha256:deadbeefcafefeedfacefeed";
+        let image_dir = cache.image_dir_for_test(digest);
+        tokio::fs::create_dir_all(&image_dir).await.unwrap();
+        tokio::fs::write(
+            image_dir.join("manifest.toml"),
+            b"name = \"chunked-test\"\n",
+        )
+        .await
+        .unwrap();
+        // Drop a bytes-equal `rootfs.ext4` alongside so the cache-hit
+        // existence check passes; the chunked path supersedes it.
+        tokio::fs::write(image_dir.join("rootfs.ext4"), &bytes)
+            .await
+            .unwrap();
+        let bundle_bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "disk_manifest": mref,
+        }))
+        .unwrap();
+        tokio::fs::write(image_dir.join("bundle.json"), bundle_bytes)
+            .await
+            .unwrap();
+        cache.prime_image_for_test("test:1", digest);
+
+        // 4. Capturing inner backend — records the spec it receives.
+        struct Capturing {
+            captured: PlMutex<Option<SandboxSpec>>,
+        }
+        #[async_trait]
+        impl SandboxBackend for Capturing {
+            async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                *self.captured.lock() = Some(spec);
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                _id: SandboxId,
+                _cmd: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(
+                &self,
+                _id: SandboxId,
+                _dest: &Path,
+            ) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn restore(&self, _src: PathBuf) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(
+                &self,
+                _id: SandboxId,
+                _agent: AgentSpec,
+            ) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Capturing {
+            captured: PlMutex::new(None),
+        });
+        let inner: Arc<dyn SandboxBackend> = captured.clone();
+
+        // 5. PooledBackend wires both image cache + chunk store +
+        //    materialize dir. target_size=0 to skip warm-pool
+        //    replenish (we only care about the single create path).
+        let materialize_dir = tmp.path().join("materialized");
+        let pooled = PooledBackend::new(inner, 0)
+            .with_image_cache(cache)
+            .with_chunk_store(cs.clone(), materialize_dir.clone());
+
+        // 6. Drive a session-create with image_uri set.
+        let mut spec = SandboxSpec {
+            image: "warm-test".into(),
+            rootfs_source: None,
+            image_uri: Some("test:1".into()),
+            harness_pack_uri: None,
+            cpu: CpuLimit { vcpus: 1 },
+            memory: MemoryLimit { max_mib: 64 },
+            disk: DiskLimit { max_gib: 1 },
+            ttl: None,
+            env: Default::default(),
+            workdir: None,
+            harness_substrate: None,
+            network: Default::default(),
+        };
+        spec.image_uri = Some("test:1".into());
+        let _id = pooled.create(spec).await.unwrap();
+
+        // 7. The inner backend must have received the chunked
+        //    materialized path, NOT the OCI-pulled rootfs.ext4.
+        let received = captured.captured.lock().clone().expect("inner not called");
+        let received_rootfs = received.rootfs_source.expect("rootfs_source not set");
+        let expected =
+            materialize_dir.join(format!("{}-v{}.ext4", mref.manifest_id, mref.version,));
+        assert_eq!(
+            received_rootfs, expected,
+            "PooledBackend must route chunked manifests through materialize_dir, not the OCI rootfs.ext4",
+        );
+
+        // 8. The materialized file exists and is byte-equal.
+        let materialized = tokio::fs::read(&expected).await.unwrap();
+        assert_eq!(materialized, bytes, "materialized file bytes mismatch");
+    }
 }
