@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use engram_chunk_store::ChunkStore;
+use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
@@ -72,6 +72,14 @@ pub struct PooledBackend {
     /// manifest share the materialized file (and VZ's per-sandbox
     /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
     materialize_dir: Option<PathBuf>,
+    /// Optional NVMe-backed LRU cache fronting the chunk store.
+    /// When wired, chunk reads during materialization go through
+    /// the cache — chunks shared across manifests (canonical-base
+    /// images, fork lineage) stay local across rematerializes
+    /// rather than re-fetching from `BlobStorage` every time.
+    /// When unset, `materialize_chunked_rootfs` goes straight to
+    /// the store.
+    chunk_cache: Option<ChunkCache>,
     /// Single-flight gate: stops two concurrent `create()` calls
     /// from racing on the same manifest_id+version file. Held only
     /// for the materialize critical section, not the whole call.
@@ -89,6 +97,7 @@ impl PooledBackend {
             egress_sessions: DashMap::new(),
             chunk_store: None,
             materialize_dir: None,
+            chunk_cache: None,
             materialize_lock: Mutex::new(()),
         }
     }
@@ -102,6 +111,16 @@ impl PooledBackend {
     pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
         self.chunk_store = Some(chunk_store);
         self.materialize_dir = Some(materialize_dir);
+        self
+    }
+
+    /// Attach an NVMe-backed `ChunkCache`. Optional; chains on top
+    /// of `with_chunk_store`. Production hosts wire one to
+    /// amortise repeated chunk reads across manifests; dev /
+    /// single-host setups can skip it without breaking the
+    /// materialization path.
+    pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
+        self.chunk_cache = Some(cache);
         self
     }
 
@@ -151,6 +170,7 @@ impl PooledBackend {
         };
         materialize_chunked_rootfs(
             chunk_store,
+            self.chunk_cache.as_ref(),
             materialize_dir,
             uri,
             bundle,
@@ -182,6 +202,7 @@ impl PooledBackend {
 /// fast when the file already exists with the expected size.
 async fn materialize_chunked_rootfs(
     chunk_store: &ChunkStore,
+    chunk_cache: Option<&ChunkCache>,
     materialize_dir: &std::path::Path,
     uri: &str,
     bundle: &ImageBundle,
@@ -232,12 +253,22 @@ async fn materialize_chunked_rootfs(
         chunks = manifest.chunks.len(),
         total_bytes = manifest.total_bytes,
         path = %dest.display(),
+        cached = chunk_cache.is_some(),
         "materializing chunked rootfs",
     );
-    chunk_store
-        .materialize_to_file(&manifest, &dest)
-        .await
-        .map_err(|e| SandboxError::Vm(format!("materialize {manifest_ref}: {e}").into()))?;
+    // Route chunk reads through the local NVMe cache when one is
+    // attached. Without it we re-fetch from BlobStorage every
+    // materialize even when chunks haven't changed across
+    // manifests.
+    match chunk_cache {
+        Some(cache) => {
+            chunk_store
+                .materialize_to_file_cached(&manifest, &dest, cache)
+                .await
+        }
+        None => chunk_store.materialize_to_file(&manifest, &dest).await,
+    }
+    .map_err(|e| SandboxError::Vm(format!("materialize {manifest_ref}: {e}").into()))?;
     Ok(dest)
 }
 
@@ -592,9 +623,10 @@ mod tests {
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());
 
-        let path1 = materialize_chunked_rootfs(&cs, &materialize_dir, "img:1", &bundle, &lock)
-            .await
-            .unwrap();
+        let path1 =
+            materialize_chunked_rootfs(&cs, None, &materialize_dir, "img:1", &bundle, &lock)
+                .await
+                .unwrap();
         let restored = tokio::fs::read(&path1).await.unwrap();
         assert_eq!(restored, bytes, "byte-for-byte mismatch");
 
@@ -602,15 +634,89 @@ mod tests {
         // no rewrite.
         let mtime_before = std::fs::metadata(&path1).unwrap().modified().unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let path2 = materialize_chunked_rootfs(&cs, &materialize_dir, "img:1", &bundle, &lock)
-            .await
-            .unwrap();
+        let path2 =
+            materialize_chunked_rootfs(&cs, None, &materialize_dir, "img:1", &bundle, &lock)
+                .await
+                .unwrap();
         assert_eq!(path1, path2);
         let mtime_after = std::fs::metadata(&path2).unwrap().modified().unwrap();
         assert_eq!(
             mtime_before, mtime_after,
             "second call must not rewrite the file",
         );
+    }
+
+    /// Cache wiring: when a `ChunkCache` is provided,
+    /// `materialize_chunked_rootfs` routes chunk reads through it.
+    /// We verify by materializing twice — once to populate, once
+    /// against a "broken" store (drop the chunks underneath). The
+    /// second materialize succeeds iff reads served from the cache.
+    #[tokio::test]
+    async fn materialize_chunked_rootfs_uses_chunk_cache_when_present() {
+        use engram_chunk_store::{
+            cache::ChunkCacheConfig, ChunkCache, ChunkStore, ManifestKind, ManifestRef,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_root = tmp.path().join("blob");
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
+        );
+        let cs = ChunkStore::new(blob);
+        let cache = ChunkCache::new(
+            ChunkCacheConfig::new(tmp.path().join("chunk-cache")),
+            cs.clone(),
+        );
+
+        // Plant a small source + manifest.
+        let src = tmp.path().join("source.ext4");
+        let bytes: Vec<u8> = (0..(1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&src, &bytes).await.unwrap();
+        let manifest = cs.chunk_file(&src, ManifestKind::Disk, None).await.unwrap();
+        let mref = ManifestRef::new();
+        cs.put_manifest(mref, &manifest).await.unwrap();
+
+        let bundle = ImageBundle {
+            schema_version: 1,
+            disk_manifest: mref,
+        };
+        let materialize_dir = tmp.path().join("materialized");
+        let lock = Mutex::new(());
+
+        // First materialize warms the cache.
+        let path1 = materialize_chunked_rootfs(
+            &cs,
+            Some(&cache),
+            &materialize_dir,
+            "img:cached",
+            &bundle,
+            &lock,
+        )
+        .await
+        .unwrap();
+        let restored = tokio::fs::read(&path1).await.unwrap();
+        assert_eq!(restored, bytes, "first materialize must reproduce bytes");
+
+        // Delete the materialized file and the underlying blob store —
+        // the cache should still have everything we need.
+        tokio::fs::remove_file(&path1).await.unwrap();
+        let chunks_dir = blob_root.join("chunks");
+        tokio::fs::remove_dir_all(&chunks_dir).await.unwrap();
+
+        // Second materialize would fail if it hit the store; succeeds
+        // when reads are served from the cache.
+        let path2 = materialize_chunked_rootfs(
+            &cs,
+            Some(&cache),
+            &materialize_dir,
+            "img:cached",
+            &bundle,
+            &lock,
+        )
+        .await
+        .expect("cache should serve chunks after store is gone");
+        let restored2 = tokio::fs::read(&path2).await.unwrap();
+        assert_eq!(restored2, bytes, "cached materialize must reproduce bytes");
     }
 
     /// Tier 1 regression guard for the ADR 0007 chunked-lifecycle

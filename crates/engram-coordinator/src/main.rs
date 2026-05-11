@@ -441,13 +441,22 @@ async fn main() -> Result<(), CoordinatorError> {
         // independently, pointing at the same backing bucket via env.
         let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
         let materialize_dir = cli.local_path.join("chunked-rootfs");
+        // ADR 0007 #3a: NVMe-backed chunk cache. Amortises repeat
+        // reads for chunks shared across manifests (canonical-base
+        // images, fork lineage). Default 200 GiB budget per the
+        // crate's `ChunkCacheConfig::new`.
+        let chunk_cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(cli.local_path.join("chunk-cache")),
+            chunk_store.clone(),
+        );
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new({
             let mut p = engram_host_agent::pooled_backend::PooledBackend::new(
                 raw_backend,
                 cli.warm_pool_size,
             )
             .with_image_cache(image_cache)
-            .with_chunk_store(chunk_store, materialize_dir);
+            .with_chunk_store(chunk_store, materialize_dir)
+            .with_chunk_cache(chunk_cache);
             if let Some(egress) = host_egress.clone() {
                 p = p.with_egress(egress);
             }

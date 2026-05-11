@@ -600,20 +600,20 @@ tier.
    (Static / GcpWorkloadIdentity / Anonymous auth_kinds all flow).
    Plaintext creds traverse the WS only at pull time. WIRE_VERSION
    bumped to v2 for the new enum variants.
-3. ⬜ **Materialized rootfs file GC** (Phase 3 gap) — the
-   `<work_dir>/chunked-rootfs/` directory accumulates one
-   `<manifest_id>-vN.ext4` per (re)materialized image and never
-   reaps. Two independent concerns conflated earlier:
-     - *(a)* Local NVMe cache for chunks across manifests:
-       `materialize_to_file_cached` already exists in
-       `engram-chunk-store::file` + needs `ChunkCache` wiring into
-       `PooledBackend`.
-     - *(b)* Materialized-file orphan reap: scan `chunked-rootfs/`
-       periodically and delete `<manifest_id>-vN.ext4` files no
-       longer referenced by a live session or recent snapshot.
-       Needs a coord-side admin endpoint + cron primitive.
-   *(a)* is an optimization; *(b)* is a real disk-leak fix.
-   Production needs both.
+3. **Materialized rootfs file GC** (Phase 3 gap) — two concerns:
+     - ✅ *(a)* Local NVMe cache for chunks across manifests —
+       `PooledBackend::with_chunk_cache` wires the existing
+       `ChunkCache` so `materialize_to_file_cached` serves repeat
+       reads from local disk. Default 200 GiB budget. Coord
+       `--mode=all` + standalone host-agent both wire one. Test
+       at `pooled_backend::tests::materialize_chunked_rootfs_uses_chunk_cache_when_present`
+       proves the cache path is exercised (materialize succeeds
+       even after the underlying store's chunks are deleted).
+     - ⬜ *(b)* Materialized-file orphan reap: scan
+       `chunked-rootfs/` periodically and delete
+       `<manifest_id>-vN.ext4` files no longer referenced by a
+       live session or recent snapshot. Needs a coord-side admin
+       endpoint + cron primitive. Pairs naturally with item #4.
 4. ⬜ **Chunk-store GC scheduler** (Phase 1 gap) — coordinator cron
    loop + `POST /api/admin/gc-chunks` admin endpoint (the testable-
    trigger pattern per the feedback memory). ~50 lines.

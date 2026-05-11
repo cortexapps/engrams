@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use engram_chunk_store::ChunkStore;
+use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::{CloudBackend, SandboxBackend};
 
 use crate::image_cache::ImageCache;
@@ -58,6 +58,9 @@ pub struct HostAgent {
     /// lookup so credentials can travel back over the existing
     /// WS connection. `None` skips the wiring entirely.
     pub auth_session_handle: Option<ws_auth::SessionHandle>,
+    /// ADR 0007 #3a: NVMe-backed chunk cache. Optional; wired in
+    /// production to amortise chunk reads across manifests.
+    pub chunk_cache: Option<ChunkCache>,
 }
 
 impl HostAgent {
@@ -74,7 +77,16 @@ impl HostAgent {
             chunk_store: None,
             image_cache: None,
             auth_session_handle: None,
+            chunk_cache: None,
         }
+    }
+
+    /// Attach a `ChunkCache`. Optional; layers on top of
+    /// `with_chunk_store` to amortise chunk reads across manifests
+    /// (canonical-base images, forks).
+    pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
+        self.chunk_cache = Some(cache);
+        self
     }
 
     /// Wire the session handle the dialer will populate so the
@@ -146,6 +158,9 @@ impl HostAgent {
                 }
                 if let Some((cs, dir)) = self.chunk_store.clone() {
                     p = p.with_chunk_store(cs, dir);
+                }
+                if let Some(cache) = self.chunk_cache.clone() {
+                    p = p.with_chunk_cache(cache);
                 }
                 if let Some(ic) = self.image_cache.clone() {
                     p = p.with_image_cache(ic);
