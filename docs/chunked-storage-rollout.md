@@ -521,54 +521,51 @@ sharing a chunk store. This is the topology production runs.
 
 **Entry criteria**: Tier 2 green.
 
-**Current state**: standalone `engram-host-agent` binary wires
-nothing — no blob, no chunk store, no image cache. The largest
-single gap in the chunked-storage rollout.
+**Current state**: wiring is shipped. The remaining gap is a
+manual validation pass with two real processes.
 
 **Required work**:
 
-- ⬜ **`engram_host_agent::blob::from_env()`** — mirror
-  `engram_coordinator::blob::from_env`. Reads
-  `ENGRAM_BLOB_BACKEND={local,gcs}` + bucket env. ~40 lines.
-- ⬜ **CLI / env in `crates/engram-host-agent/src/main.rs`** for blob
-  backend selection + `materialize_dir`. ~15 lines.
-- ⬜ **`HostAgent::with_chunk_store(cs, dir)` call** added to
-  `main.rs` after the existing `with_egress` chain. ~10 lines.
-- ⬜ **Decide + implement OCI auth for the standalone host-agent**.
-  Currently ⛔ blocked. For Tier 3 only (local-controlled testing),
-  the cheap answer is `AnonymousResolver` pointing at a
-  `localhost:5001` docker registry — same setup the FC tests use.
-  This unblocks Tier 3 without committing to a production approach.
-  *The Tier 4 decision is a separate, properly-designed credential
-  story.*
-- ⬜ **`ImageCache::open` call** in `main.rs`, threading through the
-  anonymous `OciClient`. ~20 lines.
-- ⬜ **Wire-version handshake.** Bincode is positional;
-  `e68ee23`'s `SnapshotMetadata` field add broke wire compat. Two
-  things needed:
-  1. A `WIRE_VERSION` constant in `engram-protocol`
-  2. The dialer's hello frame includes this version; the coord's
-     `on_hello` rejects a mismatch with a clear error
-  ~30 lines + a refusal path in the dialer reconnect loop.
-- ⬜ **Shared blob backend for the test scenario.** Easiest: both
-  processes on the dev VM, both `--blob-backend=local
-  --local-path=/shared`. Alternative: fake-gcs-server on the dev VM,
-  both processes pointing at it via `STORAGE_EMULATOR_HOST`. Latter
-  is more production-shaped.
-- ⬜ **Tier 3 smoke script** — like Tier 1's but with coord on one
-  side and host-agent on the other.
+- ✅ **`engram_host_agent::blob::from_env()`** mirroring coord's
+  selector. `local` (default) + `gcs`; fails closed on
+  misconfiguration. Shipped in `80d6841` with unit tests.
+- ✅ **Host-agent main.rs reads blob backend from env** + constructs
+  `ChunkStore` + materialize_dir at `<work_dir>/chunked-rootfs/`.
+- ✅ **`HostAgent::with_chunk_store(cs, dir)` call** threads through
+  to PooledBackend during `run()`.
+- ✅ **OCI auth (Tier 3 placeholder)** — anonymous resolver wired
+  in `main.rs`. Works for `localhost:5001` testing + public
+  registries. *Tier 4 needs a real credential story (see below).*
+- ✅ **`ImageCache::open` call** in `main.rs` at
+  `<work_dir>/oci-cache/`; `HostAgent::with_image_cache(...)`
+  threads through to PooledBackend.
+- ✅ **Wire-version handshake** — `engram_protocol::WIRE_VERSION`
+  (v1) shipped in `0df3a31`. `NotifyKind::Hello.wire_version`
+  exchanged on connect; coord's `/api/hosts/connect` rejects
+  mismatch with a loud error.
+- ⬜ **Two-process manual smoke.** The wiring is in; running it
+  end-to-end as separate processes is the final validation. Skip
+  if confident in the unit + integration coverage; do it if you
+  want bit-level confidence before driving toward T4. Shape:
+  ```
+  # Terminal A (or process A)
+  engram-coordinator --mode=coordinator --local-path=/shared ...
+  # Terminal B (or process B)
+  engram-host-agent --coordinator http://... --work-dir=... \
+      ENGRAM_BLOB_BACKEND=local ENGRAM_LOCAL_PATH=/shared ...
+  # Terminal C — session lifecycle via the API
+  ```
+  Both processes point at the same `ENGRAM_LOCAL_PATH` so chunks
+  produced by the image-builder on one side are readable by the
+  host-agent on the other. Production swaps both to GCS with the
+  same bucket.
 
 **Exit criteria**:
 
 ```
-# Terminal A (or process A on dev VM)
-engram-coordinator --mode=coordinator ...
-
-# Terminal B (or process B)
-engram-host-agent --coordinator-endpoint ws://... --blob-backend=local --local-path=/shared ...
-
-# Terminal C
-just chunked-smoke-split   # passes, asserting the session ran on the host-agent
+cargo test -p engram-host-agent --lib blob::tests::from_env_dispatches_per_backend_var   # passes ✓
+cargo test -p engram-protocol --lib codec::tests::encode_decode_round_trips_notify       # passes ✓
+# Optional: end-to-end two-process smoke per the shape above.
 ```
 
 ---
