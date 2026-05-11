@@ -10,8 +10,10 @@
 //! gRPC channel; today they go through an in-process trait object so
 //! the `--mode=all` single-binary path works.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use engram_chunk_store::ChunkStore;
 use engram_core::traits::{CloudBackend, SandboxBackend};
 
 pub mod config;
@@ -36,6 +38,11 @@ pub struct HostAgent {
     /// ADR 0006: local egress proxy. `None` keeps egress unfiltered
     /// (dev / explicit opt-out via `--egress-proxy-port=0`).
     pub egress: Option<Arc<egress::HostEgress>>,
+    /// ADR 0007: chunk store + per-host materialization root. `None`
+    /// keeps the legacy OCI-pulled `rootfs.ext4` path active (chunked
+    /// images skip the chunk-store resolve and use the cached file
+    /// directly).
+    pub chunk_store: Option<(ChunkStore, PathBuf)>,
 }
 
 impl HostAgent {
@@ -49,6 +56,7 @@ impl HostAgent {
             sandbox,
             cloud,
             egress: None,
+            chunk_store: None,
         }
     }
 
@@ -58,6 +66,14 @@ impl HostAgent {
     /// PEM to substrate-building code paths.
     pub fn with_egress(mut self, egress: Arc<egress::HostEgress>) -> Self {
         self.egress = Some(egress);
+        self
+    }
+
+    /// Attach a chunk store + per-host materialization directory.
+    /// The PooledBackend uses these to resolve chunked image
+    /// manifests to per-host materialized rootfs files.
+    pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
+        self.chunk_store = Some((chunk_store, materialize_dir));
         self
     }
 
@@ -92,6 +108,9 @@ impl HostAgent {
                 );
                 if let Some(egress) = self.egress.clone() {
                     p = p.with_egress(egress);
+                }
+                if let Some((cs, dir)) = self.chunk_store.clone() {
+                    p = p.with_chunk_store(cs, dir);
                 }
                 Arc::new(p)
             };

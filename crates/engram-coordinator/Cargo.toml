@@ -20,6 +20,7 @@ path = "src/main.rs"
 engram-core.workspace = true
 engram-protocol.workspace = true
 engram-postgres.workspace = true
+engram-chunk-store.workspace = true
 engram-host-agent.workspace = true
 engram-sandbox-firecracker.workspace = true
 engram-sandbox-vz.workspace = true

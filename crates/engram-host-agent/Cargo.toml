@@ -53,4 +53,5 @@ tempfile = "3"
 [dev-dependencies]
 engram-harness-noop.workspace = true
 engram-sandbox-process.workspace = true
+engram-storage-local.workspace = true
 tempfile = "3"

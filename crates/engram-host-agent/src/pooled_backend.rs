@@ -12,19 +12,23 @@
 //! pool's job is to amortise the create-time cost of a given image,
 //! not enforce per-repo isolation.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use engram_chunk_store::ChunkStore;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use engram_protocol::WarmPoolReport;
+use tokio::fs;
+use tokio::sync::Mutex;
 
 use crate::egress::HostEgress;
-use crate::image_cache::ImageCache;
+use crate::image_cache::{CachedImage, ImageBundle, ImageCache};
 use crate::pool::{Pool, PoolKey};
 
 /// Wraps an inner [`SandboxBackend`] with warm-pool semantics. `create`
@@ -54,6 +58,24 @@ pub struct PooledBackend {
     /// policy frame arrives. Skipped for sandboxes never policied
     /// (warm-pool slots that never bound to a session).
     egress_sessions: DashMap<SandboxId, SessionId>,
+    /// ADR 0007: chunk-store-backed materialization. When set, the
+    /// `bundle.json` on a cached image is the source of truth for
+    /// the disk — chunks are fetched from `BlobStorage`, written to
+    /// a content-addressed file under `materialize_dir`, and that
+    /// path becomes `spec.rootfs_source`. When unset, we fall back
+    /// to the OCI-pulled `rootfs.ext4` (transitional path; retired
+    /// in Phase 6).
+    chunk_store: Option<ChunkStore>,
+    /// Per-host directory where chunked manifests are materialized.
+    /// `Some` iff `chunk_store` is. Files inside are named by
+    /// `manifest_id`-`version` so two sessions hitting the same
+    /// manifest share the materialized file (and VZ's per-sandbox
+    /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
+    materialize_dir: Option<PathBuf>,
+    /// Single-flight gate: stops two concurrent `create()` calls
+    /// from racing on the same manifest_id+version file. Held only
+    /// for the materialize critical section, not the whole call.
+    materialize_lock: Mutex<()>,
 }
 
 impl PooledBackend {
@@ -65,7 +87,22 @@ impl PooledBackend {
             image_cache: None,
             egress: None,
             egress_sessions: DashMap::new(),
+            chunk_store: None,
+            materialize_dir: None,
+            materialize_lock: Mutex::new(()),
         }
+    }
+
+    /// Attach a chunk store + a per-host directory where chunked
+    /// manifests get materialized. Once set, `create()` resolves the
+    /// cached image's `bundle.json` → manifest → file via the chunk
+    /// store, bypassing the OCI-pulled `rootfs.ext4`. Required for
+    /// chunked storage to actually flow through dev / production
+    /// sessions.
+    pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
+        self.chunk_store = Some(chunk_store);
+        self.materialize_dir = Some(materialize_dir);
+        self
     }
 
     /// Attach an image cache. Calling this after `new()` lets
@@ -92,6 +129,36 @@ impl PooledBackend {
         self.pool.snapshot_reports()
     }
 
+    /// Resolve the disk for a cached image. When a chunk store is
+    /// wired AND the cached image carries a Bundle, materialize the
+    /// disk from the chunk manifest into a content-addressed file
+    /// in `materialize_dir`. Otherwise hand back the OCI-pulled
+    /// `rootfs.ext4` unchanged. Idempotent: a second call against
+    /// the same manifest hits the materialized file directly.
+    async fn resolve_rootfs(
+        &self,
+        uri: &str,
+        cached: &CachedImage,
+    ) -> Result<PathBuf, SandboxError> {
+        let (chunk_store, materialize_dir) =
+            match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
+                (Some(cs), Some(dir)) => (cs, dir),
+                _ => return Ok(cached.rootfs_path.clone()),
+            };
+        let bundle = match cached.bundle.as_ref() {
+            Some(b) => b,
+            None => return Ok(cached.rootfs_path.clone()),
+        };
+        materialize_chunked_rootfs(
+            chunk_store,
+            materialize_dir,
+            uri,
+            bundle,
+            &self.materialize_lock,
+        )
+        .await
+    }
+
     fn pool_key(spec: &SandboxSpec) -> PoolKey {
         // `rootfs_source` is set by the image cache (OCI path) or
         // the caller (local:// dev) before this is called — see
@@ -105,6 +172,73 @@ impl PooledBackend {
             rootfs_source: spec.rootfs_source.clone(),
         }
     }
+}
+
+/// Materialize a chunked manifest to a content-addressed file under
+/// `materialize_dir`. The output path is named by
+/// `manifest_id-v{version}.ext4` so two sessions referencing the same
+/// manifest deterministically land at the same file (the inner backend
+/// can then APFS-clonefile or NBD-attach on top). Idempotent: returns
+/// fast when the file already exists with the expected size.
+async fn materialize_chunked_rootfs(
+    chunk_store: &ChunkStore,
+    materialize_dir: &std::path::Path,
+    uri: &str,
+    bundle: &ImageBundle,
+    materialize_lock: &Mutex<()>,
+) -> Result<PathBuf, SandboxError> {
+    fs::create_dir_all(materialize_dir)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("materialize dir: {e}").into()))?;
+    let manifest_ref = bundle.disk_manifest;
+    let dest = materialize_dir.join(format!(
+        "{}-v{}.ext4",
+        manifest_ref.manifest_id, manifest_ref.version,
+    ));
+
+    // Fast-path: file exists at the expected size. We trust local-
+    // disk integrity here — the chunk store's content addressing
+    // already validates bytes on the way in.
+    let manifest = chunk_store
+        .get_manifest(manifest_ref)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("get manifest {manifest_ref}: {e}").into()))?;
+    if let Ok(meta) = fs::metadata(&dest).await {
+        if meta.len() == manifest.total_bytes {
+            tracing::debug!(
+                uri = %uri,
+                manifest = %manifest_ref,
+                path = %dest.display(),
+                "chunked rootfs already materialized",
+            );
+            return Ok(dest);
+        }
+    }
+
+    // Slow-path: hold the lock so two concurrent creates against the
+    // same manifest don't both walk the chunks. The second waiter
+    // sees the file once the first releases and short-circuits via
+    // the fast-path check we redo below.
+    let _guard = materialize_lock.lock().await;
+    if let Ok(meta) = fs::metadata(&dest).await {
+        if meta.len() == manifest.total_bytes {
+            return Ok(dest);
+        }
+    }
+
+    tracing::info!(
+        uri = %uri,
+        manifest = %manifest_ref,
+        chunks = manifest.chunks.len(),
+        total_bytes = manifest.total_bytes,
+        path = %dest.display(),
+        "materializing chunked rootfs",
+    );
+    chunk_store
+        .materialize_to_file(&manifest, &dest)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("materialize {manifest_ref}: {e}").into()))?;
+    Ok(dest)
 }
 
 /// Pick a stable name for the harness substrate's mount-root
@@ -149,7 +283,7 @@ impl SandboxBackend for PooledBackend {
                     SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
                 })?;
                 tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
-                spec.rootfs_source = Some(cached.rootfs_path);
+                spec.rootfs_source = Some(self.resolve_rootfs(&uri, &cached).await?);
             }
             if let Some(uri) = spec.harness_pack_uri.clone() {
                 // Backends that attach the substrate as a virtio-blk
@@ -422,5 +556,60 @@ mod tests {
             "specs with distinct rootfs must produce two pool entries even when image strings match",
         );
         assert!(reports.iter().all(|r| r.image_version == "warm-1"));
+    }
+
+    #[tokio::test]
+    async fn materialize_chunked_rootfs_round_trips_and_dedupes() {
+        // ADR 0007 acceptance: a chunked manifest is sufficient to
+        // reproduce the disk bit-for-bit, AND concurrent resolves
+        // share the materialized file rather than each producing
+        // their own.
+        use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
+        let tmp = tempfile::tempdir().unwrap();
+        // Local-filesystem BlobStorage = production code path for
+        // dev. Same trait the host-agent uses against GCS in prod.
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+
+        // A fake "ext4" — small but enough to span more than one
+        // 16 MiB chunk so the chunking path is exercised end-to-end.
+        let src = tmp.path().join("rootfs.ext4");
+        let mut bytes = vec![0u8; 24 * 1024 * 1024];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        tokio::fs::write(&src, &bytes).await.unwrap();
+        let manifest = cs.chunk_file(&src, ManifestKind::Disk, None).await.unwrap();
+        let mref = ManifestRef::new();
+        cs.put_manifest(mref, &manifest).await.unwrap();
+
+        let bundle = ImageBundle {
+            schema_version: 1,
+            disk_manifest: mref,
+        };
+        let materialize_dir = tmp.path().join("materialized");
+        let lock = Mutex::new(());
+
+        let path1 = materialize_chunked_rootfs(&cs, &materialize_dir, "img:1", &bundle, &lock)
+            .await
+            .unwrap();
+        let restored = tokio::fs::read(&path1).await.unwrap();
+        assert_eq!(restored, bytes, "byte-for-byte mismatch");
+
+        // Second call short-circuits via the size check — same path,
+        // no rewrite.
+        let mtime_before = std::fs::metadata(&path1).unwrap().modified().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let path2 = materialize_chunked_rootfs(&cs, &materialize_dir, "img:1", &bundle, &lock)
+            .await
+            .unwrap();
+        assert_eq!(path1, path2);
+        let mtime_after = std::fs::metadata(&path2).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "second call must not rewrite the file",
+        );
     }
 }

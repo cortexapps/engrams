@@ -301,6 +301,21 @@ async fn main() -> Result<(), CoordinatorError> {
         ));
     }
 
+    // ADR 0005 / Stage 4 / ADR 0007: blob storage. The same Arc
+    // backs the legacy seal-pipeline `Services.blob` AND the ADR
+    // 0007 chunk store. Hoisting it before the --mode=all wiring
+    // lets the in-process host-agent share one connection. `local`
+    // (default) writes under `<local_path>/blobs/`; `gcs` requires
+    // `ENGRAM_GCS_BUCKET` and honors `STORAGE_EMULATOR_HOST` for
+    // fake-gcs-server in `just dev`.
+    let blob = match engram_coordinator::blob::from_env().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "blob backend init failed; aborting");
+            std::process::exit(1);
+        }
+    };
+
     // Phase 3a: every coordinator-side SandboxBackend call routes
     // through HostRegistry. For --mode=all we register a local backend
     // synchronously at startup; for --mode=coordinator the registry
@@ -411,12 +426,21 @@ async fn main() -> Result<(), CoordinatorError> {
         } else {
             None
         };
+        // ADR 0007: chunked-rootfs materialization root. In
+        // `--mode=all`, coordinator + host-agent share one process,
+        // so the chunk store wired into the PooledBackend uses the
+        // same `blob` Arc the coordinator's Services consumes.
+        // Multi-host deployments wire each host-agent's chunk store
+        // independently, pointing at the same backing bucket via env.
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let materialize_dir = cli.local_path.join("chunked-rootfs");
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new({
             let mut p = engram_host_agent::pooled_backend::PooledBackend::new(
                 raw_backend,
                 cli.warm_pool_size,
             )
-            .with_image_cache(image_cache);
+            .with_image_cache(image_cache)
+            .with_chunk_store(chunk_store, materialize_dir);
             if let Some(egress) = host_egress.clone() {
                 p = p.with_egress(egress);
             }
@@ -514,21 +538,9 @@ async fn main() -> Result<(), CoordinatorError> {
         }
     };
 
-    // KEK + meta_arc were constructed up-front so the OCI auth
-    // resolver could reference them. They flow through to Services
-    // here unchanged.
-
-    // ADR 0005 / Stage 4: cold-tier blob storage. `local` (default)
-    // writes under `<local_path>/blobs/`; `gcs` requires
-    // `ENGRAM_GCS_BUCKET` and honors `STORAGE_EMULATOR_HOST` for
-    // fake-gcs-server in `just dev`.
-    let blob = match engram_coordinator::blob::from_env().await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(error = %e, "blob backend init failed; aborting");
-            std::process::exit(1);
-        }
-    };
+    // KEK + meta_arc + blob were constructed up-front so the OCI
+    // auth resolver / chunk store could reference them. They flow
+    // through to Services here unchanged.
 
     let services = Services {
         meta: meta_arc.clone(),
