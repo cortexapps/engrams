@@ -369,6 +369,7 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
+        auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),
@@ -423,6 +424,7 @@ impl TestFixture {
             oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
                 engram_oci::AnonymousResolver,
             ))),
+            auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
             blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
                 std::env::temp_dir().join("engram-blobs-test"),
             )),
@@ -1985,6 +1987,7 @@ async fn create_session_failure_marks_session_failed() {
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
+        auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),

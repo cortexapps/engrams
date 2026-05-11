@@ -112,6 +112,15 @@ enum Pending {
 type WsSink =
     Box<dyn futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Unpin>;
 
+/// Handler the coord installs on `ConnectedHost` to process
+/// host-initiated requests (ADR 0007: e.g. `ResolveRegistryAuth`).
+/// Lives in the coord side rather than the protocol because the
+/// dispatch chains into coord state (Postgres + KEK).
+#[async_trait]
+pub trait HostRequestHandler: Send + Sync {
+    async fn handle(&self, kind: RequestKind) -> Result<ResponseKind, RemoteError>;
+}
+
 #[derive(Clone)]
 pub struct ConnectedHost {
     inner: Arc<Inner>,
@@ -130,6 +139,9 @@ struct Inner {
     /// the demuxer drops notifies on a full channel rather than block
     /// the request/response path.
     notify_tx: mpsc::Sender<NotifyKind>,
+    /// Optional handler for host-initiated Requests. `None` (today's
+    /// default) keeps the existing "warn and ignore" behavior.
+    request_handler: parking_lot::Mutex<Option<Arc<dyn HostRequestHandler>>>,
 }
 
 impl ConnectedHost {
@@ -163,10 +175,18 @@ impl ConnectedHost {
             writer: Mutex::new(Box::new(writer)),
             closed: parking_lot::Mutex::new(false),
             notify_tx,
+            request_handler: parking_lot::Mutex::new(None),
         });
 
         let demux = tokio::spawn(demux_loop(inner.clone(), reader));
         (Self { inner }, notify_rx, demux)
+    }
+
+    /// Install (or replace) the handler for host-initiated requests.
+    /// Until set, the demuxer logs and ignores `Frame::Request`
+    /// frames from the host. Idempotent; the last call wins.
+    pub fn set_request_handler(&self, handler: Arc<dyn HostRequestHandler>) {
+        *self.inner.request_handler.lock() = Some(handler);
     }
 
     /// Send a unary request and await its response. Used for every
@@ -402,8 +422,50 @@ where
                     tracing::warn!(error = %e, "notify channel full or closed; dropping");
                 }
             }
-            Frame::Request { req_id, .. } => {
-                tracing::warn!(req_id, "client received Request frame from host; ignoring");
+            Frame::Request {
+                req_id,
+                trace: _,
+                kind,
+            } => {
+                let handler = inner.request_handler.lock().clone();
+                match handler {
+                    Some(h) => {
+                        // Dispatch in a fresh task so a slow handler can't
+                        // stall the demuxer (and every concurrent
+                        // request/response in flight). Write the reply
+                        // back through the shared writer.
+                        let inner_for_task = inner.clone();
+                        tokio::spawn(async move {
+                            let result = h.handle(kind).await;
+                            let frame = Frame::Response { req_id, result };
+                            let msg = match codec::encode(&frame) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        req_id,
+                                        error = %e,
+                                        "failed to encode host-request response",
+                                    );
+                                    return;
+                                }
+                            };
+                            let mut w = inner_for_task.writer.lock().await;
+                            if let Err(e) = w.send(msg).await {
+                                tracing::warn!(
+                                    req_id,
+                                    error = %e,
+                                    "failed to send host-request response",
+                                );
+                            }
+                        });
+                    }
+                    None => {
+                        tracing::warn!(
+                            req_id,
+                            "client received Request frame from host with no handler installed; ignoring"
+                        );
+                    }
+                }
             }
         }
     }

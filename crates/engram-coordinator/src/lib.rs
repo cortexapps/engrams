@@ -44,6 +44,13 @@ pub struct Services {
     /// with the host-agent's `image_cache` in `--mode=all` so one
     /// auth-resolver cache backs both.
     pub oci: Arc<engram_oci::OciClient>,
+    /// Same resolver the `oci` client was built with, surfaced
+    /// separately so the host-side `ConnectedHost` request handler
+    /// (ADR 0007: `ResolveRegistryAuth`) can call it directly when a
+    /// standalone host-agent asks for creds. Coord process boundary
+    /// — credentials never leave this domain except over the WS at
+    /// pull time.
+    pub auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver>,
     /// Cold-tier blob storage (ADR 0005). Used by the flush primitive
     /// (Stage 5) and the cross-host cold-resume path (Stage 6).
     /// Selected at boot via `ENGRAM_BLOB_BACKEND={local,gcs}`;

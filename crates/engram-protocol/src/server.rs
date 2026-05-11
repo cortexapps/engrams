@@ -7,20 +7,24 @@
 //! all Requests come from the coordinator.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::sandbox::ExecEvent;
 use engram_core::SandboxError;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::codec;
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
-use crate::wire::{Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem};
+use crate::wire::{
+    Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, TraceContext,
+};
 
 /// Hooks the coordinator side of the server can install to react to
 /// inbound notifications.
@@ -75,9 +79,20 @@ pub async fn serve<W, R>(
 /// Host-side connection handle. Owns the WS writer behind a mutex so
 /// the dialer can send outbound Notifies (Hello, Heartbeat) while the
 /// reader loop concurrently handles inbound Requests.
+///
+/// As of ADR 0007 the host also issues outbound Requests
+/// (`ResolveRegistryAuth` for OCI auth resolution against the coord's
+/// `PgAuthResolver`). The reverse-direction RPC uses the same wire
+/// shape: outbound `Frame::Request { req_id }`, inbound
+/// `Frame::Response { req_id }`. The reader loop demuxes responses
+/// against `pending`, mirroring `ConnectedHost::demux_loop` on the
+/// coord side.
 #[derive(Clone)]
 pub struct HostSession {
     writer: SharedSink,
+    /// Outbound-request bookkeeping. `req_id → oneshot for the response`.
+    pending: Arc<DashMap<u64, oneshot::Sender<Result<ResponseKind, RemoteError>>>>,
+    next_id: Arc<AtomicU64>,
 }
 
 impl HostSession {
@@ -90,12 +105,39 @@ impl HostSession {
     {
         Self {
             writer: Arc::new(Mutex::new(Box::new(writer))),
+            pending: Arc::new(DashMap::new()),
+            next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
     /// Send an outbound Notify (e.g. Hello at connect, periodic Heartbeat).
     pub async fn notify(&self, notify: NotifyKind) -> Result<(), String> {
         send_frame_typed(&self.writer, Frame::Notify(notify)).await
+    }
+
+    /// Issue an outbound Request and await its Response. Used by
+    /// host-initiated RPCs against the coord (e.g.
+    /// `ResolveRegistryAuth`).
+    pub async fn request(&self, kind: RequestKind) -> Result<ResponseKind, String> {
+        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let trace = TraceContext::random();
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(req_id, tx);
+
+        let frame = Frame::Request {
+            req_id,
+            trace,
+            kind,
+        };
+        if let Err(e) = send_frame_typed(&self.writer, frame).await {
+            self.pending.remove(&req_id);
+            return Err(e);
+        }
+        match rx.await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(remote)) => Err(format!("remote error: {remote:?}")),
+            Err(_) => Err("response channel dropped before reply arrived".into()),
+        }
     }
 
     /// Drive the inbound side of the connection: read frames, dispatch
@@ -159,7 +201,22 @@ impl HostSession {
                         });
                     }
                 }
-                Frame::Response { req_id, .. } | Frame::Stream { req_id, .. } => {
+                Frame::Response { req_id, result } => {
+                    // Demux against `pending` first — this is the
+                    // reply path for host-initiated RPCs added in
+                    // ADR 0007. Falls through to a warn-log if no
+                    // pending entry matched (genuinely unexpected
+                    // response).
+                    if let Some((_, tx)) = self.pending.remove(&req_id) {
+                        let _ = tx.send(result);
+                    } else {
+                        tracing::warn!(
+                            req_id,
+                            "host received Response with no pending request; ignoring",
+                        );
+                    }
+                }
+                Frame::Stream { req_id, .. } => {
                     tracing::warn!(
                         req_id,
                         "server received non-request frame from coordinator; ignoring",
@@ -317,6 +374,13 @@ async fn handle_request(
                 Err(e) => Err(RemoteError::from_sandbox(e)),
             }
         }
+        RequestKind::ResolveRegistryAuth { .. } => {
+            // Host → coord direction; if a host's serve loop gets
+            // one back it's the coord echoing in confusion. Refuse.
+            Err(RemoteError::Other(
+                "ResolveRegistryAuth is host-initiated; hosts don't serve it".into(),
+            ))
+        }
     };
 
     send_frame(&writer, Frame::Response { req_id, result }).await;
@@ -330,6 +394,7 @@ fn request_kind_name(kind: &RequestKind) -> &'static str {
         RequestKind::ExecStart { .. } => "exec_start",
         RequestKind::Snapshot { .. } => "snapshot",
         RequestKind::Restore { .. } => "restore",
+        RequestKind::ResolveRegistryAuth { .. } => "resolve_registry_auth",
     }
 }
 

@@ -231,17 +231,16 @@ async fn main() -> Result<(), HostAgentError> {
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
 
-    // OCI image cache. The standalone host-agent uses an
-    // anonymous resolver — fine for `localhost:5001` dev registries
-    // and public registries (ghcr.io public images). Private
-    // registries (gcr.io / Artifact Registry / ECR / Harbor) need a
-    // production credential story that's deferred to a follow-up:
-    // see docs/chunked-storage-rollout.md "Tier 4 — Real OCI
-    // credential strategy". For Tier 3 testing this resolver is
-    // enough; production gets a richer one before flipping traffic.
+    // OCI auth resolver. The standalone host-agent doesn't have
+    // direct DB/KEK access, so it asks the coord to resolve
+    // credentials via a `ResolveRegistryAuth` RPC over the existing
+    // dialer connection. The `SessionHandle` is shared mutable
+    // state — empty until the dialer connects, populated for the
+    // lifetime of each connection. ADR 0007.
+    let (ws_auth_resolver, auth_session_handle) = engram_host_agent::ws_auth::WsAuthResolver::new();
     let oci_cache_root = cli.work_dir.join("oci-cache");
     let oci_client = std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
-        engram_oci::AnonymousResolver,
+        ws_auth_resolver,
     )));
     let image_cache =
         engram_host_agent::image_cache::ImageCache::open(oci_cache_root, (*oci_client).clone())
@@ -250,7 +249,8 @@ async fn main() -> Result<(), HostAgentError> {
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
-        .with_image_cache(image_cache);
+        .with_image_cache(image_cache)
+        .with_auth_session_handle(auth_session_handle);
     if cli.egress_proxy_port > 0 {
         match build_host_egress(&cli).await {
             Ok(egress) => agent = agent.with_egress(Arc::new(egress)),

@@ -31,6 +31,7 @@ pub mod pool;
 pub mod pooled_backend;
 pub mod resource;
 pub mod snapshot;
+pub mod ws_auth;
 
 pub use config::HostAgentConfig;
 
@@ -51,6 +52,12 @@ pub struct HostAgent {
     /// `spec.rootfs_source` set already (the dev-only path).
     /// Production multi-host topologies must set this.
     pub image_cache: Option<ImageCache>,
+    /// ADR 0007: shared handle the dialer writes the live
+    /// `HostSession` into when the WS comes up. The
+    /// [`ws_auth::WsAuthResolver`] reads it for each OCI auth
+    /// lookup so credentials can travel back over the existing
+    /// WS connection. `None` skips the wiring entirely.
+    pub auth_session_handle: Option<ws_auth::SessionHandle>,
 }
 
 impl HostAgent {
@@ -66,7 +73,17 @@ impl HostAgent {
             egress: None,
             chunk_store: None,
             image_cache: None,
+            auth_session_handle: None,
         }
+    }
+
+    /// Wire the session handle the dialer will populate so the
+    /// `WsAuthResolver` can issue OCI auth RPCs over the live WS.
+    /// Pair with the resolver returned by
+    /// [`ws_auth::WsAuthResolver::new`].
+    pub fn with_auth_session_handle(mut self, handle: ws_auth::SessionHandle) -> Self {
+        self.auth_session_handle = Some(handle);
+        self
     }
 
     /// Attach a local egress proxy. The host-agent will route every
@@ -150,6 +167,7 @@ impl HostAgent {
                 auth_token: self.cfg.coordinator_token.clone(),
                 heartbeat_interval: self.cfg.heartbeat_interval,
                 heartbeat_provider: Some(provider),
+                auth_session_handle: self.auth_session_handle.clone(),
             };
             let dialer_task = tokio::spawn(async move {
                 if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, pooled_for_dialer).await {

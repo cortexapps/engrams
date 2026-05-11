@@ -34,7 +34,12 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 ///   schemaless positional encoding doesn't honor `#[serde(default)]`
 ///   the way JSON does, so adding it broke wire compat with any
 ///   pre-rollout binary.
-pub const WIRE_VERSION: u32 = 1;
+/// - v2: added `RequestKind::ResolveRegistryAuth` +
+///   `ResponseKind::RegistryAuth` + the `RegistryCreds` wire type
+///   so the standalone host-agent can resolve OCI auth via the
+///   coord's `PgAuthResolver`. New enum variants shift discriminants
+///   in bincode and are a wire break.
+pub const WIRE_VERSION: u32 = 2;
 
 /// Top-level frame on the wire.
 ///
@@ -152,6 +157,15 @@ pub enum RequestKind {
     Restore {
         src_path: String,
     },
+    /// Host → coord. The standalone host-agent doesn't have direct
+    /// `MetadataStore` / KEK access, so it asks the coord to resolve
+    /// OCI registry credentials on its behalf. Coord delegates to
+    /// the existing `engram-oci-auth::PgAuthResolver`. Plaintext
+    /// creds traverse the WS only at pull time; never persisted on
+    /// the host. ADR 0007.
+    ResolveRegistryAuth {
+        host: String,
+    },
 }
 
 /// Successful response payloads. Errors take the [`RemoteError`] path
@@ -171,6 +185,21 @@ pub enum ResponseKind {
     Snapshotted { metadata: SnapshotMetadata },
     /// `Restore` reply.
     Restored { sandbox_id: SandboxId },
+    /// `ResolveRegistryAuth` reply. `None` for anonymous /
+    /// unknown-registry; `Some` for an entry the coord resolved
+    /// via its `PgAuthResolver`. Caller plugs the creds into the
+    /// OCI client's basic-auth path for the in-flight pull.
+    RegistryAuth { creds: Option<RegistryCreds> },
+}
+
+/// Plaintext credentials for an OCI registry, returned by the
+/// coord in response to `ResolveRegistryAuth`. Mirrors
+/// `engram_oci::auth::BasicCreds` but defined here so the wire
+/// type doesn't drag a dep on the heavier OCI crate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegistryCreds {
+    pub username: String,
+    pub password: String,
 }
 
 /// In-flight streaming items for an `ExecStart` request.

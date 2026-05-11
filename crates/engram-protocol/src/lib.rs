@@ -18,9 +18,10 @@ pub mod scheduling;
 pub mod server;
 pub mod wire;
 
+pub use client::HostRequestHandler;
 pub use heartbeat::*;
 pub use scheduling::*;
 pub use wire::{
-    Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, TraceContext,
-    WireExecRequest, WIRE_VERSION,
+    Frame, NotifyKind, RegistryCreds, RemoteError, RequestKind, ResponseKind, StreamItem,
+    TraceContext, WireExecRequest, WIRE_VERSION,
 };

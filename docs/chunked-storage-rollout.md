@@ -592,13 +592,32 @@ tier.
    `ENGRAM_GCS_BUCKET`; local default keeps existing dev workflows
    working. Production CI bakes now land chunks directly in the
    deployment bucket without an intermediate local-to-GCS hop.
-2. ⬜ **Real OCI credential strategy** — the Tier 3 anonymous
-   resolver is a placeholder. Production needs:
-   - GCP Workload Identity binding for `gcr.io` / Artifact Registry
-   - Coordinator's existing `MetadataStore`-backed `AuthResolver`
-     reused, OR a parallel path on the host-agent side
-   - Design call: does host-agent fetch creds from coordinator
-     on-demand, or use ambient WI directly?
+2. ⬜ **WS-RPC for OCI auth resolution on the standalone host-agent**.
+   The infrastructure exists — `engram-oci-auth::PgAuthResolver`
+   reads encrypted `RegistryCredential` rows from Postgres, decrypts
+   under KEK, handles `Static` / `GcpWorkloadIdentity` /
+   `Anonymous` auth_kinds. Coord wires it into the shared
+   `OciClient` at `engram-coordinator/src/main.rs:281-284`.
+   `--mode=all` shares that client with the in-process host-agent,
+   so private-registry pulls work today.
+
+   The gap is solely on the standalone host-agent: no
+   `MetadataStore` access (it's on the other side of the WS), so
+   it can't instantiate `PgAuthResolver` directly. Today wires an
+   `AnonymousResolver` as a placeholder — fine for `localhost:5001`
+   and public registries; misses every private registry.
+
+   Concrete shape:
+   - Add `RequestKind::ResolveRegistryAuth { host: String }` +
+     matching response to `engram-protocol::wire`.
+   - Coord-side handler delegates to the existing `PgAuthResolver`.
+   - New `WsAuthResolver` impl in `engram-host-agent` issues this
+     RPC via the existing dialer connection.
+   - Replace the `AnonymousResolver` in
+     `engram-host-agent/src/main.rs` with `WsAuthResolver`.
+
+   ~150 lines. Credentials traverse the WS only at pull time;
+   never persisted on the host.
 3. ⬜ **Materialized rootfs file GC** (Phase 3 gap) — the
    `<work_dir>/chunked-rootfs/` directory accumulates one
    `<manifest_id>-vN.ext4` per (re)materialized image and never

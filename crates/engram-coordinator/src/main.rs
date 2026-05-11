@@ -281,7 +281,7 @@ async fn main() -> Result<(), CoordinatorError> {
     let auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver> = Arc::new(
         engram_oci_auth::PgAuthResolver::new(meta_arc.clone(), kek.clone()),
     );
-    let oci_client = Arc::new(engram_oci::OciClient::new(auth_resolver));
+    let oci_client = Arc::new(engram_oci::OciClient::new(auth_resolver.clone()));
 
     let cloud: Arc<dyn CloudBackend> = match cli.cloud_backend {
         CloudBackendChoice::Static => Arc::new(
@@ -556,6 +556,7 @@ async fn main() -> Result<(), CoordinatorError> {
         secrets,
         kek,
         oci: oci_client,
+        auth_resolver,
         blob,
     };
 

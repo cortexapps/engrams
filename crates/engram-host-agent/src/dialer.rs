@@ -50,6 +50,13 @@ pub struct DialerConfig {
     /// empty fields — the scheduler then ranks by capacity-fallback
     /// only, which is fine for early/dev deployments.
     pub heartbeat_provider: Option<HeartbeatProvider>,
+    /// ADR 0007: when set, the dialer writes the live
+    /// [`HostSession`] into this handle on connect (so
+    /// `WsAuthResolver` can issue host→coord RPCs over the WS) and
+    /// clears it on disconnect. `None` skips the wiring — the
+    /// OCI client falls back to whatever resolver the binary
+    /// configured at startup.
+    pub auth_session_handle: Option<crate::ws_auth::SessionHandle>,
 }
 
 /// Dialer entry point. Runs forever, reconnecting on disconnect.
@@ -102,6 +109,14 @@ async fn connect_once(
     let (write, read) = futures::stream::StreamExt::split(ws);
     let session = HostSession::new(write);
 
+    // ADR 0007: publish the live session to the auth handle BEFORE
+    // sending Hello so any concurrent OCI pull that's already
+    // awaiting a `resolve()` round-trip can land its RPC the moment
+    // the coord registers us. Cleared at the end of this function.
+    if let Some(h) = cfg.auth_session_handle.as_ref() {
+        *h.write().await = Some(session.clone());
+    }
+
     // First frame: Hello. Failure here means the coordinator never
     // sees us as registered; bail out to retry.
     let _ = session
@@ -127,6 +142,12 @@ async fn connect_once(
     session.serve_with_reader(backend, None, read).await;
 
     hb_handle.abort();
+
+    // Clear the auth handle so any pull issued mid-disconnect fails
+    // fast instead of trying to RPC against a dead session.
+    if let Some(h) = cfg.auth_session_handle.as_ref() {
+        *h.write().await = None;
+    }
     Ok(())
 }
 

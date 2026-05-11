@@ -211,6 +211,14 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
         Arc::new(RemoteSandboxBackend::new(host.clone()));
     state.host_registry.register(host_id, backend);
 
+    // ADR 0007: install the host-request handler so the host-agent
+    // can resolve OCI auth via the coord's `PgAuthResolver`. Plaintext
+    // creds traverse the WS only at pull time; never persisted on
+    // the host side.
+    host.set_request_handler(Arc::new(AuthRequestHandler {
+        auth_resolver: state.services.auth_resolver.clone(),
+    }));
+
     // Persist the row in Postgres so future scheduler queries see this
     // host. Phase 3a: capacity is unknown yet (heartbeats will populate
     // it in 3b); record an initial Ready entry with zero capacity.
@@ -320,6 +328,44 @@ fn tung_to_axum(m: TungMessage) -> AxumMessage {
             // Raw frames don't appear in normal flow; treat as a Close
             // so the peer cleans up.
             AxumMessage::Close(None)
+        }
+    }
+}
+
+/// Coord-side handler for host-initiated requests. ADR 0007 wires
+/// `ResolveRegistryAuth`; future host→coord RPCs slot in alongside.
+/// Holds an `Arc<dyn RegistryAuthResolver>` so the existing
+/// `PgAuthResolver` from `Services` is the single source of truth.
+struct AuthRequestHandler {
+    auth_resolver: Arc<dyn engram_oci::RegistryAuthResolver>,
+}
+
+#[async_trait::async_trait]
+impl engram_protocol::HostRequestHandler for AuthRequestHandler {
+    async fn handle(
+        &self,
+        kind: engram_protocol::RequestKind,
+    ) -> Result<engram_protocol::ResponseKind, engram_protocol::RemoteError> {
+        match kind {
+            engram_protocol::RequestKind::ResolveRegistryAuth { host } => {
+                tracing::debug!(host = %host, "host-agent requested OCI auth resolution");
+                match self.auth_resolver.resolve(&host).await {
+                    Ok(Some(creds)) => Ok(engram_protocol::ResponseKind::RegistryAuth {
+                        creds: Some(engram_protocol::RegistryCreds {
+                            username: creds.username,
+                            password: creds.password,
+                        }),
+                    }),
+                    Ok(None) => Ok(engram_protocol::ResponseKind::RegistryAuth { creds: None }),
+                    Err(e) => Err(engram_protocol::RemoteError::Other(format!(
+                        "resolve registry auth: {e}"
+                    ))),
+                }
+            }
+            other => Err(engram_protocol::RemoteError::Other(format!(
+                "coord-side host-request handler doesn't serve {:?}",
+                std::mem::discriminant(&other),
+            ))),
         }
     }
 }
