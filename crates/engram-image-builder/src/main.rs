@@ -128,17 +128,15 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         None => DockerCli::new(),
     };
 
-    // ADR 0007: chunks live in a `BlobStorage` rooted at
-    // `<images_dir>/store/` for local-dev workflows. Production CI
-    // wires a `GcsBlobStorage` here so freshly-baked images land
-    // directly in the deployment bucket. The chunk root is
-    // co-located with the images dir so a single image-builder
-    // invocation produces a self-contained tree.
-    let chunk_root = opts.images_dir.join("store");
-    tokio::fs::create_dir_all(&chunk_root).await?;
-    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-        engram_storage_local::LocalBlobStorage::new(chunk_root.clone()),
-    );
+    // ADR 0007: chunk-store backend driven by `ENGRAM_BLOB_BACKEND`.
+    //   - `local` (default): chunks land at `<images_dir>/store/`,
+    //     keeping the dev workflow self-contained.
+    //   - `gcs`: chunks land directly in the deployment bucket; the
+    //     CI runner needs `ENGRAM_GCS_BUCKET` set and the right
+    //     Workload Identity binding. Without this knob, production
+    //     bakes wrote to the runner's local FS and lost the chunks
+    //     on recycle — see docs/chunked-storage-rollout.md.
+    let blob = engram_image_builder::blob::from_env(&opts.images_dir).await?;
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let builder = Builder::new(docker, chunk_store);
 

@@ -24,6 +24,7 @@
 //! continues into `mkfs.ext4` and bakes in `engram-agentd` + an init
 //! unit. Out of scope this round.
 
+pub mod blob;
 pub mod config;
 pub mod docker;
 pub mod ext4;

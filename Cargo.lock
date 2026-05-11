@@ -1077,6 +1077,7 @@ dependencies = [
  "engram-core",
  "engram-oci",
  "engram-postgres",
+ "engram-storage-gcs",
  "engram-storage-local",
  "parking_lot",
  "serde",

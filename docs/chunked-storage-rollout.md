@@ -586,9 +586,12 @@ tier.
 
 **Required work** (criticality-ordered):
 
-1. ⬜ **Image-builder GCS path** (Phase 2 remaining gap #5) —
-   without this, production CI bakes don't produce usable artifacts.
-   ~40 lines mirroring `engram_coordinator::blob::from_env`.
+1. ✅ **Image-builder GCS path** (was Phase 2 gap #5) — shipped:
+   `engram_image_builder::blob::from_env` mirrors coord + host-
+   agent selectors. Reads `ENGRAM_BLOB_BACKEND={local,gcs}` +
+   `ENGRAM_GCS_BUCKET`; local default keeps existing dev workflows
+   working. Production CI bakes now land chunks directly in the
+   deployment bucket without an intermediate local-to-GCS hop.
 2. ⬜ **Real OCI credential strategy** — the Tier 3 anonymous
    resolver is a placeholder. Production needs:
    - GCP Workload Identity binding for `gcr.io` / Artifact Registry
@@ -596,9 +599,20 @@ tier.
      reused, OR a parallel path on the host-agent side
    - Design call: does host-agent fetch creds from coordinator
      on-demand, or use ambient WI directly?
-3. ⬜ **Materialized rootfs LRU** (Phase 3 gap) — swap
-   `materialize_to_file` → `materialize_to_file_cached` in
-   `pooled_backend::materialize_chunked_rootfs`. ~20 lines.
+3. ⬜ **Materialized rootfs file GC** (Phase 3 gap) — the
+   `<work_dir>/chunked-rootfs/` directory accumulates one
+   `<manifest_id>-vN.ext4` per (re)materialized image and never
+   reaps. Two independent concerns conflated earlier:
+     - *(a)* Local NVMe cache for chunks across manifests:
+       `materialize_to_file_cached` already exists in
+       `engram-chunk-store::file` + needs `ChunkCache` wiring into
+       `PooledBackend`.
+     - *(b)* Materialized-file orphan reap: scan `chunked-rootfs/`
+       periodically and delete `<manifest_id>-vN.ext4` files no
+       longer referenced by a live session or recent snapshot.
+       Needs a coord-side admin endpoint + cron primitive.
+   *(a)* is an optimization; *(b)* is a real disk-leak fix.
+   Production needs both.
 4. ⬜ **Chunk-store GC scheduler** (Phase 1 gap) — coordinator cron
    loop + `POST /api/admin/gc-chunks` admin endpoint (the testable-
    trigger pattern per the feedback memory). ~50 lines.
