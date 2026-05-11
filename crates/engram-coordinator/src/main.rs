@@ -139,12 +139,41 @@ struct Cli {
     /// `--kek-provider gcp-kms` is in effect. Required for that mode.
     #[arg(long, env = "ENGRAM_KEK_GCP_RESOURCE")]
     kek_gcp_resource: Option<String>,
+
+    /// Per-session SecretStore backend. `env` reads `$NAME` from the
+    /// coordinator's host environment (dev / single-tenant). `gcp`
+    /// resolves each image manifest's `[secrets.*]` entry via GCP
+    /// Secret Manager at session-create time, authenticated through
+    /// the instance metadata server (Workload Identity in GKE).
+    #[arg(long, env = "ENGRAM_SECRETS_BACKEND", value_parser = parse_secrets_choice, default_value = "env")]
+    secrets_backend: SecretsChoice,
+
+    /// GCP project ID for `--secrets-backend=gcp`. Required when that
+    /// backend is selected.
+    #[arg(long, env = "ENGRAM_GCP_PROJECT_ID")]
+    gcp_project_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KekChoice {
     EnvVar,
     GcpKms,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecretsChoice {
+    Env,
+    Gcp,
+}
+
+fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
+    match s {
+        "env" => Ok(SecretsChoice::Env),
+        "gcp" => Ok(SecretsChoice::Gcp),
+        other => Err(format!(
+            "unknown secrets backend `{other}` (expected env | gcp)"
+        )),
+    }
 }
 
 /// Initialise the global tracing subscriber.
@@ -435,11 +464,27 @@ async fn main() -> Result<(), CoordinatorError> {
         );
     }
 
-    // Default dev wiring: env-var-backed SecretStore (pulls
-    // `$GITHUB_TOKEN` etc. from the host shell). Production
-    // deployments swap this out for `engram-secrets-gcp` / vault /
-    // etc. via a config flag (next round).
-    let secrets: Arc<dyn SecretStore> = Arc::new(EnvSecretStore::new());
+    // SecretStore selection. `env` is dev-only (reads `$NAME` from
+    // the coordinator's host shell); `gcp` resolves each image
+    // manifest's `[secrets.*]` entry against GCP Secret Manager at
+    // session-create time, authenticating via the metadata server
+    // (Workload Identity).
+    let secrets: Arc<dyn SecretStore> = match cli.secrets_backend {
+        SecretsChoice::Env => Arc::new(EnvSecretStore::new()),
+        SecretsChoice::Gcp => {
+            let project = cli.gcp_project_id.clone().ok_or_else(|| {
+                CoordinatorError::Config(
+                    "--secrets-backend=gcp requires --gcp-project-id (or \
+                     ENGRAM_GCP_PROJECT_ID)"
+                        .into(),
+                )
+            })?;
+            Arc::new(
+                engram_secrets_gcp::GcpSecretManager::new(project)
+                    .map_err(|e| CoordinatorError::Config(format!("secrets gcp: {e}")))?,
+            )
+        }
+    };
 
     // KEK + meta_arc were constructed up-front so the OCI auth
     // resolver could reference them. They flow through to Services

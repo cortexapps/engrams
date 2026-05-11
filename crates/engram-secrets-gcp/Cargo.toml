@@ -13,6 +13,11 @@ workspace = true
 engram-core.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = "0.6"

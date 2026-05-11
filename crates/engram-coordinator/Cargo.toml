@@ -28,6 +28,7 @@ engram-cloud-gcp.workspace = true
 engram-cloud-mock.workspace = true
 engram-harness-proto.workspace = true
 engram-secrets-dev.workspace = true
+engram-secrets-gcp.workspace = true
 engram-image-builder.workspace = true
 engram-egress-proxy.workspace = true
 engram-crypto.workspace = true
