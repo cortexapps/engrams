@@ -527,20 +527,29 @@ async fn main() -> Result<(), CoordinatorError> {
 /// `cli.egress_proxy_port`, and return the registry handle so
 /// session creation can register/unregister state. Returns None on
 /// failure (logged) or when the proxy is disabled (port=0).
+///
+/// CA sourcing priority:
+///   1. `ENGRAM_EGRESS_CA_CERT_PEM` + `ENGRAM_EGRESS_CA_KEY_PEM`
+///      (both required if either is set). Used for stateless HA
+///      deployments where every coordinator replica loads the same
+///      CA from a shared secret (k8s Secret backed by GCP Secret
+///      Manager). Without this path, every pod restart would
+///      generate a fresh CA and invalidate every live VM's trust
+///      store. PEM blobs are read verbatim — base64-encoded k8s
+///      Secrets are decoded by the projector, so callers should
+///      provide raw PEM.
+///   2. Local disk under `<local_path>/egress-proxy/`. Single-host
+///      dev workflow (`--mode=all`) where persistent local storage
+///      is fine and operators want a stable CA across restarts.
 async fn build_egress_proxy(cli: &Cli) -> Option<engram_coordinator::EgressProxy> {
     if cli.egress_proxy_port == 0 {
         tracing::info!("egress proxy disabled (--egress-proxy-port=0)");
         return None;
     }
-    let proxy_dir = cli.local_path.join("egress-proxy");
-    let ca = match engram_egress_proxy::Ca::load_or_generate(&proxy_dir) {
+    let ca = match load_egress_ca(&cli.local_path) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            tracing::warn!(
-                dir = %proxy_dir.display(),
-                error = %e,
-                "egress proxy CA load/generate failed; proxy disabled",
-            );
+            tracing::warn!(error = %e, "egress proxy CA init failed; proxy disabled");
             return None;
         }
     };
@@ -565,6 +574,31 @@ async fn build_egress_proxy(cli: &Cli) -> Option<engram_coordinator::EgressProxy
     });
     tracing::info!(addr = %bind_addr, "egress proxy spawned");
     Some(engram_coordinator::EgressProxy { registry, ca })
+}
+
+/// Resolve the egress-proxy CA, preferring env-injected PEM material
+/// when present. See [`build_egress_proxy`] for sourcing semantics.
+fn load_egress_ca(local_path: &std::path::Path) -> Result<engram_egress_proxy::Ca, String> {
+    let cert_env = std::env::var("ENGRAM_EGRESS_CA_CERT_PEM").ok();
+    let key_env = std::env::var("ENGRAM_EGRESS_CA_KEY_PEM").ok();
+    match (cert_env, key_env) {
+        (Some(cert_pem), Some(key_pem)) => {
+            tracing::info!("loading egress proxy CA from env (stateless deploy path)");
+            engram_egress_proxy::Ca::from_pem(&cert_pem, &key_pem)
+                .map_err(|e| format!("Ca::from_pem: {e}"))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(
+            "ENGRAM_EGRESS_CA_CERT_PEM and ENGRAM_EGRESS_CA_KEY_PEM must both be set, \
+             or both unset to fall back to local-disk generation"
+                .into(),
+        ),
+        (None, None) => {
+            let proxy_dir = local_path.join("egress-proxy");
+            tracing::info!(dir = %proxy_dir.display(), "loading egress proxy CA from local disk");
+            engram_egress_proxy::Ca::load_or_generate(&proxy_dir)
+                .map_err(|e| format!("Ca::load_or_generate({}): {e}", proxy_dir.display()))
+        }
+    }
 }
 
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`

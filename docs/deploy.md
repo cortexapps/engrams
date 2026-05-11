@@ -99,21 +99,57 @@ no plaintext key in pod memory), implement `wrap` / `unwrap` in
 
 ## Egress proxy CA
 
-The egress proxy (run by each host-agent) MITMs guest TLS so
-per-secret `allow_hosts` policies can be enforced and broker-mode
-placeholder substitution can run. For this to work, every guest
-substrate must trust the proxy's CA, which means all host-agents
-must MITM with the same chain.
+The egress proxy MITMs guest TLS so per-secret `allow_hosts`
+policies can be enforced and broker-mode placeholder substitution
+can run. For MITM to work, every guest substrate must trust the
+proxy's CA chain.
 
-| Variable                          | Purpose                                                |
-|-----------------------------------|--------------------------------------------------------|
-| `ENGRAM_EGRESS_CA_CERT_PEM`       | Base64-encoded CA cert PEM, sourced from Secret Manager |
-| `ENGRAM_EGRESS_CA_KEY_PEM`        | Base64-encoded CA private key PEM, ditto                |
-| `ENGRAM_EGRESS_PROXY_PORT`        | Listener port on the FC host's tap interface           |
+### V1: proxy stays on the coordinator
 
-Sourcing path is the same shape as the KEK: generate once, store
-in Secret Manager, inject through a k8s Secret (or GCE metadata
-secret) at boot.
+For v1 the proxy listens on the coordinator. Every replica must
+load the same CA from a shared secret so substrate-baked trust
+stores stay valid across coordinator restarts and any replica's
+MITM leaves validate.
+
+| Variable                       | Purpose                                              |
+|--------------------------------|------------------------------------------------------|
+| `ENGRAM_EGRESS_CA_CERT_PEM`    | CA cert PEM, sourced from GCP Secret Manager         |
+| `ENGRAM_EGRESS_CA_KEY_PEM`     | CA private key PEM, ditto                            |
+| `ENGRAM_EGRESS_PROXY_PORT`     | Listener port (`0` disables egress filtering)        |
+
+Generation: `engram-coordinator` (any binary linking the
+`engram-egress-proxy` crate) generates the CA pair on first boot
+into `<local_path>/egress-proxy/{ca.pem,ca.key}` when the env vars
+are unset. To make this stateless, generate once during initial
+deploy, store both PEMs in Secret Manager, then project into the
+coordinator pod env via k8s Secret. Once the env vars are set, the
+local-disk path is ignored.
+
+`ENGRAM_EGRESS_PROXY_PORT=0` (the default) is fine for the initial
+deploy — egress filtering and per-secret `allow_hosts` aren't
+enforced, but Literal-mode secrets still flow correctly.
+
+### V2: proxy moves to each host-agent
+
+Long-term the proxy belongs on each FC host-agent so iptables
+REDIRECT is local (no cross-machine traffic in the request path)
+and the coordinator stays out of egress hot paths. That move
+requires:
+
+- A wire frame (`NotifyKind::SessionEgressPolicy`) carrying per-
+  session `NetworkPolicy` + (when broker mode lands) the per-
+  secret keyring from the coordinator to the host-agent.
+- Substrate CA injection: the production substrate-build path
+  (`engram-host-agent::image_cache::ensure_harness_ext4`) must
+  write `<host_meta>/ca.pem` into the substrate before mke2fs.
+  The e2e test (`engram-sandbox-firecracker/tests/proxy_e2e.rs`)
+  demonstrates the shape; production wires it via the host-agent's
+  loaded CA.
+- Coordinator-side removal of `services.egress_proxy`.
+
+This is tracked as a follow-up. V1 deploys can either disable the
+proxy entirely (`--egress-proxy-port=0`) or live with the
+coordinator-hosted topology while broker-mode wiring catches up.
 
 ## Secret resolution
 

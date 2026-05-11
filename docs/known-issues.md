@@ -97,7 +97,37 @@ proxy. Coverage: `engram-egress-proxy/tests/intercept_e2e.rs`
 (sudo, iptables apply), `tests/harness_loopback.rs` (CA delivery
 via substrate).
 
-## 6. No system-wide event stream on the coordinator
+## 6. Egress proxy lives on the coordinator, not the host-agent
+
+**Files**: `crates/engram-coordinator/src/main.rs::build_egress_proxy`,
+`crates/engram-host-agent/src/image_cache.rs::ensure_harness_ext4`.
+
+V1 keeps the proxy on the coordinator with a CA loaded from env
+(`ENGRAM_EGRESS_CA_CERT_PEM` / `_KEY_PEM`), which is enough for
+stateless HA — every replica MITMs with the same chain. But the
+"egress proxy per FC host" architecture (chosen in the production
+deploy plan) isn't yet implemented because two pieces are missing:
+
+1. **Cross-machine session-policy delivery**: the coordinator
+   currently calls `proxy.registry.register(SessionState { ... })`
+   in-process after creating a sandbox. Moving the proxy to the
+   host-agent means the host-agent has to learn the manifest's
+   `NetworkPolicy` (and, eventually, the broker-mode secret
+   keyring). A `NotifyKind::SessionEgressPolicy` wire frame would
+   cover this.
+
+2. **Substrate CA injection in production**: today
+   `ensure_harness_ext4` builds the ext4 harness substrate from the
+   OCI pack but **doesn't** stamp `.engram-host/ca.pem` into it. The
+   e2e test (`proxy_e2e.rs`) writes the file manually, demonstrating
+   the shape; production needs the same step driven by the
+   host-agent's resident CA before mke2fs runs.
+
+**Fix**: do both in tandem with the broker-mode wiring. Until
+then, `--egress-proxy-port=0` keeps the proxy off for v1 prod
+deploys.
+
+## 7. No system-wide event stream on the coordinator
 
 The dashboard's Overview page only polls `GET /sessions` and
 `GET /api/hosts` at 1Hz — no SSE. Live event streaming is reserved

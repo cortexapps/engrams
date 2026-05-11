@@ -60,8 +60,19 @@ impl Ca {
     fn load(cert_path: &Path, key_path: &Path) -> Result<Self, CaError> {
         let cert_pem = std::fs::read_to_string(cert_path)?;
         let key_pem = std::fs::read_to_string(key_path)?;
-        let key_pair = KeyPair::from_pem(&key_pem)
-            .map_err(|e| CaError::Rcgen(format!("parse ca key: {e}")))?;
+        Self::from_pem(&cert_pem, &key_pem)
+    }
+
+    /// Build a `Ca` directly from cert+key PEM strings — no disk I/O.
+    /// Used by deployments that source the CA from a secret manager
+    /// (k8s Secret backed by GCP Secret Manager, etc.) instead of a
+    /// per-host local file. Every replica/host loading the same
+    /// material produces an issuer with the same SubjectPublicKeyInfo,
+    /// so leaves they sign all validate against the cert baked into
+    /// guest substrates.
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, CaError> {
+        let key_pair =
+            KeyPair::from_pem(key_pem).map_err(|e| CaError::Rcgen(format!("parse ca key: {e}")))?;
         // rcgen 0.13 has no Cert→Params round-trip, so we rebuild
         // params from constants. Validity in the rebuilt params is
         // independent of the persisted cert; what matters is that
@@ -70,7 +81,7 @@ impl Ca {
         Ok(Self {
             key_pair,
             params,
-            cert_pem,
+            cert_pem: cert_pem.to_string(),
         })
     }
 
@@ -193,5 +204,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ca = Ca::load_or_generate(tmp.path()).unwrap();
         assert!(ca.cert_pem.contains("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn from_pem_round_trips_through_load_or_generate() {
+        // Stateless deploy path: one tempdir generates a CA on disk,
+        // a second `Ca` constructed via `from_pem` against the same
+        // material must produce an issuer with the same key (so a
+        // leaf signed by either validates against the on-disk cert).
+        let tmp = tempfile::tempdir().unwrap();
+        let on_disk = Ca::load_or_generate(tmp.path()).unwrap();
+        let key_pem = std::fs::read_to_string(tmp.path().join("ca.key")).unwrap();
+        let from_env = Ca::from_pem(&on_disk.cert_pem, &key_pem).unwrap();
+        assert_eq!(from_env.cert_pem, on_disk.cert_pem);
+        // KeyPair doesn't expose equality, but `serialize_pem`
+        // round-trips deterministically.
+        assert_eq!(from_env.key_pair.serialize_pem(), key_pem);
+    }
+
+    #[test]
+    fn from_pem_rejects_malformed_key() {
+        let result = Ca::from_pem(
+            "-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----\n",
+            "not-a-key",
+        );
+        assert!(matches!(result, Err(CaError::Rcgen(_))));
     }
 }
