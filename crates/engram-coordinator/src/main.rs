@@ -147,6 +147,27 @@ enum KekChoice {
     GcpKms,
 }
 
+/// Initialise the global tracing subscriber.
+///
+/// Honors `ENGRAM_LOG_FORMAT` (`pretty`, the default, or `json` for
+/// production Cloud Logging ingestion). Falls back to `RUST_LOG` for
+/// the filter, then to `info,engram=debug` as a sensible local
+/// default.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,engram=debug"));
+    let json = matches!(
+        std::env::var("ENGRAM_LOG_FORMAT").as_deref(),
+        Ok("json") | Ok("JSON")
+    );
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
+}
+
 fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
     match s {
         "env" | "env-var" | "envvar" => Ok(KekChoice::EnvVar),
@@ -159,12 +180,7 @@ fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), CoordinatorError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,engram=debug")),
-        )
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
 
