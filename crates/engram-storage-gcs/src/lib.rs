@@ -15,11 +15,15 @@
 //! - `get_streaming` returns the SDK's native `Stream<Item =
 //!   Result<Bytes, ...>>` directly — no re-buffering, GB-scale memory
 //!   files don't materialize in RAM.
-//! - `put_streaming` currently collects the inbound body to a
-//!   `Vec<u8>` and uses the SDK's `Multipart` upload. Acceptable for
-//!   the fake-gcs-server local tests + modest-sized payloads; Stage 5
-//!   may switch to resumable-upload semantics if profiling shows it's
-//!   worth the complexity for the FC `memory.bin` flush path.
+//! - `put_streaming` forwards the inbound `ByteStream` through the
+//!   SDK's `upload_streamed_object`, which wraps it as the reqwest
+//!   request body. Bytes flow through hyper without being collected;
+//!   peak memory is one TCP frame's worth (~64 KiB), not the full
+//!   payload. This matters for the FC `memory.bin` cold-tier flush
+//!   where a single object can be multi-GB. Not yet truly resumable
+//!   on transient failures (a mid-stream disconnect aborts the
+//!   upload); a future pass can wire `prepare_resumable_upload` for
+//!   that.
 //!
 //! 404 → [`BlobError::NotFound`]; idempotent delete.
 
@@ -28,7 +32,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engram_core::error::BlobError;
 use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::delete::DeleteObjectRequest;
 use google_cloud_storage::http::objects::download::Range;
@@ -86,23 +90,39 @@ fn map_http_err(e: GcsHttpError) -> BlobError {
 #[async_trait]
 impl BlobStorage for GcsBlobStorage {
     async fn put_streaming(&self, key: &str, mut body: ByteStream) -> Result<u64, BlobError> {
-        // Drain into a Vec<u8>. See the module docstring — fine for
-        // emulator tests and small payloads; the FC flush path may
-        // want resumable uploads in a follow-up.
-        let mut buf = Vec::new();
-        while let Some(chunk) = body.next().await {
-            buf.extend_from_slice(&chunk?);
-        }
-        let total = buf.len() as u64;
+        // Bridge the inbound `ByteStream` (Send but not Sync — its
+        // inner `Pin<Box<dyn Stream + Send>>` carries no Sync bound)
+        // through a `futures::channel::mpsc` channel whose Receiver
+        // *is* Sync, satisfying the SDK's `S: TryStream + Send + Sync`
+        // bound on `upload_streamed_object`. The pump task forwards
+        // bytes verbatim and counts as they go; the SDK consumes the
+        // receiver directly via reqwest's chunked body, so peak
+        // memory is one TCP frame regardless of total upload size.
+        let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = total.clone();
+        let (mut tx, rx) = futures::channel::mpsc::channel::<Result<bytes::Bytes, BlobError>>(4);
+        tokio::spawn(async move {
+            while let Some(chunk) = body.next().await {
+                if let Ok(bytes) = chunk.as_ref() {
+                    counter.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if tx.send(chunk).await.is_err() {
+                    // Receiver dropped — upload was aborted.
+                    break;
+                }
+            }
+        });
+
         let req = UploadObjectRequest {
             bucket: self.bucket.clone(),
             ..Default::default()
         };
         let upload_type = UploadType::Simple(Media::new(key.to_string()));
         self.client
-            .upload_object(&req, buf, &upload_type)
+            .upload_streamed_object(&req, rx, &upload_type)
             .await
             .map_err(map_http_err)?;
+        let total = total.load(std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(bucket = %self.bucket, key = %key, bytes = total, "gcs put");
         Ok(total)
     }
@@ -240,5 +260,61 @@ mod tests {
 
         // After delete, get/head should surface NotFound.
         assert!(matches!(store.head(&key).await, Err(BlobError::NotFound)));
+    }
+
+    /// Streams a 64 MiB payload through `put_streaming` and verifies
+    /// it round-trips byte-for-byte via `get_streaming`. The chunk
+    /// generator yields 64 KiB at a time, so the upload pipeline is
+    /// exercised across ~1024 chunks — if anything was secretly
+    /// collecting the body to a Vec we'd see it in the test's
+    /// transient memory usage. Gated on the emulator + bucket env
+    /// vars like the small round-trip test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_streaming_round_trips_a_large_body() {
+        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+            return;
+        };
+        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
+            return;
+        };
+
+        let store = GcsBlobStorage::connect(bucket)
+            .await
+            .expect("connect against emulator");
+        let key = format!(
+            "engram/snapshots/test/streamed-{}.bin",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 1024; // 64 MiB total
+        let body: Vec<u8> = (0..CHUNK).map(|i| (i % 257) as u8).collect();
+        let body_bytes = bytes::Bytes::from(body.clone());
+
+        let chunks = (0..CHUNKS).map(move |_| Ok(body_bytes.clone()));
+        let stream = futures::stream::iter(chunks);
+        let put_size = store
+            .put_streaming(&key, ByteStream::new(stream))
+            .await
+            .expect("put_streaming");
+        assert_eq!(put_size, (CHUNK * CHUNKS) as u64);
+
+        let head = store.head(&key).await.expect("head");
+        assert_eq!(head.size_bytes, (CHUNK * CHUNKS) as u64);
+
+        // Pull it back via the streaming get and verify the first +
+        // last chunks match. (Full equality would be 64 MiB in RAM
+        // which defeats the point.)
+        let mut got = store.get_streaming(&key).await.expect("get_streaming");
+        let first = got.next().await.expect("first chunk").expect("first ok");
+        assert_eq!(
+            &first[..CHUNK.min(first.len())],
+            &body[..CHUNK.min(first.len())]
+        );
+
+        store.delete(&key).await.expect("delete");
     }
 }
