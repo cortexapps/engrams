@@ -13,8 +13,9 @@
 //! TCB — per-host is fine: a sandbox can't ever obtain the signing
 //! key in either model, since the proxy lives on the host.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
 const CA_COMMON_NAME: &str = "Engram Egress Proxy CA";
@@ -167,6 +168,114 @@ impl std::error::Error for CaError {}
 impl From<std::io::Error> for CaError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+// ---------------------------------------------------------------------
+// CaSource — pluggable backend for loading the deployment CA.
+// ---------------------------------------------------------------------
+
+/// Loads the deployment-wide egress-proxy CA.
+///
+/// Multi-host production needs every host-agent to MITM with the same
+/// cert chain — guest substrates are baked with one CA cert and the
+/// leaves any host's proxy mints have to validate against it. The
+/// abstraction is a trait so cloud-specific backends (GCP Secret
+/// Manager, AWS Secrets Manager, Vault) can plug in without
+/// `engram-egress-proxy` taking a dep on any of them. ADR 0006.
+#[async_trait]
+pub trait CaSource: Send + Sync {
+    async fn load(&self) -> Result<Ca, CaError>;
+}
+
+/// Reads CA cert + key PEM verbatim from two env vars. Suitable for
+/// deployments that already project secrets into the process env via
+/// some out-of-band mechanism (k8s Secret CSI projection, GCE
+/// startup script writing to the systemd unit's Environment, …).
+#[derive(Clone, Debug)]
+pub struct EnvCaSource {
+    pub cert_var: String,
+    pub key_var: String,
+}
+
+impl EnvCaSource {
+    pub fn new(cert_var: impl Into<String>, key_var: impl Into<String>) -> Self {
+        Self {
+            cert_var: cert_var.into(),
+            key_var: key_var.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl CaSource for EnvCaSource {
+    async fn load(&self) -> Result<Ca, CaError> {
+        let cert_pem = std::env::var(&self.cert_var)
+            .map_err(|_| CaError::Rcgen(format!("env var `{}` not set", self.cert_var)))?;
+        let key_pem = std::env::var(&self.key_var)
+            .map_err(|_| CaError::Rcgen(format!("env var `{}` not set", self.key_var)))?;
+        Ca::from_pem(&cert_pem, &key_pem)
+    }
+}
+
+/// Reads (or generates on first run) CA cert + key from a local
+/// directory. The dev path: `just dev` boots with no env vars and
+/// gets a stable CA across restarts. Not appropriate for stateless
+/// multi-host production — each replica would generate its own CA
+/// and leaves wouldn't validate cross-host.
+#[derive(Clone, Debug)]
+pub struct LocalDiskCaSource {
+    pub dir: PathBuf,
+}
+
+impl LocalDiskCaSource {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+}
+
+#[async_trait]
+impl CaSource for LocalDiskCaSource {
+    async fn load(&self) -> Result<Ca, CaError> {
+        // `Ca::load_or_generate` is sync but cheap; running it on the
+        // current thread is fine. No blocking-pool dispatch needed.
+        Ca::load_or_generate(&self.dir)
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_disk_source_round_trips_through_load_or_generate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = LocalDiskCaSource::new(tmp.path());
+        let ca1 = source.load().await.unwrap();
+        let ca2 = source.load().await.unwrap();
+        // Same on-disk material → same persisted cert PEM.
+        assert_eq!(ca1.cert_pem, ca2.cert_pem);
+    }
+
+    #[tokio::test]
+    async fn env_source_reports_missing_vars_explicitly() {
+        // Pick var names unlikely to clash with any real env var; the
+        // test process's actual env is whatever cargo decided.
+        let source = EnvCaSource::new(
+            "__ENGRAM_TEST_CA_CERT_UNSET__",
+            "__ENGRAM_TEST_CA_KEY_UNSET__",
+        );
+        let err = source
+            .load()
+            .await
+            .err()
+            .expect("missing env vars must error");
+        match err {
+            CaError::Rcgen(msg) => {
+                assert!(msg.contains("__ENGRAM_TEST_CA_CERT_UNSET__"));
+            }
+            other => panic!("expected Rcgen(missing-var), got {other}"),
+        }
     }
 }
 
