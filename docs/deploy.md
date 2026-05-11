@@ -97,59 +97,68 @@ no plaintext key in pod memory), implement `wrap` / `unwrap` in
 `providers.rs` against `google-cloud-kms` and flip
 `--kek-provider gcp-kms`.
 
-## Egress proxy CA
+## Egress proxy
 
-The egress proxy MITMs guest TLS so per-secret `allow_hosts`
-policies can be enforced and broker-mode placeholder substitution
-can run. For MITM to work, every guest substrate must trust the
-proxy's CA chain.
+The egress proxy MITMs guest TLS so per-image `[network].allow_hosts`
+gates and broker-mode placeholder substitution can run. The proxy
+**runs on each FC host-agent**, not on the coordinator (ADR 0006).
+iptables PREROUTING REDIRECT on each FC host hands tcp/443 to the
+local proxy; no cross-machine traffic enters the request path.
 
-### V1: proxy stays on the coordinator
+### CA distribution
 
-For v1 the proxy listens on the coordinator. Every replica must
-load the same CA from a shared secret so substrate-baked trust
-stores stay valid across coordinator restarts and any replica's
-MITM leaves validate.
+All host-agents in a deployment load the **same CA cert + key** so
+guest substrates that trust one host's chain trust them all. The
+loader is pluggable (`engram_egress_proxy::CaSource` trait); three
+impls ship today, with one more impl per cloud later:
 
-| Variable                       | Purpose                                              |
-|--------------------------------|------------------------------------------------------|
-| `ENGRAM_EGRESS_CA_CERT_PEM`    | CA cert PEM, sourced from GCP Secret Manager         |
-| `ENGRAM_EGRESS_CA_KEY_PEM`     | CA private key PEM, ditto                            |
-| `ENGRAM_EGRESS_PROXY_PORT`     | Listener port (`0` disables egress filtering)        |
+| `--ca-source`        | When to use                                                    |
+|----------------------|----------------------------------------------------------------|
+| `local-disk` (default) | Dev / single-host. Auto-generates `<work_dir>/egress-ca/{ca.pem,ca.key}` on first boot. |
+| `env`                | Process env carries the PEMs (k8s Secret CSI mount, GCE startup script writing systemd Environment). |
+| `gcp-secret-manager` | Production. Workload Identity → Secret Manager. Two named secret paths, fetched at host-agent boot. |
 
-Generation: `engram-coordinator` (any binary linking the
-`engram-egress-proxy` crate) generates the CA pair on first boot
-into `<local_path>/egress-proxy/{ca.pem,ca.key}` when the env vars
-are unset. To make this stateless, generate once during initial
-deploy, store both PEMs in Secret Manager, then project into the
-coordinator pod env via k8s Secret. Once the env vars are set, the
-local-disk path is ignored.
+### Host-agent env vars
 
-`ENGRAM_EGRESS_PROXY_PORT=0` (the default) is fine for the initial
-deploy — egress filtering and per-secret `allow_hosts` aren't
-enforced, but Literal-mode secrets still flow correctly.
+| Variable                              | Purpose                                                              |
+|---------------------------------------|----------------------------------------------------------------------|
+| `ENGRAM_EGRESS_PROXY_PORT`            | Local listener port (`0` disables the proxy)                         |
+| `ENGRAM_EGRESS_CA_SOURCE`             | `env` \| `local-disk` \| `gcp-secret-manager`                        |
+| `ENGRAM_EGRESS_CA_CERT_VAR`           | Env var name holding the cert PEM (`--ca-source=env`)                |
+| `ENGRAM_EGRESS_CA_KEY_VAR`            | Env var name holding the key PEM (`--ca-source=env`)                 |
+| `ENGRAM_EGRESS_CA_DIR`                | Directory for `--ca-source=local-disk`                               |
+| `ENGRAM_EGRESS_CA_GCP_CERT_SECRET`    | `projects/<p>/secrets/<name>/versions/<v>` for the cert PEM          |
+| `ENGRAM_EGRESS_CA_GCP_KEY_SECRET`     | Same shape for the key PEM                                           |
 
-### V2: proxy moves to each host-agent
+Production deploy on GCP:
 
-Long-term the proxy belongs on each FC host-agent so iptables
-REDIRECT is local (no cross-machine traffic in the request path)
-and the coordinator stays out of egress hot paths. That move
-requires:
+1. Generate the CA pair once (`openssl req -x509 -days 3650 ...`).
+2. Store both PEMs in GCP Secret Manager (e.g.
+   `engram-egress-ca-cert` + `engram-egress-ca-key`).
+3. Bind the FC host VM's service account to those secrets with
+   `roles/secretmanager.secretAccessor`.
+4. Set `ENGRAM_EGRESS_CA_SOURCE=gcp-secret-manager` plus the two
+   `_SECRET` paths on each FC host's systemd unit.
 
-- A wire frame (`NotifyKind::SessionEgressPolicy`) carrying per-
-  session `NetworkPolicy` + (when broker mode lands) the per-
-  secret keyring from the coordinator to the host-agent.
-- Substrate CA injection: the production substrate-build path
-  (`engram-host-agent::image_cache::ensure_harness_ext4`) must
-  write `<host_meta>/ca.pem` into the substrate before mke2fs.
-  The e2e test (`engram-sandbox-firecracker/tests/proxy_e2e.rs`)
-  demonstrates the shape; production wires it via the host-agent's
-  loaded CA.
-- Coordinator-side removal of `services.egress_proxy`.
+The coordinator never sees the CA. CA rotation is a rolling
+redeploy of host-agents (and a substrate-cache invalidation, which
+is automatic: the cache filename includes the CA fingerprint).
 
-This is tracked as a follow-up. V1 deploys can either disable the
-proxy entirely (`--egress-proxy-port=0`) or live with the
-coordinator-hosted topology while broker-mode wiring catches up.
+### Per-session policy delivery
+
+The coordinator ships `SessionEgressPolicy` (network allow-hosts
++ per-secret placeholder→real_value keyring + `SecretMode`) over
+the existing coordinator↔host WS as a notify frame. The host-agent
+registers it with its local proxy registry. WS-frame ordering
+guarantees the policy lands before the subsequent `start_agent`
+request, so the harness can't make egress calls before the proxy
+knows the policy. Cold resume re-issues the policy when a session
+moves hosts.
+
+`ENGRAM_EGRESS_PROXY_PORT=0` on a host-agent disables egress
+filtering for that host — guests get unfiltered network access.
+Mix-and-match is fine: some hosts can run with the proxy off
+during bring-up while others have it on.
 
 ## Secret resolution
 

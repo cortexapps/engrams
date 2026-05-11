@@ -9,7 +9,7 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 > - **ADR 0003** — Apple Silicon backend via Virtualization.framework (clone-based snapshots, virtio-console transport, sub-second cold boot).
 > - **ADR 0004** — registry-backed image and harness distribution (OCI artifacts, content-addressable host-side cache, KEK-sealed registry credentials).
 > - **ADR 0005** — disk-pressure blob tier reintroduced; git removed from the platform layer. Sessions live ↔ snapshot exists in *either* tier (hot on local NVMe, cold in a `BlobStorage` backend).
-> - **ADR 0006** — production deploy uses coordinator-side egress proxy for v1; the host-agent topology and the matching cross-machine state-sync moves (idle evictor, broker-mode session registration) are v2.
+> - **ADR 0006** — egress proxy lives on each FC host-agent (not the coordinator). Deployment-wide CA loaded via a pluggable `CaSource` trait (env / local-disk / GCP Secret Manager); per-session policy ships from the coordinator over the existing WS as a `NotifyKind::SessionEgressPolicy` frame.
 >
 > Operational reference for GCP/GKE deployments: [`docs/deploy.md`](./docs/deploy.md).
 
