@@ -126,7 +126,6 @@ async fn build_app_state(
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
-        egress_proxy: None,
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),

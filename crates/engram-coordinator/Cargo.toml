@@ -36,7 +36,6 @@ engram-oci.workspace = true
 engram-oci-auth.workspace = true
 engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
-rustls.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 axum.workspace = true

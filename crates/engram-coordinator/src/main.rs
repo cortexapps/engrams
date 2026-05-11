@@ -108,13 +108,13 @@ struct Cli {
     #[arg(long, env = "ENGRAM_FC_NET_CIDR", default_value = "10.200.0.0")]
     fc_net_cidr: std::net::Ipv4Addr,
 
-    /// TCP port the egress-proxy listens on. iptables PREROUTING
-    /// REDIRECTs VM→tcp/443 to this port; the proxy SNI-peeks then
-    /// dispatches Reject / Bypass / Intercept per the manifest's
-    /// `[network] allow_hosts` and `[secrets.X] allow_hosts`.
-    /// `0` (default) disables the proxy — the host-startup iptables
-    /// rules also skip the REDIRECT in that case, so VMs run with
-    /// no egress filtering (test mode).
+    /// `--mode=all` only. TCP port the in-process egress proxy
+    /// listens on for the locally-attached FC backend. iptables
+    /// PREROUTING REDIRECT on the same host sends VM→tcp/443 here.
+    /// `0` (default) disables egress filtering for `--mode=all`.
+    /// Ignored in `--mode=coordinator` — host-agents own their own
+    /// proxies (ADR 0006), configured via the host-agent's own
+    /// `--egress-proxy-port` flag.
     #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 0)]
     egress_proxy_port: u16,
 
@@ -390,10 +390,38 @@ async fn main() -> Result<(), CoordinatorError> {
             engram_host_agent::image_cache::ImageCache::open(oci_cache_root, (*oci_client).clone())
                 .await
                 .map_err(|e| CoordinatorError::Config(format!("oci cache: {e}")))?;
-        let pooled_backend: Arc<dyn SandboxBackend> = Arc::new(
-            engram_host_agent::pooled_backend::PooledBackend::new(raw_backend, cli.warm_pool_size)
-                .with_image_cache(image_cache),
-        );
+        // ADR 0006: --mode=all gets a local HostEgress so the
+        // single-binary dev loop and the multi-host production
+        // topology share one egress code path. `egress_proxy_port=0`
+        // (default) skips it.
+        let host_egress = if cli.egress_proxy_port > 0 {
+            let dir = cli.local_path.join("egress-ca");
+            let source: Arc<dyn engram_egress_proxy::CaSource> =
+                Arc::new(engram_egress_proxy::LocalDiskCaSource::new(dir));
+            let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
+                .parse()
+                .expect("egress-proxy-port maps to a valid SocketAddr");
+            match engram_host_agent::egress::HostEgress::spawn(source, bind).await {
+                Ok(e) => Some(Arc::new(e)),
+                Err(e) => {
+                    tracing::error!(error = %e, "--mode=all egress proxy spawn failed; aborting");
+                    return Err(CoordinatorError::Config(format!("egress: {e}")));
+                }
+            }
+        } else {
+            None
+        };
+        let pooled_backend: Arc<dyn SandboxBackend> = Arc::new({
+            let mut p = engram_host_agent::pooled_backend::PooledBackend::new(
+                raw_backend,
+                cli.warm_pool_size,
+            )
+            .with_image_cache(image_cache);
+            if let Some(egress) = host_egress.clone() {
+                p = p.with_egress(egress);
+            }
+            p
+        });
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions
         // / snapshots inserted in a prior run still reference a valid
@@ -490,13 +518,6 @@ async fn main() -> Result<(), CoordinatorError> {
     // resolver could reference them. They flow through to Services
     // here unchanged.
 
-    // Build the egress proxy's CA + spawn the proxy task. Best-effort:
-    // if the proxy fails to start (port in use, missing rustls/ring
-    // crypto provider) sessions still get created — the FC backend
-    // will surface "no proxy" as no egress filtering, which is fine
-    // for VZ-on-macOS where this binary runs cross-platform.
-    let egress_proxy = build_egress_proxy(&cli).await;
-
     // ADR 0005 / Stage 4: cold-tier blob storage. `local` (default)
     // writes under `<local_path>/blobs/`; `gcs` requires
     // `ENGRAM_GCS_BUCKET` and honors `STORAGE_EMULATOR_HOST` for
@@ -516,89 +537,10 @@ async fn main() -> Result<(), CoordinatorError> {
         secrets,
         kek,
         oci: oci_client,
-        egress_proxy,
         blob,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await
-}
-
-/// Generate (or load) the per-host CA, spawn the proxy task on
-/// `cli.egress_proxy_port`, and return the registry handle so
-/// session creation can register/unregister state. Returns None on
-/// failure (logged) or when the proxy is disabled (port=0).
-///
-/// CA sourcing priority:
-///   1. `ENGRAM_EGRESS_CA_CERT_PEM` + `ENGRAM_EGRESS_CA_KEY_PEM`
-///      (both required if either is set). Used for stateless HA
-///      deployments where every coordinator replica loads the same
-///      CA from a shared secret (k8s Secret backed by GCP Secret
-///      Manager). Without this path, every pod restart would
-///      generate a fresh CA and invalidate every live VM's trust
-///      store. PEM blobs are read verbatim — base64-encoded k8s
-///      Secrets are decoded by the projector, so callers should
-///      provide raw PEM.
-///   2. Local disk under `<local_path>/egress-proxy/`. Single-host
-///      dev workflow (`--mode=all`) where persistent local storage
-///      is fine and operators want a stable CA across restarts.
-async fn build_egress_proxy(cli: &Cli) -> Option<engram_coordinator::EgressProxy> {
-    if cli.egress_proxy_port == 0 {
-        tracing::info!("egress proxy disabled (--egress-proxy-port=0)");
-        return None;
-    }
-    let ca = match load_egress_ca(&cli.local_path) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::warn!(error = %e, "egress proxy CA init failed; proxy disabled");
-            return None;
-        }
-    };
-    // Install the default rustls crypto provider once. Idempotent;
-    // `install_default` returns Err if already set, which we ignore.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let registry = Arc::new(engram_egress_proxy::Registry::new());
-    let mint = Arc::new(engram_egress_proxy::CertMint::new(ca.clone()));
-    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
-        .parse()
-        .unwrap();
-    let proxy = engram_egress_proxy::Proxy::new(engram_egress_proxy::ProxyConfig::new(
-        bind_addr,
-        registry.clone(),
-        mint,
-    ));
-    tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
-            tracing::error!(error = %e, "egress proxy listener exited");
-        }
-    });
-    tracing::info!(addr = %bind_addr, "egress proxy spawned");
-    Some(engram_coordinator::EgressProxy { registry, ca })
-}
-
-/// Resolve the egress-proxy CA, preferring env-injected PEM material
-/// when present. See [`build_egress_proxy`] for sourcing semantics.
-fn load_egress_ca(local_path: &std::path::Path) -> Result<engram_egress_proxy::Ca, String> {
-    let cert_env = std::env::var("ENGRAM_EGRESS_CA_CERT_PEM").ok();
-    let key_env = std::env::var("ENGRAM_EGRESS_CA_KEY_PEM").ok();
-    match (cert_env, key_env) {
-        (Some(cert_pem), Some(key_pem)) => {
-            tracing::info!("loading egress proxy CA from env (stateless deploy path)");
-            engram_egress_proxy::Ca::from_pem(&cert_pem, &key_pem)
-                .map_err(|e| format!("Ca::from_pem: {e}"))
-        }
-        (Some(_), None) | (None, Some(_)) => Err(
-            "ENGRAM_EGRESS_CA_CERT_PEM and ENGRAM_EGRESS_CA_KEY_PEM must both be set, \
-             or both unset to fall back to local-disk generation"
-                .into(),
-        ),
-        (None, None) => {
-            let proxy_dir = local_path.join("egress-proxy");
-            tracing::info!(dir = %proxy_dir.display(), "loading egress proxy CA from local disk");
-            engram_egress_proxy::Ca::load_or_generate(&proxy_dir)
-                .map_err(|e| format!("Ca::load_or_generate({}): {e}", proxy_dir.display()))
-        }
-    }
 }
 
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`

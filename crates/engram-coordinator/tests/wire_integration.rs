@@ -341,7 +341,6 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
-        egress_proxy: None,
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),
@@ -465,7 +464,6 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
             engram_oci::AnonymousResolver,
         ))),
-        egress_proxy: None,
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),

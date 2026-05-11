@@ -44,26 +44,11 @@ pub struct Services {
     /// with the host-agent's `image_cache` in `--mode=all` so one
     /// auth-resolver cache backs both.
     pub oci: Arc<engram_oci::OciClient>,
-    /// Per-host TLS-MITM egress proxy. Sessions get registered here
-    /// at create-time so the proxy knows how to dispatch outbound
-    /// HTTPS traffic from each VM. `None` if the proxy isn't enabled
-    /// (`--fc-egress-proxy=disabled`) or failed to start (logged at
-    /// startup, sessions still work but with no egress filtering).
-    pub egress_proxy: Option<EgressProxy>,
     /// Cold-tier blob storage (ADR 0005). Used by the flush primitive
     /// (Stage 5) and the cross-host cold-resume path (Stage 6).
     /// Selected at boot via `ENGRAM_BLOB_BACKEND={local,gcs}`;
     /// defaults to `local` so `just dev` works without cloud creds.
     pub blob: Arc<dyn BlobStorage>,
-}
-
-/// Coordinator-side handle to the running egress proxy. Owns the
-/// session registry and the persisted CA (host-agents fetch the CA
-/// at session-create time and bake it into the per-session harness
-/// substrate so VMs trust the proxy's MITM cert).
-pub struct EgressProxy {
-    pub registry: std::sync::Arc<engram_egress_proxy::Registry>,
-    pub ca: std::sync::Arc<engram_egress_proxy::Ca>,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.
