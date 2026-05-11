@@ -403,40 +403,236 @@ exporter at this point.
 
 ---
 
-## Production-deploy punch list (ordered by criticality)
+## Maturity tiers — the route to production
 
-Real-deploy blockers, in order:
+Four tiers of validation, each gating the next. Don't skip ahead;
+each tier surfaces failure modes the next can't.
 
-1. **Image-builder GCS path** (Phase 2 remaining gap #5 above) — without
-   this production bakes don't work at all. ~40 lines.
-2. **Standalone host-agent wiring** (cross-cutting above) — without this
-   `--mode=host` can't pull images. ChunkStore + BlobStorage parts are
-   ~60 lines. The OCI credential question is a real design call.
-3. **Wire-version enforcement** — without this, a mid-deploy version
-   skew silently corrupts the protocol. ~30 lines + a hello-frame
-   handshake.
-4. **Materialized rootfs LRU / GC** (Phase 3 remaining gap) — long-
-   running hosts exhaust disk. ~20 lines if we use
-   `materialize_to_file_cached`.
-5. **Chunk-store GC scheduler** (Phase 1 remaining gap) — storage
-   bill creeps up forever. Coordinator cron + admin endpoint. ~50 lines.
-6. **Basic observability** — cache hit rate, chunk fetch latency,
-   materialize time. Without these, debugging production slowness is
-   guesswork.
-7. **Phase 4 NBD** — without this, FC restore time scales with image
-   size (materialize-first). Functional but slow.
-8. **Phase 5 UFFD** — without this, no sub-100ms restore. Functional
-   but slow.
-9. **Phase 6 trait + DB reshape** — required for cross-host resume +
-   spot preemption.
-10. **Phase 7 tar.zst deletion** — code-hygiene; no production
-    behavior change.
-11. **Phase 8 Helm** — required for any K8s deploy.
-12. **Phase 9 Packer + Terraform** — required for self-serve provisioning.
+```
+T1 (Mac local) → T2 (dev-vm Linux) → T3 (coord + host split) → T4 (GCP prod)
+```
 
-Items 1–3 are the actual blockers for "engram on GCP, real users".
-Items 4–6 are needed for a stable production. Items 7–12 are the
-remaining surface from the plan.
+Within each tier, the **required work** list is the minimum to claim
+that tier. **Exit criteria** is the executable check that says "done."
+Each tier inherits everything proven in the prior tier.
+
+---
+
+### Tier 1 — Can test locally on macOS (`--mode=all`)
+
+**Goal**: bake an image → start coord → create session → exec
+something → snapshot → resume → exec again, with the chunked path
+demonstrably involved.
+
+**Entry criteria**: macOS dev box, `just dev` brings up the stack
+cleanly.
+
+**Current state**: mostly there. `--mode=all` wiring shipped in
+`d6a6281` + `e68ee23`. Unit tests cover the pieces. **What's
+missing is the integrated scenario.**
+
+**Required work**:
+
+- ⬜ **End-to-end smoke recipe.** A `just chunked-smoke` (or shell
+  script under `scripts/`) that:
+  1. Bakes an `ext4` image with the new image-builder
+  2. Asserts `bundle.json` exists alongside `rootfs.ext4`
+  3. Starts coord in `--mode=all` with `--sandbox-backend=vz`
+  4. Creates a session referencing the baked image via `image_uri`
+     (`local://` or a `localhost:5001` push)
+  5. Asserts the materialized rootfs landed under
+     `<local_path>/chunked-rootfs/<manifest_id>-v1.ext4`
+  6. `exec`s `echo hello` and asserts stdout
+  7. `snapshot`s and asserts the returned `SnapshotMetadata.disk_manifest`
+     is `Some`
+  8. Resumes and `exec`s again to confirm the disk survived
+- ⬜ **A new integration test** at
+  `crates/engram-coordinator/tests/chunked_lifecycle.rs` covering the
+  same flow against `--mode=all` + VZ. Doesn't need a real VM —
+  ProcessBackend smoke is enough to lock the coordinator + host-agent
+  + chunk-store wiring.
+
+**Exit criteria**:
+
+```
+just chunked-smoke    # passes
+cargo test -p engram-coordinator --test chunked_lifecycle    # passes
+```
+
+---
+
+### Tier 2 — Can test with `dev-vm` on real Linux (FC + KVM)
+
+**Goal**: the Tier-1 scenario, but with Firecracker microVMs on the
+GCP Linux dev box via the `dev-vm` skill.
+
+**Entry criteria**: Tier 1 green. dev-vm bootstrapped, kernel +
+ubuntu rootfs cached
+(`bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh`).
+
+**Current state**: the existing FC integration tests (`exec_real_vm`,
+`harness_loopback`, `proxy_e2e`) were updated to construct chunk
+stores in their Builder calls (commits 22efdc3 + 1d8afbe), but they
+haven't actually been run on Linux this session. There's a real
+possibility a Linux-only compile path or a test-time assumption
+broke.
+
+**Required work**:
+
+- ⬜ **Re-run the existing FC test suite on the dev VM**:
+  ```
+  /dev-vm run bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
+  ```
+  Fix any regressions surfaced. Likely small (the changes were
+  surface-additive) but unvalidated.
+- ⬜ **FC-specific chunked assertion.** Add
+  `crates/engram-sandbox-firecracker/tests/chunked_disk.rs` (gated
+  `#[ignore]` like the rest of the FC suite) asserting:
+  1. After bake, `bundle.json` + the chunk manifest exist
+  2. After `FirecrackerBackend::create` with `image_uri` set, the
+     materialized file under `chunked-rootfs/` exists and is what FC
+     attached as `path_on_host`
+  3. `exec_stream` returns expected output (the chunked file is a
+     real bootable rootfs)
+- ⬜ **Confirm `just fc-bake-demo` still works.** It's the
+  user-facing demo path; chunked output shouldn't break it.
+- ⬜ **Make sure new tests run in CI.** Per the feedback memory: any
+  new tests added should be traced through `.github/workflows/ci.yml`
+  to confirm they'll be invoked, and any gated tests have env vars /
+  services satisfied there too.
+
+**Exit criteria**:
+
+```
+/dev-vm run bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all   # passes
+/dev-vm run cargo test -p engram-sandbox-firecracker --test chunked_disk -- --ignored   # passes
+```
+
+---
+
+### Tier 3 — Can test coord + host split locally
+
+**Goal**: coordinator and host-agent in separate processes (could
+even be separate machines), communicating over the dialer WebSocket,
+sharing a chunk store. This is the topology production runs.
+
+**Entry criteria**: Tier 2 green.
+
+**Current state**: standalone `engram-host-agent` binary wires
+nothing — no blob, no chunk store, no image cache. The largest
+single gap in the chunked-storage rollout.
+
+**Required work**:
+
+- ⬜ **`engram_host_agent::blob::from_env()`** — mirror
+  `engram_coordinator::blob::from_env`. Reads
+  `ENGRAM_BLOB_BACKEND={local,gcs}` + bucket env. ~40 lines.
+- ⬜ **CLI / env in `crates/engram-host-agent/src/main.rs`** for blob
+  backend selection + `materialize_dir`. ~15 lines.
+- ⬜ **`HostAgent::with_chunk_store(cs, dir)` call** added to
+  `main.rs` after the existing `with_egress` chain. ~10 lines.
+- ⬜ **Decide + implement OCI auth for the standalone host-agent**.
+  Currently ⛔ blocked. For Tier 3 only (local-controlled testing),
+  the cheap answer is `AnonymousResolver` pointing at a
+  `localhost:5001` docker registry — same setup the FC tests use.
+  This unblocks Tier 3 without committing to a production approach.
+  *The Tier 4 decision is a separate, properly-designed credential
+  story.*
+- ⬜ **`ImageCache::open` call** in `main.rs`, threading through the
+  anonymous `OciClient`. ~20 lines.
+- ⬜ **Wire-version handshake.** Bincode is positional;
+  `e68ee23`'s `SnapshotMetadata` field add broke wire compat. Two
+  things needed:
+  1. A `WIRE_VERSION` constant in `engram-protocol`
+  2. The dialer's hello frame includes this version; the coord's
+     `on_hello` rejects a mismatch with a clear error
+  ~30 lines + a refusal path in the dialer reconnect loop.
+- ⬜ **Shared blob backend for the test scenario.** Easiest: both
+  processes on the dev VM, both `--blob-backend=local
+  --local-path=/shared`. Alternative: fake-gcs-server on the dev VM,
+  both processes pointing at it via `STORAGE_EMULATOR_HOST`. Latter
+  is more production-shaped.
+- ⬜ **Tier 3 smoke script** — like Tier 1's but with coord on one
+  side and host-agent on the other.
+
+**Exit criteria**:
+
+```
+# Terminal A (or process A on dev VM)
+engram-coordinator --mode=coordinator ...
+
+# Terminal B (or process B)
+engram-host-agent --coordinator-endpoint ws://... --blob-backend=local --local-path=/shared ...
+
+# Terminal C
+just chunked-smoke-split   # passes, asserting the session ran on the host-agent
+```
+
+---
+
+### Tier 4 — Productionization on GCP
+
+**Goal**: real users on `cortex.<domain>`, served by Engram on GKE +
+a GCE MIG of Firecracker hosts.
+
+**Entry criteria**: Tier 3 green; Tier 3 surfaces any wire-level or
+multi-process bugs before they're under load.
+
+**Current state**: not even adjacent. Major Phases 4-10 + cross-
+cutting work still pending. Below is the criticality-ordered work
+list *within* Tier 4. None of it should start before Tier 3 is
+solid — production has too many failure modes for a fragile lower
+tier.
+
+**Required work** (criticality-ordered):
+
+1. ⬜ **Image-builder GCS path** (Phase 2 remaining gap #5) —
+   without this, production CI bakes don't produce usable artifacts.
+   ~40 lines mirroring `engram_coordinator::blob::from_env`.
+2. ⬜ **Real OCI credential strategy** — the Tier 3 anonymous
+   resolver is a placeholder. Production needs:
+   - GCP Workload Identity binding for `gcr.io` / Artifact Registry
+   - Coordinator's existing `MetadataStore`-backed `AuthResolver`
+     reused, OR a parallel path on the host-agent side
+   - Design call: does host-agent fetch creds from coordinator
+     on-demand, or use ambient WI directly?
+3. ⬜ **Materialized rootfs LRU** (Phase 3 gap) — swap
+   `materialize_to_file` → `materialize_to_file_cached` in
+   `pooled_backend::materialize_chunked_rootfs`. ~20 lines.
+4. ⬜ **Chunk-store GC scheduler** (Phase 1 gap) — coordinator cron
+   loop + `POST /api/admin/gc-chunks` admin endpoint (the testable-
+   trigger pattern per the feedback memory). ~50 lines.
+5. ⬜ **Phase 6 trait reshape + migration 0018** — required for
+   cross-host resume + spot preemption. Substantial: ~10 files.
+6. ⬜ **Phase 7 tar.zst deletion** — clean up dead paths now that
+   chunks are the source of truth.
+7. ⬜ **Observability** — cache hit rate, chunk fetch latency,
+   materialize time, GC counts. Without these, debugging production
+   slowness is guesswork. Probably a Prometheus exporter; needs a
+   framework call.
+8. ⬜ **Phase 4 NBD** — FC restore time scales with image size
+   without it. Could ship Tier 4 *without* this and accept ~16s
+   restore for a 16 GiB image (materialize-first), then ship NBD as
+   a perf upgrade.
+9. ⬜ **Phase 5 UFFD + canonical memory + WS R&R** — the sub-100ms
+   restore. Same "can ship without; eats latency budget" tradeoff.
+10. ⬜ **Phase 8 Helm** — required for any K8s deploy.
+11. ⬜ **Phase 9 Packer + Terraform** — required for self-serve
+    provisioning of FC hosts.
+12. ⬜ **Phase 10 ADR + docs** — alongside the deploy.
+
+**Exit criteria**: a real user session on the GCP deployment runs
+end-to-end with chunked storage, cross-host resume, and no manual
+intervention.
+
+---
+
+## Next concrete step
+
+Per the tier ladder, the next slice of work is **Tier 1 exit**: a
+`just chunked-smoke` (or equivalent) + a focused integration test
+that locks the `--mode=all` chunked lifecycle in place. That gives
+us a regression guard before climbing to Tier 2.
 
 ---
 
