@@ -1047,6 +1047,7 @@ dependencies = [
  "engram-sandbox-process",
  "engram-sandbox-vz",
  "engram-secrets-gcp",
+ "engram-storage-gcs",
  "engram-storage-local",
  "futures",
  "futures-util",

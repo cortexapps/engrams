@@ -16,6 +16,9 @@ use std::sync::Arc;
 use engram_chunk_store::ChunkStore;
 use engram_core::traits::{CloudBackend, SandboxBackend};
 
+use crate::image_cache::ImageCache;
+
+pub mod blob;
 pub mod config;
 pub mod dialer;
 pub mod disk_pressure;
@@ -43,6 +46,11 @@ pub struct HostAgent {
     /// images skip the chunk-store resolve and use the cached file
     /// directly).
     pub chunk_store: Option<(ChunkStore, PathBuf)>,
+    /// Per-host OCI image cache. `None` means the host-agent can't
+    /// pull images by URI — sessions must arrive with
+    /// `spec.rootfs_source` set already (the dev-only path).
+    /// Production multi-host topologies must set this.
+    pub image_cache: Option<ImageCache>,
 }
 
 impl HostAgent {
@@ -57,6 +65,7 @@ impl HostAgent {
             cloud,
             egress: None,
             chunk_store: None,
+            image_cache: None,
         }
     }
 
@@ -74,6 +83,15 @@ impl HostAgent {
     /// manifests to per-host materialized rootfs files.
     pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
         self.chunk_store = Some((chunk_store, materialize_dir));
+        self
+    }
+
+    /// Attach a per-host OCI image cache. Sessions with `image_uri`
+    /// set route through this cache (pull on miss, hit on subsequent
+    /// references). Required for multi-host production where the
+    /// coordinator hands out images by URI.
+    pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
+        self.image_cache = Some(cache);
         self
     }
 
@@ -111,6 +129,9 @@ impl HostAgent {
                 }
                 if let Some((cs, dir)) = self.chunk_store.clone() {
                     p = p.with_chunk_store(cs, dir);
+                }
+                if let Some(ic) = self.image_cache.clone() {
+                    p = p.with_image_cache(ic);
                 }
                 Arc::new(p)
             };

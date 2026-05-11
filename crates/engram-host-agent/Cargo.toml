@@ -20,6 +20,8 @@ path = "src/main.rs"
 engram-core.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
+engram-storage-local.workspace = true
+engram-storage-gcs.workspace = true
 engram-egress-proxy.workspace = true
 engram-oci.workspace = true
 engram-image-builder.workspace = true
@@ -53,5 +55,4 @@ tempfile = "3"
 [dev-dependencies]
 engram-harness-noop.workspace = true
 engram-sandbox-process.workspace = true
-engram-storage-local.workspace = true
 tempfile = "3"
