@@ -148,8 +148,12 @@ pub async fn evict_idle_session(
         last_accessed_at: now,
         // Hot-tier-only at create time; the cold-tier flush primitive
         // (Stage 5) flips these via `MetadataStore::flush_to_cold`.
+        // Retiring with Phase 7 of the chunked-storage rollout.
         blob_present: false,
         replicated_at: None,
+        // ADR 0007: the chunked-snapshot write path populates this
+        // when wired (VZ today, FC after Phase 4).
+        disk_manifest: metadata.disk_manifest,
     };
     state
         .services

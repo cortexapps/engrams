@@ -70,11 +70,25 @@ pub struct SnapshotRecord {
     /// Cold-tier presence. `true` ↔ the envelope-encrypted columns
     /// (`wrapped_dek`, `nonce`, `ciphertext`, `key_id`) carry the
     /// sealed blob ref. Indexed for the LRU/disk-pressure scan.
+    ///
+    /// **ADR 0007 deprecation**: the cold-tier columns retire with
+    /// Phase 7 of the chunked-storage rollout. `disk_manifest` is
+    /// the replacement durability primitive; this field stays
+    /// alongside until the legacy code path is deleted.
     #[serde(default)]
     pub blob_present: bool,
     /// When the cold-tier upload completed. `None` until first flush.
     #[serde(default)]
     pub replicated_at: Option<DateTime<Utc>>,
+    /// ADR 0007: content-addressed manifest ref pointing at the
+    /// disk's chunks in `BlobStorage`. `Some` for rows produced by
+    /// the chunked-snapshot write path (VZ today; FC once Phase 4's
+    /// NBD work lands); `None` for legacy rows + backends that
+    /// haven't wired chunked snapshot yet. Persisted to the
+    /// `disk_manifest_id` + `disk_manifest_version` columns added
+    /// by migration 0018.
+    #[serde(default)]
+    pub disk_manifest: Option<super::manifest::ManifestRef>,
 }
 
 impl SnapshotRecord {
@@ -106,6 +120,7 @@ mod tests {
             last_accessed_at: Utc::now(),
             blob_present: blob,
             replicated_at: None,
+            disk_manifest: None,
         }
     }
 

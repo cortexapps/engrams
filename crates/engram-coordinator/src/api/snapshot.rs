@@ -77,8 +77,14 @@ pub async fn snapshot(
         last_accessed_at: now,
         // Hot-tier-only at create time; the cold-tier flush primitive
         // (Stage 5) flips these via `MetadataStore::flush_to_cold`.
+        // Retiring with Phase 7 of the chunked-storage rollout.
         blob_present: false,
         replicated_at: None,
+        // ADR 0007: the chunked-snapshot write path (VZ today;
+        // FC once Phase 4 lands) populates this. Backends that
+        // haven't wired it leave the field None and the row
+        // remains restore-only on the same host (the legacy path).
+        disk_manifest: metadata.disk_manifest,
     };
     state.services.meta.record_snapshot(record).await?;
 

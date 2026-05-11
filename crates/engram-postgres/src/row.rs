@@ -77,6 +77,19 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     // FALSE; `replicated_at` is nullable.
     let blob_present: bool = row.try_get("blob_present").map_err(col_err)?;
     let replicated_at: Option<DateTime<Utc>> = row.try_get("replicated_at").map_err(col_err)?;
+    // ADR 0007 columns (migration 0018). Both nullable; the DB
+    // constraint enforces "both or neither" so half-populated rows
+    // can't happen.
+    let disk_manifest_id: Option<Uuid> = row.try_get("disk_manifest_id").map_err(col_err)?;
+    let disk_manifest_version: Option<i64> =
+        row.try_get("disk_manifest_version").map_err(col_err)?;
+    let disk_manifest = match (disk_manifest_id, disk_manifest_version) {
+        (Some(id), Some(version)) => Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: id,
+            version: version.max(0) as u64,
+        }),
+        _ => None,
+    };
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: SessionId(session_id),
@@ -88,6 +101,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         last_accessed_at,
         blob_present,
         replicated_at,
+        disk_manifest,
     })
 }
 

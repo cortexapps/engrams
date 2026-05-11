@@ -224,11 +224,37 @@ memory dedup.
 
 - `e68ee23` `SnapshotMetadata.disk_manifest: Option<ManifestRef>`,
   populated by VZ snapshot, threads through the trait without
-  breaking signatures
+  breaking signatures.
 - `ManifestRef` hoisted to `engram-core::types::manifest` to break
-  dep cycle
+  the dep cycle (chunk-store depends on engram-core for
+  BlobStorage; engram-core can't depend back).
+- `0df3a31` `WIRE_VERSION` constant + hello-frame handshake.
+  Production-grade version negotiation; bumped to v2 in `ad13dc0`
+  for the `ResolveRegistryAuth` add.
+- **DB migration `0018_chunked_storage.sql`** —
+  `disk_manifest_id` + `disk_manifest_version` columns on
+  `snapshots`. **Additive**, not the full Phase 6 drop: the
+  cold-tier columns stay until Phase 7 deletion lands. The
+  `idx_snapshots_disk_manifest` partial index supports the GC
+  sweep's live-set query. CHECK constraint rejects half-populated
+  rows.
+- **`SnapshotRecord.disk_manifest`** persists through
+  `MetadataStore::record_snapshot` + reads back via
+  `list_snapshots_for_session` /
+  `latest_snapshot_for_session`. Live-PG round-trip locked in by
+  `crates/engram-coordinator/tests/snapshot_disk_manifest_persistence.rs`
+  (gated on `ENGRAM_TEST_DATABASE_URL`; runs in CI via the
+  Postgres-gated step).
+- Coordinator's snapshot recording paths (`api/snapshot.rs`,
+  `idle_evictor.rs`) propagate `metadata.disk_manifest` into the
+  row, so VZ snapshots taken via the chunked write path
+  (commit `e68ee23`) now persist their manifest ref end-to-end.
 
 ### Remaining (the full reshape)
+
+The pieces below are the *destructive* / signature-changing
+half. Splitting them off keeps the additive surface immediately
+shippable + makes Phase 7 deletion cleanly excisable.
 
 - ⬜ **Trait signature changes**:
   - `SandboxBackend::snapshot(id) -> SnapshotRef` (drop `dest: &Path`)
@@ -236,25 +262,27 @@ memory dedup.
     `src: PathBuf`)
   - `SandboxSpec.rootfs: ManifestRef` (drop `rootfs_source:
     Option<PathBuf>`); add `memory_canonical` + `working_set_trace`
-- ⬜ **DB migration `0018_chunked_storage.sql`** —
-  `deploy/migrations/`. Drops cold-tier columns, adds manifest refs.
-  See plan for the SQL skeleton.
-- ⬜ **`SnapshotRecord` reshape** — `disk_manifest_id`,
-  `disk_manifest_version`, `memory_manifest_*`,
-  `working_set_trace_host`. Delete `local_path`, `blob_present`,
-  envelope-encryption quartet, `replicated_at`.
+- ⬜ **DB migration `0019_drop_cold_tier_columns.sql`** — drops
+  `local_path`, `blob_present`, `replicated_at`, the
+  envelope-encryption quartet. Ships alongside the
+  `MetadataStore` method retirement (next bullet).
+- ⬜ **`SnapshotRecord` reshape** — drop `local_path`,
+  `blob_present`, `replicated_at`. Add `memory_manifest_*` +
+  `working_set_trace_host` once Phase 5 produces them.
 - ⬜ **`SnapshotResidency` enum deleted** — single tier now.
 - ⬜ **`MetadataStore::flush_to_cold`, `clear_local_path`,
   `latest_cold_snapshot_for_session` deleted**.
 - ⬜ **Coordinator `ensure_active` simplification** — three-branch
   (`Idle` hot, `ColdEvicted` cold, `Dead` 410) collapses to two
   (`Idle`, `Dead`).
-- ⬜ **`engram-protocol::wire` changes** — `SandboxSpec` wire shape
-  bump. Adds a real `WIRE_VERSION` constant or version-handshake at
-  this point.
+- ⬜ **`engram-protocol::wire` `SandboxSpec` wire-shape bump** —
+  the protocol surface for `RequestKind::CreateSandbox` carries
+  the new `SandboxSpec` shape. `WIRE_VERSION` already exists
+  (v2); this would bump to v3.
 
 This is the single largest planned change. Touches ~10 files
-substantially.
+substantially. Naturally pairs with Phase 7 deletion since the
+trait-signature changes orphan the legacy code paths.
 
 ---
 

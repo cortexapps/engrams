@@ -170,12 +170,13 @@ jobs:
       # listener catches test A's NOTIFY, the session_id assertion
       # fires on the wrong row. Production has one listener per
       # coordinator, so this is purely a test-harness artifact.
-      - name: ha_listener ignored tests (Postgres NOTIFY/LISTEN)
+      - name: Postgres-gated ignored tests
         if: always()
         run: |
           cargo nextest run \
             -p engram-coordinator \
             --test ha_listener \
+            --test snapshot_disk_manifest_persistence \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

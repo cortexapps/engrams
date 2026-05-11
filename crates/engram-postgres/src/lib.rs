@@ -324,19 +324,26 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
-        // Cold-tier columns default to "no cold copy" at create time.
-        // `flush_to_cold` flips them; this insert path doesn't.
+        // Cold-tier columns (ADR 0005) default to "no cold copy" at
+        // create time; `flush_to_cold` flips them. ADR 0007's
+        // chunked-manifest columns persist when the snapshot was
+        // captured via the chunked write path (VZ today; FC after
+        // Phase 4). Half-populated rows are rejected by the DB
+        // constraint added in migration 0018.
         sqlx::query(
             r#"
             INSERT INTO snapshots
                 (id, session_id, host_id, local_path,
                  image_version, size_bytes, created_at, last_accessed_at,
-                 blob_present)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE)
+                 blob_present,
+                 disk_manifest_id, disk_manifest_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10)
             ON CONFLICT (id) DO UPDATE SET
-                local_path       = EXCLUDED.local_path,
-                last_accessed_at = EXCLUDED.last_accessed_at,
-                updated_at       = NOW()
+                local_path            = EXCLUDED.local_path,
+                last_accessed_at      = EXCLUDED.last_accessed_at,
+                disk_manifest_id      = EXCLUDED.disk_manifest_id,
+                disk_manifest_version = EXCLUDED.disk_manifest_version,
+                updated_at            = NOW()
             "#,
         )
         .bind(snap.id.as_uuid())
@@ -351,6 +358,8 @@ impl MetadataStore for PostgresStore {
         .bind(snap.size_bytes as i64)
         .bind(snap.created_at)
         .bind(snap.last_accessed_at)
+        .bind(snap.disk_manifest.map(|m| m.manifest_id))
+        .bind(snap.disk_manifest.map(|m| m.version as i64))
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -366,7 +375,8 @@ impl MetadataStore for PostgresStore {
             SELECT id, session_id, host_id, local_path,
                    image_version, size_bytes,
                    created_at, last_accessed_at,
-                   blob_present, replicated_at
+                   blob_present, replicated_at,
+                   disk_manifest_id, disk_manifest_version
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -386,7 +396,8 @@ impl MetadataStore for PostgresStore {
             SELECT id, session_id, host_id, local_path,
                    image_version, size_bytes,
                    created_at, last_accessed_at,
-                   blob_present, replicated_at
+                   blob_present, replicated_at,
+                   disk_manifest_id, disk_manifest_version
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -408,6 +419,7 @@ impl MetadataStore for PostgresStore {
                    image_version, size_bytes,
                    created_at, last_accessed_at,
                    blob_present, replicated_at,
+                   disk_manifest_id, disk_manifest_version,
                    wrapped_dek, nonce, ciphertext, key_id
             FROM snapshots
             WHERE session_id = $1 AND blob_present = TRUE
