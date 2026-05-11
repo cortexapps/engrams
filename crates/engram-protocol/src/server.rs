@@ -198,6 +198,12 @@ async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, noti
             // host-targeted server got one it's a confused peer.
             tracing::debug!("server received unexpected HeartbeatAck; ignoring");
         }
+        NotifyKind::SessionEgressPolicy(_) => {
+            // Coordinator → host frame; if a host's server end of
+            // the WS got one back, it's a confused peer reflecting
+            // its own outbound. Ignore.
+            tracing::debug!("server received unexpected SessionEgressPolicy; ignoring");
+        }
     }
 }
 

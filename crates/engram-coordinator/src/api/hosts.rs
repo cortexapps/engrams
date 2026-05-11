@@ -264,6 +264,11 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
             NotifyKind::HeartbeatAck(_) => {
                 tracing::debug!(host_id = %host_id, "host sent unexpected HeartbeatAck; ignoring");
             }
+            NotifyKind::SessionEgressPolicy(_) => {
+                // Coordinator → host frame; if a host echoed one
+                // back, it's a confused peer. Drop.
+                tracing::debug!(host_id = %host_id, "host sent unexpected SessionEgressPolicy; ignoring");
+            }
         }
     }
 
