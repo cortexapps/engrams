@@ -14,6 +14,13 @@ pub const ENGRAM_MANIFEST_MEDIA_TYPE: &str = "application/vnd.engram.manifest.v1
 /// Bake image rootfs layer — raw `rootfs.ext4` bytes (large blob).
 pub const ENGRAM_ROOTFS_EXT4_MEDIA_TYPE: &str = "application/vnd.engram.rootfs.ext4.v1";
 
+/// ADR 0007 bake bundle — tiny JSON pointing at content-addressed
+/// chunk manifests in BlobStorage. Production pull paths resolve
+/// disk + memory content through the chunk store via these refs;
+/// the rootfs.ext4 layer above stays alongside until Phase 6 wires
+/// SandboxBackend to take `ManifestRef` natively.
+pub const ENGRAM_BUNDLE_MEDIA_TYPE: &str = "application/vnd.engram.bundle.v1+json";
+
 /// Harness pack config (currently unused beyond the mediaType marker).
 pub const ENGRAM_HARNESS_CONFIG_MEDIA_TYPE: &str = "application/vnd.engram.harness.v1+json";
 

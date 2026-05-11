@@ -648,12 +648,28 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let config_bytes = serde_json::to_vec(&config)
             .map_err(|e| BuildError::Config(format!("config json: {e}")))?;
 
+        // ADR 0007 bundle layer — present iff the bake produced a
+        // chunked disk manifest (Ext4 outputs do; Directory bakes
+        // don't and can't be pushed anyway). Pullers learn the
+        // chunk-manifest ref from this sidecar.
+        let bundle_path = outcome.image_dir.join("bundle.json");
+        let bundle_bytes = if outcome.disk_manifest.is_some() && bundle_path.exists() {
+            Some(
+                tokio::fs::read(&bundle_path)
+                    .await
+                    .map_err(BuildError::Io)?,
+            )
+        } else {
+            None
+        };
+
         let digest = oci
             .push_image(
                 &full_uri,
                 &manifest_bytes,
                 &outcome.rootfs_path,
                 &config_bytes,
+                bundle_bytes.as_deref(),
             )
             .await
             .map_err(|e| BuildError::Docker(format!("oci push: {e}")))?;

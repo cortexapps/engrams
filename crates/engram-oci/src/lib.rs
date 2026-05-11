@@ -109,10 +109,14 @@ impl OciClient {
         }
     }
 
-    /// Push a bake image artifact. Two layers:
+    /// Push a bake image artifact. Up to three layers:
     ///
     /// - layer 0: `manifest.toml` content (uncompressed bytes)
     /// - layer 1: `rootfs.ext4` content (raw bytes, large)
+    /// - layer 2 (optional): `bundle.json` — ADR 0007 chunk-manifest
+    ///   pointer set (tiny). Pullers that understand the bundle can
+    ///   skip the rootfs layer in favor of chunk-store resolution
+    ///   once SandboxBackend takes `ManifestRef` natively (Phase 6).
     ///
     /// `config_json` is small JSON metadata (format, agent version,
     /// transport) used by the host-agent at pull time to validate
@@ -123,6 +127,7 @@ impl OciClient {
         manifest_toml: &[u8],
         rootfs_ext4: &Path,
         config_json: &[u8],
+        bundle_json: Option<&[u8]>,
     ) -> Result<Digest256, OciError> {
         let reference: Reference = uri
             .parse()
@@ -141,7 +146,14 @@ impl OciClient {
             ENGRAM_ROOTFS_EXT4_MEDIA_TYPE.to_string(),
             None,
         );
-        let layers = vec![manifest_layer, rootfs_layer];
+        let mut layers = vec![manifest_layer, rootfs_layer];
+        if let Some(bytes) = bundle_json {
+            layers.push(ImageLayer::new(
+                bytes.to_vec(),
+                ENGRAM_BUNDLE_MEDIA_TYPE.to_string(),
+                None,
+            ));
+        }
 
         let config = Config::new(
             config_json.to_vec(),
@@ -173,6 +185,7 @@ impl OciClient {
         let accepted = vec![
             ENGRAM_MANIFEST_MEDIA_TYPE,
             ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
+            ENGRAM_BUNDLE_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -186,6 +199,7 @@ impl OciClient {
 
         let mut manifest_path = None;
         let mut rootfs_path = None;
+        let mut bundle_path = None;
         for layer in &data.layers {
             match layer.media_type.as_str() {
                 ENGRAM_MANIFEST_MEDIA_TYPE => {
@@ -197,6 +211,11 @@ impl OciClient {
                     let p = dest.join("rootfs.ext4");
                     write_file_bytes(&p, &layer.data).await?;
                     rootfs_path = Some(p);
+                }
+                ENGRAM_BUNDLE_MEDIA_TYPE => {
+                    let p = dest.join("bundle.json");
+                    write_file_bytes(&p, &layer.data).await?;
+                    bundle_path = Some(p);
                 }
                 other => {
                     tracing::debug!(media_type = %other, "skipping unrecognized layer");
@@ -213,6 +232,7 @@ impl OciClient {
         Ok(PulledImage {
             manifest_path,
             rootfs_path,
+            bundle_path,
             manifest_digest: Digest256(data.digest.unwrap_or_default()),
         })
     }
@@ -353,6 +373,11 @@ impl Digest256 {
 pub struct PulledImage {
     pub manifest_path: PathBuf,
     pub rootfs_path: PathBuf,
+    /// ADR 0007: bundle.json sidecar pointing at chunk-store
+    /// manifests. Present for images baked after the chunked-
+    /// storage rollout, absent for older artifacts (we still
+    /// accept those during the transition window).
+    pub bundle_path: Option<PathBuf>,
     pub manifest_digest: Digest256,
 }
 

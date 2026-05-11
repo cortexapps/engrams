@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 engram-core.workspace = true
 engram-protocol.workspace = true
+engram-chunk-store.workspace = true
 engram-egress-proxy.workspace = true
 engram-oci.workspace = true
 engram-image-builder.workspace = true

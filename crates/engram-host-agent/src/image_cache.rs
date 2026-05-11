@@ -105,9 +105,11 @@ impl ImageCache {
                 && fs::try_exists(&rootfs_path).await.unwrap_or(false)
             {
                 touch(&dir).await;
+                let bundle = read_bundle(&dir.join("bundle.json")).await?;
                 return Ok(CachedImage {
                     manifest_path,
                     rootfs_path,
+                    bundle,
                     digest,
                 });
             }
@@ -145,9 +147,11 @@ impl ImageCache {
         }
         self.update_map(&self.inner.image_map, uri, &digest).await;
 
+        let bundle = read_bundle(&final_dir.join("bundle.json")).await?;
         Ok(CachedImage {
             manifest_path: final_dir.join("manifest.toml"),
             rootfs_path: final_dir.join("rootfs.ext4"),
+            bundle,
             digest,
         })
     }
@@ -432,7 +436,20 @@ impl ImageCache {
 pub struct CachedImage {
     pub manifest_path: PathBuf,
     pub rootfs_path: PathBuf,
+    /// ADR 0007: parsed bundle.json content, when the image carries
+    /// one. Phase 4/5 wire this into FC's NBD disk + UFFD memory
+    /// adapters; today it's plumbed through so adopters can find
+    /// the chunk-store reference without re-reading the file.
+    pub bundle: Option<ImageBundle>,
     pub digest: String,
+}
+
+/// Parsed contents of the ADR 0007 `bundle.json` sidecar shipped
+/// with an OCI image artifact.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ImageBundle {
+    pub schema_version: u32,
+    pub disk_manifest: engram_chunk_store::ManifestRef,
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +475,9 @@ pub enum CacheError {
     Oci(OciError),
     /// Building the harness substrate ext4 (mke2fs / staging) failed.
     Substrate(String),
+    /// Parsing the ADR 0007 bundle.json sidecar failed. The image
+    /// itself is on disk; only the chunk-manifest plumbing is unusable.
+    Bundle(String),
 }
 
 impl std::fmt::Display for CacheError {
@@ -466,6 +486,7 @@ impl std::fmt::Display for CacheError {
             Self::Io(e) => write!(f, "image cache io: {e}"),
             Self::Oci(e) => write!(f, "image cache oci: {e}"),
             Self::Substrate(s) => write!(f, "harness substrate build: {s}"),
+            Self::Bundle(s) => write!(f, "image bundle parse: {s}"),
         }
     }
 }
@@ -476,8 +497,31 @@ impl std::error::Error for CacheError {
             Self::Io(e) => Some(e),
             Self::Oci(e) => Some(e),
             Self::Substrate(_) => None,
+            Self::Bundle(_) => None,
         }
     }
+}
+
+/// Read + parse `bundle.json` if it exists. Returns Ok(None) when
+/// the file isn't present (older images don't carry one). Returns
+/// `Err` on read/parse failure — we'd rather fail loudly than
+/// silently fall back, since the bundle is the production-grade
+/// path now.
+async fn read_bundle(path: &Path) -> Result<Option<ImageBundle>, CacheError> {
+    if !fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).await.map_err(CacheError::Io)?;
+    let bundle: ImageBundle = serde_json::from_slice(&bytes)
+        .map_err(|e| CacheError::Bundle(format!("{}: {e}", path.display())))?;
+    if bundle.schema_version != 1 {
+        return Err(CacheError::Bundle(format!(
+            "{}: unsupported schema_version {}",
+            path.display(),
+            bundle.schema_version,
+        )));
+    }
+    Ok(Some(bundle))
 }
 
 #[derive(Debug)]
@@ -716,6 +760,52 @@ mod tests {
         // The sentinel survives the call (we didn't re-mke2fs).
         let bytes = fs::read(&cached.ext4_path).await.unwrap();
         assert_eq!(bytes, b"sentinel");
+    }
+
+    #[tokio::test]
+    async fn read_bundle_returns_none_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("bundle.json");
+        let got = read_bundle(&missing).await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bundle_parses_well_formed_v1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.json");
+        let manifest_ref = engram_chunk_store::ManifestRef::new();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "disk_manifest": manifest_ref,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let got = read_bundle(&path).await.unwrap().expect("bundle present");
+        assert_eq!(got.schema_version, 1);
+        assert_eq!(got.disk_manifest, manifest_ref);
+    }
+
+    #[tokio::test]
+    async fn read_bundle_rejects_unsupported_schema_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.json");
+        // schema_version 99 — we only know v1.
+        fs::write(
+            &path,
+            br#"{"schema_version":99,"disk_manifest":{"manifest_id":"00000000-0000-0000-0000-000000000000","version":1}}"#,
+        )
+        .await
+        .unwrap();
+        let err = read_bundle(&path).await.unwrap_err();
+        match err {
+            CacheError::Bundle(msg) => assert!(msg.contains("schema_version")),
+            other => panic!("expected Bundle error, got {other:?}"),
+        }
     }
 
     /// CA fingerprint should be deterministic (same PEM → same

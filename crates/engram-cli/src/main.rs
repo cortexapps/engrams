@@ -1138,9 +1138,8 @@ async fn image_build(
     tokio::fs::create_dir_all(&chunk_root)
         .await
         .map_err(|e| CliError::Other(format!("chunk store root: {e}")))?;
-    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
-        engram_storage_local::LocalBlobStorage::new(chunk_root),
-    );
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
+        std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let builder = Builder::new(docker, chunk_store);
     let outcome = builder

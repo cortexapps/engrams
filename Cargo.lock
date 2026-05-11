@@ -1033,6 +1033,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "engram-chunk-store",
  "engram-cloud-static",
  "engram-core",
  "engram-egress-proxy",
