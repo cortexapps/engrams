@@ -20,10 +20,10 @@ mod shell;
 mod snapshot;
 
 pub fn router(state: SharedState) -> Router {
-    // The protected sub-router gets the bearer-token layer. `/healthz`
-    // is grafted on outside the layer so liveness probes (k8s, GCP
-    // load balancers) don't have to be told a token. If we ever need
-    // an authenticated `/readyz`, it lives on the protected side.
+    // The protected sub-router gets the bearer-token layer.
+    // `/healthz` (liveness) and `/readyz` (readiness — pings
+    // Postgres) are grafted on outside the layer so k8s and GCP LB
+    // probes don't have to be told a token.
     let auth_state = auth::AuthState::new(state.cfg.auth_tokens.clone());
     let protected = Router::new()
         .route(
@@ -78,6 +78,7 @@ pub fn router(state: SharedState) -> Router {
 
     Router::new()
         .route("/healthz", get(health::healthz))
+        .route("/readyz", get(health::readyz))
         .merge(protected)
         .with_state(state)
 }

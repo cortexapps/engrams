@@ -27,6 +27,17 @@ pub struct SealedBlobRef {
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    // ---- liveness ----
+    //
+    // Cheap connectivity check for readiness probes. Default is
+    // `Ok(())` so in-memory test stores don't need to override.
+    // Postgres-backed impls should issue a `SELECT 1` against the
+    // pool so a coordinator with a broken DB connection fails its
+    // `/readyz` probe instead of receiving traffic that 503s.
+    async fn ping(&self) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     // ---- sessions ----
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;

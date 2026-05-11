@@ -59,6 +59,14 @@ fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
 
 #[async_trait]
 impl MetadataStore for PostgresStore {
+    async fn ping(&self) -> Result<(), MetaError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(db_err)
+    }
+
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
