@@ -280,17 +280,26 @@ dead code only once the trait reshape removes their callers.
 
 ## Phase 8 — Helm chart for coordinator
 
-**Status: ⬜ pending**
+**Status: 🟡 partial — chart shipped; multi-cluster validation pending**
 
-`deploy/helm/engram-coordinator/`. Cloud-agnostic templates; cloud-
-specific values in `values-gcp.yaml.example` / `values-aws.yaml.example`.
+`deploy/helm/engram-coordinator/`. Cloud-agnostic templates;
+cloud-specific values in `values-gcp.yaml.example` /
+`values-aws.yaml.example`.
 
-- ⬜ `Chart.yaml`, `values.yaml`, templates for `deployment`,
-  `service`, `serviceaccount`, `configmap`, `secretproviderclass`,
-  `hpa`, `pdb`, `networkpolicy`, `ingress`
-- ⬜ Validation against a `kind` cluster (cloud-agnostic) + a real
-  GKE cluster
-- ⬜ README documenting the values shape
+- ✅ `Chart.yaml`, `values.yaml`, templates for `deployment`,
+  `service`, `serviceaccount`, `configmap`, `hpa`, `pdb`,
+  `networkpolicy`, `ingress`, `_helpers.tpl`, `NOTES.txt`.
+  `helm lint` clean; `helm template` renders against both
+  `values-gcp.yaml.example` and a minimal local-dev overlay.
+- ✅ README documenting prerequisites + values reference + GKE
+  + kind quickstarts.
+- ⬜ Validation against a real `kind` cluster (cloud-agnostic) +
+  a real GKE cluster. Rendering works; runtime healthcheck
+  pending.
+- 💤 `secretproviderclass.yaml` — Secrets Store CSI Driver is
+  cloud-specific (GCP CSI vs AWS Secrets Store CSI) and depends
+  on the driver being installed cluster-side. Operators add it
+  per their cluster shape; chart stays driver-agnostic.
 
 ---
 

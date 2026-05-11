@@ -1,0 +1,84 @@
+# AWS-flavored overlay. Apply with:
+#   helm install engram engram-coordinator -f values-aws.yaml
+#
+# NB: ADR 0007 ships GCS as the first-class blob backend.
+# `ENGRAM_BLOB_BACKEND=s3` is reserved but the engram-storage-s3
+# crate is a stub — see docs/chunked-storage-rollout.md "Tier 4 #1".
+# This overlay is a scaffold for when that lands.
+#
+# Assumptions:
+# - EKS cluster with IRSA enabled.
+# - An IAM role `engram-coordinator-role` has S3 read/write on the
+#   chunks bucket, kms:Encrypt/Decrypt on the KEK key, and
+#   secretsmanager:GetSecretValue on relevant secrets.
+
+image:
+  repository: REPLACE_ACCOUNT.dkr.ecr.REPLACE_REGION.amazonaws.com/engram/coordinator
+  tag: ""
+  pullPolicy: IfNotPresent
+
+mode: coordinator
+
+blob:
+  # NB: not yet implemented — see rollout doc Tier 4 #1.
+  backend: gcs   # placeholder; flip to `s3` once stubs land.
+  gcs:
+    bucket: REPLACE_BUCKET
+
+kek:
+  # `aws-kms` provider isn't implemented yet either. Placeholder
+  # for the future AWS path.
+  provider: env-var
+  envVarName: ENGRAM_KEK_MASTER_KEY
+
+secrets:
+  backend: env
+
+database:
+  existingSecret: engram-coordinator-secrets
+  secretKey: DATABASE_URL
+
+auth:
+  existingSecret: engram-coordinator-secrets
+  secretKey: ENGRAM_AUTH_TOKENS
+
+serviceAccount:
+  create: true
+  name: engram-coordinator
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ACCOUNT:role/engram-coordinator-role
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations:
+    # Internal NLB; flip to internet-facing when a public ingress
+    # is wired.
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+
+ingress:
+  enabled: false
+  className: alb
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 65
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: 4000m
+    memory: 4Gi

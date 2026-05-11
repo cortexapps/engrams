@@ -1,0 +1,51 @@
+{{- if .Values.networkPolicy.enabled -}}
+# Default: allow ingress on the service port from anywhere in the
+# cluster (an LB / ingress controller takes the public edge), and
+# constrain egress to the CIDRs the coord legitimately needs:
+# Postgres, the blob backend, the OCI registry, the metadata
+# server (cloud APIs). Tighten in values.networkPolicy.egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "engram-coordinator.fullname" . }}
+  labels:
+    {{- include "engram-coordinator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "engram-coordinator.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+  egress:
+    # DNS is always required.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicy.egress.cidrs }}
+    - to:
+        {{- range .Values.networkPolicy.egress.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{- with .Values.networkPolicy.egress.ports }}
+      ports:
+        {{- range . }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+      {{- end }}
+    {{- else }}
+    # No explicit CIDRs configured — fall back to allow-all so the
+    # NetworkPolicy doesn't accidentally cut off DB/blob/registry
+    # access. Operators should set .Values.networkPolicy.egress.cidrs
+    # in production.
+    - {}
+    {{- end }}
+{{- end -}}

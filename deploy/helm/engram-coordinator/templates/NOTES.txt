@@ -1,0 +1,28 @@
+engram-coordinator {{ .Chart.AppVersion }} installed as {{ include "engram-coordinator.fullname" . }} in {{ .Release.Namespace }}.
+
+Service: {{ include "engram-coordinator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+Pre-flight checks the chart did not perform:
+
+1. The DATABASE_URL Secret named {{ printf "%q" .Values.database.existingSecret }} exists and contains key {{ printf "%q" .Values.database.secretKey }}.
+2. Postgres is reachable + the schema migrations from `deploy/migrations/` have been applied.
+3. {{- if eq .Values.blob.backend "gcs" }} The GCS bucket {{ printf "%q" .Values.blob.gcs.bucket }} exists and the Service Account bound to {{ include "engram-coordinator.serviceAccountName" . }} can read+write objects on it.
+{{- else }} The local blob path on each replica's PVC is writable (note: `emptyDir` is the chart default — fine for testing, NOT for production).
+{{- end }}
+4. {{- if eq .Values.kek.provider "gcp-kms" }} The KMS key {{ printf "%q" .Values.kek.gcpResource }} exists and the Service Account can Encrypt/Decrypt on it.
+{{- else if eq .Values.kek.provider "env-var" }} The DATABASE_URL Secret also carries an `ENGRAM_KEK_MASTER_KEY` entry (base64 32-byte key). Production should use kek.provider=gcp-kms.
+{{- end }}
+
+Tail the coord:
+
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/name=engram-coordinator -f --max-log-requests=10
+
+Verify health:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "engram-coordinator.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/healthz
+
+Connect FC hosts: deploy `engram-host-agent` on FC-capable VMs and
+point it at the service URL above via `--coordinator <ws://...>`.
+The host-agent is provisioned per-cloud via Packer + Terraform; see
+`deploy/packer/` and `deploy/terraform/`.

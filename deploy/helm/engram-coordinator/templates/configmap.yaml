@@ -1,0 +1,40 @@
+# Non-secret env vars consumed by the coord. Database URLs + auth
+# tokens come from Secrets (see deployment.yaml); blob bucket
+# name, KEK resource path, project id are plain config — operators
+# can grep them out of `kubectl describe configmap` without surprise.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "engram-coordinator.fullname" . }}-config
+  labels:
+    {{- include "engram-coordinator.labels" . | nindent 4 }}
+data:
+  ENGRAM_MODE: {{ .Values.mode | quote }}
+  ENGRAM_SANDBOX_BACKEND: {{ .Values.sandboxBackend | quote }}
+  ENGRAM_BLOB_BACKEND: {{ .Values.blob.backend | quote }}
+  {{- if eq .Values.blob.backend "gcs" }}
+  {{- if not .Values.blob.gcs.bucket }}
+  {{- fail "values.blob.gcs.bucket is required when blob.backend=gcs" }}
+  {{- end }}
+  ENGRAM_GCS_BUCKET: {{ .Values.blob.gcs.bucket | quote }}
+  {{- end }}
+  ENGRAM_KEK_PROVIDER: {{ .Values.kek.provider | quote }}
+  {{- if eq .Values.kek.provider "env-var" }}
+  ENGRAM_KEK_ENV_VAR: {{ .Values.kek.envVarName | quote }}
+  {{- else if eq .Values.kek.provider "gcp-kms" }}
+  {{- if not .Values.kek.gcpResource }}
+  {{- fail "values.kek.gcpResource is required when kek.provider=gcp-kms" }}
+  {{- end }}
+  ENGRAM_KEK_GCP_RESOURCE: {{ .Values.kek.gcpResource | quote }}
+  {{- end }}
+  ENGRAM_SECRETS_BACKEND: {{ .Values.secrets.backend | quote }}
+  {{- if eq .Values.secrets.backend "gcp" }}
+  {{- if not .Values.secrets.gcpProjectId }}
+  {{- fail "values.secrets.gcpProjectId is required when secrets.backend=gcp" }}
+  {{- end }}
+  ENGRAM_GCP_PROJECT_ID: {{ .Values.secrets.gcpProjectId | quote }}
+  {{- end }}
+  ENGRAM_BIND_ADDR: {{ printf "0.0.0.0:%d" (int .Values.service.port) | quote }}
+  {{- range $k, $v := .Values.extraConfig }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

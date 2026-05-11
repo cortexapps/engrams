@@ -1,0 +1,97 @@
+# GCP-flavored overlay. Apply with:
+#   helm install engram engram-coordinator -f values-gcp.yaml
+#
+# Assumptions:
+# - GKE cluster with Workload Identity enabled.
+# - A Google Service Account `engram-coordinator@<project>.iam.gserviceaccount.com`
+#   has been granted: roles/storage.objectAdmin on the chunks bucket,
+#   roles/cloudkms.cryptoKeyEncrypterDecrypter on the KEK,
+#   roles/secretmanager.secretAccessor on relevant secrets.
+# - The KSA → GSA binding is in place:
+#     gcloud iam service-accounts add-iam-policy-binding \
+#       --role roles/iam.workloadIdentityUser \
+#       --member "serviceAccount:<project>.svc.id.goog[<namespace>/engram-coordinator]" \
+#       engram-coordinator@<project>.iam.gserviceaccount.com
+
+image:
+  repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
+  tag: ""           # let the chart's appVersion drive it
+  pullPolicy: IfNotPresent
+
+mode: coordinator
+
+blob:
+  backend: gcs
+  gcs:
+    bucket: REPLACE_BUCKET
+
+kek:
+  provider: gcp-kms
+  # Full resource name: projects/<P>/locations/<L>/keyRings/<R>/cryptoKeys/<K>
+  gcpResource: REPLACE_KMS_RESOURCE
+
+secrets:
+  backend: gcp
+  gcpProjectId: REPLACE_PROJECT
+
+database:
+  existingSecret: engram-coordinator-secrets
+  secretKey: DATABASE_URL
+
+auth:
+  existingSecret: engram-coordinator-secrets
+  secretKey: ENGRAM_AUTH_TOKENS
+
+serviceAccount:
+  create: true
+  name: engram-coordinator
+  annotations:
+    iam.gke.io/gcp-service-account: engram-coordinator@REPLACE_PROJECT.iam.gserviceaccount.com
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations:
+    # Expose via an internal LB; flip to External when a public
+    # ingress is wired separately (recommended via the `ingress`
+    # block below + Google-managed cert).
+    cloud.google.com/load-balancer-type: Internal
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
+
+ingress:
+  enabled: false   # flip on once you have a managed cert + DNS
+  className: gce
+  annotations:
+    kubernetes.io/ingress.class: gce
+    networking.gke.io/managed-certificates: engram-coordinator-cert
+  hosts:
+    - host: engram.REPLACE_DOMAIN
+      paths:
+        - path: /
+          pathType: Prefix
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 65
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: 4000m
+    memory: 4Gi
+
+# GCP egress tightening: only Postgres + Cloud SQL Auth Proxy
+# socket, GCS object endpoints, Artifact Registry, and the
+# Workload Identity metadata server. Replace with your VPC CIDR
+# ranges. Keeping `networkPolicy.enabled=false` until the operator
+# is ready to lock down egress avoids accidental outage.
+networkPolicy:
+  enabled: false

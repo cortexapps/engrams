@@ -1,0 +1,159 @@
+# Default values — cloud-agnostic. Override per-cloud via
+# `values-gcp.yaml` / `values-aws.yaml` overlays.
+
+replicaCount: 2
+
+image:
+  # Override at deploy: `image.repository=us-docker.pkg.dev/...`
+  repository: ghcr.io/cortexapps/engram-coordinator
+  tag: ""           # falls back to .Chart.AppVersion when unset
+  pullPolicy: IfNotPresent
+
+# Optional image pull secrets when the registry needs auth.
+imagePullSecrets: []
+# - name: engram-pull-secret
+
+# `--mode` flag: `coordinator` (multi-host production) or `all`
+# (single-binary dev). Production deploys must use `coordinator`;
+# the host-agent runs separately on FC-capable VMs.
+mode: coordinator
+
+# Sandbox backend the coord registers locally in `--mode=all`. Ignored
+# in `--mode=coordinator`. `firecracker` requires Linux + KVM in the
+# coord pod (uncommon for K8s); `vz` is macOS-only and won't help here.
+sandboxBackend: firecracker
+
+# Blob storage backend selection (ADR 0007). Production reads chunks
+# from the same bucket the image-builder writes to.
+blob:
+  # `local` or `gcs`. AWS S3 is reserved.
+  backend: gcs
+  # Required when backend=gcs.
+  gcs:
+    bucket: ""
+
+# KEK provider for envelope-encrypted creds + cold-tier blob seals.
+kek:
+  # `env-var` (dev/CI) or `gcp-kms` (production).
+  provider: gcp-kms
+  # env-var only — name of the env var carrying the base64 master key.
+  envVarName: ENGRAM_KEK_MASTER_KEY
+  # gcp-kms only — full resource path.
+  gcpResource: ""
+
+# Secrets backend for image manifest's `[secrets.*]` references.
+secrets:
+  # `env` (dev) or `gcp` (Secret Manager via Workload Identity).
+  backend: gcp
+  # Required when backend=gcp.
+  gcpProjectId: ""
+
+# Database: Postgres URL pulled from a Secret; the chart never lets
+# raw URLs sit in a ConfigMap.
+database:
+  existingSecret: engram-coordinator-secrets
+  secretKey: DATABASE_URL
+
+# Bearer tokens that gate the API. Comma-separated list lives in the
+# secret; an empty value (default) leaves auth disabled — fine for
+# dev/staging, NOT for production. The values overlay flips this on.
+auth:
+  existingSecret: ""
+  secretKey: ENGRAM_AUTH_TOKENS
+
+# Cloud-agnostic identity. Production overlays bind to a
+# cloud-specific SA via annotations (GKE Workload Identity, EKS IRSA).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod-level identity hints (overridable).
+podLabels: {}
+podAnnotations: {}
+
+# HTTP service exposing the coord's API + WS.
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# Optional ingress. By default the coord sits behind a per-cloud LB
+# wired via the values overlay.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  # - host: engram.example.com
+  #   paths:
+  #     - path: /
+  #       pathType: Prefix
+  tls: []
+
+# HorizontalPodAutoscaler. The coord is stateless; scale on CPU.
+# Active sessions live on FC hosts so coord scaling is independent of
+# session count.
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# PodDisruptionBudget so rolling restarts never drop below quorum.
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# NetworkPolicy egress controls. The coord needs to reach Postgres,
+# the blob backend, and the OCI registry. Tighten per cloud.
+networkPolicy:
+  enabled: false
+  egress:
+    # CIDRs the coord can dial. `[]` allows all.
+    cidrs: []
+    # TCP ports for those CIDRs.
+    ports: []
+
+# Resource requests + limits. Default sizing fits the
+# small/medium-fleet shape; bump for high-throughput deploys.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# Pod scheduling.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Optional sidecars (e.g. cloudsql-proxy on GCP). Each entry mirrors
+# a k8s container spec.
+extraContainers: []
+
+# Optional environment vars not covered by the structured fields
+# above. Format: list of { name, value } or { name, valueFrom }.
+extraEnv: []
+
+# Optional ConfigMap key/value pairs mounted as env vars.
+extraConfig: {}
+
+# Probes — defaults aligned with the coord's /healthz handler.
+probes:
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readiness:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
