@@ -41,6 +41,7 @@
 
 pub mod cache;
 pub mod error;
+pub mod file;
 pub mod gc;
 pub mod manifest;
 pub mod store;
