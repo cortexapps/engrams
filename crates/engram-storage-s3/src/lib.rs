@@ -64,6 +64,10 @@ impl BlobStorage for S3BlobStorage {
     async fn delete(&self, _key: &str) -> Result<(), BlobError> {
         Err(BlobError::Config(STUB_REASON.into()))
     }
+
+    async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>, BlobError> {
+        Err(BlobError::Config(STUB_REASON.into()))
+    }
 }
 
 #[cfg(test)]

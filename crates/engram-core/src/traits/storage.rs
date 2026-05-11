@@ -137,4 +137,23 @@ pub trait BlobStorage: Send + Sync {
     /// Delete a key. Idempotent — succeeds if the key was already
     /// gone. Implementations map backend 404 into success.
     async fn delete(&self, key: &str) -> Result<(), BlobError>;
+
+    /// List keys under a prefix. Returns the full keys (not
+    /// relative to the prefix). The order is backend-specific —
+    /// callers that need a stable order should sort.
+    ///
+    /// Used by:
+    /// - `engram-chunk-store::gc` to enumerate live chunks and
+    ///   manifest versions during the sweep.
+    /// - `engram-chunk-store::store::latest_manifest_version` to
+    ///   find the highest version of a manifest without the
+    ///   exponential-probe fallback.
+    /// - Image-builder + image-cache utilities that need to walk
+    ///   over a repo's tags.
+    ///
+    /// Implementations should paginate transparently — the result
+    /// is the full set, not a single page. Empty prefix is
+    /// allowed (lists everything); callers should be cautious
+    /// about using that against large buckets.
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError>;
 }

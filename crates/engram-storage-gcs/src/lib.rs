@@ -37,6 +37,7 @@ use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::delete::DeleteObjectRequest;
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
+use google_cloud_storage::http::objects::list::ListObjectsRequest;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
 use google_cloud_storage::http::Error as GcsHttpError;
 
@@ -174,6 +175,36 @@ impl BlobStorage for GcsBlobStorage {
                 other => Err(other),
             },
         }
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let req = ListObjectsRequest {
+                bucket: self.bucket.clone(),
+                prefix: if prefix.is_empty() {
+                    None
+                } else {
+                    Some(prefix.to_string())
+                },
+                // Recommended max per the SDK docs.
+                max_results: Some(1000),
+                page_token: page_token.clone(),
+                ..Default::default()
+            };
+            let resp = self.client.list_objects(&req).await.map_err(map_http_err)?;
+            if let Some(items) = resp.items {
+                for obj in items {
+                    out.push(obj.name);
+                }
+            }
+            match resp.next_page_token {
+                Some(t) if !t.is_empty() => page_token = Some(t),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 }
 

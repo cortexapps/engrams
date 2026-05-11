@@ -149,6 +149,55 @@ impl BlobStorage for LocalBlobStorage {
             Err(e) => Err(BlobError::Io(e)),
         }
     }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
+        // Empty prefix means "the entire root." Validate non-empty
+        // prefixes the same way we validate keys, then walk the
+        // matching subtree.
+        if !prefix.is_empty() {
+            Self::validate_key(prefix)?;
+        }
+        let start = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(prefix)
+        };
+        // If the prefix points at a file, return just that key.
+        // If it points at a directory, walk and collect file keys.
+        // If it doesn't exist, return empty.
+        let metadata = match fs::metadata(&start).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(BlobError::Io(e)),
+        };
+        let mut out = Vec::new();
+        if metadata.is_file() {
+            out.push(prefix.to_string());
+            return Ok(out);
+        }
+        let mut stack: Vec<PathBuf> = vec![start];
+        while let Some(dir) = stack.pop() {
+            let mut rd = fs::read_dir(&dir).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    // Strip the root prefix to reconstruct the key.
+                    let rel = path
+                        .strip_prefix(&self.root)
+                        .map_err(|_| {
+                            BlobError::Io(std::io::Error::other("listed path escaped root"))
+                        })?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push(rel);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +290,42 @@ mod tests {
 
         let got = store.get("multi").await.unwrap();
         assert_eq!(&got[..], b"part-1-part-2-part-3");
+    }
+
+    #[tokio::test]
+    async fn list_prefix_walks_matching_subtree() {
+        let dir = tempdir().unwrap();
+        let store = LocalBlobStorage::new(dir.path());
+        store.put("a/x", Bytes::from_static(b"1")).await.unwrap();
+        store.put("a/y", Bytes::from_static(b"1")).await.unwrap();
+        store
+            .put("a/nested/z", Bytes::from_static(b"1"))
+            .await
+            .unwrap();
+        store.put("b/q", Bytes::from_static(b"1")).await.unwrap();
+
+        let mut keys = store.list_prefix("a").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["a/nested/z", "a/x", "a/y"]);
+
+        let nested = store.list_prefix("a/nested").await.unwrap();
+        assert_eq!(nested, vec!["a/nested/z"]);
+
+        let everything: std::collections::HashSet<_> =
+            store.list_prefix("").await.unwrap().into_iter().collect();
+        let want: std::collections::HashSet<String> = ["a/x", "a/y", "a/nested/z", "b/q"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(everything, want);
+    }
+
+    #[tokio::test]
+    async fn list_prefix_returns_empty_for_missing_subtree() {
+        let dir = tempdir().unwrap();
+        let store = LocalBlobStorage::new(dir.path());
+        let keys = store.list_prefix("never-existed").await.unwrap();
+        assert!(keys.is_empty());
     }
 
     #[tokio::test]

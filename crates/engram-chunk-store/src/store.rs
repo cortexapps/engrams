@@ -44,10 +44,10 @@ impl ChunkStore {
         Self { inner: blob }
     }
 
-    /// Borrow the underlying blob storage. Test-only escape hatch
-    /// for corruption + bypass tests. Production callers go through
-    /// the typed surface (`put_chunk`, `get_manifest`, etc.).
-    #[cfg(test)]
+    /// Borrow the underlying blob storage. Crate-internal: GC and
+    /// corruption tests need to bypass the typed surface for raw
+    /// `list_prefix` / `head` / `delete`. Production callers go
+    /// through `put_chunk`, `get_manifest`, etc.
     pub(crate) fn blob(&self) -> &Arc<dyn BlobStorage> {
         &self.inner
     }
@@ -141,83 +141,26 @@ impl ChunkStore {
     }
 
     /// Returns the highest `version` stored for `manifest_id`, or
-    /// `None` if no versions exist. Linear scan over the storage
-    /// keys under the prefix; acceptable for typical version
-    /// counts.
+    /// `None` if no versions exist. Lists the manifest's prefix
+    /// directly via `BlobStorage::list_prefix` and parses out the
+    /// version numbers.
     pub async fn latest_manifest_version(&self, manifest_id: Uuid) -> Result<Option<u64>> {
-        // BlobStorage doesn't expose listing — adapters need it for
-        // GC and "fetch latest" lookups. For now: probe versions
-        // exponentially upward, then binary-search to find the
-        // highest existing version. This works because versions
-        // are dense (every version 1..=latest exists; gaps mean
-        // the GC swept them, in which case we want the most recent
-        // surviving anyway).
-        //
-        // TODO: extend `BlobStorage` with a `list_prefix` op once
-        // any backend needs it for a non-GC reason. The GC code
-        // can also live with prefix scans done by the impl directly.
-        if !self
-            .inner
-            .exists(
-                &ManifestRef {
-                    manifest_id,
-                    version: 1,
-                }
-                .storage_key(),
-            )
-            .await?
-        {
-            return Ok(None);
-        }
-        // Exponential probe upward to find an upper bound that does
-        // not exist.
-        let mut lo: u64 = 1;
-        let mut hi: u64 = 2;
-        loop {
-            if !self
-                .inner
-                .exists(
-                    &ManifestRef {
-                        manifest_id,
-                        version: hi,
-                    }
-                    .storage_key(),
-                )
-                .await?
-            {
-                break;
-            }
-            lo = hi;
-            // Cap exponential growth; manifest version counts
-            // grow slowly, but 1M is a sane ceiling for the
-            // probe before we'd want a real list API.
-            if hi >= 1_048_576 {
-                return Err(ChunkStoreError::Internal(format!(
-                    "manifest {manifest_id} has > 1M versions; need list_prefix API"
-                )));
-            }
-            hi *= 2;
-        }
-        // Binary search in [lo, hi).
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if self
-                .inner
-                .exists(
-                    &ManifestRef {
-                        manifest_id,
-                        version: mid,
-                    }
-                    .storage_key(),
-                )
-                .await?
-            {
-                lo = mid;
-            } else {
-                hi = mid;
+        let prefix = ManifestRef::id_prefix(manifest_id);
+        let keys = self.inner.list_prefix(&prefix).await?;
+        let mut max: Option<u64> = None;
+        for key in keys {
+            // Parse out "vN.json" from the tail.
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(num) = rest.strip_prefix('v').and_then(|s| s.strip_suffix(".json")) else {
+                continue;
+            };
+            if let Ok(v) = num.parse::<u64>() {
+                max = Some(max.map_or(v, |cur| cur.max(v)));
             }
         }
-        Ok(Some(lo))
+        Ok(max)
     }
 
     /// Convenience: fetch the highest existing version of a
