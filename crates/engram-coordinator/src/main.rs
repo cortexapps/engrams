@@ -373,9 +373,16 @@ async fn main() -> Result<(), CoordinatorError> {
                             )
                         })?;
                     let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
+                    // ADR 0007: attach the chunk store so snapshots
+                    // chunk the rootfs and report the manifest ref.
+                    // Shares the same `blob` Arc as the rest of the
+                    // process so chunks the bake produced are readable
+                    // here (and vice versa).
+                    let cs = engram_chunk_store::ChunkStore::new(blob.clone());
                     Arc::new(
                         engram_sandbox_vz::VzBackend::new(cli.sandbox_work_dir.clone(), vz_cfg)
-                            .map_err(|e| CoordinatorError::Config(format!("vz backend: {e}")))?,
+                            .map_err(|e| CoordinatorError::Config(format!("vz backend: {e}")))?
+                            .with_chunk_store(cs),
                     )
                 }
                 #[cfg(not(target_os = "macos"))]

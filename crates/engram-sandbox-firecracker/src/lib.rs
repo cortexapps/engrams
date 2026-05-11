@@ -1218,6 +1218,10 @@ impl SandboxBackend for FirecrackerBackend {
             size_bytes,
             created_at,
             image_version: spec.image,
+            // FC snapshots capture VM state + memory only; disk state
+            // lives on the per-sandbox rootfs file. Phase 4's NBD work
+            // produces a disk_manifest here when it lands.
+            disk_manifest: None,
         })
     }
 

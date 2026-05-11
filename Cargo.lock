@@ -1222,6 +1222,7 @@ dependencies = [
  "dashmap",
  "dispatch2",
  "engram-agentd",
+ "engram-chunk-store",
  "engram-core",
  "engram-harness-proto",
  "futures",

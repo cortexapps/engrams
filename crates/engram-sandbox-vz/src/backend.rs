@@ -105,6 +105,11 @@ pub struct VzBackend {
     /// bridge passes guest-initiated 1026 connections to this sink
     /// in the same way `engram-sandbox-firecracker` does.
     harness_sink: Mutex<Option<HarnessSink>>,
+    /// ADR 0007: when set, `snapshot()` chunks the snapshot rootfs
+    /// into this store and populates `SnapshotMetadata.disk_manifest`.
+    /// `None` keeps the legacy "rootfs-only-on-host" behavior — the
+    /// snapshot remains restorable on this host but can't migrate.
+    chunk_store: Option<engram_chunk_store::ChunkStore>,
 }
 
 impl VzBackend {
@@ -125,7 +130,17 @@ impl VzBackend {
             cfg,
             sandboxes: DashMap::new(),
             harness_sink: Mutex::new(None),
+            chunk_store: None,
         })
+    }
+
+    /// Attach a chunk store. Once set, every `snapshot()` chunks
+    /// the rootfs clone into the store and the returned metadata
+    /// carries the `disk_manifest` ref. Required for cross-host
+    /// resume / spot-preemption migration.
+    pub fn with_chunk_store(mut self, chunk_store: engram_chunk_store::ChunkStore) -> Self {
+        self.chunk_store = Some(chunk_store);
+        self
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -506,7 +521,44 @@ impl SandboxBackend for VzBackend {
         tokio::fs::write(&manifest_path, bytes)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("write manifest: {e}")))?;
-        crate::snapshot::build_metadata(dest, &spec.image).await
+
+        // ADR 0007: when a chunk store is wired, chunk the cloned
+        // rootfs into the store so the snapshot is restorable on
+        // any host (the manifest_ref + the bytes in BlobStorage are
+        // sufficient). The host-local clone stays alongside as the
+        // hot-path restore source — Phase 6 retires the clone once
+        // restore takes a ManifestRef natively.
+        let disk_manifest = if let Some(cs) = self.chunk_store.as_ref() {
+            tracing::debug!(
+                sandbox_id = %id,
+                rootfs = %snapshot_rootfs.display(),
+                "chunking snapshot rootfs into store",
+            );
+            let m = cs
+                .chunk_file(
+                    &snapshot_rootfs,
+                    engram_chunk_store::ManifestKind::Disk,
+                    None,
+                )
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("chunk snapshot rootfs: {e}")))?;
+            let mref = engram_core::types::manifest::ManifestRef::new();
+            cs.put_manifest(mref, &m)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("put snapshot manifest: {e}")))?;
+            tracing::info!(
+                sandbox_id = %id,
+                manifest = %mref,
+                chunks = m.chunks.len(),
+                total_bytes = m.total_bytes,
+                "snapshot rootfs chunked",
+            );
+            Some(mref)
+        } else {
+            None
+        };
+
+        crate::snapshot::build_metadata(dest, &spec.image, disk_manifest).await
     }
 
     async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {

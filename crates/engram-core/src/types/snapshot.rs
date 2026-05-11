@@ -12,6 +12,13 @@ pub struct SnapshotMetadata {
     pub created_at: DateTime<Utc>,
     /// Image version the source sandbox was launched from.
     pub image_version: String,
+    /// ADR 0007: content-addressed manifest pointing at the disk's
+    /// chunks in `BlobStorage`, captured at snapshot time. `None`
+    /// for backends that haven't wired chunk-store snapshot yet
+    /// (FC; lights up with Phase 4's NBD work). `Some` for VZ on
+    /// macOS once a `ChunkStore` is attached to its config.
+    #[serde(default)]
+    pub disk_manifest: Option<super::manifest::ManifestRef>,
 }
 
 /// Where a snapshot's bytes currently live. Computed from

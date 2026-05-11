@@ -71,6 +71,7 @@ pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
 pub(crate) async fn build_metadata(
     dest: &Path,
     image_version: &str,
+    disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
 ) -> Result<SnapshotMetadata, SandboxError> {
     let mut size_bytes = 0u64;
     for name in [SNAPSHOT_ROOTFS_FILENAME, MANIFEST_FILENAME] {
@@ -87,6 +88,7 @@ pub(crate) async fn build_metadata(
         size_bytes,
         created_at: Utc::now(),
         image_version: image_version.into(),
+        disk_manifest,
     })
 }
 
@@ -161,5 +163,31 @@ mod tests {
         .unwrap();
         let err = read_manifest(dir.path()).await.unwrap_err();
         assert!(err.to_string().contains("not 'vz'"));
+    }
+
+    #[tokio::test]
+    async fn build_metadata_carries_disk_manifest_when_provided() {
+        // ADR 0007: the trait's `snapshot()` result threads the
+        // chunked-disk manifest ref out for the coordinator to
+        // persist on the `snapshots` row.
+        let dir = tempfile::tempdir().unwrap();
+        // Plant the artifacts `build_metadata` stats.
+        tokio::fs::write(dir.path().join(SNAPSHOT_ROOTFS_FILENAME), b"fake-rootfs")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join(MANIFEST_FILENAME), b"{}")
+            .await
+            .unwrap();
+
+        let mref = engram_core::types::manifest::ManifestRef::new();
+        let meta = build_metadata(dir.path(), "img:1", Some(mref))
+            .await
+            .unwrap();
+        assert_eq!(meta.disk_manifest, Some(mref));
+        assert_eq!(meta.image_version, "img:1");
+
+        // No chunk store wired → caller passes None → field stays None.
+        let meta_no = build_metadata(dir.path(), "img:1", None).await.unwrap();
+        assert_eq!(meta_no.disk_manifest, None);
     }
 }

@@ -328,6 +328,9 @@ impl SandboxBackend for ProcessBackend {
             size_bytes: manifest_size + archive_size,
             created_at: manifest.created_at,
             image_version: manifest.image_version,
+            // ProcessBackend doesn't write disks in ext4 form; chunked
+            // storage doesn't apply here (the rootfs is a directory).
+            disk_manifest: None,
         })
     }
 
