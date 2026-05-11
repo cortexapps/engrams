@@ -170,9 +170,8 @@ pub async fn evict_idle_session(
             "idle eviction: destroy failed; continuing to mark session Idle",
         );
     }
-    if let Some(proxy) = state.services.egress_proxy.as_ref() {
-        proxy.registry.unregister(session_id);
-    }
+    // ADR 0006: host-agent unregisters its local proxy entry as
+    // part of `destroy`. No coordinator-side cleanup needed.
 
     // Step 4: clear sandbox_id, set Idle, emit events.
     if let Err(e) = state

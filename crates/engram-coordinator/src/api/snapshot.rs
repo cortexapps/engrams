@@ -631,9 +631,8 @@ pub async fn evict_local(
                 "sandbox destroy failed during evict_local; continuing",
             );
         }
-        if let Some(proxy) = state.services.egress_proxy.as_ref() {
-            proxy.registry.unregister(id);
-        }
+        // ADR 0006: the host-agent unregisters its local proxy
+        // entry as part of `destroy`. No coordinator-side cleanup.
     }
 
     // Clear the persisted sandbox_id so a coordinator restart

@@ -508,42 +508,49 @@ pub async fn create_session(
     };
 
     state.registry.bind(session_id, sandbox_id);
-    // Register with the egress proxy so outbound HTTPS from this
-    // sandbox gets the right per-secret substitution + the right
-    // network.allow_hosts policy. Skipped when the proxy isn't
-    // running (`--egress-proxy-port=0`), or when the backend has
-    // no guest IP for this sandbox (process backend, VZ, etc.).
-    if let Some(proxy) = state.services.egress_proxy.as_ref() {
-        if let Some(guest_ip_str) = state.services.sandbox.guest_ip(sandbox_id).await {
-            if let Ok(guest_ip) = guest_ip_str.parse::<std::net::Ipv4Addr>() {
-                let mut secrets_for_proxy = Vec::new();
-                for (name, resolved) in &secret_bundle.secrets {
-                    let allow = engram_egress_proxy::HostList::from_manifest(
-                        &resolved.schema.allow_hosts,
-                        &resolved.schema.allow_host_patterns,
-                    )
-                    .ok();
-                    let placeholder = spec_env_for_proxy.get(name).cloned();
-                    let (Some(allow), Some(placeholder)) = (allow, placeholder) else {
-                        continue;
-                    };
-                    secrets_for_proxy.push(engram_egress_proxy::SecretEntry {
-                        placeholder,
-                        real_value: resolved.value.clone(),
-                        allow,
-                    });
-                }
-                let network_allow = engram_egress_proxy::HostList::from_manifest(
-                    &network_for_proxy.allow_hosts,
-                    &network_for_proxy.allow_host_patterns,
-                )
-                .unwrap_or_default();
-                proxy.registry.register(engram_egress_proxy::SessionState {
-                    session_id,
-                    guest_ip,
-                    network_allow,
-                    secrets: secrets_for_proxy,
+    // ADR 0006: ship per-session egress policy to the host-agent
+    // that owns this sandbox. The host-agent applies it to its
+    // local proxy registry; the WS frame and any subsequent
+    // start_agent request are serialised on the same connection so
+    // the policy is live before the harness can make egress calls.
+    //
+    // Skipped only when the backend has no guest IP for this
+    // sandbox (process backend, VZ in some configs). Host-agents
+    // with no local proxy attached treat the frame as a no-op.
+    if let Some(guest_ip_str) = state.services.sandbox.guest_ip(sandbox_id).await {
+        if let Ok(guest_ip) = guest_ip_str.parse::<std::net::Ipv4Addr>() {
+            let mut secrets = Vec::new();
+            for (name, resolved) in &secret_bundle.secrets {
+                let Some(placeholder) = spec_env_for_proxy.get(name).cloned() else {
+                    continue;
+                };
+                secrets.push(engram_core::types::egress::EgressSecretEntry {
+                    placeholder,
+                    real_value: resolved.value.clone(),
+                    allow_hosts: resolved.schema.allow_hosts.clone(),
+                    allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
                 });
+            }
+            let policy = engram_core::types::egress::SessionEgressPolicy {
+                session_id,
+                sandbox_id,
+                guest_ip,
+                network_allow_hosts: network_for_proxy.allow_hosts.clone(),
+                network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
+                secrets,
+                secret_mode: manifest.secret_mode,
+            };
+            if let Err(e) = state.services.sandbox.notify_session_policy(policy).await {
+                // Don't fail session create — the policy frame is
+                // best-effort. Hosts without an attached proxy
+                // silently no-op; transient WS issues should retry
+                // through cold-resume re-issuance.
+                tracing::warn!(
+                    %session_id,
+                    %sandbox_id,
+                    error = %e,
+                    "notify_session_policy failed; proceeding without egress policy",
+                );
             }
         }
     }
@@ -668,9 +675,8 @@ pub async fn delete_session(
                 "sandbox destroy failed during session delete; continuing",
             );
         }
-        if let Some(proxy) = state.services.egress_proxy.as_ref() {
-            proxy.registry.unregister(id);
-        }
+        // ADR 0006: the host-agent unregisters its local proxy
+        // entry as part of `destroy`. No coordinator-side cleanup.
     }
 
     // Clear sandbox_id since the sandbox is destroyed; the session

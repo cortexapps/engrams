@@ -165,9 +165,8 @@ pub async fn drain_session(
             "preemption drain: destroy failed (expected during shutdown)",
         );
     }
-    if let Some(proxy) = state.services.egress_proxy.as_ref() {
-        proxy.registry.unregister(session_id);
-    }
+    // ADR 0006: host-agent unregisters its local proxy entry as
+    // part of `destroy`. No coordinator-side cleanup.
 
     // Step 2: mark Dead. ADR 0005: there is no resume path — the
     // session is gone. Callers either accept the loss or start
