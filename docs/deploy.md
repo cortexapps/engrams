@@ -173,6 +173,23 @@ deferred — substitution logic is complete in
 `crates/engram-egress-proxy/src/substitute.rs`, but the
 coordinator-to-proxy registration step is not yet wired.
 
+## Operational notes
+
+### Idle auto-eviction is a v2 feature
+
+The idle evictor only fires in single-host `--mode=all`. In
+production multi-host deployments, sessions don't auto-suspend on
+idle until the host-agent grows its own `HarnessHub` (see
+`docs/known-issues.md` #7). For v1, operators evict on demand:
+
+```
+POST /api/admin/sessions/:id/flush     # one session
+POST /api/admin/flush-idle             # all idle sessions
+```
+
+Wire this up as a cron job (e.g., every 10 min from a k8s
+CronJob) if you want approximate auto-eviction in v1.
+
 ## Liveness / readiness
 
 - `/healthz` (port 8080, no auth) — process-up check.

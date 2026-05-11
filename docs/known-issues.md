@@ -127,7 +127,34 @@ deploy plan) isn't yet implemented because two pieces are missing:
 then, `--egress-proxy-port=0` keeps the proxy off for v1 prod
 deploys.
 
-## 7. No system-wide event stream on the coordinator
+## 7. Idle auto-eviction doesn't fire in `--mode=coordinator`
+
+**Files**: `crates/engram-coordinator/src/idle_evictor.rs`,
+`crates/engram-host-agent/src/harness.rs`.
+
+The idle evictor reads `state.harness_hub.idle_sandboxes(...)`. In
+`--mode=all` (dev/single-host) the hub sees every harness via the
+local sandbox backend's sink and the evictor works. In
+`--mode=coordinator` the `HarnessHub` lives on the coordinator but
+its source — `set_harness_sink` on the `RemoteSandboxBackend` —
+is the trait default no-op. The hub stays empty, `idle_sandboxes`
+returns nothing, and no sessions get auto-suspended on idle.
+
+The driver still runs and is harmless (no false evictions); it
+just produces no candidates. Operators can manually suspend via
+`POST /api/admin/sessions/:id/flush` or
+`POST /api/admin/flush-idle`.
+
+**Fix** (v2): instantiate a `HarnessHub` inside the host-agent's
+`run` loop, wire the local backend's harness sink into it, ship
+`SessionId` to the host-agent so it can `bind_session` locally,
+poll `idle_sandboxes` there, and emit candidates over WS via a
+new `NotifyKind::IdleEvictionCandidates(Vec<(SessionId, SandboxId)>)`.
+The coordinator's `evict_idle_session` pipeline function is
+already split out and can stay where it is — only the driver
+moves.
+
+## 8. No system-wide event stream on the coordinator
 
 The dashboard's Overview page only polls `GET /sessions` and
 `GET /api/hosts` at 1Hz — no SSE. Live event streaming is reserved
