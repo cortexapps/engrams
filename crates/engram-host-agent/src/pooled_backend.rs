@@ -162,9 +162,16 @@ impl SandboxBackend for PooledBackend {
                 // segment. This keeps the in-VM `/run/engram/
                 // harnesses/<name>/harness` invariant intact.
                 let name = harness_name_for_substrate(&spec, &uri);
-                let cached = cache.ensure_harness_ext4(&uri, &name).await.map_err(|e| {
-                    SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
-                })?;
+                // ADR 0006: when a local egress proxy is attached,
+                // stamp its CA cert into the substrate so the guest
+                // trust store accepts MITM leaves.
+                let host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.as_str());
+                let cached = cache
+                    .ensure_harness_ext4(&uri, &name, host_ca_pem)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
+                    })?;
                 tracing::debug!(
                     uri = %uri,
                     name = %name,

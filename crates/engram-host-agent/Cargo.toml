@@ -29,6 +29,7 @@ engram-secrets-gcp.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
 rustls.workspace = true
+sha2.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dashmap.workspace = true

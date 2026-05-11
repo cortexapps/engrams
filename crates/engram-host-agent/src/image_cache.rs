@@ -210,22 +210,40 @@ impl ImageCache {
     /// correctly: the ext4 root contains a single `<name>/`
     /// directory whose contents are the pack bytes.
     ///
-    /// Cached at `harness/sha256/<digest>/<name>.ext4` next to the
-    /// extracted pack — same digest dir, so GC sweeps both atomically.
+    /// Cached at `harness/sha256/<digest>/<name>[-ca-<fp>].ext4` next
+    /// to the extracted pack — same digest dir, so GC sweeps both
+    /// atomically.
+    ///
+    /// When `host_ca_cert_pem` is `Some`, the proxy CA cert is
+    /// stamped into the substrate at `.engram-host/ca.pem` before
+    /// `mke2fs` runs (ADR 0006 — guest substrates trust the
+    /// deployment-wide CA so any host's MITM leaves validate). The
+    /// CA cert's fingerprint is included in the cache filename so a
+    /// CA rotation produces a fresh cache entry; old ones are GC'd
+    /// in the usual sweep.
     pub async fn ensure_harness_ext4(
         &self,
         uri: &str,
         name: &str,
+        host_ca_cert_pem: Option<&str>,
     ) -> Result<CachedHarnessExt4, CacheError> {
         // Reuse the existing pull path. We need the pack contents
         // on disk before mke2fs can populate from them.
         let cached = self.ensure_harness(uri).await?;
+        // Bake the CA fingerprint into the cache filename so
+        // rotation invalidates cleanly. When no CA is configured we
+        // keep the legacy filename so dev workflows that don't run
+        // the proxy aren't perturbed.
+        let cache_name = match host_ca_cert_pem {
+            Some(pem) => format!("{}-ca-{}.ext4", name, ca_pem_fingerprint(pem)),
+            None => format!("{name}.ext4"),
+        };
         let ext4_path = self
             .inner
             .root
             .join("harness/sha256")
             .join(strip_sha256_prefix(&cached.digest))
-            .join(format!("{name}.ext4"));
+            .join(&cache_name);
 
         // Cache hit: ext4 already built. Touch + return.
         if fs::try_exists(&ext4_path).await.unwrap_or(false) {
@@ -254,6 +272,20 @@ impl ImageCache {
             .await
             .map_err(CacheError::Io)?;
         hardlink_tree(&cached.pack_dir, &staging_subdir).await?;
+
+        // ADR 0006: stamp the deployment-wide CA cert into the
+        // substrate so the guest's trust store accepts the proxy's
+        // MITM leaves. Lives at `.engram-host/ca.pem` — the bake
+        // image's init script picks it up from there.
+        if let Some(pem) = host_ca_cert_pem {
+            let host_meta_dir = staging.path().join(".engram-host");
+            fs::create_dir_all(&host_meta_dir)
+                .await
+                .map_err(CacheError::Io)?;
+            fs::write(host_meta_dir.join("ca.pem"), pem)
+                .await
+                .map_err(CacheError::Io)?;
+        }
 
         // Size the ext4: pack size doubled, +128 MiB minimum, 4 KiB-
         // aligned. Reusing image-builder's helper keeps the sizing
@@ -459,6 +491,21 @@ fn strip_sha256_prefix(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
 }
 
+/// Short hex fingerprint of a CA cert PEM. Used in the
+/// `harness_ext4` cache filename so a CA rotation produces a fresh
+/// cache entry. 16 hex chars (64 bits) is plenty for collision-
+/// avoidance within a single deployment.
+fn ca_pem_fingerprint(pem: &str) -> String {
+    use sha2::Digest as _;
+    let hash = sha2::Sha256::digest(pem.as_bytes());
+    let mut s = String::with_capacity(16);
+    for b in &hash[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Recursively replicate `src` under `dst` as a tree of hardlinks for
 /// regular files, real directories for directories, and verbatim
 /// symlinks for symlinks. Caller guarantees `dst` exists; entries
@@ -661,7 +708,7 @@ mod tests {
             .insert("registry.example/claude:v1".into(), digest.into());
 
         let cached = cache
-            .ensure_harness_ext4("registry.example/claude:v1", "claude")
+            .ensure_harness_ext4("registry.example/claude:v1", "claude", None)
             .await
             .unwrap();
         assert_eq!(cached.ext4_path, ext4_path);
@@ -669,5 +716,59 @@ mod tests {
         // The sentinel survives the call (we didn't re-mke2fs).
         let bytes = fs::read(&cached.ext4_path).await.unwrap();
         assert_eq!(bytes, b"sentinel");
+    }
+
+    /// CA fingerprint should be deterministic (same PEM → same
+    /// hex) and short enough not to blow up the filename.
+    #[test]
+    fn ca_pem_fingerprint_is_stable_and_short() {
+        let a = ca_pem_fingerprint("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n");
+        let b = ca_pem_fingerprint("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n");
+        let c = ca_pem_fingerprint("-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 16);
+    }
+
+    /// Cache-hit short-circuit must distinguish CA-stamped builds
+    /// from un-stamped ones — different CA fingerprint → different
+    /// cache filename → no false hit.
+    #[tokio::test]
+    async fn ensure_harness_ext4_distinguishes_ca_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ImageCache::open(tmp.path().to_path_buf(), empty_oci())
+            .await
+            .unwrap();
+
+        let digest = "sha256:fakehashcafp";
+        let pack_dir = tmp.path().join("harness/sha256/fakehashcafp");
+        fs::create_dir_all(&pack_dir).await.unwrap();
+        fs::write(pack_dir.join("harness"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
+        let ca_pem = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n";
+        let fp = ca_pem_fingerprint(ca_pem);
+        let stamped_path = pack_dir.join(format!("claude-ca-{fp}.ext4"));
+        let unstamped_path = pack_dir.join("claude.ext4");
+        fs::write(&stamped_path, b"with-ca").await.unwrap();
+        fs::write(&unstamped_path, b"no-ca").await.unwrap();
+        cache
+            .inner
+            .harness_map
+            .lock()
+            .entries
+            .insert("registry.example/claude:cafp".into(), digest.into());
+
+        let with_ca = cache
+            .ensure_harness_ext4("registry.example/claude:cafp", "claude", Some(ca_pem))
+            .await
+            .unwrap();
+        assert_eq!(with_ca.ext4_path, stamped_path);
+
+        let no_ca = cache
+            .ensure_harness_ext4("registry.example/claude:cafp", "claude", None)
+            .await
+            .unwrap();
+        assert_eq!(no_ca.ext4_path, unstamped_path);
     }
 }
