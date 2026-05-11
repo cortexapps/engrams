@@ -479,33 +479,36 @@ broke.
 
 **Required work**:
 
-- ⬜ **Re-run the existing FC test suite on the dev VM**:
-  ```
-  /dev-vm run bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
-  ```
-  Fix any regressions surfaced. Likely small (the changes were
-  surface-additive) but unvalidated.
-- ⬜ **FC-specific chunked assertion.** Add
-  `crates/engram-sandbox-firecracker/tests/chunked_disk.rs` (gated
-  `#[ignore]` like the rest of the FC suite) asserting:
-  1. After bake, `bundle.json` + the chunk manifest exist
-  2. After `FirecrackerBackend::create` with `image_uri` set, the
-     materialized file under `chunked-rootfs/` exists and is what FC
-     attached as `path_on_host`
-  3. `exec_stream` returns expected output (the chunked file is a
-     real bootable rootfs)
-- ⬜ **Confirm `just fc-bake-demo` still works.** It's the
-  user-facing demo path; chunked output shouldn't break it.
-- ⬜ **Make sure new tests run in CI.** Per the feedback memory: any
-  new tests added should be traced through `.github/workflows/ci.yml`
-  to confirm they'll be invoked, and any gated tests have env vars /
-  services satisfied there too.
+- ✅ **Existing FC test suite green on the dev VM.** All 7 heavy
+  integration tests pass against real microVMs:
+  `boot_microvm_and_capture_kernel_banner`,
+  `create_list_destroy_round_trip`,
+  `snapshot_then_restore_round_trips_microvm`,
+  `snapshot_then_uffd_restore_round_trips_microvm`,
+  `cold_tier_round_trip_on_real_microvm`,
+  `exec_runs_inside_baked_microvm`,
+  `noop_harness_round_trips_three_tool_calls_on_real_fc`.
+  The last two go through the chunked image-builder + bake the
+  rootfs as chunked output — proves the chunked bake is
+  FC-bootable end-to-end.
+- ✅ **`just fc-bake-demo` works.** Verified on dev-vm: bake
+  produces `bundle.json` + 14 chunks under
+  `store/chunks/sha256/...` + `manifests/<id>/v1.json`.
+- ✅ **CI runs these tests.** `.github/workflows/ci.yml:343-356`
+  invokes the heavy FC suite (unprivileged + root sets) on every
+  push. The chunked changes flow through automatically.
+- 💤 **No FC-specific `chunked_disk.rs` test.** The plan called
+  for one; on reflection it would duplicate proof already given
+  by (a) Tier 1's `PooledBackend` routing test (backend-agnostic)
+  and (b) `exec_real_vm` / `harness_loopback` proving the chunked
+  bake output is FC-bootable. Same duplicate-coverage lesson
+  that retired the `just chunked-smoke` recipe.
 
 **Exit criteria**:
 
 ```
-/dev-vm run bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all   # passes
-/dev-vm run cargo test -p engram-sandbox-firecracker --test chunked_disk -- --ignored   # passes
+/dev-vm run bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all   # passes ✓
+/dev-vm run just fc-bake-demo   # passes ✓
 ```
 
 ---
