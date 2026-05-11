@@ -1130,7 +1130,19 @@ async fn image_build(
         Some(bin) => DockerCli::with_binary(bin.to_string()),
         None => DockerCli::new(),
     };
-    let builder = Builder::new(docker);
+    // ADR 0007: chunked-storage layout. Chunks land at
+    // `<images_dir>/store/` so a single bake produces a
+    // self-contained tree (mirrors the image-builder binary's
+    // wiring).
+    let chunk_root = images_dir.join("store");
+    tokio::fs::create_dir_all(&chunk_root)
+        .await
+        .map_err(|e| CliError::Other(format!("chunk store root: {e}")))?;
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
+        engram_storage_local::LocalBlobStorage::new(chunk_root),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let builder = Builder::new(docker, chunk_store);
     let outcome = builder
         .build(&req)
         .await

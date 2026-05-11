@@ -285,7 +285,20 @@ exec /sbin/engram-agentd --port __VSOCK_PORT__
 pub struct BuildOutcome {
     pub image_dir: PathBuf,
     pub manifest_path: PathBuf,
+    /// Path on disk where the rootfs lives (directory for
+    /// `Format::Directory`; `.ext4` file for `Format::Ext4`).
+    /// Kept for ProcessBackend dev path; production consumers
+    /// resolve content via `disk_manifest` instead.
     pub rootfs_path: PathBuf,
+    /// ADR 0007: content-addressed chunked manifest pointing at
+    /// the disk's bytes in `BlobStorage`. `None` for
+    /// `Format::Directory` bakes (ProcessBackend reads the
+    /// rootfs as files); `Some` for `Format::Ext4` bakes. The
+    /// host-agent's image cache adopts this ref to materialize
+    /// per-sandbox disks via NBD (Linux+FC) or materialize-to-
+    /// file (macOS+VZ).
+    pub disk_manifest: Option<engram_chunk_store::ManifestRef>,
+    /// Size of `rootfs_path` on disk.
     pub size_bytes: u64,
 }
 
@@ -332,23 +345,42 @@ impl From<Ext4Error> for BuildError {
     }
 }
 
-/// The baker. Composed of a [`DockerRunner`] (mockable) for `docker
-/// build/create/export` and an [`Ext4Packer`] (mockable) for the
-/// `Format::Ext4` step. Stage A decoupled bake from Postgres; baked
-/// artifacts are pushed to the registry via [`Self::push_image`] and
-/// the coordinator's `/api/enabled-images` POST handler enables them
+impl From<engram_chunk_store::ChunkStoreError> for BuildError {
+    fn from(e: engram_chunk_store::ChunkStoreError) -> Self {
+        // Chunk-store errors surface as generic Config since
+        // they're a fail-the-bake condition not categorically
+        // different from any other I/O.
+        Self::Config(format!("chunk store: {e}"))
+    }
+}
+
+/// The baker. Composed of:
+///
+/// - A [`DockerRunner`] (mockable) for `docker build/create/export`.
+/// - An [`Ext4Packer`] (mockable) for the `Format::Ext4` step.
+/// - A [`engram_chunk_store::ChunkStore`] that the ext4 path
+///   chunks the produced rootfs into (ADR 0007). The store can
+///   be backed by `LocalBlobStorage` in dev or
+///   `GcsBlobStorage` / `S3BlobStorage` in production CI.
+///
+/// Stage A decoupled bake from Postgres; baked artifacts are
+/// pushed to the registry via [`Self::push_image`] and the
+/// coordinator's `/api/enabled-images` POST handler enables them
 /// — the builder never touches a `MetadataStore`.
 pub struct Builder<D: DockerRunner, P: Ext4Packer = Mke2fsPacker> {
     docker: D,
     packer: P,
+    chunk_store: engram_chunk_store::ChunkStore,
 }
 
 impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
-    /// Default constructor: real `mke2fs` packer for `Format::Ext4`.
-    pub fn new(docker: D) -> Self {
+    /// Default constructor: real `mke2fs` packer for `Format::Ext4`
+    /// + caller-supplied chunk store.
+    pub fn new(docker: D, chunk_store: engram_chunk_store::ChunkStore) -> Self {
         Self {
             docker,
             packer: Mke2fsPacker::default(),
+            chunk_store,
         }
     }
 }
@@ -356,8 +388,12 @@ impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
 impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     /// Construct with a custom packer — used by tests to record /
     /// inject errors instead of running real mke2fs.
-    pub fn with_packer(docker: D, packer: P) -> Self {
-        Self { docker, packer }
+    pub fn with_packer(docker: D, packer: P, chunk_store: engram_chunk_store::ChunkStore) -> Self {
+        Self {
+            docker,
+            packer,
+            chunk_store,
+        }
     }
 
     /// Run a single bake. Steps:
@@ -485,8 +521,8 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
 
         let dir_size = recursive_size(&rootfs_dir).await?;
 
-        let (rootfs_path, total_size) = match req.format {
-            Format::Directory => (rootfs_dir, dir_size),
+        let (rootfs_path, total_size, disk_manifest) = match req.format {
+            Format::Directory => (rootfs_dir, dir_size, None),
             Format::Ext4 => {
                 // Format the staging dir into a single ext4 image,
                 // then drop the staging dir — Firecracker only needs
@@ -498,7 +534,52 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 self.packer.pack(&rootfs_dir, &ext4_path, ext4_size).await?;
                 let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
                 let on_disk = tokio::fs::metadata(&ext4_path).await?.len();
-                (ext4_path, on_disk)
+
+                // ADR 0007: chunk the ext4 into the content-addressed
+                // store + commit a manifest. Production consumers
+                // (FC's NBD daemon, VZ's materialize-to-file) read
+                // from the manifest, not the ext4 file directly.
+                // We keep the .ext4 around for now so dev workflows
+                // and the OCI push path (which still uploads the
+                // ext4 as a layer) don't break; Phase 6 retires the
+                // file when SandboxBackend takes ManifestRef
+                // natively.
+                let m = self
+                    .chunk_store
+                    .chunk_file(
+                        &ext4_path,
+                        engram_chunk_store::ManifestKind::Disk,
+                        None, // default 16 MiB
+                    )
+                    .await?;
+                let manifest_ref = engram_chunk_store::ManifestRef::new();
+                self.chunk_store.put_manifest(manifest_ref, &m).await?;
+
+                // Sidecar bundle.json so image_cache + tooling can
+                // find the manifest ref without hitting Postgres.
+                // Format is intentionally tiny so a future "list
+                // images" CLI can fetch it cheaply.
+                let bundle = serde_json::json!({
+                    "schema_version": 1,
+                    "disk_manifest": manifest_ref,
+                });
+                tokio::fs::write(
+                    image_dir.join("bundle.json"),
+                    serde_json::to_vec_pretty(&bundle)
+                        .map_err(|e| BuildError::Config(format!("bundle.json: {e}")))?,
+                )
+                .await?;
+
+                tracing::info!(
+                    repo = %req.repo,
+                    tag = %req.tag,
+                    manifest = %manifest_ref,
+                    chunks = m.chunks.len(),
+                    total_bytes = m.total_bytes,
+                    "chunked ext4 into manifest"
+                );
+
+                (ext4_path, on_disk, Some(manifest_ref))
             }
         };
 
@@ -506,6 +587,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             image_dir: image_dir.to_path_buf(),
             manifest_path,
             rootfs_path,
+            disk_manifest,
             size_bytes: total_size,
         })
     }

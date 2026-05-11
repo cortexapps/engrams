@@ -127,7 +127,20 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         Some(bin) => DockerCli::with_binary(bin),
         None => DockerCli::new(),
     };
-    let builder = Builder::new(docker);
+
+    // ADR 0007: chunks live in a `BlobStorage` rooted at
+    // `<images_dir>/store/` for local-dev workflows. Production CI
+    // wires a `GcsBlobStorage` here so freshly-baked images land
+    // directly in the deployment bucket. The chunk root is
+    // co-located with the images dir so a single image-builder
+    // invocation produces a self-contained tree.
+    let chunk_root = opts.images_dir.join("store");
+    tokio::fs::create_dir_all(&chunk_root).await?;
+    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+        engram_storage_local::LocalBlobStorage::new(chunk_root.clone()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let builder = Builder::new(docker, chunk_store);
 
     let outcome = builder.build(&req).await?;
     println!("{}", outcome.image_dir.display());

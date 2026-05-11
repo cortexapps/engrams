@@ -103,7 +103,12 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
-    let baker = Builder::new(DockerCli::new());
+    let chunk_root = tempfile::tempdir().expect("chunk store root");
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
+        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let baker = Builder::new(DockerCli::new(), chunk_store);
     let outcome = baker
         .build(&BuildRequest {
             source: src.path().to_path_buf(),

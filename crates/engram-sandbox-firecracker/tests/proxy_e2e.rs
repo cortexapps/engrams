@@ -254,7 +254,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     )
     .unwrap();
     let images = tempfile::tempdir().expect("images");
-    let baker = Builder::new(DockerCli::new());
+    let chunk_root = tempfile::tempdir().expect("chunk store root");
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
+        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let baker = Builder::new(DockerCli::new(), chunk_store);
     let outcome = baker
         .build(&BuildRequest {
             source: src.path().to_path_buf(),

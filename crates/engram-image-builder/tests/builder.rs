@@ -157,6 +157,17 @@ fn write_source_repo(dir: &Path, engram_toml: &str) {
     std::fs::write(dir.join("engram.toml"), engram_toml).unwrap();
 }
 
+/// Helper: build a `ChunkStore` rooted at a fresh tempdir. Caller
+/// holds the `TempDir` for the lifetime of the test (drop = cleanup).
+fn test_chunk_store() -> (engram_chunk_store::ChunkStore, tempfile::TempDir) {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+        engram_storage_local::LocalBlobStorage::new(dir.path().to_path_buf()),
+    );
+    (engram_chunk_store::ChunkStore::new(blob), dir)
+}
+
 fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest {
     BuildRequest {
         source: source.to_path_buf(),
@@ -255,7 +266,8 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
         (PathBuf::from("README.md"), b"# starter\n".to_vec()),
         (PathBuf::from("scripts/run.sh"), b"#!/bin/sh\n".to_vec()),
     ]);
-    let builder = Builder::new(docker.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
 
     let outcome = builder
         .build(&req(src.path(), images.path(), "cortex/api", "warm-1"))
@@ -301,7 +313,8 @@ async fn build_passes_build_args_to_docker() {
         "#,
     );
     let docker = RecordingDocker::new();
-    let builder = Builder::new(docker.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
     builder
         .build(&req(src.path(), images.path(), "cortex/api", "warm-1"))
         .await
@@ -343,7 +356,8 @@ async fn build_uses_dockerfile_path_from_engram_toml() {
     .unwrap();
 
     let docker = RecordingDocker::new();
-    let builder = Builder::new(docker.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
     builder
         .build(&req(src.path(), images.path(), "cortex/api", "warm-1"))
         .await
@@ -363,7 +377,8 @@ async fn build_rejects_path_traversal_in_repo_or_tag() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     write_source_repo(src.path(), r#"name = "x""#);
-    let builder = Builder::new(RecordingDocker::new());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(RecordingDocker::new(), cs);
 
     for (repo, tag) in [
         ("..", "warm-1"),
@@ -388,7 +403,8 @@ async fn build_errors_when_dockerfile_is_missing() {
     let images = tempfile::tempdir().unwrap();
     // Only engram.toml; no Dockerfile.
     std::fs::write(src.path().join("engram.toml"), r#"name = "x""#).unwrap();
-    let builder = Builder::new(RecordingDocker::new());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(RecordingDocker::new(), cs);
     let res = builder
         .build(&req(src.path(), images.path(), "x", "warm-1"))
         .await;
@@ -408,7 +424,8 @@ async fn build_errors_when_engram_toml_is_missing() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     std::fs::write(src.path().join("Dockerfile"), "FROM scratch\n").unwrap();
-    let builder = Builder::new(RecordingDocker::new());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(RecordingDocker::new(), cs);
     let res = builder
         .build(&req(src.path(), images.path(), "x", "warm-1"))
         .await;
@@ -430,7 +447,8 @@ async fn build_propagates_docker_build_failure_and_does_not_create_rootfs() {
         code: Some(1),
         stderr: "no space left on device".into(),
     });
-    let builder = Builder::new(docker.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
     let res = builder
         .build(&req(src.path(), images.path(), "x", "warm-1"))
         .await;
@@ -461,7 +479,8 @@ async fn build_cleans_up_image_when_create_fails() {
         code: Some(1),
         stderr: "out of memory".into(),
     });
-    let builder = Builder::new(docker.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
     let res = builder
         .build(&req(src.path(), images.path(), "x", "warm-1"))
         .await;
@@ -488,7 +507,8 @@ async fn build_cleans_up_container_and_image_when_export_fails() {
         code: Some(1),
         stderr: "permission denied".into(),
     });
-    let builder = Builder::new(docker.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
     let res = builder
         .build(&req(src.path(), images.path(), "x", "warm-1"))
         .await;
@@ -517,7 +537,8 @@ async fn rebuild_overwrites_existing_image_dir() {
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs(vec![(PathBuf::from("v1-only.txt"), b"hi".to_vec())]);
-    let builder = Builder::new(docker);
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker, cs);
     builder
         .build(&req(src.path(), images.path(), "x", "warm-same"))
         .await
@@ -526,7 +547,8 @@ async fn rebuild_overwrites_existing_image_dir() {
     // Second bake with different fake rootfs.
     let docker2 = RecordingDocker::new()
         .with_fake_rootfs(vec![(PathBuf::from("v2-only.txt"), b"yo".to_vec())]);
-    let builder2 = Builder::new(docker2);
+    let (cs2, _csdir2) = test_chunk_store();
+    let builder2 = Builder::new(docker2, cs2);
     let outcome = builder2
         .build(&req(src.path(), images.path(), "x", "warm-same"))
         .await
@@ -575,7 +597,8 @@ async fn manifest_round_trips_full_engram_toml_through_baker() {
         "#,
     );
 
-    let builder = Builder::new(RecordingDocker::new());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(RecordingDocker::new(), cs);
     let outcome = builder
         .build(&req(src.path(), images.path(), "cortex/api", "warm-1"))
         .await
@@ -632,7 +655,8 @@ async fn end_to_end_with_real_docker() {
     .unwrap();
 
     let docker = engram_image_builder::DockerCli::new();
-    let builder = Builder::new(docker);
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker, cs);
     let outcome = builder
         .build(&req(src.path(), images.path(), "baker-test", "warm-1"))
         .await
@@ -652,6 +676,43 @@ async fn end_to_end_with_real_docker() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
+async fn ext4_bake_round_trips_through_chunk_store() {
+    // ADR 0007 promise: the chunked manifest is sufficient to
+    // reproduce the disk exactly. If this drifts (chunk size,
+    // hashing, manifest format), the host-agent's image cache
+    // will silently serve corrupt blocks to FC. Lock it down.
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(src.path(), "name = \"chunk-roundtrip\"\n");
+
+    let docker = RecordingDocker::new()
+        .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
+    let packer = RecordingPacker::default();
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::with_packer(docker, packer, cs.clone());
+
+    let outcome = builder
+        .build(&req_ext4(src.path(), images.path(), "p", "warm-1"))
+        .await
+        .expect("ext4 bake");
+
+    let manifest_ref = outcome.disk_manifest.expect("disk manifest");
+    let original = std::fs::read(&outcome.rootfs_path).expect("read ext4");
+
+    // Pull the manifest back, materialize the disk into a scratch
+    // file, and compare byte-for-byte against the on-disk ext4.
+    let manifest = cs.get_manifest(manifest_ref).await.expect("get manifest");
+    let dest = tempfile::NamedTempFile::new().unwrap();
+    cs.materialize_to_file(&manifest, dest.path())
+        .await
+        .expect("materialize");
+    let restored = std::fs::read(dest.path()).expect("read materialized");
+
+    assert_eq!(restored.len(), original.len(), "size mismatch");
+    assert_eq!(restored, original, "byte-for-byte mismatch");
+}
+
+#[tokio::test]
 async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     // The Ext4 path should: extract via docker, run the packer once
     // with src=<staging rootfs> and dst=<image_dir>/rootfs.ext4, then
@@ -669,7 +730,8 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
         ),
     ]);
     let packer = RecordingPacker::default();
-    let builder = Builder::with_packer(docker.clone(), packer.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::with_packer(docker.clone(), packer.clone(), cs);
 
     let outcome = builder
         .build(&req_ext4(src.path(), images.path(), "p", "warm-1"))
@@ -701,6 +763,20 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
         "size should be sized via recommended_size"
     );
 
+    // ADR 0007: ext4 bakes produce a chunked manifest + sidecar bundle.json
+    // so downstream consumers (host-agent image cache, NBD daemon,
+    // VZ materialize) can resolve content through the chunk store.
+    let manifest_ref = outcome
+        .disk_manifest
+        .expect("ext4 bake must produce a disk manifest");
+    let bundle_path = outcome.image_dir.join("bundle.json");
+    assert!(bundle_path.is_file(), "bundle.json sidecar should exist");
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    assert_eq!(bundle["schema_version"], 1);
+    let serialized: serde_json::Value = serde_json::to_value(manifest_ref).unwrap();
+    assert_eq!(bundle["disk_manifest"], serialized);
+
     // Docker orchestration unchanged: build → create → export → rm → rmi.
     let calls = docker.calls();
     assert!(
@@ -722,7 +798,8 @@ async fn build_directory_format_skips_packer() {
 
     let docker = RecordingDocker::new();
     let packer = RecordingPacker::default();
-    let builder = Builder::with_packer(docker, packer.clone());
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::with_packer(docker, packer.clone(), cs);
 
     builder
         .build(&req(src.path(), images.path(), "p", "warm-1"))
@@ -750,7 +827,8 @@ async fn build_ext4_propagates_packer_failure_and_keeps_rootfs_for_diagnostics()
         .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
     let packer = RecordingPacker::default();
     packer.fail_next("mocked mke2fs failure");
-    let builder = Builder::with_packer(docker, packer);
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::with_packer(docker, packer, cs);
 
     let err = builder
         .build(&req_ext4(src.path(), images.path(), "p", "warm-1"))
@@ -792,7 +870,8 @@ async fn build_directory_with_agent_injection_writes_agent_and_init() {
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
-    let builder = Builder::new(docker);
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker, cs);
 
     let mut request = req(src.path(), images.path(), "p", "warm-1");
     request.agent_injection = Some(AgentInjection {
@@ -847,7 +926,8 @@ async fn build_with_missing_agent_binary_errors_cleanly() {
     let images = tempfile::tempdir().unwrap();
     write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
     let docker = RecordingDocker::new();
-    let builder = Builder::new(docker);
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker, cs);
 
     let mut request = req(src.path(), images.path(), "p", "warm-1");
     request.agent_injection = Some(AgentInjection {
@@ -877,7 +957,8 @@ async fn build_with_init_script_override_uses_provided_script() {
     write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
 
     let docker = RecordingDocker::new();
-    let builder = Builder::new(docker);
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker, cs);
 
     let mut request = req(src.path(), images.path(), "p", "warm-1");
     request.agent_injection = Some(AgentInjection {

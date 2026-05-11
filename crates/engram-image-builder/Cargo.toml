@@ -18,8 +18,10 @@ path = "src/main.rs"
 
 [dependencies]
 engram-core.workspace = true
+engram-chunk-store.workspace = true
 engram-oci.workspace = true
 engram-postgres.workspace = true
+engram-storage-local.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -32,6 +34,7 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+engram-storage-local.workspace = true
 parking_lot.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt"] }

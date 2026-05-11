@@ -78,8 +78,13 @@ async fn exec_runs_inside_baked_microvm() {
     .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
+    let chunk_root = tempfile::tempdir().expect("chunk store root");
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
+        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let docker = DockerCli::new();
-    let baker = Builder::new(docker);
+    let baker = Builder::new(docker, chunk_store);
     let outcome = baker
         .build(&BuildRequest {
             source: src.path().to_path_buf(),
