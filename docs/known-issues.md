@@ -154,3 +154,104 @@ and starving the rest of the app.
 broadcast buses into one SSE feed. That'd let a dashboard show
 real-time activity across the whole system over a single connection.
 Out of scope until there's a concrete need.
+
+## 9. NBD disk adapter for Firecracker not implemented
+
+The chunked-storage rollout (ADR 0007) ships disk reads via a
+"materialize-first" path: the host-agent's `PooledBackend`
+assembles the chunked manifest into a per-host `.ext4` file
+before VM boot, then attaches that file as FC's `path_on_host`.
+Functional but pays cost proportional to image size on first
+materialize — ~16 s for a 16 GiB rootfs against GCS.
+
+The Phase 4 NBD path (`crates/engram-host-agent/src/disk_daemon.rs`,
+~800 lines per the plan) would replace this with on-demand
+block reads streamed from the chunk store. Sub-second
+VM-running time even for cold-cache images.
+
+**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #8.
+
+## 10. UFFD-from-chunks for memory not implemented
+
+The rollout's memory side is unimplemented. Sessions boot cold
+from the kernel rather than restoring from a chunked canonical
+memory snapshot, so first-session-on-a-host pays full boot
+latency (~3–10 s depending on the image) and we don't get
+cross-VM page-cache dedup. The image-builder doesn't yet
+capture the canonical memory snapshot during bake either.
+
+The full implementation is large (~1500 lines): bake-time
+canonical capture in `engram-image-builder/src/canonical_boot.rs`,
+a substantial rewrite of `engram-uffd-handler` to serve faults
+from the chunk store + record/replay working-set traces, and
+wiring through `FirecrackerBackend::{snapshot,restore}`.
+
+**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #9.
+
+## 11. `snapshots` table still carries cold-tier columns
+
+ADR 0007 supersedes the two-tier durability model, but the
+`snapshots` table schema (migration 0001 + 0016) still has
+`local_path`, `blob_present`, and the envelope-encryption
+quartet (`wrapped_dek`, `nonce`, `ciphertext`, `key_id`). The
+chunked write path (commit `e68ee23`) produces a
+`SnapshotMetadata.disk_manifest` that the coord captures in
+memory but doesn't persist to the row.
+
+Migration `0018_chunked_storage.sql` (Phase 6 of the rollout)
+drops the cold-tier columns and adds `disk_manifest_id` +
+`disk_manifest_version`. Until that lands, `SnapshotRecord`
+reshape + the `MetadataStore` method retirement
+(`flush_to_cold` etc.) are also blocked.
+
+**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #5
+(Phase 6 trait + DB reshape).
+
+## 12. No metrics on the chunked-storage code paths
+
+Zero observability on the new pieces: cache hit rate, chunk
+fetch latency, materialize time, GC counts, manifest puts/gets.
+Operators can't tell whether sessions are slow because chunks
+are missing the cache, GCS is slow, or materialization is
+contending on the local mutex.
+
+**Future work**: add a tracing-based metrics layer that
+exports Prometheus-compatible counters/histograms on
+`ChunkCache::get`, `ChunkStore::{put,get}_manifest`,
+`materialize_chunked_rootfs`, the chunk GC sweep, etc.
+Framework choice (Prometheus exporter vs OpenTelemetry) is a
+separate decision; today's stack uses structured tracing
+without an exporter.
+
+**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #7.
+
+## 13. Materialized-rootfs files leak between manifest updates
+
+`<work_dir>/chunked-rootfs/<manifest_id>-vN.ext4` accumulates one
+file per (re)materialized manifest version. The
+`PooledBackend::with_chunk_cache` wiring (commit `f42e1a2`)
+covers the *chunk* read cache via LRU; the materialized files
+themselves are never reaped.
+
+For a host whose images turn over frequently (CI bakes a new
+warm tag every day), the materialize dir grows without bound.
+Fix needs a scanner that enumerates live manifest refs from the
+DB and deletes any `chunked-rootfs/<manifest_id>-vN.ext4` not
+in the set. Currently blocked on Phase 6's DB schema (issue
+#11) — there's no `disk_manifest` column on `snapshots` to
+enumerate yet.
+
+**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #3(b).
+
+## 14. Wire compatibility is enforced at hello but bincode-positional
+
+`engram-protocol::WIRE_VERSION` (v2 today) + the hello-frame
+handshake reject coord/host-agent version mismatches loudly.
+The handshake itself works.
+
+What's *not* a known issue but worth knowing: bincode is
+schemaless positional encoding, so any future serde-derived
+field add/remove anywhere in the wire types is a hard break
+that must bump WIRE_VERSION. Future contributors editing
+`engram-protocol::wire` should bump the version and add a
+history note alongside any structural change.

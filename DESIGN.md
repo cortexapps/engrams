@@ -8,10 +8,22 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 > - **ADR 0002** — engram is a one-shot task runner (no cross-host cold resume; sessions live ↔ FC snapshot lifetime). *Amended by ADR 0005.*
 > - **ADR 0003** — Apple Silicon backend via Virtualization.framework (clone-based snapshots, virtio-console transport, sub-second cold boot).
 > - **ADR 0004** — registry-backed image and harness distribution (OCI artifacts, content-addressable host-side cache, KEK-sealed registry credentials).
-> - **ADR 0005** — disk-pressure blob tier reintroduced; git removed from the platform layer. Sessions live ↔ snapshot exists in *either* tier (hot on local NVMe, cold in a `BlobStorage` backend).
+> - **ADR 0005** — disk-pressure blob tier reintroduced; git removed from the platform layer. Sessions live ↔ snapshot exists in *either* tier (hot on local NVMe, cold in a `BlobStorage` backend). *Two-tier framing superseded by ADR 0007.*
 > - **ADR 0006** — egress proxy lives on each FC host-agent (not the coordinator). Deployment-wide CA loaded via a pluggable `CaSource` trait (env / local-disk / GCP Secret Manager); per-session policy ships from the coordinator over the existing WS as a `NotifyKind::SessionEgressPolicy` frame.
+> - **ADR 0007** — chunked-immutable content-addressed storage replaces the tar+zstd cold-tier flush. Disk + memory state lives as sha256-keyed chunks in `BlobStorage`; manifests are versioned references. Sessions live ↔ chunks reachable; no hot/cold dichotomy. Hardware-enforced memory COW across sessions sharing an image. Rollout is tier-laddered in [`docs/chunked-storage-rollout.md`](./docs/chunked-storage-rollout.md).
 >
-> Operational reference for GCP/GKE deployments: [`docs/deploy.md`](./docs/deploy.md).
+> Operational reference for GCP/GKE deployments: [`docs/deploy.md`](./docs/deploy.md). Production Helm chart: [`deploy/helm/engram-coordinator/`](./deploy/helm/engram-coordinator/). FC host fleet provisioning: [`deploy/packer/`](./deploy/packer/) + [`deploy/terraform/gcp/`](./deploy/terraform/gcp/).
+>
+> **Sections below that describe the two-tier (hot/cold) snapshot model
+> reflect ADR 0005 as a historical record.** ADR 0007 supersedes the
+> framing: chunked storage is the single durability primitive, sessions
+> live ↔ chunks reachable in `BlobStorage`. The hot/cold seal-pipeline
+> code is retiring (Phase 7 of the rollout); the architectural
+> description here gets a full refresh once Phase 6's schema reshape
+> lands. Treat anything below the next horizontal rule as
+> "ADR 0005-era; superseded but not yet rewritten."
+
+---
 
 ---
 

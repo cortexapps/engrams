@@ -1,8 +1,19 @@
 # Production deployment notes
 
 Operational guidance for running Engram on GCP. Code-level setup
-only — Terraform, GKE manifests, IAM bindings, and image-build CI
-are out of band.
+only.
+
+For the **actual deployment artifacts** see:
+- [`deploy/helm/engram-coordinator/`](../deploy/helm/engram-coordinator/) — Helm chart
+- [`deploy/packer/fc-host-gcp.pkr.hcl`](../deploy/packer/fc-host-gcp.pkr.hcl) — host image
+- [`deploy/terraform/gcp/`](../deploy/terraform/gcp/) — modules + minimal example
+- [`docs/chunked-storage-rollout.md`](./chunked-storage-rollout.md) — tier-laddered rollout tracker
+
+This doc dates from ADR 0005 (hot/cold tiers); ADR 0007 supersedes
+that framing — chunked storage is the single durability primitive
+now. The env vars + topology below are still accurate; the storage
+narrative ("cold-tier blobs") is historical until this gets
+refreshed.
 
 ## Topology
 

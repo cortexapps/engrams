@@ -355,16 +355,38 @@ image actually doing anything useful.
 
 ## Phase 10 — ADR 0007 + doc updates
 
-**Status: ⬜ pending**
+**Status: 🟡 partial — ADR + known-issues + intro callouts shipped; deep narrative refresh pending Phase 6**
 
-- ⬜ `docs/adr/0007-chunked-immutable-storage.md`
-- ⬜ `docs/deploy.md` rewritten for chunked storage
-- ⬜ `docs/known-issues.md` — retire entries closed by this work,
-  add new ones for deferred work (AWS module, L2 cache, page-level
-  memory dedup)
-- ⬜ `DESIGN.md` — architecture diagrams, source-of-truth table,
-  component descriptions
-- ⬜ `README.md` — drop "two snapshot tiers" framing
+- ✅ [`docs/adr/0007-chunked-immutable-storage.md`](./adr/0007-chunked-immutable-storage.md)
+  — the headline ADR. Context + decision (chunk sizes, manifest
+  shape, memory dedup, working-set traces, layered architecture,
+  COW levels, cold-tier deletion, wire protocol), consequences,
+  alternatives considered, rollout pointer, explicit "what this
+  ADR does NOT cover" section listing the deferred pieces.
+- ✅ `docs/known-issues.md` — six new entries (#9 NBD, #10 UFFD,
+  #11 schema reshape blocked, #12 observability, #13 materialize-
+  dir leak, #14 wire-version bincode caveat) all cross-referenced
+  to the rollout doc's Tier 4 punch list. Existing entries
+  untouched (none were affected).
+- ✅ `README.md` — Phase 7 paragraph added; the "two snapshot
+  tiers, one primitive" architecture paragraph replaced with
+  the chunked-storage narrative + a pointer to ADR 0007 +
+  rollout doc.
+- ✅ `DESIGN.md` — ADR 0007 added to the ADR list with the
+  "supersedes 0005's two-tier framing" note; deploy artifact
+  pointers added; intro callout explains that the ADR-0005-era
+  narrative below is historical pending Phase 6 schema reshape.
+- ✅ `docs/deploy.md` — header callout supersedes the cold-tier
+  framing + points at the deployment artifacts (Helm, Packer,
+  Terraform) and the rollout tracker.
+- ⬜ **Deep rewrite of DESIGN.md's architecture sections** —
+  source-of-truth table, snapshot-residency diagrams,
+  hot/cold/tier component descriptions all still reflect ADR
+  0005. Refreshes naturally with Phase 6's `SnapshotRecord`
+  reshape (the new fields drive the new descriptions).
+- ⬜ **Deploy.md rewrite** — env vars + topology section is
+  still accurate, but the storage narrative is ADR-0005-era.
+  Refresh alongside Phase 6.
 
 ---
 
