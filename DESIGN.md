@@ -4,9 +4,14 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 
 > Founding design + roadmap. Sections that reflect superseded earlier decisions are marked. ADRs in `docs/adr/` capture the live trajectory:
 >
-> - **ADR 0001** — sessions are versioned conversations (workspace + transcript externalized to git + Postgres; blob storage removed).
-> - **ADR 0002** — engram is a one-shot task runner (no cross-host cold resume; sessions live ↔ FC snapshot lifetime).
+> - **ADR 0001** — sessions are versioned conversations (workspace + transcript externalized to git + Postgres; blob storage removed). *Superseded by ADR 0005.*
+> - **ADR 0002** — engram is a one-shot task runner (no cross-host cold resume; sessions live ↔ FC snapshot lifetime). *Amended by ADR 0005.*
 > - **ADR 0003** — Apple Silicon backend via Virtualization.framework (clone-based snapshots, virtio-console transport, sub-second cold boot).
+> - **ADR 0004** — registry-backed image and harness distribution (OCI artifacts, content-addressable host-side cache, KEK-sealed registry credentials).
+> - **ADR 0005** — disk-pressure blob tier reintroduced; git removed from the platform layer. Sessions live ↔ snapshot exists in *either* tier (hot on local NVMe, cold in a `BlobStorage` backend).
+> - **ADR 0006** — production deploy uses coordinator-side egress proxy for v1; the host-agent topology and the matching cross-machine state-sync moves (idle evictor, broker-mode session registration) are v2.
+>
+> Operational reference for GCP/GKE deployments: [`docs/deploy.md`](./docs/deploy.md).
 
 ---
 
@@ -29,7 +34,7 @@ The architecture comes out of an extended design discussion that explored: Strip
 3. **Pluggable cloud backend** so the project ports cleanly between GCP, AWS, Hetzner, and self-hosted bare metal.
 4. **Pluggable storage backend** (GCS, S3, MinIO, local) for snapshot durability.
 5. **Spot/preemptible-tolerant** by default — eviction = forced snapshot + resume elsewhere, not data loss.
-6. **Recoverable from snapshot loss** without losing user work (Postgres + git remain sources of truth).
+6. **Recoverable from host loss** without losing user work — the cold tier (`BlobStorage`) survives host loss, disk-pressure flushing, and operator drains (ADR 0005). Sessions die only when both snapshot tiers are gone.
 7. **Single-binary single-host** mode for trivial deployment; **multi-host** mode when scale demands.
 8. **Open-source, Apache-2.0**, idiomatic Rust, well-tested, contributable.
 
@@ -74,18 +79,18 @@ The Modal/E2B/Ramp pattern: spawn an ephemeral, isolated environment per task; p
          │harness  │         │harness  │         │harness  │
          │  hub    │         │  hub    │         │  hub    │
          └────┬────┘         └────┬────┘         └────┬────┘
-              │ git push (workspace)
+              │ cold-tier flush (tar+zstd, KEK-sealed URL)
               ▼
        ┌─────────────────────┐         ┌─────────────────────┐
-       │  Git remote         │         │  Postgres (managed) │
-       │  (GitHub / GitLab / │         │   - sessions        │
-       │   etc.)             │         │   - session_events  │
-       │  engram/sessions/<id│         │   - hosts / sandboxes│
-       │  branch per session │         │   - image_versions  │
+       │  BlobStorage        │         │  Postgres (managed) │
+       │  (GCS / S3 / local) │         │   - sessions        │
+       │   - snapshot blobs  │         │   - session_events  │
+       │   - tar+zstd FC dir │         │   - snapshots       │
+       │   - sealed URL refs │         │   - hosts           │
        └─────────────────────┘         └─────────────────────┘
 ```
 
-Snapshot store lives on each host's local NVMe — an FC `memory.bin` for hot resume, an APFS rootfs clone for VZ's clone-based snapshots. Snapshots are explicitly *not* replicated; a session's lifetime is bounded by its FC snapshot's local lifetime (ADR 0002). Sessions whose snapshots are gone go `Dead`; the workspace lives on as a git branch and the caller forks if they want to continue.
+Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's local NVMe — an FC `memory.bin` + state file for sub-100ms same-host resume, an APFS rootfs clone for VZ. **Cold tier** is the same payload tar+zstd-compressed and pushed to a `BlobStorage` backend; the URL is KEK-sealed and persisted on the snapshot row. Disk-pressure or admin flush moves a session from hot to cold; a cold-tier resume on any host with capacity materialises a fresh local copy and continues. Sessions go `Dead` only when *both* tiers are gone.
 
 ### Component summary
 
@@ -232,9 +237,26 @@ pub trait CloudBackend: Send + Sync {
 
 **v2+**: `engram-cloud-aws` (Spot eviction via IMDS), `engram-cloud-hetzner` (Cloud API).
 
-### ~~`BlobStorage`~~ — retired (ADR 0001)
+### `BlobStorage` (in `engram-core`, impls in `engram-storage-*`)
 
-Earlier drafts hung the snapshot replication subsystem off a `BlobStorage` trait with `engram-storage-{gcs,s3,local}` impls. ADR 0001 retired the entire subsystem (replication driver, cold-tier fetch, the trait, all three backends — ~1500 LOC) once the durability story moved to git + Postgres. ADR 0002 then made session lifetime host-local-bounded by design, so the cold-tier fallback would have had no caller anyway. Image distribution (Phase 5) will use a Docker registry, reusing standard tooling rather than rebuilding bespoke object-storage pipelines.
+Cold-tier durability primitive — ADR 0005 reintroduced it after ADR 0001 had retired it. The original framing ("30-second-preemption replication is the design point") was infeasible math; the new framing ("minutes-budget disk-pressure flush") is trivial math, and the trait carries its own weight.
+
+```rust
+#[async_trait]
+pub trait BlobStorage: Send + Sync {
+    async fn put_streaming(&self, key: &str, body: ByteStream) -> Result<u64, BlobError>;
+    async fn get_streaming(&self, key: &str) -> Result<ByteStream, BlobError>;
+    async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError>;
+    async fn delete(&self, key: &str) -> Result<(), BlobError>;
+}
+```
+
+**v1 implementations:**
+- `engram-storage-gcs` — Google Cloud Storage via `google-cloud-storage` v0.24. ADC + Workload Identity in production, `STORAGE_EMULATOR_HOST` for fake-gcs-server in `just dev`. `put_streaming` forwards the body through `upload_streamed_object` so multi-GB FC `memory.bin` flushes don't materialise in host-agent RAM.
+- `engram-storage-s3` — S3 via the AWS SDK. Same surface, different backend.
+- `engram-storage-local` — filesystem-backed `<local_path>/blobs/`. Default in `just dev`; useful for single-host deployments that want cold-tier durability without standing up an object store.
+
+The cold-tier flush pipeline (`engram-host-agent::flush::flush_session`) runs `sh -c 'tar -cf - -C <snapshot_path> . | zstd -3 -T0'` and pipes stdout to `BlobStorage::put_streaming`. The blob URL is sealed under the deployment KEK and stored on the `snapshots` row.
 
 ### `MetadataStore` (in `engram-core`)
 
@@ -479,90 +501,20 @@ Versioning: TODO. Two consumers exist now (the agentd vsock proto + the Phase 3 
 
 ## Database schema (Postgres)
 
-Bare-bones v1 schema. All tables get `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `updated_at TIMESTAMPTZ`.
+The authoritative schema lives in `deploy/migrations/*.sql` — currently 17 sequential migrations applied by `sqlx::migrate!()` at coordinator startup. The original founding-design sketch reproduced here drifted heavily as the system grew (`messages` was replaced by `session_events`; `enabled_images`, `harness_packs`, `registry_credentials`, and `session_secrets` were added in Phase 5; the snapshot row gained the sealed-blob-ref quartet `(wrapped_dek, nonce, ciphertext, key_id)` in ADR 0005); rather than restate it in two places, treat the migrations directory as the source of truth.
 
-```sql
-CREATE TABLE sessions (
-    id UUID PRIMARY KEY,
-    repo TEXT NOT NULL,
-    branch TEXT NOT NULL,
-    user_id TEXT,
-    status TEXT NOT NULL,                    -- pending | active | idle | completed | failed
-    image_version TEXT NOT NULL,             -- the warm image this session was created against
-    host_id UUID REFERENCES hosts(id),       -- current host (NULL if evicted-only-in-blob)
-    created_at TIMESTAMPTZ NOT NULL,
-    last_active_at TIMESTAMPTZ NOT NULL
-);
+**Key tables, briefly:**
 
-CREATE TABLE hosts (
-    id UUID PRIMARY KEY,
-    hostname TEXT NOT NULL UNIQUE,
-    cloud_metadata JSONB,                    -- instance ID, zone, machine type
-    capacity_total_gb INT NOT NULL,
-    capacity_used_gb INT NOT NULL,
-    last_heartbeat_at TIMESTAMPTZ NOT NULL,
-    status TEXT NOT NULL                     -- ready | draining | dead
-);
+- `sessions` — id, repo, image identity, current `host_id` + `sandbox_id` (NULL when no live VM), status (`Pending` / `Active` / `Idle` / `ColdEvicted` / `Dead` / `Failed`), timestamps.
+- `hosts` — id, hostname, cloud metadata, capacity, heartbeat timestamp, status (`Ready` / `Draining` / `Dead`).
+- `snapshots` — id, session, host, `local_path` (hot tier), `blob_present` + sealed-blob-ref columns (cold tier — ADR 0005), `image_version`, sizes, timestamps.
+- `session_events` — append-only conversation + tool-call log keyed `(session_id, idx)`. Drives the SSE replay stream.
+- `enabled_images` — per-deployment allowlist of OCI image URIs that sessions can spawn against (Phase 5b).
+- `harness_packs` — `name → OCI URI` map for built-in harnesses (`claude`, `noop`).
+- `registry_credentials` — KEK-sealed creds for OCI registry pulls. Encrypted with the same envelope shape as `session_secrets` (`engram-crypto::CredCipher`).
+- `session_secrets` — sealed per-request overrides (e.g. `CLAUDE_CODE_OAUTH_TOKEN`) needed to rebuild the harness env on cold resume.
 
-CREATE TABLE snapshots (
-    id UUID PRIMARY KEY,
-    session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
-    host_id UUID REFERENCES hosts(id),       -- NULL if local copy gone
-    local_path TEXT,                         -- NULL if not on disk
-    blob_url TEXT,                           -- NULL until upload completes
-    image_version TEXT NOT NULL,             -- warm image at time of snapshot
-    size_bytes BIGINT NOT NULL,
-    replicated_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL,
-    last_accessed_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE TABLE messages (
-    id UUID PRIMARY KEY,
-    session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
-    idx INT NOT NULL,                        -- ordering within session
-    role TEXT NOT NULL,                      -- user | assistant | tool
-    content_json JSONB NOT NULL,
-    tokens INT,
-    created_at TIMESTAMPTZ NOT NULL,
-    UNIQUE (session_id, idx)
-);
-
-CREATE TABLE tool_calls (
-    id UUID PRIMARY KEY,
-    session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
-    message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
-    tool_name TEXT NOT NULL,
-    input_json JSONB NOT NULL,
-    output_json JSONB,
-    exit_status INT,
-    created_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE TABLE agent_commits (
-    id UUID PRIMARY KEY,
-    session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
-    sha TEXT NOT NULL,
-    branch TEXT NOT NULL,
-    pushed BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE TABLE image_versions (
-    id UUID PRIMARY KEY,
-    repo TEXT NOT NULL,
-    tag TEXT NOT NULL,                       -- warm-<timestamp>
-    blob_url TEXT,                           -- where image lives
-    status TEXT NOT NULL,                    -- building | ready | retired
-    created_at TIMESTAMPTZ NOT NULL,
-    UNIQUE (repo, tag)
-);
-
-CREATE INDEX idx_snapshots_session ON snapshots(session_id);
-CREATE INDEX idx_snapshots_host ON snapshots(host_id);
-CREATE INDEX idx_messages_session_idx ON messages(session_id, idx);
-CREATE INDEX idx_sessions_status ON sessions(status) WHERE status IN ('pending', 'active', 'idle');
-```
+See `deploy/migrations/` for the live DDL.
 
 ---
 
@@ -614,7 +566,7 @@ engram/
     └── engram-protocol/               # bincode-over-WS Frame protocol (coordinator <-> host)
 ```
 
-(`engram-storage-{gcs,s3,local}` retired with ADR 0001.)
+(`engram-storage-{gcs,s3,local}` were retired with ADR 0001 and brought back with ADR 0005; the cold tier is now the cross-host durability primitive.)
 
 **Key dependency choices** (informed by exploration of claw-code patterns + 2026 Rust ecosystem):
 
