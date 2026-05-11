@@ -33,7 +33,7 @@ pub use resolver::{
     default_resolver, ResolveError, StaticResolver, SystemResolver, UpstreamResolver,
 };
 
-pub use ca::{Ca, CaError};
+pub use ca::{Ca, CaError, CaSource, EnvCaSource, LocalDiskCaSource};
 pub use cert_mint::{CertMint, MintError};
 pub use policy::{HostList, HostSpec, ParseError as PolicyParseError};
 pub use registry::{Decision, Registry, SecretEntry, SessionState};

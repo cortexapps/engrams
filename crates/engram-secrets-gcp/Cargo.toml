@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 engram-core.workspace = true
+engram-egress-proxy.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
@@ -21,3 +22,4 @@ base64 = "0.22"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock = "0.6"
+tempfile = "3"

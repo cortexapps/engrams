@@ -26,6 +26,8 @@
 //! 60 seconds of expiry. Tests inject [`StaticTokenSource`] to avoid
 //! the metadata-server dependency.
 
+pub mod ca;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,7 +41,7 @@ use serde::Deserialize;
 
 /// Production Secret Manager API root. Overridable for tests via
 /// [`GcpSecretManager::with_base_url`].
-const DEFAULT_SECRETMANAGER_BASE: &str = "https://secretmanager.googleapis.com";
+pub(crate) const DEFAULT_SECRETMANAGER_BASE: &str = "https://secretmanager.googleapis.com";
 
 /// Default metadata-server token endpoint. Overridable for tests.
 const DEFAULT_METADATA_TOKEN_URL: &str =
@@ -261,6 +263,63 @@ struct Payload {
     data: String,
 }
 
+/// Low-level `AccessSecretVersion` fetcher: GET the resource path,
+/// map status codes to typed errors, return the base64-decoded
+/// payload bytes. Shared by the [`SecretStore`] impl (per-image
+/// session secrets) and [`ca::GcpSecretManagerCaSource`]
+/// (deployment-wide CA material).
+///
+/// Returns `Ok(None)` on 404 — caller decides whether absent is fatal.
+pub(crate) async fn access_payload(
+    http: &reqwest::Client,
+    base_url: &str,
+    token_source: &Arc<dyn TokenSource>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, SecretError> {
+    let url = format!("{base_url}/v1/{path}:access");
+    let bearer = token_source.token().await?;
+
+    let resp = http
+        .get(&url)
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .map_err(|e| SecretError::Backend(Box::new(e)))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Err(SecretError::Unauthorized(format!(
+            "Secret Manager denied access to `{path}` (status 403); \
+             check Workload Identity binding for `roles/secretmanager.secretAccessor`"
+        )));
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST {
+        return Err(SecretError::InvalidRef(format!(
+            "Secret Manager rejected path `{path}` (status 400)"
+        )));
+    }
+    if !status.is_success() {
+        return Err(SecretError::Backend(
+            format!("Secret Manager AccessSecretVersion returned {status} for `{path}`").into(),
+        ));
+    }
+
+    let body: AccessSecretVersionResponse = resp
+        .json()
+        .await
+        .map_err(|e| SecretError::Protocol(format!("AccessSecretVersion JSON: {e}")))?;
+
+    let bytes = BASE64_STANDARD
+        .decode(body.payload.data.as_bytes())
+        .map_err(|e| {
+            SecretError::Protocol(format!("AccessSecretVersion payload not base64: {e}"))
+        })?;
+    Ok(Some(bytes))
+}
+
 #[async_trait]
 impl SecretStore for GcpSecretManager {
     async fn get(
@@ -270,48 +329,11 @@ impl SecretStore for GcpSecretManager {
         schema: &SecretSchema,
     ) -> Result<Option<String>, SecretError> {
         let path = self.resolve_path(ctx, name, schema);
-        let url = format!("{}/v1/{}:access", self.base_url, path);
-        let bearer = self.token_source.token().await?;
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&bearer)
-            .send()
-            .await
-            .map_err(|e| SecretError::Backend(Box::new(e)))?;
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(SecretError::Unauthorized(format!(
-                "Secret Manager denied access to `{path}` (status 403); \
-                 check Workload Identity binding for `roles/secretmanager.secretAccessor`"
-            )));
-        }
-        if status == reqwest::StatusCode::BAD_REQUEST {
-            return Err(SecretError::InvalidRef(format!(
-                "Secret Manager rejected path `{path}` (status 400)"
-            )));
-        }
-        if !status.is_success() {
-            return Err(SecretError::Backend(
-                format!("Secret Manager AccessSecretVersion returned {status} for `{path}`").into(),
-            ));
-        }
-
-        let body: AccessSecretVersionResponse = resp
-            .json()
-            .await
-            .map_err(|e| SecretError::Protocol(format!("AccessSecretVersion JSON: {e}")))?;
-
-        let bytes = BASE64_STANDARD
-            .decode(body.payload.data.as_bytes())
-            .map_err(|e| {
-                SecretError::Protocol(format!("AccessSecretVersion payload not base64: {e}"))
-            })?;
+        let bytes =
+            match access_payload(&self.http, &self.base_url, &self.token_source, &path).await? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
         let value = String::from_utf8(bytes).map_err(|_| {
             SecretError::BadValue(format!(
                 "secret `{path}` payload is not valid UTF-8 (binary secrets unsupported)"
