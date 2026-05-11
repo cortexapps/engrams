@@ -124,11 +124,17 @@ mod tests {
         let f = Frame::Notify(NotifyKind::Hello {
             host_id: HostId::new(),
             agent_version: "x".into(),
+            wire_version: crate::WIRE_VERSION,
         });
         let msg = encode(&f).unwrap();
         match decode(msg).unwrap() {
-            Frame::Notify(NotifyKind::Hello { agent_version, .. }) => {
-                assert_eq!(agent_version, "x")
+            Frame::Notify(NotifyKind::Hello {
+                agent_version,
+                wire_version,
+                ..
+            }) => {
+                assert_eq!(agent_version, "x");
+                assert_eq!(wire_version, crate::WIRE_VERSION);
             }
             other => panic!("wrong shape: {other:?}"),
         }

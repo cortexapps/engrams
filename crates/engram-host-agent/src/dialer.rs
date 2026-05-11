@@ -108,6 +108,7 @@ async fn connect_once(
         .notify(NotifyKind::Hello {
             host_id,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            wire_version: engram_protocol::WIRE_VERSION,
         })
         .await
         .map_err(|e| std::io::Error::other(format!("hello send failed: {e}")));

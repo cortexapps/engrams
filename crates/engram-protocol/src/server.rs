@@ -28,7 +28,18 @@ use crate::wire::{Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, Str
 pub trait NotifyHandler: Send + Sync {
     /// Called for every `NotifyKind::Hello` (typically once per
     /// connection lifetime). The coordinator binds the host_id here.
-    async fn on_hello(&self, host_id: engram_core::HostId, agent_version: String);
+    ///
+    /// `wire_version` is the host-agent's [`crate::WIRE_VERSION`]
+    /// constant. Implementations should compare it to their own
+    /// `WIRE_VERSION` and log loudly (or refuse subsequent frames)
+    /// on mismatch — bincode is schemaless positional encoding, so
+    /// a mismatch silently misaligns every byte that follows.
+    async fn on_hello(
+        &self,
+        host_id: engram_core::HostId,
+        agent_version: String,
+        wire_version: u32,
+    );
 
     /// Called for each `NotifyKind::Heartbeat`. The coordinator
     /// updates `hosts.last_heartbeat_at` and refreshes its in-memory
@@ -188,7 +199,20 @@ async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, noti
         NotifyKind::Hello {
             host_id,
             agent_version,
-        } => handler.on_hello(host_id, agent_version).await,
+            wire_version,
+        } => {
+            if wire_version != crate::WIRE_VERSION {
+                tracing::error!(
+                    host_id = %host_id,
+                    agent_version = %agent_version,
+                    host_wire_version = wire_version,
+                    coord_wire_version = crate::WIRE_VERSION,
+                    "WIRE-VERSION MISMATCH — host-agent and coordinator are at incompatible wire shapes; \
+                     subsequent frames will misalign. Rebuild both at the same commit, or drain before redeploy.",
+                );
+            }
+            handler.on_hello(host_id, agent_version, wire_version).await
+        }
         NotifyKind::Heartbeat(hb) => {
             let ack = handler.on_heartbeat(hb).await;
             send_frame(&writer, Frame::Notify(NotifyKind::HeartbeatAck(ack))).await;

@@ -22,5 +22,5 @@ pub use heartbeat::*;
 pub use scheduling::*;
 pub use wire::{
     Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, TraceContext,
-    WireExecRequest,
+    WireExecRequest, WIRE_VERSION,
 };

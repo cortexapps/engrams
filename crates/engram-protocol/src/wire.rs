@@ -21,6 +21,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
 
+/// Bumped on every wire-incompatible change to the bincode frame
+/// shape. The dialer ships this in its [`NotifyKind::Hello`] frame;
+/// the coordinator rejects on mismatch. Bincode is positional and
+/// schemaless, so a single mismatched int between coord and host
+/// silently misaligns every subsequent byte — version-gating the
+/// connection is the only safe way to roll mixed-version deploys.
+///
+/// History:
+/// - v1: introduced alongside ADR 0007's chunked-storage rollout.
+///   `SnapshotMetadata.disk_manifest` was the trigger — bincode's
+///   schemaless positional encoding doesn't honor `#[serde(default)]`
+///   the way JSON does, so adding it broke wire compat with any
+///   pre-rollout binary.
+pub const WIRE_VERSION: u32 = 1;
+
 /// Top-level frame on the wire.
 ///
 /// Request/Response frames carry a `req_id` allocated by the side that
@@ -174,10 +189,13 @@ pub enum StreamItem {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NotifyKind {
     /// First frame the host sends after the WS upgrade. The coordinator
-    /// uses `host_id` to route subsequent traffic.
+    /// uses `host_id` to route subsequent traffic and `wire_version`
+    /// to reject mismatched binaries (mid-rollout build skew breaks
+    /// the bincode wire silently otherwise).
     Hello {
         host_id: HostId,
         agent_version: String,
+        wire_version: u32,
     },
     Heartbeat(Heartbeat),
     HeartbeatAck(HeartbeatAck),
@@ -436,6 +454,7 @@ mod tests {
         let f = Frame::Notify(NotifyKind::Hello {
             host_id: host,
             agent_version: "0.1.0".into(),
+            wire_version: WIRE_VERSION,
         });
         let bytes = bincode::serialize(&f).unwrap();
         let back: Frame = bincode::deserialize(&bytes).unwrap();
@@ -443,6 +462,7 @@ mod tests {
             Frame::Notify(NotifyKind::Hello {
                 host_id,
                 agent_version,
+                wire_version: _,
             }) => {
                 assert_eq!(host_id, host);
                 assert_eq!(agent_version, "0.1.0");

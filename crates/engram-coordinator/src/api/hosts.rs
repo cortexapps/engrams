@@ -173,8 +173,20 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
         Ok(Some(NotifyKind::Hello {
             host_id,
             agent_version,
+            wire_version,
         })) => {
-            tracing::info!(host_id = %host_id, %agent_version, "host registered via /api/hosts/connect");
+            if wire_version != engram_protocol::WIRE_VERSION {
+                tracing::error!(
+                    host_id = %host_id,
+                    %agent_version,
+                    host_wire_version = wire_version,
+                    coord_wire_version = engram_protocol::WIRE_VERSION,
+                    "WIRE-VERSION MISMATCH on /api/hosts/connect; rejecting registration. \
+                     Rebuild coordinator + host-agent at the same commit, or drain before redeploy."
+                );
+                return;
+            }
+            tracing::info!(host_id = %host_id, %agent_version, wire_version, "host registered via /api/hosts/connect");
             host_id
         }
         Ok(Some(other)) => {
