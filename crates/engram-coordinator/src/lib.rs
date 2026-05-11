@@ -247,8 +247,32 @@ async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaErr
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("coordinator received ctrl-c, shutting down");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("coordinator received ctrl-c, shutting down");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("coordinator received ctrl-c, shutting down");
+            }
+            _ = term.recv() => {
+                tracing::info!("coordinator received SIGTERM, shutting down");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("coordinator received ctrl-c, shutting down");
+    }
 }
 
 #[derive(Debug)]

@@ -96,15 +96,44 @@ impl HostAgent {
                     tracing::error!(error = %e, "dialer terminated with error");
                 }
             });
-            tokio::signal::ctrl_c().await.map_err(HostAgentError::Io)?;
+            shutdown_signal().await;
             dialer_task.abort();
         } else {
             tracing::info!("no coordinator_endpoint set; standalone dev mode (ctrl-c to exit)");
-            tokio::signal::ctrl_c().await.map_err(HostAgentError::Io)?;
+            shutdown_signal().await;
         }
 
-        tracing::info!("host-agent received ctrl-c, shutting down");
+        tracing::info!("host-agent shutting down");
         Ok(())
+    }
+}
+
+/// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
+/// On non-unix platforms, falls back to ctrl-c only.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("host-agent received ctrl-c");
+            }
+            _ = term.recv() => {
+                tracing::info!("host-agent received SIGTERM");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
