@@ -39,6 +39,7 @@
 //! - `engram-sandbox-vz::disk` — materialize-to-file for macOS dev
 //! - `engram-image-builder` — chunks new image bake outputs
 
+pub mod bootstrap;
 pub mod cache;
 pub mod error;
 pub mod file;
@@ -48,6 +49,7 @@ pub mod resolver;
 pub mod store;
 pub mod working_set;
 
+pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use manifest::{
