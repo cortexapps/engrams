@@ -204,19 +204,18 @@ maturity tiers:
 The following are tracked as "still pending" in the rollout doc
 and have their own deferred-decision notes:
 
-- **Phase 6 trait reshape** — the destructive half of
-  `SandboxBackend::{snapshot,restore}` signatures (drop `&Path`
-  args, switch `SandboxSpec.rootfs_source` → `rootfs:
-  ManifestRef`, bump the wire shape to v3) is the single largest
-  remaining ADR-7 change. The additive surface — `disk_manifest`,
-  `memory_manifest`, `WIRE_VERSION` exchange — is in. The full
-  reshape pairs naturally with retiring the last cold-tier
-  remnants in `SnapshotRecord`.
 - **Observability** — no metrics on the chunked path yet.
   Cache hit rate, chunk fetch latency, materialize time, GC
   counters are all silent in production. Needs a framework
   call on whether the rest of the stack adopts Prometheus
   alongside the existing structured-`tracing` logs.
+- **Phase 6 destructive trait reshape** — shipped.
+  `SandboxBackend::snapshot(id)` (no `dest: &Path`) +
+  `restore(metadata: SnapshotMetadata)` (no `src: PathBuf`) +
+  `snapshot_path_for(id)` accessor. Backends own their own
+  per-snapshot staging dir under `<work_dir>/snapshots/<id>/`.
+  WIRE_VERSION bumped to v4 for the
+  `RequestKind::{Snapshot, Restore}` shape change.
 - **NBD adapter for FC disks** — shipped in this branch
   (`55dd889`, `c770b6f`, `645afd8`, `e4f7500`, `94e9a52`).
   PooledBackend prefers NBD over materialize-to-file when
