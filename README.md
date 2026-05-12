@@ -2,68 +2,245 @@
 
 Self-hosted, open-source orchestrator for ephemeral AI agent sandboxes.
 
-Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: warm pools, snapshot lifecycle (UFFD-backed restore), multi-host scheduling, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS during development; an Apple Silicon backend (Apple Virtualization.framework) gives Mac devs real microVM isolation locally. Production isolation is always Firecracker.
+Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: warm pools, snapshot lifecycle (UFFD-backed restore), multi-host scheduling, a pluggable cloud abstraction, and chunked-immutable content-addressed durability so cross-host migration costs ~1–2 s and `1000 × 4 GiB` sessions consume `~100 GiB` total (canonical + per-session deltas), not `4 TiB`. A subprocess-based dev backend lets the entire orchestration layer run on macOS during development; an Apple Silicon backend (Apple Virtualization.framework) gives Mac devs real microVM isolation locally. Production isolation is always Firecracker.
 
-It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to open source so any organization can run their own without vendor lock-in. See `DESIGN.md` for the full architecture and roadmap.
+It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to open source so any organization can run their own without vendor lock-in.
 
-## Status
+- Architecture details: this README's [Architecture](#architecture) section + [`DESIGN.md`](./DESIGN.md).
+- Decisions: [`docs/adr/`](./docs/adr/) (ADR 0007 is the current storage substrate).
+- What shipped, in order: [`docs/history.md`](./docs/history.md).
+- What's pending / deferred: [`docs/chunked-storage-rollout.md`](./docs/chunked-storage-rollout.md).
+- Operational guide for GCP: [`docs/deploy.md`](./docs/deploy.md).
 
-**Phase 1 — done.** Orchestration layer end-to-end on the dev backend. Coordinator HTTP API, scheduler, warm pool, persistent session-event log with SSE replay (`Last-Event-ID` / `?since=N`), bearer-token auth, image baker (Dockerfile + `engram.toml` → rootfs), pluggable secret store (env / dotenv / GCP Secret Manager), Postgres metadata store. End-to-end create → exec → delete on macOS via `engram-sandbox-process`. CLI covers session list/get/delete/logs and image build.
+## Architecture
 
-**Phase 2 — done.** `engram-sandbox-firecracker` drives real Firecracker microVMs end-to-end: typed HTTP client over the FC unix socket; `create`/`destroy`/`list`/`snapshot`/`restore`/`exec_stream` all wired and exercised by integration tests on a Linux dev VM. `restore` supports both `File` mode (synchronous read of `memory.bin`) and `Uffd` mode (lazy paging via `engram-uffd-handler` — sub-100ms resume). `exec_stream` reaches an in-guest `engram-agentd` over Firecracker's vsock proxy; the image baker injects a static-musl agent + init shim into ext4 rootfs images.
+Three process classes, four storage primitives, three wire surfaces.
 
-**Phase 3 — done.** Multi-host coordinator: host-agents run as a separate binary that dials the coordinator over WebSocket (bincode-over-WS with hand-rolled `request_id` demuxer + W3C trace context per RPC; `--mode=all` keeps single-binary `just dev` working by registering the local backend in-process). The warm `Pool` is host-side (`engram-host-agent::pooled_backend::PooledBackend`), so heartbeats carry real `(ready, target)` per `image_version` and `HostRegistry`'s scheduler ranks by snapshot affinity → warm pool → capacity. `LISTEN/NOTIFY` on `session_events` + `host_dead` lets coordinator replicas re-broadcast events into local SSE subscribers and drop dead hosts in lockstep. The dead-host auto-detector (`crates/engram-coordinator/src/dead_host.rs`) handles `kill -9 host → mark Dead within 30s`, racing replicas via `pg_try_advisory_lock` so exactly one wins each eviction. `sessions.sandbox_id` persistence + `repopulate_routing` on coord startup means Active sessions survive a coordinator restart. `GET /api/hosts` + `engram host list/get/drain` CLI shipped. Production hardening (TLS, `HostStatus::Disconnected`, backpressure tuning) lands with Phase 6.
+### Topology
 
-**Phase 4 — done.** Hot-suspend keeps Firecracker memory snapshots for *local* idle eviction (Track B); harness protocol (`engram-harness-{proto,noop,claude}`) + in-VM supervisor (`engram-bootstrap`) wired end-to-end; preemption best-effort drain (Track D). The Claude Code adapter (`engram-harness-claude`) shipped as the reference adapter and runs end-to-end against real Firecracker microVMs. *Originally framed as "git as the workspace durability primitive"; superseded by ADR 0005 — see Phase 6 below.*
+```
+              ┌───────────────────────────────────────────────────┐
+              │                  Engram Coordinator               │
+              │                  (axum, stateless, N replicas)    │
+              │                                                   │
+   HTTP +     │   - HTTP API: /sessions, /events (SSE), /admin    │
+   SSE  ◄────►│   - Scheduler: snapshot affinity → warm pool      │
+              │     → capacity-fit                                │
+              │   - Idle evictor, dead-host detector,             │
+              │     chunk-store GC scheduler                      │
+              │   - Postgres LISTEN/NOTIFY for cross-replica      │
+              │     event fan-out + dead-host coordination        │
+              └─────────────┬─────────────────────────────────────┘
+                            │ bincode-over-WS, WIRE_VERSION=4
+                            │ (Frame { req_id, trace, kind })
+                            │ Coord ↔ Host: hosts DIAL coord
+                            │ (NAT-friendly; no inbound
+                            │  to host required)
+              ┌─────────────┼─────────────┬─────────────┐
+              ▼             ▼             ▼             ▼
+        ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐
+        │ Host A  │   │ Host B  │   │ Host C  │   │  ...    │
+        │         │   │         │   │         │   │         │
+        │ engram- │   │ engram- │   │ engram- │   │         │
+        │ host-   │   │ host-   │   │ host-   │   │         │
+        │ agent   │   │ agent   │   │ agent   │   │         │
+        │         │   │         │   │         │   │         │
+        │  warm   │   │  warm   │   │  warm   │   │         │
+        │  pool   │   │  pool   │   │  pool   │   │         │
+        │         │   │         │   │         │   │         │
+        │  NBD    │   │  NBD    │   │  NBD    │   │         │
+        │  daemon │   │  daemon │   │  daemon │   │         │
+        │  (FC)   │   │  (FC)   │   │  (FC)   │   │         │
+        │         │   │         │   │         │   │         │
+        │  UFFD   │   │  UFFD   │   │  UFFD   │   │         │
+        │  handlr │   │  handlr │   │  handlr │   │         │
+        │  (FC)   │   │  (FC)   │   │  (FC)   │   │         │
+        │         │   │         │   │         │   │         │
+        │  micro  │   │  micro  │   │  micro  │   │         │
+        │  VMs    │   │  VMs    │   │  VMs    │   │         │
+        └────┬────┘   └────┬────┘   └────┬────┘   └─────────┘
+             │             │             │
+             │  reads/writes              writes
+             │  chunks + manifests        snapshots
+             ▼             ▼             ▼
+        ┌──────────────────────┐    ┌─────────────────────┐
+        │   BlobStorage        │    │  Postgres (managed) │
+        │   (GCS / S3 / local) │    │   - sessions        │
+        │                      │    │   - session_events  │
+        │ - chunks/sha256/…    │    │     (conversation   │
+        │   (immutable, 16 MiB │    │      log + SSE)     │
+        │    disk / 512 KiB    │    │   - snapshots       │
+        │    memory)           │    │     (manifest refs) │
+        │ - manifests/<id>/    │    │   - hosts           │
+        │   v<n>.json          │    │   - enabled_images  │
+        │   (versioned, content│    │   - registry_creds  │
+        │   -addressed)        │    │   - session_secrets │
+        │ - traces/<id>/       │    └─────────────────────┘
+        │   <host>.json        │
+        │   (working-set       │    ┌─────────────────────┐
+        │    prefault hints)   │    │  OCI Registry       │
+        └──────────────────────┘    │  (Artifact Reg /    │
+                                    │   ECR / Docker Hub) │
+                                    │                     │
+                                    │  - bake images      │
+                                    │    (manifest.toml + │
+                                    │     bundle.json +   │
+                                    │     optional        │
+                                    │     rootfs.ext4)    │
+                                    │  - harness packs    │
+                                    └─────────────────────┘
+```
 
-**Phase 4.5 — done (April 2026). Apple Silicon backend.** `engram-sandbox-vz` drives Apple's Virtualization.framework directly from Rust via the `objc2-virtualization` bindings — no Swift driver. Mac contributors get real microVM isolation locally (not just subprocesses). Multi-port virtio-console replaces vsock for the host↔guest control plane (universal kernel support, no `CONFIG_VIRTIO_VSOCKETS=y` requirement) — `engram-transport` is a backend-agnostic trait abstraction over both. APFS `clonefile(2)`-based snapshots replace VZ's broken-upstream `saveMachineStateToURL`/`restoreMachineStateFromURL` pair (~50 ms even for 1.7 GB rootfs); the snapshot is the clone. Cold boot 562 ms, cold resume 746 ms, warm-pool checkout 30 ms — same warm-pool code path as FC. ADR 0003 captures the design.
+### Process classes
 
-**Phase 5 — done.** Registry-backed image + harness distribution (ADR 0004). Bake images and harness packs are pushed to a Docker registry as custom OCI artifacts; the coordinator becomes stateless w.r.t. image data, and host-agents pull on first use into a content-addressable cache. Registry credentials live in Postgres envelope-encrypted under a deployment KEK (`engram-crypto`); `RegistryAuthSpec` is variant-discriminated so static creds, GCP Workload Identity, and future cloud IAM kinds all dispatch through one resolver. `engram registry`/`engram harness` CLI surface; per-deployment local dev via `registry:2` in `docker-compose`.
+**`engram-coordinator`** — stateless HTTP service (axum). Owns the public API, scheduling, idle eviction, dead-host detection, chunk-store GC, the persistent SSE event bus. Backed by Postgres. Multiple replicas behind a load balancer; replicas reconcile via `LISTEN/NOTIFY` on `session_events` + `host_dead` and race via `pg_try_advisory_lock` for exclusive-write operations (dead-host eviction). `--mode=all` registers a local host-agent in-process for single-binary `just dev`.
 
-**Phase 6 — pivot complete (May 2026). Hot+cold snapshot durability + cold-tier blob (ADR 0005).** Git is fully retired from the platform layer. Workspace contents now come exclusively from the bake image's `/workspace`; agents that want to push code do it themselves inside the sandbox using credentials mounted via the existing `[secrets.X]` machinery. Two snapshot tiers replace it: **hot** (FC `memory.bin` + state file on Linux, APFS rootfs clone on VZ — local NVMe, sub-second resume on the same host) and **cold** (tar+zstd of the FC snapshot dir, uploaded via a `BlobStorage` backend — KEK-sealed blob URLs in Postgres). `POST /api/admin/sessions/:id/flush` and `POST /api/admin/flush-idle` expose the flush primitive explicitly; a host-agent disk-pressure detector calls the same `flush_session` primitive on the implicit trigger. `POST /sessions/:id/resume` dispatches three branches: hot (local NVMe), cold (download + untar + restore on any host with capacity), or 410 Gone if both tiers are gone. ADR 0005 captures the pivot end-to-end; ADRs 0001 + 0002 are superseded/amended.
+**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Drives the `SandboxBackend` for one of three production-grade isolation modes (see below). Hosts the warm pool, the harness hub (TCP listener for in-VM harness adapters), the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the egress proxy (ADR 0006). Heartbeats `(capacity, warm_pools, local_snapshots, draining)` every 5 s.
 
-**Phase 7 — production deploy + chunked storage (May 2026, in flight). ADRs 0006 + 0007.** Two intertwined goals shipping together: (a) the durability primitive moves from tar+zstd cold-tier to **chunked-immutable content-addressed storage** — 16 MiB disk chunks + 512 KiB memory chunks in `BlobStorage`, manifests versioned per session, hardware-enforced COW across sessions sharing an image; (b) **cloud-agnostic deployment artifacts** — a Helm chart for the coord, Packer manifest + GCP Terraform reference module for FC hosts. ADR 0007 supersedes the two-tier durability framing of ADR 0005: chunked storage is now the single durability primitive (sessions live ↔ chunks reachable in `BlobStorage`). The read path (host-agent materializes chunked manifest → per-host file → VZ/FC attaches) is live end-to-end on macOS `--mode=all` + Linux FC; the write path (VZ snapshot chunks the rootfs back) ships for VZ today. NBD-streaming (FC disk) + UFFD-from-chunks (FC memory) are the remaining large pieces — sessions still materialize-first and cold-boot from kernel respectively, but everything else works. Rollout is tier-laddered in [`docs/chunked-storage-rollout.md`](docs/chunked-storage-rollout.md); the architectural decision lives in [`docs/adr/0007-chunked-immutable-storage.md`](docs/adr/0007-chunked-immutable-storage.md).
+**In-guest binaries** (live inside each microVM, baked into the rootfs by `engram-image-builder`):
+- `engram-bootstrap` — PID 1's child after the init shim. Listens for `BootstrapLaunch` frames from the host-agent over vsock (FC) / virtio-console (VZ); on each frame, kills the previous harness child and spawns a fresh one. Necessary because the warm-pool spec is agent-blind and because FC snapshot/restore needs a clean re-spawn point on resume.
+- `engram-agentd` — exec daemon. Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `Ping`, `Shutdown`. Token-handshake gated.
+- `engram-harness-{noop,claude}` — the agent runtime (Claude Code or a deterministic test harness). Reports run state + tool calls back through the harness hub.
 
-**494 tests pass** via `cargo nextest run --workspace` (4 ignored: 2 live-Postgres integration tests, 1 entitlement-gated VZ smoke test, 1 live-cloud GCS round-trip), plus 5 Firecracker integration tests on the Linux dev VM and 14 VZ unit tests on macOS Apple Silicon.
+### Storage substrate (ADR 0007)
 
-## Workspace
+Engram's durability primitive is **chunked-immutable content-addressed storage**. Disk + memory state lives as sha256-keyed chunks in any `BlobStorage` backend (GCS / S3 / local fs); manifests are versioned references that point at them.
+
+| Tier | What | Where | Cost model |
+|---|---|---|---|
+| **Persistent** | sha256-keyed chunks (16 MiB disk, 512 KiB memory), versioned manifests, per-host working-set traces | `BlobStorage` impl (GCS / S3 / local) | dedup is automatic (content-addressed); the base image's GiBs are stored once regardless of session count |
+| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | bounded by `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` (default 200 GiB); operator-tuned via Packer / Terraform |
+| **In-memory** | FC's memory.bin canonical mmap (`MAP_PRIVATE`) + per-session UFFD-populated divergent pages | host RAM | hardware-enforced COW; one canonical copy serves N sessions of the same image |
+| **Metadata** | sessions, conversation log, snapshot manifest refs, hosts, secrets | Postgres | managed/backups |
+
+**Three free COW levels** fall out of content-addressing:
+
+1. **Disk COW** — chunks shared by N sessions referencing the same image. Writes produce new chunks; per-session manifest gets new pointers for dirty offsets. The base manifest never changes.
+2. **Memory COW** — image-builder captures a canonical memory snapshot at bake time. Sessions `mmap(addr, len, MAP_PRIVATE, fd, 0)` against the canonical file. Hardware-enforced via the MMU; one canonical copy serves every session of that image.
+3. **Session-fork COW** — `fork_manifest` is a few-KB shallow copy of the parent's chunk list. The data layer is shipped; the `POST /sessions/:id/fork` API endpoint is descriptive only at the chunk-store layer today.
+
+Two consumers turn manifests into running VMs:
+
+- **NBD daemon** (`engram-host-agent::disk_daemon`, Linux + FC only) — serves chunked disks to Firecracker over `/dev/nbdN`. Direct kernel ioctls; no `nbd-client` userspace required. On-demand reads stream from `BlobStorage` via the chunk cache; writes coalesce into per-chunk dirty buffers and flush on snapshot.
+- **UFFD handler** (`engram-uffd-handler`, Linux + FC only) — companion process that owns the `userfaultfd(2)` for the VM's memory region. On page fault, resolves the byte offset to a chunk (either canonical `MAP_PRIVATE` hit or session-divergent chunk fetch) and `UFFDIO_COPY`s the page. Working-set traces record the first-N-seconds chunk-access trace per `(manifest, host)`; subsequent restores prefault those chunks before vCPUs run.
+
+The macOS VZ backend uses `materialize-to-file` instead (chunks → assembled `.ext4` before VM start, APFS `clonefile(2)` for per-sandbox COW); memory chunking is FC-only (VZ's native memory snapshot is broken upstream for arm64 Linux guests).
+
+### Wire protocols
+
+Three protocol layers, each with explicit version negotiation where it matters.
+
+| Layer | From → To | Wire | Versioning |
+|---|---|---|---|
+| **Public API** | clients → coord | JSON over HTTP + SSE | `/v1/` prefix planned |
+| **Control plane** | coord ↔ host-agent | bincode `Frame` over WebSocket | `WIRE_VERSION=4` in `Hello`; mismatch refuses connection |
+| **In-guest** | host-agent ↔ agentd / bootstrap / harness | length-prefixed bincode over vsock (FC) or virtio-console (VZ) | first-frame token handshake |
+| **Image distribution** | host-agent → OCI registry | standard registry pull | OCI media types: `vnd.engram.manifest.v1+toml`, `vnd.engram.rootfs.ext4`, `vnd.engram.bundle.v1+json` |
+| **Storage** | chunk-store ↔ blob backend | `BlobStorage` trait | impl-specific (GCS, S3, local fs) |
+
+**Control plane wire** (`engram-protocol`):
+- `RequestKind`: `CreateSandbox`, `DestroySandbox`, `ListSandboxes`, `ExecStart`, `Snapshot`, `Restore`, `ResolveRegistryAuth` (host→coord for OCI creds), `ReapMaterializeDir` (coord→host for materialize-dir GC fanout).
+- `ResponseKind`: matched 1:1 with `RequestKind`.
+- `StreamItem`: `ExecStdout`, `ExecStderr`, `ExecExit` (terminal). One streaming RPC = one request id; demuxed by `ConnectedHost`.
+- `NotifyKind`: `Hello`, `Heartbeat`, `HeartbeatAck`, `SessionEgressPolicy`.
+
+Wire bumps are deliberate; the history is in `WIRE_VERSION`'s rustdoc.
+
+### Session lifecycle
+
+```
+POST /sessions
+  ↓
+Coord scheduler picks a host:
+  - snapshot affinity (if resuming)
+  - warm-pool match on (image_uri)
+  - capacity-fit
+  ↓
+host-agent.PooledBackend.create(spec)
+  ├─ ImageCache.ensure_image(uri) → CachedImage { bundle }
+  ├─ resolve_rootfs(uri, cached):
+  │   - NBD daemon path (Linux + FC + chunked + ENGRAM_NBD_DEVICES set)
+  │   - materialize-to-file (anywhere else with a chunk_store)
+  │   - legacy rootfs.ext4 (pre-chunked images)
+  └─ inner.create(spec with rootfs_source = resolved_path)
+     ├─ FC: spawn firecracker; PUT machine-config / boot-source /
+     │      drives/rootfs / vsock; PUT actions InstanceStart
+     ├─ VZ: APFS-clone bake rootfs; spawn VZVirtualMachine
+     └─ Process: tokio::process::Command in per-sandbox cwd
+
+POST /sessions/:id/exec
+  ↓
+sandbox.exec_stream(id, ExecRequest)
+  ├─ FC: connect to vsock UDS; CONNECT 1024; WireExecRequest;
+  │      stream WireExecEvent { Stdout, Stderr, Exit }
+  ├─ VZ: same wire shape over virtio-console port 1024
+  └─ Process: spawn child; pipe stdout/stderr → ExecEvent stream
+
+[idle TTL exceeded or POST /sessions/:id/snapshot]
+  ↓
+sandbox.snapshot(id) → SnapshotMetadata { id, disk_manifest, memory_manifest }
+  ├─ FC: PATCH /vm Paused; PUT /snapshot/create; PATCH /vm Resumed
+  ├─ VZ: pause; APFS-clone the rootfs into the snapshot dir; resume
+  └─ Process: tar+gzip the cwd
+  ↓
+PooledBackend wraps:
+  ├─ NBD: backend.flush() → new disk_manifest version
+  ├─ Memory: chunk_file(memory.bin, Memory) → memory_manifest
+  └─ Coord persists metadata on snapshots row
+
+[next exec/prompt/SSE-subscribe]
+  ↓
+ensure_active: status Idle → resume
+  ↓
+sandbox.restore(metadata)
+  ├─ PooledBackend.materialize_memory_if_missing (from chunks if
+  │   host-local cache lost it; cross-host migration case)
+  └─ inner.restore(metadata) → FC PUT /snapshot/load (UFFD or File)
+                              → VZ clone rootfs back, fresh VM
+                              → Process untar
+```
+
+### Workspace
 
 ```
 crates/
   engram-core                       # types, traits, errors. No I/O.
-  engram-protocol                   # wire types: bincode-over-WS Frame protocol (coordinator <-> host)
-  engram-harness-proto              # wire types: harness ↔ host (HarnessEvent / HarnessCommand)
-  engram-harness-noop               # first-party test harness (deterministic event cadence, no real agent)
-  engram-harness-claude             # Claude Code adapter — reference agent harness implementation
-  engram-transport                  # transport abstraction: vsock (FC) / virtio-console (VZ)
-  engram-coordinator                # binary: HTTP API + scheduler + idle evictor
-  engram-host-agent                 # binary: per-host daemon (warm pool, harness hub, flush primitive, disk-pressure detector)
-  engram-image-builder              # binary: warm-image baker (Directory + Ext4 modes)
+  engram-chunk-store                # content-addressed chunks + versioned manifests
+  engram-protocol                   # wire types: bincode-over-WS Frame protocol
+  engram-harness-proto              # wire types: harness ↔ host
+  engram-harness-noop               # first-party test harness
+  engram-harness-claude             # Claude Code adapter — reference agent harness
+  engram-transport                  # vsock (FC) / virtio-console (VZ) abstraction
+  engram-coordinator                # binary: HTTP API + scheduler + GC scheduler
+  engram-host-agent                 # binary: per-host daemon (warm pool, NBD, reaper)
+  engram-image-builder              # binary: warm-image baker (Directory + Ext4)
   engram-cli                        # binary: ops/admin tool
-  engram-agentd                     # binary: in-guest exec daemon (transport-agnostic)
-  engram-bootstrap                  # binary: in-guest supervisor (spawns the harness, handles re-attach)
-  engram-sandbox-firecracker        # SandboxBackend: Firecracker microVMs (Linux production)
-  engram-sandbox-vz                 # SandboxBackend: Apple Virtualization.framework (macOS Apple Silicon dev)
-  engram-sandbox-process            # SandboxBackend: host subprocesses (DEV ONLY, no isolation)
-  engram-uffd-handler               # binary: userfaultfd page-fault handler for fast FC snapshot restore
+  engram-agentd                     # binary: in-guest exec daemon
+  engram-bootstrap                  # binary: in-guest supervisor
+  engram-uffd-handler               # binary: userfaultfd page-fault handler
+  engram-sandbox-firecracker        # SandboxBackend: FC microVMs (Linux production)
+  engram-sandbox-vz                 # SandboxBackend: Apple VZ (macOS Apple Silicon)
+  engram-sandbox-process            # SandboxBackend: subprocesses (DEV ONLY)
   engram-cloud-{gcp,static,mock}    # CloudBackend impls
   engram-secrets-{dev,gcp}          # SecretStore impls (env/dotenv; GCP Secret Manager)
+  engram-storage-{local,gcs,s3}     # BlobStorage impls
+  engram-oci, engram-oci-auth       # OCI registry client + auth resolver
   engram-postgres                   # MetadataStore impl
+  engram-crypto                     # envelope encryption (KEK wrap, registry creds)
+  engram-egress-proxy               # per-host egress proxy (ADR 0006)
 ```
 
-(ADR 0001 retired the `engram-storage-*` (`BlobStorage`) crates entirely; image distribution moves to a Docker registry in Phase 5.)
+### Sandbox backends
 
-## Sandbox backends
-
-The orchestration layer is VMM-agnostic — anything that implements `SandboxBackend` plugs in. We ship three:
+The orchestration layer is VMM-agnostic — anything that implements `SandboxBackend` plugs in. Three ship today:
 
 | Backend | Isolation | Snapshots | Where it runs | When to use |
 |---|---|---|---|---|
 | `engram-sandbox-process` | **None** — host subprocess | Tarball of workdir | Anywhere (macOS, Linux) | Iterating on the orchestration layer without firing up a VMM. |
 | `engram-sandbox-vz` | microVM (Hypervisor.framework) | APFS clone of rootfs | macOS 12+ on Apple Silicon | Mac dev with real microVM isolation. Sub-second cold boot, sub-second cold resume. ADR 0003. |
-| `engram-sandbox-firecracker` | microVM (KVM) | FC memory snapshot + UFFD lazy paging | Linux + KVM | Production. Real isolation, real resource enforcement, sub-100ms hot resume. |
+| `engram-sandbox-firecracker` | microVM (KVM) | FC memory snapshot + UFFD lazy paging + NBD chunked disk | Linux + KVM | Production. Real isolation, real resource enforcement, sub-100ms hot resume. |
 
-`process` and `vz` are dev-side: `process` for the fastest possible iteration loop (no kernel, no VM, plain subprocesses), `vz` for fidelity to the FC code paths (same `engram-bootstrap` supervisor, same `engram-agentd` wire protocol, same warm-pool semantics). Production isolation is always Firecracker.
+`process` and `vz` are dev-side: `process` for the fastest possible iteration loop, `vz` for fidelity to the FC code paths (same `engram-bootstrap` + `engram-agentd` + harness binaries; same warm-pool semantics). Production isolation is always Firecracker.
 
 ## Quick start (dev, macOS or Linux)
 
@@ -125,35 +302,33 @@ just dev-vz             # coordinator wired to the Apple Silicon backend (macOS 
 just clean-var          # rm -rf the local sandbox cwds + snapshots
 ```
 
-## Sessions are bake-image sandboxes with hot+cold snapshot durability
+## Sessions are bake-image sandboxes with chunked-immutable durability
 
 A session is one bounded unit of agent work. It's two things on the wire: an `image` (the OCI URI of a baked rootfs) and an optional `harness` (which agent process to attach). The bake image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
 
-**Chunked-immutable durability (ADR 0007, supersedes ADR 0005's hot+cold tiers).** Sessions' disk + memory state live as content-addressed chunks in a `BlobStorage` backend (GCS / S3 / local fs); manifests are versioned references that point at them. 16 MiB disk chunks + 512 KiB memory chunks, both sha256-keyed. Hardware-enforced COW across sessions sharing an image (MAP_PRIVATE of a canonical memory base); near-free session fork. Cross-host migration is "rebind to target host + materialize the dirty delta" — ~1–2 s per session, the spot/preemption window fits. The tar+zstd hot+cold pipeline retired in Phase 7 (see [the rollout doc](docs/chunked-storage-rollout.md) for what's shipped vs pending).
-
 ```
-create → Active                                          (live VM)
-       → idle TTL → Idle                                 (snapshot taken, chunks in BlobStorage, VM destroyed)
-       → next prompt/exec → Active                       (chunked resume, sub-second on same host)
+create → Active                                            (live VM)
+       → idle TTL → Idle                                   (snapshot taken, chunks in BlobStorage, VM destroyed)
+       → next prompt/exec → Active                         (chunked resume, sub-second on same host)
        ... loop ...
-       → chunked manifests unreachable / hard TTL → Dead (terminal)
+       → chunked manifests unreachable / hard TTL → Dead   (terminal)
 ```
 
 `POST /sessions/:id/resume` is a single-tier dispatcher: **Idle** → restore from the snapshot's chunked manifests (snapshot-affinity-scheduled to the host that captured it); **Dead** → 410 Gone; anything else → 409. `ensure_active` auto-resumes Idle sessions on the next exec/prompt/SSE-subscribe so callers don't have to know whether the session is live or paused.
 
-**Chunk-store GC keeps storage cost bounded.** `POST /api/admin/gc-chunks` enumerates `manifest_id`s referenced by live snapshot rows, deletes chunks unreferenced by any of them (older than `retain_secs`). Paired with `POST /api/admin/reap-materialize-dir` for the per-host assembled-file cache. Operators run both on a cron; same code path as integration tests.
+**Chunk-store GC keeps storage cost bounded.** `engram_coordinator::chunk_gc::spawn` is a background cron (`ENGRAM_CHUNK_GC_INTERVAL_SECS`, default 1h) that fires `chunk_gc::run_once`. `POST /api/admin/gc-chunks` delegates to the same pipeline so explicit-trigger and cron-driver share code. `POST /api/admin/reap-materialize-dir` reaps the per-host assembled-`.ext4` file cache; in `--mode=coordinator` it fans out across every connected host via WS-RPC.
 
 **Agents push code from inside the sandbox** when their task is code-edit-shaped. Mount `GITHUB_TOKEN` (or an SSH key) via the image manifest's `[secrets.GITHUB_TOKEN]` block; the secret flows into the harness's env via the same pipeline that delivers `CLAUDE_CODE_OAUTH_TOKEN`. The platform doesn't care whether the agent runs `git push` or `slack.post()` or anything else — that's the agent's job, not Engram's.
 
 **What survives what:**
 
-| Event | Snapshot residency | Conversation log | In-memory state |
-|---|---|---|---|
-| Hot-suspend (idle eviction, same host) | hot, local NVMe | preserved | preserved (FC `memory.bin`) |
-| Disk-pressure or admin flush | cold, blob storage | preserved | preserved (snapshot bytes) |
-| Cold resume on a different host | local copy materialized on new host; cold blob still there | preserved | preserved (restored from snapshot) |
-| Cold blob deleted / KEK lost / Dead | gone | preserved (Postgres) | lost |
-| Mid-run host crash (no completed snapshot) | gone | up to last persisted event | lost |
+| Event | Disk chunks | Memory chunks | Conversation log | In-memory state |
+|---|---|---|---|---|
+| Hot-resume (same host, NVMe cache hit) | preserved | preserved | preserved | preserved |
+| Resume on a different host | rebuilt from chunks | rebuilt from chunks + canonical mmap | preserved | preserved |
+| Whole-fleet loss (chunks reachable in BlobStorage) | preserved | preserved | preserved | preserved (cold-boot in seconds) |
+| BlobStorage backend lost / Dead | gone | gone | preserved (Postgres) | lost |
+| Mid-run host crash before snapshot | gone | gone | up to last persisted event | lost |
 
 ## Building images
 
@@ -197,6 +372,8 @@ engram image build --repo cortex/api --source ./path/to/repo --format ext4
 
 `--format ext4` produces `<images_dir>/<repo>/<tag>/rootfs.ext4` (a block-device image Firecracker mounts directly), built via `mke2fs -t ext4 -F -d` from the staged Docker export — no loopback mount, no root needed. The `Directory` default produces `<images_dir>/<repo>/<tag>/rootfs/` for the dev backend.
 
+For ADR 0007 chunked storage, the bake also emits a `bundle.json` sidecar pointing at the chunked disk manifest in `BlobStorage`; the OCI push ships the bundle alongside (and skips the redundant `rootfs.ext4` layer when chunked). Opt into bake-time canonical memory capture with `BuildRequest.capture_canonical_memory` if running with FC + KVM available.
+
 Then create a session against it (the coordinator picks up the new tag automatically):
 
 ```bash
@@ -218,6 +395,8 @@ engram session delete <id>
 engram session logs <id> --since 0                    # tail SSE event log; resume after idx
 engram image build --repo <r> --source .              # bake (directory rootfs, default)
 engram image build --repo <r> --source . --format ext4  # bake ext4 image for Firecracker
+engram host list                                      # connected hosts + capacity
+engram host drain <id>                                # mark host draining; migrate sessions away
 ```
 
 `ENGRAM_ENDPOINT` and `ENGRAM_TOKEN` (when auth is on) configure where the CLI talks and what it sends in `Authorization: Bearer ...`. The CLI defaults to `http://localhost:8080`; the `just dev` setup binds to `:8090`, so set `ENGRAM_ENDPOINT=http://localhost:8090` in dev.
@@ -244,19 +423,24 @@ The dev backend is for orchestration iteration. Real Firecracker needs Linux + K
 
 `just dev-firecracker` runs the coordinator against the Firecracker backend. Set `ENGRAM_KERNEL_IMAGE_PATH` to a vmlinux on disk; the rootfs comes from images baked with `--format ext4` (and, for `exec_stream`, with `engram-agentd` injected — see `crates/engram-image-builder/src/lib.rs::AgentInjection`).
 
-The crate ships a five-test integration suite that covers the full surface against real microVMs:
+The crate ships an integration suite that covers the full surface against real microVMs:
 
 ```bash
 # On a Linux + KVM host, after building engram-uffd-handler + engram-agentd:
 bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
 ```
 
-Tests: `boot` (kernel banner on serial), `lifecycle` (create/list/destroy round-trip), `snapshot` (file-backed restore), `snapshot_uffd` (lazy paging via the userfaultfd handler), `exec_real_vm` (bake → boot → exec through in-guest agent over vsock).
+Tests: `boot` (kernel banner on serial), `lifecycle` (create/list/destroy round-trip), `snapshot` (file-backed restore), `snapshot_uffd` (lazy paging via the userfaultfd handler), `exec_real_vm` (bake → boot → exec through in-guest agent over vsock), `nbd_chunked_disk` (chunked disk via NBD daemon), `canonical_capture` (bake-time memory snapshot).
 
 For UFFD-backed restore, the coordinator's host needs:
 - `/dev/userfaultfd` mode 0666 (set via udev rule, see `dev-vm/scripts/bootstrap-remote.sh`)
 - `vm.unprivileged_userfaultfd = 1` sysctl
 - `engram-uffd-handler` binary on `$PATH` (or set `FirecrackerConfig::uffd_handler_bin`)
+
+For NBD chunked disks, the host needs:
+- `CONFIG_BLK_DEV_NBD=y` in the kernel (Ubuntu cloud images — yes)
+- `modprobe nbd nbds_max=<N>` at boot
+- `ENGRAM_NBD_DEVICES=/dev/nbd0,/dev/nbd1,...` set in the host-agent env
 
 For agent-baked images, the coordinator needs:
 - A static-musl `engram-agentd` build:
@@ -269,11 +453,16 @@ For multi-host production (coordinator on GKE behind a load balancer, a pool of 
 
 - **`engram-coordinator --mode=coordinator`** as a stateless K8s `Deployment` with N replicas. Reads its bootstrap secrets (DB URL, KEK, egress-proxy CA, registry tokens) from env via projected k8s Secrets. Liveness probe on `/healthz`, readiness probe on `/readyz` (which pings Postgres). Replicas reconcile via `LISTEN/NOTIFY` and `pg_try_advisory_lock`.
 - **`engram-host-agent --sandbox-backend=firecracker`** on each GCE FC host. Self-registers via `ENGRAM_COORDINATOR_ENDPOINT` over WebSocket; the coordinator never has to reach back. Hosts are NAT-friendly and can come and go without inventory changes.
-- **GCP Secret Manager** via Workload Identity (the coordinator's k8s SA mapped to a GCP SA with `roles/secretmanager.secretAccessor`) backs per-image session secret resolution at session-create time (`--secrets-backend=gcp`).
-- **GCS** for cold-tier snapshot durability (`ENGRAM_BLOB_BACKEND=gcs`). Multi-GB FC `memory.bin` flushes stream through `upload_streamed_object` without materialising in host RAM.
+- **GCP Secret Manager** via Workload Identity (the coordinator's k8s SA mapped to a GCP SA with `roles/secretmanager.secretAccessor`) backs per-image session secret resolution.
+- **GCS** for chunked-storage durability (`ENGRAM_BLOB_BACKEND=gcs`). Multi-GB FC `memory.bin` chunks stream through without materialising in host-agent RAM.
 - **`ENGRAM_LOG_FORMAT=json`** on both binaries for Cloud Logging ingestion.
 
-See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK + egress-proxy CA sourcing path, IAM/Workload-Identity wiring, and the operational gaps (idle auto-eviction, host-agent egress topology) still slated for v2 with their workarounds.
+Deployment artifacts ship in-tree:
+- [`deploy/helm/engram-coordinator/`](./deploy/helm/engram-coordinator/) — Helm chart, cloud-agnostic templates.
+- [`deploy/packer/`](./deploy/packer/) — Packer manifest for the GCE FC host image.
+- [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-mig) + `examples/minimal/`.
+
+See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK + egress-proxy CA sourcing path, IAM/Workload-Identity wiring, and the operational gaps (observability, AWS Terraform, multi-region) still slated for v2 with their workarounds.
 
 ## License
 
