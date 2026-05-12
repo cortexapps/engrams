@@ -40,12 +40,14 @@
 
 pub mod chunked;
 pub mod proto;
+pub mod working_set;
 
 #[cfg(target_os = "linux")]
 pub mod runtime;
 
 pub use chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
 pub use proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
+pub use working_set::WorkingSetRecorder;
 
 #[cfg(target_os = "linux")]
 pub use runtime::{recv_handshake, run_listener, HandlerError, Runtime};
