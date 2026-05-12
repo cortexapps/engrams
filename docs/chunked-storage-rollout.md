@@ -938,6 +938,76 @@ us a regression guard before climbing to Tier 2.
 
 ---
 
+## ADR 0008 migration — chunks-in-OCI (proposed, design phase)
+
+**Status: 0 (design)** — `docs/adr/0008-chunks-in-oci.md`.
+
+The architectural shift: OCI registry becomes the durable
+source of truth for image chunks; BlobStorage becomes a
+regional read-through cache + durable home for snapshot
+chunks. Disk and memory canonical chunks live as OCI layers
+(Nydus-shaped); chunk faults resolve `NVMe → BlobStorage →
+OCI`, with opportunistic write-through fill. The cross-
+namespace bricked-image failure mode (silent 404 on chunk
+fault when bake-time and runtime BlobStorage namespaces
+differ) is the headline thing this fixes.
+
+Snapshot semantics, chunk sizes (16 MiB / 512 KB, disk-
+aligned), and the canonical-memory MAP_PRIVATE primitive are
+unchanged from ADR 0007. The architectural line is
+canonical-vs-per-session, not disk-vs-memory: both canonical
+disk and canonical memory live in OCI; both per-session
+snapshot deltas (disk + memory) stay in BlobStorage.
+
+The migration is gated on ADR 0007's stack landing in
+production and validating real workloads. Rollout sub-
+phases:
+
+1. ⬜ **`ChunkResolver` trait introduced.** Default impl
+   wraps current `BlobStorage` — no behavior change. Clean
+   abstraction point for tiered fetch. Insertion crate:
+   `engram-chunk-store`.
+2. ⬜ **`OciChunkResolver` + Range GET in `engram-oci`.**
+   Fault path falls through to OCI on BlobStorage miss.
+   This phase alone fixes the cross-namespace bricked-image
+   failure mode without any bake-side changes — useful even
+   if later phases stall.
+3. ⬜ **Bake produces Nydus-shaped artifacts.** Image-builder
+   emits `bootstrap.disk + chunks.disk` (and memory
+   counterparts) as OCI layers with new media types
+   (`application/vnd.engram.bootstrap.{disk,memory}.v1+json`,
+   `application/vnd.engram.chunks.{disk,memory}.v1`).
+   `ImageBundle` schema bumps to v2. Scan + SBOM + referrer
+   publish step (OCI 1.1 Referrers API) lands here.
+4. ⬜ **Base/diff layer engineering.** Bake consults parent
+   bootstrap at build time to skip chunks already in the
+   base layer. Preserves cross-image dedup at OCI granularity.
+5. ⬜ **Hybrid image_cache.** Conventional OCI and chunked-
+   OCI artifacts coexist; format detected at pull time;
+   both paths run. Long-term shape for environments that
+   accept external/customer-supplied images.
+
+Gating items / open questions outside this ADR's scope:
+
+- **Per-registry Range-GET validation** (ECR / GAR / GHCR /
+  Harbor known good; Docker Hub + self-hosted distribution
+  vary). Gated in Phase 2.
+- **Scanner integration choice** (Trivy assumed; pipeline
+  is scanner-agnostic). Operator selects per deployment.
+- **Referrer artifact lifecycle and GC per registry** — some
+  registries don't evict referrers when the subject is
+  deleted.
+- **User-facing `[bake.warmup]` knob** for warm-daemon
+  snapshots — separate ADR.
+- **File-level chunking** (Nydus-default; stronger cross-
+  image dedup but blocks VZ's materialize-to-file path) —
+  separate ADR if/when justified.
+
+See ADR 0008 for design rationale, the four-camp analysis,
+the cost/benefit accounting, and the deferred decisions.
+
+---
+
 ## Updating this doc
 
 When you land a commit that touches anything above:
