@@ -489,6 +489,12 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_chunks_survive_eviction() {
+        // LRU comparator is mtime-based; on Linux ext4 (~1ms mtime
+        // resolution) back-to-back puts can land on the same tick
+        // and the eviction order ties non-deterministically. Sleep
+        // between writes so timestamps definitely differ — same
+        // pattern as `budget_triggers_lru_eviction` /
+        // `clear_pins_releases_all`.
         let (cache, _store, _b, _c) = setup(20).await;
         let a = b"aaaaaaaaaa";
         let b = b"bbbbbbbbbb";
@@ -498,7 +504,9 @@ mod tests {
         let hc = ChunkHash::of(c);
         cache.put(ha, a).await.unwrap();
         cache.pin(ha);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         cache.put(hb, b).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // Putting c pushes us to 30; eviction targets the oldest
         // un-pinned (b), not the pinned a.
         cache.put(hc, c).await.unwrap();
