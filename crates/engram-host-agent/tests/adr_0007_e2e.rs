@@ -267,6 +267,8 @@ impl E2eFixture {
             schema_version: 1,
             disk_manifest: disk_ref,
             canonical_memory_manifest: Some(canonical_ref),
+            bootstrap_disk_available: false,
+            bootstrap_memory_available: false,
         };
         (bundle, canonical_bytes)
     }

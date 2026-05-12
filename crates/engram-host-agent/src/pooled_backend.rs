@@ -1020,6 +1020,8 @@ mod tests {
             schema_version: 1,
             disk_manifest: mref,
             canonical_memory_manifest: None,
+            bootstrap_disk_available: false,
+            bootstrap_memory_available: false,
         };
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());
@@ -1517,6 +1519,8 @@ mod tests {
             schema_version: 1,
             disk_manifest: mref,
             canonical_memory_manifest: None,
+            bootstrap_disk_available: false,
+            bootstrap_memory_available: false,
         };
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());

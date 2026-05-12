@@ -120,10 +120,28 @@ impl ImageCache {
                     } else {
                         None
                     };
+                    // ADR 0008 Phase 3: discover Nydus-shaped
+                    // sidecars from the cache directory. The pull
+                    // path writes them out; cache hits just
+                    // re-probe their presence. Blob digests are
+                    // stored in `chunks_disk.blob.digest` /
+                    // `chunks_memory.blob.digest` (sidecar files
+                    // written at pull time — see below).
+                    let disk_bootstrap_path = optional_path(&dir.join("bootstrap.disk.json")).await;
+                    let disk_chunks_blob_digest =
+                        read_digest_sidecar(&dir.join("chunks.disk.blob.digest")).await;
+                    let memory_bootstrap_path =
+                        optional_path(&dir.join("bootstrap.memory.json")).await;
+                    let memory_chunks_blob_digest =
+                        read_digest_sidecar(&dir.join("chunks.memory.blob.digest")).await;
                     return Ok(CachedImage {
                         manifest_path,
                         rootfs_path: has_rootfs.then_some(rootfs_path),
                         bundle,
+                        disk_bootstrap_path,
+                        disk_chunks_blob_digest,
+                        memory_bootstrap_path,
+                        memory_chunks_blob_digest,
                         digest,
                     });
                 }
@@ -165,10 +183,44 @@ impl ImageCache {
         let bundle = read_bundle(&final_dir.join("bundle.json")).await?;
         let rootfs_path = final_dir.join("rootfs.ext4");
         let rootfs_present = fs::try_exists(&rootfs_path).await.unwrap_or(false);
+
+        // ADR 0008 Phase 3: PulledImage carries the bootstrap layer
+        // paths and chunk-blob digests for Nydus-shaped artifacts.
+        // The bootstrap files are already on disk (`pull_image`
+        // writes them); we additionally persist the blob digests as
+        // small sidecar files so cache-hit reads can recover them
+        // without re-pulling.
+        let disk_bootstrap_path = pulled
+            .disk_bootstrap_path
+            .as_ref()
+            .map(|_| final_dir.join("bootstrap.disk.json"))
+            .filter(|p| p.exists());
+        let disk_chunks_blob_digest = pulled.disk_chunks_blob_digest.clone();
+        if let Some(d) = &disk_chunks_blob_digest {
+            fs::write(final_dir.join("chunks.disk.blob.digest"), d.as_bytes())
+                .await
+                .map_err(CacheError::Io)?;
+        }
+        let memory_bootstrap_path = pulled
+            .memory_bootstrap_path
+            .as_ref()
+            .map(|_| final_dir.join("bootstrap.memory.json"))
+            .filter(|p| p.exists());
+        let memory_chunks_blob_digest = pulled.memory_chunks_blob_digest.clone();
+        if let Some(d) = &memory_chunks_blob_digest {
+            fs::write(final_dir.join("chunks.memory.blob.digest"), d.as_bytes())
+                .await
+                .map_err(CacheError::Io)?;
+        }
+
         Ok(CachedImage {
             manifest_path: final_dir.join("manifest.toml"),
             rootfs_path: rootfs_present.then_some(rootfs_path),
             bundle,
+            disk_bootstrap_path,
+            disk_chunks_blob_digest,
+            memory_bootstrap_path,
+            memory_chunks_blob_digest,
             digest,
         })
     }
@@ -484,11 +536,39 @@ pub struct CachedImage {
     /// adapters; today it's plumbed through so adopters can find
     /// the chunk-store reference without re-reading the file.
     pub bundle: Option<ImageBundle>,
+    /// ADR 0008 Phase 3: path to the disk-side bootstrap layer when
+    /// the artifact is Nydus-shaped. `Some` enables the
+    /// `TieredChunkResolver` (cache → OCI) fault path; `None` means
+    /// the artifact predates ADR 0008 and consumers fall back to
+    /// BlobStorage-only resolution via `bundle.disk_manifest`.
+    pub disk_bootstrap_path: Option<PathBuf>,
+    /// ADR 0008 Phase 3: OCI layer digest of the disk chunk blob.
+    /// Paired with `disk_bootstrap_path`; required to Range-GET
+    /// chunks. Not the per-chunk sha256 — that's per-entry in the
+    /// bootstrap.
+    pub disk_chunks_blob_digest: Option<String>,
+    /// ADR 0008 Phase 3: memory-side counterparts. `Some` iff the
+    /// bake captured canonical memory AND emitted Nydus-shaped
+    /// memory layers.
+    pub memory_bootstrap_path: Option<PathBuf>,
+    pub memory_chunks_blob_digest: Option<String>,
     pub digest: String,
 }
 
-/// Parsed contents of the ADR 0007 `bundle.json` sidecar shipped
-/// with an OCI image artifact.
+/// Parsed contents of the `bundle.json` sidecar shipped with an OCI
+/// image artifact.
+///
+/// Two on-disk shapes, deserialized into one struct:
+///
+/// - **v1** (ADR 0007): `schema_version: 1`, carries
+///   `disk_manifest` + `canonical_memory_manifest`. Disk bytes
+///   resolve through BlobStorage via the chunk store.
+/// - **v2** (ADR 0008 Phase 3): `schema_version: 2`, all v1 fields
+///   plus `bootstrap_disk_available` / `bootstrap_memory_available`
+///   flags signaling that Nydus-shaped sidecar layers exist in the
+///   OCI artifact. The actual bootstrap file paths and chunk-blob
+///   digests live on `CachedImage` (populated by the image_cache at
+///   pull time from `PulledImage`).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ImageBundle {
     pub schema_version: u32,
@@ -502,6 +582,17 @@ pub struct ImageBundle {
     /// sessions still work but pay session-private memory cost.
     #[serde(default)]
     pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
+    /// ADR 0008 Phase 3: bake produced Nydus-shaped disk layers
+    /// alongside the chunked manifest. v1 readers ignore (defaults
+    /// to false via `#[serde(default)]`); v2 readers pair this with
+    /// the `CachedImage::disk_bootstrap_path` populated at pull.
+    #[serde(default)]
+    pub bootstrap_disk_available: bool,
+    /// ADR 0008 Phase 3: same flag for the memory side. Only set
+    /// when canonical memory was captured at bake AND emitted as
+    /// chunked OCI layers.
+    #[serde(default)]
+    pub bootstrap_memory_available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -566,7 +657,10 @@ async fn read_bundle(path: &Path) -> Result<Option<ImageBundle>, CacheError> {
     let bytes = fs::read(path).await.map_err(CacheError::Io)?;
     let bundle: ImageBundle = serde_json::from_slice(&bytes)
         .map_err(|e| CacheError::Bundle(format!("{}: {e}", path.display())))?;
-    if bundle.schema_version != 1 {
+    // ADR 0007: schema v1. ADR 0008 Phase 3: schema v2. v2's extra
+    // fields default-deserialize cleanly into v1 readers (#[serde
+    // (default)] on the optional fields).
+    if bundle.schema_version > 2 {
         return Err(CacheError::Bundle(format!(
             "{}: unsupported schema_version {}",
             path.display(),
@@ -574,6 +668,28 @@ async fn read_bundle(path: &Path) -> Result<Option<ImageBundle>, CacheError> {
         )));
     }
     Ok(Some(bundle))
+}
+
+/// Wrap a path in `Option<PathBuf>` based on existence — small
+/// helper used by `ensure_image`'s cache-hit path to discover
+/// optional Nydus-shaped sidecars without panicking.
+async fn optional_path(path: &Path) -> Option<PathBuf> {
+    if fs::try_exists(path).await.unwrap_or(false) {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Read a digest sidecar file written by `ensure_image` at pull
+/// time — a single line containing the `sha256:<hex>` digest of an
+/// OCI chunk-blob layer. Returns `None` if the sidecar is absent
+/// (the cache entry predates ADR 0008 Phase 3 or the artifact
+/// wasn't Nydus-shaped).
+async fn read_digest_sidecar(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).await.ok()?;
+    let s = std::str::from_utf8(&bytes).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 #[derive(Debug)]
@@ -846,7 +962,7 @@ mod tests {
     async fn read_bundle_rejects_unsupported_schema_version() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bundle.json");
-        // schema_version 99 — we only know v1.
+        // schema_version 99 — we only know v1/v2.
         fs::write(
             &path,
             br#"{"schema_version":99,"disk_manifest":{"manifest_id":"00000000-0000-0000-0000-000000000000","version":1}}"#,
@@ -858,6 +974,59 @@ mod tests {
             CacheError::Bundle(msg) => assert!(msg.contains("schema_version")),
             other => panic!("expected Bundle error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_bundle_parses_well_formed_v2_with_bootstrap_flags() {
+        // ADR 0008 Phase 3: v2 bundles carry bootstrap availability
+        // flags. They must round-trip through the deserializer
+        // alongside the v1 fields.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.json");
+        let manifest_ref = engram_chunk_store::ManifestRef::new();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "disk_manifest": manifest_ref,
+                "canonical_memory_manifest": null,
+                "bootstrap_disk_available": true,
+                "bootstrap_memory_available": false,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let got = read_bundle(&path).await.unwrap().expect("bundle present");
+        assert_eq!(got.schema_version, 2);
+        assert_eq!(got.disk_manifest, manifest_ref);
+        assert!(got.bootstrap_disk_available);
+        assert!(!got.bootstrap_memory_available);
+        assert!(got.canonical_memory_manifest.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bundle_v1_defaults_bootstrap_flags_to_false() {
+        // A v1 bundle (no bootstrap fields) still deserializes —
+        // serde defaults the new fields to `false`. Ensures forward
+        // compat: older bakes don't break v2 readers.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.json");
+        let manifest_ref = engram_chunk_store::ManifestRef::new();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "disk_manifest": manifest_ref,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let got = read_bundle(&path).await.unwrap().expect("bundle present");
+        assert_eq!(got.schema_version, 1);
+        assert!(!got.bootstrap_disk_available);
+        assert!(!got.bootstrap_memory_available);
     }
 
     /// CA fingerprint should be deterministic (same PEM → same
