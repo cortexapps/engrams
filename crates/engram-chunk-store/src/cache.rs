@@ -509,6 +509,12 @@ mod tests {
 
     #[tokio::test]
     async fn clear_pins_releases_all() {
+        // LRU comparator is mtime-based, and Linux ext4's mtime
+        // resolution is ~1ms. Without the sleep between puts, the
+        // three writes can land on the same mtime tick — the
+        // tie-breaker is then implementation-dependent and the
+        // assertion below races. Mirrors the `budget_triggers_lru_eviction`
+        // pattern that intentionally separates put timestamps.
         let (cache, _s, _b, _c) = setup(20).await;
         let a = b"aaaaaaaaaa";
         let b = b"bbbbbbbbbb";
@@ -519,7 +525,9 @@ mod tests {
         cache.put(ha, a).await.unwrap();
         cache.pin(ha);
         cache.clear_pins();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         cache.put(hb, b).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         cache.put(hc, c).await.unwrap();
         // With pin released, a (oldest) gets evicted.
         assert!(!cache.contains(ha).await);
