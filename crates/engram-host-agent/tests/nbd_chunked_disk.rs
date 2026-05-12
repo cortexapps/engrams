@@ -87,7 +87,11 @@ fn preflight() -> Option<(PathBuf, PathBuf, PathBuf)> {
     }
     // Check the daemon can open the device — fails-fast if perms
     // aren't right rather than letting the daemon error opaquely.
-    match std::fs::OpenOptions::new().read(true).write(true).open(&nbd_path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&nbd_path)
+    {
         Ok(_) => {}
         Err(e) => {
             eprintln!(
@@ -151,8 +155,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     //    serving the just-chunked manifest. The returned
     //    NbdSandboxState owns the live daemon + slot lease; drop
     //    cleanly tears down.
-    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()])
-        .expect("build slot pool");
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("build slot pool");
     let nbd_state = attach_manifest(manifest_ref, cache, store.clone(), &pool)
         .await
         .expect("spawn NBD daemon against /dev/nbd0");
@@ -175,7 +178,10 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
             break;
         }
         if std::time::Instant::now() > nbd_ready_deadline {
-            panic!("NBD device {} did not become readable", nbd_device.display());
+            panic!(
+                "NBD device {} did not become readable",
+                nbd_device.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

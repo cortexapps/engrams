@@ -23,6 +23,12 @@ engram-oci.workspace = true
 engram-postgres.workspace = true
 engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
+# ADR 0007 Phase 5: bake-time canonical memory capture re-uses
+# `FirecrackerBackend` to boot the just-built rootfs once at bake
+# time and snapshot `memory.bin`. FC has only a dev-dep on
+# image-builder (for its integration tests that bake fixtures),
+# so the dep graph stays acyclic.
+engram-sandbox-firecracker.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -34,8 +40,9 @@ tracing-subscriber.workspace = true
 toml.workspace = true
 uuid.workspace = true
 
+tempfile = "3"
+
 [dev-dependencies]
 engram-storage-local.workspace = true
 parking_lot.workspace = true
-tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt"] }

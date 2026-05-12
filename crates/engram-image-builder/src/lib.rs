@@ -74,18 +74,54 @@ pub struct BuildRequest {
     /// host's `exec_stream` reaches the in-guest agent over vsock.
     pub agent_injection: Option<AgentInjection>,
     /// ADR 0007 Phase 5: pre-computed canonical-base memory
-    /// manifest. The image-builder normally captures this itself
-    /// by booting the rootfs once at bake time and chunking the
-    /// post-init `memory.bin` — but the bake-time capture step
-    /// requires FC + KVM on the runner, which not every CI lane
-    /// has. Callers that bake on a non-KVM runner can pre-compute
-    /// the canonical manifest separately (e.g. on a sidecar
-    /// Linux+KVM job) and pass it through here. `None` skips the
-    /// canonical write to `bundle.json`, so sessions of this
-    /// image pay session-private memory cost at restore time.
-    /// Also `None` until `capture_canonical_memory` (the
-    /// post-build FC boot+pause+chunk pipeline) ships.
+    /// manifest. Two ways callers populate this:
+    ///
+    ///  1. Pre-computed by an external pipeline (sidecar Linux+KVM
+    ///     job) and passed in directly.
+    ///  2. Auto-captured at bake time by setting
+    ///     [`capture_canonical_memory`] — the baker boots the
+    ///     just-built rootfs via FC, pauses after `boot_wait`,
+    ///     snapshots `memory.bin`, chunks it into the store, and
+    ///     fills this field with the resulting [`ManifestRef`].
+    ///
+    /// `None` skips the canonical write to `bundle.json`, so
+    /// sessions of this image pay session-private memory cost at
+    /// restore time (functionally correct, no cross-VM dedup).
     pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
+    /// ADR 0007 Phase 5: opt-in bake-time canonical memory
+    /// capture. When `Some`, the baker reuses
+    /// `FirecrackerBackend::create` + `snapshot` to boot the
+    /// just-built rootfs, wait for it to settle, and capture
+    /// `memory.bin`. The bytes get chunked into the chunk store
+    /// and the resulting [`ManifestRef`] populates
+    /// `bundle.json::canonical_memory_manifest`. Requires FC +
+    /// `/dev/kvm` on the runner; non-KVM CI lanes set this
+    /// `None` and rely on the pre-computed path above.
+    pub capture_canonical_memory: Option<CanonicalCaptureConfig>,
+}
+
+/// Bake-time canonical memory capture parameters. ADR 0007 Phase 5.
+#[derive(Clone, Debug)]
+pub struct CanonicalCaptureConfig {
+    /// Path to the FC kernel image (vmlinux). The same artifact
+    /// the production FC host uses; image-builder boots a transient
+    /// VM with it.
+    pub kernel_image_path: PathBuf,
+    /// `firecracker` binary. Defaults to PATH lookup in
+    /// `FirecrackerConfig::with_kernel`; override here when CI
+    /// pins a specific build.
+    pub firecracker_bin: Option<PathBuf>,
+    /// How long to wait after `InstanceStart` before snapshotting.
+    /// Production bakes pair this with a sentinel file the in-VM
+    /// init script writes; for v1 we use a fixed wait that's
+    /// generous enough for typical Python/Node images to reach
+    /// steady state (5–10 s post-boot).
+    pub boot_wait: std::time::Duration,
+    /// Guest RAM. The canonical snapshot's `memory.bin` size is
+    /// dominated by this — the chunked-storage compression ratio
+    /// means it's fine to grant generously. Defaults to 512 MiB
+    /// when caller passes `None`.
+    pub memory_mib: Option<u32>,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -312,6 +348,11 @@ pub struct BuildOutcome {
     /// per-sandbox disks via NBD (Linux+FC) or materialize-to-
     /// file (macOS+VZ).
     pub disk_manifest: Option<engram_chunk_store::ManifestRef>,
+    /// ADR 0007 Phase 5: bake-time canonical-base memory
+    /// manifest. `Some` when the baker captured a post-init
+    /// `memory.bin` via FC + chunked it; `None` when capture
+    /// was skipped. Mirrors `bundle.json::canonical_memory_manifest`.
+    pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
     /// Size of `rootfs_path` on disk.
     pub size_bytes: u64,
 }
@@ -605,13 +646,181 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             }
         };
 
+        // ADR 0007 Phase 5: bake-time canonical memory capture.
+        // Three branches:
+        //   1. Caller supplied a pre-computed ref → use it as is.
+        //   2. Caller enabled auto-capture AND we have an ext4
+        //      rootfs (canonical only makes sense on FC) → boot
+        //      the rootfs once + chunk memory.bin.
+        //   3. Otherwise → None (sessions pay session-private
+        //      memory cost at restore, functionally correct).
+        let canonical_memory_manifest = if req.canonical_memory_manifest.is_some() {
+            req.canonical_memory_manifest
+        } else if let (Some(capture_cfg), Some(_disk_ref)) =
+            (req.capture_canonical_memory.as_ref(), disk_manifest)
+        {
+            match self
+                .capture_canonical_memory(&rootfs_path, capture_cfg)
+                .await
+            {
+                Ok(mref) => {
+                    tracing::info!(
+                        repo = %req.repo,
+                        tag = %req.tag,
+                        manifest = %mref,
+                        "captured canonical memory manifest at bake time"
+                    );
+                    Some(mref)
+                }
+                Err(e) => {
+                    // Capture is best-effort: if FC + KVM aren't
+                    // available, the bake still ships with a valid
+                    // disk_manifest. Operators on KVM-capable
+                    // runners get the canonical perf boost; CI
+                    // lanes without it ship anyway.
+                    tracing::warn!(
+                        repo = %req.repo,
+                        tag = %req.tag,
+                        error = %e,
+                        "canonical memory capture failed; bundle.json will omit canonical_memory_manifest"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Re-write bundle.json now that we know whether the
+        // canonical memory ref is set. The earlier write inside
+        // the Ext4 branch already wrote a baseline bundle; this
+        // is the canonical-aware overwrite.
+        if let Some(disk_ref) = disk_manifest {
+            let bundle = serde_json::json!({
+                "schema_version": 1,
+                "disk_manifest": disk_ref,
+                "canonical_memory_manifest": canonical_memory_manifest,
+            });
+            tokio::fs::write(
+                image_dir.join("bundle.json"),
+                serde_json::to_vec_pretty(&bundle)
+                    .map_err(|e| BuildError::Config(format!("bundle.json: {e}")))?,
+            )
+            .await?;
+        }
+
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
             manifest_path,
             rootfs_path,
             disk_manifest,
+            canonical_memory_manifest,
             size_bytes: total_size,
         })
+    }
+
+    /// Boot the just-baked rootfs via FC, wait `boot_wait`, then
+    /// snapshot `memory.bin` and chunk it into the chunk store.
+    /// Returns the [`ManifestRef`] suitable for stamping on
+    /// `bundle.json::canonical_memory_manifest`.
+    ///
+    /// Requires:
+    /// - `/dev/kvm` accessible to the bake user (the dev VM, the
+    ///   Blacksmith nested-virt runner, or a bare-metal builder)
+    /// - The `firecracker` binary on PATH (or `capture_cfg.
+    ///   firecracker_bin` set)
+    ///
+    /// The bake VM has **no networking** — `net_pool = None` —
+    /// and runs `init=/bin/bash` by default. Operators baking
+    /// agentd-injected images that need to reach steady-state
+    /// before snapshotting should set `boot_wait` proportionally
+    /// (5–10 s for typical Python/Node, longer for heavy
+    /// services). A sentinel-file detector is the right v2.
+    pub async fn capture_canonical_memory(
+        &self,
+        rootfs_path: &Path,
+        capture_cfg: &CanonicalCaptureConfig,
+    ) -> Result<engram_chunk_store::ManifestRef, BuildError> {
+        use engram_chunk_store::ManifestKind;
+        use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+        use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
+
+        let work = tempfile::tempdir()
+            .map_err(|e| BuildError::Config(format!("canonical bake tempdir: {e}")))?;
+
+        let mut fc_cfg = FirecrackerConfig::with_kernel(&capture_cfg.kernel_image_path);
+        if let Some(bin) = &capture_cfg.firecracker_bin {
+            fc_cfg.firecracker_bin = bin.clone();
+        }
+        // Bake-time isolation: no networking, no egress proxy.
+        // The image is supposed to reach steady state on local
+        // resources only.
+        fc_cfg.net_pool = None;
+        fc_cfg.egress_proxy_port = None;
+        // Boot to a shell — init shim isn't required for the
+        // memory snapshot, just enough kernel + userspace to
+        // reach steady state.
+        fc_cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+
+        let backend = FirecrackerBackend::new(work.path(), fc_cfg);
+
+        let spec = SandboxSpec {
+            image: format!("canonical-bake:{}", uuid::Uuid::new_v4().simple()),
+            rootfs_source: Some(rootfs_path.to_path_buf()),
+            image_uri: None,
+            harness_pack_uri: None,
+            cpu: CpuLimit { vcpus: 1 },
+            memory: MemoryLimit {
+                max_mib: capture_cfg.memory_mib.unwrap_or(512),
+            },
+            disk: DiskLimit { max_gib: 4 },
+            ttl: None,
+            env: Default::default(),
+            workdir: None,
+            harness_substrate: None,
+            network: Default::default(),
+            canonical_memory_manifest: None,
+        };
+
+        let sandbox_id = engram_core::traits::SandboxBackend::create(&backend, spec)
+            .await
+            .map_err(|e| BuildError::Config(format!("canonical bake create: {e}")))?;
+
+        // Wait for steady state. Production v2 will replace this
+        // with a sentinel file the init script writes (the agentd
+        // injection shim writes /run/engram/agentd-ready); v1's
+        // fixed wait works for any rootfs.
+        tokio::time::sleep(capture_cfg.boot_wait).await;
+
+        let snap_dir = work.path().join("canonical-snap");
+        let _metadata =
+            engram_core::traits::SandboxBackend::snapshot(&backend, sandbox_id, &snap_dir)
+                .await
+                .map_err(|e| BuildError::Config(format!("canonical bake snapshot: {e}")))?;
+
+        // Snapshot wrote memory.bin into snap_dir. Chunk it into
+        // the store.
+        let memory_bin = snap_dir.join("memory.bin");
+        let memory_manifest = self
+            .chunk_store
+            .chunk_file(&memory_bin, ManifestKind::Memory, None)
+            .await
+            .map_err(|e| BuildError::Config(format!("chunk canonical memory.bin: {e}")))?;
+        let manifest_ref = engram_chunk_store::ManifestRef::new();
+        self.chunk_store
+            .put_manifest(manifest_ref, &memory_manifest)
+            .await
+            .map_err(|e| BuildError::Config(format!("put canonical manifest: {e}")))?;
+
+        // Cleanup: destroy the bake VM. Errors are logged but
+        // don't fail the capture — the manifest is already in
+        // the store. A leaked VM gets reaped at process exit
+        // via FC's kill_on_drop on the spawned firecracker child.
+        if let Err(e) = engram_core::traits::SandboxBackend::destroy(&backend, sandbox_id).await {
+            tracing::warn!(error = %e, "canonical bake VM destroy failed; FC child cleanup is kill-on-drop");
+        }
+
+        Ok(manifest_ref)
     }
 
     /// Push a freshly-baked image (output of [`Self::build`]) to a

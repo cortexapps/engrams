@@ -122,6 +122,7 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         // `--inject-agent` flag is a CLI ergonomics task for later.
         agent_injection: None,
         canonical_memory_manifest: None,
+        capture_canonical_memory: None,
     };
 
     let docker = match opts.docker_bin {

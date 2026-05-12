@@ -274,6 +274,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
                 init_script: None,
                 bootstrap_binary: None,
                 canonical_memory_manifest: None,
+                capture_canonical_memory: None,
             }),
         })
         .await
@@ -315,6 +316,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         harness_substrate: Some(substrate_path),
         network: Default::default(),
         canonical_memory_manifest: None,
+        capture_canonical_memory: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create");
     // Poll for guest_ip — the in-VM agent takes a few seconds to

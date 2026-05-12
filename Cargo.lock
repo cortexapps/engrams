@@ -1079,6 +1079,7 @@ dependencies = [
  "engram-core",
  "engram-oci",
  "engram-postgres",
+ "engram-sandbox-firecracker",
  "engram-storage-gcs",
  "engram-storage-local",
  "parking_lot",

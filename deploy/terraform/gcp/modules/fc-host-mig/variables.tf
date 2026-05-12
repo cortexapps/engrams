@@ -105,6 +105,19 @@ variable "warm_pool_size" {
   default     = 2
 }
 
+variable "nbd_slots" {
+  type        = number
+  description = <<-EOT
+    ADR 0007 Phase 4. Number of /dev/nbdN devices the host-agent
+    allocates from when serving chunked disks via the NBD daemon.
+    Must be ≤ `nbds_max` set on the kernel `nbd` module
+    (Packer image pins 64). Setting 0 disables NBD and falls back
+    to the materialize-to-file path (slower cold start, still
+    correct).
+  EOT
+  default     = 16
+}
+
 variable "egress_proxy_port" {
   type        = number
   description = "TCP port the per-host egress proxy binds. 0 disables egress filtering (NOT recommended in prod)."

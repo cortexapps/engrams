@@ -198,6 +198,17 @@ build {
       # Ensure kvm + nbd modules load at boot on the deployed VM.
       "echo kvm | sudo tee /etc/modules-load.d/engram-kvm.conf",
       "echo nbd | sudo tee /etc/modules-load.d/engram-nbd.conf",
+      # ADR 0007 Phase 4: the NBD daemon allocates from a fixed
+      # pool of /dev/nbdN devices, sized at modprobe time. 64
+      # gives us comfortable headroom for high-density hosts;
+      # operators reduce via /etc/modprobe.d/engram-nbd-tuning.conf
+      # if they want fewer slots.
+      "echo 'options nbd nbds_max=64' | sudo tee /etc/modprobe.d/engram-nbd-tuning.conf",
+      # The host-agent runs as root so default 0660 permissions
+      # are fine; document the device name format for operators
+      # who later want to scope it to a non-root user.
+      "echo '# ADR 0007 Phase 4 NBD devices created by `nbd` module' | sudo tee /etc/udev/rules.d/90-engram-nbd.rules",
+      "echo 'KERNEL==\"nbd*\", GROUP=\"root\", MODE=\"0660\"' | sudo tee -a /etc/udev/rules.d/90-engram-nbd.rules",
     ]
   }
 

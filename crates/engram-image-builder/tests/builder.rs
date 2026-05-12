@@ -177,6 +177,7 @@ fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest 
         format: Format::Directory,
         agent_injection: None,
         canonical_memory_manifest: None,
+        capture_canonical_memory: None,
     }
 }
 

@@ -120,6 +120,7 @@ ENGRAM_EGRESS_PROXY_PORT=${var.egress_proxy_port}
 ENGRAM_EGRESS_CA_SOURCE=${var.egress_ca_source}
 ${var.egress_ca_gcp_cert_secret == "" ? "" : "ENGRAM_EGRESS_CA_GCP_CERT_SECRET=${var.egress_ca_gcp_cert_secret}"}
 ${var.egress_ca_gcp_key_secret == "" ? "" : "ENGRAM_EGRESS_CA_GCP_KEY_SECRET=${var.egress_ca_gcp_key_secret}"}
+${var.nbd_slots > 0 ? "ENGRAM_NBD_DEVICES=${join(",", [for i in range(var.nbd_slots) : "/dev/nbd${i}"])}" : ""}
 EOF
       systemctl daemon-reload
       systemctl restart engram-host-agent.service

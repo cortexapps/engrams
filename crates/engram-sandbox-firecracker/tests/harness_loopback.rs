@@ -123,6 +123,7 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
                 init_script: None,
                 bootstrap_binary: Some(bootstrap_bin),
                 canonical_memory_manifest: None,
+                capture_canonical_memory: None,
             }),
         })
         .await
@@ -225,6 +226,7 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
         harness_substrate: Some(substrate_path),
         network: Default::default(),
         canonical_memory_manifest: None,
+        capture_canonical_memory: None,
     };
     let sandbox_id: SandboxId = backend.create(sandbox_spec).await.expect("create");
 
