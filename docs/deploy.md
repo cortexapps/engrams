@@ -42,8 +42,10 @@ reflect chunks-in-`BlobStorage` rather than the legacy "hot tier
 | `ENGRAM_KEK_MASTER_KEY`        | 32-byte master KEK, base64-encoded (see below)                       |
 | `ENGRAM_CLOUD_BACKEND=gcp`     | Enables GCP-specific metadata-server probes                          |
 | `ENGRAM_SANDBOX_BACKEND=firecracker` | Coordinator scheduling assumes FC hosts                        |
-| `ENGRAM_BLOB_BACKEND=gcs`      | Cold-tier flush target                                               |
-| `ENGRAM_GCS_BUCKET`            | Bucket name for snapshots / logs                                     |
+| `ENGRAM_BLOB_BACKEND=gcs`      | Backing storage for the chunk store (chunks + manifests + traces)    |
+| `ENGRAM_GCS_BUCKET`            | Bucket name for chunks + manifests                                   |
+| `ENGRAM_CHUNK_GC_INTERVAL_SECS`| GC sweep cadence (default 3600). `0` disables the cron driver.       |
+| `ENGRAM_CHUNK_GC_RETAIN_SECS`  | Unreferenced-chunk retention before sweep (default 86400)            |
 | `ENGRAM_SECRETS_BACKEND=gcp`   | Selects `GcpSecretManager` (default project from metadata server)    |
 | `ENGRAM_LOG_FORMAT=json`       | Structured logging for Cloud Logging ingestion                       |
 
@@ -59,6 +61,10 @@ production the cache lives on each host-agent.
 | `ENGRAM_COORDINATOR_TOKEN`     | Must match an entry in the coordinator's `ENGRAM_AUTH_TOKENS`        |
 | `ENGRAM_SANDBOX_BACKEND=firecracker` | Production backend on Linux                                    |
 | `ENGRAM_KERNEL_IMAGE_PATH`     | Path to the vmlinux image baked into the FC host image               |
+| `ENGRAM_BLOB_BACKEND=gcs`      | Must match the coord's chunk-store backend                           |
+| `ENGRAM_GCS_BUCKET`            | Same bucket as the coord; host materialises chunks on demand         |
+| `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` | NVMe-backed LRU chunk cache budget (default 200 GiB)              |
+| `ENGRAM_NBD_DEVICES`           | `/dev/nbd0,/dev/nbd1,…` for the chunked-disk NBD daemon. Empty / unset falls back to materialize-to-file (correct, slower cold start). |
 | `ENGRAM_LOG_FORMAT=json`       | Same as coordinator                                                  |
 
 ## KEK (key-encryption key)
@@ -201,15 +207,31 @@ coordinator-to-proxy registration step is not yet wired.
 The idle evictor only fires in single-host `--mode=all`. In
 production multi-host deployments, sessions don't auto-suspend on
 idle until the host-agent grows its own `HarnessHub` (see
-`docs/known-issues.md` #7). For v1, operators evict on demand:
+`docs/known-issues.md` #7). For v1, sessions linger until their
+hard TTL or explicit `DELETE /sessions/:id`. There's no admin
+endpoint to "drain idle sessions" today — the ADR 0005 cold-
+tier flush endpoints (`POST /api/admin/sessions/:id/flush` and
+`POST /api/admin/flush-idle`) retired in Phase 7 when chunked-
+immutable storage became the single durability primitive.
 
-```
-POST /api/admin/sessions/:id/flush     # one session
-POST /api/admin/flush-idle             # all idle sessions
-```
+### Chunk-store GC
 
-Wire this up as a cron job (e.g., every 10 min from a k8s
-CronJob) if you want approximate auto-eviction in v1.
+`engram_coordinator::chunk_gc::spawn` is the cron driver
+(`ENGRAM_CHUNK_GC_INTERVAL_SECS`, default 1h; `0` disables).
+Sweeps chunks unreferenced by any live snapshot's
+`disk_manifest` / `memory_manifest` after
+`ENGRAM_CHUNK_GC_RETAIN_SECS` (default 24h). Operators can
+trigger an on-demand sweep via
+`POST /api/admin/gc-chunks?retain_secs=<N>`.
+
+### Materialize-dir reap
+
+Per-host `<work_dir>/chunked-rootfs/<manifest_id>-vN.ext4`
+files are reaped by
+`POST /api/admin/reap-materialize-dir?min_age_secs=<N>`. In
+`--mode=coordinator` the endpoint fans out across every
+connected host via WS-RPC (WIRE v3); each host sweeps its
+own local dir and returns per-host stats.
 
 ## Liveness / readiness
 
