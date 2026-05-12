@@ -16,8 +16,12 @@
 //!   live manifest after a retention TTL.
 //!
 //! The local NVMe cache (`cache::ChunkCache`) is a separate layer
-//! consumed by adapters; this module's GETs go directly to
-//! `BlobStorage`. Use the cache for hot-path read patterns.
+//! consumed by adapters; this module's GETs go through the
+//! configured `ChunkResolver` (see ADR 0008 Phase 1). The default
+//! resolver wraps `BlobStorage` directly — identical behavior to
+//! pre-ADR-0008. Phase 2+ swaps in `TieredChunkResolver` to add
+//! OCI fallback. Writes always go through `BlobStorage` directly;
+//! the tiered story is read-only.
 
 use std::sync::Arc;
 
@@ -27,21 +31,48 @@ use uuid::Uuid;
 
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::{ChunkHash, Manifest, ManifestRef};
+use crate::resolver::{BlobStorageResolver, ChunkResolver};
 use crate::working_set::{TraceRef, WorkingSetTrace};
 
 /// Front door to chunked-immutable storage. Cheap to clone (it's
-/// an `Arc` internally); pass clones around freely.
+/// `Arc`s internally); pass clones around freely.
 #[derive(Clone)]
 pub struct ChunkStore {
+    /// Write target for chunks, manifests, and traces. Always
+    /// `BlobStorage` — writes don't have a tiered story.
     inner: Arc<dyn BlobStorage>,
+    /// Read path for chunks. Defaults to a `BlobStorageResolver`
+    /// over `inner`; production may swap in a tiered resolver
+    /// (see ADR 0008 Phase 2 — `TieredChunkResolver`).
+    resolver: Arc<dyn ChunkResolver>,
 }
 
 impl ChunkStore {
     /// Wrap any `BlobStorage` impl. Production uses
     /// `engram-storage-gcs::GcsBlobStorage`; tests +
     /// `--mode=all` use `engram-storage-local::LocalBlobStorage`.
+    ///
+    /// Chunk reads default to `BlobStorageResolver` over the same
+    /// blob; use [`Self::with_resolver`] to swap in a tiered
+    /// resolver for ADR 0008's OCI-fallback path.
     pub fn new(blob: Arc<dyn BlobStorage>) -> Self {
-        Self { inner: blob }
+        let resolver: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(blob.clone()));
+        Self {
+            inner: blob,
+            resolver,
+        }
+    }
+
+    /// Replace the chunk-fetch resolver. Phase 2+ of ADR 0008
+    /// uses this to install a `TieredChunkResolver` that falls
+    /// through `BlobStorage → OCI`, with opportunistic
+    /// write-through fill on miss.
+    ///
+    /// Phase 1 (today): no caller swaps the resolver; the default
+    /// `BlobStorageResolver` preserves pre-ADR-0008 behavior.
+    pub fn with_resolver(mut self, resolver: Arc<dyn ChunkResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Borrow the underlying blob storage. Crate-internal: GC and
@@ -72,24 +103,22 @@ impl ChunkStore {
         Ok(hash)
     }
 
-    /// GET a chunk's bytes. Verifies the returned content hashes
-    /// to the requested hash — catches storage-layer corruption.
+    /// GET a chunk's bytes. The resolver verifies the returned
+    /// content hashes to the requested value — callers don't
+    /// re-hash. With the default `BlobStorageResolver` this is a
+    /// direct `BlobStorage` GET; with `TieredChunkResolver`
+    /// (ADR 0008 Phase 2) it falls through `BlobStorage → OCI`
+    /// with opportunistic write-through fill on miss.
     pub async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
-        let key = hash.storage_key();
-        let bytes = self.inner.get(&key).await?;
-        let actual = ChunkHash::of(&bytes);
-        if actual != hash {
-            return Err(ChunkStoreError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
-        Ok(bytes)
+        self.resolver.fetch_chunk(hash).await
     }
 
-    /// Existence check for a chunk. Useful for caching decisions.
+    /// Existence check for a chunk. Routed through the resolver,
+    /// so "exists" means "reachable through any tier" in the
+    /// tiered world. With the default `BlobStorageResolver` this
+    /// is equivalent to a `BlobStorage::exists` call.
     pub async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {
-        Ok(self.inner.exists(&hash.storage_key()).await?)
+        self.resolver.chunk_exists(hash).await
     }
 
     // ---------- manifests ----------
@@ -372,5 +401,68 @@ mod tests {
         let (s, _d) = store().await;
         let r = TraceRef::canonical(Uuid::new_v4());
         assert!(s.get_trace(r).await.unwrap().is_none());
+    }
+
+    // ---- ADR 0008 Phase 1: ChunkResolver indirection ----
+
+    /// `with_resolver` swaps the chunk-fetch path. A custom resolver
+    /// that returns a sentinel ChunkHash for any request lets us
+    /// observe that `get_chunk` and `chunk_exists` flow through it
+    /// rather than `inner`.
+    #[tokio::test]
+    async fn with_resolver_redirects_chunk_reads() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingResolver {
+            calls: AtomicUsize,
+            body: Bytes,
+        }
+
+        #[async_trait]
+        impl crate::resolver::ChunkResolver for CountingResolver {
+            async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                // Sanity: the returned bytes must hash to the request
+                // for the contract to hold; precompute a body that
+                // satisfies that.
+                assert_eq!(hash, ChunkHash::of(&self.body));
+                Ok(self.body.clone())
+            }
+            async fn chunk_exists(&self, _hash: ChunkHash) -> Result<bool> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+        }
+
+        let (base, _d) = store().await;
+        let body = Bytes::from_static(b"resolver redirect target");
+        let hash = ChunkHash::of(&body);
+        let counting = Arc::new(CountingResolver {
+            calls: AtomicUsize::new(0),
+            body,
+        });
+        let s = base.with_resolver(counting.clone());
+
+        // get_chunk + chunk_exists both flow through the resolver,
+        // not the underlying BlobStorage (which never had the chunk).
+        let bytes = s.get_chunk(hash).await.unwrap();
+        assert_eq!(&bytes[..], b"resolver redirect target");
+        assert!(s.chunk_exists(hash).await.unwrap());
+
+        assert_eq!(counting.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Default `ChunkStore::new` keeps pre-ADR-0008 semantics:
+    /// writes via `put_chunk` are immediately readable via
+    /// `get_chunk`, with no resolver swap needed.
+    #[tokio::test]
+    async fn default_resolver_preserves_legacy_behavior() {
+        let (s, _d) = store().await;
+        let body = b"default behavior";
+        let h = s.put_chunk(body).await.unwrap();
+        let back = s.get_chunk(h).await.unwrap();
+        assert_eq!(&back[..], body);
+        assert!(s.chunk_exists(h).await.unwrap());
     }
 }
