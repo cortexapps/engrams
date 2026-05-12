@@ -288,6 +288,7 @@ mod tests {
                     std::env::temp_dir().join("engram-blobs-test"),
                 ),
             )),
+            materialize_dir: None,
         };
         let cfg = CoordinatorConfig {
             local_path,

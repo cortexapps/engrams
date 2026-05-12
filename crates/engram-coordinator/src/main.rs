@@ -301,6 +301,17 @@ async fn main() -> Result<(), CoordinatorError> {
         ));
     }
 
+    // ADR 0007 orphan-reap admin endpoint needs to know which
+    // local dir the in-process host-agent materializes into. Only
+    // populated for `--mode=all`; in `--mode=coordinator` the
+    // materialized files live on each host and the reap is a
+    // future multi-host RPC.
+    let coord_materialize_dir = if matches!(cli.mode, RunMode::All) {
+        Some(cli.local_path.join("chunked-rootfs"))
+    } else {
+        None
+    };
+
     // ADR 0005 / Stage 4 / ADR 0007: blob storage. The same Arc
     // backs the legacy seal-pipeline `Services.blob` AND the ADR
     // 0007 chunk store. Hoisting it before the --mode=all wiring
@@ -440,6 +451,11 @@ async fn main() -> Result<(), CoordinatorError> {
         // Multi-host deployments wire each host-agent's chunk store
         // independently, pointing at the same backing bucket via env.
         let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        // The materialize dir lives at `<local_path>/chunked-rootfs/`
+        // — defined inside this block but ALSO consumed by the
+        // Services wiring outside it (so the admin orphan-reap
+        // endpoint knows the path). Pulled out below via the
+        // `coord_materialize_dir` binding.
         let materialize_dir = cli.local_path.join("chunked-rootfs");
         // ADR 0007 #3a: NVMe-backed chunk cache. Amortises repeat
         // reads for chunks shared across manifests (canonical-base
@@ -574,6 +590,7 @@ async fn main() -> Result<(), CoordinatorError> {
         auth_resolver,
         blob,
         chunk_store,
+        materialize_dir: coord_materialize_dir,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await

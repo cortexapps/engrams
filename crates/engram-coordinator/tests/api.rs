@@ -378,6 +378,7 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -438,6 +439,7 @@ impl TestFixture {
                     std::env::temp_dir().join("engram-blobs-test"),
                 ),
             )),
+            materialize_dir: None,
         };
         let cfg = CoordinatorConfig {
             default_image_version: "warm-bootstrap".into(),
@@ -2006,6 +2008,7 @@ async fn create_session_failure_marks_session_failed() {
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -2892,6 +2895,101 @@ async fn admin_gc_chunks_returns_zero_on_empty_store() {
         v["elapsed_ms"].is_number(),
         "elapsed_ms must be present + numeric: {v:?}",
     );
+}
+
+#[tokio::test]
+async fn admin_reap_materialize_dir_rejects_in_coordinator_mode() {
+    // Default TestFixture has no `materialize_dir` (it doesn't
+    // wire one for the unit-test harness — the fixture targets
+    // the multi-host code path). The reap endpoint refuses with
+    // 409 so an operator running `--mode=coordinator` doesn't
+    // silently get a no-op response.
+    let store = MockMetadataStore::arc();
+    let app = build_app(store);
+
+    let resp = post(app, "/api/admin/reap-materialize-dir", json!({})).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "reap is `--mode=all`-only; coordinator mode must refuse",
+    );
+    let v = body_json(resp.into_body()).await;
+    // ApiError serializes as { error: "<slug>", message: "<msg>" } —
+    // slug is "conflict"; the explanation lives in `message`.
+    let msg = v["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("mode=all"),
+        "error message must explain why: {msg}",
+    );
+}
+
+#[tokio::test]
+async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
+    // End-to-end: stand up an app with a real `materialize_dir`,
+    // plant two `.ext4` files (one for a live manifest, one for
+    // an orphan), fire the endpoint, assert the orphan is gone.
+    // The `MockMetadataStore` doesn't override
+    // `list_live_disk_manifest_ids`, so the default Vec::new()
+    // returns the empty set — every file on disk is treated as
+    // orphan. That's fine for this test: we just need to prove
+    // the endpoint actually scans + deletes + reports stats.
+    use std::path::PathBuf;
+
+    let store = MockMetadataStore::arc();
+    let materialize_dir: PathBuf = tempfile::tempdir().expect("materialize tempdir").keep();
+
+    // Plant two ext4 files matching the `<uuid>-v<num>.ext4` shape.
+    let orphan_id = uuid::Uuid::new_v4();
+    let orphan_path = materialize_dir.join(format!("{orphan_id}-v1.ext4"));
+    std::fs::write(&orphan_path, b"orphan-bytes").unwrap();
+    let live_id = uuid::Uuid::new_v4();
+    let live_path = materialize_dir.join(format!("{live_id}-v3.ext4"));
+    std::fs::write(&live_path, b"live-bytes-larger-payload").unwrap();
+
+    let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
+    let services = Services {
+        meta: store,
+        cloud: Arc::new(MockCloud::new()),
+        sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
+        secrets: Arc::new(InMemorySecretStore::new()),
+        kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+            [0u8; 32], "test:v1",
+        )),
+        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
+        auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
+        blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+            std::env::temp_dir().join("engram-blobs-test"),
+        )),
+        chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
+            engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            ),
+        )),
+        materialize_dir: Some(materialize_dir.clone()),
+    };
+    let cfg = engram_coordinator::CoordinatorConfig::default();
+    let state = Arc::new(engram_coordinator::AppState::new(cfg, services));
+    let app = engram_coordinator::api::router(state);
+
+    // min_age_secs=0 lets the freshly-written files be deletable.
+    // Without this override the 1h default would skip them all.
+    let resp = post(
+        app,
+        "/api/admin/reap-materialize-dir?min_age_secs=0",
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(v["files_scanned"], 2);
+    // Empty live set → both files are orphans.
+    assert_eq!(v["files_deleted"], 2, "body: {v:?}");
+    assert!(v["bytes_freed"].as_u64().unwrap() > 0);
+    assert!(!orphan_path.exists());
+    assert!(!live_path.exists());
 }
 
 #[tokio::test]

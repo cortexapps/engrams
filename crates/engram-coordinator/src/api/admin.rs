@@ -271,3 +271,101 @@ pub async fn gc_chunks(
         retain_secs,
     }))
 }
+
+// ---------------------------------------------------------------------
+// ADR 0007 — materialize-dir orphan reap
+// ---------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct ReapMaterializeDirParams {
+    /// Minimum age (seconds) a materialized file must reach
+    /// before the reaper considers it for deletion. Guards a
+    /// freshly-materialized file from being ripped out from
+    /// under an in-flight `create()`'s clonefile step. Default
+    /// 1h; tune down to ~5min in high-churn deployments.
+    pub min_age_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct ReapMaterializeDirResult {
+    pub files_scanned: u64,
+    pub files_deleted: u64,
+    pub bytes_freed: u64,
+    pub files_skipped_unparseable: u64,
+    pub files_skipped_too_young: u64,
+    pub live_manifest_count: usize,
+    pub min_age_secs: u64,
+    pub materialize_dir: String,
+}
+
+/// `POST /api/admin/reap-materialize-dir` — drop materialized
+/// `<manifest_id>-vN.ext4` files whose manifest_id is no longer
+/// referenced by any live snapshot row. Pairs with the chunk-
+/// store GC endpoint above: that one sweeps chunks; this one
+/// sweeps the assembled files derived from chunks.
+///
+/// Returns 409 when running in `--mode=coordinator`: the
+/// materialize dir lives on each host's local disk, and the
+/// multi-host fanout RPC isn't wired yet (tracked in the rollout
+/// doc as a follow-up).
+pub async fn reap_materialize_dir(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ReapMaterializeDirParams>,
+) -> Result<Json<ReapMaterializeDirResult>, ApiError> {
+    let materialize_dir = match state.services.materialize_dir.as_ref() {
+        Some(dir) => dir.clone(),
+        None => {
+            return Err(ApiError::Conflict(
+                "reap-materialize-dir is `--mode=all`-only; multi-host fanout is \
+                 a follow-up (see docs/chunked-storage-rollout.md)"
+                    .into(),
+            ));
+        }
+    };
+    let min_age_secs = params.min_age_secs.unwrap_or(3600);
+    let min_age = std::time::Duration::from_secs(min_age_secs);
+
+    // Live-set source = the same DB query the chunk GC uses. The
+    // two reapers stay coherent: a manifest that survives the
+    // chunk sweep also keeps its materialized files, and
+    // vice-versa.
+    let live_ids: std::collections::HashSet<uuid::Uuid> = state
+        .services
+        .meta
+        .list_live_disk_manifest_ids()
+        .await
+        .map_err(|e| ApiError::Internal(format!("list_live_disk_manifest_ids: {e}")))?
+        .into_iter()
+        .collect();
+    let live_manifest_count = live_ids.len();
+
+    tracing::info!(
+        materialize_dir = %materialize_dir.display(),
+        live_manifest_count,
+        min_age_secs,
+        "starting materialize-dir orphan reap",
+    );
+
+    let stats =
+        engram_host_agent::orphan_reap::reap_materialize_dir(&materialize_dir, &live_ids, min_age)
+            .await
+            .map_err(|e| ApiError::Internal(format!("reap_materialize_dir: {e}")))?;
+
+    tracing::info!(
+        files_scanned = stats.files_scanned,
+        files_deleted = stats.files_deleted,
+        bytes_freed = stats.bytes_freed,
+        "materialize-dir orphan reap complete",
+    );
+
+    Ok(Json(ReapMaterializeDirResult {
+        files_scanned: stats.files_scanned,
+        files_deleted: stats.files_deleted,
+        bytes_freed: stats.bytes_freed,
+        files_skipped_unparseable: stats.files_skipped_unparseable,
+        files_skipped_too_young: stats.files_skipped_too_young,
+        live_manifest_count,
+        min_age_secs,
+        materialize_dir: materialize_dir.display().to_string(),
+    }))
+}

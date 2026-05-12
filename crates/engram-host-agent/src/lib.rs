@@ -27,6 +27,7 @@ pub mod flush;
 pub mod harness;
 pub mod heartbeat;
 pub mod image_cache;
+pub mod orphan_reap;
 pub mod pool;
 pub mod pooled_backend;
 pub mod resource;

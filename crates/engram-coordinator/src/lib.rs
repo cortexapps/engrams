@@ -61,6 +61,12 @@ pub struct Services {
     /// `PooledBackend` (materialize-on-create) and the coord's
     /// admin GC endpoint (sweep unreferenced chunks).
     pub chunk_store: engram_chunk_store::ChunkStore,
+    /// ADR 0007: where the in-process host-agent (active in
+    /// `--mode=all`) materializes chunked manifests. `Some` when
+    /// running `--mode=all`; `None` in `--mode=coordinator` (the
+    /// admin reaper endpoint then becomes a multi-host fanout —
+    /// out of scope for this slice).
+    pub materialize_dir: Option<std::path::PathBuf>,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.

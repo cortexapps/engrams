@@ -350,6 +350,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
@@ -479,6 +480,7 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),

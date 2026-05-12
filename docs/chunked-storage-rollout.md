@@ -696,11 +696,15 @@ tier.
        at `pooled_backend::tests::materialize_chunked_rootfs_uses_chunk_cache_when_present`
        proves the cache path is exercised (materialize succeeds
        even after the underlying store's chunks are deleted).
-     - ⬜ *(b)* Materialized-file orphan reap: scan
-       `chunked-rootfs/` periodically and delete
-       `<manifest_id>-vN.ext4` files no longer referenced by a
-       live session or recent snapshot. Needs a coord-side admin
-       endpoint + cron primitive. Pairs naturally with item #4.
+     - ✅ *(b)* Materialized-file orphan reap — shipped as
+       `engram_host_agent::orphan_reap::reap_materialize_dir`
+       primitive + `POST /api/admin/reap-materialize-dir` admin
+       endpoint. Parses `<manifest_id>-vN.ext4` filenames; deletes
+       any not in the live-set (same query the chunk GC uses).
+       `min_age_secs` gate guards in-flight `create()` clonefiles.
+       `--mode=all` only today; multi-host fanout via WS-RPC is a
+       follow-up (deliberate: avoid wire bloat until ops actually
+       hit the leak in production). Cron scheduler pairs with #4.
 4. ⬜ **Chunk-store GC scheduler** (Phase 1 gap) — coordinator cron
    loop + `POST /api/admin/gc-chunks` admin endpoint (the testable-
    trigger pattern per the feedback memory). ~50 lines.

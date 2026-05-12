@@ -72,6 +72,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/admin/sessions/:id/flush", post(admin::flush_one))
         .route("/api/admin/flush-idle", post(admin::flush_idle))
         .route("/api/admin/gc-chunks", post(admin::gc_chunks))
+        .route(
+            "/api/admin/reap-materialize-dir",
+            post(admin::reap_materialize_dir),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

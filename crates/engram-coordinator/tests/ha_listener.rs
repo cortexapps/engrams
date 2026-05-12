@@ -135,6 +135,7 @@ async fn build_app_state(
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         database_url: database_url.to_string(),

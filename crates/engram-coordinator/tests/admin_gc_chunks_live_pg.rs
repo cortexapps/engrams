@@ -98,6 +98,7 @@ async fn gc_chunks_endpoint_reports_live_manifest_count_from_db() {
         auth_resolver: Arc::new(engram_oci::AnonymousResolver),
         blob,
         chunk_store,
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),

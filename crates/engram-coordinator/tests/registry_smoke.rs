@@ -285,6 +285,7 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
