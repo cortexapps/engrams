@@ -204,28 +204,37 @@ maturity tiers:
 The following are tracked as "still pending" in the rollout doc
 and have their own deferred-decision notes:
 
-- **NBD adapter for FC disks** — the disk side currently
-  materializes via a host-local file before VM boot. NBD-
-  streaming for sub-second restore is Phase 4 of the rollout,
-  estimated ~800 lines of kernel-NBD-client wiring. The
-  current materialize-first path is functional but pays
-  proportional cost in restore time.
-- **UFFD-from-chunks for memory** — the canonical-memory
-  snapshot pipeline (Phase 5 of the rollout, ~1500 lines) is
-  not yet implemented. Sessions currently rebuild VM memory
-  from cold boot rather than restoring from a canonical base.
-  This is the single largest piece of future work.
-- **Migration 0018 schema reshape** — the `snapshots` table
-  still carries the legacy cold-tier columns (`local_path`,
-  `blob_present`, envelope-encryption quartet). Phase 6 of the
-  rollout drops them and replaces with `disk_manifest_id` +
-  `disk_manifest_version`. Until then, the chunked write path
-  produces a `SnapshotMetadata.disk_manifest` that the
-  coordinator captures but doesn't persist to the row.
-- **Materialized-rootfs orphan reap + chunk-store GC scheduler**
-  — primitives exist (`ChunkStore::gc::run`, manifest-file
-  reachability traversal); the cron + admin-endpoint wiring
-  that schedules them depends on the schema reshape above.
+- **Phase 6 trait reshape** — the destructive half of
+  `SandboxBackend::{snapshot,restore}` signatures (drop `&Path`
+  args, switch `SandboxSpec.rootfs_source` → `rootfs:
+  ManifestRef`, bump the wire shape to v3) is the single largest
+  remaining ADR-7 change. The additive surface — `disk_manifest`,
+  `memory_manifest`, `WIRE_VERSION` exchange — is in. The full
+  reshape pairs naturally with retiring the last cold-tier
+  remnants in `SnapshotRecord`.
 - **Observability** — no metrics on the chunked path yet.
-  Cache hit rate, chunk fetch latency, materialize time are
-  all silent in production.
+  Cache hit rate, chunk fetch latency, materialize time, GC
+  counters are all silent in production. Needs a framework
+  call on whether the rest of the stack adopts Prometheus
+  alongside the existing structured-`tracing` logs.
+- **NBD adapter for FC disks** — shipped in this branch
+  (`55dd889`, `c770b6f`, `645afd8`, `e4f7500`, `94e9a52`).
+  PooledBackend prefers NBD over materialize-to-file when
+  `ENGRAM_NBD_DEVICES` is set + the manifest is chunked.
+- **UFFD-from-chunks for memory** — shipped (Phase 5). Bake-
+  time canonical-memory capture lands `canonical_memory_manifest`
+  in `bundle.json`; the UFFD handler resolves session faults via
+  the chunk store with MAP_PRIVATE'd canonical base for
+  cross-VM page-cache sharing.
+- **Migration 0018/0019 schema reshape** — landed in Phase 7
+  (commit history; `0020_drop_cold_tier.sql` is the destructive
+  cap). The `snapshots` table now carries `disk_manifest_id` +
+  `disk_manifest_version` + `memory_manifest_id` +
+  `memory_manifest_version` with a CHECK constraint and partial
+  GC index.
+- **Materialized-rootfs orphan reap + chunk-store GC scheduler**
+  — both shipped. `POST /api/admin/reap-materialize-dir` +
+  `POST /api/admin/gc-chunks` for explicit triggers; the
+  coordinator's `chunk_gc::spawn` is the cron driver (interval
+  via `ENGRAM_CHUNK_GC_INTERVAL_SECS`, retain via
+  `ENGRAM_CHUNK_GC_RETAIN_SECS`).

@@ -44,16 +44,16 @@ that's the single largest production-deploy blocker.
 
 ### Remaining
 
-- ⬜ **GC scheduler** — `ChunkStore::gc_unreferenced(retain_for)`
-  exists at `crates/engram-chunk-store/src/gc.rs` but **nothing calls
-  it**. Needs either:
-  - A periodic task in `engram-coordinator::lib.rs::start_coordinator`
-    (mirror of how `engram-host-agent::disk_pressure::spawn` was
-    wired before retirement), or
-  - An admin endpoint at `crates/engram-coordinator/src/api/admin.rs`
-    so it's explicitly triggerable (matches the project's
-    "explicit-trigger admin endpoints" preference)
-  - Likely both — cron in prod, admin endpoint for tests.
+- ✅ **GC scheduler** — shipped as `engram_coordinator::chunk_gc`.
+  Background loop fires `chunk_gc::run_once` on the
+  `ENGRAM_CHUNK_GC_INTERVAL_SECS` cadence (default 1h); `0` disables.
+  Retention via `ENGRAM_CHUNK_GC_RETAIN_SECS` (default 24h). The
+  `POST /api/admin/gc-chunks` admin endpoint now delegates to the
+  same pipeline, so explicit-trigger and cron-driver exercise
+  identical code — including the disk+memory live-set union
+  (latent bug fix from the original admin endpoint, which only
+  read `list_live_disk_manifest_ids` and would have prematurely
+  swept memory chunks).
 - ⬜ **`list_prefix` on S3** — stub at
   `crates/engram-storage-s3/src/lib.rs` returns `Err(Config)`.
   Breaks GC on AWS. Fix when AWS lands (💤 for now).
@@ -855,9 +855,11 @@ tier.
        `--mode=all` only today; multi-host fanout via WS-RPC is a
        follow-up (deliberate: avoid wire bloat until ops actually
        hit the leak in production). Cron scheduler pairs with #4.
-4. ⬜ **Chunk-store GC scheduler** (Phase 1 gap) — coordinator cron
-   loop + `POST /api/admin/gc-chunks` admin endpoint (the testable-
-   trigger pattern per the feedback memory). ~50 lines.
+4. ✅ **Chunk-store GC scheduler** (Phase 1 gap) — shipped. Cron
+   loop `engram_coordinator::chunk_gc::spawn` in `start_coordinator`
+   + `POST /api/admin/gc-chunks` admin endpoint delegating to the
+   same `run_once` pipeline. Disk+memory live-set union (admin
+   endpoint previously only read disk). 8 unit tests.
 5. 🟡 **Phase 6 trait reshape + migration 0018/0019** — additive
    surface shipped (`SnapshotMetadata.disk_manifest`,
    `.memory_manifest`); full trait reshape lands alongside Phase 7

@@ -155,38 +155,31 @@ broadcast buses into one SSE feed. That'd let a dashboard show
 real-time activity across the whole system over a single connection.
 Out of scope until there's a concrete need.
 
-## 9. NBD disk adapter for Firecracker not implemented
+## 9. ~~NBD disk adapter for Firecracker not implemented~~
 
-The chunked-storage rollout (ADR 0007) ships disk reads via a
-"materialize-first" path: the host-agent's `PooledBackend`
-assembles the chunked manifest into a per-host `.ext4` file
-before VM boot, then attaches that file as FC's `path_on_host`.
-Functional but pays cost proportional to image size on first
-materialize — ~16 s for a 16 GiB rootfs against GCS.
+**Resolved**: Phase 4 NBD daemon shipped (commits `55dd889`,
+`c770b6f`, `645afd8`, `e4f7500`, `94e9a52`). Host-agent's
+`PooledBackend` prefers NBD over materialize-to-file when
+`ENGRAM_NBD_DEVICES=/dev/nbd0,…` is set in the env (Packer
+manifest + Terraform `fc-host-mig` module both wire this).
+Direct kernel ioctls — no `nbd-client` userspace required.
+Linux-gated CI test at
+`crates/engram-host-agent/tests/nbd_chunked_disk.rs` boots a
+real microVM against `/dev/nbd0` served by the daemon.
 
-The Phase 4 NBD path (`crates/engram-host-agent/src/disk_daemon.rs`,
-~800 lines per the plan) would replace this with on-demand
-block reads streamed from the chunk store. Sub-second
-VM-running time even for cold-cache images.
+## 10. ~~UFFD-from-chunks for memory not implemented~~
 
-**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #8.
-
-## 10. UFFD-from-chunks for memory not implemented
-
-The rollout's memory side is unimplemented. Sessions boot cold
-from the kernel rather than restoring from a chunked canonical
-memory snapshot, so first-session-on-a-host pays full boot
-latency (~3–10 s depending on the image) and we don't get
-cross-VM page-cache dedup. The image-builder doesn't yet
-capture the canonical memory snapshot during bake either.
-
-The full implementation is large (~1500 lines): bake-time
-canonical capture in `engram-image-builder/src/canonical_boot.rs`,
-a substantial rewrite of `engram-uffd-handler` to serve faults
-from the chunk store + record/replay working-set traces, and
-wiring through `FirecrackerBackend::{snapshot,restore}`.
-
-**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #9.
+**Resolved**: Phase 5 UFFD-from-chunks + canonical-base
+MAP_PRIVATE + working-set record-and-replay shipped. Image-
+builder captures the canonical memory snapshot during bake
+(`BuildRequest.capture_canonical_memory` opt-in) and chunks
+it into the store. UFFD handler resolves session faults via
+the chunk store, prefaults the working-set trace before vCPUs
+unfreeze, and records the actual access trace for subsequent
+restores. `FirecrackerBackend::{snapshot,restore}` thread
+`canonical_memory_manifest` + `memory_manifest` end-to-end.
+PooledBackend materializes `memory.bin` from chunks on
+cross-host restore when not present locally.
 
 ## 11. ~~`snapshots` table still carries cold-tier columns~~
 
@@ -217,23 +210,17 @@ without an exporter.
 
 **Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #7.
 
-## 13. Materialized-rootfs files leak between manifest updates
+## 13. ~~Materialized-rootfs files leak between manifest updates~~
 
-`<work_dir>/chunked-rootfs/<manifest_id>-vN.ext4` accumulates one
-file per (re)materialized manifest version. The
-`PooledBackend::with_chunk_cache` wiring (commit `f42e1a2`)
-covers the *chunk* read cache via LRU; the materialized files
-themselves are never reaped.
-
-For a host whose images turn over frequently (CI bakes a new
-warm tag every day), the materialize dir grows without bound.
-Fix needs a scanner that enumerates live manifest refs from the
-DB and deletes any `chunked-rootfs/<manifest_id>-vN.ext4` not
-in the set. Currently blocked on Phase 6's DB schema (issue
-#11) — there's no `disk_manifest` column on `snapshots` to
-enumerate yet.
-
-**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #3(b).
+**Resolved**: `engram_host_agent::orphan_reap::reap_materialize_dir`
+shipped as both a library primitive and a `POST /api/admin/reap-materialize-dir`
+admin endpoint. Parses `<manifest_id>-vN.ext4` filenames + deletes
+any not referenced by a live `disk_manifest_id` row; `min_age_secs`
+guard protects in-flight clonefiles. The chunk-store GC scheduler
+(`engram_coordinator::chunk_gc`) drives this on a cadence in
+`--mode=all`; multi-host fanout via WS-RPC is a deliberate follow-
+up (avoid wire bloat until ops actually hit the leak in
+production).
 
 ## 14. Wire compatibility is enforced at hello but bincode-positional
 
