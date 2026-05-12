@@ -217,16 +217,25 @@ shipped as both a library primitive and a `POST /api/admin/reap-materialize-dir`
 admin endpoint. Parses `<manifest_id>-vN.ext4` filenames + deletes
 any not referenced by a live `disk_manifest_id` row; `min_age_secs`
 guard protects in-flight clonefiles. The chunk-store GC scheduler
-(`engram_coordinator::chunk_gc`) drives this on a cadence in
-`--mode=all`; multi-host fanout via WS-RPC is a deliberate follow-
-up (avoid wire bloat until ops actually hit the leak in
-production).
+(`engram_coordinator::chunk_gc`) drives this on a cadence. Multi-
+host fanout shipped via WS-RPC in commit `2971115` (WIRE v3 /
+`HostAdminHandler::reap_materialize_dir`); in `--mode=coordinator`
+the admin endpoint walks every connected host and aggregates per-
+host outcomes.
 
 ## 14. Wire compatibility is enforced at hello but bincode-positional
 
-`engram-protocol::WIRE_VERSION` (v2 today) + the hello-frame
+`engram-protocol::WIRE_VERSION` (v4 today) + the hello-frame
 handshake reject coord/host-agent version mismatches loudly.
 The handshake itself works.
+
+Version history (current trajectory):
+- v1 — `SnapshotMetadata.disk_manifest` add (`e68ee23`)
+- v2 — `RequestKind::ResolveRegistryAuth` for OCI auth WS-RPC (`ad13dc0`)
+- v3 — `RequestKind::ReapMaterializeDir` + `WireReapStats` for
+  multi-host materialize-dir reap fanout (`2971115`)
+- v4 — Phase 6 destructive trait reshape: `Snapshot` drops
+  `dest_path`; `Restore` takes `metadata: SnapshotMetadata` (`b8afb42`)
 
 What's *not* a known issue but worth knowing: bincode is
 schemaless positional encoding, so any future serde-derived
