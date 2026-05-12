@@ -9,18 +9,19 @@ For the **actual deployment artifacts** see:
 - [`deploy/terraform/gcp/`](../deploy/terraform/gcp/) — modules + minimal example
 - [`docs/chunked-storage-rollout.md`](./chunked-storage-rollout.md) — tier-laddered rollout tracker
 
-This doc dates from ADR 0005 (hot/cold tiers); ADR 0007 supersedes
-that framing — chunked storage is the single durability primitive
-now. The env vars + topology below are still accurate; the storage
-narrative ("cold-tier blobs") is historical until this gets
-refreshed.
+ADR 0007's chunked-immutable storage rolled out through Phase 7;
+the cold-tier flush pipeline is retired. The env vars + topology
+below are accurate; the storage layout below is updated to
+reflect chunks-in-`BlobStorage` rather than the legacy "hot tier
++ tar.zst sealed-blob cold tier" framing.
 
 ## Topology
 
 - **Coordinator**: stateless service, deployed to GKE as N replicas
   behind a single load balancer. Talks to Cloud SQL Postgres for
-  durable state, GCS for cold-tier blobs, and GCP Secret Manager
-  for per-session secret resolution.
+  durable state, GCS for the chunk store (content-addressed
+  manifests + chunks), and GCP Secret Manager for per-session
+  secret resolution.
 - **FC host VMs**: pool of GCE instances, each running
   `engram-host-agent` with `--sandbox-backend=firecracker`. They
   dial the coordinator over WebSocket and serve as worker hosts
