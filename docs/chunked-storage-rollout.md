@@ -938,70 +938,110 @@ us a regression guard before climbing to Tier 2.
 
 ---
 
-## ADR 0008 migration — chunks-in-OCI (proposed, design phase)
+## ADR 0008 migration — chunks-in-OCI (shipped end-to-end)
 
-**Status: 0 (design)** — `docs/adr/0008-chunks-in-oci.md`.
+**Status: 5 (all sub-phases shipped, CI-validated)** — `docs/adr/0008-chunks-in-oci.md`.
 
-The architectural shift: OCI registry becomes the durable
-source of truth for image chunks; BlobStorage becomes a
-regional read-through cache + durable home for snapshot
-chunks. Disk and memory canonical chunks live as OCI layers
-(Nydus-shaped); chunk faults resolve `NVMe → BlobStorage →
-OCI`, with opportunistic write-through fill. The cross-
-namespace bricked-image failure mode (silent 404 on chunk
-fault when bake-time and runtime BlobStorage namespaces
-differ) is the headline thing this fixes.
+The architectural shift landed: OCI registry is now the durable
+source of truth for image chunks; BlobStorage is a regional
+read-through cache + durable home for snapshot chunks. Disk and
+memory canonical chunks live as OCI layers (Nydus-shaped); chunk
+faults resolve `NVMe → BlobStorage → OCI`, with opportunistic
+write-through fill. The cross-namespace bricked-image failure
+mode from ADR 0007 — silent 404 on chunk fault when bake-time
+and runtime BlobStorage namespaces differ — is closed: a host
+with an empty BlobStorage namespace now successfully creates
+sessions against chunked-OCI images by faulting chunks from the
+registry.
 
-Snapshot semantics, chunk sizes (16 MiB / 512 KB, disk-
-aligned), and the canonical-memory MAP_PRIVATE primitive are
-unchanged from ADR 0007. The architectural line is
-canonical-vs-per-session, not disk-vs-memory: both canonical
-disk and canonical memory live in OCI; both per-session
-snapshot deltas (disk + memory) stay in BlobStorage.
+Snapshot semantics, chunk sizes (16 MiB / 512 KB, disk-aligned),
+and the canonical-memory MAP_PRIVATE primitive are unchanged
+from ADR 0007. The architectural line is canonical-vs-per-
+session, not disk-vs-memory: both canonical disk and canonical
+memory live in OCI; both per-session snapshot deltas (disk +
+memory) stay in BlobStorage.
 
-The migration is gated on ADR 0007's stack landing in
-production and validating real workloads. Rollout sub-
-phases:
+Rollout sub-phases:
 
-1. ⬜ **`ChunkResolver` trait introduced.** Default impl
-   wraps current `BlobStorage` — no behavior change. Clean
-   abstraction point for tiered fetch. Insertion crate:
-   `engram-chunk-store`.
-2. ⬜ **`OciChunkResolver` + Range GET in `engram-oci`.**
-   Fault path falls through to OCI on BlobStorage miss.
-   This phase alone fixes the cross-namespace bricked-image
-   failure mode without any bake-side changes — useful even
-   if later phases stall.
-3. ⬜ **Bake produces Nydus-shaped artifacts.** Image-builder
-   emits `bootstrap.disk + chunks.disk` (and memory
-   counterparts) as OCI layers with new media types
-   (`application/vnd.engram.bootstrap.{disk,memory}.v1+json`,
-   `application/vnd.engram.chunks.{disk,memory}.v1`).
-   `ImageBundle` schema bumps to v2. Scan + SBOM + referrer
-   publish step (OCI 1.1 Referrers API) lands here.
-4. ⬜ **Base/diff layer engineering.** Bake consults parent
-   bootstrap at build time to skip chunks already in the
-   base layer. Preserves cross-image dedup at OCI granularity.
-5. ⬜ **Hybrid image_cache.** Conventional OCI and chunked-
-   OCI artifacts coexist; format detected at pull time;
-   both paths run. Long-term shape for environments that
-   accept external/customer-supplied images.
+1. ✅ **`ChunkResolver` trait introduced** (`b04834b`).
+   `BlobStorageResolver` default impl wraps current
+   `BlobStorage` — no behavior change. `ChunkStore` holds an
+   `Arc<dyn ChunkResolver>` for chunk reads and exposes
+   `with_resolver(...)` for swap-in. Phase 1 of the rollout.
+2. ✅ **`OciChunkResolver` + Range GET + `TieredChunkResolver`**
+   (`7279232`). `OciClient::fetch_blob_range` wraps oci-client
+   0.15's `pull_blob_stream_partial` with auth setup, fails
+   loudly when the registry returns a full blob instead of
+   a Range response. `OciChunkResolver` verifies the partial
+   response against per-chunk sha256. `TieredChunkResolver`
+   composes resolvers with CDN-fill write-back to BlobStorage.
+   New `ChunkStoreError::Origin` variant distinguishes
+   origin-tier failures.
+3. ✅ **Bake produces Nydus-shaped artifacts.** Four sub-commits:
+   - `77d53f9` — `Bootstrap` module: build `(bootstrap_json,
+     blob_bytes)` from an existing chunk-store `Manifest`.
+   - `fb719dd` — Four new OCI media types
+     (`application/vnd.engram.{bootstrap,chunks}.{disk,memory}.v1`),
+     `OciClient::push_chunked_image` + symmetric memory guard,
+     `pull_image` writes bootstrap sidecars and records
+     chunk-blob digests on `PulledImage`.
+   - `4cdbebd` — `Builder::build` emits `bootstrap.disk.json`
+     + `chunks.disk.blob` next to `rootfs.ext4`; bundle.json
+     bumps to schema v2; `push_to_registry` routes Nydus-shaped
+     bakes through `push_chunked_image`.
+   - `d711697` — `ImageBundle` v2 with
+     `bootstrap_disk_available` / `bootstrap_memory_available`
+     flags (v1 deserializes via `#[serde(default)]`).
+     `CachedImage` learns four new fields for the Nydus-shaped
+     sidecar paths and chunk-blob digests; `ensure_image` pull
+     + cache-hit paths populate them.
+4. ✅ **Base/diff layer engineering** (`73ab684`).
+   `BootstrapEntry.blob_digest: Option<String>` (None = self-
+   blob; Some(digest) = cross-blob via parent layer).
+   `Bootstrap::build_from_manifest_with_parent` does the dedup
+   walk against a parent bootstrap. `BuildRequest` gets paired
+   `parent_disk_bootstrap_path` + `parent_disk_chunks_blob_digest`
+   fields with asymmetric-input validation.
+5. ✅ **Hybrid image_cache + PooledBackend dispatch.** Two
+   sub-commits:
+   - `fc9437c` — `CachedImage::is_disk_chunked_oci()` +
+     `build_oci_chunk_index()` helpers. Resolve self-blob
+     entries to the image's primary chunks-blob digest; keep
+     cross-blob inheritance intact.
+   - `a2b7bdd` — `PooledBackend.oci_client` field +
+     `with_oci_client()`; `resolve_rootfs` upgrades the base
+     `ChunkStore` to a `TieredChunkResolver`-wearing clone for
+     chunked-OCI images. Both `--mode=all` (coordinator) and
+     standalone host-agent feed the OciClient automatically.
+     CI-validated integration test
+     (`crates/engram-host-agent/tests/chunked_oci_fault.rs`)
+     spins up a loopback fake OCI registry, exercises the cold
+     fault → CDN-fill → warm cache-hit cycle, and asserts
+     origin-tier fetch counts. Zero external dependencies; picked
+     up by `cargo nextest run --workspace` automatically.
 
-Gating items / open questions outside this ADR's scope:
+Items still pending — deferred-with-rationale rather than blockers:
 
 - **Per-registry Range-GET validation** (ECR / GAR / GHCR /
-  Harbor known good; Docker Hub + self-hosted distribution
-  vary). Gated in Phase 2.
-- **Scanner integration choice** (Trivy assumed; pipeline
-  is scanner-agnostic). Operator selects per deployment.
-- **Referrer artifact lifecycle and GC per registry** — some
-  registries don't evict referrers when the subject is
-  deleted.
-- **User-facing `[bake.warmup]` knob** for warm-daemon
-  snapshots — separate ADR.
-- **File-level chunking** (Nydus-default; stronger cross-
-  image dedup but blocks VZ's materialize-to-file path) —
-  separate ADR if/when justified.
+  Harbor expected to honor; Docker Hub + self-hosted
+  distribution vary). The fake-registry integration test
+  exercises the contract; real-registry smoke against a live
+  GAR/ECR endpoint is a per-deployment validation step.
+- **Scanner integration step** (Trivy + `syft` referrer publish)
+  in the bake. Out of scope for the substrate; lands when an
+  operator wires it on top of `push_chunked_image`.
+- **Caller for cross-image dedup.** Phase 4 plumbs
+  `parent_disk_bootstrap_path` through `BuildRequest` and the
+  diff logic; no CLI surface yet for "build this image with
+  `<parent_uri>` as base." Operator workflow follow-up.
+- **Bake-side memory streaming.** `Bootstrap::build_from_manifest`
+  holds the chunk blob in a `Vec<u8>` (4 GiB for a 4 GiB ext4).
+  Streaming-to-temp-file follow-up if bakes hit memory pressure.
+- **User-facing `[bake.warmup]` knob** for warm-daemon snapshots
+  — separate ADR.
+- **File-level chunking** (Nydus-default; stronger cross-image
+  dedup but blocks VZ's materialize-to-file path) — separate
+  ADR if/when justified.
 
 See ADR 0008 for design rationale, the four-camp analysis,
 the cost/benefit accounting, and the deferred decisions.

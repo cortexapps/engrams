@@ -1,7 +1,7 @@
 # ADR 0008: Chunks in OCI with tiered cache
 
-Status: accepted (incremental rollout in flight), 2026-05-12
-Phase: 0 (design ratified; Phase 1 in flight)
+Status: accepted (rollout shipped), 2026-05-12
+Phase: 5 (all sub-phases shipped; integration-tested in CI)
 Supersedes: the storage-substrate decision of ADR 0007.
 Chunk sizes, manifest shape, COW levels, and snapshot
 semantics are unchanged. What changes is where image chunks

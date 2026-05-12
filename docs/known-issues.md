@@ -243,3 +243,39 @@ field add/remove anywhere in the wire types is a hard break
 that must bump WIRE_VERSION. Future contributors editing
 `engram-protocol::wire` should bump the version and add a
 history note alongside any structural change.
+
+## 15. ~~Cross-namespace bricked images: chunks live in BlobStorage, OCI artifact is just metadata~~ (FIXED, ADR 0008)
+
+**Resolved.** ADR 0007's chunked-storage push (the `d79094f`
+"skip the rootfs.ext4 layer when bundle.json is present"
+optimization) made the OCI artifact a pointer-only — chunks
+lived exclusively in the bake's `BlobStorage` namespace.
+Result: a bake in namespace A and a push to a registry
+produced an artifact that pulled cleanly into namespace B but
+404'd at chunk-fault time when sessions tried to read a chunk
+that wasn't in B's BlobStorage. The failure was silent at
+push and pull, only surfaced on first chunk fault.
+
+ADR 0008 closes this by making the OCI registry the durable
+source of truth for image chunks via Nydus-shaped layers
+(bootstrap + chunk_blob), with a tiered fault path that
+falls through `local NVMe → BlobStorage → OCI`. A host with
+an empty BlobStorage namespace now Range-GETs missing chunks
+from the registry on demand and CDN-fills BlobStorage as a
+side effect. Per-host cold start has a one-time fault cost;
+warm steady-state hits the cache tier.
+
+Wiring: `BlobStorageResolver` + `OciChunkResolver` composed
+via `TieredChunkResolver` (`7279232`); `PooledBackend`
+constructs the tiered resolver per-sandbox in
+`resolve_rootfs` when `CachedImage::is_disk_chunked_oci()`
+and an `OciClient` is wired (`a2b7bdd`). Integration test at
+`crates/engram-host-agent/tests/chunked_oci_fault.rs`
+exercises the cold-fault → CDN-fill → warm-cache cycle
+against a loopback fake registry; runs in CI with zero
+external deps.
+
+See `docs/adr/0008-chunks-in-oci.md` for the full
+architectural picture and the five-phase rollout
+(`b04834b → 7279232 → 77d53f9 → fb719dd → 4cdbebd → d711697
+→ 73ab684 → fc9437c → a2b7bdd`).
