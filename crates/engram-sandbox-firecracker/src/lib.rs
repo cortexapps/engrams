@@ -273,6 +273,25 @@ struct FcSnapshotManifest {
     /// backwards compat.
     #[serde(default)]
     format: String,
+    /// ADR 0007 / Phase 5: chunked memory manifest ref. Populated by
+    /// `PooledBackend::snapshot` after FC writes memory.bin; the
+    /// chunked UFFD restore path reads it to wire the handler. When
+    /// `None` (FC backend ran without `PooledBackend` chunking), UFFD
+    /// restore mode refuses to start — the operator must either wrap
+    /// with PooledBackend+chunk_store or switch to RestoreMode::File.
+    #[serde(default)]
+    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    /// ADR 0007 / Phase 5: canonical-base memory manifest. Identifies
+    /// the per-image bake-time canonical snapshot the UFFD handler
+    /// mmaps for cross-VM page-cache sharing. When equal to
+    /// `memory_manifest`, the resolver returns `Canonical` for every
+    /// fault (no chunk fetches; the local memory.bin mmap serves
+    /// everything). When different, divergent chunks fetch from the
+    /// chunk store. `None` is treated identically to "equal to
+    /// memory_manifest" — convenient default until the image-builder
+    /// bake-time canonical capture slice lands.
+    #[serde(default)]
+    canonical_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
 }
 
 const MANIFEST_FORMAT_FC: &str = "fc";
@@ -502,15 +521,28 @@ impl FirecrackerBackend {
         Ok((socket, child))
     }
 
-    /// Spawn `engram-uffd-handler --listen <uffd_uds> --memory-bin <mem>`
-    /// and wait until it's listening. Stdout/stderr go into the jail
-    /// dir's `uffd-handler.log` so a snapshot-restore failure has a
-    /// recoverable diagnostic. Returns the live `Child` so the caller
-    /// can hold it for the VM's lifetime.
+    /// Spawn `engram-uffd-handler` in ADR 0007 chunked mode and
+    /// wait until it's listening on `uffd_uds`. `canonical_memory`
+    /// is the local file the handler mmaps for canonical-resolved
+    /// pages; `canonical_ref` + `session_ref` identify the
+    /// manifests it reads from the chunk store. `prefault_trace_host`
+    /// optionally points at a host's prior working-set recording for
+    /// REAP-style replay; `publish_trace_host` names the host the
+    /// recorder publishes the new trace under on clean shutdown.
+    ///
+    /// Stdout/stderr go into the jail dir's `uffd-handler.log` so a
+    /// snapshot-restore failure has a recoverable diagnostic.
+    /// Returns the live `Child` so the caller can hold it for the
+    /// VM's lifetime.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_uffd_handler(
         &self,
         uffd_uds: &Path,
-        memory_bin: &Path,
+        canonical_memory: &Path,
+        canonical_ref: engram_core::types::manifest::ManifestRef,
+        session_ref: engram_core::types::manifest::ManifestRef,
+        prefault_trace_host: Option<uuid::Uuid>,
+        publish_trace_host: Option<uuid::Uuid>,
         jail_dir: &Path,
     ) -> Result<Child, SandboxError> {
         let log_path = jail_dir.join("uffd-handler.log");
@@ -520,13 +552,23 @@ impl FirecrackerBackend {
             .try_clone()
             .map_err(|e| vm_err(format!("dup uffd-handler log fd: {e}")))?;
 
-        let mut child = Command::new(&self.config.uffd_handler_bin)
-            .args([
-                "--listen",
-                uffd_uds.to_string_lossy().as_ref(),
-                "--memory-bin",
-                memory_bin.to_string_lossy().as_ref(),
-            ])
+        let mut cmd = Command::new(&self.config.uffd_handler_bin);
+        cmd.arg("--listen")
+            .arg(uffd_uds)
+            .arg("--canonical-memory")
+            .arg(canonical_memory)
+            .arg("--canonical-manifest")
+            .arg(canonical_ref.to_string())
+            .arg("--session-manifest")
+            .arg(session_ref.to_string());
+        if let Some(host) = prefault_trace_host {
+            cmd.arg("--prefault-trace").arg(host.to_string());
+        }
+        if let Some(host) = publish_trace_host {
+            cmd.arg("--publish-trace-host").arg(host.to_string());
+        }
+
+        let mut child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
             .stdin(Stdio::null())
@@ -857,10 +899,54 @@ impl FirecrackerBackend {
                 .await
                 .map(|_| None),
             RestoreMode::Uffd => {
+                // ADR 0007: the handler reads its memory manifests
+                // from the chunk store. Without `memory_manifest` on
+                // the snapshot we have nothing to hand it — refuse
+                // loud rather than fall back to a degenerate path
+                // that would silently lose the chunked benefits.
+                let session_ref = match manifest.memory_manifest {
+                    Some(r) => r,
+                    None => {
+                        drop(child);
+                        if let Some(setup) = net_setup.as_ref() {
+                            net::teardown(setup, &self.net_allocator).await;
+                        }
+                        return Err(SandboxError::Snapshot(
+                            "RestoreMode::Uffd requires manifest.memory_manifest \
+                             (snapshot wasn't taken via PooledBackend with a \
+                             chunk_store attached; either wrap the FC backend \
+                             with PooledBackend.with_chunk_store(...) before \
+                             snapshotting, or switch to RestoreMode::File)"
+                                .into(),
+                        ));
+                    }
+                };
+                // No bake-time canonical yet → reuse the session ref
+                // as canonical. Resolver returns `Canonical` for every
+                // fault (canonical == session at every chunk hash),
+                // local memory.bin mmap serves the bytes, no chunk
+                // store I/O at runtime. The bake-time canonical-base
+                // slice will diverge these.
+                let canonical_ref = manifest.canonical_memory_manifest.unwrap_or(session_ref);
                 let uffd_uds = jail_dir.join("uffd.sock");
                 let _ = tokio::fs::remove_file(&uffd_uds).await;
                 match self
-                    .spawn_uffd_handler(&uffd_uds, &mem_path, jail_dir)
+                    .spawn_uffd_handler(
+                        &uffd_uds,
+                        &mem_path,
+                        canonical_ref,
+                        session_ref,
+                        // No host_id is plumbed through this layer
+                        // yet; trace replay+publish wires in when the
+                        // coord-side migration adds it to the
+                        // FcSnapshotManifest (cross-host migration
+                        // slice). Until then, traces are skipped —
+                        // first-restore latency, every time, but
+                        // correctness is intact.
+                        None,
+                        None,
+                        jail_dir,
+                    )
                     .await
                 {
                     Ok(handler) => api
@@ -1195,6 +1281,11 @@ impl SandboxBackend for FirecrackerBackend {
             spec: spec.clone(),
             net: net_snapshot,
             format: MANIFEST_FORMAT_FC.into(),
+            // PooledBackend::snapshot patches this in-place after
+            // FC returns. The bare backend can't chunk memory.bin
+            // without a chunk-store wiring.
+            memory_manifest: None,
+            canonical_memory_manifest: None,
         };
         let manifest_path = dest.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -1672,6 +1763,8 @@ mod tests {
                 cidr_network: std::net::Ipv4Addr::new(10, 200, 0, 4),
             }),
             format: MANIFEST_FORMAT_FC.into(),
+            memory_manifest: None,
+            canonical_memory_manifest: None,
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: FcSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
