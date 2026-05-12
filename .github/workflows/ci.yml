@@ -4,20 +4,26 @@ name: CI
 # lives in ci-macos-vz.yml; together they form the full CI surface.
 #
 # Surfaces this workflow exercises:
-#   - lint:             cargo fmt --check, cargo clippy -D warnings
+#   - lint:             cargo fmt --check, cargo clippy -D warnings,
+#                       cargo check workspace
 #   - test-linux:       cargo nextest workspace tests + doctests, plus
-#                       the Postgres-gated `ha_listener` ignored tests
-#                       against the postgres service container
+#                       Postgres-gated ignored tests (ha_listener,
+#                       snapshot_disk_manifest_persistence,
+#                       admin_gc_chunks_live_pg) against the postgres
+#                       service container, plus the GCS-emulator round-
+#                       trip via fake-gcs-server
 #   - cross-musl:       cross-compile engram-agentd / engram-bootstrap
 #                       / the harness wrappers to
 #                       x86_64-unknown-linux-musl (catches breakage of
 #                       the FC image bake chain)
-#   - test-firecracker: every `#[ignore]`'d FC integration test
-#                       (boot, lifecycle, snapshot, snapshot_uffd,
-#                       exec_real_vm, harness_loopback)
-#                       under nested virt, plus the root-required
-#                       suite (host_startup, proxy_e2e, snapshot_net)
-#                       under sudo for iptables + TAP creation.
+#   - test-firecracker: every `#[ignore]`'d FC integration test under
+#                       nested virt. Unprivileged set: boot, lifecycle,
+#                       snapshot, snapshot_uffd, exec_real_vm,
+#                       harness_loopback. ADR 0007 set:
+#                       canonical_capture (bake-time memory capture)
+#                       and nbd_chunked_disk (Linux + nbd, gated — see
+#                       the step). Root set under sudo for iptables +
+#                       TAP: host_startup, proxy_e2e, snapshot_net.
 #   - web:              pnpm install + tsc + vite build + vitest
 #
 # All jobs run on Blacksmith Linux runners
@@ -107,10 +113,12 @@ jobs:
       # `store.migrate()` themselves before exercising NOTIFY/LISTEN,
       # so a bare Postgres without engram migrations is fine.
       ENGRAM_TEST_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
-      # ADR 0005: the GCS round-trip test in engram-storage-gcs is
+      # ADR 0007: the GCS round-trip test in engram-storage-gcs is
       # gated on these env vars (so it no-ops on hosts without the
       # emulator). Setting them at the job level so every nextest
       # invocation in this job exercises the real SDK→emulator path.
+      # The chunk store backs onto the same BlobStorage impl, so
+      # this also covers the chunked-storage primitive end-to-end.
       STORAGE_EMULATOR_HOST: http://localhost:4443
       ENGRAM_TEST_GCS_BUCKET: engram-snapshots-test
     steps:
@@ -362,8 +370,6 @@ jobs:
       # would otherwise be invoked here only to short-circuit via
       # their `require_root()` SKIP path — leaving the gap silent.
       - name: Firecracker `#[ignore]` tests (unprivileged)
-        # `cold_tier` was deleted in Phase 7 of the ADR 0007 rollout —
-        # chunked-immutable storage is the single durability tier now.
         run: |
           cargo nextest run \
             -p engram-sandbox-firecracker \
@@ -377,46 +383,42 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # ADR 0007 Phase 4: NBD daemon serves chunked disks. This
-      # test boots a real FC microVM with `/dev/nbd0` as the rootfs;
-      # the kernel's NBD client talks to our daemon, which serves
-      # chunk-store reads on demand. Validates the kernel-userspace
-      # NBD boundary that the unit tests can't exercise.
+      # ADR 0007 Phase 4: NBD daemon serves chunked disks. The
+      # `nbd_chunked_disk` integration test boots a real FC microVM
+      # with `/dev/nbd0` as the rootfs; the kernel's NBD client
+      # talks to our daemon, which serves chunk-store reads on
+      # demand. Validates the kernel-userspace NBD boundary that
+      # the unit tests can't exercise.
       #
-      # Blacksmith's runner kernel (and Ubuntu's cloud image
-      # generally) doesn't preinstall `linux-modules-extra-*`, so
-      # `/lib/modules/$(uname -r)/kernel/drivers/block/nbd.ko` is
-      # missing and `modprobe nbd` fails with "Module nbd not found"
-      # — the test then skips silently. Install the package so the
-      # test actually runs.
-      - name: Resolve kernel version
-        id: kver
-        run: echo "kernel=$(uname -r)" >> "$GITHUB_OUTPUT"
-
-      # awalsh128/cache-apt-pkgs-action caches the unpacked package
-      # state (not just the .deb), so a cache hit is a tar-restore
-      # rather than a full `dpkg --install` + `depmod` (~30s cold,
-      # ~2s warm). Cache scopes to `(packages-list, version)` —
-      # because `linux-modules-extra-<uname>` includes the kernel
-      # version in its name, a Blacksmith-image kernel bump
-      # invalidates cleanly.
-      - name: Install linux-modules-extra (provides nbd.ko)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: linux-modules-extra-${{ steps.kver.outputs.kernel }}
-          version: 1.0
-
-      # `modprobe nbd nbds_max=4` exposes /dev/nbd{0..3}. The chmod
-      # opens the device to non-root so the test process can `open(2)`
-      # it. Production hosts use a udev rule + the engram-host-agent
-      # system user, but for CI we just open it wide.
-      - name: Load nbd kernel module + open /dev/nbd0
+      # Blacksmith caveat: each runner job runs inside a Firecracker
+      # microVM with Blacksmith's own bespoke guest kernel (uname
+      # reports a bare `6.5.13` with no Ubuntu variant suffix), and
+      # `nbd.ko` isn't compiled in or shipped via any apt package.
+      # We can't `apt-get install linux-modules-extra-$(uname -r)`
+      # — that package only exists for Ubuntu's stock kernels.
+      # See https://docs.blacksmith.sh/blacksmith-runners/overview.
+      #
+      # Result: this test currently does not run in CI. It runs
+      # locally on the dev VM (which uses the standard Ubuntu cloud
+      # kernel) and is covered by the dev-vm test runbook
+      # (`bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh`).
+      # Wiring the dev VM as a GH self-hosted runner specifically
+      # for this test is tracked as a follow-up — see
+      # `docs/chunked-storage-rollout.md` Tier 4.
+      - name: Detect NBD kernel module
+        id: nbd_setup
         run: |
-          sudo modprobe nbd nbds_max=4
-          sudo chmod 666 /dev/nbd0
-          ls -la /dev/nbd0
+          if sudo modprobe nbd nbds_max=4 2>/dev/null \
+             && sudo chmod 666 /dev/nbd0 2>/dev/null; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            ls -la /dev/nbd0
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=NBD test skipped on Blacksmith::nbd.ko unavailable in the runner kernel; nbd_chunked_disk runs locally via the dev VM. Tracking a self-hosted-runner follow-up to close the CI gap."
+          fi
 
       - name: NBD chunked-disk integration test (Linux + KVM + nbd)
+        if: steps.nbd_setup.outputs.available == 'true'
         env:
           ENGRAM_TEST_NBD_DEVICE: /dev/nbd0
         run: |

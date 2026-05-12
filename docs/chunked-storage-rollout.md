@@ -192,17 +192,18 @@ end-to-end FC microVM integration test deferred to a dev-VM session**
 
 ### Still pending
 
-- ⬜ **End-to-end FC microVM integration test.** A
-  `crates/engram-sandbox-firecracker/tests/nbd_chunked_disk.rs`
-  (Linux + KVM + `modprobe nbd nbds_max=N` gated) that builds a
-  small chunked disk manifest, spawns the daemon, attaches
-  `/dev/nbd0` as the FC rootfs, boots a real microVM, asserts
-  reads + writes round-trip + flush produces a new manifest
-  version. Same shape as `tests/snapshot_uffd.rs`. Needs a
-  focused dev-VM session.
-- ⬜ **Packer manifest update**: `modprobe nbd nbds_max=64` +
-  set `ENGRAM_NBD_DEVICES` in `engram-host-agent.service`
-  Environment=. Trivial — pairs with the integration test.
+- ⬜ **CI runner for the NBD test.** The
+  `crates/engram-host-agent/tests/nbd_chunked_disk.rs` test
+  exists and runs locally on the dev VM, but Blacksmith's runner
+  kernel doesn't ship `nbd.ko` (custom guest kernel, no Ubuntu
+  apt package matches). The CI step (`Detect NBD kernel module`
+  in `ci.yml::test-firecracker`) detects the gap and emits a
+  `::warning::` annotation; the test is gated on the detection
+  output, so it skips rather than fakes a pass — but that
+  violates the "new tests must run in CI" rule. The right
+  follow-up is wiring the dev VM as a GH self-hosted runner
+  for this one test (the rest of the FC suite already works on
+  Blacksmith).
 
 ### Dependencies / open questions
 
