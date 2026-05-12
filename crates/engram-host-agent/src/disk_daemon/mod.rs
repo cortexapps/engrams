@@ -43,3 +43,6 @@ pub mod runtime;
 
 pub use backend::{ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome};
 pub use nbd::{NbdCommand, NbdReply, NbdRequest, NbdWireError, NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC};
+
+#[cfg(target_os = "linux")]
+pub use runtime::{spawn, NbdHandle, NbdRuntimeError, NBD_BLOCK_SIZE};

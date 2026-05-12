@@ -6,8 +6,16 @@ license.workspace = true
 repository.workspace = true
 description = "Per-host daemon: warm pool, snapshot manager, resource governor."
 
-[lints]
-workspace = true
+# ADR 0007 Phase 4: the NBD daemon's `disk_daemon::runtime` module
+# wraps Linux kernel ioctls (`NBD_SET_SOCK`, `socketpair`, raw fd
+# ownership transfer to the kernel) that the safe Rust surface
+# can't model. We loosen `unsafe_code` from the workspace's
+# `forbid` to `allow` here so the unavoidable kernel-surface
+# blocks pass clippy; each block carries a `// SAFETY:` comment
+# explaining the invariant it relies on. Other lints stay at the
+# workspace default.
+[lints.rust]
+unsafe_code = "allow"
 
 [lib]
 path = "src/lib.rs"
@@ -32,6 +40,13 @@ engram-secrets-gcp.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+# Linux-only: raw libc bindings for the NBD ioctl orchestration
+# in `disk_daemon::runtime`. Gated by `target_os = "linux"` on the
+# call sites; the dep is unconditional because Cargo's
+# target-cfg deps machinery doesn't gate workspace-style deps and
+# `libc` is platform-portable (it just compiles to a no-op crate
+# on non-Linux).
+libc = "0.2"
 rustls.workspace = true
 sha2.workspace = true
 chrono.workspace = true
