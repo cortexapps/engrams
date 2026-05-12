@@ -1,27 +1,12 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 
 use crate::error::MetaError;
 use crate::types::event::PersistedEvent;
 use crate::types::host::{HostRecord, HostStatus};
-use crate::types::ids::{HostId, SandboxId, SessionId, SnapshotId};
+use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential, SessionSecrets};
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
-
-/// Sealed cold-tier blob ref + accompanying envelope-encryption
-/// fields, mirroring the shape that `engram-crypto::CredCipher::seal`
-/// produces (and that `registry_credentials` / `session_secrets`
-/// rows already use). The plaintext blob URL never lands in
-/// Postgres — `engram-coordinator::blob::open_blob_ref` unseals on
-/// demand.
-#[derive(Clone, Debug)]
-pub struct SealedBlobRef {
-    pub wrapped_dek: Vec<u8>,
-    pub nonce: Vec<u8>,
-    pub ciphertext: Vec<u8>,
-    pub key_id: String,
-}
 
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
@@ -128,43 +113,6 @@ pub trait MetadataStore: Send + Sync {
     async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
         Ok(Vec::new())
     }
-
-    // ---- cold-tier (ADR 0005 / Stage 4+) ----
-
-    /// Return the most-recently-created snapshot for `sid` whose
-    /// `blob_present = true`, paired with its sealed blob ref. The
-    /// cross-host cold-resume path (Stage 6) opens the sealed ref via
-    /// the deployment KEK and asks the picked host to download +
-    /// untar. `Ok(None)` when no cold copy exists.
-    async fn latest_cold_snapshot_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Option<(SnapshotRecord, SealedBlobRef)>, MetaError>;
-
-    /// Atomic flush: write the sealed blob ref onto a snapshot row,
-    /// clear its `local_path`, transition the owning session
-    /// `Idle → ColdEvicted`, set `cold_evicted_at`. Idempotent: when
-    /// the snapshot already has `blob_present = true`, no rows are
-    /// modified and `Ok(())` is returned. The Postgres impl runs
-    /// this in a single transaction.
-    async fn flush_to_cold(
-        &self,
-        session_id: SessionId,
-        snapshot_id: SnapshotId,
-        sealed: SealedBlobRef,
-        flushed_at: DateTime<Utc>,
-    ) -> Result<(), MetaError>;
-
-    /// Drop the local-path mark on a snapshot row whose bytes are
-    /// already in cold tier. Used by the disk-pressure detector's
-    /// cheap-drop path: when `blob_present` is already true we just
-    /// reclaim disk by removing the local copy + clearing the column.
-    async fn clear_local_path(&self, snapshot_id: SnapshotId) -> Result<(), MetaError>;
-
-    /// Return every session with `status = 'idle'`. Used by Stage 5's
-    /// admin `flush-idle` endpoint and Stage 7's disk-pressure
-    /// detector's victim picker.
-    async fn list_idle_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
     // ---- session event log ----
 

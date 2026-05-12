@@ -159,13 +159,10 @@ fn snapshot_for(session_id: SessionId, disk_manifest: Option<ManifestRef>) -> Sn
         id: SnapshotId::new(),
         session_id,
         host_id: None,
-        local_path: None,
         image_version: "warm-test".into(),
         size_bytes: 0,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
-        blob_present: false,
-        replicated_at: None,
         disk_manifest,
         memory_manifest: None,
     }

@@ -117,23 +117,36 @@ pub async fn evict_idle_session(
         return Ok(());
     }
 
-    // Step 1: take a Firecracker memory snapshot to local NVMe.
-    // Path layout matches the operator-driven /sessions/:id/snapshot
-    // handler so the resume path can find it via the same
-    // `local_path` field on SnapshotRecord.
-    let dest = state
+    // Step 1: take a snapshot. Same path layout as the
+    // operator-driven /sessions/:id/snapshot handler so resume can
+    // reconstruct the dir from `(snapshot_dir, session_id, snapshot_id)`
+    // — no local_path persistence required.
+    let staging = state
         .snapshot_dir()
         .join(session_id.to_string())
         .join(uuid::Uuid::new_v4().to_string());
-    tokio::fs::create_dir_all(&dest)
+    tokio::fs::create_dir_all(&staging)
         .await
         .map_err(|e| EvictError::Io(format!("create snapshot dir: {e}")))?;
     let metadata = state
         .services
         .sandbox
-        .snapshot(sandbox_id, &dest)
+        .snapshot(sandbox_id, &staging)
         .await
         .map_err(EvictError::Sandbox)?;
+    let dest = state
+        .snapshot_dir()
+        .join(session_id.to_string())
+        .join(metadata.id.to_string());
+    if staging != dest {
+        tokio::fs::rename(&staging, &dest).await.map_err(|e| {
+            EvictError::Io(format!(
+                "rename snapshot {} -> {}: {e}",
+                staging.display(),
+                dest.display(),
+            ))
+        })?;
+    }
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();
@@ -141,20 +154,12 @@ pub async fn evict_idle_session(
         id: metadata.id,
         session_id,
         host_id,
-        local_path: Some(dest),
         image_version: metadata.image_version.clone(),
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,
         last_accessed_at: now,
-        // Hot-tier-only at create time; the cold-tier flush primitive
-        // (Stage 5) flips these via `MetadataStore::flush_to_cold`.
-        // Retiring with Phase 7 of the chunked-storage rollout.
-        blob_present: false,
-        replicated_at: None,
-        // ADR 0007: the chunked-snapshot write path populates this
-        // when wired (VZ today, FC after Phase 4).
+        // ADR 0007: chunked manifests are the durability primitive.
         disk_manifest: metadata.disk_manifest,
-        // ADR 0007 / Phase 5: FC memory manifest.
         memory_manifest: metadata.memory_manifest,
     };
     state
@@ -412,7 +417,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snaps.len(), 1, "exactly one snapshot recorded");
-        assert!(snaps[0].local_path.is_some());
 
         // Drain the bus and confirm the post-checkpoint sequence:
         // SnapshotTaken / Evicted / StatusChanged.

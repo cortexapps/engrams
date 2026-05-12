@@ -16,7 +16,7 @@ pub mod secrets;
 pub mod storage;
 
 pub use cloud::{CloudBackend, PreemptionStream};
-pub use metadata::{MetadataStore, SealedBlobRef};
+pub use metadata::MetadataStore;
 pub use sandbox::{HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend};
 pub use secrets::{ResolvedSecret, SecretBundle, SecretContext, SecretStore};
 pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};

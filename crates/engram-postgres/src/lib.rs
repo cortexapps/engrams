@@ -324,23 +324,21 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
-        // Cold-tier columns (ADR 0005) default to "no cold copy" at
-        // create time; `flush_to_cold` flips them. ADR 0007's
-        // chunked-manifest columns persist when the snapshot was
-        // captured via the chunked write path (VZ today; FC after
-        // Phase 4). Half-populated rows are rejected by the DB
-        // constraint added in migration 0018.
+        // ADR 0007: single-tier durability. Every snapshot row
+        // references chunked manifests in `BlobStorage` via the
+        // `disk_manifest_*` / `memory_manifest_*` quartet. The
+        // previous hot-tier (`local_path`) + cold-tier (envelope-
+        // encrypted blob ref) columns retired with Phase 7
+        // (migration 0020).
         sqlx::query(
             r#"
             INSERT INTO snapshots
-                (id, session_id, host_id, local_path,
+                (id, session_id, host_id,
                  image_version, size_bytes, created_at, last_accessed_at,
-                 blob_present,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (id) DO UPDATE SET
-                local_path              = EXCLUDED.local_path,
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
                 disk_manifest_version   = EXCLUDED.disk_manifest_version,
@@ -352,11 +350,6 @@ impl MetadataStore for PostgresStore {
         .bind(snap.id.as_uuid())
         .bind(snap.session_id.as_uuid())
         .bind(snap.host_id.map(|h| h.as_uuid()))
-        .bind(
-            snap.local_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-        )
         .bind(&snap.image_version)
         .bind(snap.size_bytes as i64)
         .bind(snap.created_at)
@@ -377,10 +370,9 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Vec<SnapshotRecord>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, host_id, local_path,
+            SELECT id, session_id, host_id,
                    image_version, size_bytes,
                    created_at, last_accessed_at,
-                   blob_present, replicated_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
@@ -399,10 +391,9 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, session_id, host_id, local_path,
+            SELECT id, session_id, host_id,
                    image_version, size_bytes,
                    created_at, last_accessed_at,
-                   blob_present, replicated_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version
             FROM snapshots WHERE session_id = $1
@@ -460,133 +451,6 @@ impl MetadataStore for PostgresStore {
                     .map_err(db_err)
             })
             .collect()
-    }
-
-    async fn latest_cold_snapshot_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Option<(SnapshotRecord, engram_core::traits::SealedBlobRef)>, MetaError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, session_id, host_id, local_path,
-                   image_version, size_bytes,
-                   created_at, last_accessed_at,
-                   blob_present, replicated_at,
-                   disk_manifest_id, disk_manifest_version,
-                   memory_manifest_id, memory_manifest_version,
-                   wrapped_dek, nonce, ciphertext, key_id
-            FROM snapshots
-            WHERE session_id = $1 AND blob_present = TRUE
-            ORDER BY replicated_at DESC NULLS LAST, created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(sid.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let snap = row::snapshot_from_row(&row)?;
-        let sealed = engram_core::traits::SealedBlobRef {
-            wrapped_dek: row.try_get("wrapped_dek").map_err(db_err)?,
-            nonce: row.try_get("nonce").map_err(db_err)?,
-            ciphertext: row.try_get("ciphertext").map_err(db_err)?,
-            key_id: row.try_get("key_id").map_err(db_err)?,
-        };
-        Ok(Some((snap, sealed)))
-    }
-
-    async fn flush_to_cold(
-        &self,
-        session_id: SessionId,
-        snapshot_id: engram_core::SnapshotId,
-        sealed: engram_core::traits::SealedBlobRef,
-        flushed_at: chrono::DateTime<Utc>,
-    ) -> Result<(), MetaError> {
-        // Single transaction so a crash mid-flush leaves a consistent
-        // row pair (either everything updated or nothing). The
-        // `WHERE blob_present = FALSE` guard makes the snapshot
-        // update idempotent: a second flush against a row that's
-        // already cold is a no-op.
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        sqlx::query(
-            r#"
-            UPDATE snapshots
-               SET wrapped_dek   = $2,
-                   nonce         = $3,
-                   ciphertext    = $4,
-                   key_id        = $5,
-                   blob_present  = TRUE,
-                   replicated_at = $6,
-                   local_path    = NULL,
-                   last_accessed_at = $6,
-                   updated_at    = NOW()
-             WHERE id = $1 AND blob_present = FALSE
-            "#,
-        )
-        .bind(snapshot_id.as_uuid())
-        .bind(&sealed.wrapped_dek)
-        .bind(&sealed.nonce)
-        .bind(&sealed.ciphertext)
-        .bind(&sealed.key_id)
-        .bind(flushed_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        sqlx::query(
-            r#"
-            UPDATE sessions
-               SET status          = 'cold_evicted',
-                   sandbox_id      = NULL,
-                   cold_evicted_at = $2,
-                   updated_at      = NOW()
-             WHERE id = $1 AND status = 'idle'
-            "#,
-        )
-        .bind(session_id.as_uuid())
-        .bind(flushed_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn clear_local_path(
-        &self,
-        snapshot_id: engram_core::SnapshotId,
-    ) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            UPDATE snapshots
-               SET local_path = NULL, updated_at = NOW()
-             WHERE id = $1 AND blob_present = TRUE
-            "#,
-        )
-        .bind(snapshot_id.as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn list_idle_sessions(&self) -> Result<Vec<Session>, MetaError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
-                   created_at, last_active_at
-            FROM sessions
-            WHERE status = 'idle'
-            ORDER BY last_active_at ASC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.iter().map(row::session_from_row).collect()
     }
 
     async fn append_session_event(

@@ -72,23 +72,6 @@ pub enum SessionEvent {
         snapshot_id: SnapshotId,
         at: DateTime<Utc>,
     },
-    /// ADR 0005: a snapshot was flushed to cold-tier blob storage.
-    /// Triggered by the admin endpoint or the disk-pressure detector
-    /// (Stage 7). Session transitions Idle → ColdEvicted; subsequent
-    /// resume goes through `resume_from_cold` (Stage 6).
-    ColdEvicted {
-        snapshot_id: SnapshotId,
-        blob_size_bytes: u64,
-        took_ms: u64,
-        at: DateTime<Utc>,
-    },
-    /// ADR 0005: a cold-evicted session was re-hydrated from blob.
-    /// Stage 6 emits this when `resume_from_cold` lands a fresh
-    /// sandbox on the picked host.
-    ColdResumed {
-        snapshot_id: SnapshotId,
-        at: DateTime<Utc>,
-    },
     /// Phase 4: harness-emitted events. Web UI and Slackbot
     /// subscribe to these to render the agent's play-by-play.
     /// Track B reshape: structured summary fields replace the
@@ -149,8 +132,6 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
-            Self::ColdEvicted { .. } => "cold_evicted",
-            Self::ColdResumed { .. } => "cold_resumed",
             Self::HarnessRunStarted { .. } => "run_started",
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
@@ -870,28 +851,6 @@ pub(crate) mod tests {
         }
         async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
             Ok(())
-        }
-        async fn latest_cold_snapshot_for_session(
-            &self,
-            _: engram_core::SessionId,
-        ) -> Result<Option<(SnapshotRecord, engram_core::traits::SealedBlobRef)>, MetaError>
-        {
-            Ok(None)
-        }
-        async fn flush_to_cold(
-            &self,
-            _: engram_core::SessionId,
-            _: engram_core::SnapshotId,
-            _: engram_core::traits::SealedBlobRef,
-            _: chrono::DateTime<chrono::Utc>,
-        ) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn clear_local_path(&self, _: engram_core::SnapshotId) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn list_idle_sessions(&self) -> Result<Vec<Session>, MetaError> {
-            Ok(Vec::new())
         }
     }
 

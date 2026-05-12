@@ -232,27 +232,6 @@ impl MetadataStore for MockMetadataStore {
     async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn latest_cold_snapshot_for_session(
-        &self,
-        _: SessionId,
-    ) -> Result<Option<(SnapshotRecord, engram_core::traits::SealedBlobRef)>, MetaError> {
-        Ok(None)
-    }
-    async fn flush_to_cold(
-        &self,
-        _: SessionId,
-        _: engram_core::SnapshotId,
-        _: engram_core::traits::SealedBlobRef,
-        _: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn clear_local_path(&self, _: engram_core::SnapshotId) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_idle_sessions(&self) -> Result<Vec<Session>, MetaError> {
-        Ok(Vec::new())
-    }
 }
 
 // ---------------------------------------------------------------------

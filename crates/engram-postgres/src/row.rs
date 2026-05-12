@@ -1,8 +1,6 @@
 //! Row -> domain-type conversions. Kept separate so the query bodies in
 //! `lib.rs` stay readable.
 
-use std::path::PathBuf;
-
 use chrono::{DateTime, Utc};
 use engram_core::types::session::HarnessSpec;
 use engram_core::types::{
@@ -68,15 +66,9 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
     let host_id: Option<Uuid> = row.try_get("host_id").map_err(col_err)?;
-    let local_path: Option<String> = row.try_get("local_path").map_err(col_err)?;
     let size_bytes: i64 = row.try_get("size_bytes").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_accessed_at: DateTime<Utc> = row.try_get("last_accessed_at").map_err(col_err)?;
-    // Cold-tier columns added by 0016. Older rows pre-migration default
-    // to "no cold copy" naturally — `blob_present` is NOT NULL DEFAULT
-    // FALSE; `replicated_at` is nullable.
-    let blob_present: bool = row.try_get("blob_present").map_err(col_err)?;
-    let replicated_at: Option<DateTime<Utc>> = row.try_get("replicated_at").map_err(col_err)?;
     // ADR 0007 columns (migration 0018 + 0019). Both pairs are
     // nullable; the DB constraint enforces "both or neither" so
     // half-populated rows can't happen.
@@ -104,13 +96,10 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         id: SnapshotId(id),
         session_id: SessionId(session_id),
         host_id: host_id.map(HostId),
-        local_path: local_path.map(PathBuf::from),
         image_version: row.try_get("image_version").map_err(col_err)?,
         size_bytes: size_bytes.max(0) as u64,
         created_at,
         last_accessed_at,
-        blob_present,
-        replicated_at,
         disk_manifest,
         memory_manifest,
     })
@@ -210,7 +199,6 @@ fn parse_session_status(s: &str) -> Result<SessionStatus, MetaError> {
         "pending" => SessionStatus::Pending,
         "active" => SessionStatus::Active,
         "idle" => SessionStatus::Idle,
-        "cold_evicted" => SessionStatus::ColdEvicted,
         "dead" => SessionStatus::Dead,
         "completed" => SessionStatus::Completed,
         "failed" => SessionStatus::Failed,
@@ -248,7 +236,6 @@ mod tests {
             ("pending", SessionStatus::Pending),
             ("active", SessionStatus::Active),
             ("idle", SessionStatus::Idle),
-            ("cold_evicted", SessionStatus::ColdEvicted),
             ("completed", SessionStatus::Completed),
             ("failed", SessionStatus::Failed),
             ("dead", SessionStatus::Dead),

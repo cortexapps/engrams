@@ -334,21 +334,51 @@ trait-signature changes orphan the legacy code paths.
 
 ## Phase 7 — Delete v1 tar.zst path
 
-**Status: ⬜ pending**
+**Status: ✅ shipped**
 
-Pure deletion phase. Lands after Phase 6 since these files become
-dead code only once the trait reshape removes their callers.
+Pure deletion. Cold-tier flush pipeline retires; chunked manifests
+become the single durability primitive.
 
-- ⬜ `crates/engram-host-agent/src/flush.rs` — delete
-- ⬜ `crates/engram-host-agent/src/disk_pressure.rs` — delete
-- ⬜ `crates/engram-coordinator/src/blob.rs` — delete the snapshot
-  seal/unseal helpers (keep `engram-crypto::CredCipher` itself; it
-  still serves `registry_credentials` + `session_secrets`)
-- ⬜ `crates/engram-coordinator/src/api/admin.rs::flush_one`,
-  `flush_idle` — delete
-- ⬜ `start_coordinator` — drop the `disk_pressure::spawn` call
-- ⬜ `local_path` references outside the cache layer — sweep + delete
-- ⬜ `Cargo.toml` cleanup for crates that referenced the deleted code
+- ✅ `crates/engram-host-agent/src/flush.rs` — deleted (324 lines)
+- ✅ `crates/engram-host-agent/src/disk_pressure.rs` — deleted
+  (399 lines)
+- ✅ `crates/engram-coordinator/src/blob.rs` — slimmed to just
+  `from_env`; `seal_blob_ref` / `open_blob_ref` / `snapshot_blob_key`
+  / `unpack_blob_to_dir` deleted. `engram-crypto::CredCipher`
+  itself stays — `registry_credentials` + `session_secrets` are
+  still envelope-encrypted.
+- ✅ `crates/engram-coordinator/src/api/admin.rs::flush_one`,
+  `flush_idle` + their wire route — deleted. `FlushResult` +
+  `flush_inner` deleted. The admin surface is now
+  `gc_chunks` + `reap_materialize_dir`.
+- ✅ `start_coordinator` — `disk_pressure::spawn` block gone.
+- ✅ `SnapshotEvent::ColdEvicted` + `SnapshotEvent::ColdResumed` —
+  deleted from `engram-coordinator::state`.
+- ✅ `SessionStatus::ColdEvicted` — deleted from
+  `engram-core::types::session`.
+- ✅ `MetadataStore::flush_to_cold`, `clear_local_path`,
+  `latest_cold_snapshot_for_session`, `list_idle_sessions` —
+  trait methods deleted. `SealedBlobRef` deleted.
+- ✅ `SnapshotRecord.local_path`, `blob_present`, `replicated_at` —
+  deleted; `SnapshotResidency` deleted. The Coord-side
+  `ensure_active` simplifies from a three-branch dispatcher to
+  Idle/Dead; `resume_from_cold` gone.
+- ✅ **Migration `0020_drop_cold_tier.sql`** drops the columns +
+  rebuilds `sessions_status_check` without `'cold_evicted'`.
+  `wrapped_dek`, `nonce`, `ciphertext`, `key_id`, `blob_present`,
+  `replicated_at`, `local_path` columns dropped from
+  `snapshots`. `cold_evicted_at` dropped from `sessions`.
+- ✅ Test fixtures (`cold_tier_round_trip.rs`, FC `cold_tier.rs`)
+  deleted. Remaining mock impls updated to drop the cold-tier
+  methods.
+
+**Non-trivial follow-up landed alongside**: same-host resume now
+reconstructs the snapshot dir from
+`(cfg.local_path, session_id, snapshot_id)` instead of reading
+`record.local_path`. The snapshot API renames the staging dir to
+`<snapshot_id>` after the backend returns. Idle-evictor mirrors
+the rename. Cross-host materialization (rehydrate dir from chunks
+when the picked host doesn't have it) is task #33.
 
 ---
 
@@ -754,10 +784,13 @@ tier.
 4. ⬜ **Chunk-store GC scheduler** (Phase 1 gap) — coordinator cron
    loop + `POST /api/admin/gc-chunks` admin endpoint (the testable-
    trigger pattern per the feedback memory). ~50 lines.
-5. ⬜ **Phase 6 trait reshape + migration 0018** — required for
-   cross-host resume + spot preemption. Substantial: ~10 files.
-6. ⬜ **Phase 7 tar.zst deletion** — clean up dead paths now that
-   chunks are the source of truth.
+5. 🟡 **Phase 6 trait reshape + migration 0018/0019** — additive
+   surface shipped (`SnapshotMetadata.disk_manifest`,
+   `.memory_manifest`); full trait reshape lands alongside Phase 7
+   deletion.
+6. ✅ **Phase 7 tar.zst deletion** — shipped. Cold-tier
+   flush/disk-pressure/sealed-blob machinery removed; migration
+   0020 drops the columns. Chunks are the only durability surface.
 7. ⬜ **Observability** — cache hit rate, chunk fetch latency,
    materialize time, GC counts. Without these, debugging production
    slowness is guesswork. Probably a Prometheus exporter; needs a
@@ -766,12 +799,16 @@ tier.
    without it. Could ship Tier 4 *without* this and accept ~16s
    restore for a 16 GiB image (materialize-first), then ship NBD as
    a perf upgrade.
-9. ⬜ **Phase 5 UFFD + canonical memory + WS R&R** — the sub-100ms
-   restore. Same "can ship without; eats latency budget" tradeoff.
-10. ⬜ **Phase 8 Helm** — required for any K8s deploy.
-11. ⬜ **Phase 9 Packer + Terraform** — required for self-serve
-    provisioning of FC hosts.
-12. ⬜ **Phase 10 ADR + docs** — alongside the deploy.
+9. ✅ **Phase 5 UFFD + canonical memory + WS R&R** — runtime +
+   snapshot wiring shipped (bake-time canonical capture + cross-
+   host trace/memory.bin materialization are tasks #32/#33).
+10. ✅ **Phase 8 Helm** — chart shipped; multi-cluster validation
+    pending.
+11. ✅ **Phase 9 Packer + Terraform** — Packer + 3 core modules
+    shipped; GKE/Postgres/SecretManager/AR deferred to operator
+    modules per the contract doc.
+12. ✅ **Phase 10 ADR + docs** — ADR 0007 + known-issues +
+    DESIGN.md + deploy.md updated.
 
 **Exit criteria**: a real user session on the GCP deployment runs
 end-to-end with chunked storage, cross-host resume, and no manual

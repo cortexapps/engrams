@@ -160,29 +160,11 @@ pub async fn run_with_registry(
     // Caller-driven recovery via `POST /sessions/:id/resume`.
     let _preemption_drain = preemption_drain::spawn(state.clone());
 
-    // ADR 0005 / Stage 7: disk-pressure detector. Polls statvfs on
-    // <local_path>; below the configured threshold, runs the same
-    // `flush_session` primitive Stage 5's admin endpoint exposes —
-    // implicit + explicit triggers share one code path. Sequential;
-    // hysteresis-bounded.
-    let _disk_pressure = {
-        let dp_state = state.clone();
-        let seal: engram_host_agent::flush::SealFn = std::sync::Arc::new(move |url: String| {
-            let s = dp_state.clone();
-            Box::pin(async move {
-                blob::seal_blob_ref(&s, &url)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-        });
-        engram_host_agent::disk_pressure::spawn(
-            engram_host_agent::disk_pressure::config_from_env(),
-            state.cfg.local_path.clone(),
-            state.services.blob.clone(),
-            state.services.meta.clone(),
-            seal,
-        )
-    };
+    // ADR 0007: cold-tier flush + disk-pressure detector retired in
+    // Phase 7. Durability now flows through the chunk store: chunks
+    // are durable in BlobStorage at snapshot time, the chunk-store
+    // GC reaps unreferenced bytes on a cadence, and the
+    // materialize-dir reaper handles the host-side assembled files.
 
     // Demo wiring: bind the harness-channel TCP listener so
     // `SandboxSpec::agent`-spawned harnesses (today: the dev

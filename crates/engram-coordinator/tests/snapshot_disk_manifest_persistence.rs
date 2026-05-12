@@ -61,13 +61,10 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         id: SnapshotId::new(),
         session_id,
         host_id: None,
-        local_path: None,
         image_version: "warm-1".into(),
         size_bytes: 1024,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
-        blob_present: false,
-        replicated_at: None,
         disk_manifest: Some(mref),
         memory_manifest: None,
     };

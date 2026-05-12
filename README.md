@@ -129,22 +129,19 @@ just clean-var          # rm -rf the local sandbox cwds + snapshots
 
 A session is one bounded unit of agent work. It's two things on the wire: an `image` (the OCI URI of a baked rootfs) and an optional `harness` (which agent process to attach). The bake image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
 
-**Chunked-immutable durability (ADR 0007, superseding ADR 0005's hot+cold tiers).** Sessions' disk + memory state live as content-addressed chunks in a `BlobStorage` backend (GCS / S3 / local fs); manifests are versioned references that point at them. 16 MiB disk chunks + 512 KiB memory chunks, both sha256-keyed. Hardware-enforced COW across sessions sharing an image (MAP_PRIVATE of a canonical memory base); near-free session fork. Cross-host migration is "rebind to target host + materialize the dirty delta" — ~1–2 s per session, the spot/preemption window fits. The tar+zstd hot+cold pipeline is retiring with Phase 7 (see [the rollout doc](docs/chunked-storage-rollout.md) for what's shipped vs pending).
+**Chunked-immutable durability (ADR 0007, supersedes ADR 0005's hot+cold tiers).** Sessions' disk + memory state live as content-addressed chunks in a `BlobStorage` backend (GCS / S3 / local fs); manifests are versioned references that point at them. 16 MiB disk chunks + 512 KiB memory chunks, both sha256-keyed. Hardware-enforced COW across sessions sharing an image (MAP_PRIVATE of a canonical memory base); near-free session fork. Cross-host migration is "rebind to target host + materialize the dirty delta" — ~1–2 s per session, the spot/preemption window fits. The tar+zstd hot+cold pipeline retired in Phase 7 (see [the rollout doc](docs/chunked-storage-rollout.md) for what's shipped vs pending).
 
 ```
 create → Active                                          (live VM)
-       → idle TTL → Idle                                 (hot snapshot, VM destroyed)
-       → next prompt/exec → Active                       (hot resume, sub-second)
+       → idle TTL → Idle                                 (snapshot taken, chunks in BlobStorage, VM destroyed)
+       → next prompt/exec → Active                       (chunked resume, sub-second on same host)
        ... loop ...
-       → disk pressure / admin flush → ColdEvicted       (blob upload, local copy dropped)
-       → next prompt/exec → Active                       (cold resume on any host: download + untar)
-       ... loop ...
-       → cold blob deleted / KEK lost / hard TTL → Dead  (terminal)
+       → chunked manifests unreachable / hard TTL → Dead (terminal)
 ```
 
-`POST /sessions/:id/resume` is a three-branch dispatcher: **hot** (Idle → local NVMe restore on the original host, sub-second), **cold** (ColdEvicted → download + untar + restore on any host with capacity), **410 Gone** (Dead → both tiers lost). `ensure_active` auto-resumes both Idle and ColdEvicted on the next exec/prompt/SSE-subscribe so callers don't have to know which tier they're in.
+`POST /sessions/:id/resume` is a single-tier dispatcher: **Idle** → restore from the snapshot's chunked manifests (snapshot-affinity-scheduled to the host that captured it); **Dead** → 410 Gone; anything else → 409. `ensure_active` auto-resumes Idle sessions on the next exec/prompt/SSE-subscribe so callers don't have to know whether the session is live or paused.
 
-**Disk pressure is survivable.** The host-agent's disk-pressure detector polls `statvfs`; below a configurable threshold it runs the same `flush_session` primitive the admin endpoint exposes (cheap-drop pass first for already-replicated snapshots, then LRU full-flush). One code path, two triggers: tests + drain-before-redeploy ops scenarios fire flush via `POST /api/admin/flush-idle`, production fires it via the detector.
+**Chunk-store GC keeps storage cost bounded.** `POST /api/admin/gc-chunks` enumerates `manifest_id`s referenced by live snapshot rows, deletes chunks unreferenced by any of them (older than `retain_secs`). Paired with `POST /api/admin/reap-materialize-dir` for the per-host assembled-file cache. Operators run both on a cron; same code path as integration tests.
 
 **Agents push code from inside the sandbox** when their task is code-edit-shaped. Mount `GITHUB_TOKEN` (or an SSH key) via the image manifest's `[secrets.GITHUB_TOKEN]` block; the secret flows into the harness's env via the same pipeline that delivers `CLAUDE_CODE_OAUTH_TOKEN`. The platform doesn't care whether the agent runs `git push` or `slack.post()` or anything else — that's the agent's job, not Engram's.
 

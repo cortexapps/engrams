@@ -1,6 +1,7 @@
 # ADR 0005: Disk-pressure blob tier; git removed from the platform
 
-Status: accepted, 2026-05-09
+Status: superseded by [ADR 0007](./0007-chunked-immutable-storage.md), 2026-05-11
+Originally accepted 2026-05-09
 Phase: 6 (re-shape)
 
 Supersedes the "blob storage retired" + "git as the workspace
@@ -8,6 +9,18 @@ durability primitive" claims of [ADR 0001](./0001-versioned-conversations.md);
 amends the "session lifetime is host-bounded" contract of
 [ADR 0002](./0002-one-shot-task-runner.md) — durability is now
 *snapshot-tier-bounded* (hot or cold), not host-bounded.
+
+> **Superseded note (2026-05-11):** ADR 0007's chunked-immutable
+> storage rolled out through Phases 1-7. The "hot tier
+> (`local_path`) + cold tier (tar.zst sealed blob)" durability
+> scheme this ADR introduced is retired. Snapshots now reference
+> content-addressed chunks in `BlobStorage` directly via
+> `disk_manifest_id` + `memory_manifest_id`. The
+> `engram-host-agent::flush` / `disk_pressure` modules + the
+> coord-side seal/unseal helpers + the cold-tier columns were
+> deleted in Phase 7 (migration `0020_drop_cold_tier.sql`). Read
+> this ADR for historical context; ADR 0007 documents the system
+> as it stands today.
 
 ## Context
 

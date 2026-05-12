@@ -49,45 +49,57 @@ pub async fn snapshot(
     })?;
 
     // Snapshots live under `<local_path>/snapshots/<session>/<dir>`.
-    // The directory name is its own UUID; the canonical SnapshotId is what
-    // the backend reports back in SnapshotMetadata.
-    let dest = state
+    // The directory name is initially a placeholder UUID — once the
+    // backend returns its SnapshotId we rename to that, so the
+    // resume path can reconstruct the path deterministically from
+    // `(snapshot_dir, session_id, snapshot_id)` without persisting
+    // a local_path column.
+    let staging = state
         .snapshot_dir()
         .join(id.to_string())
         .join(uuid::Uuid::new_v4().to_string());
-    tokio::fs::create_dir_all(&dest)
+    tokio::fs::create_dir_all(&staging)
         .await
         .map_err(|e| ApiError::Internal(format!("create snapshot dir: {e}")))?;
 
-    let metadata = state.services.sandbox.snapshot(sandbox_id, &dest).await?;
+    let metadata = state
+        .services
+        .sandbox
+        .snapshot(sandbox_id, &staging)
+        .await?;
+    let dest = state
+        .snapshot_dir()
+        .join(id.to_string())
+        .join(metadata.id.to_string());
+    if staging != dest {
+        if let Err(e) = tokio::fs::rename(&staging, &dest).await {
+            return Err(ApiError::Internal(format!(
+                "rename snapshot {} -> {}: {e}",
+                staging.display(),
+                dest.display(),
+            )));
+        }
+    }
 
     let now = Utc::now();
     // Record the host that wrote this snapshot to its local disk so
     // the resume path's snapshot-affinity scheduler can route back to
-    // it (zero-cost hot-tier hit).
+    // it (zero-cost hot-tier hit). ADR 0007: durability lives in the
+    // chunk store (`disk_manifest` / `memory_manifest`); the local dir
+    // is a per-host cache the same-host fast-resume reads from.
     let host_id = state.host_registry.host_of(sandbox_id);
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: id,
         host_id,
-        local_path: Some(dest),
         image_version: metadata.image_version,
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,
         last_accessed_at: now,
-        // Hot-tier-only at create time; the cold-tier flush primitive
-        // (Stage 5) flips these via `MetadataStore::flush_to_cold`.
-        // Retiring with Phase 7 of the chunked-storage rollout.
-        blob_present: false,
-        replicated_at: None,
-        // ADR 0007: the chunked-snapshot write path (VZ today;
-        // FC once Phase 4 lands) populates this. Backends that
-        // haven't wired it leave the field None and the row
-        // remains restore-only on the same host (the legacy path).
+        // ADR 0007: chunked manifests are the durability primitive.
+        // FC backends produce both fields via the PooledBackend wrap;
+        // VZ produces disk_manifest only; Process produces neither.
         disk_manifest: metadata.disk_manifest,
-        // ADR 0007 / Phase 5: FC's chunked memory manifest. Set
-        // by `PooledBackend::snapshot` after FC writes memory.bin,
-        // unset on every other backend.
         memory_manifest: metadata.memory_manifest,
     };
     state.services.meta.record_snapshot(record).await?;
@@ -133,41 +145,33 @@ pub async fn resume(
 /// terminal sessions.
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
-    // ColdEvicted joins Idle here: both auto-resume on next access.
-    // The cold path is heavier (download + untar) but the caller
-    // shouldn't have to know.
-    if matches!(
-        session.status,
-        SessionStatus::Idle | SessionStatus::ColdEvicted
-    ) {
+    if session.status == SessionStatus::Idle {
         resume_session(state.clone(), id).await?;
     }
     // Active / Pending / Dead / Completed / Failed all fall through
     // to the downstream handler. Dead in particular is terminal —
-    // the snapshot is gone from both tiers, the session can't be
-    // brought back.
+    // the chunked manifests are gone (or never were), the session
+    // can't be brought back.
     Ok(())
 }
 
 async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
-    // Three-branch dispatcher (ADR 0005 / Stage 6):
-    //   Idle         → hot resume from local NVMe (sub-second)
-    //   ColdEvicted  → cold resume: download blob, untar, restore
-    //                  on any host with capacity
-    //   Dead         → 410 Gone (snapshot invalidated in both tiers)
-    //   anything else → 409
+    // ADR 0007: single-tier dispatcher.
+    //   Idle  → restore from the snapshot's chunked manifests
+    //           (snapshot-affinity-scheduled to the host that
+    //           captured it; cross-host materialization is a
+    //           follow-up).
+    //   Dead  → 410 Gone (no recoverable manifests).
+    //   any other status → 409.
     match session.status {
         SessionStatus::Idle => resume_from_idle(state, session).await,
-        SessionStatus::ColdEvicted => resume_from_cold(state, session).await,
         SessionStatus::Dead => Err(ApiError::Gone(
-            "snapshot_invalidated: session can't be revived; \
-             snapshot is gone from both hot and cold tiers"
-                .into(),
+            "snapshot_invalidated: session is terminal; chunked manifests are gone or never existed".into(),
         )),
         other => Err(ApiError::Conflict(format!(
-            "session is {} — only Idle / ColdEvicted sessions can be resumed",
+            "session is {} — only Idle sessions can be resumed",
             other.as_str()
         ))),
     }
@@ -178,22 +182,15 @@ async fn resume_from_idle(
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
-    // Hot path: a local FC snapshot exists on some host; the
-    // snapshot-affinity scheduler routes the restore back to that
-    // host. Sub-second hot resume from FC memory.bin.
-    let snapshot = state.services.meta.latest_snapshot_for_session(id).await?;
-    let record = snapshot
-        .as_ref()
-        .filter(|r| r.local_path.is_some())
-        .cloned()
+    let record = state
+        .services
+        .meta
+        .latest_snapshot_for_session(id)
+        .await?
         .ok_or_else(|| {
-            // No usable snapshot in the hot tier. The session might
-            // still be recoverable from cold, but to get here the
-            // status is Idle (not ColdEvicted) — so nothing to fall
-            // back to. Mark Dead.
             tracing::warn!(
                 session_id = %id,
-                "resume requested but no hot snapshot is recoverable — marking Dead",
+                "resume requested but no snapshot row found — marking Dead",
             );
             ApiError::Gone(
                 "snapshot_invalidated: session can't be revived; \
@@ -218,11 +215,8 @@ async fn transition_to_dead_if_no_snapshot(
         .meta
         .latest_snapshot_for_session(id)
         .await?
-        .as_ref()
-        .filter(|r| r.local_path.is_some())
         .is_some()
     {
-        // A snapshot DID land — don't mark Dead.
         return Ok(());
     }
     let _ = state
@@ -243,170 +237,37 @@ async fn transition_to_dead_if_no_snapshot(
     Ok(())
 }
 
-/// Cold-resume path (ADR 0005 / Stage 6). The session's hot
-/// snapshot was flushed to blob storage; reverse the flush:
-/// download from blob, untar to a fresh local directory, then call
-/// `restore_for_session` like the hot path does. The session can
-/// land on any host with capacity — cold resume isn't pinned to
-/// the original snapshot's host (that's the whole point of the
-/// cold tier).
+/// Same-host resume path: the snapshot's chunked manifests are
+/// durable in `BlobStorage`, and the host that captured the snapshot
+/// still holds the dir under
+/// `<cfg.local_path>/snapshots/<session>/<snapshot_id>`. The scheduler
+/// routes restore back to that host via snapshot-affinity.
 ///
-/// Multi-host follow-up: the picked host may not be `--mode=all`'s
-/// in-process host. A future `Frame::Request::CopyBlobToLocal`
-/// teaches the dialer to drive the unpack on the picked host's own
-/// disk. Today both share `services.blob` + `cfg.local_path`, so
-/// the in-process unpack is correct for the single-host case
-/// `just dev` runs.
-async fn resume_from_cold(
-    state: SharedState,
-    session: Session,
-) -> Result<SnapshotResponse, ApiError> {
-    let id = session.id;
-    let (snap, sealed) = state
-        .services
-        .meta
-        .latest_cold_snapshot_for_session(id)
-        .await?
-        .ok_or_else(|| {
-            // ColdEvicted without a cold snapshot is a state-machine
-            // bug — the only way to land in ColdEvicted is via
-            // flush_to_cold which writes the sealed ref. Surface as
-            // 410 (terminal) rather than 500 since the caller can't
-            // do anything about it; mark the session Dead so future
-            // calls take the 410 fast path.
-            tracing::error!(
-                session_id = %id,
-                "ColdEvicted session has no cold snapshot row — marking Dead",
-            );
-            let _ = std::sync::Arc::clone(&state.services.meta);
-            ApiError::Gone(
-                "snapshot_invalidated: cold-evicted session has no recoverable blob".into(),
-            )
-        })?;
-
-    // Open the sealed blob URL under the deployment KEK.
-    let blob_url = crate::blob::open_blob_ref(&state, &sealed).await?;
-
-    // Pick a fresh per-session staging path. Same layout as the hot
-    // path's snapshot dirs so `restore_for_session` reads from a
-    // familiar location. Wrapped in the snapshot id so concurrent
-    // cold-resume retries against the same session don't collide.
-    let dest = state
-        .snapshot_dir()
-        .join(id.to_string())
-        .join(format!("cold-{}", uuid::Uuid::new_v4()));
-    let bytes = crate::blob::unpack_blob_to_dir(&state.services.blob, &blob_url, &dest).await?;
-    tracing::info!(
-        session_id = %id,
-        snapshot_id = %snap.id,
-        bytes,
-        dest = %dest.display(),
-        "cold snapshot unpacked; proceeding to restore",
-    );
-
-    // From here the path is identical to hot resume: pick a host
-    // (any non-draining host with capacity), call restore, bind the
-    // session, start the agent. Pre-mode=all the picked host could
-    // differ from the snapshot's original host_id; today the
-    // scheduler short-circuits to the in-process backend.
-    let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
-    let ctx = ScheduleContext {
-        repo: image_repo,
-        image_version: image_tag,
-        // Cold resume isn't snapshot-affinity-routed (the original
-        // host may be gone or saturated). Falling back to warm-pool
-        // / capacity ranking is the right shape.
-        prefer_snapshot_id: None,
-        memory_mib: None,
-    };
-    let (host_id, new_sandbox_id) = state.host_registry.restore_for_session(&ctx, dest).await?;
-    bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
-
-    // Same secret re-resolution + start_agent dance as the hot path.
-    let mut resume_base_env = match crate::api::sessions::resolve_manifest_secrets(&state, &session)
-        .await
-    {
-        Ok(env) => env,
-        Err(e) => {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "resolve_manifest_secrets failed during cold resume; continuing without manifest env",
-            );
-            std::collections::HashMap::new()
-        }
-    };
-    match crate::api::sessions::load_session_secrets(&state, id).await {
-        Ok(Some(overrides)) => {
-            for (k, v) in overrides {
-                resume_base_env.insert(k, v);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "load_session_secrets failed during cold resume; continuing without per-request overrides",
-            );
-        }
-    }
-    let agent_opt =
-        crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
-            .ok()
-            .flatten();
-    if let Some(agent) = agent_opt {
-        if let Err(e) = state
-            .services
-            .sandbox
-            .start_agent(new_sandbox_id, agent)
-            .await
-        {
-            tracing::warn!(
-                session_id = %id,
-                sandbox_id = %new_sandbox_id,
-                error = %e,
-                "post-cold-resume start_agent failed; harness may not reattach",
-            );
-        }
-    }
-
-    finalize_resume(
-        &state,
-        id,
-        SessionStatus::ColdEvicted,
-        SessionEvent::ColdResumed {
-            snapshot_id: snap.id,
-            at: Utc::now(),
-        },
-    )
-    .await?;
-
-    Ok(SnapshotResponse {
-        session_id: id,
-        snapshot_id: Some(snap.id.to_string()),
-        size_bytes: Some(snap.size_bytes),
-        note: "resumed from cold tier",
-    })
-}
-
-/// Hot-resume path: a local FC snapshot exists, restore it on the
-/// host that holds it (snapshot-affinity-scheduled). Sub-second.
+/// Cross-host materialization (where the picked host doesn't have a
+/// local copy and reconstructs from chunks) is a follow-up task —
+/// the chunked manifests are the portable form, but FC's restore
+/// API still wants a directory on local disk today.
 async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
     record: SnapshotRecord,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
-    let local_path = record.local_path.clone().ok_or_else(|| {
-        ApiError::Internal("resume_from_fc_snapshot called without local_path".into())
-    })?;
+    // ADR 0007: reconstruct the snapshot dir from
+    // `(snapshot_dir, session_id, snapshot_id)`. The snapshot path
+    // wrote the directory at this exact location; the chunked
+    // manifests on the row carry the durable copy.
+    let local_path = state
+        .snapshot_dir()
+        .join(id.to_string())
+        .join(record.id.to_string());
     // Pre-flight: if the snapshot dir or manifest disappeared on
     // disk (host wiped /var, operator rm'd, FC's own writes failed
     // halfway), the restore call below would surface as a generic
-    // 500. Treat the missing-file case the same as a null
-    // local_path in metadata — terminal-Dead, 410 Gone — so the
-    // caller's affordance ("fork the workspace") is the same.
+    // 500. Treat the missing-file case as terminal-Dead, 410 Gone —
+    // the caller's affordance ("fork the workspace") is the same.
+    // Cross-host materialization (rehydrate from chunks if local
+    // dir is missing) is the follow-up task.
     let manifest_path = local_path.join("manifest.json");
     if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
         tracing::warn!(
