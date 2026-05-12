@@ -54,6 +54,6 @@ pub use manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, ManifestRef, DEFAULT_DISK_CHUNK_SIZE,
     DEFAULT_MEMORY_CHUNK_SIZE,
 };
-pub use resolver::{BlobStorageResolver, ChunkResolver};
+pub use resolver::{BlobStorageResolver, ChunkResolver, TieredChunkResolver};
 pub use store::ChunkStore;
 pub use working_set::{TraceRef, WorkingSetTrace};

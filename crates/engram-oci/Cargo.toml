@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
+engram-chunk-store.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }

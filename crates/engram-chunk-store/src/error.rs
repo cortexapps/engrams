@@ -42,6 +42,14 @@ pub enum ChunkStoreError {
     /// Local cache I/O failure (writes to NVMe, evictions).
     Cache(std::io::Error),
 
+    /// Origin-tier resolver failure. ADR 0008: when chunks live in
+    /// an OCI registry as Nydus-shaped layers, a Range GET against
+    /// the registry can fail (network, 404 on missing chunk, 416
+    /// on an out-of-bounds range, etc.). The string carries the
+    /// resolver-specific error message; the resolver type
+    /// (`OciChunkResolver`, future variants) chooses what to surface.
+    Origin(String),
+
     /// Operation hit an internal invariant that shouldn't happen.
     /// Use for "should never reach here" branches that we still want
     /// to surface rather than panic.
@@ -74,6 +82,7 @@ impl fmt::Display for ChunkStoreError {
             ),
             Self::MalformedManifest(msg) => write!(f, "malformed manifest: {msg}"),
             Self::Cache(e) => write!(f, "local cache I/O: {e}"),
+            Self::Origin(msg) => write!(f, "origin tier: {msg}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }

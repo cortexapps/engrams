@@ -24,15 +24,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer, PushResponse};
+use bytes::{Bytes, BytesMut};
+use futures::TryStreamExt;
+use oci_client::client::{
+    BlobResponse, ClientConfig, ClientProtocol, Config, ImageLayer, PushResponse,
+};
 use oci_client::manifest::OCI_IMAGE_MEDIA_TYPE;
 use oci_client::secrets::RegistryAuth;
-use oci_client::{Client, Reference};
+use oci_client::{Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub mod chunk_resolver;
 pub mod media_types;
 
+pub use chunk_resolver::{OciBlobLocator, OciChunkIndex, OciChunkResolver};
 pub use media_types::*;
 
 /// Resolves auth credentials for a given registry host.
@@ -375,6 +381,83 @@ impl OciClient {
     /// some code paths.
     pub fn inner(&self) -> &Client {
         &self.inner
+    }
+
+    /// Fetch a byte range from an OCI blob via an HTTP `Range`
+    /// request. Used by [`OciChunkResolver`] (ADR 0008 Phase 2) to
+    /// pull a single chunk out of a chunked OCI blob layer without
+    /// downloading the entire layer.
+    ///
+    /// `uri` identifies the registry/repo (the OCI image URI; the
+    /// tag portion is ignored for blob lookup). `blob_digest` is the
+    /// OCI layer digest (`sha256:<hex>`). `offset` + `length` define
+    /// the byte range; the registry returns
+    /// `[offset, offset+length)`.
+    ///
+    /// The returned bytes are **not** verified — the OCI layer
+    /// digest covers the whole blob, not arbitrary ranges, so
+    /// oci-client can't verify a partial response. Callers must
+    /// hash-verify against their per-chunk expectation; that's
+    /// exactly what `OciChunkResolver` does using the per-chunk
+    /// `sha256` from the bootstrap layer.
+    ///
+    /// Fails with `OciError::Distribution` if the registry doesn't
+    /// honor the `Range` request (returns the full blob instead) —
+    /// ADR 0008's chunked-OCI fault path requires partial responses
+    /// to be viable; downloading a GB-scale chunk blob per fault is
+    /// not acceptable. ECR / GAR / GHCR / Harbor are known to
+    /// honor Range; some self-hosted registries don't.
+    pub async fn fetch_blob_range(
+        &self,
+        uri: &str,
+        blob_digest: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Bytes, OciError> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let reference: Reference = uri
+            .parse()
+            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
+        let client = Self::client_for(&reference);
+        let auth = self.auth_for(&reference).await?;
+
+        // Populate the token cache for this registry/repo. Without
+        // this, pull_blob_stream_partial's internal `apply_auth`
+        // doesn't have a bearer token to apply.
+        client
+            .auth(&reference, &auth, RegistryOperation::Pull)
+            .await
+            .map_err(|e| OciError::Distribution(format!("auth: {e}")))?;
+
+        let response = client
+            .pull_blob_stream_partial(&reference, blob_digest, offset, Some(length))
+            .await
+            .map_err(|e| OciError::Distribution(format!("pull_blob_stream_partial: {e}")))?;
+
+        let stream = match response {
+            BlobResponse::Partial(s) => s,
+            BlobResponse::Full(_) => {
+                return Err(OciError::Distribution(format!(
+                    "registry returned full blob for Range request on {blob_digest}; \
+                     ADR 0008 chunked-OCI fault path requires Range support \
+                     (known-good: ECR, GAR, GHCR, Harbor)"
+                )));
+            }
+        };
+
+        // Drain the stream into a single Bytes. Pre-size to length so
+        // the registry can give us a single allocation.
+        let mut buf = BytesMut::with_capacity(length as usize);
+        let chunks: Vec<Bytes> = stream
+            .try_collect()
+            .await
+            .map_err(|e| OciError::Distribution(format!("stream: {e}")))?;
+        for c in chunks {
+            buf.extend_from_slice(&c);
+        }
+        Ok(buf.freeze())
     }
 }
 
