@@ -20,19 +20,26 @@ what's shipped, what's left, what's blocking real deploy.
 
 ## Where we stand (one-paragraph)
 
-Phases 1–2 are shipped. Phase 3's read path is in (`--mode=all` only).
-Phase 6's additive surface is in (`SnapshotMetadata.disk_manifest`)
-plus VZ snapshot-time chunking AND the destructive trait reshape
-(snapshot/restore signatures, WIRE_VERSION v4). Phases 4, 5, 7-10
-all shipped. The standalone
-host-agent binary has no blob / chunk-store / image-cache wiring —
-that's the single largest production-deploy blocker.
+All ten phases shipped to the engineering bar. Phase 6's destructive
+trait reshape (snapshot/restore signatures, WIRE_VERSION v4) landed
+alongside the additive surface (disk + memory manifest refs on
+`SnapshotMetadata`). The standalone host-agent is wired end-to-end
+(blob, chunk store, chunk cache, image cache, OCI auth via WS-RPC).
+The remaining open work is **observability** (no metrics on the
+chunked path; needs a Prometheus-vs-OTel framework call),
+**validation gates** (real `helm install` + `terraform apply`
+against a live cloud), and **the CI runner gap for the NBD test**
+(Blacksmith's kernel doesn't ship `nbd.ko`, so the test runs locally
+on the dev VM but skips on CI — see Phase 4). Everything else is
+either deferred-with-rationale (AWS Terraform, L2 cache, KEK
+rotation, live migration) or doc refresh (DESIGN.md narrative
+still reflects ADR 0005's two-tier model).
 
 ---
 
 ## Phase 1 — Chunk store foundations
 
-**Status: 🟡 partial**
+**Status: ✅ shipped — modulo S3 stub + schema-version doc note**
 
 ### Shipped
 
@@ -55,12 +62,15 @@ that's the single largest production-deploy blocker.
   (latent bug fix from the original admin endpoint, which only
   read `list_live_disk_manifest_ids` and would have prematurely
   swept memory chunks).
-- ⬜ **`list_prefix` on S3** — stub at
+- 💤 **`list_prefix` on S3** — stub at
   `crates/engram-storage-s3/src/lib.rs` returns `Err(Config)`.
-  Breaks GC on AWS. Fix when AWS lands (💤 for now).
-- ⬜ **Local cache budget config** — `ChunkCache` takes a budget but
-  there's no env / CLI flag plumbing it from the host-agent
-  configuration. Today every consumer hard-codes a default.
+  Breaks GC on AWS. Fix when AWS lands.
+- ✅ **Local cache budget config** — shipped via
+  `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` env var (commit `3d75723`).
+  Both coord (`--mode=all`) and the standalone host-agent build
+  the cache via `ChunkCacheConfig::from_env_or_default`. Terraform
+  `fc-host-mig` module exposes a `chunk_cache_budget_bytes` var
+  for per-fleet overrides.
 - ⬜ **Schema-version-migration story** — manifests are
   `schema_version: 1`. No documented path for v2. One-line ADR note
   is enough for now; the writer rejects v≠1 already.
@@ -69,7 +79,7 @@ that's the single largest production-deploy blocker.
 
 ## Phase 2 — Image-builder chunked artifacts
 
-**Status: 🟡 partial**
+**Status: ✅ shipped — modulo Directory-format note**
 
 ### Shipped
 
@@ -78,32 +88,30 @@ that's the single largest production-deploy blocker.
 - `1d8afbe` OCI push carries `bundle.json` as a third layer
   (`application/vnd.engram.bundle.v1+json`); host-agent's image_cache
   parses + surfaces it as `CachedImage.bundle`
+- ✅ **image-builder GCS path** —
+  `engram_image_builder::blob::from_env` mirrors coord + host-agent
+  selectors. Reads `ENGRAM_BLOB_BACKEND={local,gcs}` +
+  `ENGRAM_GCS_BUCKET`; production CI bakes land chunks directly in
+  the deployment bucket without an intermediate local-to-GCS hop.
+- ✅ **OCI push skips the rootfs.ext4 layer when bundle.json is
+  present** (commit `d79094f`). `OciClient::push_image` takes
+  `rootfs_ext4: Option<&Path>`; image-builder passes `None` when
+  the bake produced a chunked disk manifest. Saves 4 GiB of
+  registry bandwidth per push. Wire-redundant rootfs duplication
+  retired.
+- ✅ **Bake-time canonical memory capture** —
+  `BuildRequest.capture_canonical_memory` opt-in (commit `0c88381`).
+  Reuses `FirecrackerBackend::create + snapshot` to boot the
+  just-built rootfs, capture `memory.bin`, chunk it. CI-gated
+  integration test at `engram-image-builder/tests/canonical_capture.rs`.
 
 ### Remaining
 
-- ⬜ **image-builder can't write to GCS today** —
-  `crates/engram-image-builder/src/main.rs:139` hard-codes
-  `LocalBlobStorage::new(images_dir.join("store"))`. **Production CI
-  bakes can't produce usable artifacts**: chunks would land on the
-  CI runner's local FS and be lost when the runner recycles. Needs:
-  - `engram_image_builder::blob::from_env()` analogue of
-    `engram_coordinator::blob::from_env` reading
-    `ENGRAM_BLOB_BACKEND={local,gcs}` + `ENGRAM_GCS_BUCKET`
-  - The chunk_root for the local path stays, but GCS path lands
-    chunks directly in the deployment bucket
-  - ~40 lines. **Production blocker.**
-- ⬜ **OCI push still uploads the full `rootfs.ext4` layer** — this
-  is wire-redundant once `bundle.json` is the source of truth. Phase 6
-  retires it; until then every push transfers the disk twice (layer
-  bytes + chunk bytes). For a 4 GiB rootfs that's wasted bandwidth +
-  GCS spend.
-- ⬜ **No memory canonical snapshot during bake** — the plan's Phase
-  2 had image-builder boot the VM once and capture canonical memory.
-  That's actually folded into Phase 5 in practice (UFFD work owns the
-  canonical-base path).
-- ⬜ **No working-set trace capture during bake** — same; Phase 5
-  territory.
-- ⬜ **`Format::Directory` bakes don't get chunked** —
+- ⬜ **No working-set trace capture during bake** — UFFD handler
+  captures traces at runtime; bake-time prefault-trace capture
+  would let first-fault on a fresh host benefit too. Phase 5
+  territory; not on the critical path.
+- 💤 **`Format::Directory` bakes don't get chunked** —
   ProcessBackend is dev-only on macOS; acceptable not to chunk
   directories. Document this in the OCI bundle README so operators
   don't expect chunks on Directory bakes.
@@ -112,7 +120,7 @@ that's the single largest production-deploy blocker.
 
 ## Phase 3 — Disk adapter for macOS (VZ + Process)
 
-**Status: 🟡 partial — slice 3a (read) shipped, slice 3b (write) shipped via Phase 6 additive**
+**Status: ✅ shipped**
 
 ### Shipped
 
@@ -122,19 +130,21 @@ that's the single largest production-deploy blocker.
   VZ's existing APFS-clonefile per-sandbox flow operates on top.
 - `e68ee23` VZ's `snapshot()` chunks the cloned rootfs into the
   store and populates `SnapshotMetadata.disk_manifest`.
+- ✅ **Materialized file orphan reap** — shipped as
+  `engram_host_agent::orphan_reap::reap_materialize_dir` +
+  `POST /api/admin/reap-materialize-dir`. `engram_coordinator::chunk_gc`
+  cron drives it; multi-host fanout via WS-RPC shipped in commit
+  `2971115` (WIRE v3 / `HostAdminHandler::reap_materialize_dir`).
+- ✅ **Chunk cache wired into materialize path** —
+  `PooledBackend::with_chunk_cache` routes chunk reads through the
+  NVMe LRU on rematerialize. Default 200 GiB budget,
+  operator-tuned via `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`.
+- ✅ **Standalone host-agent wiring** — see cross-cutting section
+  below; shipped across `80d6841` (blob/chunk-store/image-cache
+  env wiring) + `ad13dc0` (OCI auth via WS-RPC).
 
 ### Remaining
 
-- ⬜ **Materialized file directory has no LRU / GC** —
-  `<local_path>/chunked-rootfs/` grows unbounded over a host's
-  lifetime. Two ways to close:
-  - Swap `materialize_to_file` for `materialize_to_file_cached` (uses
-    the existing `ChunkCache` for backing — LRU comes free) in
-    `crates/engram-host-agent/src/pooled_backend.rs:materialize_chunked_rootfs`
-  - Or add reachability-based cleanup co-located with
-    `ImageCache::gc()`
-- ⬜ **Standalone host-agent doesn't wire any of this** — see
-  cross-cutting section below.
 - 💤 **ProcessBackend chunked-rootfs path** — plan says "chunks
   become a cwd". Requires chunking Directory-format bakes. Low value
   (dev-only); deferred.
@@ -143,8 +153,8 @@ that's the single largest production-deploy blocker.
 
 ## Phase 4 — Disk adapter for Linux + FC (NBD daemon)
 
-**Status: 🟡 partial — daemon + PooledBackend integration shipped;
-end-to-end FC microVM integration test deferred to a dev-VM session**
+**Status: 🟡 partial — daemon + integration test shipped; CI runner
+gap remains (Blacksmith kernel lacks `nbd.ko`)**
 
 ### Shipped
 
@@ -216,8 +226,7 @@ end-to-end FC microVM integration test deferred to a dev-VM session**
 
 ## Phase 5 — Memory adapter (UFFD-from-chunks + canonical + WS R&R)
 
-**Status: 🟡 partial — runtime + snapshot wiring shipped; bake-time
-canonical capture deferred**
+**Status: ✅ shipped**
 
 ### Shipped
 
@@ -590,33 +599,29 @@ image actually doing anything useful.
 
 ## Cross-cutting: Standalone host-agent wiring
 
-**Status: ⛔ blocked on design call for OCI credentials. Production blocker.**
+**Status: ✅ shipped**
 
 The `engram-host-agent` binary (used in `--mode=host` multi-host
-production) does not wire ImageCache, ChunkStore, or BlobStorage.
-`crates/engram-host-agent/src/main.rs:222` constructs `HostAgent::new`
-and `with_egress` only.
+production) now wires ImageCache, ChunkStore, ChunkCache, BlobStorage,
+and OCI auth end-to-end.
 
-### What needs to land
+### Shipped
 
-- ⬜ `engram_host_agent::blob::from_env()` — mirror of
-  `engram_coordinator::blob::from_env`. ~40 lines.
-- ⬜ CLI flag / env in `crates/engram-host-agent/src/main.rs` for
-  blob backend + bucket. ~10 lines.
-- ⬜ `ChunkStore` construction + `HostAgent::with_chunk_store(...)`
-  call. ~10 lines.
-- ⛔ **`ImageCache` wiring** — needs an `OciClient`, which needs an
-  `AuthResolver`. **Open design question**: how does a remote host-
-  agent get registry credentials? Options:
-  1. Anonymous resolver — only works for public registries
-  2. Fetch creds from coordinator over the dialer WebSocket
-     on-demand
-  3. Wire host-agent directly to GCP Secret Manager (same Workload
-     Identity binding the coordinator uses)
-  4. Per-host credential file mounted by Packer (least flexible)
-
-This blocks the standalone host-agent serving any session whose spec
-carries an `image_uri` — i.e., every production session.
+- ✅ `engram_host_agent::blob::from_env()` mirrors
+  `engram_coordinator::blob::from_env`. Reads
+  `ENGRAM_BLOB_BACKEND={local,gcs}` + `ENGRAM_GCS_BUCKET`.
+- ✅ Host-agent main.rs constructs `ChunkStore` + `ChunkCache` +
+  materialize_dir at `<work_dir>/`, wires
+  `HostAgent::with_chunk_store(...)` / `with_chunk_cache(...)` /
+  `with_image_cache(...)`.
+- ✅ **OCI auth via WS-RPC** — the previously open design
+  question resolved in option (2). `WsAuthResolver` in the
+  host-agent issues `RequestKind::ResolveRegistryAuth` over the
+  existing dialer WebSocket; the coord delegates to
+  `engram-oci-auth::PgAuthResolver`. Plaintext creds traverse the
+  WS only at pull time; never persisted on the host. `WIRE_VERSION`
+  bumped to v2 for the new RPC variant (now v4 after subsequent
+  bumps). Commit `ad13dc0`.
 
 ---
 
@@ -644,19 +649,24 @@ exporter at this point.
 
 ## Cross-cutting: Wire compatibility
 
-**Status: 🟡 one known break**
+**Status: ✅ shipped**
 
-- 🟡 `SnapshotMetadata` gained `disk_manifest: Option<ManifestRef>`
-  in `e68ee23`. Bincode is positional — coordinator and host-agent
-  must ship at matching versions or deserialization mid-bincode
-  payload misaligns.
-  - Today the wire uses an `agent_version` string in the hello frame
-    but **no formal protocol version**. The host-agent dialer
-    doesn't currently refuse to connect on a mismatch.
-  - Phase 6's wire-shape bump is the natural place to introduce a
-    `WIRE_VERSION` constant + a strict hello-frame check. Until then,
-    **a mixed-version deploy of this branch will misbehave** —
-    rolling upgrades need to either drain or be wholesale.
+- ✅ `engram_protocol::WIRE_VERSION` constant + hello-frame check.
+  Currently at **v4**:
+  - v1 — `SnapshotMetadata.disk_manifest` add (`e68ee23`).
+  - v2 — `RequestKind::ResolveRegistryAuth` for OCI auth WS-RPC
+    (`ad13dc0`).
+  - v3 — `RequestKind::ReapMaterializeDir` + `WireReapStats` for
+    multi-host materialize-dir reap fanout (`2971115`).
+  - v4 — Phase 6 destructive trait reshape:
+    `RequestKind::Snapshot` drops `dest_path`; `Restore` takes
+    `metadata: SnapshotMetadata` instead of `src_path` (`b8afb42`).
+  The host-agent's `Hello` frame ships its `WIRE_VERSION`; the
+  coord rejects on mismatch in `api/hosts.rs::handle_connection`.
+  Mixed-version deploys are refused loudly with a wire-version
+  log line on both sides. Future contributors editing
+  `engram-protocol::wire` should bump the version + add a history
+  note alongside any structural change.
 
 ---
 
