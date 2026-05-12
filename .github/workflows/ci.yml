@@ -14,7 +14,7 @@ name: CI
 #                       the FC image bake chain)
 #   - test-firecracker: every `#[ignore]`'d FC integration test
 #                       (boot, lifecycle, snapshot, snapshot_uffd,
-#                       cold_tier, exec_real_vm, harness_loopback)
+#                       exec_real_vm, harness_loopback)
 #                       under nested virt, plus the root-required
 #                       suite (host_startup, proxy_e2e, snapshot_net)
 #                       under sudo for iptables + TAP creation.
@@ -343,6 +343,8 @@ jobs:
       # would otherwise be invoked here only to short-circuit via
       # their `require_root()` SKIP path — leaving the gap silent.
       - name: Firecracker `#[ignore]` tests (unprivileged)
+        # `cold_tier` was deleted in Phase 7 of the ADR 0007 rollout —
+        # chunked-immutable storage is the single durability tier now.
         run: |
           cargo nextest run \
             -p engram-sandbox-firecracker \
@@ -350,9 +352,35 @@ jobs:
             --test lifecycle \
             --test snapshot \
             --test snapshot_uffd \
-            --test cold_tier \
             --test exec_real_vm \
             --test harness_loopback \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+
+      # ADR 0007 Phase 4: NBD daemon serves chunked disks. This
+      # test boots a real FC microVM with `/dev/nbd0` as the rootfs;
+      # the kernel's NBD client talks to our daemon, which serves
+      # chunk-store reads on demand. Validates the kernel-userspace
+      # NBD boundary that the unit tests can't exercise.
+      #
+      # `modprobe nbd nbds_max=4` exposes /dev/nbd{0..3}. The chmod
+      # opens the device to non-root so the test process can `open(2)`
+      # it. Production hosts use a udev rule + the engram-host-agent
+      # system user, but for CI we just open it wide.
+      - name: Load nbd kernel module + open /dev/nbd0
+        run: |
+          sudo modprobe nbd nbds_max=4
+          sudo chmod 666 /dev/nbd0
+          ls -la /dev/nbd0
+
+      - name: NBD chunked-disk integration test (Linux + KVM + nbd)
+        env:
+          ENGRAM_TEST_NBD_DEVICE: /dev/nbd0
+        run: |
+          cargo nextest run \
+            -p engram-host-agent \
+            --test nbd_chunked_disk \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
