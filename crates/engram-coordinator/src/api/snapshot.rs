@@ -85,6 +85,10 @@ pub async fn snapshot(
         // haven't wired it leave the field None and the row
         // remains restore-only on the same host (the legacy path).
         disk_manifest: metadata.disk_manifest,
+        // ADR 0007 / Phase 5: FC's chunked memory manifest. Set
+        // by `PooledBackend::snapshot` after FC writes memory.bin,
+        // unset on every other backend.
+        memory_manifest: metadata.memory_manifest,
     };
     state.services.meta.record_snapshot(record).await?;
 

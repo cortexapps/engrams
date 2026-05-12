@@ -1222,6 +1222,13 @@ impl SandboxBackend for FirecrackerBackend {
             // lives on the per-sandbox rootfs file. Phase 4's NBD work
             // produces a disk_manifest here when it lands.
             disk_manifest: None,
+            // FC backend's bare snapshot writes memory.bin to disk
+            // and stops there. `PooledBackend::snapshot` is the
+            // integration point that chunks memory.bin into the
+            // chunk store and patches this field afterward — that
+            // way the FC backend stays chunk-store-agnostic and
+            // dev/test paths don't need a chunk-store wiring.
+            memory_manifest: None,
         })
     }
 

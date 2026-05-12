@@ -19,6 +19,15 @@ pub struct SnapshotMetadata {
     /// macOS once a `ChunkStore` is attached to its config.
     #[serde(default)]
     pub disk_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0007: content-addressed manifest pointing at the
+    /// snapshot's memory chunks (512 KiB) in `BlobStorage`. The
+    /// UFFD handler reads this at restore time to resolve per-page
+    /// faults against the canonical-base mmap or the session's
+    /// divergent chunks. `None` outside FC: VZ's memory snapshot is
+    /// broken upstream for arm64 (ADR 0003), so memory chunking
+    /// stays FC-only.
+    #[serde(default)]
+    pub memory_manifest: Option<super::manifest::ManifestRef>,
 }
 
 /// Where a snapshot's bytes currently live. Computed from
@@ -89,6 +98,14 @@ pub struct SnapshotRecord {
     /// by migration 0018.
     #[serde(default)]
     pub disk_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0007 / Phase 5: content-addressed manifest ref pointing
+    /// at the snapshot's memory chunks. Set only for FC snapshots
+    /// whose host wraps the backend with a `PooledBackend` that has
+    /// a `ChunkStore` attached. Persisted to
+    /// `memory_manifest_id` + `memory_manifest_version` (migration
+    /// 0019).
+    #[serde(default)]
+    pub memory_manifest: Option<super::manifest::ManifestRef>,
 }
 
 impl SnapshotRecord {
@@ -121,6 +138,7 @@ mod tests {
             blob_present: blob,
             replicated_at: None,
             disk_manifest: None,
+            memory_manifest: None,
         }
     }
 

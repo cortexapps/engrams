@@ -167,5 +167,6 @@ fn snapshot_for(session_id: SessionId, disk_manifest: Option<ManifestRef>) -> Sn
         blob_present: false,
         replicated_at: None,
         disk_manifest,
+        memory_manifest: None,
     }
 }

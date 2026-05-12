@@ -331,6 +331,9 @@ impl SandboxBackend for ProcessBackend {
             // ProcessBackend doesn't write disks in ext4 form; chunked
             // storage doesn't apply here (the rootfs is a directory).
             disk_manifest: None,
+            // No memory snapshot in ProcessBackend — there's no
+            // guest RAM to capture.
+            memory_manifest: None,
         })
     }
 

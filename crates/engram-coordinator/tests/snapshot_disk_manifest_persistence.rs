@@ -69,6 +69,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         blob_present: false,
         replicated_at: None,
         disk_manifest: Some(mref),
+        memory_manifest: None,
     };
     meta.record_snapshot(snap_with.clone())
         .await

@@ -89,6 +89,10 @@ pub(crate) async fn build_metadata(
         created_at: Utc::now(),
         image_version: image_version.into(),
         disk_manifest,
+        // VZ memory snapshots stay None — the Virtualization
+        // framework's memory snapshot is broken upstream for arm64
+        // guests (ADR 0003), so chunked memory is FC-only.
+        memory_manifest: None,
     })
 }
 

@@ -118,6 +118,17 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Symmetric to `list_live_disk_manifest_ids` for the memory
+    /// side. ADR 0007 Phase 5 introduced `memory_manifest_id` on
+    /// the `snapshots` table; the GC sweep needs both axes so
+    /// chunks for retired session memories get collected on the
+    /// same cadence as disk chunks. Default `Ok(vec![])` keeps
+    /// in-memory test impls quiet — the real query lives in
+    /// `engram-postgres`.
+    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
+        Ok(Vec::new())
+    }
+
     // ---- cold-tier (ADR 0005 / Stage 4+) ----
 
     /// Return the most-recently-created snapshot for `sid` whose

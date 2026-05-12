@@ -336,14 +336,17 @@ impl MetadataStore for PostgresStore {
                 (id, session_id, host_id, local_path,
                  image_version, size_bytes, created_at, last_accessed_at,
                  blob_present,
-                 disk_manifest_id, disk_manifest_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10)
+                 disk_manifest_id, disk_manifest_version,
+                 memory_manifest_id, memory_manifest_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
-                local_path            = EXCLUDED.local_path,
-                last_accessed_at      = EXCLUDED.last_accessed_at,
-                disk_manifest_id      = EXCLUDED.disk_manifest_id,
-                disk_manifest_version = EXCLUDED.disk_manifest_version,
-                updated_at            = NOW()
+                local_path              = EXCLUDED.local_path,
+                last_accessed_at        = EXCLUDED.last_accessed_at,
+                disk_manifest_id        = EXCLUDED.disk_manifest_id,
+                disk_manifest_version   = EXCLUDED.disk_manifest_version,
+                memory_manifest_id      = EXCLUDED.memory_manifest_id,
+                memory_manifest_version = EXCLUDED.memory_manifest_version,
+                updated_at              = NOW()
             "#,
         )
         .bind(snap.id.as_uuid())
@@ -360,6 +363,8 @@ impl MetadataStore for PostgresStore {
         .bind(snap.last_accessed_at)
         .bind(snap.disk_manifest.map(|m| m.manifest_id))
         .bind(snap.disk_manifest.map(|m| m.version as i64))
+        .bind(snap.memory_manifest.map(|m| m.manifest_id))
+        .bind(snap.memory_manifest.map(|m| m.version as i64))
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -376,7 +381,8 @@ impl MetadataStore for PostgresStore {
                    image_version, size_bytes,
                    created_at, last_accessed_at,
                    blob_present, replicated_at,
-                   disk_manifest_id, disk_manifest_version
+                   disk_manifest_id, disk_manifest_version,
+                   memory_manifest_id, memory_manifest_version
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -397,7 +403,8 @@ impl MetadataStore for PostgresStore {
                    image_version, size_bytes,
                    created_at, last_accessed_at,
                    blob_present, replicated_at,
-                   disk_manifest_id, disk_manifest_version
+                   disk_manifest_id, disk_manifest_version,
+                   memory_manifest_id, memory_manifest_version
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -432,6 +439,29 @@ impl MetadataStore for PostgresStore {
             .collect()
     }
 
+    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
+        // Mirror of `list_live_disk_manifest_ids`. The partial
+        // `idx_snapshots_memory_manifest` (migration 0019) keeps
+        // the scan proportional to FC snapshot rows — VZ rows skip
+        // memory manifests so they're invisible here.
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT memory_manifest_id
+            FROM snapshots
+            WHERE memory_manifest_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<uuid::Uuid, _>("memory_manifest_id")
+                    .map_err(db_err)
+            })
+            .collect()
+    }
+
     async fn latest_cold_snapshot_for_session(
         &self,
         sid: SessionId,
@@ -443,6 +473,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    blob_present, replicated_at,
                    disk_manifest_id, disk_manifest_version,
+                   memory_manifest_id, memory_manifest_version,
                    wrapped_dek, nonce, ciphertext, key_id
             FROM snapshots
             WHERE session_id = $1 AND blob_present = TRUE

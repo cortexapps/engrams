@@ -475,6 +475,7 @@ async fn flush_then_unpack_round_trips_snapshot_contents() {
         blob_present: false,
         replicated_at: None,
         disk_manifest: None,
+        memory_manifest: None,
     };
     let meta = Arc::new(FlushTrackingMeta::default());
     meta.seed(session.clone(), snap.clone());
@@ -577,6 +578,7 @@ async fn flush_to_cold_is_idempotent_on_already_cold_row() {
         blob_present: true,
         replicated_at: Some(now),
         disk_manifest: None,
+        memory_manifest: None,
     };
     let meta = Arc::new(FlushTrackingMeta::default());
     meta.seed(session.clone(), snap.clone());

@@ -154,6 +154,8 @@ pub async fn evict_idle_session(
         // ADR 0007: the chunked-snapshot write path populates this
         // when wired (VZ today, FC after Phase 4).
         disk_manifest: metadata.disk_manifest,
+        // ADR 0007 / Phase 5: FC memory manifest.
+        memory_manifest: metadata.memory_manifest,
     };
     state
         .services
