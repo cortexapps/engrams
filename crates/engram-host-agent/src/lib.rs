@@ -18,6 +18,7 @@ use engram_core::traits::{CloudBackend, SandboxBackend};
 
 use crate::image_cache::ImageCache;
 
+pub mod admin_handler;
 pub mod blob;
 pub mod config;
 pub mod dialer;
@@ -215,12 +216,28 @@ impl HostAgent {
                     false,
                 )
             });
+            // ADR 0007: surface the reaper to the coord. The coord's
+            // POST /api/admin/reap-materialize-dir fans this out
+            // across every connected host in --mode=coordinator;
+            // without it, that admin endpoint can't reach this
+            // host. We hand it `materialize_dir` from
+            // chunk_store; hosts without a chunk_store wiring
+            // leave admin_handler = None (RPC then returns a clean
+            // "unsupported" error, the coord-side aggregator
+            // tolerates per-host failures).
+            let admin_handler: Option<
+                std::sync::Arc<dyn engram_protocol::server::HostAdminHandler>,
+            > = self.chunk_store.as_ref().map(|(_, dir)| {
+                std::sync::Arc::new(admin_handler::MaterializeDirReaper::new(dir.clone()))
+                    as std::sync::Arc<dyn engram_protocol::server::HostAdminHandler>
+            });
             let dialer_cfg = dialer::DialerConfig {
                 coordinator_url: coord_url,
                 auth_token: self.cfg.coordinator_token.clone(),
                 heartbeat_interval: self.cfg.heartbeat_interval,
                 heartbeat_provider: Some(provider),
                 auth_session_handle: self.auth_session_handle.clone(),
+                admin_handler,
             };
             let dialer_task = tokio::spawn(async move {
                 if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, pooled_for_dialer).await {

@@ -11,7 +11,7 @@ use std::time::Duration;
 use engram_core::traits::SandboxBackend;
 use engram_core::HostId;
 use engram_protocol::heartbeat::Heartbeat;
-use engram_protocol::server::HostSession;
+use engram_protocol::server::{HostAdminHandler, HostSession};
 use engram_protocol::wire::NotifyKind;
 use engram_protocol::{HostCapacityReport, LocalSnapshotReport, WarmPoolReport};
 use tokio_tungstenite::connect_async;
@@ -57,6 +57,13 @@ pub struct DialerConfig {
     /// OCI client falls back to whatever resolver the binary
     /// configured at startup.
     pub auth_session_handle: Option<crate::ws_auth::SessionHandle>,
+    /// ADR 0007: host-side admin RPC handler (e.g. materialize-dir
+    /// orphan reap). `None` means the host rejects admin RPCs with
+    /// a typed error — `--mode=coordinator` fanouts then see the
+    /// host as "unsupported" and skip it without blocking other
+    /// hosts. Hosts that wire a `materialize_dir` should pass
+    /// `MaterializeDirReaper::new(dir)` here.
+    pub admin_handler: Option<Arc<dyn HostAdminHandler>>,
 }
 
 /// Dialer entry point. Runs forever, reconnecting on disconnect.
@@ -139,7 +146,9 @@ async fn connect_once(
     ));
 
     // Block on inbound frames until the connection ends.
-    session.serve_with_reader(backend, None, read).await;
+    session
+        .serve_with_reader(backend, None, cfg.admin_handler.clone(), read)
+        .await;
 
     hb_handle.abort();
 

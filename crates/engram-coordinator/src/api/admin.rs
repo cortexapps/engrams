@@ -112,7 +112,36 @@ pub struct ReapMaterializeDirResult {
     pub files_skipped_too_young: u64,
     pub live_manifest_count: usize,
     pub min_age_secs: u64,
+    /// Local materialize_dir in `--mode=all`; empty in
+    /// `--mode=coordinator` (each host has its own dir, surfaced
+    /// per-host below).
     pub materialize_dir: String,
+    /// `--mode=coordinator` fanout: per-host reap outcomes.
+    /// Empty in `--mode=all`. Stays present (zero-length) instead
+    /// of optional so clients can deserialize one shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_host: Vec<PerHostReap>,
+}
+
+#[derive(Serialize)]
+pub struct PerHostReap {
+    pub host_id: String,
+    /// Per-host stats. Absent when the host returned an error; in
+    /// that case `error` is populated. Mutually exclusive with
+    /// `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<PerHostReapStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PerHostReapStats {
+    pub files_scanned: u64,
+    pub files_deleted: u64,
+    pub bytes_freed: u64,
+    pub files_skipped_unparseable: u64,
+    pub files_skipped_too_young: u64,
 }
 
 /// `POST /api/admin/reap-materialize-dir` — drop materialized
@@ -121,68 +150,160 @@ pub struct ReapMaterializeDirResult {
 /// store GC endpoint above: that one sweeps chunks; this one
 /// sweeps the assembled files derived from chunks.
 ///
-/// Returns 409 when running in `--mode=coordinator`: the
-/// materialize dir lives on each host's local disk, and the
-/// multi-host fanout RPC isn't wired yet (tracked in the rollout
-/// doc as a follow-up).
+/// Dispatch:
+/// - `--mode=all`: runs in-proc against the coordinator's local
+///   `materialize_dir`. Top-level fields populated; `per_host`
+///   empty.
+/// - `--mode=coordinator`: fans out across every registered host
+///   that exposes a `ConnectedHost`. Top-level totals are summed
+///   across hosts; `per_host` carries individual outcomes
+///   (including any per-host failures — one host's RPC error
+///   doesn't fail the aggregate). Hosts without a wired admin
+///   handler return a clean "unsupported" error rather than
+///   bringing down the whole sweep.
 pub async fn reap_materialize_dir(
     State(state): State<SharedState>,
     axum::extract::Query(params): axum::extract::Query<ReapMaterializeDirParams>,
 ) -> Result<Json<ReapMaterializeDirResult>, ApiError> {
-    let materialize_dir = match state.services.materialize_dir.as_ref() {
-        Some(dir) => dir.clone(),
-        None => {
-            return Err(ApiError::Conflict(
-                "reap-materialize-dir is `--mode=all`-only; multi-host fanout is \
-                 a follow-up (see docs/chunked-storage-rollout.md)"
-                    .into(),
-            ));
-        }
-    };
     let min_age_secs = params.min_age_secs.unwrap_or(3600);
-    let min_age = std::time::Duration::from_secs(min_age_secs);
 
     // Live-set source = the same DB query the chunk GC uses. The
     // two reapers stay coherent: a manifest that survives the
     // chunk sweep also keeps its materialized files, and
-    // vice-versa.
-    let live_ids: std::collections::HashSet<uuid::Uuid> = state
+    // vice-versa. Computed once + shared across the in-proc path
+    // AND the per-host fanout.
+    let live_ids_vec = state
         .services
         .meta
         .list_live_disk_manifest_ids()
         .await
-        .map_err(|e| ApiError::Internal(format!("list_live_disk_manifest_ids: {e}")))?
-        .into_iter()
-        .collect();
-    let live_manifest_count = live_ids.len();
+        .map_err(|e| ApiError::Internal(format!("list_live_disk_manifest_ids: {e}")))?;
+    let live_manifest_count = live_ids_vec.len();
 
-    tracing::info!(
-        materialize_dir = %materialize_dir.display(),
-        live_manifest_count,
-        min_age_secs,
-        "starting materialize-dir orphan reap",
-    );
+    // In-proc path (--mode=all): the coord owns a local
+    // materialize_dir; skip the fanout entirely.
+    if let Some(dir) = state.services.materialize_dir.as_ref() {
+        let live: std::collections::HashSet<uuid::Uuid> = live_ids_vec.iter().copied().collect();
+        let min_age = std::time::Duration::from_secs(min_age_secs);
 
-    let stats =
-        engram_host_agent::orphan_reap::reap_materialize_dir(&materialize_dir, &live_ids, min_age)
+        tracing::info!(
+            materialize_dir = %dir.display(),
+            live_manifest_count,
+            min_age_secs,
+            "starting materialize-dir orphan reap (in-proc)",
+        );
+
+        let stats = engram_host_agent::orphan_reap::reap_materialize_dir(dir, &live, min_age)
             .await
             .map_err(|e| ApiError::Internal(format!("reap_materialize_dir: {e}")))?;
 
+        tracing::info!(
+            files_scanned = stats.files_scanned,
+            files_deleted = stats.files_deleted,
+            bytes_freed = stats.bytes_freed,
+            "materialize-dir orphan reap complete",
+        );
+
+        return Ok(Json(ReapMaterializeDirResult {
+            files_scanned: stats.files_scanned,
+            files_deleted: stats.files_deleted,
+            bytes_freed: stats.bytes_freed,
+            files_skipped_unparseable: stats.files_skipped_unparseable,
+            files_skipped_too_young: stats.files_skipped_too_young,
+            live_manifest_count,
+            min_age_secs,
+            materialize_dir: dir.display().to_string(),
+            per_host: Vec::new(),
+        }));
+    }
+
+    // Fanout path (--mode=coordinator): walk every connected host
+    // with an admin_client and call the RPC. Aggregate the stats
+    // for the top-level response so consumers can use one
+    // shape regardless of mode; per-host details land in
+    // `per_host`.
+    let host_ids = state.host_registry.host_ids();
     tracing::info!(
-        files_scanned = stats.files_scanned,
-        files_deleted = stats.files_deleted,
-        bytes_freed = stats.bytes_freed,
-        "materialize-dir orphan reap complete",
+        host_count = host_ids.len(),
+        live_manifest_count,
+        min_age_secs,
+        "starting materialize-dir orphan reap (multi-host fanout)",
+    );
+
+    let mut per_host = Vec::with_capacity(host_ids.len());
+    let mut total_scanned = 0u64;
+    let mut total_deleted = 0u64;
+    let mut total_bytes_freed = 0u64;
+    let mut total_skipped_unparseable = 0u64;
+    let mut total_skipped_too_young = 0u64;
+
+    for host_id in host_ids {
+        let client = match state.host_registry.admin_client(host_id) {
+            Some(c) => c,
+            None => {
+                per_host.push(PerHostReap {
+                    host_id: host_id.to_string(),
+                    stats: None,
+                    error: Some(
+                        "host registered without an admin_client (in-proc or test backend)".into(),
+                    ),
+                });
+                continue;
+            }
+        };
+        match client
+            .reap_materialize_dir(min_age_secs, live_ids_vec.clone())
+            .await
+        {
+            Ok(stats) => {
+                total_scanned += stats.files_scanned;
+                total_deleted += stats.files_deleted;
+                total_bytes_freed += stats.bytes_freed;
+                total_skipped_unparseable += stats.files_skipped_unparseable;
+                total_skipped_too_young += stats.files_skipped_too_young;
+                per_host.push(PerHostReap {
+                    host_id: host_id.to_string(),
+                    stats: Some(PerHostReapStats {
+                        files_scanned: stats.files_scanned,
+                        files_deleted: stats.files_deleted,
+                        bytes_freed: stats.bytes_freed,
+                        files_skipped_unparseable: stats.files_skipped_unparseable,
+                        files_skipped_too_young: stats.files_skipped_too_young,
+                    }),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    host_id = %host_id,
+                    error = %e,
+                    "host failed materialize-dir reap; other hosts unaffected",
+                );
+                per_host.push(PerHostReap {
+                    host_id: host_id.to_string(),
+                    stats: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    tracing::info!(
+        hosts_visited = per_host.len(),
+        files_deleted = total_deleted,
+        bytes_freed = total_bytes_freed,
+        "materialize-dir orphan reap (fanout) complete",
     );
 
     Ok(Json(ReapMaterializeDirResult {
-        files_scanned: stats.files_scanned,
-        files_deleted: stats.files_deleted,
-        bytes_freed: stats.bytes_freed,
-        files_skipped_unparseable: stats.files_skipped_unparseable,
-        files_skipped_too_young: stats.files_skipped_too_young,
+        files_scanned: total_scanned,
+        files_deleted: total_deleted,
+        bytes_freed: total_bytes_freed,
+        files_skipped_unparseable: total_skipped_unparseable,
+        files_skipped_too_young: total_skipped_too_young,
         live_manifest_count,
         min_age_secs,
-        materialize_dir: materialize_dir.display().to_string(),
+        materialize_dir: String::new(),
+        per_host,
     }))
 }

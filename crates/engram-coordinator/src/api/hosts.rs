@@ -209,7 +209,12 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
     // backend trait object owns its own copy.
     let backend: Arc<dyn engram_core::traits::SandboxBackend> =
         Arc::new(RemoteSandboxBackend::new(host.clone()));
-    state.host_registry.register(host_id, backend);
+    // Hand a second clone to the registry as the admin client so
+    // out-of-band RPCs (materialize-dir reap fanout, ADR 0007) can
+    // reach this host directly.
+    state
+        .host_registry
+        .register_remote(host_id, backend, host.clone());
 
     // ADR 0007: install the host-request handler so the host-agent
     // can resolve OCI auth via the coord's `PgAuthResolver`. Plaintext

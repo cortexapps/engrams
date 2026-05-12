@@ -29,10 +29,15 @@ use parking_lot::RwLock;
 
 /// Per-host record kept in-memory. Backend dispatches RPCs over the
 /// wire (or directly in `--mode=all`); the heartbeat-derived state
-/// fields drive the scheduler in Phase 3b.
+/// fields drive the scheduler in Phase 3b. The optional
+/// `admin_client` is the underlying `ConnectedHost` used by
+/// out-of-band admin RPCs (ADR 0007 materialize-dir reap fanout);
+/// `None` for `--mode=all` test-registered backends that aren't
+/// routed through the wire layer.
 struct HostEntry {
     backend: Arc<dyn SandboxBackend>,
     state: RwLock<HostState>,
+    admin_client: Option<engram_protocol::client::ConnectedHost>,
 }
 
 /// Heartbeat-derived view of a host. Updated by the WS supervisor
@@ -85,8 +90,39 @@ impl HostRegistry {
             HostEntry {
                 backend,
                 state: RwLock::new(HostState::default()),
+                admin_client: None,
             },
         );
+    }
+
+    /// Register a host with a ConnectedHost reference, so admin
+    /// RPCs (ADR 0007 materialize-dir reap fanout) can reach it
+    /// directly. Wire-connected hosts use this; `--mode=all` /
+    /// test backends use [`Self::register`] without an admin
+    /// client (the admin endpoint then short-circuits to in-proc).
+    pub fn register_remote(
+        &self,
+        host_id: HostId,
+        backend: Arc<dyn SandboxBackend>,
+        admin_client: engram_protocol::client::ConnectedHost,
+    ) {
+        self.hosts.insert(
+            host_id,
+            HostEntry {
+                backend,
+                state: RwLock::new(HostState::default()),
+                admin_client: Some(admin_client),
+            },
+        );
+    }
+
+    /// Look up the ConnectedHost for a registered remote host. Used
+    /// by the admin endpoint to fan out RPCs. Returns `None` for
+    /// in-proc / test-registered hosts.
+    pub fn admin_client(&self, host_id: HostId) -> Option<engram_protocol::client::ConnectedHost> {
+        self.hosts
+            .get(&host_id)
+            .and_then(|e| e.value().admin_client.clone())
     }
 
     /// Update a host's heartbeat-derived state. Called by the WS

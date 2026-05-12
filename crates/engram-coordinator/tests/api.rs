@@ -2876,28 +2876,34 @@ async fn admin_gc_chunks_returns_zero_on_empty_store() {
 }
 
 #[tokio::test]
-async fn admin_reap_materialize_dir_rejects_in_coordinator_mode() {
-    // Default TestFixture has no `materialize_dir` (it doesn't
-    // wire one for the unit-test harness — the fixture targets
-    // the multi-host code path). The reap endpoint refuses with
-    // 409 so an operator running `--mode=coordinator` doesn't
-    // silently get a no-op response.
+async fn admin_reap_materialize_dir_reports_host_without_admin_client() {
+    // Default TestFixture has no local materialize_dir but DOES
+    // register an in-proc ProcessBackend via plain `register()`
+    // (test backends don't have a ConnectedHost). Per ADR 0007 the
+    // coordinator-mode path fans out, and hosts without an
+    // admin_client surface a per-host error explaining the skip
+    // — this exercises the "graceful skip" contract where one
+    // host's missing handler doesn't fail the whole sweep.
     let store = MockMetadataStore::arc();
     let app = build_app(store);
 
     let resp = post(app, "/api/admin/reap-materialize-dir", json!({})).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "reap is `--mode=all`-only; coordinator mode must refuse",
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp.into_body()).await;
-    // ApiError serializes as { error: "<slug>", message: "<msg>" } —
-    // slug is "conflict"; the explanation lives in `message`.
-    let msg = v["message"].as_str().unwrap_or("");
+    assert_eq!(v["files_deleted"], 0);
+    assert_eq!(v["bytes_freed"], 0);
+    let per_host = v["per_host"]
+        .as_array()
+        .expect("per_host array must be present in coordinator mode");
+    assert!(!per_host.is_empty(), "test fixture registers one host");
+    let entry = &per_host[0];
+    assert!(entry["stats"].is_null(), "no stats when host was skipped");
+    let err = entry["error"]
+        .as_str()
+        .expect("missing admin_client → per-host error string");
     assert!(
-        msg.contains("mode=all"),
-        "error message must explain why: {msg}",
+        err.contains("admin_client"),
+        "error must explain the skip reason, got: {err}",
     );
 }
 

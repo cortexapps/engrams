@@ -65,7 +65,7 @@ async fn pair(
     let backend_clone = backend.clone();
     let serve_handle = tokio::spawn(async move {
         session
-            .serve_with_reader(backend_clone, None, Box::pin(host_stream))
+            .serve_with_reader(backend_clone, None, None, Box::pin(host_stream))
             .await;
     });
 

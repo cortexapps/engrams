@@ -297,7 +297,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     let local_backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_dir));
     let serve_handle = tokio::spawn(async move {
         session
-            .serve_with_reader(local_backend, None, Box::pin(host_stream))
+            .serve_with_reader(local_backend, None, None, Box::pin(host_stream))
             .await;
     });
 

@@ -852,9 +852,14 @@ tier.
        endpoint. Parses `<manifest_id>-vN.ext4` filenames; deletes
        any not in the live-set (same query the chunk GC uses).
        `min_age_secs` gate guards in-flight `create()` clonefiles.
-       `--mode=all` only today; multi-host fanout via WS-RPC is a
-       follow-up (deliberate: avoid wire bloat until ops actually
-       hit the leak in production). Cron scheduler pairs with #4.
+       Multi-host fanout shipped: in `--mode=coordinator` the
+       endpoint walks every connected host with an `admin_client`
+       and calls `RequestKind::ReapMaterializeDir` (WIRE v3) so
+       each host sweeps its own local dir. Per-host failures
+       surface in `per_host[].error`; top-level totals sum
+       successful runs. Hosts without a wired `HostAdminHandler`
+       (no `materialize_dir` configured) skip gracefully with a
+       typed error. Cron scheduler pairs with #4.
 4. ✅ **Chunk-store GC scheduler** (Phase 1 gap) — shipped. Cron
    loop `engram_coordinator::chunk_gc::spawn` in `start_coordinator`
    + `POST /api/admin/gc-chunks` admin endpoint delegating to the

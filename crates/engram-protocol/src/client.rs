@@ -319,6 +319,30 @@ impl ConnectedHost {
     pub fn is_closed(&self) -> bool {
         *self.inner.closed.lock()
     }
+
+    /// Fire the host-side `reap_materialize_dir` admin RPC. Pairs
+    /// with `engram_protocol::server::HostAdminHandler`; the coord
+    /// drives this via `POST /api/admin/reap-materialize-dir` in
+    /// `--mode=coordinator` (fans out across all connected hosts).
+    /// ADR 0007.
+    pub async fn reap_materialize_dir(
+        &self,
+        min_age_secs: u64,
+        live_disk_manifest_ids: Vec<uuid::Uuid>,
+    ) -> Result<crate::wire::WireReapStats, ConnectionError> {
+        match self
+            .unary(RequestKind::ReapMaterializeDir {
+                min_age_secs,
+                live_disk_manifest_ids,
+            })
+            .await?
+        {
+            ResponseKind::MaterializeDirReaped { stats } => Ok(stats),
+            other => Err(ConnectionError::Protocol(format!(
+                "expected MaterializeDirReaped, got {other:?}"
+            ))),
+        }
+    }
 }
 
 async fn demux_loop<R>(inner: Arc<Inner>, mut reader: R)

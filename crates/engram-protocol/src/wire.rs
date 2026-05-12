@@ -39,7 +39,12 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 ///   so the standalone host-agent can resolve OCI auth via the
 ///   coord's `PgAuthResolver`. New enum variants shift discriminants
 ///   in bincode and are a wire break.
-pub const WIRE_VERSION: u32 = 2;
+/// - v3: added `RequestKind::ReapMaterializeDir` +
+///   `ResponseKind::MaterializeDirReaped` + the `WireReapStats`
+///   wire type so the coord can fan out the materialize-dir
+///   orphan reap to every connected host in `--mode=coordinator`.
+///   Adding enum variants shifts discriminants; another wire break.
+pub const WIRE_VERSION: u32 = 3;
 
 /// Top-level frame on the wire.
 ///
@@ -166,6 +171,26 @@ pub enum RequestKind {
     ResolveRegistryAuth {
         host: String,
     },
+    /// Coord → host. Per-host materialize-dir orphan reap. The
+    /// admin endpoint runs the same primitive inline in
+    /// `--mode=all`; in `--mode=coordinator` it fans this RPC out
+    /// across `host_registry`'s connected hosts so each host
+    /// sweeps its own local materialize_dir.
+    ///
+    /// The host-agent surfaces this via its `HostAdminHandler`,
+    /// which calls `engram_host_agent::orphan_reap::reap_materialize_dir`
+    /// against the host's own materialize_dir + a live-id set fetched
+    /// from the coord (sent inline so the host doesn't need DB
+    /// access to compute its own live set). ADR 0007.
+    ReapMaterializeDir {
+        min_age_secs: u64,
+        /// Snapshot of `MetadataStore::list_live_disk_manifest_ids`
+        /// taken by the coord just before fanout. Hosts don't have
+        /// DB access; the coord owns the truth and ships it inline.
+        /// Cap implicit: a UUID is 16 bytes; even 1M live manifests
+        /// is 16 MiB on the wire — well under bincode's defaults.
+        live_disk_manifest_ids: Vec<uuid::Uuid>,
+    },
 }
 
 /// Successful response payloads. Errors take the [`RemoteError`] path
@@ -190,6 +215,22 @@ pub enum ResponseKind {
     /// via its `PgAuthResolver`. Caller plugs the creds into the
     /// OCI client's basic-auth path for the in-flight pull.
     RegistryAuth { creds: Option<RegistryCreds> },
+    /// `ReapMaterializeDir` reply. Per-host outcome of the reap
+    /// pass; the coord aggregates across hosts in the admin
+    /// endpoint's JSON response.
+    MaterializeDirReaped { stats: WireReapStats },
+}
+
+/// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
+/// Defined here so `engram-protocol` doesn't drag a dep on the
+/// host-agent crate (matches the `RegistryCreds` pattern).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WireReapStats {
+    pub files_scanned: u64,
+    pub files_deleted: u64,
+    pub bytes_freed: u64,
+    pub files_skipped_unparseable: u64,
+    pub files_skipped_too_young: u64,
 }
 
 /// Plaintext credentials for an OCI registry, returned by the
@@ -455,6 +496,73 @@ mod tests {
                 req_id,
                 result: Err(RemoteError::NotFound),
             } => assert_eq!(req_id, 7),
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reap_materialize_dir_round_trips_through_bincode() {
+        // Sanity: the new v3 variant survives a Request → bytes →
+        // Request cycle, including the live-set vector. Discriminant
+        // alignment + Vec<uuid::Uuid> encoding both have caught real
+        // wire breaks in earlier rollouts.
+        let live_ids = vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+        let kind = RequestKind::ReapMaterializeDir {
+            min_age_secs: 600,
+            live_disk_manifest_ids: live_ids.clone(),
+        };
+        let frame = Frame::Request {
+            req_id: 7,
+            trace: TraceContext::default(),
+            kind,
+        };
+        let bytes = bincode::serialize(&frame).unwrap();
+        let back: Frame = bincode::deserialize(&bytes).unwrap();
+        match back {
+            Frame::Request {
+                kind:
+                    RequestKind::ReapMaterializeDir {
+                        min_age_secs,
+                        live_disk_manifest_ids,
+                    },
+                ..
+            } => {
+                assert_eq!(min_age_secs, 600);
+                assert_eq!(live_disk_manifest_ids, live_ids);
+            }
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_dir_reaped_response_round_trips() {
+        // Response side mirror.
+        let stats = WireReapStats {
+            files_scanned: 12,
+            files_deleted: 5,
+            bytes_freed: 1024,
+            files_skipped_unparseable: 1,
+            files_skipped_too_young: 2,
+        };
+        let frame = Frame::Response {
+            req_id: 7,
+            result: Ok(ResponseKind::MaterializeDirReaped {
+                stats: stats.clone(),
+            }),
+        };
+        let bytes = bincode::serialize(&frame).unwrap();
+        let back: Frame = bincode::deserialize(&bytes).unwrap();
+        match back {
+            Frame::Response {
+                result: Ok(ResponseKind::MaterializeDirReaped { stats: got }),
+                ..
+            } => {
+                assert_eq!(got.files_scanned, 12);
+                assert_eq!(got.files_deleted, 5);
+                assert_eq!(got.bytes_freed, 1024);
+                assert_eq!(got.files_skipped_unparseable, 1);
+                assert_eq!(got.files_skipped_too_young, 2);
+            }
             other => panic!("wrong shape: {other:?}"),
         }
     }

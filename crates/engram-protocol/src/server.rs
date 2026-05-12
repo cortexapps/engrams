@@ -24,6 +24,7 @@ use crate::codec;
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
 use crate::wire::{
     Frame, NotifyKind, RemoteError, RequestKind, ResponseKind, StreamItem, TraceContext,
+    WireReapStats,
 };
 
 /// Hooks the coordinator side of the server can install to react to
@@ -51,13 +52,41 @@ pub trait NotifyHandler: Send + Sync {
     async fn on_heartbeat(&self, hb: Heartbeat) -> HeartbeatAck;
 }
 
+/// Host-side admin operations the coord can fan out via WS-RPC.
+///
+/// Distinct from [`SandboxBackend`] because these aren't session-
+/// lifecycle calls — they're per-host operational primitives the
+/// coord drives on a cadence or via `POST /api/admin/*`. Adding
+/// them to `SandboxBackend` would force every backend (Process,
+/// VZ, FC) to implement orchestration concerns that don't belong
+/// to a single sandbox.
+///
+/// `None` on `serve()` is the supported zero-config default — the
+/// host returns `RemoteError::Other("...not configured")` for any
+/// admin RPC, which the coord surfaces as an aggregate failure in
+/// the fanout response.
+#[async_trait]
+pub trait HostAdminHandler: Send + Sync {
+    /// Sweep the host's local materialize_dir. `live_disk_manifest_ids`
+    /// is the coord's authoritative live set; anything not in it +
+    /// older than `min_age_secs` gets reaped.
+    async fn reap_materialize_dir(
+        &self,
+        min_age_secs: u64,
+        live_disk_manifest_ids: Vec<uuid::Uuid>,
+    ) -> Result<WireReapStats, String>;
+}
+
 /// Server side: read frames from a WS connection and dispatch them.
 ///
 /// `backend` services Request frames; `notify_handler` is called for
-/// inbound Notifies. Returns when the read half ends or errors.
+/// inbound Notifies. `admin_handler` (optional) handles host-admin
+/// RPCs like `ReapMaterializeDir`; `None` rejects those with a
+/// typed error. Returns when the read half ends or errors.
 pub async fn serve<W, R>(
     backend: Arc<dyn SandboxBackend>,
     notify_handler: Option<Arc<dyn NotifyHandler>>,
+    admin_handler: Option<Arc<dyn HostAdminHandler>>,
     writer: W,
     reader: R,
 ) where
@@ -72,7 +101,7 @@ pub async fn serve<W, R>(
 {
     let session = HostSession::new(writer);
     session
-        .serve_with_reader(backend, notify_handler, reader)
+        .serve_with_reader(backend, notify_handler, admin_handler, reader)
         .await
 }
 
@@ -141,12 +170,14 @@ impl HostSession {
     }
 
     /// Drive the inbound side of the connection: read frames, dispatch
-    /// Requests to `backend`, route Notifies to `notify_handler`.
-    /// Returns when the reader ends or errors.
+    /// Requests to `backend`, route Notifies to `notify_handler`, and
+    /// route host-admin RPCs (ReapMaterializeDir, etc.) to
+    /// `admin_handler`. Returns when the reader ends or errors.
     pub async fn serve_with_reader<R>(
         &self,
         backend: Arc<dyn SandboxBackend>,
         notify_handler: Option<Arc<dyn NotifyHandler>>,
+        admin_handler: Option<Arc<dyn HostAdminHandler>>,
         mut reader: R,
     ) where
         R: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -187,6 +218,7 @@ impl HostSession {
                 } => {
                     tokio::spawn(handle_request(
                         backend.clone(),
+                        admin_handler.clone(),
                         self.writer.clone(),
                         req_id,
                         trace,
@@ -290,6 +322,7 @@ async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, noti
 
 async fn handle_request(
     backend: Arc<dyn SandboxBackend>,
+    admin_handler: Option<Arc<dyn HostAdminHandler>>,
     writer: SharedSink,
     req_id: u64,
     trace: crate::wire::TraceContext,
@@ -381,6 +414,21 @@ async fn handle_request(
                 "ResolveRegistryAuth is host-initiated; hosts don't serve it".into(),
             ))
         }
+        RequestKind::ReapMaterializeDir {
+            min_age_secs,
+            live_disk_manifest_ids,
+        } => match admin_handler.as_ref() {
+            Some(h) => match h
+                .reap_materialize_dir(min_age_secs, live_disk_manifest_ids)
+                .await
+            {
+                Ok(stats) => Ok(ResponseKind::MaterializeDirReaped { stats }),
+                Err(e) => Err(RemoteError::Other(format!("reap_materialize_dir: {e}"))),
+            },
+            None => Err(RemoteError::Other(
+                "host did not register a HostAdminHandler; ReapMaterializeDir unsupported".into(),
+            )),
+        },
     };
 
     send_frame(&writer, Frame::Response { req_id, result }).await;
@@ -395,6 +443,7 @@ fn request_kind_name(kind: &RequestKind) -> &'static str {
         RequestKind::Snapshot { .. } => "snapshot",
         RequestKind::Restore { .. } => "restore",
         RequestKind::ResolveRegistryAuth { .. } => "resolve_registry_auth",
+        RequestKind::ReapMaterializeDir { .. } => "reap_materialize_dir",
     }
 }
 
