@@ -338,22 +338,29 @@ mod linux {
     /// `ENGRAM_BLOB_BACKEND` (default `local`) decides backend.
     /// Mirrors the convention every other Engram crate uses (see
     /// `engram_image_builder::blob`, `engram_coordinator::blob`,
-    /// etc.).
-    async fn pick_blob_backend(cache_root: &Path) -> Result<Arc<dyn BlobStorage>, String> {
+    /// `engram_host_agent::blob`).
+    ///
+    /// Local-mode blob root resolves from `ENGRAM_LOCAL_PATH/blobs`
+    /// to match `engram_host_agent::blob::from_env` exactly — that
+    /// way the chunked-memory bytes the host-agent's PooledBackend
+    /// just wrote land at the same place this handler reads them
+    /// from. `_cache_root` is the L1 NVMe cache (separate dir);
+    /// reads first hit it, miss falls through to the blob root.
+    async fn pick_blob_backend(_cache_root: &Path) -> Result<Arc<dyn BlobStorage>, String> {
         let backend = std::env::var("ENGRAM_BLOB_BACKEND")
             .unwrap_or_else(|_| "local".to_string())
             .to_lowercase();
         match backend.as_str() {
             "local" => {
-                // Local mode: the "chunk store" is a directory next
-                // to the cache root. Useful for dev / unit tests.
-                let local_root = cache_root.join("..").join("store");
-                tokio::fs::create_dir_all(&local_root)
+                let root = std::env::var("ENGRAM_LOCAL_PATH")
+                    .unwrap_or_else(|_| "./var/engram".to_string());
+                let blobs_dir = std::path::PathBuf::from(root).join("blobs");
+                tokio::fs::create_dir_all(&blobs_dir)
                     .await
-                    .map_err(|e| format!("create local blob root {}: {e}", local_root.display()))?;
-                tracing::info!(path = %local_root.display(), "blob backend: local");
+                    .map_err(|e| format!("create local blob root {}: {e}", blobs_dir.display()))?;
+                tracing::info!(path = %blobs_dir.display(), "blob backend: local");
                 Ok(Arc::new(engram_storage_local::LocalBlobStorage::new(
-                    local_root,
+                    blobs_dir,
                 )))
             }
             "gcs" => {

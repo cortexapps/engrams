@@ -2,6 +2,16 @@
 //! `tests/snapshot.rs` but configures `RestoreMode::Uffd` and points
 //! `uffd_handler_bin` at the locally-built `engram-uffd-handler`.
 //!
+//! ADR 0007: UFFD restore requires a `memory_manifest` on the
+//! snapshot's FC sidecar JSON. In production the host-agent's
+//! `PooledBackend::snapshot` chunks memory.bin into the chunk
+//! store and patches the manifest on the operator's behalf;
+//! pulling host-agent into this crate would be a circular dep,
+//! so the test inlines the same chunking + patch sequence on the
+//! emitted memory.bin before invoking restore. That keeps FC's
+//! UFFD restore path exercised end-to-end against a real chunk
+//! store + content-addressed bytes.
+//!
 //! Gating + run instructions match the other FC integration tests:
 //!
 //! ```sh
@@ -16,11 +26,16 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::traits::BlobStorage;
+use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
+use engram_storage_local::LocalBlobStorage;
 
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + built engram-uffd-handler"]
@@ -84,6 +99,45 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         .snapshot(original_id, &snap_dir)
         .await
         .expect("snapshot");
+
+    // ADR 0007: Inline the PooledBackend chunk-memory-on-snapshot
+    // wrap. Production wires this via `PooledBackend::with_chunk_store`;
+    // FC tests can't take that dep without a cycle, so reproduce
+    // the on-disk effect here so the UFFD restore has the manifest
+    // ref it now requires.
+    //
+    // The spawned handler reads `ENGRAM_LOCAL_PATH/blobs` for the
+    // local-mode blob backend, so put chunks at exactly that path
+    // and set the env var before invoking restore.
+    let local_path = work.path().join("local-state");
+    let blobs_dir = local_path.join("blobs");
+    std::env::set_var("ENGRAM_BLOB_BACKEND", "local");
+    std::env::set_var("ENGRAM_LOCAL_PATH", &local_path);
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(blobs_dir));
+    let cs = ChunkStore::new(blob);
+    let memory_bin = snap_dir.join("memory.bin");
+    let manifest = cs
+        .chunk_file(&memory_bin, ManifestKind::Memory, None)
+        .await
+        .expect("chunk memory.bin");
+    let manifest_ref = ManifestRef::new();
+    cs.put_manifest(manifest_ref, &manifest)
+        .await
+        .expect("put memory manifest");
+    let manifest_json = snap_dir.join("manifest.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&manifest_json).await.expect("read mj"))
+            .expect("parse mj");
+    value.as_object_mut().expect("mj root is an object").insert(
+        "memory_manifest".into(),
+        serde_json::to_value(manifest_ref).expect("serialize mref"),
+    );
+    tokio::fs::write(
+        &manifest_json,
+        serde_json::to_vec_pretty(&value).expect("re-serialize mj"),
+    )
+    .await
+    .expect("write patched mj");
 
     backend
         .destroy(original_id)
