@@ -409,6 +409,29 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::snapshot_from_row(&r)).transpose()
     }
 
+    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
+        // The `idx_snapshots_disk_manifest` partial index (migration
+        // 0018) makes this a fast scan over rows that actually have
+        // a chunked manifest. Legacy rows (NULL disk_manifest_id)
+        // are filtered out by the index predicate.
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT disk_manifest_id
+            FROM snapshots
+            WHERE disk_manifest_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<uuid::Uuid, _>("disk_manifest_id")
+                    .map_err(db_err)
+            })
+            .collect()
+    }
+
     async fn latest_cold_snapshot_for_session(
         &self,
         sid: SessionId,

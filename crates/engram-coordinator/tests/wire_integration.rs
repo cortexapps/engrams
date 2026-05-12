@@ -345,6 +345,11 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),
+        chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
+            engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            ),
+        )),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
@@ -468,6 +473,11 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
+        )),
+        chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
+            engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            ),
         )),
     };
     let cfg = CoordinatorConfig {

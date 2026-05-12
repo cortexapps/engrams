@@ -56,6 +56,11 @@ pub struct Services {
     /// Selected at boot via `ENGRAM_BLOB_BACKEND={local,gcs}`;
     /// defaults to `local` so `just dev` works without cloud creds.
     pub blob: Arc<dyn BlobStorage>,
+    /// ADR 0007: chunked-storage primitive layered on top of the
+    /// same `blob`. Shared between the `--mode=all` host-agent's
+    /// `PooledBackend` (materialize-on-create) and the coord's
+    /// admin GC endpoint (sweep unreferenced chunks).
+    pub chunk_store: engram_chunk_store::ChunkStore,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.

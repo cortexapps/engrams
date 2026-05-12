@@ -320,6 +320,11 @@ mod tests {
             blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
                 std::env::temp_dir().join("engram-blobs-test"),
             )),
+            chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-blobs-test"),
+                ),
+            )),
         };
         let cfg = CoordinatorConfig {
             local_path,

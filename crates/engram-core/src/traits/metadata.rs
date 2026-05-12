@@ -100,6 +100,24 @@ pub trait MetadataStore: Send + Sync {
         sid: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError>;
 
+    /// ADR 0007 chunk-store GC: enumerate every `manifest_id`
+    /// referenced by a live snapshot row. The chunk store's
+    /// `gc::run` takes this set as its "do not delete" filter.
+    /// Empty default returns no manifests — backends without a
+    /// real DB (mocks) can opt out by leaving the default.
+    ///
+    /// Notes for callers:
+    /// - Returns DISTINCT ids; versions aren't surfaced because
+    ///   `gc::run` preserves every version of every live id.
+    /// - Doesn't include manifest_ids that only enabled images
+    ///   reference (no snapshot has been taken yet). Operators
+    ///   set a generous `retain_for` window to compensate, or
+    ///   layer enabled-image manifests on top before calling
+    ///   `gc::run`.
+    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
+        Ok(Vec::new())
+    }
+
     // ---- cold-tier (ADR 0005 / Stage 4+) ----
 
     /// Return the most-recently-created snapshot for `sid` whose

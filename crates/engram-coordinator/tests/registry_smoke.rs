@@ -280,6 +280,11 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
         blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
             std::env::temp_dir().join("engram-blobs-test"),
         )),
+        chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
+            engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            ),
+        )),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),

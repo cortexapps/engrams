@@ -558,6 +558,12 @@ async fn main() -> Result<(), CoordinatorError> {
     // auth resolver / chunk store could reference them. They flow
     // through to Services here unchanged.
 
+    // ADR 0007: one ChunkStore per process. Shared between the
+    // host-agent-equivalent PooledBackend (built earlier in
+    // `--mode=all`) and the coord's GC admin endpoint. Both
+    // consume the same `blob` so chunks the bake writes land in
+    // the same keyspace the GC sweeps.
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
     let services = Services {
         meta: meta_arc.clone(),
         cloud,
@@ -567,6 +573,7 @@ async fn main() -> Result<(), CoordinatorError> {
         oci: oci_client,
         auth_resolver,
         blob,
+        chunk_store,
     };
 
     engram_coordinator::run_with_registry(cfg, services, host_registry).await

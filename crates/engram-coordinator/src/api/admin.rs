@@ -184,3 +184,90 @@ async fn flush_inner(
 // `.buffer_unordered` is on `futures::stream::StreamExt`; the bulk
 // endpoint uses it via `futures::stream::iter(...).map(...).buffer_unordered`.
 use futures::stream::StreamExt;
+
+// ---------------------------------------------------------------------
+// ADR 0007 — chunk-store GC
+// ---------------------------------------------------------------------
+
+/// Query params for `POST /api/admin/gc-chunks`.
+#[derive(serde::Deserialize, Default)]
+pub struct GcChunksParams {
+    /// Minimum age (seconds) an unreferenced chunk must reach
+    /// before it's eligible for deletion. Defaults to 24h — long
+    /// enough that a session committing a new manifest version
+    /// isn't racing the sweep, short enough that storage cost
+    /// catches up reasonably fast.
+    ///
+    /// Operators bump this when the GC's live-set source is
+    /// incomplete (we currently only see manifest_ids referenced
+    /// by `snapshots` rows; enabled_images' canonical chunks
+    /// would otherwise be eligible for sweep until someone takes
+    /// a snapshot using them).
+    pub retain_secs: Option<u64>,
+}
+
+/// Wire shape of `POST /api/admin/gc-chunks` response.
+/// Mirrors `engram_chunk_store::gc::GcStats` with concrete types
+/// the JSON serializer can render directly.
+#[derive(Serialize)]
+pub struct GcChunksResult {
+    pub chunks_deleted: u64,
+    pub bytes_freed: u64,
+    pub chunks_retained_age: u64,
+    pub elapsed_ms: u64,
+    pub live_manifest_count: usize,
+    pub retain_secs: u64,
+}
+
+/// `POST /api/admin/gc-chunks` — fire a single GC pass against
+/// the chunk store. Matches the project's "explicit-trigger
+/// admin endpoints for testability" pattern: there's a future
+/// cron alongside, but the admin route is also what tests +
+/// drain-before-redeploy ops use directly.
+///
+/// Returns 500 on internal failures (chunk-store I/O, DB
+/// unreachable). Always safe to retry — the sweep is idempotent
+/// w.r.t. its own output (deleting an already-deleted chunk is
+/// a no-op).
+pub async fn gc_chunks(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<GcChunksParams>,
+) -> Result<Json<GcChunksResult>, ApiError> {
+    let retain_secs = params.retain_secs.unwrap_or(24 * 3600);
+    let retain_for = std::time::Duration::from_secs(retain_secs);
+
+    let live_ids = state
+        .services
+        .meta
+        .list_live_disk_manifest_ids()
+        .await
+        .map_err(|e| ApiError::Internal(format!("list_live_disk_manifest_ids: {e}")))?;
+    let live_count = live_ids.len();
+
+    tracing::info!(
+        live_manifest_count = live_count,
+        retain_secs,
+        "starting chunk-store GC sweep",
+    );
+
+    let stats = engram_chunk_store::gc::run(&state.services.chunk_store, retain_for, live_ids)
+        .await
+        .map_err(|e| ApiError::Internal(format!("chunk gc: {e}")))?;
+
+    tracing::info!(
+        chunks_deleted = stats.chunks_deleted,
+        bytes_freed = stats.bytes_freed,
+        chunks_retained_age = stats.chunks_retained_age,
+        elapsed_ms = stats.elapsed.as_millis() as u64,
+        "chunk-store GC sweep complete",
+    );
+
+    Ok(Json(GcChunksResult {
+        chunks_deleted: stats.chunks_deleted,
+        bytes_freed: stats.bytes_freed,
+        chunks_retained_age: stats.chunks_retained_age,
+        elapsed_ms: stats.elapsed.as_millis() as u64,
+        live_manifest_count: live_count,
+        retain_secs,
+    }))
+}
