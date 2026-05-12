@@ -154,15 +154,25 @@ impl PositionalDiskManifest {
 /// Cheap to clone via `Arc` — the runtime task and a (future)
 /// admin flush path both hold references.
 pub struct ChunkedDiskBackend {
-    manifest_ref: ManifestRef,
-    base: PositionalDiskManifest,
+    /// Base + manifest_ref live under one lock so `flush()` can
+    /// atomically rebase both: after a successful flush, the base's
+    /// chunk hashes point at the freshly-uploaded chunks AND the
+    /// manifest_ref ticks to the new version. Without this, an
+    /// in-session post-flush read of just-rewritten content would
+    /// re-fetch the old hash from the chunk store.
+    state: Arc<Mutex<BackendState>>,
+    chunk_size: u64,
+    total_bytes: u64,
     cache: ChunkCache,
     store: Arc<ChunkStore>,
     /// `chunk_idx -> dirty bytes`. Locked together so a concurrent
     /// read + write of the same chunk doesn't see torn state.
-    /// Holding `Bytes` (vs `Vec<u8>`) is intentional: the bytes
-    /// crate's COW + slicing keeps cross-chunk reads cheap.
     dirty: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
+}
+
+struct BackendState {
+    manifest_ref: ManifestRef,
+    base: PositionalDiskManifest,
 }
 
 impl ChunkedDiskBackend {
@@ -180,9 +190,12 @@ impl ChunkedDiskBackend {
     ) -> Result<Self, DiskBackendError> {
         let manifest = store.get_manifest(manifest_ref).await?;
         let base = PositionalDiskManifest::from_manifest(&manifest)?;
+        let chunk_size = base.chunk_size;
+        let total_bytes = base.total_bytes;
         Ok(Self {
-            manifest_ref,
-            base,
+            state: Arc::new(Mutex::new(BackendState { manifest_ref, base })),
+            chunk_size,
+            total_bytes,
             cache,
             store,
             dirty: Arc::new(Mutex::new(HashMap::new())),
@@ -198,9 +211,12 @@ impl ChunkedDiskBackend {
         store: Arc<ChunkStore>,
     ) -> Result<Self, DiskBackendError> {
         let base = PositionalDiskManifest::from_manifest(manifest)?;
+        let chunk_size = base.chunk_size;
+        let total_bytes = base.total_bytes;
         Ok(Self {
-            manifest_ref,
-            base,
+            state: Arc::new(Mutex::new(BackendState { manifest_ref, base })),
+            chunk_size,
+            total_bytes,
             cache,
             store,
             dirty: Arc::new(Mutex::new(HashMap::new())),
@@ -208,45 +224,49 @@ impl ChunkedDiskBackend {
     }
 
     /// Bytes per chunk. NBD reads / writes that span chunk boundaries
-    /// fan out into per-chunk operations internally.
+    /// fan out into per-chunk operations internally. Pinned at
+    /// construction; flush doesn't change it.
     pub fn chunk_size(&self) -> u64 {
-        self.base.chunk_size
+        self.chunk_size
     }
 
     /// Total virtual-disk size. Reported back to the kernel via
     /// `NBD_SET_SIZE_BLOCKS` during the daemon's startup dance.
+    /// Pinned at construction; flush doesn't change it.
     pub fn total_bytes(&self) -> u64 {
-        self.base.total_bytes
+        self.total_bytes
     }
 
-    /// Manifest ref this backend was constructed against. Changes
-    /// only via `flush()` (which ticks the version).
-    pub fn manifest_ref(&self) -> ManifestRef {
-        self.manifest_ref
+    /// Current manifest ref. Reads the state under the lock —
+    /// after a successful `flush()` the ref ticks to the new
+    /// version atomically with the base-chunk hashes the lock
+    /// guards.
+    pub async fn manifest_ref(&self) -> ManifestRef {
+        self.state.lock().await.manifest_ref
     }
 
     /// Read `length` bytes from `offset`. Fans out across chunk
     /// boundaries; each chunk read serves from the dirty buffer
     /// if present, otherwise fetches via the L1 cache.
     pub async fn read(&self, offset: u64, length: u64) -> Result<Bytes, DiskBackendError> {
-        if offset.saturating_add(length) > self.base.total_bytes {
+        if offset.saturating_add(length) > self.total_bytes {
             return Err(DiskBackendError::OutOfRange {
                 offset,
                 length,
-                total: self.base.total_bytes,
+                total: self.total_bytes,
             });
         }
         if length == 0 {
             return Ok(Bytes::new());
         }
         let mut out = Vec::with_capacity(length as usize);
-        let chunk_size = self.base.chunk_size;
+        let chunk_size = self.chunk_size;
         let mut cursor = offset;
         let end = offset + length;
         while cursor < end {
             let chunk_idx = (cursor / chunk_size) as usize;
             let chunk_start = (chunk_idx as u64) * chunk_size;
-            let chunk_end = std::cmp::min(chunk_start + chunk_size, self.base.total_bytes);
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, self.total_bytes);
             let intra = (cursor - chunk_start) as usize;
             let take = std::cmp::min(end, chunk_end) - cursor;
             let chunk_bytes = self.read_chunk(chunk_idx, chunk_end - chunk_start).await?;
@@ -261,24 +281,24 @@ impl ChunkedDiskBackend {
     /// the dirty buffer on first touch (copy from base, then patch).
     pub async fn write(&self, offset: u64, data: &[u8]) -> Result<(), DiskBackendError> {
         let length = data.len() as u64;
-        if offset.saturating_add(length) > self.base.total_bytes {
+        if offset.saturating_add(length) > self.total_bytes {
             return Err(DiskBackendError::OutOfRange {
                 offset,
                 length,
-                total: self.base.total_bytes,
+                total: self.total_bytes,
             });
         }
         if length == 0 {
             return Ok(());
         }
-        let chunk_size = self.base.chunk_size;
+        let chunk_size = self.chunk_size;
         let mut cursor = offset;
         let mut src_off = 0usize;
         let end = offset + length;
         while cursor < end {
             let chunk_idx = (cursor / chunk_size) as usize;
             let chunk_start = (chunk_idx as u64) * chunk_size;
-            let chunk_end = std::cmp::min(chunk_start + chunk_size, self.base.total_bytes);
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, self.total_bytes);
             let intra = (cursor - chunk_start) as usize;
             let take_u64 = std::cmp::min(end, chunk_end) - cursor;
             let take = take_u64 as usize;
@@ -310,14 +330,14 @@ impl ChunkedDiskBackend {
     /// manifest version."
     pub async fn flush(&self) -> Result<DiskFlushOutcome, DiskBackendError> {
         let mut dirty_guard = self.dirty.lock().await;
+        let chunk_size = self.chunk_size;
         if dirty_guard.is_empty() {
             return Ok(DiskFlushOutcome {
-                manifest_ref: self.manifest_ref,
+                manifest_ref: self.state.lock().await.manifest_ref,
                 chunks_flushed: 0,
                 bytes_uploaded: 0,
             });
         }
-        let chunk_size = self.base.chunk_size;
         let mut new_chunks: Vec<(usize, ChunkHash, u64)> = Vec::new();
         // Drain into a Vec so we can release the lock while
         // uploading (uploads are async + bounded by network
@@ -330,10 +350,16 @@ impl ChunkedDiskBackend {
             let hash = self.store.put_chunk(&bytes).await?;
             new_chunks.push((chunk_idx, hash, size));
         }
-        // Build the new manifest: start from the base, overlay the
-        // flushed hashes. `put_manifest` will reject any duplicate
-        // chunk_idx so half-applied state can't leak through.
-        let mut chunks: Vec<ChunkRef> = self
+
+        // Now atomically: rebuild the manifest from the (locked)
+        // current base + the just-uploaded hashes, publish to the
+        // store, and rebase `state` so future reads serve from the
+        // new hashes. Holding the state lock across the put_manifest
+        // call is OK — it's a single PUT, bounded by network
+        // latency, and reads against this backend during flush are
+        // already in-flight or waiting on the dirty lock anyway.
+        let mut state = self.state.lock().await;
+        let mut chunks: Vec<ChunkRef> = state
             .base
             .chunks
             .iter()
@@ -349,8 +375,7 @@ impl ChunkedDiskBackend {
         for (idx, hash, size) in &new_chunks {
             // Replace the existing entry if one was there; insert
             // otherwise. Linear scan because the chunks list is
-            // small (<< 1024 entries for typical disks) and the
-            // overhead is dominated by the chunk upload itself.
+            // small (<< 1024 entries for typical disks).
             let offset = (*idx as u64) * chunk_size;
             if let Some(existing) = chunks.iter_mut().find(|c| c.offset == offset) {
                 existing.hash = *hash;
@@ -367,14 +392,26 @@ impl ChunkedDiskBackend {
             schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
             kind: ManifestKind::Disk,
             chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
-            total_bytes: self.base.total_bytes,
+            total_bytes: self.total_bytes,
             chunks,
-            parent: Some(self.manifest_ref),
+            parent: Some(state.manifest_ref),
             working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
-        let new_ref = self.manifest_ref.next_version();
+        let new_ref = state.manifest_ref.next_version();
         self.store.put_manifest(new_ref, &new_manifest).await?;
+
+        // Rebase: future reads of any chunk_idx we just rewrote
+        // resolve to the NEW hash via the cache + store. Without
+        // this rebase a post-flush read would re-fetch the OLD
+        // hash from the base and serve stale bytes.
+        for (idx, hash, _) in &new_chunks {
+            if *idx < state.base.chunks.len() {
+                state.base.chunks[*idx] = Some(*hash);
+            }
+        }
+        state.manifest_ref = new_ref;
+
         Ok(DiskFlushOutcome {
             manifest_ref: new_ref,
             chunks_flushed: new_chunks.len(),
@@ -399,7 +436,21 @@ impl ChunkedDiskBackend {
                 return Ok(Bytes::copy_from_slice(buf));
             }
         }
-        match self.base.chunks.get(chunk_idx).copied().flatten() {
+        // Snapshot the hash under the state lock, then release
+        // before the (potentially slow) cache fetch — a concurrent
+        // flush mid-fetch will rebase the state, but the hash we
+        // captured is still valid (content-addressed; the chunk
+        // store retains the old hash until GC).
+        let hash = self
+            .state
+            .lock()
+            .await
+            .base
+            .chunks
+            .get(chunk_idx)
+            .copied()
+            .flatten();
+        match hash {
             Some(hash) => Ok(self.cache.get(hash).await?),
             // Zero-filled hole — the manifest had no entry here.
             None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
@@ -419,13 +470,21 @@ impl ChunkedDiskBackend {
                 return Ok(());
             }
         }
-        // Fetch the base bytes outside the lock — the chunk store
-        // call is async and slow. Two concurrent writers to the
-        // same chunk may both perform the fetch; the second one's
-        // insert is a no-op. That's fine — fetches are cache-warm
-        // after the first, and content-addressing makes them safe
-        // to redo.
-        let base_bytes = match self.base.chunks.get(chunk_idx).copied().flatten() {
+        // Fetch the base bytes outside the dirty lock — the chunk
+        // store call is async and slow. Two concurrent writers to
+        // the same chunk may both perform the fetch; the second
+        // one's insert is a no-op. Content-addressing makes
+        // redundant fetches safe.
+        let hash = self
+            .state
+            .lock()
+            .await
+            .base
+            .chunks
+            .get(chunk_idx)
+            .copied()
+            .flatten();
+        let base_bytes = match hash {
             Some(hash) => self.cache.get(hash).await?,
             None => Bytes::from(vec![0u8; chunk_len]),
         };
@@ -589,7 +648,7 @@ mod tests {
         assert_eq!(outcome.chunks_flushed, 0);
         assert_eq!(outcome.bytes_uploaded, 0);
         // The manifest ref doesn't tick when nothing was dirty.
-        assert_eq!(outcome.manifest_ref, backend.manifest_ref());
+        assert_eq!(outcome.manifest_ref, backend.manifest_ref().await);
     }
 
     #[tokio::test]
@@ -665,5 +724,59 @@ mod tests {
         let (backend, _, _dir) = build_backend(&manifest).await;
         let bytes = backend.read(0, 0).await.unwrap();
         assert_eq!(bytes.len(), 0);
+    }
+
+    /// Regression: after `flush()`, a read of a just-rewritten
+    /// chunk MUST serve the freshly-flushed bytes — not the
+    /// original base hash's bytes. An earlier revision left the
+    /// backend's `base.chunks` pointing at the pre-flush hashes
+    /// and zeroed the dirty buffer, so the next read returned
+    /// stale data. The fix rebases `state.base.chunks` to the
+    /// new hashes atomically with the version tick under the
+    /// state lock.
+    #[tokio::test]
+    async fn post_flush_read_observes_flushed_bytes_not_stale_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64;
+        let h_base = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h_base)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone()).unwrap();
+
+        // Write 16 bytes of 0xCC at offset 0, then flush. The
+        // dirty buffer is drained during flush; the next read
+        // must reflect the WRITTEN content.
+        backend.write(0, &[0xcc; 16]).await.unwrap();
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 1);
+
+        // Post-flush read of the rewritten region. Without the
+        // rebase fix this would return 0xaa (base content);
+        // with the fix it returns 0xcc.
+        let bytes = backend.read(0, 32).await.unwrap();
+        assert!(
+            bytes[..16].iter().all(|b| *b == 0xcc),
+            "post-flush read served stale base bytes: {:?}",
+            &bytes[..16],
+        );
+        assert!(
+            bytes[16..].iter().all(|b| *b == 0xaa),
+            "untouched region should still serve base content"
+        );
+
+        // Subsequent flush should be a no-op (dirty buffer
+        // empty after the rebase + the absence of new writes).
+        let second = backend.flush().await.unwrap();
+        assert_eq!(second.chunks_flushed, 0);
+        // The manifest_ref hasn't ticked again.
+        assert_eq!(second.manifest_ref, outcome.manifest_ref);
     }
 }

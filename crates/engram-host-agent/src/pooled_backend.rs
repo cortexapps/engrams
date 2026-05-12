@@ -31,6 +31,21 @@ use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageBundle, ImageCache};
 use crate::pool::{Pool, PoolKey};
 
+/// Cross-platform optional NBD state slot. Linux carries the real
+/// state; non-Linux is `()` so the `resolve_rootfs` return signature
+/// is consistent and call sites cfg-gate the storage-stash branch.
+#[cfg(target_os = "linux")]
+type NbdStateSlot = Option<crate::disk_daemon::NbdSandboxState>;
+#[cfg(not(target_os = "linux"))]
+type NbdStateSlot = ();
+
+#[cfg(target_os = "linux")]
+fn nbd_state_none() -> NbdStateSlot {
+    None
+}
+#[cfg(not(target_os = "linux"))]
+fn nbd_state_none() -> NbdStateSlot {}
+
 /// Wraps an inner [`SandboxBackend`] with warm-pool semantics. `create`
 /// looks for a warm slot first; on miss it forwards to `inner` and
 /// kicks off a background `replenish` so the next session gets the
@@ -84,6 +99,22 @@ pub struct PooledBackend {
     /// from racing on the same manifest_id+version file. Held only
     /// for the materialize critical section, not the whole call.
     materialize_lock: Mutex<()>,
+    /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
+    /// host-agent allocates from when serving chunked disks via
+    /// the NBD daemon. `None` = NBD disabled (the materialize-to-
+    /// file fallback runs instead — that's the macOS path and the
+    /// transitional Linux path before operators wire `nbds_max=N`).
+    /// Cross-platform because the allocator itself is target-
+    /// agnostic; the daemon that consumes a slot is Linux-only.
+    nbd_pool: Option<Arc<crate::disk_daemon::NbdSlotAllocator>>,
+    /// Live NBD daemon state, keyed by sandbox id. Each entry
+    /// owns the daemon's kernel-binding handle, the data-plane
+    /// backend (used for snapshot flush), and the slot lease
+    /// (Drop returns `/dev/nbdN` to the pool). Linux-only — on
+    /// macOS the materialize-to-file path is the only option for
+    /// chunked disks.
+    #[cfg(target_os = "linux")]
+    nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
 }
 
 impl PooledBackend {
@@ -99,7 +130,22 @@ impl PooledBackend {
             materialize_dir: None,
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
+            nbd_pool: None,
+            #[cfg(target_os = "linux")]
+            nbd_sandboxes: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Attach a `/dev/nbdN` slot pool. When set + `chunk_store` +
+    /// `chunk_cache` are also wired AND the cached image bundle
+    /// carries a `disk_manifest`, `create()` spawns an NBD daemon
+    /// instead of materializing the manifest to a single file. FC's
+    /// `path_on_host` becomes `/dev/nbdN`. Linux-only at runtime;
+    /// on macOS the builder accepts a pool but the spawn path is
+    /// gated so dev workflows fall back to materialize-to-file.
+    pub fn with_nbd_pool(mut self, pool: Arc<crate::disk_daemon::NbdSlotAllocator>) -> Self {
+        self.nbd_pool = Some(pool);
+        self
     }
 
     /// Attach a chunk store + a per-host directory where chunked
@@ -148,27 +194,50 @@ impl PooledBackend {
         self.pool.snapshot_reports()
     }
 
-    /// Resolve the disk for a cached image. When a chunk store is
-    /// wired AND the cached image carries a Bundle, materialize the
-    /// disk from the chunk manifest into a content-addressed file
-    /// in `materialize_dir`. Otherwise hand back the OCI-pulled
-    /// `rootfs.ext4` unchanged. Idempotent: a second call against
-    /// the same manifest hits the materialized file directly.
+    /// Resolve the disk for a cached image. Three branches in
+    /// priority order:
+    ///
+    /// 1. **NBD path** (Linux + `nbd_pool` + `chunk_store` +
+    ///    `chunk_cache` + `bundle.disk_manifest` all present):
+    ///    spawn an NBD daemon serving the chunk manifest, return
+    ///    `(/dev/nbdN, Some(NbdSandboxState))`. The state is held
+    ///    by `create()` and stashed in `nbd_sandboxes` keyed by
+    ///    the eventual SandboxId.
+    /// 2. **Materialize-to-file** (chunk_store + materialize_dir +
+    ///    bundle): walk the chunk manifest into a single ext4
+    ///    file at `<materialize_dir>/<manifest_id>-v<n>.ext4`,
+    ///    return that path. The legacy chunked path; still the
+    ///    only option on macOS or when NBD isn't wired.
+    /// 3. **OCI fallback**: hand back the OCI-pulled `rootfs.ext4`
+    ///    unchanged. The pre-chunked-storage path; retiring as
+    ///    every host gets a chunk_store.
     async fn resolve_rootfs(
         &self,
         uri: &str,
         cached: &CachedImage,
-    ) -> Result<PathBuf, SandboxError> {
+    ) -> Result<(PathBuf, NbdStateSlot), SandboxError> {
+        // Branch 1: NBD daemon.
+        #[cfg(target_os = "linux")]
+        if let Some(state) = self.try_spawn_nbd(cached).await? {
+            tracing::info!(
+                uri = %uri,
+                device = %state.device_path().display(),
+                "chunked rootfs served via NBD daemon",
+            );
+            return Ok((state.device_path().to_path_buf(), Some(state)));
+        }
+
+        // Branch 2: materialize-to-file (the legacy chunked path).
         let (chunk_store, materialize_dir) =
             match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
                 (Some(cs), Some(dir)) => (cs, dir),
-                _ => return Ok(cached.rootfs_path.clone()),
+                _ => return Ok((cached.rootfs_path.clone(), nbd_state_none())),
             };
         let bundle = match cached.bundle.as_ref() {
             Some(b) => b,
-            None => return Ok(cached.rootfs_path.clone()),
+            None => return Ok((cached.rootfs_path.clone(), nbd_state_none())),
         };
-        materialize_chunked_rootfs(
+        let path = materialize_chunked_rootfs(
             chunk_store,
             self.chunk_cache.as_ref(),
             materialize_dir,
@@ -176,7 +245,41 @@ impl PooledBackend {
             bundle,
             &self.materialize_lock,
         )
+        .await?;
+        Ok((path, nbd_state_none()))
+    }
+
+    /// Linux-only NBD spawn branch. Returns `None` when any
+    /// prerequisite (pool / chunk_store / chunk_cache /
+    /// bundle.disk_manifest) is missing. Caller falls back to
+    /// materialize-to-file in that case.
+    #[cfg(target_os = "linux")]
+    async fn try_spawn_nbd(
+        &self,
+        cached: &CachedImage,
+    ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
+        let (pool, store, cache) = match (
+            self.nbd_pool.as_ref(),
+            self.chunk_store.as_ref(),
+            self.chunk_cache.as_ref(),
+        ) {
+            (Some(p), Some(s), Some(c)) => (p, s, c),
+            _ => return Ok(None),
+        };
+        let bundle = match cached.bundle.as_ref() {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let store_arc = Arc::new(store.clone());
+        let state = crate::disk_daemon::attach_manifest(
+            bundle.disk_manifest,
+            cache.clone(),
+            store_arc,
+            pool,
+        )
         .await
+        .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest: {e}").into()))?;
+        Ok(Some(state))
     }
 
     fn pool_key(spec: &SandboxSpec) -> PoolKey {
@@ -386,13 +489,24 @@ impl SandboxBackend for PooledBackend {
         // substrate unchanged. On cache miss we pull synchronously;
         // subsequent sessions for the same digest hit the cache and
         // pay only the FS cost.
+        // `pending_nbd_state` carries the NBD daemon's state from
+        // the `resolve_rootfs` call (which spawns it) into the
+        // post-`inner.create` stash step. Linux-only — on macOS
+        // resolve_rootfs always returns `()` for the second slot.
+        #[cfg(target_os = "linux")]
+        let mut pending_nbd_state: Option<crate::disk_daemon::NbdSandboxState> = None;
         if let Some(cache) = &self.image_cache {
             if let Some(uri) = spec.image_uri.clone() {
                 let cached = cache.ensure_image(&uri).await.map_err(|e| {
                     SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
                 })?;
                 tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
-                spec.rootfs_source = Some(self.resolve_rootfs(&uri, &cached).await?);
+                let (path, _state) = self.resolve_rootfs(&uri, &cached).await?;
+                spec.rootfs_source = Some(path);
+                #[cfg(target_os = "linux")]
+                {
+                    pending_nbd_state = _state;
+                }
             }
             if let Some(uri) = spec.harness_pack_uri.clone() {
                 // Backends that attach the substrate as a virtio-blk
@@ -448,6 +562,14 @@ impl SandboxBackend for PooledBackend {
         if self.default_target > 0 {
             self.spawn_replenish(key);
         }
+        // Stash any spawned NBD daemon under the freshly-assigned
+        // sandbox id. `destroy()` removes the entry (Drop tears
+        // down the daemon + returns the slot); `snapshot()` reads
+        // it back to call `backend.flush()`.
+        #[cfg(target_os = "linux")]
+        if let Some(state) = pending_nbd_state {
+            self.nbd_sandboxes.insert(sandbox_id, state);
+        }
         Ok(sandbox_id)
     }
 
@@ -464,7 +586,43 @@ impl SandboxBackend for PooledBackend {
         id: SandboxId,
         dest: &std::path::Path,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        // ADR 0007 Phase 4: if this sandbox is NBD-backed, flush
+        // its dirty disk chunks BEFORE we ask the inner FC backend
+        // to take its memory snapshot. The flush produces a new
+        // disk manifest version that we attach to
+        // `SnapshotMetadata.disk_manifest`; the snapshot row's
+        // chunked-disk pointer matches the bytes the kernel saw
+        // at quiesce time. Flushing AFTER FC's pause + memory
+        // capture would race the post-pause writes the guest
+        // might queue.
+        #[cfg(target_os = "linux")]
+        let nbd_disk_manifest = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            let outcome = entry
+                .backend
+                .flush()
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("nbd disk flush: {e}")))?;
+            tracing::info!(
+                sandbox_id = %id,
+                manifest = %outcome.manifest_ref,
+                chunks_flushed = outcome.chunks_flushed,
+                bytes_uploaded = outcome.bytes_uploaded,
+                "chunked NBD disk flushed",
+            );
+            Some(outcome.manifest_ref)
+        } else {
+            None
+        };
+
         let mut metadata = self.inner.snapshot(id, dest).await?;
+
+        // Plumb the new disk manifest onto SnapshotMetadata so
+        // the coord-side snapshot recorder persists it on the
+        // `snapshots` row's `disk_manifest_*` columns.
+        #[cfg(target_os = "linux")]
+        if let Some(mref) = nbd_disk_manifest {
+            metadata.disk_manifest = Some(mref);
+        }
         // ADR 0007 / Phase 5: when a chunk store is wired AND the
         // underlying backend left a memory.bin in `dest` (FC does;
         // VZ + Process don't), chunk it into the store + patch the
@@ -513,7 +671,17 @@ impl SandboxBackend for PooledBackend {
                 egress.registry.unregister(session_id);
             }
         }
-        self.inner.destroy(id).await
+        let result = self.inner.destroy(id).await;
+        // Tear down the NBD daemon AFTER the inner backend has
+        // closed the VM (so the kernel doesn't surface "device
+        // busy" on disconnect). Drop on NbdSandboxState handles
+        // disconnect → join → slot release. Done last so even
+        // if inner.destroy errors, the daemon cleanup still runs.
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.nbd_sandboxes.remove(&id);
+        }
+        result
     }
 
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
