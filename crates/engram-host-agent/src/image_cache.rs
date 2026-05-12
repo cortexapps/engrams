@@ -470,6 +470,15 @@ pub struct CachedImage {
 pub struct ImageBundle {
     pub schema_version: u32,
     pub disk_manifest: engram_chunk_store::ManifestRef,
+    /// ADR 0007 Phase 5: optional canonical-base memory manifest
+    /// captured by the image-builder at bake time. When set, the
+    /// UFFD handler `mmap`s the canonical memory file with
+    /// `MAP_PRIVATE` so every session of this image shares the
+    /// canonical pages via the host page cache. `None` for
+    /// images baked before the canonical-capture slice landed —
+    /// sessions still work but pay session-private memory cost.
+    #[serde(default)]
+    pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
 }
 
 #[derive(Clone, Debug)]

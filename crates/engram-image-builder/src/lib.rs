@@ -73,6 +73,19 @@ pub struct BuildRequest {
     /// `default_boot_args = "... init=/sbin/engram-init"` and the
     /// host's `exec_stream` reaches the in-guest agent over vsock.
     pub agent_injection: Option<AgentInjection>,
+    /// ADR 0007 Phase 5: pre-computed canonical-base memory
+    /// manifest. The image-builder normally captures this itself
+    /// by booting the rootfs once at bake time and chunking the
+    /// post-init `memory.bin` — but the bake-time capture step
+    /// requires FC + KVM on the runner, which not every CI lane
+    /// has. Callers that bake on a non-KVM runner can pre-compute
+    /// the canonical manifest separately (e.g. on a sidecar
+    /// Linux+KVM job) and pass it through here. `None` skips the
+    /// canonical write to `bundle.json`, so sessions of this
+    /// image pay session-private memory cost at restore time.
+    /// Also `None` until `capture_canonical_memory` (the
+    /// post-build FC boot+pause+chunk pipeline) ships.
+    pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -560,9 +573,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 // find the manifest ref without hitting Postgres.
                 // Format is intentionally tiny so a future "list
                 // images" CLI can fetch it cheaply.
+                //
+                // ADR 0007 Phase 5: `canonical_memory_manifest`
+                // ships as `null` until the bake-time canonical
+                // capture step runs (`req.capture_canonical_memory`).
+                // The field is optional both on the wire and in
+                // `ImageBundle`'s serde shape, so older bakes that
+                // never set it deserialise cleanly.
                 let bundle = serde_json::json!({
                     "schema_version": 1,
                     "disk_manifest": manifest_ref,
+                    "canonical_memory_manifest": req.canonical_memory_manifest,
                 });
                 tokio::fs::write(
                     image_dir.join("bundle.json"),

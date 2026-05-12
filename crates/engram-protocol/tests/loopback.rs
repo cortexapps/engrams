@@ -37,6 +37,7 @@ fn live_spec() -> SandboxSpec {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
+        canonical_memory_manifest: None,
     }
 }
 

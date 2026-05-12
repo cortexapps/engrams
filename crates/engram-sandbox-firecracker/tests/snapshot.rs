@@ -66,6 +66,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
+        canonical_memory_manifest: None,
     };
 
     // Step 1: create

@@ -66,6 +66,20 @@ pub struct SandboxSpec {
     /// non-empty.
     #[serde(default)]
     pub network: NetworkPolicy,
+    /// ADR 0007 Phase 5: per-image bake-time canonical memory
+    /// manifest. The image-builder boots the rootfs once at bake
+    /// time, captures `memory.bin` at steady state, and chunks it
+    /// into the chunk store under this ref. The UFFD handler
+    /// `mmap`s the canonical file with `MAP_PRIVATE` so every
+    /// session of this image shares the canonical pages via the
+    /// host page cache — divergent chunks fault in from the
+    /// session's per-snapshot `memory_manifest`. `None` keeps the
+    /// pre-canonical-bake behaviour: every restore pays session-
+    /// private memory cost (functionally correct, no cross-VM
+    /// dedup). Plumbed from `ImageBundle.canonical_memory_manifest`
+    /// (written by `engram-image-builder`) on session create.
+    #[serde(default)]
+    pub canonical_memory_manifest: Option<super::manifest::ManifestRef>,
 }
 
 /// Argv + env for the long-running "agent" process (Claude Code,

@@ -385,6 +385,7 @@ mod tests {
             workdir: Some("/work".into()),
             harness_substrate: None,
             network: Default::default(),
+            canonical_memory_manifest: None,
         };
         let f = Frame::Request {
             req_id: 1,

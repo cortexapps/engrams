@@ -576,6 +576,15 @@ impl SandboxBackend for PooledBackend {
                 tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
                 let (path, _state) = self.resolve_rootfs(&uri, &cached).await?;
                 spec.rootfs_source = Some(path);
+                // ADR 0007 Phase 5: lift the bundle's canonical
+                // memory manifest onto the spec so FC backend's
+                // snapshot can stamp it on `FcSnapshotManifest.
+                // canonical_memory_manifest`. UFFD handler reads
+                // that on restore and serves shared-canonical
+                // reads from the per-image page cache.
+                if let Some(bundle) = cached.bundle.as_ref() {
+                    spec.canonical_memory_manifest = bundle.canonical_memory_manifest;
+                }
                 #[cfg(target_os = "linux")]
                 {
                     pending_nbd_state = _state;
@@ -852,6 +861,7 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
+            canonical_memory_manifest: None,
         }
     }
 
@@ -987,6 +997,7 @@ mod tests {
         let bundle = ImageBundle {
             schema_version: 1,
             disk_manifest: mref,
+            canonical_memory_manifest: None,
         };
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());
@@ -1422,6 +1433,7 @@ mod tests {
         let bundle = ImageBundle {
             schema_version: 1,
             disk_manifest: mref,
+            canonical_memory_manifest: None,
         };
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());
@@ -1610,6 +1622,7 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
+            canonical_memory_manifest: None,
         };
         spec.image_uri = Some("test:1".into());
         let _id = pooled.create(spec).await.unwrap();

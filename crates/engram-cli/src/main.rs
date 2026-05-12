@@ -1125,6 +1125,7 @@ async fn image_build(
         images_dir: images_dir.to_path_buf(),
         format,
         agent_injection,
+        canonical_memory_manifest: None,
     };
     let docker = match docker_bin {
         Some(bin) => DockerCli::with_binary(bin.to_string()),

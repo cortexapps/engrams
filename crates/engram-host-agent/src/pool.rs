@@ -202,6 +202,7 @@ fn stub_spec() -> SandboxSpec {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
+        canonical_memory_manifest: None,
     }
 }
 
@@ -253,6 +254,7 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
+            canonical_memory_manifest: None,
         }
     }
 

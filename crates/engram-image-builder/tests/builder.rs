@@ -176,6 +176,7 @@ fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest 
         images_dir: images_dir.to_path_buf(),
         format: Format::Directory,
         agent_injection: None,
+        canonical_memory_manifest: None,
     }
 }
 

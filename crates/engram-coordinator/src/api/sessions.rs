@@ -453,6 +453,11 @@ pub async fn create_session(
         workdir: None,
         harness_substrate: None,
         network,
+        // ADR 0007 Phase 5: PooledBackend populates this from the
+        // image bundle after the image-cache resolve, so we leave
+        // it None at session-create. Sessions whose bundle carries
+        // a canonical pick up the canonical mmap at restore time.
+        canonical_memory_manifest: None,
     };
 
     // -------- 5. Schedule + create the sandbox --------

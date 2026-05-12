@@ -1306,11 +1306,16 @@ impl SandboxBackend for FirecrackerBackend {
             spec: spec.clone(),
             net: net_snapshot,
             format: MANIFEST_FORMAT_FC.into(),
-            // PooledBackend::snapshot patches this in-place after
-            // FC returns. The bare backend can't chunk memory.bin
-            // without a chunk-store wiring.
+            // PooledBackend::snapshot patches `memory_manifest`
+            // in-place after FC returns (the bare backend can't
+            // chunk memory.bin without a chunk-store wiring).
             memory_manifest: None,
-            canonical_memory_manifest: None,
+            // ADR 0007 Phase 5: canonical-base memory manifest
+            // lifted from the image bundle. Set on session create
+            // by PooledBackend; carried on the spec through every
+            // snapshot. UFFD handler `mmap`s the canonical file
+            // and serves shared-canonical reads from page cache.
+            canonical_memory_manifest: spec.canonical_memory_manifest,
             // ADR 0007 Phase 5: snapshotting host's id, so cross-
             // host restore can request this host's recorded
             // trace via `--prefault-trace <hint>`. Set from FC
@@ -1663,6 +1668,7 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
+            canonical_memory_manifest: None,
         }
     }
 
