@@ -78,12 +78,9 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // and keeps the test fast.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Step 3: snapshot
-    let snap_dir = work.path().join("snap");
-    let metadata = backend
-        .snapshot(original_id, &snap_dir)
-        .await
-        .expect("snapshot");
+    // Step 3: snapshot (ADR 0007 Phase 6: backend owns staging)
+    let metadata = backend.snapshot(original_id).await.expect("snapshot");
+    let snap_dir = backend.snapshot_path_for(metadata.id);
 
     assert!(snap_dir.join("state.bin").exists(), "state.bin missing");
     assert!(snap_dir.join("memory.bin").exists(), "memory.bin missing");
@@ -113,7 +110,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
     );
 
     // Step 6: restore from the snapshot — gets a *new* sandbox id
-    let restored_id = backend.restore(snap_dir.clone()).await.expect("restore");
+    let restored_id = backend.restore(metadata.clone()).await.expect("restore");
     assert_ne!(
         restored_id, original_id,
         "restore must allocate a fresh sandbox id"

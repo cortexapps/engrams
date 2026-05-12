@@ -183,11 +183,9 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // 3. snapshot — manifest should carry the net info
-    let snap_dir = work.path().join("snap");
-    backend
-        .snapshot(original_id, &snap_dir)
-        .await
-        .expect("snapshot");
+    // ADR 0007 Phase 6: backend owns its staging dir.
+    let metadata = backend.snapshot(original_id).await.expect("snapshot");
+    let snap_dir = backend.snapshot_path_for(metadata.id);
     let (orig_tap, orig_cidr) =
         manifest_carries_net_field(&snap_dir).expect("snapshot manifest must carry `net` field");
     println!("snapshot recorded tap={orig_tap} cidr={orig_cidr}/30");
@@ -213,7 +211,7 @@ async fn snapshot_restore_round_trips_per_vm_network() {
 
     // 5. restore — re-provisions the same /30 + recreates the TAP
     //    under the same name
-    let restored_id = backend.restore(snap_dir.clone()).await.expect("restore");
+    let restored_id = backend.restore(metadata.clone()).await.expect("restore");
     assert_ne!(
         restored_id, original_id,
         "restore allocates fresh sandbox id"

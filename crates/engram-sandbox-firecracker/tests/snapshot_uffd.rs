@@ -95,11 +95,9 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
     let original_id = backend.create(spec).await.expect("create");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let snap_dir = work.path().join("snap");
-    backend
-        .snapshot(original_id, &snap_dir)
-        .await
-        .expect("snapshot");
+    // ADR 0007 Phase 6: backend owns its staging dir.
+    let metadata = backend.snapshot(original_id).await.expect("snapshot");
+    let snap_dir = backend.snapshot_path_for(metadata.id);
 
     // ADR 0007: Inline the PooledBackend chunk-memory-on-snapshot
     // wrap. Production wires this via `PooledBackend::with_chunk_store`;
@@ -155,7 +153,18 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     let restore_start = std::time::Instant::now();
-    let restored_id = match backend.restore(snap_dir.clone()).await {
+    // Build a metadata that mirrors what the production coord
+    // would persist + replay: same snapshot id, same chunked
+    // memory_manifest we just wrote.
+    let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
+        id: metadata.id,
+        size_bytes: metadata.size_bytes,
+        created_at: metadata.created_at,
+        image_version: metadata.image_version.clone(),
+        disk_manifest: metadata.disk_manifest,
+        memory_manifest: Some(manifest_ref),
+    };
+    let restored_id = match backend.restore(restore_metadata).await {
         Ok(id) => id,
         Err(e) => {
             // The preserved jail dir lives under work_dir; dump every
