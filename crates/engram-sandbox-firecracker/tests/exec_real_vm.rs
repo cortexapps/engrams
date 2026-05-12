@@ -98,8 +98,6 @@ async fn exec_runs_inside_baked_microvm() {
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
                 bootstrap_binary: None,
-                canonical_memory_manifest: None,
-                capture_canonical_memory: None,
             }),
         })
         .await
@@ -137,7 +135,6 @@ async fn exec_runs_inside_baked_microvm() {
         harness_substrate: None,
         network: Default::default(),
         canonical_memory_manifest: None,
-        capture_canonical_memory: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create");
 
