@@ -71,38 +71,20 @@ pub async fn gc_chunks(
     let retain_secs = params.retain_secs.unwrap_or(24 * 3600);
     let retain_for = std::time::Duration::from_secs(retain_secs);
 
-    let live_ids = state
-        .services
-        .meta
-        .list_live_disk_manifest_ids()
-        .await
-        .map_err(|e| ApiError::Internal(format!("list_live_disk_manifest_ids: {e}")))?;
-    let live_count = live_ids.len();
-
-    tracing::info!(
-        live_manifest_count = live_count,
-        retain_secs,
-        "starting chunk-store GC sweep",
-    );
-
-    let stats = engram_chunk_store::gc::run(&state.services.chunk_store, retain_for, live_ids)
+    // Delegate to `chunk_gc::run_once` so the admin trigger and the
+    // background cron exercise the exact same pipeline — including
+    // the disk+memory live-set union (forgetting one would sweep
+    // the other side's chunks prematurely).
+    let result = crate::chunk_gc::run_once(&state, retain_for)
         .await
         .map_err(|e| ApiError::Internal(format!("chunk gc: {e}")))?;
 
-    tracing::info!(
-        chunks_deleted = stats.chunks_deleted,
-        bytes_freed = stats.bytes_freed,
-        chunks_retained_age = stats.chunks_retained_age,
-        elapsed_ms = stats.elapsed.as_millis() as u64,
-        "chunk-store GC sweep complete",
-    );
-
     Ok(Json(GcChunksResult {
-        chunks_deleted: stats.chunks_deleted,
-        bytes_freed: stats.bytes_freed,
-        chunks_retained_age: stats.chunks_retained_age,
-        elapsed_ms: stats.elapsed.as_millis() as u64,
-        live_manifest_count: live_count,
+        chunks_deleted: result.stats.chunks_deleted,
+        bytes_freed: result.stats.bytes_freed,
+        chunks_retained_age: result.stats.chunks_retained_age,
+        elapsed_ms: result.stats.elapsed.as_millis() as u64,
+        live_manifest_count: result.live_manifest_count,
         retain_secs,
     }))
 }

@@ -11,6 +11,7 @@ use engram_core::traits::{BlobStorage, CloudBackend, MetadataStore, SandboxBacke
 
 pub mod api;
 pub mod blob;
+pub mod chunk_gc;
 pub mod config;
 pub mod dead_host;
 pub mod error;
@@ -165,6 +166,16 @@ pub async fn run_with_registry(
     // are durable in BlobStorage at snapshot time, the chunk-store
     // GC reaps unreferenced bytes on a cadence, and the
     // materialize-dir reaper handles the host-side assembled files.
+    //
+    // The chunk-store GC scheduler fires `chunk_gc::run_once` on the
+    // `ENGRAM_CHUNK_GC_INTERVAL_SECS` cadence (default 1h). The same
+    // pipeline is reachable via `POST /api/admin/gc-chunks` for ops
+    // + tests — explicit-trigger admin endpoints pattern. Setting
+    // the interval env to `0` disables the cron and leaves the admin
+    // endpoint as the sole trigger.
+    let _chunk_gc = chunk_gc::interval_from_env().and_then(|interval| {
+        chunk_gc::spawn(state.clone(), interval, chunk_gc::retain_for_from_env())
+    });
 
     // Demo wiring: bind the harness-channel TCP listener so
     // `SandboxSpec::agent`-spawned harnesses (today: the dev
