@@ -327,9 +327,21 @@ impl OciClient {
         let client = Self::client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
+        // Must list every media type the artifact may carry —
+        // oci-client validates each pulled layer against this set and
+        // errors on the first mismatch (even though we only consume
+        // the manifest.toml layer here). Keep this in sync with
+        // [`Self::pull_image`]'s accepted list. ADR 0007 adds the
+        // bundle layer; ADR 0008 Phase 3 adds the chunked-OCI
+        // bootstrap + chunks blob layers.
         let accepted = vec![
             ENGRAM_MANIFEST_MEDIA_TYPE,
             ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
+            ENGRAM_BUNDLE_MEDIA_TYPE,
+            ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
+            ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
+            ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE,
+            ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
