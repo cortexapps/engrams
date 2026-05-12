@@ -288,6 +288,27 @@ impl ChunkedMemoryBackend {
     pub async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes, ChunkedBackendError> {
         self.cache.get(hash).await.map_err(Into::into)
     }
+
+    /// Chunk-start byte offsets where the session manifest holds
+    /// `hash`. Used by the working-set replay path: a trace entry
+    /// names a chunk hash, the runtime asks "where does the session
+    /// place this chunk?" and pre-installs it at each position.
+    ///
+    /// Linear scan over `chunks` because the chunked manifest is
+    /// typically small (≤8192 entries for a 4 GiB / 512 KiB layout)
+    /// and the prefault path runs once per restore, before vCPUs
+    /// unfreeze — not a hot loop.
+    pub fn session_positions_of(&self, hash: ChunkHash) -> Vec<u64> {
+        self.session
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| match entry {
+                Some(h) if *h == hash => Some((idx as u64) * self.session.chunk_size),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
