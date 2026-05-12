@@ -47,4 +47,6 @@ pub use nbd::{NbdCommand, NbdReply, NbdRequest, NbdWireError, NBD_REPLY_MAGIC, N
 pub use slot::{NbdSlot, NbdSlotAllocator};
 
 #[cfg(target_os = "linux")]
-pub use runtime::{spawn, NbdHandle, NbdRuntimeError, NBD_BLOCK_SIZE};
+pub use runtime::{
+    attach_manifest, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
+};

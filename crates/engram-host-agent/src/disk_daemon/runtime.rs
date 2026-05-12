@@ -42,8 +42,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::task::JoinHandle as TokioJoinHandle;
 
-use super::backend::ChunkedDiskBackend;
+use super::backend::{ChunkedDiskBackend, DiskBackendError};
 use super::nbd::{NbdCommand, NbdReply, NbdRequest, REQUEST_HEADER_LEN};
+use super::slot::{NbdSlot, NbdSlotAllocator};
 
 // ---------------------------------------------------------------------
 // NBD ioctl constants
@@ -131,6 +132,12 @@ impl From<io::Error> for NbdRuntimeError {
     }
 }
 
+impl From<DiskBackendError> for NbdRuntimeError {
+    fn from(e: DiskBackendError) -> Self {
+        Self::Io(io::Error::other(e))
+    }
+}
+
 /// Live NBD daemon handle. Holds the spawned tokio serve task,
 /// the kernel-side ioctl thread, and the `/dev/nbdN` file
 /// descriptor. Dropping cleanly tears everything down.
@@ -202,6 +209,59 @@ impl Drop for NbdHandle {
         // OwnedFd drop closes the device file.
         let _ = self.nbd_fd.take();
     }
+}
+
+/// Per-sandbox NBD state. Composes everything `PooledBackend`
+/// needs to track for a sandbox whose rootfs is served via NBD:
+/// the data plane (used for snapshot flush), the kernel-binding
+/// handle (Drop tears down), and the slot lease (Drop returns
+/// the `/dev/nbdN` path to the pool).
+///
+/// Field order matters: `Drop` runs top-to-bottom, so `handle`
+/// gets disconnected from the kernel BEFORE the slot returns to
+/// the pool — that way a follow-up `acquire()` against the same
+/// path doesn't race the kernel's tear-down.
+pub struct NbdSandboxState {
+    /// `flush()` produces the new manifest version on snapshot.
+    pub backend: Arc<ChunkedDiskBackend>,
+    /// Live daemon. Owns the OS thread + Tokio serve task.
+    pub handle: NbdHandle,
+    /// Slot lease. Returns to the pool when dropped.
+    pub slot: NbdSlot,
+}
+
+impl NbdSandboxState {
+    /// Convenience: the `/dev/nbdN` path FC should attach as
+    /// `path_on_host` for the rootfs drive.
+    pub fn device_path(&self) -> &Path {
+        self.slot.path()
+    }
+}
+
+/// One-call setup for a sandbox's NBD-backed rootfs:
+/// 1. Build a [`ChunkedDiskBackend`] from `disk_manifest_ref`
+///    (reading the manifest from the chunk store).
+/// 2. Acquire a `/dev/nbdN` slot from `slot_pool`.
+/// 3. [`spawn`] the daemon against the acquired device.
+///
+/// Returns the composite [`NbdSandboxState`] the caller stores
+/// for the sandbox's lifetime. Dropping the state tears the
+/// whole daemon down (handle → slot → cache references).
+pub async fn attach_manifest(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot_pool: &Arc<NbdSlotAllocator>,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend = ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store).await?;
+    let backend = Arc::new(backend);
+    let slot = slot_pool.acquire().await;
+    let handle = spawn(backend.clone(), slot.path()).await?;
+    Ok(NbdSandboxState {
+        backend,
+        handle,
+        slot,
+    })
 }
 
 /// Spawn a daemon that serves `backend` as a block device at
