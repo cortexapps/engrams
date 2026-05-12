@@ -191,6 +191,16 @@ pub struct FirecrackerConfig {
     /// pre-Phase-5 behaviour: traces aren't recorded or replayed,
     /// every restore pays full first-fault cost.
     pub host_id: Option<engram_core::HostId>,
+    /// ADR 0007 Phase 5: NVMe-backed chunk cache dir handed to
+    /// `engram-uffd-handler` as `--cache-root`. `None` falls back
+    /// to the handler's compiled-in default
+    /// (`/var/cache/engram/chunks`) which production root-running
+    /// hosts can use as-is; unprivileged CI runners + the FC
+    /// backend's own work_dir convention should set this
+    /// explicitly. Constructors derive a sensible default
+    /// (`<work_dir>/uffd-chunk-cache/`) when the backend is built
+    /// via `FirecrackerBackend::new`.
+    pub uffd_cache_root: Option<PathBuf>,
 }
 
 /// Backing-memory strategy for `restore`.
@@ -225,6 +235,7 @@ impl FirecrackerConfig {
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
             host_id: None,
+            uffd_cache_root: None,
         }
     }
 }
@@ -363,8 +374,18 @@ impl FirecrackerBackend {
             .net_pool
             .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
         let net_allocator = Arc::new(parking_lot::Mutex::new(net::NetworkAllocator::new(pool)));
+        let work_dir: PathBuf = work_dir.into();
+        // ADR 0007 Phase 5: default the UFFD handler's chunk cache
+        // to a work_dir-local directory unless the caller picked
+        // one explicitly. This avoids the handler's compiled-in
+        // `/var/cache/engram/chunks` default that requires root on
+        // CI runners + unprivileged production hosts.
+        let mut config = config;
+        if config.uffd_cache_root.is_none() {
+            config.uffd_cache_root = Some(work_dir.join("uffd-chunk-cache"));
+        }
         Self {
-            work_dir: work_dir.into(),
+            work_dir,
             config,
             sandboxes: DashMap::new(),
             next_cid: AtomicU32::new(FIRST_GUEST_CID),
@@ -593,6 +614,14 @@ impl FirecrackerBackend {
             .arg(canonical_ref.to_string())
             .arg("--session-manifest")
             .arg(session_ref.to_string());
+        // ADR 0007 Phase 5: hand the handler a work_dir-local
+        // chunk cache root. `FirecrackerBackend::new` populates a
+        // default; callers using `FirecrackerConfig` directly can
+        // override or leave `None` (the handler's compiled-in
+        // default is `/var/cache/engram/chunks`, root-only).
+        if let Some(cache_root) = self.config.uffd_cache_root.as_ref() {
+            cmd.arg("--cache-root").arg(cache_root);
+        }
         if let Some(host) = prefault_trace_host {
             cmd.arg("--prefault-trace").arg(host.to_string());
         }
@@ -1670,6 +1699,7 @@ mod tests {
             net_pool: None,
             egress_proxy_port: None,
             host_id: None,
+            uffd_cache_root: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }
