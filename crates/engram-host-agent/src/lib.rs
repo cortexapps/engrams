@@ -21,6 +21,7 @@ use crate::image_cache::ImageCache;
 pub mod blob;
 pub mod config;
 pub mod dialer;
+pub mod disk_daemon;
 pub mod egress;
 pub mod harness;
 pub mod heartbeat;

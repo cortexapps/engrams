@@ -1,0 +1,669 @@
+//! `ChunkedDiskBackend` — data plane for the NBD daemon.
+//!
+//! Maps NBD `(offset, length)` operations onto chunk-store
+//! operations. Per-fault read resolves to one chunk fetch (via the
+//! L1 NVMe cache); per-write copies the base chunk into a
+//! per-session in-memory dirty buffer and applies the write there.
+//!
+//! Two key invariants the runtime depends on:
+//!
+//! 1. **Read-after-write** within a session sees the dirty bytes.
+//!    Writes don't go back to the chunk store on every NBD_CMD_WRITE
+//!    — that would explode object-storage cost. Dirty chunks live
+//!    in RAM until `flush()` is called (snapshot trigger).
+//! 2. **Base chunks are immutable.** The chunk store is content-
+//!    addressed; the daemon never PUTs an existing hash again.
+//!    Dirty chunks get rehashed at flush time; new hashes go up,
+//!    the manifest version ticks.
+//!
+//! Memory cost: 16 MiB per dirty chunk. A session that writes
+//! pseudorandomly across the whole 16 GiB rootfs would peak at
+//! 16 GiB resident — at that point the dirty buffer is the wrong
+//! shape anyway. Realistic Python/Node sessions touch < 100 MiB
+//! of fresh writes between snapshots; that's six dirty chunks.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use engram_chunk_store::{
+    cache::ChunkCache,
+    manifest::{ChunkHash, ChunkRef, Manifest, ManifestKind},
+    store::ChunkStore,
+};
+use engram_core::types::manifest::ManifestRef;
+use tokio::sync::Mutex;
+
+/// Anything that can go wrong on the backend data plane.
+#[derive(Debug)]
+pub enum DiskBackendError {
+    /// Caller passed a non-disk manifest (memory manifests aren't
+    /// served as block devices).
+    WrongKind(String),
+    /// Manifest structurally invalid: chunk offset not aligned to
+    /// chunk_size, or a chunk past `total_bytes`.
+    InvalidManifest(String),
+    /// Underlying chunk store / blob I/O failed.
+    Chunk(engram_chunk_store::error::ChunkStoreError),
+    /// NBD offset + length lands past the end of the virtual disk.
+    /// The kernel side shouldn't normally send these; if it does,
+    /// the daemon replies EINVAL.
+    OutOfRange {
+        offset: u64,
+        length: u64,
+        total: u64,
+    },
+}
+
+impl std::fmt::Display for DiskBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongKind(m) => write!(f, "wrong manifest kind: {m}"),
+            Self::InvalidManifest(m) => write!(f, "invalid manifest: {m}"),
+            Self::Chunk(e) => write!(f, "chunk store: {e}"),
+            Self::OutOfRange {
+                offset,
+                length,
+                total,
+            } => write!(f, "NBD range {offset}+{length} exceeds total_bytes {total}"),
+        }
+    }
+}
+
+impl std::error::Error for DiskBackendError {}
+
+impl From<engram_chunk_store::error::ChunkStoreError> for DiskBackendError {
+    fn from(e: engram_chunk_store::error::ChunkStoreError) -> Self {
+        Self::Chunk(e)
+    }
+}
+
+/// Outcome of [`ChunkedDiskBackend::flush`]. Carries the new
+/// manifest ref the daemon should hand back to the coord-side
+/// snapshot path so it can persist `disk_manifest` on the row.
+#[derive(Clone, Debug)]
+pub struct DiskFlushOutcome {
+    /// The freshly-published manifest version. The id is the same
+    /// as the input manifest's id; the version ticks.
+    pub manifest_ref: ManifestRef,
+    /// How many dirty chunks were flushed. Zero if the session
+    /// never wrote to its disk.
+    pub chunks_flushed: usize,
+    /// Total bytes of new chunk content uploaded (sum of dirty
+    /// chunk sizes). Useful for telemetry; small relative to the
+    /// VM's total RAM since 16 MiB chunks dedup at content level.
+    pub bytes_uploaded: u64,
+}
+
+/// In-memory representation of the manifest, indexed for O(1) chunk
+/// lookup. Identical shape to the memory side's positional manifest
+/// (see `engram-uffd-handler::chunked::PositionalManifest`) but
+/// kept separate so the disk daemon doesn't take a circular dep on
+/// the UFFD handler crate.
+#[derive(Clone)]
+struct PositionalDiskManifest {
+    /// `chunks[chunk_idx]` is `Some(hash)` when the base manifest
+    /// has a chunk there; `None` for sparse / zero-filled holes.
+    chunks: Vec<Option<ChunkHash>>,
+    chunk_size: u64,
+    total_bytes: u64,
+}
+
+impl PositionalDiskManifest {
+    fn from_manifest(m: &Manifest) -> Result<Self, DiskBackendError> {
+        if !matches!(m.kind, ManifestKind::Disk) {
+            return Err(DiskBackendError::WrongKind(format!(
+                "expected ManifestKind::Disk, got {:?}",
+                m.kind
+            )));
+        }
+        let chunk_size = m.chunk_size.as_u64();
+        if chunk_size == 0 {
+            return Err(DiskBackendError::InvalidManifest(
+                "chunk_size is zero".into(),
+            ));
+        }
+        let chunk_count = m.total_bytes.div_ceil(chunk_size) as usize;
+        let mut chunks = vec![None; chunk_count];
+        for entry in &m.chunks {
+            if entry.offset % chunk_size != 0 {
+                return Err(DiskBackendError::InvalidManifest(format!(
+                    "chunk offset {} is not a multiple of chunk_size {}",
+                    entry.offset, chunk_size,
+                )));
+            }
+            let idx = (entry.offset / chunk_size) as usize;
+            if idx >= chunks.len() {
+                return Err(DiskBackendError::InvalidManifest(format!(
+                    "chunk at offset {} (idx {idx}) exceeds total_bytes {}",
+                    entry.offset, m.total_bytes,
+                )));
+            }
+            chunks[idx] = Some(entry.hash);
+        }
+        Ok(Self {
+            chunks,
+            chunk_size,
+            total_bytes: m.total_bytes,
+        })
+    }
+}
+
+/// Public data plane. One per FC sandbox.
+///
+/// Cheap to clone via `Arc` — the runtime task and a (future)
+/// admin flush path both hold references.
+pub struct ChunkedDiskBackend {
+    manifest_ref: ManifestRef,
+    base: PositionalDiskManifest,
+    cache: ChunkCache,
+    store: Arc<ChunkStore>,
+    /// `chunk_idx -> dirty bytes`. Locked together so a concurrent
+    /// read + write of the same chunk doesn't see torn state.
+    /// Holding `Bytes` (vs `Vec<u8>`) is intentional: the bytes
+    /// crate's COW + slicing keeps cross-chunk reads cheap.
+    dirty: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
+}
+
+impl ChunkedDiskBackend {
+    /// Build a backend rooted at `manifest_ref`. `cache` should be
+    /// the host-agent's shared `ChunkCache` — that way base chunks
+    /// stay warm across sessions of the same image. `store` is the
+    /// underlying chunk store the cache wraps; the backend holds
+    /// it directly so `flush()` can call `put_chunk` /
+    /// `put_manifest` without going through the cache (cache is
+    /// for reads only).
+    pub async fn from_blob(
+        manifest_ref: ManifestRef,
+        cache: ChunkCache,
+        store: Arc<ChunkStore>,
+    ) -> Result<Self, DiskBackendError> {
+        let manifest = store.get_manifest(manifest_ref).await?;
+        let base = PositionalDiskManifest::from_manifest(&manifest)?;
+        Ok(Self {
+            manifest_ref,
+            base,
+            cache,
+            store,
+            dirty: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Build from an already-loaded `Manifest`. Used by unit tests
+    /// to avoid the round-trip through the chunk store.
+    pub fn new(
+        manifest_ref: ManifestRef,
+        manifest: &Manifest,
+        cache: ChunkCache,
+        store: Arc<ChunkStore>,
+    ) -> Result<Self, DiskBackendError> {
+        let base = PositionalDiskManifest::from_manifest(manifest)?;
+        Ok(Self {
+            manifest_ref,
+            base,
+            cache,
+            store,
+            dirty: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Bytes per chunk. NBD reads / writes that span chunk boundaries
+    /// fan out into per-chunk operations internally.
+    pub fn chunk_size(&self) -> u64 {
+        self.base.chunk_size
+    }
+
+    /// Total virtual-disk size. Reported back to the kernel via
+    /// `NBD_SET_SIZE_BLOCKS` during the daemon's startup dance.
+    pub fn total_bytes(&self) -> u64 {
+        self.base.total_bytes
+    }
+
+    /// Manifest ref this backend was constructed against. Changes
+    /// only via `flush()` (which ticks the version).
+    pub fn manifest_ref(&self) -> ManifestRef {
+        self.manifest_ref
+    }
+
+    /// Read `length` bytes from `offset`. Fans out across chunk
+    /// boundaries; each chunk read serves from the dirty buffer
+    /// if present, otherwise fetches via the L1 cache.
+    pub async fn read(&self, offset: u64, length: u64) -> Result<Bytes, DiskBackendError> {
+        if offset.saturating_add(length) > self.base.total_bytes {
+            return Err(DiskBackendError::OutOfRange {
+                offset,
+                length,
+                total: self.base.total_bytes,
+            });
+        }
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let mut out = Vec::with_capacity(length as usize);
+        let chunk_size = self.base.chunk_size;
+        let mut cursor = offset;
+        let end = offset + length;
+        while cursor < end {
+            let chunk_idx = (cursor / chunk_size) as usize;
+            let chunk_start = (chunk_idx as u64) * chunk_size;
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, self.base.total_bytes);
+            let intra = (cursor - chunk_start) as usize;
+            let take = std::cmp::min(end, chunk_end) - cursor;
+            let chunk_bytes = self.read_chunk(chunk_idx, chunk_end - chunk_start).await?;
+            out.extend_from_slice(&chunk_bytes[intra..intra + take as usize]);
+            cursor += take;
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Write `data` at `offset`. Idempotent on the same byte range
+    /// — last writer wins. Materialises the affected chunks into
+    /// the dirty buffer on first touch (copy from base, then patch).
+    pub async fn write(&self, offset: u64, data: &[u8]) -> Result<(), DiskBackendError> {
+        let length = data.len() as u64;
+        if offset.saturating_add(length) > self.base.total_bytes {
+            return Err(DiskBackendError::OutOfRange {
+                offset,
+                length,
+                total: self.base.total_bytes,
+            });
+        }
+        if length == 0 {
+            return Ok(());
+        }
+        let chunk_size = self.base.chunk_size;
+        let mut cursor = offset;
+        let mut src_off = 0usize;
+        let end = offset + length;
+        while cursor < end {
+            let chunk_idx = (cursor / chunk_size) as usize;
+            let chunk_start = (chunk_idx as u64) * chunk_size;
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, self.base.total_bytes);
+            let intra = (cursor - chunk_start) as usize;
+            let take_u64 = std::cmp::min(end, chunk_end) - cursor;
+            let take = take_u64 as usize;
+            // Materialise the chunk into the dirty map if it isn't
+            // already. We fetch the base bytes ONCE here regardless
+            // of where in the chunk this write lands.
+            let chunk_len = (chunk_end - chunk_start) as usize;
+            self.ensure_dirty(chunk_idx, chunk_len).await?;
+            let mut dirty = self.dirty.lock().await;
+            let buf = dirty
+                .get_mut(&chunk_idx)
+                .expect("ensure_dirty just inserted");
+            buf[intra..intra + take].copy_from_slice(&data[src_off..src_off + take]);
+            drop(dirty);
+            cursor += take_u64;
+            src_off += take;
+        }
+        Ok(())
+    }
+
+    /// Flush dirty chunks to the chunk store and tick the manifest
+    /// version. The new `ManifestRef` is the durability gate the
+    /// snapshot path attaches to `SnapshotRecord.disk_manifest`.
+    ///
+    /// After flush, the dirty buffer is cleared and reads of those
+    /// regions go through the new manifest entries via the chunk
+    /// cache like any other base chunk. The post-flush state is
+    /// indistinguishable from "fresh session against the new
+    /// manifest version."
+    pub async fn flush(&self) -> Result<DiskFlushOutcome, DiskBackendError> {
+        let mut dirty_guard = self.dirty.lock().await;
+        if dirty_guard.is_empty() {
+            return Ok(DiskFlushOutcome {
+                manifest_ref: self.manifest_ref,
+                chunks_flushed: 0,
+                bytes_uploaded: 0,
+            });
+        }
+        let chunk_size = self.base.chunk_size;
+        let mut new_chunks: Vec<(usize, ChunkHash, u64)> = Vec::new();
+        // Drain into a Vec so we can release the lock while
+        // uploading (uploads are async + bounded by network
+        // latency; holding the lock would serialise unrelated
+        // reads).
+        let drained: Vec<(usize, Vec<u8>)> = dirty_guard.drain().collect();
+        drop(dirty_guard);
+        for (chunk_idx, bytes) in drained {
+            let size = bytes.len() as u64;
+            let hash = self.store.put_chunk(&bytes).await?;
+            new_chunks.push((chunk_idx, hash, size));
+        }
+        // Build the new manifest: start from the base, overlay the
+        // flushed hashes. `put_manifest` will reject any duplicate
+        // chunk_idx so half-applied state can't leak through.
+        let mut chunks: Vec<ChunkRef> = self
+            .base
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                h.map(|hash| ChunkRef {
+                    offset: (i as u64) * chunk_size,
+                    hash,
+                })
+            })
+            .collect();
+        let mut bytes_uploaded = 0u64;
+        for (idx, hash, size) in &new_chunks {
+            // Replace the existing entry if one was there; insert
+            // otherwise. Linear scan because the chunks list is
+            // small (<< 1024 entries for typical disks) and the
+            // overhead is dominated by the chunk upload itself.
+            let offset = (*idx as u64) * chunk_size;
+            if let Some(existing) = chunks.iter_mut().find(|c| c.offset == offset) {
+                existing.hash = *hash;
+            } else {
+                chunks.push(ChunkRef {
+                    offset,
+                    hash: *hash,
+                });
+            }
+            bytes_uploaded += *size;
+        }
+        chunks.sort_by_key(|c| c.offset);
+        let new_manifest = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
+            total_bytes: self.base.total_bytes,
+            chunks,
+            parent: Some(self.manifest_ref),
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let new_ref = self.manifest_ref.next_version();
+        self.store.put_manifest(new_ref, &new_manifest).await?;
+        Ok(DiskFlushOutcome {
+            manifest_ref: new_ref,
+            chunks_flushed: new_chunks.len(),
+            bytes_uploaded,
+        })
+    }
+
+    /// Fetch a chunk's bytes — from the dirty buffer if present,
+    /// otherwise via the L1 cache + chunk store. `chunk_len` is the
+    /// chunk's full byte size (might be < `chunk_size` for the
+    /// final chunk of a non-aligned disk).
+    async fn read_chunk(
+        &self,
+        chunk_idx: usize,
+        chunk_len: u64,
+    ) -> Result<Bytes, DiskBackendError> {
+        // Dirty buffer wins. Hold the lock only long enough to
+        // clone the bytes; chunk reads are O(N) memcpy.
+        {
+            let dirty = self.dirty.lock().await;
+            if let Some(buf) = dirty.get(&chunk_idx) {
+                return Ok(Bytes::copy_from_slice(buf));
+            }
+        }
+        match self.base.chunks.get(chunk_idx).copied().flatten() {
+            Some(hash) => Ok(self.cache.get(hash).await?),
+            // Zero-filled hole — the manifest had no entry here.
+            None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
+        }
+    }
+
+    /// Ensure the dirty buffer has a writeable copy of chunk `idx`.
+    /// If not, copy the base chunk's bytes in. Idempotent.
+    async fn ensure_dirty(
+        &self,
+        chunk_idx: usize,
+        chunk_len: usize,
+    ) -> Result<(), DiskBackendError> {
+        {
+            let dirty = self.dirty.lock().await;
+            if dirty.contains_key(&chunk_idx) {
+                return Ok(());
+            }
+        }
+        // Fetch the base bytes outside the lock — the chunk store
+        // call is async and slow. Two concurrent writers to the
+        // same chunk may both perform the fetch; the second one's
+        // insert is a no-op. That's fine — fetches are cache-warm
+        // after the first, and content-addressing makes them safe
+        // to redo.
+        let base_bytes = match self.base.chunks.get(chunk_idx).copied().flatten() {
+            Some(hash) => self.cache.get(hash).await?,
+            None => Bytes::from(vec![0u8; chunk_len]),
+        };
+        let mut dirty = self.dirty.lock().await;
+        dirty
+            .entry(chunk_idx)
+            .or_insert_with(|| base_bytes.to_vec());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_chunk_store::cache::ChunkCacheConfig;
+    use engram_chunk_store::manifest::{ChunkSize, MANIFEST_SCHEMA_VERSION};
+    use engram_core::traits::BlobStorage;
+    use engram_storage_local::LocalBlobStorage;
+    use std::sync::Arc;
+
+    fn synth_manifest(
+        total_bytes: u64,
+        chunk_size: u64,
+        entries: Vec<(u64, ChunkHash)>,
+    ) -> Manifest {
+        Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes,
+            chunks: entries
+                .into_iter()
+                .map(|(offset, hash)| ChunkRef { offset, hash })
+                .collect(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        }
+    }
+
+    async fn build_backend(
+        manifest: &Manifest,
+    ) -> (ChunkedDiskBackend, Arc<ChunkStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, manifest).await.unwrap();
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, manifest, cache, store.clone()).unwrap();
+        (backend, store, dir)
+    }
+
+    /// Synth helper: put a chunk of `byte` repeated `size` times
+    /// into the store and return its hash. Lets tests build a base
+    /// manifest with known content.
+    async fn put_chunk(store: &ChunkStore, byte: u8, size: usize) -> ChunkHash {
+        let bytes = vec![byte; size];
+        store.put_chunk(&bytes).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_within_a_single_base_chunk_returns_chunk_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 8192u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0), (chunk_size, h1)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+
+        let bytes = backend.read(0, 4096).await.unwrap();
+        assert_eq!(bytes.len(), 4096);
+        assert!(bytes.iter().all(|b| *b == 0xaa));
+
+        let bytes = backend.read(4096, 4096).await.unwrap();
+        assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    #[tokio::test]
+    async fn read_across_chunk_boundary_stitches_two_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 8192u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0), (chunk_size, h1)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+
+        // 2 KiB straddle: last 2 KiB of chunk 0 + first 2 KiB of chunk 1.
+        let bytes = backend.read(2048, 4096).await.unwrap();
+        assert_eq!(bytes.len(), 4096);
+        assert!(
+            bytes[..2048].iter().all(|b| *b == 0xaa),
+            "first half should be 0xaa"
+        );
+        assert!(
+            bytes[2048..].iter().all(|b| *b == 0xbb),
+            "second half should be 0xbb"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_a_sparse_hole_returns_zeros() {
+        // Manifest omits chunk 1 (sparse hole). Read of that
+        // region serves zeros without touching the cache or
+        // store.
+        let total = 8192u64;
+        let chunk_size = 4096u64;
+        let (backend, store, _dir) =
+            build_backend(&synth_manifest(total, chunk_size, vec![])).await;
+        let _ = store; // hush unused
+        let bytes = backend.read(4096, 4096).await.unwrap();
+        assert!(bytes.iter().all(|b| *b == 0), "sparse hole reads as zeros");
+    }
+
+    #[tokio::test]
+    async fn write_then_read_within_one_chunk_observes_dirty_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+
+        backend.write(0, &[0xcc; 16]).await.unwrap();
+        let bytes = backend.read(0, 32).await.unwrap();
+        assert!(bytes[..16].iter().all(|b| *b == 0xcc));
+        assert!(bytes[16..].iter().all(|b| *b == 0xaa));
+    }
+
+    #[tokio::test]
+    async fn flush_with_no_writes_is_a_no_op() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _store, _dir) = build_backend(&manifest).await;
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 0);
+        assert_eq!(outcome.bytes_uploaded, 0);
+        // The manifest ref doesn't tick when nothing was dirty.
+        assert_eq!(outcome.manifest_ref, backend.manifest_ref());
+    }
+
+    #[tokio::test]
+    async fn flush_publishes_new_manifest_version_with_dirty_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 8192u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone()).unwrap();
+
+        // Touch chunk 0 (mutate it) and chunk 1 (was sparse).
+        backend.write(0, &[0xff; 64]).await.unwrap();
+        backend.write(4096, &[0xee; 128]).await.unwrap();
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 2);
+        assert!(outcome.bytes_uploaded > 0);
+        assert_eq!(outcome.manifest_ref.manifest_id, manifest_ref.manifest_id);
+        assert_eq!(outcome.manifest_ref.version, manifest_ref.version + 1);
+
+        // The new manifest, fetched back from the store, contains
+        // the new hashes — not the original ones.
+        let new_manifest = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        assert_eq!(new_manifest.parent, Some(manifest_ref));
+        assert_eq!(new_manifest.chunks.len(), 2);
+        let chunk0 = new_manifest.chunks.iter().find(|c| c.offset == 0).unwrap();
+        assert_ne!(chunk0.hash, h0, "chunk 0 was rewritten; hash must differ");
+    }
+
+    #[tokio::test]
+    async fn rejects_read_past_total_bytes() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _, _dir) = build_backend(&manifest).await;
+        let err = backend.read(4000, 4096).await.unwrap_err();
+        assert!(matches!(err, DiskBackendError::OutOfRange { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_write_past_total_bytes() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _, _dir) = build_backend(&manifest).await;
+        let err = backend.write(4000, &[0u8; 4096]).await.unwrap_err();
+        assert!(matches!(err, DiskBackendError::OutOfRange { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_disk_manifest_kind() {
+        let mut mem = synth_manifest(4096, 4096, vec![]);
+        mem.kind = ManifestKind::Memory;
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 1024 * 1024;
+        let cache = ChunkCache::new(cfg, (*store).clone());
+        let err = ChunkedDiskBackend::new(ManifestRef::new(), &mem, cache, store)
+            .err()
+            .unwrap();
+        assert!(matches!(err, DiskBackendError::WrongKind(_)));
+    }
+
+    #[tokio::test]
+    async fn zero_length_read_returns_empty() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _, _dir) = build_backend(&manifest).await;
+        let bytes = backend.read(0, 0).await.unwrap();
+        assert_eq!(bytes.len(), 0);
+    }
+}

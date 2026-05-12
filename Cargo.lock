@@ -1031,6 +1031,7 @@ name = "engram-host-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "clap",
  "dashmap",

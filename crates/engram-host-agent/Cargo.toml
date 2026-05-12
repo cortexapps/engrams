@@ -31,6 +31,7 @@ engram-cloud-static.workspace = true
 engram-secrets-gcp.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 chrono.workspace = true
