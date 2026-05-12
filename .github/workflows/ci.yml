@@ -295,9 +295,28 @@ jobs:
           sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
           firecracker --version
 
+      # Cache the kernel + ubuntu rootfs in GH Actions cache. Both
+      # artifacts are version-pinned via fetch-fc-test-artifacts.sh
+      # (currently vmlinux-5.10.223 + ubuntu-22.04.ext4, ~1.9 GB
+      # total). Without the cache, every CI run pays a ~19 min
+      # download from `spec.ccfc.min` (Firecracker's S3 bucket).
+      #
+      # On Blacksmith runners, actions/cache@v4 transparently uses
+      # Blacksmith's colocated cache — see
+      # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
+      # No useblacksmith/* fork needed (those are archived). The
+      # cache key hashes the fetch script content, so bumping
+      # either URL (kernel or rootfs version) invalidates cleanly.
+      - name: Cache FC kernel + rootfs artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/engram-fc-test
+          key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
+
       # Drop the cached kernel + ubuntu rootfs into ~/.cache/engram-fc-test
       # and emit the `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` env vars that
-      # `common::fc_preflight()` reads.
+      # `common::fc_preflight()` reads. Idempotent: on a cache hit
+      # this just re-emits the env exports without re-downloading.
       - name: Fetch FC kernel + rootfs artifacts
         run: |
           bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
