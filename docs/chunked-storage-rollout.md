@@ -142,40 +142,73 @@ that's the single largest production-deploy blocker.
 
 ## Phase 4 — Disk adapter for Linux + FC (NBD daemon)
 
-**Status: ⬜ pending — multi-session, needs dev-VM kernel validation**
+**Status: 🟡 partial — daemon + PooledBackend integration shipped;
+end-to-end FC microVM integration test deferred to a dev-VM session**
 
-The biggest remaining piece per the plan. Estimated ~800 lines.
+### Shipped
 
-### Scope
+- **NBD wire codec + `ChunkedDiskBackend`** (commit `55dd889`,
+  ~600 lines). Pure-Rust, target-agnostic data plane:
+  `NbdRequest::parse` / `NbdReply::encode` (28-byte / 16-byte
+  big-endian headers); `ChunkedDiskBackend::read` fans out across
+  16 MiB chunk boundaries; writes copy base into a dirty buffer;
+  `flush()` hashes + uploads + atomically rebases. 18 unit tests
+  (codec + data plane) + a regression test for the
+  post-flush-stale-read bug.
+- **Linux NBD runtime** (commit `c770b6f`, ~500 lines). Direct
+  kernel ioctls (`NBD_SET_SOCK` / `NBD_SET_BLKSIZE` /
+  `NBD_SET_SIZE_BLOCKS` / `NBD_SET_FLAGS` / `NBD_DO_IT` /
+  `NBD_DISCONNECT` / `NBD_CLEAR_SOCK`) — no external
+  `nbd-client` binary required. `socketpair(AF_UNIX)` one half
+  to the kernel; tokio task serves the other. Dedicated OS
+  thread holds `NBD_DO_IT` for the lifetime of the device.
+  Drop tears down deterministically (disconnect → join → clear
+  → close). 5 `unsafe` blocks, each `// SAFETY:` annotated;
+  host-agent crate-level `unsafe_code = "allow"` (was `forbid`).
+- **`NbdSlotAllocator`** (commit `645afd8`). Async pool of
+  `/dev/nbdN` device paths; `acquire()` waits when empty;
+  `NbdSlot::Drop` returns the path. Duplicate-path rejection
+  loud at construction. 5 unit tests.
+- **`attach_manifest` + `NbdSandboxState`** (commit `e4f7500`).
+  Composer: manifest → backend → claim slot → spawn daemon →
+  wrap in state struct. Field-order-correct Drop (kernel sees
+  disconnect before slot is reusable).
+- **`PooledBackend` integration** (commit `94e9a52`). New
+  `with_nbd_pool(allocator)` builder; `nbd_sandboxes: DashMap
+  <SandboxId, NbdSandboxState>` tracks per-sandbox daemons.
+  `resolve_rootfs` picks NBD over materialize-to-file when all
+  prerequisites align. `destroy` removes from the map (Drop
+  cleans up); `snapshot` calls `state.backend.flush()` BEFORE
+  `inner.snapshot` so the new disk_manifest version is durable
+  before FC's memory capture. Propagates onto
+  `SnapshotMetadata.disk_manifest`.
+- **Coord-side + host-agent-side env wiring** (this slice).
+  `ENGRAM_NBD_DEVICES=/dev/nbd0,/dev/nbd1,...` env var on
+  `--mode=all` coordinator startup AND on standalone
+  `engram-host-agent` startup → `NbdSlotAllocator` → plumbed
+  into the wrapping `PooledBackend`. Empty / unset → fall back
+  to materialize-to-file (the existing chunked path).
 
-- `crates/engram-host-agent/src/disk_daemon.rs` (new) — NBD oldstyle
-  / newstyle handshake + READ / WRITE / FLUSH dispatching against
-  the chunk store
-- `FirecrackerBackend::create` spawns the daemon, kernel attaches
-  `/dev/nbdN`, FC's `path_on_host` points at that device
-- Per-session dirty-region buffering, periodic flush, manifest
-  version bumps on close
-- Per-VM cleanup: `nbd-client -d /dev/nbdN` on destroy
-- FC integration tests: extend
-  `crates/engram-sandbox-firecracker/tests/exec_real_vm.rs` to assert
-  the rootfs reads come through NBD
+### Still pending
+
+- ⬜ **End-to-end FC microVM integration test.** A
+  `crates/engram-sandbox-firecracker/tests/nbd_chunked_disk.rs`
+  (Linux + KVM + `modprobe nbd nbds_max=N` gated) that builds a
+  small chunked disk manifest, spawns the daemon, attaches
+  `/dev/nbd0` as the FC rootfs, boots a real microVM, asserts
+  reads + writes round-trip + flush produces a new manifest
+  version. Same shape as `tests/snapshot_uffd.rs`. Needs a
+  focused dev-VM session.
+- ⬜ **Packer manifest update**: `modprobe nbd nbds_max=64` +
+  set `ENGRAM_NBD_DEVICES` in `engram-host-agent.service`
+  Environment=. Trivial — pairs with the integration test.
 
 ### Dependencies / open questions
 
-- Kernel must have `CONFIG_BLK_DEV_NBD=y` (Ubuntu cloud image — yes;
-  the Kata kernel we use for VZ — check)
-- `nbd-client` userspace package on the host (Packer manifest needs
-  it)
-- Decision: kernel NBD client vs FUSE-backed block device vs vhost-
-  user-blk. NBD has the simplest userspace story; vhost-user is the
-  production-grade endgame.
-
-### Until Phase 4 lands
-
-FC sessions already work via the Phase 3a materialize-first path: the
-chunked image is materialized to a file before VM boot, then attached
-as `path_on_host` directly. Cost: ~16s materialize for a 16 GiB image
-vs the NBD goal of sub-second. Functional, not fast.
+- Kernel must have `CONFIG_BLK_DEV_NBD=y` (Ubuntu cloud image —
+  yes; production base image — verify in the Packer manifest).
+- No `nbd-client` userspace required — the daemon talks the
+  kernel ioctls directly.
 
 ---
 
@@ -795,10 +828,12 @@ tier.
    materialize time, GC counts. Without these, debugging production
    slowness is guesswork. Probably a Prometheus exporter; needs a
    framework call.
-8. ⬜ **Phase 4 NBD** — FC restore time scales with image size
-   without it. Could ship Tier 4 *without* this and accept ~16s
-   restore for a 16 GiB image (materialize-first), then ship NBD as
-   a perf upgrade.
+8. 🟡 **Phase 4 NBD** — daemon + PooledBackend integration
+   shipped (commits `55dd889`, `c770b6f`, `645afd8`, `e4f7500`,
+   `94e9a52`). End-to-end FC microVM integration test (boot a
+   real VM against `/dev/nbd0` served by the daemon) deferred
+   to a focused dev-VM session. Wired behind
+   `ENGRAM_NBD_DEVICES=…` so operators opt in.
 9. ✅ **Phase 5 UFFD + canonical memory + WS R&R** — runtime +
    snapshot wiring shipped (bake-time canonical capture + cross-
    host trace/memory.bin materialization are tasks #32/#33).

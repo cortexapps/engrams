@@ -259,6 +259,35 @@ async fn main() -> Result<(), HostAgentError> {
         .with_chunk_cache(chunk_cache)
         .with_image_cache(image_cache)
         .with_auth_session_handle(auth_session_handle);
+    // ADR 0007 Phase 4: opt-in NBD daemon. `ENGRAM_NBD_DEVICES`
+    // is a comma-separated list of `/dev/nbdN` paths the daemon
+    // allocates from. Empty / unset → keep the materialize-to-
+    // file path. Production Packer images load `modprobe nbd
+    // nbds_max=64` + set this env var to match.
+    if let Ok(s) = std::env::var("ENGRAM_NBD_DEVICES") {
+        let paths: Vec<std::path::PathBuf> = s
+            .split(',')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect();
+        if !paths.is_empty() {
+            match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
+                Ok(pool) => {
+                    tracing::info!(
+                        slots = pool.capacity(),
+                        "NBD daemon enabled; chunked rootfs serves /dev/nbdN",
+                    );
+                    agent = agent.with_nbd_pool(pool);
+                }
+                Err(e) => {
+                    return Err(HostAgentError::Config(format!(
+                        "ENGRAM_NBD_DEVICES misconfigured: {e}"
+                    )));
+                }
+            }
+        }
+    }
     if cli.egress_proxy_port > 0 {
         match build_host_egress(&cli).await {
             Ok(egress) => agent = agent.with_egress(Arc::new(egress)),

@@ -61,6 +61,10 @@ pub struct HostAgent {
     /// ADR 0007 #3a: NVMe-backed chunk cache. Optional; wired in
     /// production to amortise chunk reads across manifests.
     pub chunk_cache: Option<ChunkCache>,
+    /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
+    /// daemon allocates from when serving chunked rootfs disks.
+    /// `None` keeps the legacy materialize-to-file path active.
+    pub nbd_pool: Option<Arc<disk_daemon::NbdSlotAllocator>>,
 }
 
 impl HostAgent {
@@ -78,6 +82,7 @@ impl HostAgent {
             image_cache: None,
             auth_session_handle: None,
             chunk_cache: None,
+            nbd_pool: None,
         }
     }
 
@@ -86,6 +91,15 @@ impl HostAgent {
     /// (canonical-base images, forks).
     pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
         self.chunk_cache = Some(cache);
+        self
+    }
+
+    /// Attach a `/dev/nbdN` slot allocator. When set + a chunk
+    /// store + chunk cache are also wired, `create()` spawns the
+    /// NBD daemon to serve chunked rootfs disks instead of
+    /// materializing them to single files. Linux-only at runtime.
+    pub fn with_nbd_pool(mut self, pool: Arc<disk_daemon::NbdSlotAllocator>) -> Self {
+        self.nbd_pool = Some(pool);
         self
     }
 
@@ -164,6 +178,9 @@ impl HostAgent {
                 }
                 if let Some(ic) = self.image_cache.clone() {
                     p = p.with_image_cache(ic);
+                }
+                if let Some(pool) = self.nbd_pool.clone() {
+                    p = p.with_nbd_pool(pool);
                 }
                 Arc::new(p)
             };
