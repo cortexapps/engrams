@@ -355,6 +355,21 @@ pub struct BuildOutcome {
     pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
     /// Size of `rootfs_path` on disk.
     pub size_bytes: u64,
+    /// ADR 0008 Phase 3: bootstrap JSON for the disk side of a
+    /// Nydus-shaped artifact. Sits next to `rootfs.ext4` in
+    /// `image_dir` (e.g. `image_dir/bootstrap.disk.json`). `None`
+    /// for non-Ext4 bakes (Directory) or when chunked-OCI emission
+    /// was skipped. `push_to_registry` reads both this and
+    /// `disk_chunks_blob_path` to construct a chunked OCI push.
+    pub disk_bootstrap_path: Option<PathBuf>,
+    /// ADR 0008 Phase 3: path to the concatenated disk chunk blob.
+    /// Paired with `disk_bootstrap_path`.
+    pub disk_chunks_blob_path: Option<PathBuf>,
+    /// ADR 0008 Phase 3: memory-side counterpart of
+    /// `disk_bootstrap_path`. `Some` iff canonical memory was
+    /// captured at bake time.
+    pub memory_bootstrap_path: Option<PathBuf>,
+    pub memory_chunks_blob_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -691,16 +706,93 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             None
         };
 
+        // ADR 0008 Phase 3: produce Nydus-shaped artifacts
+        // alongside the existing bundle.json. For each kind that
+        // has a chunked manifest, build (bootstrap, chunk_blob)
+        // and write them to image_dir. push_to_registry uploads
+        // both as new OCI layers; the runtime resolver indexes
+        // them at pull time.
+        //
+        // The disk_manifest in BlobStorage stays — image_cache's
+        // legacy path still resolves through it for v1 artifacts
+        // and dev workflows. v2 consumers prefer the bootstrap
+        // layers because they enable Range-GET-on-fault.
+        let mut disk_bootstrap_path = None;
+        let mut disk_chunks_blob_path = None;
+        if let Some(disk_ref) = disk_manifest {
+            let manifest = self
+                .chunk_store
+                .get_manifest(disk_ref)
+                .await
+                .map_err(|e| BuildError::Config(format!("re-read disk manifest: {e}")))?;
+            let (bootstrap, blob) =
+                engram_chunk_store::Bootstrap::build_from_manifest(&self.chunk_store, &manifest)
+                    .await
+                    .map_err(|e| BuildError::Config(format!("disk bootstrap build: {e}")))?;
+            let bs_path = image_dir.join("bootstrap.disk.json");
+            let blob_path = image_dir.join("chunks.disk.blob");
+            tokio::fs::write(
+                &bs_path,
+                serde_json::to_vec(&bootstrap)
+                    .map_err(|e| BuildError::Config(format!("disk bootstrap json: {e}")))?,
+            )
+            .await?;
+            tokio::fs::write(&blob_path, &blob).await?;
+            disk_bootstrap_path = Some(bs_path);
+            disk_chunks_blob_path = Some(blob_path);
+        }
+
+        let mut memory_bootstrap_path = None;
+        let mut memory_chunks_blob_path = None;
+        if let Some(mem_ref) = canonical_memory_manifest {
+            let manifest = self
+                .chunk_store
+                .get_manifest(mem_ref)
+                .await
+                .map_err(|e| BuildError::Config(format!("re-read memory manifest: {e}")))?;
+            let (bootstrap, blob) =
+                engram_chunk_store::Bootstrap::build_from_manifest(&self.chunk_store, &manifest)
+                    .await
+                    .map_err(|e| BuildError::Config(format!("memory bootstrap build: {e}")))?;
+            let bs_path = image_dir.join("bootstrap.memory.json");
+            let blob_path = image_dir.join("chunks.memory.blob");
+            tokio::fs::write(
+                &bs_path,
+                serde_json::to_vec(&bootstrap)
+                    .map_err(|e| BuildError::Config(format!("memory bootstrap json: {e}")))?,
+            )
+            .await?;
+            tokio::fs::write(&blob_path, &blob).await?;
+            memory_bootstrap_path = Some(bs_path);
+            memory_chunks_blob_path = Some(blob_path);
+        }
+
         // Re-write bundle.json now that we know whether the
         // canonical memory ref is set. The earlier write inside
         // the Ext4 branch already wrote a baseline bundle; this
-        // is the canonical-aware overwrite.
+        // is the canonical-aware overwrite. Schema bumps to v2
+        // when chunked-OCI artifacts were produced — v1 readers
+        // see `disk_manifest` still and work; v2 readers
+        // additionally consult `bootstrap_disk` /
+        // `bootstrap_memory` for Range-GET-on-fault.
         if let Some(disk_ref) = disk_manifest {
-            let bundle = serde_json::json!({
-                "schema_version": 1,
+            let schema_version = if disk_bootstrap_path.is_some() { 2 } else { 1 };
+            let mut bundle = serde_json::json!({
+                "schema_version": schema_version,
                 "disk_manifest": disk_ref,
                 "canonical_memory_manifest": canonical_memory_manifest,
             });
+            if disk_bootstrap_path.is_some() {
+                // We don't know the OCI layer digests yet (those
+                // are computed at push time when the registry
+                // checks the upload), so we just flag that the
+                // chunked-OCI shape is *available* — consumers
+                // resolve actual digests from the OCI manifest.
+                bundle["bootstrap_disk_available"] = serde_json::Value::Bool(true);
+            }
+            if memory_bootstrap_path.is_some() {
+                bundle["bootstrap_memory_available"] = serde_json::Value::Bool(true);
+            }
             tokio::fs::write(
                 image_dir.join("bundle.json"),
                 serde_json::to_vec_pretty(&bundle)
@@ -716,6 +808,10 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             disk_manifest,
             canonical_memory_manifest,
             size_bytes: total_size,
+            disk_bootstrap_path,
+            disk_chunks_blob_path,
+            memory_bootstrap_path,
+            memory_chunks_blob_path,
         })
     }
 
@@ -896,6 +992,52 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         } else {
             None
         };
+
+        // ADR 0008 Phase 3: when the bake produced Nydus-shaped
+        // outputs (bootstrap + chunk_blob), push them as a
+        // chunked OCI artifact. Consumers with chunked-OCI
+        // support Range-GET individual chunks on fault; legacy
+        // consumers fall back to BlobStorage via bundle.json's
+        // disk_manifest. Both code paths see the same manifest
+        // toml + bundle.json.
+        if let (Some(bs_path), Some(blob_path), Some(bundle)) = (
+            outcome.disk_bootstrap_path.as_ref(),
+            outcome.disk_chunks_blob_path.as_ref(),
+            bundle_bytes.as_ref(),
+        ) {
+            let disk_bootstrap_json = tokio::fs::read(bs_path).await.map_err(BuildError::Io)?;
+            let disk_chunks_blob = tokio::fs::read(blob_path).await.map_err(BuildError::Io)?;
+            let (memory_bootstrap_json, memory_chunks_blob) = match (
+                outcome.memory_bootstrap_path.as_ref(),
+                outcome.memory_chunks_blob_path.as_ref(),
+            ) {
+                (Some(bs), Some(blob)) => (
+                    Some(tokio::fs::read(bs).await.map_err(BuildError::Io)?),
+                    Some(tokio::fs::read(blob).await.map_err(BuildError::Io)?),
+                ),
+                _ => (None, None),
+            };
+
+            let payload = engram_oci::ChunkedPushPayload {
+                manifest_toml: manifest_bytes,
+                config_json: config_bytes,
+                bundle_json: bundle.clone(),
+                disk_bootstrap_json,
+                disk_chunks_blob,
+                memory_bootstrap_json,
+                memory_chunks_blob,
+            };
+
+            let digest = oci
+                .push_chunked_image(&full_uri, payload)
+                .await
+                .map_err(|e| BuildError::Docker(format!("oci chunked push: {e}")))?;
+
+            return Ok(RegistryPush {
+                uri: full_uri,
+                manifest_digest: digest,
+            });
+        }
 
         // ADR 0007 Phase 6: skip the rootfs.ext4 layer when the
         // bundle is present. Disk bytes already live in the chunk

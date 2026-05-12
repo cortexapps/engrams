@@ -768,6 +768,12 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     // ADR 0007: ext4 bakes produce a chunked manifest + sidecar bundle.json
     // so downstream consumers (host-agent image cache, NBD daemon,
     // VZ materialize) can resolve content through the chunk store.
+    //
+    // ADR 0008 Phase 3: bake also emits Nydus-shaped sidecars
+    // (bootstrap.disk.json + chunks.disk.blob) and bumps the
+    // bundle schema to v2. v1 readers still see `disk_manifest`
+    // and work; v2 readers additionally consult the bootstrap
+    // file for Range-GET-on-fault.
     let manifest_ref = outcome
         .disk_manifest
         .expect("ext4 bake must produce a disk manifest");
@@ -775,9 +781,31 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     assert!(bundle_path.is_file(), "bundle.json sidecar should exist");
     let bundle: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
-    assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["schema_version"], 2);
     let serialized: serde_json::Value = serde_json::to_value(manifest_ref).unwrap();
     assert_eq!(bundle["disk_manifest"], serialized);
+    assert_eq!(bundle["bootstrap_disk_available"], true);
+
+    // ADR 0008: the disk-side bootstrap + chunk blob must be on
+    // disk and reachable via BuildOutcome.
+    let bs_path = outcome
+        .disk_bootstrap_path
+        .as_ref()
+        .expect("disk bootstrap path");
+    let blob_path = outcome
+        .disk_chunks_blob_path
+        .as_ref()
+        .expect("disk chunks blob path");
+    assert!(bs_path.is_file(), "bootstrap.disk.json must exist");
+    assert!(blob_path.is_file(), "chunks.disk.blob must exist");
+    // The bootstrap's chunk_blob_len must equal the actual blob
+    // file size — the contract the OCI push relies on.
+    let bs_bytes = std::fs::read(bs_path).unwrap();
+    let parsed: engram_chunk_store::Bootstrap = serde_json::from_slice(&bs_bytes).unwrap();
+    assert_eq!(
+        parsed.chunk_blob_len(),
+        std::fs::metadata(blob_path).unwrap().len()
+    );
 
     // Docker orchestration unchanged: build → create → export → rm → rmi.
     let calls = docker.calls();
