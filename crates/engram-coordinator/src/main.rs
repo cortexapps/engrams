@@ -518,6 +518,10 @@ async fn main() -> Result<(), CoordinatorError> {
                 raw_backend,
                 cli.warm_pool_size,
             )
+            // ADR 0008 Phase 5: feed the OciClient to the pooled
+            // backend so chunked-OCI images can fault chunks from
+            // the registry on BlobStorage miss.
+            .with_oci_client((*oci_client).clone())
             .with_image_cache(image_cache)
             .with_chunk_store(chunk_store, materialize_dir)
             .with_chunk_cache(chunk_cache);

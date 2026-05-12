@@ -83,6 +83,15 @@ impl ChunkStore {
         &self.inner
     }
 
+    /// Cloneable handle to the BlobStorage backing this `ChunkStore`.
+    /// Used by callers (ADR 0008 Phase 5+) that need to construct
+    /// a `TieredChunkResolver` write-back to the same BlobStorage
+    /// the store reads from. The handle is just an `Arc`-clone;
+    /// PUT/GET semantics are unchanged.
+    pub fn blob_storage(&self) -> Arc<dyn BlobStorage> {
+        Arc::clone(&self.inner)
+    }
+
     // ---------- chunks ----------
 
     /// PUT a chunk. Computes its hash, writes to

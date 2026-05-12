@@ -199,6 +199,11 @@ impl HostAgent {
                     p = p.with_chunk_cache(cache);
                 }
                 if let Some(ic) = self.image_cache.clone() {
+                    // ADR 0008 Phase 5: also feed the image cache's
+                    // OciClient into the pooled backend so chunked-
+                    // OCI images can fault chunks from the registry
+                    // via the tiered resolver path.
+                    p = p.with_oci_client(ic.oci_client());
                     p = p.with_image_cache(ic);
                 }
                 if let Some(pool) = self.nbd_pool.clone() {

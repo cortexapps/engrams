@@ -119,6 +119,14 @@ pub struct PooledBackend {
     /// from racing on the same manifest_id+version file. Held only
     /// for the materialize critical section, not the whole call.
     materialize_lock: Mutex<()>,
+    /// ADR 0008 Phase 5: OCI client used as the *origin tier* of the
+    /// tiered chunk-fault path. When `Some`, `resolve_rootfs` checks
+    /// `cached.is_disk_chunked_oci()` and builds a
+    /// `TieredChunkResolver` that consults BlobStorage first and
+    /// falls through to OCI Range GET on miss, opportunistically
+    /// write-filling BlobStorage with the fetched chunk (CDN-fill).
+    /// `None` keeps the legacy BlobStorage-only path.
+    oci_client: Option<engram_oci::OciClient>,
     /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
     /// host-agent allocates from when serving chunked disks via
     /// the NBD daemon. `None` = NBD disabled (the materialize-to-
@@ -150,6 +158,7 @@ impl PooledBackend {
             materialize_dir: None,
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
+            oci_client: None,
             nbd_pool: None,
             #[cfg(target_os = "linux")]
             nbd_sandboxes: Arc::new(DashMap::new()),
@@ -195,6 +204,20 @@ impl PooledBackend {
     /// before forwarding to the inner backend.
     pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
         self.image_cache = Some(cache);
+        self
+    }
+
+    /// ADR 0008 Phase 5: attach an `OciClient` to enable the
+    /// chunks-in-OCI fault path. When set together with a chunk
+    /// store, `resolve_rootfs` upgrades chunked-OCI images
+    /// (`CachedImage::is_disk_chunked_oci()`) from BlobStorage-only
+    /// to a tiered `BlobStorage → OCI` fault path with
+    /// write-through fill to BlobStorage. Without this, chunked-OCI
+    /// images degrade to legacy behavior — chunks must live in the
+    /// host's BlobStorage namespace or session-create fails on
+    /// first chunk fault.
+    pub fn with_oci_client(mut self, client: engram_oci::OciClient) -> Self {
+        self.oci_client = Some(client);
         self
     }
 
@@ -247,7 +270,7 @@ impl PooledBackend {
             return Ok((state.device_path().to_path_buf(), Some(state)));
         }
 
-        // Branch 2: materialize-to-file (the legacy chunked path).
+        // Branch 2: materialize-to-file (the chunked path).
         let (chunk_store, materialize_dir) =
             match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
                 (Some(cs), Some(dir)) => (cs, dir),
@@ -257,8 +280,22 @@ impl PooledBackend {
             Some(b) => b,
             None => return Ok((legacy_rootfs_path(cached)?, nbd_state_none())),
         };
+
+        // ADR 0008 Phase 5: when the image is chunked-OCI shaped AND
+        // an `OciClient` is wired, build a per-call `ChunkStore`
+        // with a `TieredChunkResolver` so chunks missing from
+        // BlobStorage fall through to OCI Range GET. Successful OCI
+        // fetches tee back into BlobStorage (CDN-fill) so subsequent
+        // sessions on the same host hit the cache tier.
+        //
+        // For non-chunked-OCI images (legacy ADR 0007 path,
+        // BlobStorage-only) we use the default chunk_store as-is.
+        let effective_store = self
+            .upgrade_chunk_store_for_chunked_oci(chunk_store, uri, cached)
+            .await?;
+
         let path = materialize_chunked_rootfs(
-            chunk_store,
+            &effective_store,
             self.chunk_cache.as_ref(),
             materialize_dir,
             uri,
@@ -267,6 +304,52 @@ impl PooledBackend {
         )
         .await?;
         Ok((path, nbd_state_none()))
+    }
+
+    /// ADR 0008 Phase 5: upgrade the base `ChunkStore` to a tiered
+    /// one when the cached image carries Nydus-shaped chunked OCI
+    /// layers AND an `OciClient` is configured. Returns the
+    /// original store unchanged otherwise — non-chunked-OCI images
+    /// don't need the OCI tier.
+    ///
+    /// Errors here surface from bootstrap parsing (corrupt sidecar)
+    /// or the chunk-store's blob_storage handle; both indicate a
+    /// real failure mode worth aborting on.
+    async fn upgrade_chunk_store_for_chunked_oci(
+        &self,
+        base: &ChunkStore,
+        uri: &str,
+        cached: &CachedImage,
+    ) -> Result<ChunkStore, SandboxError> {
+        let oci = match self.oci_client.as_ref() {
+            Some(c) => c,
+            None => return Ok(base.clone()),
+        };
+        if !cached.is_disk_chunked_oci() {
+            return Ok(base.clone());
+        }
+        let index = cached
+            .build_oci_chunk_index()
+            .await
+            .map_err(|e| SandboxError::Vm(format!("chunked-OCI index: {e}").into()))?;
+        let index = match index {
+            Some(i) => i,
+            None => return Ok(base.clone()),
+        };
+        let blob = base.blob_storage();
+        let cache_tier: Arc<dyn engram_chunk_store::ChunkResolver> =
+            Arc::new(engram_chunk_store::BlobStorageResolver::new(blob.clone()));
+        let origin_tier: Arc<dyn engram_chunk_store::ChunkResolver> = Arc::new(
+            engram_oci::OciChunkResolver::new(oci.clone(), uri.to_string(), index),
+        );
+        let tiered: Arc<dyn engram_chunk_store::ChunkResolver> = Arc::new(
+            engram_chunk_store::TieredChunkResolver::new(vec![cache_tier, origin_tier], Some(blob)),
+        );
+        tracing::debug!(
+            uri = %uri,
+            "chunked-OCI image: installing TieredChunkResolver for materialize",
+        );
+        Ok(base.clone().with_resolver(tiered))
     }
 
     /// Linux-only NBD spawn branch. Returns `None` when any

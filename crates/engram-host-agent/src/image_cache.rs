@@ -92,6 +92,16 @@ impl ImageCache {
         &self.inner.root
     }
 
+    /// Clone of the inner `OciClient`. Useful for callers that need
+    /// to reuse the same auth resolver for additional OCI verbs
+    /// outside the cache's pull surface — e.g. ADR 0008 Phase 5's
+    /// `OciChunkResolver`, which does Range GETs against the
+    /// registry for chunk fetches. The client is cheap to clone
+    /// (its internals are `Arc`s).
+    pub fn oci_client(&self) -> OciClient {
+        self.inner.oci.clone()
+    }
+
     /// Ensure the bake image at `uri` is materialised in the cache.
     /// On a hit, returns the cached paths without a network round
     /// trip. On a miss, pulls via OCI and writes the layers the

@@ -72,3 +72,10 @@ tempfile = "3"
 engram-harness-noop.workspace = true
 engram-sandbox-process.workspace = true
 tempfile = "3"
+# ADR 0008 Phase 5: the chunked-OCI fault integration test spins
+# up a loopback fake-registry that speaks just enough of the OCI
+# Distribution Spec for `OciChunkResolver` to fault chunks.
+# axum + tokio TcpListener bound to 127.0.0.1:0 keeps the test
+# self-contained — no docker, no external registry.
+axum = { workspace = true }
+http = { workspace = true }
