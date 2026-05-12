@@ -181,34 +181,80 @@ vs the NBD goal of sub-second. Functional, not fast.
 
 ## Phase 5 — Memory adapter (UFFD-from-chunks + canonical + WS R&R)
 
-**Status: ⬜ pending — multi-session, the production magic**
+**Status: 🟡 partial — runtime + snapshot wiring shipped; bake-time
+canonical capture deferred**
 
-Largest piece, ~1500 lines. Lights up sub-100ms restore + cross-VM
-memory dedup.
+### Shipped
 
-### Scope
+- **`engram-uffd-handler::chunked`** (`2e40f0b`) — pure-Rust data-
+  plane resolver. `ChunkedMemoryBackend` pre-parses canonical +
+  session manifests into positional arrays for O(1) per-fault
+  `resolve(byte_offset)`. `ResolvedPage::Canonical { offset }`
+  → copy from mmap; `ResolvedPage::Chunk { hash }` → fetch via
+  ChunkCache. 8 unit tests.
+- **`engram-uffd-handler::working_set`** (`2ac8ecd`) —
+  `WorkingSetRecorder` accumulates session-divergent chunk hashes
+  inside a fixed time window (5s default), deduped + ordered, ready
+  to publish as `traces/<manifest_id>/<host_id>.json`. 6 unit tests.
+- **Runtime rewrite + new CLI** (`34310a2`) — `Runtime::new` takes
+  a canonical path + `Arc<ChunkedMemoryBackend>` + a tokio Handle.
+  Per-fault: round to chunk boundary, resolve, install the **full
+  512 KiB chunk** in one UFFDIO_COPY (amortises the 128-page cost).
+  Pre-install bitmap guards double-install races; UFFDIO_WAKE
+  fallback for already-installed pages. `prefault_from_trace`
+  pre-installs every position in the session manifest before vCPUs
+  unfreeze. CLI: `--listen --canonical-memory --canonical-manifest
+  --session-manifest [--prefault-trace --publish-trace-host
+  --cache-root --cache-budget-bytes --recorder-window-ms]`. Blob
+  backend via `ENGRAM_BLOB_BACKEND={local,gcs}`.
+- **Postgres + migration 0019** (`e3222bd`) — `memory_manifest_id`
+  + `memory_manifest_version` on `snapshots` mirroring 0018; both-
+  or-neither CHECK constraint + partial GC index.
+  `MetadataStore::list_live_memory_manifest_ids` is the symmetric
+  GC primitive. `SnapshotMetadata.memory_manifest` +
+  `SnapshotRecord.memory_manifest` thread through every backend
+  and the coordinator API.
+- **FC backend wiring** (`ee444ff`) — `FcSnapshotManifest` gains
+  `memory_manifest` + `canonical_memory_manifest`. UFFD restore
+  refuses without `memory_manifest` (no silent fallback to a
+  degenerate path); `canonical_memory_manifest` defaults to
+  `session_manifest` (resolver returns `Canonical` for every
+  fault, mmap'd memory.bin serves the bytes — no chunk-store I/O
+  at runtime until bake-time canonical capture lands).
+- **`PooledBackend::snapshot` chunked wrap** (this slice) —
+  intercepts FC's bare snapshot, calls
+  `ChunkStore::chunk_file(memory.bin, Memory)`, commits a fresh
+  `ManifestRef`, patches `manifest.json`'s `memory_manifest` field
+  (JSON-level patch — no FC-internal struct exposed), and updates
+  `SnapshotMetadata.memory_manifest`. Two unit tests: positive
+  (memory.bin → chunks → byte-equal materialize) + no-chunk-store
+  passthrough.
 
-- Image-builder's bake step boots the VM once, pauses, captures
-  `memory.bin`, chunks it (512 KB chunks), records a canonical
-  working-set trace from a 5s post-restore warm-up
-  - `crates/engram-image-builder/src/canonical_boot.rs` (new)
-  - This is the work referenced as "deferred to Phase 5" under
-    Phase 2 above
-- `engram-uffd-handler` rewrite:
-  - `crates/engram-uffd-handler/src/canonical.rs` — `mmap` canonical
-    with `MAP_PRIVATE`; that FD goes to FC
-  - `crates/engram-uffd-handler/src/working_set.rs` — record (first
-    restore) + replay (subsequent restores)
-  - `crates/engram-uffd-handler/src/chunk_resolver.rs` — page addr →
-    chunk hash → UFFDIO_COPY
-- `FirecrackerBackend::snapshot` + `restore` updated to thread
-  memory manifests through
+### Still pending
+
+- ⬜ **Image-builder bake-time canonical capture** — boot VM during
+  bake, pause, capture `memory.bin`, chunk + publish + record a
+  canonical working-set trace. Until this lands every snapshot has
+  `canonical_memory_manifest == memory_manifest`, so the
+  cross-session page-cache sharing benefit isn't realised — restore
+  still works, just at session-private memory cost.
+  `crates/engram-image-builder/src/canonical_boot.rs` (new).
+- ⬜ **Cross-host trace replay+publish wiring** — the coord-side
+  cross-host migration slice will plumb `host_id` through to FC's
+  restore so `--prefault-trace <host>` and `--publish-trace-host
+  <host>` actually fire. Until then first-restore latency every
+  time (correctness intact).
+- ⬜ **Cross-host memory.bin materialization** — restore currently
+  assumes the snapshot's `memory.bin` is still present on the host
+  doing the restore (same-host hot resume). Cross-host migration
+  needs `host-agent` to materialize memory.bin from the chunk
+  manifest before invoking FC restore. Becomes meaningful only
+  alongside the bake-time canonical slice (then the canonical mmap
+  is the per-image shared file, not per-snapshot).
 
 ### Dependencies / open questions
 
 - Kernel CONFIG_USERFAULTFD=y (Ubuntu cloud image — yes)
-- Existing `engram-uffd-handler` crate is the host-side UFFD handler
-  for FC today; Phase 5 is a substantial rewrite
 - Cross-session canonical sharing relies on host page cache, which is
   fine on Linux but doesn't translate to macOS / VZ — VZ never gets
   memory chunking in v1 per the plan (its native memory-snapshot is

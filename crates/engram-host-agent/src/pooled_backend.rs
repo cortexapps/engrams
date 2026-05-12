@@ -272,6 +272,84 @@ async fn materialize_chunked_rootfs(
     Ok(dest)
 }
 
+/// Chunk an FC `memory.bin` snapshot file into the chunk store
+/// and commit a fresh memory manifest. Returns the new
+/// `ManifestRef` so callers can attach it to the FC sidecar JSON
+/// and `SnapshotMetadata`.
+///
+/// Uses [`engram_chunk_store::ChunkStore::chunk_file`] with the
+/// default 512 KiB memory chunk size. Sparse / all-zero blocks
+/// are omitted from the manifest (the chunk_file primitive already
+/// short-circuits them); on restore the resolver treats absent
+/// chunk entries as "use canonical mmap at that offset" so zero
+/// pages cost zero chunks + zero bytes of object storage.
+async fn chunk_memory_to_store(
+    chunk_store: &ChunkStore,
+    memory_bin: &std::path::Path,
+) -> Result<engram_core::types::manifest::ManifestRef, SandboxError> {
+    let manifest = chunk_store
+        .chunk_file(memory_bin, engram_chunk_store::ManifestKind::Memory, None)
+        .await
+        .map_err(|e| {
+            SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
+        })?;
+    let manifest_ref = engram_core::types::manifest::ManifestRef::new();
+    chunk_store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .map_err(|e| {
+            SandboxError::Snapshot(format!(
+                "put_manifest {manifest_ref} for {}: {e}",
+                memory_bin.display(),
+            ))
+        })?;
+    Ok(manifest_ref)
+}
+
+/// Set / overwrite the `memory_manifest` field on the FC sidecar
+/// JSON at `manifest_json`. Operates on the JSON value rather than
+/// the FC backend's private `FcSnapshotManifest` type — the on-disk
+/// shape is the wire contract between the two crates, and FC
+/// deserializes via `#[serde(default)]` so JSON-level patches stay
+/// compatible without a circular dependency.
+async fn patch_fc_manifest_memory_ref(
+    manifest_json: &std::path::Path,
+    memory_manifest: engram_core::types::manifest::ManifestRef,
+) -> Result<(), SandboxError> {
+    let bytes = fs::read(manifest_json).await.map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "read fc manifest.json {}: {e}",
+            manifest_json.display(),
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "parse fc manifest.json {}: {e}",
+            manifest_json.display(),
+        ))
+    })?;
+    let obj = value.as_object_mut().ok_or_else(|| {
+        SandboxError::Snapshot(format!(
+            "fc manifest.json {} root is not an object",
+            manifest_json.display(),
+        ))
+    })?;
+    obj.insert(
+        "memory_manifest".into(),
+        serde_json::to_value(memory_manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("serialize memory_manifest: {e}")))?,
+    );
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|e| SandboxError::Snapshot(format!("serialize patched manifest.json: {e}")))?;
+    fs::write(manifest_json, bytes).await.map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "write patched manifest.json {}: {e}",
+            manifest_json.display(),
+        ))
+    })?;
+    Ok(())
+}
+
 /// Pick a stable name for the harness substrate's mount-root
 /// subdirectory. Tries: (1) the env-injected
 /// `ENGRAM_SESSION_HARNESS_NAME` hint set by `resolve_harness` —
@@ -386,7 +464,38 @@ impl SandboxBackend for PooledBackend {
         id: SandboxId,
         dest: &std::path::Path,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        self.inner.snapshot(id, dest).await
+        let mut metadata = self.inner.snapshot(id, dest).await?;
+        // ADR 0007 / Phase 5: when a chunk store is wired AND the
+        // underlying backend left a memory.bin in `dest` (FC does;
+        // VZ + Process don't), chunk it into the store + patch the
+        // FC snapshot manifest so the UFFD handler can resolve
+        // session-divergent pages on restore. Skipped silently when
+        // either condition isn't met — VZ + Process paths still
+        // produce valid snapshots without a memory_manifest, and
+        // FC without a chunk_store falls back to RestoreMode::File.
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return Ok(metadata);
+        };
+        let mem_path = dest.join("memory.bin");
+        if fs::metadata(&mem_path).await.is_err() {
+            return Ok(metadata);
+        }
+        let manifest_ref = chunk_memory_to_store(chunk_store, &mem_path).await?;
+        // Patch the FC sidecar JSON (`manifest.json`) so its
+        // `memory_manifest` field carries the ref the UFFD handler
+        // needs at restore time. The FC backend deserializes via
+        // serde with `#[serde(default)]`, so a JSON patch over the
+        // wire-shape stays compatible without us depending on its
+        // private struct.
+        let manifest_json = dest.join("manifest.json");
+        patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
+        metadata.memory_manifest = Some(manifest_ref);
+        tracing::info!(
+            session_sandbox = %id,
+            manifest = %manifest_ref,
+            "chunked FC memory.bin → chunk store",
+        );
+        Ok(metadata)
     }
 
     async fn restore(&self, src: std::path::PathBuf) -> Result<SandboxId, SandboxError> {
@@ -643,6 +752,179 @@ mod tests {
         assert_eq!(
             mtime_before, mtime_after,
             "second call must not rewrite the file",
+        );
+    }
+
+    /// ADR 0007 / Phase 5: snapshot wrap chunks an FC-style
+    /// `memory.bin` into the chunk store and patches the FC sidecar
+    /// `manifest.json` with the resulting `memory_manifest` ref.
+    /// Validates that:
+    ///  - `SnapshotMetadata.memory_manifest` carries the ref
+    ///  - `manifest.json` gained a `memory_manifest` field
+    ///  - the manifest in the chunk store is byte-equal to memory.bin
+    ///    when materialised back
+    ///
+    /// Uses a fake inner backend (writes the snapshot artifacts to
+    /// `dest` like FC does on a real snapshot, but skips the actual
+    /// VM machinery) so the test runs cross-platform.
+    #[tokio::test]
+    async fn snapshot_chunks_fc_memory_bin_and_patches_manifest() {
+        use engram_chunk_store::{ChunkStore, ManifestKind};
+        use engram_storage_local::LocalBlobStorage;
+        use std::path::Path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("snap-1");
+
+        // 1. Synthetic memory.bin: 1 MiB of distinct, non-zero
+        //    content so chunk_file produces multiple chunks. Two
+        //    512 KiB chunks (default memory chunk size).
+        let mut bytes = vec![0u8; 1024 * 1024];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i % 200) + 1) as u8; // skip zero so chunks aren't elided
+        }
+
+        // 2. Inner backend stub: writes memory.bin + state.bin +
+        //    manifest.json to dest, returns a bare SnapshotMetadata
+        //    with memory_manifest=None (the FC bare-snapshot shape).
+        struct FakeFcBackend {
+            payload: Vec<u8>,
+        }
+        #[async_trait]
+        impl SandboxBackend for FakeFcBackend {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(
+                &self,
+                _: SandboxId,
+                dest: &Path,
+            ) -> Result<SnapshotMetadata, SandboxError> {
+                tokio::fs::create_dir_all(dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), &self.payload)
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"state-bin-placeholder")
+                    .await
+                    .unwrap();
+                // Mirror FC's manifest.json shape minimally.
+                let manifest = serde_json::json!({
+                    "sandbox_id": uuid::Uuid::new_v4(),
+                    "created_at": chrono::Utc::now(),
+                    "spec": {
+                        "image": "test:1",
+                        "rootfs_source": null,
+                        "image_uri": null,
+                        "harness_pack_uri": null,
+                        "cpu": {"vcpus": 1},
+                        "memory": {"max_mib": 64},
+                        "disk": {"max_gib": 1},
+                        "ttl": null,
+                        "env": {},
+                        "workdir": null,
+                        "harness_substrate": null,
+                        "network": {}
+                    },
+                    "format": "fc"
+                });
+                tokio::fs::write(
+                    dest.join("manifest.json"),
+                    serde_json::to_vec_pretty(&manifest).unwrap(),
+                )
+                .await
+                .unwrap();
+                Ok(SnapshotMetadata {
+                    id: engram_core::SnapshotId::new(),
+                    size_bytes: self.payload.len() as u64,
+                    created_at: chrono::Utc::now(),
+                    image_version: "test:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                })
+            }
+            async fn restore(&self, _: PathBuf) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        // 3. Wire the PooledBackend with a chunk store.
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let cs = ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeFcBackend {
+            payload: bytes.clone(),
+        });
+        let materialize_dir = tmp.path().join("materialized");
+        let pooled = PooledBackend::new(inner, 0).with_chunk_store(cs.clone(), materialize_dir);
+
+        // 4. Take the snapshot. PooledBackend's wrap chunks
+        //    memory.bin and patches manifest.json.
+        let metadata = pooled.snapshot(SandboxId::new(), &dest).await.unwrap();
+        let manifest_ref = metadata
+            .memory_manifest
+            .expect("PooledBackend must populate memory_manifest");
+
+        // 5. manifest.json now carries the same ref under
+        //    `memory_manifest`.
+        let mj: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(dest.join("manifest.json")).await.unwrap())
+                .unwrap();
+        let patched_ref: engram_core::types::manifest::ManifestRef =
+            serde_json::from_value(mj["memory_manifest"].clone())
+                .expect("memory_manifest field must round-trip");
+        assert_eq!(patched_ref, manifest_ref);
+
+        // 6. The chunk store materializes the manifest back to the
+        //    exact bytes.
+        let manifest = cs.get_manifest(manifest_ref).await.unwrap();
+        assert!(matches!(manifest.kind, ManifestKind::Memory));
+        assert_eq!(manifest.total_bytes, bytes.len() as u64);
+        let recovered = tmp.path().join("recovered.bin");
+        cs.materialize_to_file(&manifest, &recovered).await.unwrap();
+        let recovered_bytes = tokio::fs::read(&recovered).await.unwrap();
+        assert_eq!(recovered_bytes, bytes, "memory bytes round-trip");
+    }
+
+    /// Snapshot wrap is a no-op when no chunk store is wired —
+    /// metadata + manifest.json stay exactly as the inner backend
+    /// produced them. Guards against accidental coupling between
+    /// `with_chunk_store` and the snapshot path.
+    #[tokio::test]
+    async fn snapshot_no_chunk_store_passes_through_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir));
+        let pooled = PooledBackend::new(inner, 0);
+
+        let _id = pooled.create(live_spec("warm-test")).await.unwrap();
+        // ProcessBackend's snapshot writes the directory structure
+        // without a memory.bin (no guest RAM concept). The wrap
+        // skips chunking silently and metadata.memory_manifest
+        // stays None.
+        let dest = tmp.path().join("nochunk-snap");
+        let metadata = pooled
+            .snapshot(_id, &dest)
+            .await
+            .expect("ProcessBackend snapshot");
+        assert!(
+            metadata.memory_manifest.is_none(),
+            "no chunk_store wired must leave memory_manifest unset",
         );
     }
 
