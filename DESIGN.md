@@ -15,13 +15,17 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 > Operational reference for GCP/GKE deployments: [`docs/deploy.md`](./docs/deploy.md). Production Helm chart: [`deploy/helm/engram-coordinator/`](./deploy/helm/engram-coordinator/). FC host fleet provisioning: [`deploy/packer/`](./deploy/packer/) + [`deploy/terraform/gcp/`](./deploy/terraform/gcp/).
 >
 > **Sections below that describe the two-tier (hot/cold) snapshot model
-> reflect ADR 0005 as a historical record.** ADR 0007 supersedes the
-> framing: chunked storage is the single durability primitive, sessions
-> live ↔ chunks reachable in `BlobStorage`. The hot/cold seal-pipeline
-> code is retiring (Phase 7 of the rollout); the architectural
-> description here gets a full refresh once Phase 6's schema reshape
-> lands. Treat anything below the next horizontal rule as
-> "ADR 0005-era; superseded but not yet rewritten."
+> reflect ADR 0005 as a historical record.** ADR 0007's chunked-
+> immutable storage rolled out through Phase 7: the cold-tier flush
+> pipeline + sealed-blob columns + `SessionStatus::ColdEvicted` have
+> been deleted (migration 0020). Snapshots reference chunks in
+> `BlobStorage` via `disk_manifest_id` + `memory_manifest_id`;
+> sessions live ↔ chunks reachable. The architectural description
+> below predates the deletion — read it for design intent + the
+> ADR 0001/0002/0005 trajectory, but cross-check against the current
+> code (chunked-storage-rollout.md is the source of truth for what
+> shipped vs pending). A full refresh of this doc is queued behind
+> the Phase 5 bake-time canonical capture work.
 
 ---
 
