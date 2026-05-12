@@ -333,6 +333,16 @@ async fn main() -> Result<(), CoordinatorError> {
     // starts empty and hosts dial in via /api/hosts/connect.
     let host_registry = Arc::new(HostRegistry::new());
 
+    // ADR 0007 Phase 5: stable HostId for `--mode=all`. Hoisted
+    // up here (was computed below alongside the host_registry
+    // register) so the FC backend can stamp it on its config
+    // before construction. Cross-host trace replay (snapshot-on-
+    // host-A → restore-on-host-B reuses A's trace) keys off the
+    // matching id on both sides.
+    let in_proc_host: HostId = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000a11")
+        .expect("stable in-proc host UUID must parse")
+        .into();
+
     if matches!(cli.mode, RunMode::All) {
         let raw_backend: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
             SandboxBackendChoice::Firecracker => {
@@ -350,6 +360,7 @@ async fn main() -> Result<(), CoordinatorError> {
                 } else {
                     Some(cli.egress_proxy_port)
                 };
+                fc_cfg.host_id = Some(in_proc_host);
                 let fc = Arc::new(FirecrackerBackend::new(
                     cli.sandbox_work_dir.clone(),
                     fc_cfg,
@@ -522,9 +533,10 @@ async fn main() -> Result<(), CoordinatorError> {
         // id, every restart would collide on `("in-process")` and
         // the row's id would diverge from the in-memory id we route
         // through, breaking snapshot inserts via FK.
-        let in_proc_host: HostId = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000a11")
-            .expect("stable in-proc host UUID must parse")
-            .into();
+        //
+        // `in_proc_host` is computed at top of the function so the
+        // FC config (built earlier in this branch) can stamp the
+        // same id on `host_id` for trace replay.
         host_registry.register(in_proc_host, pooled_backend);
         // Persist a row in `hosts` so any FK-bearing insert (snapshots
         // record the host that wrote them, sessions track host_id)

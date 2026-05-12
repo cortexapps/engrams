@@ -182,6 +182,15 @@ pub struct FirecrackerConfig {
     /// path. When `None` (test/dev), VMs get open egress with the
     /// standard hard-isolation drops.
     pub egress_proxy_port: Option<u16>,
+    /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
+    /// the FC sidecar JSON at snapshot time (so cross-host restore
+    /// knows which host's working-set trace to prefault) AND
+    /// passed to the UFFD handler at restore time as
+    /// `--publish-trace-host` (so the recorder publishes this
+    /// host's trace under the right key). `None` keeps the
+    /// pre-Phase-5 behaviour: traces aren't recorded or replayed,
+    /// every restore pays full first-fault cost.
+    pub host_id: Option<engram_core::HostId>,
 }
 
 /// Backing-memory strategy for `restore`.
@@ -215,6 +224,7 @@ impl FirecrackerConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            host_id: None,
         }
     }
 }
@@ -292,6 +302,18 @@ struct FcSnapshotManifest {
     /// bake-time canonical capture slice lands.
     #[serde(default)]
     canonical_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    /// ADR 0007 / Phase 5: hint about whose working-set trace to
+    /// prefault on the restoring host. Set to the snapshotting
+    /// host's `HostId` so cross-host restore can ask
+    /// `traces/<manifest_id>/<this_hint>.json` for the chunks
+    /// the original host knew were hot. `None` skips trace replay
+    /// (pre-Phase-5 snapshots or hosts that didn't have a
+    /// `HostId` configured on FC). Note: this is a HINT — the
+    /// recorder on the restoring host still publishes its own
+    /// trace under its own host id, so subsequent restores on
+    /// this host use the local recording.
+    #[serde(default)]
+    trace_host_hint: Option<engram_core::HostId>,
 }
 
 const MANIFEST_FORMAT_FC: &str = "fc";
@@ -930,21 +952,24 @@ impl FirecrackerBackend {
                 let canonical_ref = manifest.canonical_memory_manifest.unwrap_or(session_ref);
                 let uffd_uds = jail_dir.join("uffd.sock");
                 let _ = tokio::fs::remove_file(&uffd_uds).await;
+                // ADR 0007 Phase 5: replay the snapshotting
+                // host's recorded trace if both ends opted in.
+                // Pre-fault host comes from the sidecar JSON (set
+                // at snapshot time by the host that captured
+                // memory.bin); publish-trace host is the current
+                // host's id from FC config (so the recorder
+                // republishes under THIS host's key — subsequent
+                // restores on this host use the local trace).
+                let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
+                let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
                 match self
                     .spawn_uffd_handler(
                         &uffd_uds,
                         &mem_path,
                         canonical_ref,
                         session_ref,
-                        // No host_id is plumbed through this layer
-                        // yet; trace replay+publish wires in when the
-                        // coord-side migration adds it to the
-                        // FcSnapshotManifest (cross-host migration
-                        // slice). Until then, traces are skipped —
-                        // first-restore latency, every time, but
-                        // correctness is intact.
-                        None,
-                        None,
+                        prefault_host,
+                        publish_host,
                         jail_dir,
                     )
                     .await
@@ -1286,6 +1311,11 @@ impl SandboxBackend for FirecrackerBackend {
             // without a chunk-store wiring.
             memory_manifest: None,
             canonical_memory_manifest: None,
+            // ADR 0007 Phase 5: snapshotting host's id, so cross-
+            // host restore can request this host's recorded
+            // trace via `--prefault-trace <hint>`. Set from FC
+            // config; falls back to None when not wired.
+            trace_host_hint: self.config.host_id,
         };
         let manifest_path = dest.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -1614,6 +1644,7 @@ mod tests {
             restore_mode: RestoreMode::File,
             net_pool: None,
             egress_proxy_port: None,
+            host_id: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }
@@ -1765,6 +1796,7 @@ mod tests {
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
             canonical_memory_manifest: None,
+            trace_host_hint: None,
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: FcSnapshotManifest = serde_json::from_slice(&bytes).unwrap();

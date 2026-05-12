@@ -169,6 +169,13 @@ async fn main() -> Result<(), HostAgentError> {
         ..HostAgentConfig::default()
     };
 
+    // ADR 0007 Phase 5: generate a per-startup HostId early so the
+    // FC config can stamp it on snapshots' `trace_host_hint` and
+    // pass it as `--publish-trace-host` to the UFFD handler.
+    // Cross-host trace replay keys off this id — a snapshot taken
+    // by host A becomes restoreable on host B with B reusing A's
+    // recorded trace.
+    let host_id = engram_core::HostId::new();
     let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
         BackendChoice::Firecracker => {
             let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
@@ -178,7 +185,8 @@ async fn main() -> Result<(), HostAgentError> {
                         .into(),
                 )
             })?;
-            let fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
+            let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
+            fc_cfg.host_id = Some(host_id);
             Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
                 fc_cfg,
@@ -258,7 +266,8 @@ async fn main() -> Result<(), HostAgentError> {
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
         .with_image_cache(image_cache)
-        .with_auth_session_handle(auth_session_handle);
+        .with_auth_session_handle(auth_session_handle)
+        .with_host_id(host_id);
     // ADR 0007 Phase 4: opt-in NBD daemon. `ENGRAM_NBD_DEVICES`
     // is a comma-separated list of `/dev/nbdN` paths the daemon
     // allocates from. Empty / unset → keep the materialize-to-

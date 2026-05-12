@@ -65,6 +65,12 @@ pub struct HostAgent {
     /// daemon allocates from when serving chunked rootfs disks.
     /// `None` keeps the legacy materialize-to-file path active.
     pub nbd_pool: Option<Arc<disk_daemon::NbdSlotAllocator>>,
+    /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
+    /// snapshots' `trace_host_hint` (so cross-host restore knows
+    /// which trace to prefault) AND passed to the UFFD handler
+    /// as `--publish-trace-host`. `None` generates a fresh id at
+    /// run time (the pre-Phase-5 default).
+    pub host_id: Option<engram_core::HostId>,
 }
 
 impl HostAgent {
@@ -83,7 +89,17 @@ impl HostAgent {
             auth_session_handle: None,
             chunk_cache: None,
             nbd_pool: None,
+            host_id: None,
         }
+    }
+
+    /// Set this host's stable `HostId`. Pair with the same id
+    /// stamped on `FirecrackerConfig.host_id` at backend
+    /// construction — both sides need to agree so the trace
+    /// `traces/<manifest_id>/<host_id>.json` keying is consistent.
+    pub fn with_host_id(mut self, id: engram_core::HostId) -> Self {
+        self.host_id = Some(id);
+        self
     }
 
     /// Attach a `ChunkCache`. Optional; layers on top of
@@ -150,7 +166,12 @@ impl HostAgent {
         let _ = self.cloud.host_metadata().await;
 
         if let Some(coord_url) = self.cfg.coordinator_endpoint.clone() {
-            let host_id = engram_core::HostId::new();
+            // Re-use the host_id that was stamped on the FC
+            // backend at construction time, so trace replay keys
+            // line up. Falls back to a fresh id when the caller
+            // didn't set one — that's the pre-Phase-5 behaviour
+            // (no trace replay).
+            let host_id = self.host_id.unwrap_or_default();
             tracing::info!(
                 host_id = %host_id,
                 coordinator = %coord_url,

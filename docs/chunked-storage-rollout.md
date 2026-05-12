@@ -263,6 +263,33 @@ canonical capture deferred**
   (memory.bin → chunks → byte-equal materialize) + no-chunk-store
   passthrough.
 
+### Phase 5 follow-up: cross-host trace + memory.bin materialization (shipped)
+
+- ✅ **`HostId` plumbed through FC backend.**
+  `FirecrackerConfig.host_id: Option<HostId>` set at construction
+  in both host-agent main (per-startup HostId::new) and
+  coord-side --mode=all (stable in-proc `00000000-0000-4000-
+  8000-000000000a11`). Hoisted the stable id to top of coord
+  main so the FC backend stamps it on its config before being
+  wrapped.
+- ✅ **`trace_host_hint` on FcSnapshotManifest.** Snapshot stamps
+  the current host's id; cross-host restore reads it and passes
+  to `spawn_uffd_handler` as `--prefault-trace <hint>`. The
+  recorder publishes the new trace under THIS host's id via
+  `--publish-trace-host <current>`, so subsequent restores on
+  the same host use a local recording (and cross-host restores
+  reuse the original host's trace).
+- ✅ **Cross-host memory.bin materialization** in
+  `PooledBackend::restore`. When the snapshot dir's `memory.bin`
+  is missing locally but the sidecar JSON's `memory_manifest`
+  is set, rebuild the file from chunks via
+  `ChunkStore::materialize_to_file_cached` before delegating
+  to inner.restore. Two test cases:
+  - `restore_materializes_missing_memory_bin_from_chunks` —
+    positive (1 MiB synthetic memory bin, byte-equal recovery).
+  - `snapshot_skips_materialize_when_memory_bin_already_present`
+    — negative (file untouched when locally present).
+
 ### Still pending
 
 - ⬜ **Image-builder bake-time canonical capture** — boot VM during
@@ -272,18 +299,6 @@ canonical capture deferred**
   cross-session page-cache sharing benefit isn't realised — restore
   still works, just at session-private memory cost.
   `crates/engram-image-builder/src/canonical_boot.rs` (new).
-- ⬜ **Cross-host trace replay+publish wiring** — the coord-side
-  cross-host migration slice will plumb `host_id` through to FC's
-  restore so `--prefault-trace <host>` and `--publish-trace-host
-  <host>` actually fire. Until then first-restore latency every
-  time (correctness intact).
-- ⬜ **Cross-host memory.bin materialization** — restore currently
-  assumes the snapshot's `memory.bin` is still present on the host
-  doing the restore (same-host hot resume). Cross-host migration
-  needs `host-agent` to materialize memory.bin from the chunk
-  manifest before invoking FC restore. Becomes meaningful only
-  alongside the bake-time canonical slice (then the canonical mmap
-  is the per-image shared file, not per-snapshot).
 
 ### Dependencies / open questions
 

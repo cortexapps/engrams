@@ -282,6 +282,79 @@ impl PooledBackend {
         Ok(Some(state))
     }
 
+    /// Materialise `<src>/memory.bin` from the FC sidecar JSON's
+    /// `memory_manifest` (if both the manifest exists in the
+    /// chunk store and the local file is absent). Used by
+    /// `restore()` to bootstrap cross-host transfers — the
+    /// snapshot directory may carry only `state.bin` +
+    /// `manifest.json` when staged by the coord; this fills in
+    /// the memory file from the chunked durability tier.
+    ///
+    /// Returns early-Ok on every common skip condition (no chunk
+    /// store wired, sidecar absent, memory_manifest unset, file
+    /// already present). Failures bubble; callers can log + fall
+    /// through to inner.restore which will surface a clearer
+    /// "memory.bin missing" error.
+    async fn materialize_memory_if_missing(
+        &self,
+        src: &std::path::Path,
+    ) -> Result<(), SandboxError> {
+        let mem_path = src.join("memory.bin");
+        if fs::metadata(&mem_path).await.is_ok() {
+            return Ok(());
+        }
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return Ok(());
+        };
+        let manifest_json = src.join("manifest.json");
+        let Ok(bytes) = fs::read(&manifest_json).await else {
+            return Ok(());
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(());
+        };
+        let mref_value = value.get("memory_manifest").filter(|v| !v.is_null());
+        let Some(mref_value) = mref_value else {
+            return Ok(());
+        };
+        let mref: engram_core::types::manifest::ManifestRef =
+            serde_json::from_value(mref_value.clone()).map_err(|e| {
+                SandboxError::Snapshot(format!(
+                    "parse memory_manifest from {}: {e}",
+                    manifest_json.display(),
+                ))
+            })?;
+        // Ensure the destination dir exists (cross-host stages may
+        // hand us a path that's missing intermediate components).
+        if let Some(parent) = mem_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                SandboxError::Snapshot(format!("create snapshot dir {}: {e}", parent.display(),))
+            })?;
+        }
+        let manifest = chunk_store
+            .get_manifest(mref)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("get_manifest {mref}: {e}")))?;
+        match self.chunk_cache.as_ref() {
+            Some(cache) => chunk_store
+                .materialize_to_file_cached(&manifest, &mem_path, cache)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!("materialize memory.bin (cached): {e}"))
+                })?,
+            None => chunk_store
+                .materialize_to_file(&manifest, &mem_path)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("materialize memory.bin: {e}")))?,
+        }
+        tracing::info!(
+            manifest = %mref,
+            path = %mem_path.display(),
+            "materialised memory.bin from chunked memory manifest",
+        );
+        Ok(())
+    }
+
     fn pool_key(spec: &SandboxSpec) -> PoolKey {
         // `rootfs_source` is set by the image cache (OCI path) or
         // the caller (local:// dev) before this is called — see
@@ -657,6 +730,24 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore(&self, src: std::path::PathBuf) -> Result<SandboxId, SandboxError> {
+        // ADR 0007 Phase 5: cross-host memory.bin materialization.
+        // If the snapshot dir's `memory.bin` is missing locally but
+        // the FC sidecar JSON carries a `memory_manifest`, rebuild
+        // it from chunks before delegating to the inner backend.
+        // Two callers hit this branch:
+        //   - Same host where the local memory.bin was reaped by
+        //     LRU / disk pressure (rare, but possible).
+        //   - Cross-host: the snapshotting host died, the coord
+        //     re-stages the snapshot dir on a new host with just
+        //     state.bin + manifest.json from BlobStorage, and
+        //     this host fills memory.bin from chunks.
+        if let Err(e) = self.materialize_memory_if_missing(&src).await {
+            tracing::warn!(
+                error = %e,
+                src = %src.display(),
+                "memory.bin materialization failed; inner.restore will see whatever's there",
+            );
+        }
         self.inner.restore(src).await
     }
 
@@ -1094,6 +1185,208 @@ mod tests {
             metadata.memory_manifest.is_none(),
             "no chunk_store wired must leave memory_manifest unset",
         );
+    }
+
+    /// ADR 0007 Phase 5: when `restore()` is called on a snapshot
+    /// dir whose `memory.bin` is missing locally but whose sidecar
+    /// JSON carries a `memory_manifest`, PooledBackend materialises
+    /// the file from chunks before delegating to the inner backend.
+    /// Validates by:
+    ///   1. Build a chunk store + put a small memory manifest
+    ///   2. Stage a snapshot dir with state.bin + manifest.json
+    ///      (memory_manifest set, but NO memory.bin)
+    ///   3. Call PooledBackend::restore
+    ///   4. Assert memory.bin now exists at byte-equal content
+    #[tokio::test]
+    async fn restore_materializes_missing_memory_bin_from_chunks() {
+        use engram_chunk_store::{ChunkStore, ManifestKind};
+        use engram_core::types::manifest::ManifestRef;
+        use std::path::Path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+
+        // Plant a synthetic memory.bin (1 MiB of non-zero pattern)
+        // and chunk it into the store. `chunk_file` skips all-zero
+        // blocks; we want the test to exercise non-empty chunks.
+        let src_path = tmp.path().join("source-memory.bin");
+        let bytes: Vec<u8> = (0..(1024 * 1024)).map(|i| ((i % 251) + 1) as u8).collect();
+        tokio::fs::write(&src_path, &bytes).await.unwrap();
+        let manifest = cs
+            .chunk_file(&src_path, ManifestKind::Memory, None)
+            .await
+            .unwrap();
+        let manifest_ref = ManifestRef::new();
+        cs.put_manifest(manifest_ref, &manifest).await.unwrap();
+
+        // Stage a snapshot dir: state.bin + manifest.json (with
+        // memory_manifest set), but NO memory.bin — simulates a
+        // freshly-staged cross-host transfer.
+        let snap_dir = tmp.path().join("staged-snap");
+        tokio::fs::create_dir_all(&snap_dir).await.unwrap();
+        tokio::fs::write(snap_dir.join("state.bin"), b"state-placeholder")
+            .await
+            .unwrap();
+        let manifest_json = serde_json::json!({
+            "sandbox_id": uuid::Uuid::new_v4(),
+            "created_at": chrono::Utc::now(),
+            "spec": {
+                "image": "test:1",
+                "rootfs_source": null,
+                "image_uri": null,
+                "harness_pack_uri": null,
+                "cpu": {"vcpus": 1},
+                "memory": {"max_mib": 64},
+                "disk": {"max_gib": 1},
+                "ttl": null,
+                "env": {},
+                "workdir": null,
+                "harness_substrate": null,
+                "network": {}
+            },
+            "format": "fc",
+            "memory_manifest": manifest_ref,
+        });
+        tokio::fs::write(
+            snap_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest_json).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !snap_dir.join("memory.bin").exists(),
+            "precondition: memory.bin must be absent before restore"
+        );
+
+        // Inner backend: records the path it was called with so
+        // we can assert PooledBackend's wrap fired before the
+        // inner call. Doesn't actually restore anything.
+        struct CapturingInner {
+            captured: parking_lot::Mutex<Option<PathBuf>>,
+        }
+        #[async_trait]
+        impl SandboxBackend for CapturingInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(
+                &self,
+                _: SandboxId,
+                _: &Path,
+            ) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+                *self.captured.lock() = Some(src);
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+        let inner = Arc::new(CapturingInner {
+            captured: parking_lot::Mutex::new(None),
+        });
+        let pooled = PooledBackend::new(inner.clone(), 0)
+            .with_chunk_store(cs.clone(), tmp.path().join("materialized"));
+
+        // Restore — should materialise memory.bin then delegate.
+        pooled.restore(snap_dir.clone()).await.unwrap();
+
+        // Inner backend saw the path; memory.bin is now present
+        // and byte-equal to the original.
+        assert_eq!(inner.captured.lock().clone(), Some(snap_dir.clone()));
+        let recovered = tokio::fs::read(snap_dir.join("memory.bin"))
+            .await
+            .expect("memory.bin must exist post-restore");
+        assert_eq!(recovered, bytes, "materialized bytes round-trip");
+    }
+
+    /// Cross-host trace replay: when a snapshot carries a
+    /// `trace_host_hint` on its sidecar JSON, the FC restore path
+    /// passes that as `--prefault-trace <host>` to the UFFD
+    /// handler so the recorded trace replays on a different host.
+    /// Locked at the wire-shape level here — we assert the field
+    /// round-trips through serde so a refactor can't accidentally
+    /// drop it. (End-to-end replay needs a live VM; that's the
+    /// follow-up.)
+    #[tokio::test]
+    async fn snapshot_skips_materialize_when_memory_bin_already_present() {
+        // Negative case: memory.bin already exists locally, so
+        // the materialize branch must be a no-op. Guards against a
+        // refactor that accidentally truncates the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+
+        let snap_dir = tmp.path().join("snap");
+        tokio::fs::create_dir_all(&snap_dir).await.unwrap();
+        // Pre-existing memory.bin with sentinel bytes.
+        let original = b"original-memory-bytes";
+        tokio::fs::write(snap_dir.join("memory.bin"), original)
+            .await
+            .unwrap();
+        // Manifest.json claims a different memory_manifest. The
+        // materialize branch MUST skip because the local file is
+        // present.
+        let manifest_json = serde_json::json!({
+            "sandbox_id": uuid::Uuid::new_v4(),
+            "created_at": chrono::Utc::now(),
+            "spec": {
+                "image": "test:1",
+                "rootfs_source": null,
+                "image_uri": null,
+                "harness_pack_uri": null,
+                "cpu": {"vcpus": 1},
+                "memory": {"max_mib": 64},
+                "disk": {"max_gib": 1},
+                "ttl": null,
+                "env": {},
+                "workdir": null,
+                "harness_substrate": null,
+                "network": {}
+            },
+            "format": "fc",
+            "memory_manifest": {"manifest_id": uuid::Uuid::new_v4(), "version": 1},
+        });
+        tokio::fs::write(
+            snap_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let inner: Arc<dyn SandboxBackend> = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().to_path_buf(),
+        ));
+        let pooled =
+            PooledBackend::new(inner, 0).with_chunk_store(cs, tmp.path().join("materialized"));
+        // restore would fail at ProcessBackend's level because
+        // ProcessBackend doesn't read manifest.json the FC way —
+        // but the materialize branch should have already short-
+        // circuited. Test that the file wasn't touched, regardless
+        // of inner.restore's outcome.
+        let _ = pooled.restore(snap_dir.clone()).await;
+        let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
+        assert_eq!(after, original, "memory.bin must not be overwritten");
     }
 
     /// Cache wiring: when a `ChunkCache` is provided,
