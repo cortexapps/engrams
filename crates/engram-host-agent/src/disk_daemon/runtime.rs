@@ -95,7 +95,10 @@ pub enum NbdRuntimeError {
     /// rather than rounding (which would silently expose padding
     /// to the guest), surface as an error so the caller fixes the
     /// manifest.
-    UnalignedSize { total_bytes: u64, block_size: u64 },
+    UnalignedSize {
+        total_bytes: u64,
+        block_size: u64,
+    },
     /// `ioctl(NBD_DO_IT)` exited unexpectedly (the kernel returns
     /// 0 on disconnect; non-zero means the device disappeared or
     /// the kernel-side socket closed prematurely).
@@ -106,14 +109,16 @@ impl std::fmt::Display for NbdRuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
-            Self::UnalignedSize { total_bytes, block_size } => write!(
+            Self::UnalignedSize {
+                total_bytes,
+                block_size,
+            } => write!(
                 f,
                 "manifest total_bytes={total_bytes} not aligned to NBD block_size={block_size}"
             ),
-            Self::KernelLoopExited(rc) => write!(
-                f,
-                "NBD_DO_IT returned {rc}; expected 0 (clean disconnect)"
-            ),
+            Self::KernelLoopExited(rc) => {
+                write!(f, "NBD_DO_IT returned {rc}; expected 0 (clean disconnect)")
+            }
         }
     }
 }
@@ -223,10 +228,12 @@ pub async fn spawn(
     //    the nbd module loaded with enough slots (typically via
     //    `modprobe nbd nbds_max=64`); the host-agent's Packer
     //    manifest handles that.
-    let nbd_fd = OwnedFd::from(std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(nbd_device)?);
+    let nbd_fd = OwnedFd::from(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(nbd_device)?,
+    );
 
     // 2. socketpair(AF_UNIX, SOCK_STREAM). Both halves are SOCK_STREAM
     //    so reads block until enough bytes arrive (vs SOCK_DGRAM which
@@ -399,9 +406,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStrea
                 // FUA / FLUSH would multiply object-storage cost
                 // by 100x for a typical workload; we trade off
                 // strict-FUA for cost.
-                let _ = stream
-                    .write_all(&NbdReply::ok(req.handle).encode())
-                    .await;
+                let _ = stream.write_all(&NbdReply::ok(req.handle).encode()).await;
             }
             NbdCommand::Trim => {
                 // Same trade-off as FLUSH — accept the request
@@ -409,9 +414,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStrea
                 // unsupporting trim) but treat as a no-op. A
                 // proper implementation would mark the affected
                 // chunks as "zero-fill on next read"; deferred.
-                let _ = stream
-                    .write_all(&NbdReply::ok(req.handle).encode())
-                    .await;
+                let _ = stream.write_all(&NbdReply::ok(req.handle).encode()).await;
             }
         }
     }
