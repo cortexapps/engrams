@@ -118,6 +118,18 @@ variable "nbd_slots" {
   default     = 16
 }
 
+variable "chunk_cache_budget_bytes" {
+  type        = number
+  description = <<-EOT
+    Maximum bytes the host-agent's local NVMe-backed chunk cache
+    is allowed to consume (`ENGRAM_CHUNK_CACHE_BUDGET_BYTES`). The
+    cache lazily evicts past this budget. Defaults to 200 GiB
+    inside the binary; this variable is the per-fleet override.
+    Set to 0 to leave the binary's default in place.
+  EOT
+  default     = 0
+}
+
 variable "egress_proxy_port" {
   type        = number
   description = "TCP port the per-host egress proxy binds. 0 disables egress filtering (NOT recommended in prod)."

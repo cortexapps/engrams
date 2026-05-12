@@ -470,10 +470,13 @@ async fn main() -> Result<(), CoordinatorError> {
         let materialize_dir = cli.local_path.join("chunked-rootfs");
         // ADR 0007 #3a: NVMe-backed chunk cache. Amortises repeat
         // reads for chunks shared across manifests (canonical-base
-        // images, fork lineage). Default 200 GiB budget per the
-        // crate's `ChunkCacheConfig::new`.
+        // images, fork lineage). Budget defaults to 200 GiB; smaller
+        // hosts (dev VMs, lab boxes) override via
+        // `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`.
         let chunk_cache = engram_chunk_store::ChunkCache::new(
-            engram_chunk_store::cache::ChunkCacheConfig::new(cli.local_path.join("chunk-cache")),
+            engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
+                cli.local_path.join("chunk-cache"),
+            ),
             chunk_store.clone(),
         );
         // ADR 0007 Phase 4: optional NBD daemon for chunked

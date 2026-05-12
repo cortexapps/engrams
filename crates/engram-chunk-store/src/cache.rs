@@ -56,13 +56,58 @@ pub struct ChunkCacheConfig {
     pub budget_bytes: u64,
 }
 
+/// Default cache budget when no override is provided: 200 GiB. The
+/// number assumes a standard FC host with a multi-TB NVMe attached
+/// for `<work_dir>`; smaller hosts (dev VMs, lab boxes) should
+/// override via env.
+pub const DEFAULT_BUDGET_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+
+/// Env var that overrides [`DEFAULT_BUDGET_BYTES`]. Plain integer
+/// bytes — no suffix parsing — to stay consistent with the other
+/// engram_* env knobs.
+pub const BUDGET_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_BUDGET_BYTES";
+
 impl ChunkCacheConfig {
-    /// Sensible default: cap at 200 GiB.
+    /// Sensible default: cap at [`DEFAULT_BUDGET_BYTES`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            budget_bytes: 200 * 1024 * 1024 * 1024,
+            budget_bytes: DEFAULT_BUDGET_BYTES,
         }
+    }
+
+    /// Construct with `budget_bytes` from `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`
+    /// if set + parseable, otherwise [`DEFAULT_BUDGET_BYTES`]. Logs at
+    /// info on override so operators can confirm the value picked up.
+    /// Unparseable values fall back to the default with a warn log —
+    /// fail-soft mirrors the other env-knob parsers in the codebase.
+    pub fn from_env_or_default(root: impl Into<PathBuf>) -> Self {
+        let mut cfg = Self::new(root);
+        match std::env::var(BUDGET_ENV_VAR) {
+            Ok(raw) => match raw.parse::<u64>() {
+                Ok(bytes) => {
+                    tracing::info!(
+                        budget_bytes = bytes,
+                        env = BUDGET_ENV_VAR,
+                        "chunk cache budget overridden via env",
+                    );
+                    cfg.budget_bytes = bytes;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        env = BUDGET_ENV_VAR,
+                        value = raw,
+                        error = %e,
+                        budget_bytes = cfg.budget_bytes,
+                        "could not parse chunk cache budget env var; using default",
+                    );
+                }
+            },
+            Err(_) => {
+                // Unset is the common case — no log needed.
+            }
+        }
+        cfg
     }
 }
 
@@ -532,5 +577,45 @@ mod tests {
         // With pin released, a (oldest) gets evicted.
         assert!(!cache.contains(ha).await);
         assert!(cache.contains(hc).await);
+    }
+
+    // ---- ChunkCacheConfig::from_env_or_default ----
+
+    // Tests poke process-global env vars; serialize them so concurrent
+    // test execution can't read mid-mutation, and recover from poison
+    // so a panicking test doesn't strand the others.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn from_env_or_default_uses_default_when_unset() {
+        let _g = env_guard();
+        std::env::remove_var(BUDGET_ENV_VAR);
+        let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
+        assert_eq!(cfg.budget_bytes, DEFAULT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn from_env_or_default_round_trips_byte_count() {
+        let _g = env_guard();
+        std::env::set_var(BUDGET_ENV_VAR, "12345");
+        let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
+        std::env::remove_var(BUDGET_ENV_VAR);
+        assert_eq!(cfg.budget_bytes, 12345);
+    }
+
+    #[test]
+    fn from_env_or_default_falls_back_on_unparseable() {
+        let _g = env_guard();
+        std::env::set_var(BUDGET_ENV_VAR, "not-a-number");
+        let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
+        std::env::remove_var(BUDGET_ENV_VAR);
+        assert_eq!(
+            cfg.budget_bytes, DEFAULT_BUDGET_BYTES,
+            "unparseable env must fail-soft to default",
+        );
     }
 }

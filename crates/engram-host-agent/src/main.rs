@@ -238,11 +238,13 @@ async fn main() -> Result<(), HostAgentError> {
         .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
-    // ADR 0007 #3a: NVMe-backed chunk cache. Sized via the crate's
-    // default budget (200 GiB); operators tune via a future CLI
-    // flag if they need bigger or smaller.
+    // ADR 0007 #3a: NVMe-backed chunk cache. Budget defaults to
+    // 200 GiB; operators override via `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`
+    // for hosts with smaller NVMe or different sharing ratios.
     let chunk_cache = engram_chunk_store::ChunkCache::new(
-        engram_chunk_store::cache::ChunkCacheConfig::new(cli.work_dir.join("chunk-cache")),
+        engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
+            cli.work_dir.join("chunk-cache"),
+        ),
         chunk_store.clone(),
     );
 
