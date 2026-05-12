@@ -312,13 +312,13 @@ async fn main() -> Result<(), CoordinatorError> {
         None
     };
 
-    // ADR 0005 / Stage 4 / ADR 0007: blob storage. The same Arc
-    // backs the legacy seal-pipeline `Services.blob` AND the ADR
-    // 0007 chunk store. Hoisting it before the --mode=all wiring
-    // lets the in-process host-agent share one connection. `local`
-    // (default) writes under `<local_path>/blobs/`; `gcs` requires
-    // `ENGRAM_GCS_BUCKET` and honors `STORAGE_EMULATOR_HOST` for
-    // fake-gcs-server in `just dev`.
+    // ADR 0007: blob storage. The Arc backs the chunk store
+    // (manifests + content-addressed chunks live here). Hoisting
+    // before --mode=all wiring lets the in-process host-agent
+    // share one connection. `local` (default) writes under
+    // `<local_path>/blobs/`; `gcs` requires `ENGRAM_GCS_BUCKET`
+    // and honors `STORAGE_EMULATOR_HOST` for fake-gcs-server in
+    // `just dev`.
     let blob = match engram_coordinator::blob::from_env().await {
         Ok(b) => b,
         Err(e) => {
