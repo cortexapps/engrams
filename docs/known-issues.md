@@ -188,24 +188,16 @@ wiring through `FirecrackerBackend::{snapshot,restore}`.
 
 **Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #9.
 
-## 11. `snapshots` table still carries cold-tier columns
+## 11. ~~`snapshots` table still carries cold-tier columns~~
 
-ADR 0007 supersedes the two-tier durability model, but the
-`snapshots` table schema (migration 0001 + 0016) still has
-`local_path`, `blob_present`, and the envelope-encryption
-quartet (`wrapped_dek`, `nonce`, `ciphertext`, `key_id`). The
-chunked write path (commit `e68ee23`) produces a
-`SnapshotMetadata.disk_manifest` that the coord captures in
-memory but doesn't persist to the row.
-
-Migration `0018_chunked_storage.sql` (Phase 6 of the rollout)
-drops the cold-tier columns and adds `disk_manifest_id` +
-`disk_manifest_version`. Until that lands, `SnapshotRecord`
-reshape + the `MetadataStore` method retirement
-(`flush_to_cold` etc.) are also blocked.
-
-**Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #5
-(Phase 6 trait + DB reshape).
+**Resolved**: Phase 7 (ADR 0007) shipped. Migration `0020_drop_cold_tier.sql`
+dropped the cold-tier columns (`local_path`, `blob_present`,
+`replicated_at`, the envelope-encryption quartet) + the
+`cold_evicted_at` column on `sessions`. `MetadataStore::flush_to_cold` /
+`clear_local_path` / `latest_cold_snapshot_for_session` /
+`list_idle_sessions` trait methods deleted. `SessionStatus::ColdEvicted`
+deleted. `SealedBlobRef` deleted from `engram-core::traits`. The
+chunked manifest refs are the single durability primitive.
 
 ## 12. No metrics on the chunked-storage code paths
 
