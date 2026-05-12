@@ -683,11 +683,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.exec_stream(id, cmd).await
     }
 
-    async fn snapshot(
-        &self,
-        id: SandboxId,
-        dest: &std::path::Path,
-    ) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0007 Phase 4: if this sandbox is NBD-backed, flush
         // its dirty disk chunks BEFORE we ask the inner FC backend
         // to take its memory snapshot. The flush produces a new
@@ -716,7 +712,12 @@ impl SandboxBackend for PooledBackend {
             None
         };
 
-        let mut metadata = self.inner.snapshot(id, dest).await?;
+        // ADR 0007 Phase 6: backend owns its staging dir; we look
+        // it up via snapshot_path_for after the inner call so we
+        // can read/patch the on-disk artifacts the inner backend
+        // wrote (memory.bin, manifest.json).
+        let mut metadata = self.inner.snapshot(id).await?;
+        let dest = self.inner.snapshot_path_for(metadata.id);
 
         // Plumb the new disk manifest onto SnapshotMetadata so
         // the coord-side snapshot recorder persists it on the
@@ -758,18 +759,19 @@ impl SandboxBackend for PooledBackend {
         Ok(metadata)
     }
 
-    async fn restore(&self, src: std::path::PathBuf) -> Result<SandboxId, SandboxError> {
-        // ADR 0007 Phase 5: cross-host memory.bin materialization.
-        // If the snapshot dir's `memory.bin` is missing locally but
-        // the FC sidecar JSON carries a `memory_manifest`, rebuild
-        // it from chunks before delegating to the inner backend.
-        // Two callers hit this branch:
-        //   - Same host where the local memory.bin was reaped by
-        //     LRU / disk pressure (rare, but possible).
-        //   - Cross-host: the snapshotting host died, the coord
-        //     re-stages the snapshot dir on a new host with just
-        //     state.bin + manifest.json from BlobStorage, and
-        //     this host fills memory.bin from chunks.
+    fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
+        self.inner.snapshot_path_for(snapshot_id)
+    }
+
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
+        // The backend owns its staging dir layout (Phase 6); we ask
+        // it where this snapshot would live, then ensure the
+        // memory.bin file is present before delegating to inner —
+        // either because we're on the same host where it was
+        // written, or because we need to rebuild it from chunks
+        // (cross-host migration).
+        let src = self.inner.snapshot_path_for(metadata.id);
         if let Err(e) = self.materialize_memory_if_missing(&src).await {
             tracing::warn!(
                 error = %e,
@@ -777,7 +779,7 @@ impl SandboxBackend for PooledBackend {
                 "memory.bin materialization failed; inner.restore will see whatever's there",
             );
         }
-        self.inner.restore(src).await
+        self.inner.restore(metadata).await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -1061,10 +1063,9 @@ mod tests {
     async fn snapshot_chunks_fc_memory_bin_and_patches_manifest() {
         use engram_chunk_store::{ChunkStore, ManifestKind};
         use engram_storage_local::LocalBlobStorage;
-        use std::path::Path;
 
         let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("snap-1");
+        let _dest = tmp.path().join("snap-1");
 
         // 1. Synthetic memory.bin: 1 MiB of distinct, non-zero
         //    content so chunk_file produces multiple chunks. Two
@@ -1075,10 +1076,17 @@ mod tests {
         }
 
         // 2. Inner backend stub: writes memory.bin + state.bin +
-        //    manifest.json to dest, returns a bare SnapshotMetadata
+        //    manifest.json to its own per-snapshot dir (ADR 0007
+        //    Phase 6 contract), returns a bare SnapshotMetadata
         //    with memory_manifest=None (the FC bare-snapshot shape).
         struct FakeFcBackend {
             payload: Vec<u8>,
+            staging_root: PathBuf,
+        }
+        impl FakeFcBackend {
+            fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging_root.join(id.to_string())
+            }
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
@@ -1092,12 +1100,10 @@ mod tests {
             ) -> Result<ExecStream, SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
-            async fn snapshot(
-                &self,
-                _: SandboxId,
-                dest: &Path,
-            ) -> Result<SnapshotMetadata, SandboxError> {
-                tokio::fs::create_dir_all(dest).await.unwrap();
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.dir_for(snapshot_id);
+                tokio::fs::create_dir_all(&dest).await.unwrap();
                 tokio::fs::write(dest.join("memory.bin"), &self.payload)
                     .await
                     .unwrap();
@@ -1131,7 +1137,7 @@ mod tests {
                 .await
                 .unwrap();
                 Ok(SnapshotMetadata {
-                    id: engram_core::SnapshotId::new(),
+                    id: snapshot_id,
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
                     image_version: "test:1".into(),
@@ -1139,7 +1145,10 @@ mod tests {
                     memory_manifest: None,
                 })
             }
-            async fn restore(&self, _: PathBuf) -> Result<SandboxId, SandboxError> {
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.dir_for(id)
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -1159,13 +1168,15 @@ mod tests {
         let cs = ChunkStore::new(blob);
         let inner: Arc<dyn SandboxBackend> = Arc::new(FakeFcBackend {
             payload: bytes.clone(),
+            staging_root: tmp.path().join("fc-snaps"),
         });
         let materialize_dir = tmp.path().join("materialized");
         let pooled = PooledBackend::new(inner, 0).with_chunk_store(cs.clone(), materialize_dir);
 
         // 4. Take the snapshot. PooledBackend's wrap chunks
         //    memory.bin and patches manifest.json.
-        let metadata = pooled.snapshot(SandboxId::new(), &dest).await.unwrap();
+        let metadata = pooled.snapshot(SandboxId::new()).await.unwrap();
+        let dest = pooled.snapshot_path_for(metadata.id);
         let manifest_ref = metadata
             .memory_manifest
             .expect("PooledBackend must populate memory_manifest");
@@ -1207,11 +1218,7 @@ mod tests {
         // without a memory.bin (no guest RAM concept). The wrap
         // skips chunking silently and metadata.memory_manifest
         // stays None.
-        let dest = tmp.path().join("nochunk-snap");
-        let metadata = pooled
-            .snapshot(_id, &dest)
-            .await
-            .expect("ProcessBackend snapshot");
+        let metadata = pooled.snapshot(_id).await.expect("ProcessBackend snapshot");
         assert!(
             metadata.memory_manifest.is_none(),
             "no chunk_store wired must leave memory_manifest unset",
@@ -1232,7 +1239,6 @@ mod tests {
     async fn restore_materializes_missing_memory_bin_from_chunks() {
         use engram_chunk_store::{ChunkStore, ManifestKind};
         use engram_core::types::manifest::ManifestRef;
-        use std::path::Path;
 
         let tmp = tempfile::tempdir().unwrap();
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
@@ -1253,10 +1259,57 @@ mod tests {
         let manifest_ref = ManifestRef::new();
         cs.put_manifest(manifest_ref, &manifest).await.unwrap();
 
-        // Stage a snapshot dir: state.bin + manifest.json (with
-        // memory_manifest set), but NO memory.bin — simulates a
-        // freshly-staged cross-host transfer.
-        let snap_dir = tmp.path().join("staged-snap");
+        // Inner backend: records the metadata it was called with
+        // so we can assert PooledBackend's wrap fired the
+        // materialize step BEFORE inner.restore. Owns a staging
+        // root that snapshot_path_for derives from — the wrap
+        // looks the path up from there to stage memory.bin.
+        struct CapturingInner {
+            captured: parking_lot::Mutex<Option<SnapshotMetadata>>,
+            staging_root: PathBuf,
+        }
+        #[async_trait]
+        impl SandboxBackend for CapturingInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging_root.join(id.to_string())
+            }
+            async fn restore(&self, m: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                *self.captured.lock() = Some(m);
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let inner = Arc::new(CapturingInner {
+            captured: parking_lot::Mutex::new(None),
+            staging_root: tmp.path().join("inner-snaps"),
+        });
+
+        // Allocate the snapshot_id up front so we can stage its
+        // dir at the path snapshot_path_for will return.
+        let snapshot_id = engram_core::SnapshotId::new();
+        let snap_dir = inner.snapshot_path_for(snapshot_id);
         tokio::fs::create_dir_all(&snap_dir).await.unwrap();
         tokio::fs::write(snap_dir.join("state.bin"), b"state-placeholder")
             .await
@@ -1292,57 +1345,26 @@ mod tests {
             "precondition: memory.bin must be absent before restore"
         );
 
-        // Inner backend: records the path it was called with so
-        // we can assert PooledBackend's wrap fired before the
-        // inner call. Doesn't actually restore anything.
-        struct CapturingInner {
-            captured: parking_lot::Mutex<Option<PathBuf>>,
-        }
-        #[async_trait]
-        impl SandboxBackend for CapturingInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn exec_stream(
-                &self,
-                _: SandboxId,
-                _: ExecRequest,
-            ) -> Result<ExecStream, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn snapshot(
-                &self,
-                _: SandboxId,
-                _: &Path,
-            ) -> Result<SnapshotMetadata, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
-                *self.captured.lock() = Some(src);
-                Ok(SandboxId::new())
-            }
-            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
-                Ok(())
-            }
-            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-                Ok(Vec::new())
-            }
-            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
-                Ok(())
-            }
-        }
-        let inner = Arc::new(CapturingInner {
-            captured: parking_lot::Mutex::new(None),
-        });
         let pooled = PooledBackend::new(inner.clone(), 0)
             .with_chunk_store(cs.clone(), tmp.path().join("materialized"));
 
         // Restore — should materialise memory.bin then delegate.
-        pooled.restore(snap_dir.clone()).await.unwrap();
+        let metadata = SnapshotMetadata {
+            id: snapshot_id,
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            image_version: "test:1".into(),
+            disk_manifest: None,
+            memory_manifest: Some(manifest_ref),
+        };
+        pooled.restore(metadata.clone()).await.unwrap();
 
-        // Inner backend saw the path; memory.bin is now present
-        // and byte-equal to the original.
-        assert_eq!(inner.captured.lock().clone(), Some(snap_dir.clone()));
+        // Inner backend saw the metadata; memory.bin is now
+        // present and byte-equal to the original.
+        assert_eq!(
+            inner.captured.lock().as_ref().map(|m| m.id),
+            Some(snapshot_id)
+        );
         let recovered = tokio::fs::read(snap_dir.join("memory.bin"))
             .await
             .expect("memory.bin must exist post-restore");
@@ -1405,17 +1427,58 @@ mod tests {
         .await
         .unwrap();
 
-        let inner: Arc<dyn SandboxBackend> = Arc::new(engram_sandbox_process::ProcessBackend::new(
-            tmp.path().to_path_buf(),
-        ));
+        // Phase 6: the test backend now owns where snap_dir lives.
+        // Use a CapturingInner that points snapshot_path_for at the
+        // dir we staged, so PooledBackend's wrap finds the
+        // already-existing memory.bin and the materialize branch
+        // short-circuits.
+        struct StagedInner {
+            snap_dir: PathBuf,
+        }
+        #[async_trait]
+        impl SandboxBackend for StagedInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                self.snap_dir.clone()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                // Inner restore is irrelevant for this test — we
+                // only assert the materialize branch was a no-op.
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+        }
+        let inner: Arc<dyn SandboxBackend> = Arc::new(StagedInner {
+            snap_dir: snap_dir.clone(),
+        });
         let pooled =
             PooledBackend::new(inner, 0).with_chunk_store(cs, tmp.path().join("materialized"));
-        // restore would fail at ProcessBackend's level because
-        // ProcessBackend doesn't read manifest.json the FC way —
-        // but the materialize branch should have already short-
-        // circuited. Test that the file wasn't touched, regardless
-        // of inner.restore's outcome.
-        let _ = pooled.restore(snap_dir.clone()).await;
+        let metadata = SnapshotMetadata {
+            id: engram_core::SnapshotId::new(),
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            image_version: "test:1".into(),
+            disk_manifest: None,
+            memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+        };
+        let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
         assert_eq!(after, original, "memory.bin must not be overwritten");
     }
@@ -1520,7 +1583,7 @@ mod tests {
         use engram_core::types::snapshot::SnapshotMetadata;
         use engram_core::SandboxId;
         use parking_lot::Mutex as PlMutex;
-        use std::path::{Path, PathBuf};
+        use std::path::PathBuf;
 
         // 1. Shared BlobStorage + ChunkStore, mirroring `--mode=all`.
         let tmp = tempfile::tempdir().unwrap();
@@ -1591,14 +1654,15 @@ mod tests {
             ) -> Result<ExecStream, SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
-            async fn snapshot(
-                &self,
-                _id: SandboxId,
-                _dest: &Path,
-            ) -> Result<SnapshotMetadata, SandboxError> {
+            async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
-            async fn restore(&self, _src: PathBuf) -> Result<SandboxId, SandboxError> {
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                std::env::temp_dir()
+                    .join("engram-test-snaps")
+                    .join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {

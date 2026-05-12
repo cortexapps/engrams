@@ -88,13 +88,16 @@ async fn real_main() {
 async fn run_scenario(
     kernel: &str,
     rootfs: &str,
-    state_path: &std::path::Path,
+    // ADR 0007 Phase 6: backend owns its staging dir; the caller-
+    // provided `state_path` is no longer load-bearing (kept in the
+    // signature so the existing CLI dispatch in main doesn't have
+    // to change).
+    _state_path: &std::path::Path,
     _with_console: bool,
 ) {
     use engram_core::traits::SandboxBackend;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
     use std::collections::HashMap;
-    use std::path::Path;
 
     let cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
     let work_dir = "/tmp/engram-vz-diag-work";
@@ -134,15 +137,22 @@ async fn run_scenario(
     eprintln!("[diag] sandbox_id={id}; sleeping 5s for boot to settle");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let snap_dir = state_path.parent().unwrap().to_path_buf();
-    eprintln!("[diag] backend.snapshot → {}", snap_dir.display());
-    match backend.snapshot(id, Path::new(&snap_dir)).await {
-        Ok(meta) => eprintln!("[diag] snapshot ok: size={} bytes", meta.size_bytes),
+    // ADR 0007 Phase 6: backend owns its staging dir. Capture the
+    // metadata after the snapshot completes so we can look up the
+    // dir for the post-snapshot manifest rewrite below.
+    eprintln!("[diag] backend.snapshot (Phase 6: backend-owned staging)");
+    let snap_metadata = match backend.snapshot(id).await {
+        Ok(meta) => {
+            eprintln!("[diag] snapshot ok: size={} bytes", meta.size_bytes);
+            meta
+        }
         Err(e) => {
             eprintln!("[diag] snapshot failed: {e}");
             std::process::exit(1);
         }
-    }
+    };
+    let snap_dir = backend.snapshot_path_for(snap_metadata.id);
+    eprintln!("[diag] snapshot dir = {}", snap_dir.display());
 
     // ENGRAM_DIAG_FROZEN_DISK=1 → copy the rootfs IMMEDIATELY after
     // save and rewrite the snapshot manifest to point at the copy.
@@ -189,7 +199,7 @@ async fn run_scenario(
         eprintln!("[diag] reconstructing fresh VzBackend; calling restore");
         let cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
         let backend = engram_sandbox_vz::VzBackend::new(work_dir, cfg).expect("backend rebuild");
-        match backend.restore(snap_dir).await {
+        match backend.restore(snap_metadata.clone()).await {
             Ok(new_id) => {
                 eprintln!("[diag] restore ok! new_id={new_id}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -203,7 +213,7 @@ async fn run_scenario(
     } else {
         eprintln!("[diag] same-instance restore: destroying then restoring on same backend");
         let _ = backend.destroy(id).await;
-        match backend.restore(snap_dir).await {
+        match backend.restore(snap_metadata).await {
             Ok(new_id) => {
                 eprintln!("[diag] same-instance restore ok! new_id={new_id}");
                 tokio::time::sleep(Duration::from_secs(2)).await;

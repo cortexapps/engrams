@@ -270,14 +270,16 @@ impl HostRegistry {
 
     /// Same as `create_for_session` but for restoring from a snapshot.
     /// Routes to the host carrying `snapshot_id` if any; else falls
-    /// through to capacity-based pick.
+    /// through to capacity-based pick. ADR 0007 Phase 6: takes a
+    /// `SnapshotMetadata` directly (backends look up their own
+    /// per-snapshot staging dir from the chunked manifest refs).
     pub async fn restore_for_session(
         &self,
         ctx: &ScheduleContext<'_>,
-        src: std::path::PathBuf,
+        metadata: SnapshotMetadata,
     ) -> Result<(HostId, SandboxId), SandboxError> {
         let (host_id, backend) = self.pick_for_session(ctx).ok_or_else(Self::no_host_error)?;
-        let sandbox_id = backend.restore(src).await?;
+        let sandbox_id = backend.restore(metadata).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
     }
@@ -364,18 +366,28 @@ impl SandboxBackend for HostRegistry {
         backend.exec_stream(id, cmd).await
     }
 
-    async fn snapshot(
-        &self,
-        id: SandboxId,
-        dest: &std::path::Path,
-    ) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let backend = self.lookup(id)?;
-        backend.snapshot(id, dest).await
+        backend.snapshot(id).await
     }
 
-    async fn restore(&self, src: std::path::PathBuf) -> Result<SandboxId, SandboxError> {
+    fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
+        // HostRegistry is the coord-side "any backend" router; an
+        // individual snapshot_path_for question is only meaningful
+        // when paired with a known host. Coord callers should never
+        // ask the registry for a per-snapshot host-local path.
+        // Return a sentinel that's implausible enough to fail loudly
+        // on any actual file I/O (matches RemoteSandboxBackend's
+        // contract).
+        std::path::PathBuf::from(format!(
+            "/__engram_host_registry_no_local_path__/{}",
+            snapshot_id,
+        ))
+    }
+
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         let (host_id, backend) = self.pick_any().ok_or_else(Self::no_host_error)?;
-        let sandbox_id = backend.restore(src).await?;
+        let sandbox_id = backend.restore(metadata).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok(sandbox_id)
     }

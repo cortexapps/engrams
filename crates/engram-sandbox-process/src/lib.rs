@@ -88,6 +88,17 @@ impl ProcessBackend {
     fn cwd_for(&self, id: SandboxId) -> PathBuf {
         self.work_dir.join(id.to_string())
     }
+
+    /// ADR 0007 Phase 6: per-snapshot staging dir, owned by the
+    /// backend (coord no longer dictates layout). Lives next to
+    /// `cwd_for` sandboxes but under a `snapshots/` subtree so
+    /// the destroy path's `remove_dir_all(cwd)` doesn't sweep
+    /// snapshots.
+    fn snapshot_dir_for(&self, snapshot_id: engram_core::types::SnapshotId) -> PathBuf {
+        self.work_dir
+            .join("snapshots")
+            .join(snapshot_id.to_string())
+    }
 }
 
 #[async_trait]
@@ -285,13 +296,19 @@ impl SandboxBackend for ProcessBackend {
         })
     }
 
-    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        tokio::fs::create_dir_all(dest).await?;
+
+        // ADR 0007 Phase 6: backend chooses its own staging dir.
+        // Allocate the snapshot_id first so we know the path
+        // before writing anything.
+        let snapshot_id = SnapshotId::new();
+        let dest = self.snapshot_dir_for(snapshot_id);
+        tokio::fs::create_dir_all(&dest).await?;
 
         let manifest_path = dest.join("manifest.json");
         let manifest = Manifest {
@@ -324,7 +341,7 @@ impl SandboxBackend for ProcessBackend {
         let archive_size = tokio::fs::metadata(&fs_archive).await?.len();
 
         Ok(SnapshotMetadata {
-            id: SnapshotId::new(),
+            id: snapshot_id,
             size_bytes: manifest_size + archive_size,
             created_at: manifest.created_at,
             image_version: manifest.image_version,
@@ -337,6 +354,10 @@ impl SandboxBackend for ProcessBackend {
         })
     }
 
+    fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
+        self.snapshot_dir_for(snapshot_id)
+    }
+
     /// `restore` returns a *new* SandboxId pointing at a freshly-untarred
     /// cwd. This re-creates a SandboxSpec; we don't carry resource
     /// limits or rootfs_source through a snapshot because:
@@ -345,7 +366,9 @@ impl SandboxBackend for ProcessBackend {
     ///   - `rootfs_source` is irrelevant after restore — the cwd is
     ///     materialized from the snapshot's tarball, not from a source
     ///     image directory.
-    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        // ADR 0007 Phase 6: backend looks up its own staging dir.
+        let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = tokio::fs::read(src.join("manifest.json")).await?;
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
@@ -859,18 +882,21 @@ mod tests {
         .await
         .unwrap();
 
-        let snap_dir = tempfile::tempdir().unwrap();
-        let meta = b.snapshot(id, snap_dir.path()).await.unwrap();
+        // ADR 0007 Phase 6: backend owns staging — we no longer pass
+        // a snap_dir; look it up post-snapshot via snapshot_path_for
+        // to assert on the files it wrote.
+        let meta = b.snapshot(id).await.unwrap();
+        let snap_dir = b.snapshot_path_for(meta.id);
         assert!(meta.size_bytes > 0);
         assert_eq!(meta.image_version, "warm-test");
-        assert!(snap_dir.path().join("manifest.json").is_file());
-        assert!(snap_dir.path().join("fs.tar.gz").is_file());
+        assert!(snap_dir.join("manifest.json").is_file());
+        assert!(snap_dir.join("fs.tar.gz").is_file());
 
         // Destroy the original so any restore reads from the snapshot,
         // not from leftover state.
         b.destroy(id).await.unwrap();
 
-        let restored = b.restore(snap_dir.path().to_path_buf()).await.unwrap();
+        let restored = b.restore(meta).await.unwrap();
         let h_top = b.exec(restored, exec(&["cat", "greeting"])).await.unwrap();
         assert_eq!(String::from_utf8(h_top.stdout).unwrap(), "hello\n");
         let h_nested = b.exec(restored, exec(&["cat", "sub/file"])).await.unwrap();
@@ -880,18 +906,31 @@ mod tests {
     #[tokio::test]
     async fn snapshot_unknown_id_is_not_found() {
         let (b, _d) = backend();
-        let snap_dir = tempfile::tempdir().unwrap();
-        let res = b.snapshot(SandboxId::new(), snap_dir.path()).await;
+        let res = b.snapshot(SandboxId::new()).await;
         assert!(matches!(res, Err(SandboxError::NotFound)));
     }
 
     #[tokio::test]
     async fn restore_with_corrupted_manifest_errors_cleanly() {
         let (b, _d) = backend();
-        let snap_dir = tempfile::tempdir().unwrap();
-        fs::write(snap_dir.path().join("manifest.json"), b"not json").unwrap();
-        fs::write(snap_dir.path().join("fs.tar.gz"), b"").unwrap();
-        let res = b.restore(snap_dir.path().to_path_buf()).await;
+        // Plant a corrupted manifest in the path the backend would
+        // look up for this snapshot_id, then call restore — the
+        // backend resolves the dir internally now, so we just need
+        // metadata with the right id.
+        let snap_id = SnapshotId::new();
+        let snap_dir = b.snapshot_path_for(snap_id);
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join("manifest.json"), b"not json").unwrap();
+        fs::write(snap_dir.join("fs.tar.gz"), b"").unwrap();
+        let meta = SnapshotMetadata {
+            id: snap_id,
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            image_version: "test".into(),
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        let res = b.restore(meta).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));
     }
 

@@ -353,32 +353,19 @@ async fn handle_request(
             Ok(ids) => Ok(ResponseKind::Sandboxes { ids }),
             Err(e) => Err(RemoteError::from_sandbox(e)),
         },
-        RequestKind::Snapshot {
-            sandbox_id,
-            dest_path,
-        } => {
-            let path = PathBuf::from(dest_path);
-            // Ensure the destination dir exists — backends generally
-            // assume it's preallocated. Single-host (mode=all) creates
-            // it on the coordinator side already; explicit hosts may
-            // be running on a different filesystem so we re-create here.
-            if let Err(e) = tokio::fs::create_dir_all(&path).await {
-                send_frame(
-                    &writer,
-                    Frame::Response {
-                        req_id,
-                        result: Err(RemoteError::Io(e.to_string())),
-                    },
-                )
-                .await;
-                return;
-            }
-            match backend.snapshot(sandbox_id, &path).await {
-                Ok(metadata) => Ok(ResponseKind::Snapshotted { metadata }),
-                Err(e) => Err(RemoteError::from_sandbox(e)),
-            }
-        }
-        RequestKind::Restore { src_path } => match backend.restore(PathBuf::from(src_path)).await {
+        // ADR 0007 Phase 6: backend chooses its own staging dir.
+        // No more dest_path coercion through PathBuf, no
+        // create_dir_all dance — the backend's snapshot_path_for
+        // returns a stable per-snapshot dir it owns.
+        RequestKind::Snapshot { sandbox_id } => match backend.snapshot(sandbox_id).await {
+            Ok(metadata) => Ok(ResponseKind::Snapshotted { metadata }),
+            Err(e) => Err(RemoteError::from_sandbox(e)),
+        },
+        // ADR 0007 Phase 6: restore by metadata. The backend
+        // resolves its own local staging dir via
+        // snapshot_path_for(metadata.id); PooledBackend's wrapper
+        // materialises memory.bin from chunks if missing.
+        RequestKind::Restore { metadata } => match backend.restore(metadata).await {
             Ok(sandbox_id) => Ok(ResponseKind::Restored { sandbox_id }),
             Err(e) => Err(RemoteError::from_sandbox(e)),
         },
@@ -523,13 +510,19 @@ impl SandboxBackend for RecordingBackend {
     async fn snapshot(
         &self,
         id: engram_core::SandboxId,
-        dest: &std::path::Path,
     ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
-        self.inner.snapshot(id, dest).await
+        self.inner.snapshot(id).await
     }
 
-    async fn restore(&self, src: PathBuf) -> Result<engram_core::SandboxId, SandboxError> {
-        self.inner.restore(src).await
+    async fn restore(
+        &self,
+        metadata: engram_core::types::snapshot::SnapshotMetadata,
+    ) -> Result<engram_core::SandboxId, SandboxError> {
+        self.inner.restore(metadata).await
+    }
+
+    fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> PathBuf {
+        self.inner.snapshot_path_for(snapshot_id)
     }
 
     async fn destroy(&self, id: engram_core::SandboxId) -> Result<(), SandboxError> {

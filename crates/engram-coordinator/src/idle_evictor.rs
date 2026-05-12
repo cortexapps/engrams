@@ -117,36 +117,15 @@ pub async fn evict_idle_session(
         return Ok(());
     }
 
-    // Step 1: take a snapshot. Same path layout as the
-    // operator-driven /sessions/:id/snapshot handler so resume can
-    // reconstruct the dir from `(snapshot_dir, session_id, snapshot_id)`
-    // — no local_path persistence required.
-    let staging = state
-        .snapshot_dir()
-        .join(session_id.to_string())
-        .join(uuid::Uuid::new_v4().to_string());
-    tokio::fs::create_dir_all(&staging)
-        .await
-        .map_err(|e| EvictError::Io(format!("create snapshot dir: {e}")))?;
+    // Step 1: take a snapshot. ADR 0007 Phase 6: backend owns its
+    // staging dir; coord no longer pre-allocates one. Durability
+    // flows through the chunked manifests on `SnapshotMetadata`.
     let metadata = state
         .services
         .sandbox
-        .snapshot(sandbox_id, &staging)
+        .snapshot(sandbox_id)
         .await
         .map_err(EvictError::Sandbox)?;
-    let dest = state
-        .snapshot_dir()
-        .join(session_id.to_string())
-        .join(metadata.id.to_string());
-    if staging != dest {
-        tokio::fs::rename(&staging, &dest).await.map_err(|e| {
-            EvictError::Io(format!(
-                "rename snapshot {} -> {}: {e}",
-                staging.display(),
-                dest.display(),
-            ))
-        })?;
-    }
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();

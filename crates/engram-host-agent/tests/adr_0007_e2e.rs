@@ -40,7 +40,7 @@
 //! when its `snapshot()` is called, the same way FC does after
 //! its `PUT /snapshot/create` HTTP call.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,12 +92,12 @@ impl SandboxBackend for FakeFcBackend {
             "exec not exercised in e2e".into(),
         ))
     }
-    async fn snapshot(
-        &self,
-        _id: SandboxId,
-        dest: &Path,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        tokio::fs::create_dir_all(dest).await.unwrap();
+    async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        // ADR 0007 Phase 6: backend owns its staging dir. Allocate
+        // the snapshot_id up front so `snapshot_path_for` matches.
+        let snapshot_id = SnapshotId::new();
+        let dest = self.snapshot_path_for(snapshot_id);
+        tokio::fs::create_dir_all(&dest).await.unwrap();
         // FC writes state.bin + memory.bin into dest. PooledBackend's
         // wrap reads memory.bin, chunks it, deletes the local copy
         // (or in our case leaves it; either is valid).
@@ -141,7 +141,7 @@ impl SandboxBackend for FakeFcBackend {
         .await
         .unwrap();
         Ok(SnapshotMetadata {
-            id: SnapshotId::new(),
+            id: snapshot_id,
             size_bytes: self.memory_payload.len() as u64,
             created_at: chrono::Utc::now(),
             image_version: "e2e-test:1".into(),
@@ -149,10 +149,16 @@ impl SandboxBackend for FakeFcBackend {
             memory_manifest: None,
         })
     }
-    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+    fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
+        self.work_dir
+            .join("snapshots")
+            .join(snapshot_id.to_string())
+    }
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         // Assert that by the time the inner restore sees this, the
         // snapshot dir has all three required files. That validates
         // the wrap re-hydrated memory.bin from chunks.
+        let src = self.snapshot_path_for(metadata.id);
         let mem_path = src.join("memory.bin");
         let state_path = src.join("state.bin");
         let mj_path = src.join("manifest.json");
@@ -316,8 +322,10 @@ async fn adr_0007_e2e_snapshot_chunks_memory_and_patches_manifest() {
         .await
         .unwrap();
 
-    let snap_dir = fix.work_dir.join("snap-A");
-    let metadata = pooled.snapshot(sandbox_id, &snap_dir).await.unwrap();
+    // ADR 0007 Phase 6: backend owns staging — look up where it
+    // wrote via snapshot_path_for after the call returns.
+    let metadata = pooled.snapshot(sandbox_id).await.unwrap();
+    let snap_dir = pooled.snapshot_path_for(metadata.id);
 
     // PooledBackend wraps the fake's snapshot: it should have
     // chunked memory.bin and patched manifest.json's
@@ -393,8 +401,8 @@ async fn adr_0007_e2e_cross_host_restore_materialises_memory_from_chunks() {
         })
         .await
         .unwrap();
-    let snap_dir = fix.work_dir.join("snap-cross-host");
-    pooled_a.snapshot(sandbox_id, &snap_dir).await.unwrap();
+    let metadata = pooled_a.snapshot(sandbox_id).await.unwrap();
+    let snap_dir = pooled_a.snapshot_path_for(metadata.id);
     pooled_a.destroy(sandbox_id).await.unwrap();
 
     // Cross-host simulation: remove the local memory.bin on the
@@ -404,9 +412,11 @@ async fn adr_0007_e2e_cross_host_restore_materialises_memory_from_chunks() {
         .await
         .unwrap();
 
-    // Host B: separate PooledBackend, same chunk store + cache (the
-    // "shared durability tier" — production would have both hosts
-    // pointing at the same GCS bucket).
+    // Host B: separate PooledBackend, same chunk store + cache +
+    // SAME staging-root work_dir (the "shared durability tier" —
+    // production would have both hosts pointing at the same GCS
+    // bucket; here the two PooledBackends share work_dir so
+    // snapshot_path_for resolves to the same on-disk location.
     let inner_b = Arc::new(FakeFcBackend {
         work_dir: fix.work_dir.clone(),
         memory_payload: vec![], // unused on host B; restore reads from disk
@@ -417,7 +427,7 @@ async fn adr_0007_e2e_cross_host_restore_materialises_memory_from_chunks() {
     // Restore — wrap must materialize memory.bin from chunks
     // before inner.restore sees it. The inner backend asserts
     // memory.bin is present when it's called (in restore()).
-    pooled_b.restore(snap_dir.clone()).await.unwrap();
+    pooled_b.restore(metadata.clone()).await.unwrap();
 
     // Confirm the materialised bytes round-trip.
     let recovered = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -426,7 +436,7 @@ async fn adr_0007_e2e_cross_host_restore_materialises_memory_from_chunks() {
         "cross-host materialised memory.bin must byte-equal the host-A original"
     );
 
-    // Inner backend captured the same path we passed in.
+    // Inner backend captured the same staging dir we wrote into.
     assert_eq!(
         inner_b.captured_restore.lock().unwrap().clone(),
         Some(snap_dir)

@@ -1920,7 +1920,6 @@ async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
 #[tokio::test]
 async fn create_session_failure_marks_session_failed() {
     // Build an app whose sandbox backend always errors on create.
-    use std::path::Path;
     struct AlwaysFailSandbox;
     #[async_trait]
     impl engram_core::traits::SandboxBackend for AlwaysFailSandbox {
@@ -1940,13 +1939,15 @@ async fn create_session_failure_marks_session_failed() {
         async fn snapshot(
             &self,
             _id: engram_core::SandboxId,
-            _dest: &Path,
         ) -> Result<engram_core::types::SnapshotMetadata, engram_core::SandboxError> {
             unreachable!()
         }
+        fn snapshot_path_for(&self, _: engram_core::types::SnapshotId) -> std::path::PathBuf {
+            std::path::PathBuf::from("/__test_always_fail_sandbox__")
+        }
         async fn restore(
             &self,
-            _src: std::path::PathBuf,
+            _metadata: engram_core::types::SnapshotMetadata,
         ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
             unreachable!()
         }

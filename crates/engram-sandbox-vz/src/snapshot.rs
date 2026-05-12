@@ -72,6 +72,7 @@ pub(crate) async fn build_metadata(
     dest: &Path,
     image_version: &str,
     disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    snapshot_id: SnapshotId,
 ) -> Result<SnapshotMetadata, SandboxError> {
     let mut size_bytes = 0u64;
     for name in [SNAPSHOT_ROOTFS_FILENAME, MANIFEST_FILENAME] {
@@ -84,7 +85,7 @@ pub(crate) async fn build_metadata(
             .len();
     }
     Ok(SnapshotMetadata {
-        id: SnapshotId::new(),
+        id: snapshot_id,
         size_bytes,
         created_at: Utc::now(),
         image_version: image_version.into(),
@@ -185,14 +186,18 @@ mod tests {
             .unwrap();
 
         let mref = engram_core::types::manifest::ManifestRef::new();
-        let meta = build_metadata(dir.path(), "img:1", Some(mref))
+        let snap_id = SnapshotId::new();
+        let meta = build_metadata(dir.path(), "img:1", Some(mref), snap_id)
             .await
             .unwrap();
         assert_eq!(meta.disk_manifest, Some(mref));
         assert_eq!(meta.image_version, "img:1");
+        assert_eq!(meta.id, snap_id);
 
         // No chunk store wired → caller passes None → field stays None.
-        let meta_no = build_metadata(dir.path(), "img:1", None).await.unwrap();
+        let meta_no = build_metadata(dir.path(), "img:1", None, SnapshotId::new())
+            .await
+            .unwrap();
         assert_eq!(meta_no.disk_manifest, None);
     }
 }

@@ -792,11 +792,14 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // fixed wait works for any rootfs.
         tokio::time::sleep(capture_cfg.boot_wait).await;
 
-        let snap_dir = work.path().join("canonical-snap");
-        let _metadata =
-            engram_core::traits::SandboxBackend::snapshot(&backend, sandbox_id, &snap_dir)
-                .await
-                .map_err(|e| BuildError::Config(format!("canonical bake snapshot: {e}")))?;
+        // ADR 0007 Phase 6: backend owns the staging dir; we look it
+        // up via snapshot_path_for after the snapshot completes so we
+        // can chunk the memory.bin it wrote.
+        let metadata = engram_core::traits::SandboxBackend::snapshot(&backend, sandbox_id)
+            .await
+            .map_err(|e| BuildError::Config(format!("canonical bake snapshot: {e}")))?;
+        let snap_dir =
+            engram_core::traits::SandboxBackend::snapshot_path_for(&backend, metadata.id);
 
         // Snapshot wrote memory.bin into snap_dir. Chunk it into
         // the store.

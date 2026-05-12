@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -148,8 +148,32 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
-    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError>;
-    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError>;
+    /// Snapshot a running sandbox. ADR 0007 Phase 6: the backend
+    /// chooses its own local staging directory (per
+    /// [`Self::snapshot_path_for`]) — coord doesn't dictate where
+    /// the per-host filesystem cache lives any more, because chunks
+    /// in BlobStorage are the cross-host durability primitive and
+    /// the local files are just a cache. Returns the metadata the
+    /// coord persists to the `snapshots` row.
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+
+    /// Restore a sandbox from a previously-taken snapshot. ADR 0007
+    /// Phase 6: takes the metadata directly (carrying the manifest
+    /// refs + snapshot id) rather than a host-local path — the
+    /// backend looks up its own staging dir for `metadata.id` and
+    /// rehydrates from chunks if local files are missing.
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+
+    /// Local-host path where the backend writes/reads snapshot
+    /// artifacts for `snapshot_id`. Used by `PooledBackend` to
+    /// chunk `memory.bin` after `snapshot()` returns and to
+    /// pre-materialise the file before `restore()`. Backends with
+    /// no on-disk snapshot artifacts (e.g. `engram-sandbox-process`)
+    /// return a stable per-snapshot dir even if they don't write
+    /// FC-style files into it — the caller checks for individual
+    /// files before reading.
+    fn snapshot_path_for(&self, snapshot_id: crate::types::SnapshotId) -> PathBuf;
+
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
 

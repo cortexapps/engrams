@@ -44,7 +44,14 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 ///   wire type so the coord can fan out the materialize-dir
 ///   orphan reap to every connected host in `--mode=coordinator`.
 ///   Adding enum variants shifts discriminants; another wire break.
-pub const WIRE_VERSION: u32 = 3;
+/// - v4: ADR 0007 Phase 6 destructive trait reshape. Dropped
+///   `dest_path` from `RequestKind::Snapshot` and replaced
+///   `src_path: String` on `RequestKind::Restore` with
+///   `metadata: SnapshotMetadata`. The backend now chooses its
+///   own local staging dir; the metadata's manifest refs are the
+///   cross-host durability primitive, paths are host-local
+///   caches. Wire shape change to RequestKind variants.
+pub const WIRE_VERSION: u32 = 4;
 
 /// Top-level frame on the wire.
 ///
@@ -151,16 +158,21 @@ pub enum RequestKind {
         sandbox_id: SandboxId,
         request: WireExecRequest,
     },
+    /// ADR 0007 Phase 6: backend chooses its own local staging dir
+    /// via `snapshot_path_for(snapshot_id)`. Coord no longer
+    /// dictates where on the host's filesystem snapshot artifacts
+    /// land — chunks in BlobStorage are the cross-host durability
+    /// primitive; local files are a per-host cache.
     Snapshot {
         sandbox_id: SandboxId,
-        /// Path on the host's filesystem where the snapshot should
-        /// land. Phase 3a single-host (or `--mode=all`) means coord and
-        /// host share a filesystem; multi-host work in 3b refines this
-        /// into a host-relative scheme.
-        dest_path: String,
     },
+    /// ADR 0007 Phase 6: restore by metadata, not by host-local
+    /// path. The backend reads its own staging dir for
+    /// `metadata.id`; PooledBackend wraps to materialise
+    /// `memory.bin` from chunks if the local file was reaped or
+    /// the host is fresh.
     Restore {
-        src_path: String,
+        metadata: SnapshotMetadata,
     },
     /// Host → coord. The standalone host-agent doesn't have direct
     /// `MetadataStore` / KEK access, so it asks the coord to resolve

@@ -18,7 +18,7 @@ use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
 use engram_core::traits::sandbox::{HarnessSink, SandboxBackend};
-use engram_core::types::ids::SandboxId;
+use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -153,6 +153,16 @@ impl VzBackend {
 
     fn vsock_uds_path_for(&self, id: SandboxId) -> PathBuf {
         self.work_dir.join(format!("{id}.vsock"))
+    }
+
+    /// ADR 0007 Phase 6: per-snapshot staging dir, owned by the
+    /// backend. Lives under `<work_dir>/snapshots/<id>/` rather
+    /// than the per-sandbox dir, so destroy(sandbox) doesn't
+    /// take its snapshots with it.
+    fn snapshot_dir_for(&self, snapshot_id: SnapshotId) -> PathBuf {
+        self.work_dir
+            .join("snapshots")
+            .join(snapshot_id.to_string())
     }
 }
 
@@ -474,14 +484,20 @@ impl SandboxBackend for VzBackend {
         drive_exec_protocol(id, reader, writer, cmd).await
     }
 
-    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let (vm, spec, rootfs_path) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             (live.vm.clone(), live.spec.clone(), live.rootfs_path.clone())
         };
-        tokio::fs::create_dir_all(dest).await.map_err(|e| {
+
+        // ADR 0007 Phase 6: allocate snapshot id + derive staging
+        // dir from it. Coord no longer dictates layout.
+        let snapshot_id = SnapshotId::new();
+        let dest = self.snapshot_dir_for(snapshot_id);
+        tokio::fs::create_dir_all(&dest).await.map_err(|e| {
             SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
         })?;
+        let dest = dest.as_path();
 
         // Clone-based snapshot semantics. VZ's
         // `restoreMachineStateFromURL` is broken upstream for
@@ -558,10 +574,16 @@ impl SandboxBackend for VzBackend {
             None
         };
 
-        crate::snapshot::build_metadata(dest, &spec.image, disk_manifest).await
+        crate::snapshot::build_metadata(dest, &spec.image, disk_manifest, snapshot_id).await
     }
 
-    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+    fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
+        self.snapshot_dir_for(snapshot_id)
+    }
+
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        // ADR 0007 Phase 6: backend looks up its own staging dir.
+        let src = self.snapshot_dir_for(metadata.id);
         let manifest = crate::snapshot::read_manifest(&src).await?;
         let snapshot_rootfs = manifest.spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::Snapshot(

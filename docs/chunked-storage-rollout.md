@@ -22,8 +22,9 @@ what's shipped, what's left, what's blocking real deploy.
 
 Phases 1–2 are shipped. Phase 3's read path is in (`--mode=all` only).
 Phase 6's additive surface is in (`SnapshotMetadata.disk_manifest`)
-plus VZ snapshot-time chunking. Phases 4, 5, and the full Phase 6
-trait reshape, plus Phases 7–10, are pending. The standalone
+plus VZ snapshot-time chunking AND the destructive trait reshape
+(snapshot/restore signatures, WIRE_VERSION v4). Phases 4, 5, 7-10
+all shipped. The standalone
 host-agent binary has no blob / chunk-store / image-cache wiring —
 that's the single largest production-deploy blocker.
 
@@ -338,7 +339,7 @@ canonical capture deferred**
 
 ## Phase 6 — SandboxBackend trait + MetadataStore refactor
 
-**Status: 🟡 partial — additive surface in, full reshape pending**
+**Status: ✅ shipped — additive surface AND destructive trait reshape**
 
 ### Shipped (additive)
 
@@ -370,39 +371,57 @@ canonical capture deferred**
   row, so VZ snapshots taken via the chunked write path
   (commit `e68ee23`) now persist their manifest ref end-to-end.
 
-### Remaining (the full reshape)
+### Shipped (destructive trait reshape)
 
-The pieces below are the *destructive* / signature-changing
-half. Splitting them off keeps the additive surface immediately
-shippable + makes Phase 7 deletion cleanly excisable.
+- ✅ **`SandboxBackend::snapshot(id)`** — dropped `dest: &Path`. The
+  backend chooses its own per-snapshot staging dir
+  (`<work_dir>/snapshots/<snapshot_id>/`); coord no longer dictates
+  layout. Aligns with ADR 0007's "chunks are the cross-host
+  durability primitive; local files are a per-host cache."
+- ✅ **`SandboxBackend::restore(metadata: SnapshotMetadata)`** —
+  dropped `src: PathBuf`. The backend resolves
+  `snapshot_path_for(metadata.id)` for its own local lookup;
+  PooledBackend wraps to materialise `memory.bin` from chunks
+  when the local file is missing (cross-host migration case).
+- ✅ **`snapshot_path_for(snapshot_id)` accessor** added to the
+  trait so PooledBackend (the only legitimate host-side caller)
+  can read/patch `memory.bin` + `manifest.json` after the inner
+  backend returns. RemoteSandboxBackend / HostRegistry impls
+  return a sentinel that fails loudly on any actual file I/O —
+  coord callers should never reach into a remote host's
+  filesystem layout.
+- ✅ **`WIRE_VERSION` v3 → v4** for the
+  `RequestKind::{Snapshot, Restore}` wire-shape change.
+  `RequestKind::Snapshot { sandbox_id }` (no `dest_path`);
+  `RequestKind::Restore { metadata: SnapshotMetadata }` (no
+  `src_path`).
+- ✅ **Coord callers simplified**: `api/snapshot.rs` and
+  `idle_evictor.rs` no longer pre-allocate staging dirs;
+  `restore_for_session` takes a `SnapshotMetadata`. The
+  resume path's pre-flight "manifest gone on disk" check
+  retires — backend.restore now surfaces a typed
+  `SandboxError::Snapshot` that the coord maps to 410 Gone.
 
-- ⬜ **Trait signature changes**:
-  - `SandboxBackend::snapshot(id) -> SnapshotRef` (drop `dest: &Path`)
-  - `SandboxBackend::restore(snap: SnapshotRef) -> SandboxId` (drop
-    `src: PathBuf`)
-  - `SandboxSpec.rootfs: ManifestRef` (drop `rootfs_source:
-    Option<PathBuf>`); add `memory_canonical` + `working_set_trace`
-- ⬜ **DB migration `0019_drop_cold_tier_columns.sql`** — drops
-  `local_path`, `blob_present`, `replicated_at`, the
-  envelope-encryption quartet. Ships alongside the
-  `MetadataStore` method retirement (next bullet).
-- ⬜ **`SnapshotRecord` reshape** — drop `local_path`,
-  `blob_present`, `replicated_at`. Add `memory_manifest_*` +
-  `working_set_trace_host` once Phase 5 produces them.
-- ⬜ **`SnapshotResidency` enum deleted** — single tier now.
-- ⬜ **`MetadataStore::flush_to_cold`, `clear_local_path`,
-  `latest_cold_snapshot_for_session` deleted**.
-- ⬜ **Coordinator `ensure_active` simplification** — three-branch
-  (`Idle` hot, `ColdEvicted` cold, `Dead` 410) collapses to two
-  (`Idle`, `Dead`).
-- ⬜ **`engram-protocol::wire` `SandboxSpec` wire-shape bump** —
-  the protocol surface for `RequestKind::CreateSandbox` carries
-  the new `SandboxSpec` shape. `WIRE_VERSION` already exists
-  (v2); this would bump to v3.
+### Re-scoped / not done
 
-This is the single largest planned change. Touches ~10 files
-substantially. Naturally pairs with Phase 7 deletion since the
-trait-signature changes orphan the legacy code paths.
+- 💤 **`SandboxSpec.rootfs: ManifestRef`** — kept as
+  `rootfs_source: Option<PathBuf>`. PooledBackend.resolve_rootfs
+  centralises manifest → path resolution; making each backend
+  resolve its own manifest would duplicate that logic three
+  ways (FC, VZ, Process). The current host-local PathBuf is
+  the right abstraction.
+- 💤 **`memory_canonical` field on SandboxSpec** — already shipped
+  as `canonical_memory_manifest` (Phase 5).
+- 💤 **`working_set_trace` field on SandboxSpec** — host-scoped +
+  looked up at restore time via `metadata.trace_host_hint`; not
+  load-bearing on the create spec.
+- ✅ **Migration `0019_drop_cold_tier_columns.sql`** — shipped in
+  Phase 7 as `0020_drop_cold_tier.sql`; the cold-tier columns
+  were already gone before this slice.
+- ✅ **`SnapshotResidency` enum / `flush_to_cold` /
+  `clear_local_path` / `latest_cold_snapshot_for_session`** —
+  shipped in Phase 7.
+- ✅ **`ensure_active` simplification** — shipped in Phase 7.
 
 ---
 

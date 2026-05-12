@@ -390,6 +390,16 @@ impl FirecrackerBackend {
         &self.work_dir
     }
 
+    /// ADR 0007 Phase 6: per-snapshot staging dir, owned by the
+    /// backend. Snapshots live under `<work_dir>/snapshots/<id>/`
+    /// rather than the per-sandbox jail dir, so a snapshot
+    /// outlives `destroy(sandbox_id)` cleaning the jail.
+    fn snapshot_dir_for(&self, snapshot_id: engram_core::types::SnapshotId) -> PathBuf {
+        self.work_dir
+            .join("snapshots")
+            .join(snapshot_id.to_string())
+    }
+
     pub fn config(&self) -> &FirecrackerConfig {
         &self.config
     }
@@ -1269,7 +1279,7 @@ impl SandboxBackend for FirecrackerBackend {
         }
     }
 
-    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // Read sandbox state under the dashmap guard, drop guard before
         // any await so we don't hold the read lock across an HTTP call.
         let (socket, spec, net_snapshot) = {
@@ -1285,7 +1295,11 @@ impl SandboxBackend for FirecrackerBackend {
             )
         };
 
-        tokio::fs::create_dir_all(dest).await.map_err(|e| {
+        // ADR 0007 Phase 6: allocate the snapshot id first, derive
+        // the staging dir from it. Coord no longer dictates layout.
+        let snapshot_id = SnapshotId::new();
+        let dest = self.snapshot_dir_for(snapshot_id);
+        tokio::fs::create_dir_all(&dest).await.map_err(|e| {
             SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
         })?;
 
@@ -1297,7 +1311,7 @@ impl SandboxBackend for FirecrackerBackend {
         // client timeout fits a 64 MiB VM but trips on larger ones —
         // give the snapshot path 60s explicitly. Tune up for huge VMs.
         let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
-        let paths = api.create_snapshot(dest).await?;
+        let paths = api.create_snapshot(&dest).await?;
 
         let created_at = Utc::now();
         let manifest = FcSnapshotManifest {
@@ -1340,7 +1354,7 @@ impl SandboxBackend for FirecrackerBackend {
         }
 
         Ok(SnapshotMetadata {
-            id: SnapshotId::new(),
+            id: snapshot_id,
             size_bytes,
             created_at,
             image_version: spec.image,
@@ -1358,7 +1372,13 @@ impl SandboxBackend for FirecrackerBackend {
         })
     }
 
-    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError> {
+    fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
+        self.snapshot_dir_for(snapshot_id)
+    }
+
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        // ADR 0007 Phase 6: backend looks up its own staging dir.
+        let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
             .await
             .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
@@ -1740,7 +1760,7 @@ mod tests {
         // (not a Firecracker API error) because we never spawned a
         // VM to talk to.
         let (b, _d) = backend();
-        match b.snapshot(SandboxId::new(), Path::new("/tmp/x")).await {
+        match b.snapshot(SandboxId::new()).await {
             Err(SandboxError::NotFound) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -1748,11 +1768,20 @@ mod tests {
 
     #[tokio::test]
     async fn restore_with_missing_manifest_errors_cleanly() {
-        // Restoring from a non-existent dir shouldn't try to spawn
-        // firecracker — manifest read is the first step and it should
-        // fail loudly with a Snapshot error.
+        // Restoring from a fresh metadata whose snapshot id was
+        // never persisted shouldn't try to spawn firecracker —
+        // manifest read is the first step and it should fail loudly
+        // with a Snapshot error.
         let (b, _d) = backend();
-        match b.restore(PathBuf::from("/nonexistent/snapshot/dir")).await {
+        let metadata = SnapshotMetadata {
+            id: SnapshotId::new(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            image_version: "test:1".into(),
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
                 assert!(
                     msg.contains("manifest"),
@@ -1818,7 +1847,6 @@ mod tests {
         // a clear cross-VMM error rather than reaching FC's
         // load_snapshot with garbage state.bin contents.
         let (b, _d) = backend();
-        let snap_dir = tempfile::tempdir().unwrap();
         let manifest = serde_json::json!({
             "sandbox_id": "00000000-0000-0000-0000-000000000000",
             "created_at": "2026-01-01T00:00:00Z",
@@ -1838,13 +1866,26 @@ mod tests {
             },
             "format": "vz"
         });
+        // Phase 6: backend owns its staging dir. Plant the VZ-tagged
+        // manifest where the backend will look for snapshot_id.
+        let snapshot_id = SnapshotId::new();
+        let snap_path = b.snapshot_path_for(snapshot_id);
+        tokio::fs::create_dir_all(&snap_path).await.unwrap();
         tokio::fs::write(
-            snap_dir.path().join("manifest.json"),
+            snap_path.join("manifest.json"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .await
         .unwrap();
-        match b.restore(snap_dir.path().to_path_buf()).await {
+        let metadata = SnapshotMetadata {
+            id: snapshot_id,
+            size_bytes: 0,
+            created_at: Utc::now(),
+            image_version: "test:1".into(),
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
                 assert!(
                     msg.contains("not 'fc'") && msg.contains("cross-VMM"),

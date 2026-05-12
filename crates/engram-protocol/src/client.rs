@@ -570,18 +570,10 @@ impl SandboxBackend for RemoteSandboxBackend {
         })
     }
 
-    async fn snapshot(
-        &self,
-        id: SandboxId,
-        dest: &std::path::Path,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        let dest_str = dest.to_string_lossy().into_owned();
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         match self
             .host
-            .unary(RequestKind::Snapshot {
-                sandbox_id: id,
-                dest_path: dest_str,
-            })
+            .unary(RequestKind::Snapshot { sandbox_id: id })
             .await
         {
             Ok(ResponseKind::Snapshotted { metadata }) => Ok(metadata),
@@ -592,19 +584,29 @@ impl SandboxBackend for RemoteSandboxBackend {
         }
     }
 
-    async fn restore(&self, src: std::path::PathBuf) -> Result<SandboxId, SandboxError> {
-        let src_str = src.to_string_lossy().into_owned();
-        match self
-            .host
-            .unary(RequestKind::Restore { src_path: src_str })
-            .await
-        {
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        match self.host.unary(RequestKind::Restore { metadata }).await {
             Ok(ResponseKind::Restored { sandbox_id }) => Ok(sandbox_id),
             Ok(other) => Err(SandboxError::Vm(Box::new(StringError(format!(
                 "unexpected response: {other:?}"
             ))))),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn snapshot_path_for(
+        &self,
+        _snapshot_id: engram_core::types::SnapshotId,
+    ) -> std::path::PathBuf {
+        // ADR 0007 Phase 6 contract: `snapshot_path_for` is host-
+        // local. RemoteSandboxBackend wraps a connection to a
+        // different host — paths there are meaningless here.
+        // PooledBackend (the only legitimate caller) is host-side
+        // and never wraps a RemoteSandboxBackend, so this branch
+        // shouldn't be reached in production. The sentinel path
+        // is intentionally implausible so any errant caller fails
+        // loudly on file I/O rather than corrupting a real path.
+        std::path::PathBuf::from("/__engram_remote_backend_no_local_path__")
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {

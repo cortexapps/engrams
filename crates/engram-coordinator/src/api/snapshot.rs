@@ -21,7 +21,7 @@ use axum::Json;
 use chrono::Utc;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{Session, SessionStatus};
-use engram_core::{SandboxId, SessionId};
+use engram_core::{SandboxError, SandboxId, SessionId};
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -48,38 +48,13 @@ pub async fn snapshot(
         )
     })?;
 
-    // Snapshots live under `<local_path>/snapshots/<session>/<dir>`.
-    // The directory name is initially a placeholder UUID — once the
-    // backend returns its SnapshotId we rename to that, so the
-    // resume path can reconstruct the path deterministically from
-    // `(snapshot_dir, session_id, snapshot_id)` without persisting
-    // a local_path column.
-    let staging = state
-        .snapshot_dir()
-        .join(id.to_string())
-        .join(uuid::Uuid::new_v4().to_string());
-    tokio::fs::create_dir_all(&staging)
-        .await
-        .map_err(|e| ApiError::Internal(format!("create snapshot dir: {e}")))?;
-
-    let metadata = state
-        .services
-        .sandbox
-        .snapshot(sandbox_id, &staging)
-        .await?;
-    let dest = state
-        .snapshot_dir()
-        .join(id.to_string())
-        .join(metadata.id.to_string());
-    if staging != dest {
-        if let Err(e) = tokio::fs::rename(&staging, &dest).await {
-            return Err(ApiError::Internal(format!(
-                "rename snapshot {} -> {}: {e}",
-                staging.display(),
-                dest.display(),
-            )));
-        }
-    }
+    // ADR 0007 Phase 6: backend owns its staging dir. Coord no
+    // longer pre-allocates a path — the backend's
+    // `snapshot_path_for(metadata.id)` is the canonical reference
+    // for the on-disk location. Cross-host durability flows
+    // through the chunked manifests on `SnapshotMetadata`, not
+    // through the local path.
+    let metadata = state.services.sandbox.snapshot(sandbox_id).await?;
 
     let now = Utc::now();
     // Record the host that wrote this snapshot to its local disk so
@@ -257,35 +232,14 @@ async fn resume_from_fc_snapshot(
     // `(snapshot_dir, session_id, snapshot_id)`. The snapshot path
     // wrote the directory at this exact location; the chunked
     // manifests on the row carry the durable copy.
-    let local_path = state
-        .snapshot_dir()
-        .join(id.to_string())
-        .join(record.id.to_string());
-    // Pre-flight: if the snapshot dir or manifest disappeared on
-    // disk (host wiped /var, operator rm'd, FC's own writes failed
-    // halfway), the restore call below would surface as a generic
-    // 500. Treat the missing-file case as terminal-Dead, 410 Gone —
-    // the caller's affordance ("fork the workspace") is the same.
-    // Cross-host materialization (rehydrate from chunks if local
-    // dir is missing) is the follow-up task.
-    let manifest_path = local_path.join("manifest.json");
-    if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
-        tracing::warn!(
-            session_id = %id,
-            path = %manifest_path.display(),
-            "snapshot manifest missing on disk; marking session Dead",
-        );
-        let _ = state
-            .services
-            .meta
-            .set_session_status(id, SessionStatus::Dead)
-            .await;
-        return Err(ApiError::Gone(
-            "snapshot_invalidated: session can't be revived; \
-             use `engram session fork <id>` to continue from the workspace"
-                .into(),
-        ));
-    }
+    // ADR 0007 Phase 6: coord no longer pre-resolves a local path.
+    // The backend's `snapshot_path_for(record.id)` is the canonical
+    // host-local reference; PooledBackend.restore wraps to
+    // materialise memory.bin from chunks if it's missing. The
+    // "snapshot manifest gone on disk" pre-flight that lived here
+    // is now the backend's responsibility — restore() returns a
+    // typed SandboxError::Snapshot on missing artifacts, which
+    // we map to 410 Gone below.
     let session_for_ctx = session.clone();
     // ScheduleContext keys warm-pool affinity by `(repo, tag)`. With
     // raw-URI image refs we split here for the affinity hint —
@@ -299,10 +253,46 @@ async fn resume_from_fc_snapshot(
         prefer_snapshot_id: Some(record.id),
         memory_mib: None,
     };
-    let (host_id, new_sandbox_id) = state
+    // Build the SnapshotMetadata the trait now takes. The record
+    // carries every field we need; we just round-trip it back into
+    // the engine type the backend expects.
+    let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
+        id: record.id,
+        size_bytes: record.size_bytes,
+        created_at: record.created_at,
+        image_version: record.image_version.clone(),
+        disk_manifest: record.disk_manifest,
+        memory_manifest: record.memory_manifest,
+    };
+    let (host_id, new_sandbox_id) = match state
         .host_registry
-        .restore_for_session(&ctx, local_path)
-        .await?;
+        .restore_for_session(&ctx, restore_metadata)
+        .await
+    {
+        Ok(v) => v,
+        Err(SandboxError::Snapshot(msg)) => {
+            // Lost local artifacts on every viable host — chunked
+            // restore couldn't rehydrate from the manifest either.
+            // Mark Dead + surface the same affordance the missing-
+            // manifest preflight used to return.
+            tracing::warn!(
+                session_id = %id,
+                error = %msg,
+                "snapshot restore failed; marking session Dead",
+            );
+            let _ = state
+                .services
+                .meta
+                .set_session_status(id, SessionStatus::Dead)
+                .await;
+            return Err(ApiError::Gone(
+                "snapshot_invalidated: session can't be revived; \
+                 use `engram session fork <id>` to continue from the workspace"
+                    .into(),
+            ));
+        }
+        Err(e) => return Err(ApiError::from(e)),
+    };
     bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
     // Re-launch the per-session agent so the in-VM bootstrap
     // supervisor kill+respawns the harness for the restored sandbox.
