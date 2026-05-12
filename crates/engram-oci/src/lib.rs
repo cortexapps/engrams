@@ -112,11 +112,21 @@ impl OciClient {
     /// Push a bake image artifact. Up to three layers:
     ///
     /// - layer 0: `manifest.toml` content (uncompressed bytes)
-    /// - layer 1: `rootfs.ext4` content (raw bytes, large)
+    /// - layer 1 (optional): `rootfs.ext4` content (raw bytes,
+    ///   large). Skipped when `bundle_json` is `Some` — ADR 0007
+    ///   chunked storage moves disk bytes into the chunk store, so
+    ///   pushing the full ext4 in the OCI layer is wire-redundant
+    ///   (every push would otherwise transfer the disk twice:
+    ///   chunks via BlobStorage, then bytes via the registry).
     /// - layer 2 (optional): `bundle.json` — ADR 0007 chunk-manifest
-    ///   pointer set (tiny). Pullers that understand the bundle can
-    ///   skip the rootfs layer in favor of chunk-store resolution
-    ///   once SandboxBackend takes `ManifestRef` natively (Phase 6).
+    ///   pointer set (tiny). Pullers that understand the bundle
+    ///   resolve disk bytes from the chunk store via its
+    ///   `disk_manifest`.
+    ///
+    /// At least one of `rootfs_ext4` or `bundle_json` must be
+    /// provided — a pure-manifest push has no consumable disk
+    /// bytes, and we return a typed error so callers can't push
+    /// half-formed artifacts.
     ///
     /// `config_json` is small JSON metadata (format, agent version,
     /// transport) used by the host-agent at pull time to validate
@@ -125,10 +135,15 @@ impl OciClient {
         &self,
         uri: &str,
         manifest_toml: &[u8],
-        rootfs_ext4: &Path,
+        rootfs_ext4: Option<&Path>,
         config_json: &[u8],
         bundle_json: Option<&[u8]>,
     ) -> Result<Digest256, OciError> {
+        if rootfs_ext4.is_none() && bundle_json.is_none() {
+            return Err(OciError::InvalidUri(
+                "push_image: must supply rootfs_ext4 OR bundle_json".into(),
+            ));
+        }
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
@@ -140,13 +155,15 @@ impl OciClient {
             ENGRAM_MANIFEST_MEDIA_TYPE.to_string(),
             None,
         );
-        let rootfs_bytes = read_file_bytes(rootfs_ext4).await?;
-        let rootfs_layer = ImageLayer::new(
-            rootfs_bytes,
-            ENGRAM_ROOTFS_EXT4_MEDIA_TYPE.to_string(),
-            None,
-        );
-        let mut layers = vec![manifest_layer, rootfs_layer];
+        let mut layers = vec![manifest_layer];
+        if let Some(rootfs_path) = rootfs_ext4 {
+            let rootfs_bytes = read_file_bytes(rootfs_path).await?;
+            layers.push(ImageLayer::new(
+                rootfs_bytes,
+                ENGRAM_ROOTFS_EXT4_MEDIA_TYPE.to_string(),
+                None,
+            ));
+        }
         if let Some(bytes) = bundle_json {
             layers.push(ImageLayer::new(
                 bytes.to_vec(),
@@ -225,9 +242,16 @@ impl OciClient {
         let manifest_path = manifest_path.ok_or_else(|| {
             OciError::Distribution("pulled artifact missing engram manifest layer".into())
         })?;
-        let rootfs_path = rootfs_path.ok_or_else(|| {
-            OciError::Distribution("pulled artifact missing engram rootfs.ext4 layer".into())
-        })?;
+        // ADR 0007 Phase 6: the rootfs.ext4 layer is optional when
+        // the artifact carries a `bundle.json` (disk bytes flow
+        // through the chunk store instead). Reject only when *both*
+        // are missing — that's a malformed artifact, no disk bytes
+        // are reachable.
+        if rootfs_path.is_none() && bundle_path.is_none() {
+            return Err(OciError::Distribution(
+                "pulled artifact missing both rootfs.ext4 and bundle.json layers".into(),
+            ));
+        }
 
         Ok(PulledImage {
             manifest_path,
@@ -372,7 +396,12 @@ impl Digest256 {
 #[derive(Clone, Debug)]
 pub struct PulledImage {
     pub manifest_path: PathBuf,
-    pub rootfs_path: PathBuf,
+    /// ADR 0007: `None` when the registry artifact carried only the
+    /// `bundle.json` (chunked-storage path; rootfs bytes live in
+    /// the chunk store, indexed by the bundle's `disk_manifest`).
+    /// `Some(path)` for legacy or no-bundle artifacts where the
+    /// rootfs.ext4 layer is the only source of disk bytes.
+    pub rootfs_path: Option<PathBuf>,
     /// ADR 0007: bundle.json sidecar pointing at chunk-store
     /// manifests. Present for images baked after the chunked-
     /// storage rollout, absent for older artifacts (we still
@@ -525,6 +554,35 @@ mod tests {
     async fn anonymous_resolver_returns_none() {
         let r = AnonymousResolver;
         assert!(r.resolve("anything").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn push_image_rejects_neither_rootfs_nor_bundle() {
+        // The OCI push must always carry consumable disk bytes —
+        // pushing just a manifest is a malformed artifact. Asserts
+        // that the guard fires synchronously before any network I/O,
+        // so a bad caller in CI doesn't depend on an unreachable
+        // registry to surface the error.
+        let client = OciClient::new(std::sync::Arc::new(AnonymousResolver));
+        let err = client
+            .push_image(
+                "localhost:5000/test:t1",
+                b"manifest = 'toml'",
+                None,
+                b"{}",
+                None,
+            )
+            .await
+            .expect_err("must reject neither-source push");
+        match err {
+            OciError::InvalidUri(msg) => {
+                assert!(
+                    msg.contains("rootfs_ext4 OR bundle_json"),
+                    "expected explanatory error, got: {msg}",
+                );
+            }
+            other => panic!("expected InvalidUri, got {other:?}"),
+        }
     }
 
     #[tokio::test]

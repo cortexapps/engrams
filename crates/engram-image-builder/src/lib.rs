@@ -894,11 +894,24 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             None
         };
 
+        // ADR 0007 Phase 6: skip the rootfs.ext4 layer when the
+        // bundle is present. Disk bytes already live in the chunk
+        // store (`Builder::build` chunked them at bake time); the
+        // OCI layer is pure duplication. For a 4 GiB rootfs that's
+        // 4 GiB of wasted registry bandwidth + storage per push.
+        // No-bundle bakes (legacy, dev-only) still ship the full
+        // ext4 layer as a fallback.
+        let rootfs_arg: Option<&Path> = if bundle_bytes.is_some() {
+            None
+        } else {
+            Some(outcome.rootfs_path.as_path())
+        };
+
         let digest = oci
             .push_image(
                 &full_uri,
                 &manifest_bytes,
-                &outcome.rootfs_path,
+                rootfs_arg,
                 &config_bytes,
                 bundle_bytes.as_deref(),
             )

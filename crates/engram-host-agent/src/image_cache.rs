@@ -94,24 +94,39 @@ impl ImageCache {
 
     /// Ensure the bake image at `uri` is materialised in the cache.
     /// On a hit, returns the cached paths without a network round
-    /// trip. On a miss, pulls via OCI and writes both layers.
+    /// trip. On a miss, pulls via OCI and writes the layers the
+    /// artifact actually carries.
+    ///
+    /// ADR 0007 Phase 6: `rootfs.ext4` is optional in the cache —
+    /// chunked-storage pushes only ship `bundle.json` + `manifest.toml`,
+    /// and disk bytes are resolved on demand through the chunk store.
     pub async fn ensure_image(&self, uri: &str) -> Result<CachedImage, CacheError> {
         // Cache hit fast-path: known URI + digest dir still exists.
         if let Some(digest) = self.lookup(&self.inner.image_map, uri) {
             let dir = self.image_dir(&digest);
             let manifest_path = dir.join("manifest.toml");
             let rootfs_path = dir.join("rootfs.ext4");
-            if fs::try_exists(&manifest_path).await.unwrap_or(false)
-                && fs::try_exists(&rootfs_path).await.unwrap_or(false)
-            {
-                touch(&dir).await;
-                let bundle = read_bundle(&dir.join("bundle.json")).await?;
-                return Ok(CachedImage {
-                    manifest_path,
-                    rootfs_path,
-                    bundle,
-                    digest,
-                });
+            let bundle_path = dir.join("bundle.json");
+            if fs::try_exists(&manifest_path).await.unwrap_or(false) {
+                let has_rootfs = fs::try_exists(&rootfs_path).await.unwrap_or(false);
+                let has_bundle = fs::try_exists(&bundle_path).await.unwrap_or(false);
+                // Cache entry is consumable iff at least one disk
+                // source is present (rootfs file OR bundle pointing
+                // at chunks).
+                if has_rootfs || has_bundle {
+                    touch(&dir).await;
+                    let bundle = if has_bundle {
+                        read_bundle(&bundle_path).await?
+                    } else {
+                        None
+                    };
+                    return Ok(CachedImage {
+                        manifest_path,
+                        rootfs_path: has_rootfs.then_some(rootfs_path),
+                        bundle,
+                        digest,
+                    });
+                }
             }
             // Stale map entry: the dir was GC'd. Fall through to re-pull.
             tracing::debug!(uri = %uri, digest = %digest, "cache map references missing dir; re-pulling");
@@ -148,9 +163,11 @@ impl ImageCache {
         self.update_map(&self.inner.image_map, uri, &digest).await;
 
         let bundle = read_bundle(&final_dir.join("bundle.json")).await?;
+        let rootfs_path = final_dir.join("rootfs.ext4");
+        let rootfs_present = fs::try_exists(&rootfs_path).await.unwrap_or(false);
         Ok(CachedImage {
             manifest_path: final_dir.join("manifest.toml"),
-            rootfs_path: final_dir.join("rootfs.ext4"),
+            rootfs_path: rootfs_present.then_some(rootfs_path),
             bundle,
             digest,
         })
@@ -455,7 +472,13 @@ impl ImageCache {
 #[derive(Clone, Debug)]
 pub struct CachedImage {
     pub manifest_path: PathBuf,
-    pub rootfs_path: PathBuf,
+    /// ADR 0007 Phase 6: `None` when the image artifact carried only
+    /// the `bundle.json` (chunked-storage push path skips the
+    /// `rootfs.ext4` layer to avoid duplicating chunks). Consumers
+    /// that need raw rootfs bytes must read via `bundle.disk_manifest`
+    /// through the chunk store. `Some(path)` for legacy artifacts
+    /// (no bundle present).
+    pub rootfs_path: Option<PathBuf>,
     /// ADR 0007: parsed bundle.json content, when the image carries
     /// one. Phase 4/5 wire this into FC's NBD disk + UFFD memory
     /// adapters; today it's plumbed through so adopters can find

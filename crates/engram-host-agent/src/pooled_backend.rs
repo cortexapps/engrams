@@ -46,6 +46,26 @@ fn nbd_state_none() -> NbdStateSlot {
 #[cfg(not(target_os = "linux"))]
 fn nbd_state_none() -> NbdStateSlot {}
 
+/// Return the cached image's legacy `rootfs.ext4` path or a
+/// typed error when neither it nor a bundle is present.
+///
+/// ADR 0007 Phase 6: chunked-storage OCI pushes ship only
+/// `bundle.json`; the disk is resolved through the chunk store.
+/// Callers hit this helper on the fallback paths (no chunk_store
+/// wired, or no bundle on the image) — at that point we *need* a
+/// concrete file, and the absence of both rootfs.ext4 AND bundle
+/// is a config error worth surfacing loudly rather than papering
+/// over.
+fn legacy_rootfs_path(cached: &CachedImage) -> Result<PathBuf, SandboxError> {
+    cached.rootfs_path.clone().ok_or_else(|| {
+        SandboxError::InvalidSpec(format!(
+            "image {} has neither rootfs.ext4 nor a chunk-store path resolvable here \
+             (host missing chunk_store/materialize_dir wiring?)",
+            cached.digest,
+        ))
+    })
+}
+
 /// Wraps an inner [`SandboxBackend`] with warm-pool semantics. `create`
 /// looks for a warm slot first; on miss it forwards to `inner` and
 /// kicks off a background `replenish` so the next session gets the
@@ -231,11 +251,11 @@ impl PooledBackend {
         let (chunk_store, materialize_dir) =
             match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
                 (Some(cs), Some(dir)) => (cs, dir),
-                _ => return Ok((cached.rootfs_path.clone(), nbd_state_none())),
+                _ => return Ok((legacy_rootfs_path(cached)?, nbd_state_none())),
             };
         let bundle = match cached.bundle.as_ref() {
             Some(b) => b,
-            None => return Ok((cached.rootfs_path.clone(), nbd_state_none())),
+            None => return Ok((legacy_rootfs_path(cached)?, nbd_state_none())),
         };
         let path = materialize_chunked_rootfs(
             chunk_store,
