@@ -209,6 +209,10 @@ impl OciClient {
             ENGRAM_MANIFEST_MEDIA_TYPE,
             ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
             ENGRAM_BUNDLE_MEDIA_TYPE,
+            ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
+            ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
+            ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE,
+            ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -223,6 +227,10 @@ impl OciClient {
         let mut manifest_path = None;
         let mut rootfs_path = None;
         let mut bundle_path = None;
+        let mut disk_bootstrap_path = None;
+        let mut disk_chunks_blob_digest = None;
+        let mut memory_bootstrap_path = None;
+        let mut memory_chunks_blob_digest = None;
         for layer in &data.layers {
             match layer.media_type.as_str() {
                 ENGRAM_MANIFEST_MEDIA_TYPE => {
@@ -240,6 +248,28 @@ impl OciClient {
                     write_file_bytes(&p, &layer.data).await?;
                     bundle_path = Some(p);
                 }
+                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE => {
+                    let p = dest.join("bootstrap.disk.json");
+                    write_file_bytes(&p, &layer.data).await?;
+                    disk_bootstrap_path = Some(p);
+                }
+                ENGRAM_CHUNKS_DISK_MEDIA_TYPE => {
+                    // We deliberately do *not* write the chunk blob
+                    // to disk. The whole point of Nydus-shaped
+                    // artifacts is that chunks are Range-GETted
+                    // lazily — pulling the full blob defeats that.
+                    // Record the layer digest so the resolver can
+                    // address it later.
+                    disk_chunks_blob_digest = Some(sha256_digest(&layer.data).0);
+                }
+                ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE => {
+                    let p = dest.join("bootstrap.memory.json");
+                    write_file_bytes(&p, &layer.data).await?;
+                    memory_bootstrap_path = Some(p);
+                }
+                ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE => {
+                    memory_chunks_blob_digest = Some(sha256_digest(&layer.data).0);
+                }
                 other => {
                     tracing::debug!(media_type = %other, "skipping unrecognized layer");
                 }
@@ -250,12 +280,13 @@ impl OciClient {
         })?;
         // ADR 0007 Phase 6: the rootfs.ext4 layer is optional when
         // the artifact carries a `bundle.json` (disk bytes flow
-        // through the chunk store instead). Reject only when *both*
-        // are missing — that's a malformed artifact, no disk bytes
-        // are reachable.
-        if rootfs_path.is_none() && bundle_path.is_none() {
+        // through the chunk store instead). Reject only when *all*
+        // disk sources are missing — no rootfs, no bundle, no
+        // chunked-OCI bootstrap. That's a malformed artifact.
+        if rootfs_path.is_none() && bundle_path.is_none() && disk_bootstrap_path.is_none() {
             return Err(OciError::Distribution(
-                "pulled artifact missing both rootfs.ext4 and bundle.json layers".into(),
+                "pulled artifact missing rootfs.ext4, bundle.json, and chunked-OCI bootstrap layers"
+                    .into(),
             ));
         }
 
@@ -263,6 +294,10 @@ impl OciClient {
             manifest_path,
             rootfs_path,
             bundle_path,
+            disk_bootstrap_path,
+            disk_chunks_blob_digest,
+            memory_bootstrap_path,
+            memory_chunks_blob_digest,
             manifest_digest: Digest256(data.digest.unwrap_or_default()),
         })
     }
@@ -383,6 +418,111 @@ impl OciClient {
         &self.inner
     }
 
+    /// Push a Nydus-shaped chunked image artifact (ADR 0008 Phase 3).
+    ///
+    /// Layers pushed (in order):
+    ///
+    /// - `manifest.toml` (always)
+    /// - `bundle.json` v2 (always — carries the bootstrap layer
+    ///   digests so consumers can locate them)
+    /// - `bootstrap.disk.v1+json` (always)
+    /// - `chunks.disk.v1` (always)
+    /// - `bootstrap.memory.v1+json` (when canonical memory was
+    ///   captured at bake time)
+    /// - `chunks.memory.v1` (paired with the memory bootstrap)
+    ///
+    /// The bake is expected to have pre-computed the bootstrap +
+    /// chunk-blob bytes via `engram_chunk_store::Bootstrap::build_from_manifest`
+    /// and to have written their sha256 digests into `bundle.json`
+    /// before passing the bytes here. The OCI registry verifies the
+    /// digests at push time.
+    ///
+    /// Note on memory cost: chunk-blob layers are passed as
+    /// `Vec<u8>`; a 4 GiB ext4 image gives a 4 GiB allocation. v1
+    /// accepts this; the obvious follow-up is a streaming push that
+    /// reads from a temp file. The `oci-client` API doesn't expose
+    /// streaming pushes today (`ImageLayer::new` takes owned bytes),
+    /// so this is non-trivial — leave for when bakes hit memory
+    /// pressure on a real builder.
+    pub async fn push_chunked_image(
+        &self,
+        uri: &str,
+        payload: ChunkedPushPayload,
+    ) -> Result<Digest256, OciError> {
+        // Symmetric guard: memory bootstrap and chunks must travel
+        // together. A bootstrap without its chunk blob is
+        // unconsumable; a chunk blob without its bootstrap is
+        // un-addressable. Fail synchronously so a misconfigured
+        // bake doesn't push a half-baked artifact.
+        match (
+            payload.memory_bootstrap_json.is_some(),
+            payload.memory_chunks_blob.is_some(),
+        ) {
+            (true, true) | (false, false) => {}
+            _ => {
+                return Err(OciError::InvalidUri(
+                    "push_chunked_image: memory_bootstrap and memory_chunks must be \
+                     supplied together (both Some, or both None)"
+                        .into(),
+                ));
+            }
+        }
+        let reference: Reference = uri
+            .parse()
+            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
+        let client = Self::client_for(&reference);
+        let auth = self.auth_for(&reference).await?;
+
+        let mut layers = vec![
+            ImageLayer::new(
+                payload.manifest_toml,
+                ENGRAM_MANIFEST_MEDIA_TYPE.to_string(),
+                None,
+            ),
+            ImageLayer::new(
+                payload.bundle_json,
+                ENGRAM_BUNDLE_MEDIA_TYPE.to_string(),
+                None,
+            ),
+            ImageLayer::new(
+                payload.disk_bootstrap_json,
+                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE.to_string(),
+                None,
+            ),
+            ImageLayer::new(
+                payload.disk_chunks_blob,
+                ENGRAM_CHUNKS_DISK_MEDIA_TYPE.to_string(),
+                None,
+            ),
+        ];
+        if let Some(memory_bootstrap) = payload.memory_bootstrap_json {
+            layers.push(ImageLayer::new(
+                memory_bootstrap,
+                ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE.to_string(),
+                None,
+            ));
+        }
+        if let Some(memory_chunks) = payload.memory_chunks_blob {
+            layers.push(ImageLayer::new(
+                memory_chunks,
+                ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE.to_string(),
+                None,
+            ));
+        }
+
+        let config = Config::new(
+            payload.config_json,
+            ENGRAM_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+            None,
+        );
+
+        let resp: PushResponse = client
+            .push(&reference, &layers, config, &auth, None)
+            .await
+            .map_err(|e| OciError::Distribution(e.to_string()))?;
+        Ok(Digest256(resp.manifest_url))
+    }
+
     /// Fetch a byte range from an OCI blob via an HTTP `Range`
     /// request. Used by [`OciChunkResolver`] (ADR 0008 Phase 2) to
     /// pull a single chunk out of a chunked OCI blob layer without
@@ -490,7 +630,44 @@ pub struct PulledImage {
     /// storage rollout, absent for older artifacts (we still
     /// accept those during the transition window).
     pub bundle_path: Option<PathBuf>,
+    /// ADR 0008 Phase 3: bootstrap layer for the disk side
+    /// (Nydus-shaped chunked artifact). When `Some`, the artifact
+    /// carries chunks as OCI layers and the host's tiered fault
+    /// path can Range-GET them from the registry directly.
+    pub disk_bootstrap_path: Option<PathBuf>,
+    /// ADR 0008 Phase 3: disk chunk-blob layer digest. The actual
+    /// blob bytes are *not* pulled by `pull_image` — the host fetches
+    /// individual chunks via Range GET on fault. We record only the
+    /// layer digest here so the runtime resolver can address the
+    /// blob.
+    pub disk_chunks_blob_digest: Option<String>,
+    /// ADR 0008 Phase 3: optional memory bootstrap. Mirrors the
+    /// disk fields; only present on bakes that captured canonical
+    /// memory.
+    pub memory_bootstrap_path: Option<PathBuf>,
+    pub memory_chunks_blob_digest: Option<String>,
     pub manifest_digest: Digest256,
+}
+
+/// Payload for [`OciClient::push_chunked_image`]. All-bytes shape
+/// keeps the call-site obvious; the image-builder constructs this
+/// after running `Bootstrap::build_from_manifest` to produce the
+/// per-kind bootstrap + chunk-blob bytes.
+#[derive(Clone, Debug)]
+pub struct ChunkedPushPayload {
+    pub manifest_toml: Vec<u8>,
+    pub config_json: Vec<u8>,
+    /// `bundle.json` v2 — carries the disk bootstrap/chunks layer
+    /// digests so the host's `image_cache` can resolve them.
+    pub bundle_json: Vec<u8>,
+    pub disk_bootstrap_json: Vec<u8>,
+    pub disk_chunks_blob: Vec<u8>,
+    /// Optional canonical-memory side. Both must be `Some` together
+    /// or neither; an asymmetric payload is rejected at push time
+    /// because a memory bootstrap without its chunk blob is
+    /// unconsumable.
+    pub memory_bootstrap_json: Option<Vec<u8>>,
+    pub memory_chunks_blob: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -663,6 +840,47 @@ mod tests {
                     msg.contains("rootfs_ext4 OR bundle_json"),
                     "expected explanatory error, got: {msg}",
                 );
+            }
+            other => panic!("expected InvalidUri, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_chunked_image_rejects_asymmetric_memory_payload() {
+        // ADR 0008 Phase 3: a memory bootstrap without its paired
+        // chunk blob (or vice versa) is malformed. Reject
+        // synchronously before any registry I/O.
+        let client = OciClient::new(std::sync::Arc::new(AnonymousResolver));
+        let base = ChunkedPushPayload {
+            manifest_toml: b"manifest = 'toml'".to_vec(),
+            config_json: b"{}".to_vec(),
+            bundle_json: b"{}".to_vec(),
+            disk_bootstrap_json: b"{}".to_vec(),
+            disk_chunks_blob: b"data".to_vec(),
+            memory_bootstrap_json: None,
+            memory_chunks_blob: None,
+        };
+
+        // Bootstrap but no blob → reject.
+        let p = ChunkedPushPayload {
+            memory_bootstrap_json: Some(b"{}".to_vec()),
+            ..base.clone()
+        };
+        match client.push_chunked_image("localhost:5000/test:t1", p).await {
+            Err(OciError::InvalidUri(msg)) => {
+                assert!(msg.contains("memory_bootstrap"), "got: {msg}");
+            }
+            other => panic!("expected InvalidUri, got {other:?}"),
+        }
+
+        // Blob but no bootstrap → reject.
+        let p = ChunkedPushPayload {
+            memory_chunks_blob: Some(b"data".to_vec()),
+            ..base
+        };
+        match client.push_chunked_image("localhost:5000/test:t1", p).await {
+            Err(OciError::InvalidUri(msg)) => {
+                assert!(msg.contains("memory_bootstrap"), "got: {msg}");
             }
             other => panic!("expected InvalidUri, got {other:?}"),
         }

@@ -26,3 +26,32 @@ pub const ENGRAM_HARNESS_CONFIG_MEDIA_TYPE: &str = "application/vnd.engram.harne
 
 /// Harness pack layer — gzip'd tar of the pack directory.
 pub const ENGRAM_HARNESS_TAR_MEDIA_TYPE: &str = "application/vnd.engram.harness.tar.v1+gzip";
+
+// ---- ADR 0008 Phase 3: Nydus-shaped chunked image layers ----
+//
+// A chunked image artifact carries (bootstrap, chunk_blob) per
+// kind (disk, memory). The bootstrap is a small JSON index from
+// `ChunkHash` to `(blob_offset, length)`; the chunk blob is the
+// concatenation of all chunks in bootstrap-entry order, pulled
+// lazily via Range GET at fault time.
+
+/// Bootstrap layer for the disk side. JSON content; see
+/// `engram_chunk_store::Bootstrap`.
+pub const ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE: &str = "application/vnd.engram.bootstrap.disk.v1+json";
+
+/// Chunk-blob layer for the disk side. Opaque concatenation of
+/// 16 MiB chunks; consumers do Range GET against the OCI registry's
+/// `/v2/<repo>/blobs/<digest>` endpoint to pull individual chunks.
+pub const ENGRAM_CHUNKS_DISK_MEDIA_TYPE: &str = "application/vnd.engram.chunks.disk.v1";
+
+/// Bootstrap layer for the canonical memory side. Same shape as
+/// the disk bootstrap; entries are 512 KB chunks of a memory.bin.
+/// Optional in the artifact — only present on bakes that ran
+/// canonical-memory capture.
+pub const ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE: &str =
+    "application/vnd.engram.bootstrap.memory.v1+json";
+
+/// Chunk-blob layer for the canonical memory side. Concatenated
+/// 512 KB chunks. Pulled via Range GET on UFFD fault when the
+/// chunk isn't in the local NVMe cache and isn't in BlobStorage.
+pub const ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE: &str = "application/vnd.engram.chunks.memory.v1";
