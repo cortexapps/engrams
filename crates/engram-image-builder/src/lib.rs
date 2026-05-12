@@ -98,6 +98,20 @@ pub struct BuildRequest {
     /// `/dev/kvm` on the runner; non-KVM CI lanes set this
     /// `None` and rely on the pre-computed path above.
     pub capture_canonical_memory: Option<CanonicalCaptureConfig>,
+    /// ADR 0008 Phase 4: parent image's bootstrap, for cross-image
+    /// chunk dedup. When `Some`, the disk-side bootstrap walks the
+    /// parent's entries and reuses any chunk hashes that match —
+    /// the child's diff blob then only contains chunks unique to
+    /// this image. Must be paired with `parent_chunks_blob_digest`
+    /// — the OCI layer digest of the parent's chunks blob, which
+    /// the child's bootstrap entries inherit for shared chunks.
+    ///
+    /// `None` (default) produces a fully self-contained chunk blob
+    /// (today's behavior).
+    pub parent_disk_bootstrap_path: Option<PathBuf>,
+    /// OCI layer digest of the parent's disk chunks blob. Required
+    /// when `parent_disk_bootstrap_path` is set; ignored otherwise.
+    pub parent_disk_chunks_blob_digest: Option<String>,
 }
 
 /// Bake-time canonical memory capture parameters. ADR 0007 Phase 5.
@@ -725,10 +739,48 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 .get_manifest(disk_ref)
                 .await
                 .map_err(|e| BuildError::Config(format!("re-read disk manifest: {e}")))?;
-            let (bootstrap, blob) =
-                engram_chunk_store::Bootstrap::build_from_manifest(&self.chunk_store, &manifest)
-                    .await
-                    .map_err(|e| BuildError::Config(format!("disk bootstrap build: {e}")))?;
+
+            // ADR 0008 Phase 4: if a parent bootstrap is supplied,
+            // dedup against it. Shared chunks travel by reference;
+            // the child's diff blob only contains chunks unique to
+            // this image.
+            let parent_bs_owned: Option<engram_chunk_store::Bootstrap> =
+                if let Some(p) = &req.parent_disk_bootstrap_path {
+                    let bytes = tokio::fs::read(p).await.map_err(BuildError::Io)?;
+                    let bs: engram_chunk_store::Bootstrap = serde_json::from_slice(&bytes)
+                        .map_err(|e| BuildError::Config(format!("parent bootstrap parse: {e}")))?;
+                    Some(bs)
+                } else {
+                    None
+                };
+            let parent_ref = match (
+                parent_bs_owned.as_ref(),
+                req.parent_disk_chunks_blob_digest.as_deref(),
+            ) {
+                (Some(bs), Some(digest)) => Some(engram_chunk_store::ParentBootstrap {
+                    bootstrap: bs,
+                    primary_blob_digest: digest,
+                }),
+                (Some(_), None) => {
+                    return Err(BuildError::Config(
+                        "parent_disk_bootstrap_path requires parent_disk_chunks_blob_digest".into(),
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(BuildError::Config(
+                        "parent_disk_chunks_blob_digest requires parent_disk_bootstrap_path".into(),
+                    ));
+                }
+                (None, None) => None,
+            };
+
+            let (bootstrap, blob) = engram_chunk_store::Bootstrap::build_from_manifest_with_parent(
+                &self.chunk_store,
+                &manifest,
+                parent_ref.as_ref(),
+            )
+            .await
+            .map_err(|e| BuildError::Config(format!("disk bootstrap build: {e}")))?;
             let bs_path = image_dir.join("bootstrap.disk.json");
             let blob_path = image_dir.join("chunks.disk.blob");
             tokio::fs::write(

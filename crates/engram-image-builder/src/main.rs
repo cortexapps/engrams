@@ -123,6 +123,8 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         agent_injection: None,
         canonical_memory_manifest: None,
         capture_canonical_memory: None,
+        parent_disk_bootstrap_path: None,
+        parent_disk_chunks_blob_digest: None,
     };
 
     let docker = match opts.docker_bin {

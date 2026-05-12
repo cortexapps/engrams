@@ -1127,6 +1127,8 @@ async fn image_build(
         agent_injection,
         canonical_memory_manifest: None,
         capture_canonical_memory: None,
+        parent_disk_bootstrap_path: None,
+        parent_disk_chunks_blob_digest: None,
     };
     let docker = match docker_bin {
         Some(bin) => DockerCli::with_binary(bin.to_string()),

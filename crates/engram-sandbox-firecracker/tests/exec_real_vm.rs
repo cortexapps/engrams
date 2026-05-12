@@ -101,6 +101,8 @@ async fn exec_runs_inside_baked_microvm() {
             }),
             canonical_memory_manifest: None,
             capture_canonical_memory: None,
+            parent_disk_bootstrap_path: None,
+            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("ext4 bake with agent injection");

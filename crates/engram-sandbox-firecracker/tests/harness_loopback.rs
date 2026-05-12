@@ -125,6 +125,8 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
             }),
             canonical_memory_manifest: None,
             capture_canonical_memory: None,
+            parent_disk_bootstrap_path: None,
+            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("ext4 bake");
