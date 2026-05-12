@@ -290,15 +290,41 @@ canonical capture deferred**
   - `snapshot_skips_materialize_when_memory_bin_already_present`
     — negative (file untouched when locally present).
 
-### Still pending
+### Phase 5 follow-up: image-builder bake-time canonical capture (shipped)
 
-- ⬜ **Image-builder bake-time canonical capture** — boot VM during
-  bake, pause, capture `memory.bin`, chunk + publish + record a
-  canonical working-set trace. Until this lands every snapshot has
-  `canonical_memory_manifest == memory_manifest`, so the
-  cross-session page-cache sharing benefit isn't realised — restore
-  still works, just at session-private memory cost.
-  `crates/engram-image-builder/src/canonical_boot.rs` (new).
+- ✅ **`BuildRequest.capture_canonical_memory`** opt-in flag +
+  `CanonicalCaptureConfig { kernel_image_path, firecracker_bin,
+  boot_wait, memory_mib }`. When set, `Builder::capture_canonical_memory`
+  reuses `FirecrackerBackend::create + snapshot` to boot the
+  just-built rootfs, wait for steady state, capture `memory.bin`,
+  and chunk it into the chunk store. Best-effort failure
+  semantics: a capture failure (no KVM, FC binary missing, VM
+  panic) logs + leaves canonical_memory_manifest=None — the bake
+  still ships a valid disk-only image.
+- ✅ **`bundle.json::canonical_memory_manifest`** field plus
+  matching `ImageBundle.canonical_memory_manifest` deserializer
+  with `#[serde(default)]` for backwards compat. The
+  PooledBackend.create path already lifts the bundle's canonical
+  ref onto `SandboxSpec.canonical_memory_manifest` (Phase 5 slice
+  1); FC backend then stamps it on `FcSnapshotManifest.canonical_memory_manifest`
+  at snapshot time. UFFD handler reads it via `--canonical-manifest`
+  at restore.
+- ✅ **`engram-sandbox-firecracker` dep on image-builder is
+  dev-only** — image-builder can take a real dep on FC for this
+  capture path without a cycle.
+- ✅ **Linux+KVM integration test**:
+  `crates/engram-image-builder/tests/canonical_capture.rs` —
+  preflight-skipped on non-KVM lanes, wired into CI under
+  `test-firecracker` via `cargo nextest run -p
+  engram-image-builder --test canonical_capture --run-ignored
+  ignored-only`.
+- ✅ **Production wiring**: Packer manifest sets
+  `nbds_max=64` in `/etc/modprobe.d/engram-nbd-tuning.conf`;
+  Terraform `fc-host-mig` module's startup-script writes
+  `ENGRAM_NBD_DEVICES=/dev/nbd0,...,nbd<N-1>` into
+  `/etc/engram/host-agent.env` based on a new `nbd_slots`
+  variable (default 16). The host-agent reads the env at startup
+  and wires the slot pool into PooledBackend.
 
 ### Dependencies / open questions
 

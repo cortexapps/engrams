@@ -65,27 +65,40 @@ fn preflight() -> Option<(PathBuf, PathBuf)> {
 // Trivial Docker stub — `capture_canonical_memory` doesn't go
 // through the docker build path at all; we instantiate the
 // builder with a stub so we can call the method directly.
+#[derive(Clone)]
 struct NoopDocker;
 #[async_trait::async_trait]
 impl engram_image_builder::DockerRunner for NoopDocker {
-    async fn build(&self, _args: engram_image_builder::docker::BuildArgs) -> Result<(), String> {
-        Err("docker.build not used in this test".into())
+    async fn build(
+        &self,
+        _args: engram_image_builder::docker::BuildArgs,
+    ) -> Result<(), engram_image_builder::docker::DockerError> {
+        Err(engram_image_builder::docker::DockerError::NotFound)
     }
-    async fn create(&self, _tag: &str) -> Result<String, String> {
-        Err("docker.create not used in this test".into())
+    async fn create(
+        &self,
+        _tag: &str,
+    ) -> Result<String, engram_image_builder::docker::DockerError> {
+        Err(engram_image_builder::docker::DockerError::NotFound)
     }
     async fn export_to_dir(
         &self,
         _container_id: &str,
         _dest: &std::path::Path,
-    ) -> Result<(), String> {
-        Err("docker.export_to_dir not used in this test".into())
+    ) -> Result<(), engram_image_builder::docker::DockerError> {
+        Err(engram_image_builder::docker::DockerError::NotFound)
     }
-    async fn rm_container(&self, _id: &str) -> Result<(), String> {
+    async fn rm_container(
+        &self,
+        _id: &str,
+    ) -> Result<(), engram_image_builder::docker::DockerError> {
         Ok(())
     }
-    async fn rmi(&self, _tag: &str) -> Result<(), String> {
+    async fn rmi(&self, _tag: &str) -> Result<(), engram_image_builder::docker::DockerError> {
         Ok(())
+    }
+    fn clone_runner(&self) -> Box<dyn engram_image_builder::DockerRunner> {
+        Box::new(self.clone())
     }
 }
 
