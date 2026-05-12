@@ -62,7 +62,12 @@ use super::slot::{NbdSlot, NbdSlotAllocator};
 //
 // `_IO(type, nr)` on Linux is `((type) << _IOC_TYPESHIFT) |
 // ((nr) << _IOC_NRSHIFT)` where TYPESHIFT=8, NRSHIFT=0. So:
+//
+// The `| 0` / `<< 0` below are deliberate visual alignment with the
+// `_IO(0xab, N)` source convention — clippy's identity_op fires
+// even though removing them would change nothing.
 
+#[allow(clippy::identity_op)]
 const NBD_SET_SOCK: u64 = (0xab << 8) | 0;
 const NBD_SET_BLKSIZE: u64 = (0xab << 8) | 1;
 const NBD_DO_IT: u64 = (0xab << 8) | 3;
@@ -73,6 +78,7 @@ const NBD_SET_FLAGS: u64 = (0xab << 8) | 10;
 
 /// `NBD_FLAG_HAS_FLAGS` bit. Required so the kernel honours the
 /// other capability bits we set. From `<linux/nbd.h>`.
+#[allow(clippy::identity_op)]
 const NBD_FLAG_HAS_FLAGS: u32 = 1 << 0;
 /// `NBD_FLAG_SEND_FLUSH`. Tells the kernel `NBD_CMD_FLUSH` is
 /// available so fsync()s inside the guest translate into our
