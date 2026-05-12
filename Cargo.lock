@@ -1326,14 +1326,21 @@ dependencies = [
 name = "engram-uffd-handler"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "engram-chunk-store",
+ "engram-core",
+ "engram-storage-gcs",
+ "engram-storage-local",
  "libc",
  "sendfd",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "userfaultfd",
+ "uuid",
 ]
 
 [[package]]

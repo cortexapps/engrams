@@ -38,12 +38,19 @@ name = "engram-uffd-handler"
 path = "src/main.rs"
 
 [dependencies]
+engram-core.workspace = true
+engram-chunk-store.workspace = true
+engram-storage-local.workspace = true
+engram-storage-gcs.workspace = true
+bytes.workspace = true
 libc = "0.2"
 sendfd = "0.4"
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 # Linux-only: userfaultfd is a Linux kernel surface. The crate
 # itself doesn't gate by target_os; we do here so a workspace-wide
