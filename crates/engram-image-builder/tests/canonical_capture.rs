@@ -114,7 +114,7 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
     let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
     let store = ChunkStore::new(blob);
 
-    let builder = Builder::with_packer(NoopDocker, Mke2fsPacker, store.clone());
+    let builder = Builder::with_packer(NoopDocker, Mke2fsPacker::default(), store.clone());
 
     let capture_cfg = CanonicalCaptureConfig {
         kernel_image_path: kernel,

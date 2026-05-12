@@ -123,6 +123,8 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
                 init_script: None,
                 bootstrap_binary: Some(bootstrap_bin),
             }),
+            canonical_memory_manifest: None,
+            capture_canonical_memory: None,
         })
         .await
         .expect("ext4 bake");
