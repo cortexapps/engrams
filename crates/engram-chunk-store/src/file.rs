@@ -95,11 +95,18 @@ impl ChunkStore {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
+        // Write to a `.partial` sibling and atomically `rename` to
+        // `dest` only after every chunk has been written. A crash
+        // or mid-write error leaves only the partial file behind;
+        // the canonical name doesn't exist, so callers that probe
+        // for it (e.g. PooledBackend's fast-path on size match)
+        // never see a half-written rootfs.
+        let temp = temp_for(dest);
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(dest)
+            .open(&temp)
             .await?;
 
         // Pre-extend to total_bytes so seeks past existing-EOF
@@ -113,6 +120,11 @@ impl ChunkStore {
             file.write_all(&bytes).await?;
         }
         file.flush().await?;
+        // Drop the file handle before rename — Windows wants this,
+        // and on POSIX it's cheap insurance against rare async-fs
+        // edge cases.
+        drop(file);
+        fs::rename(&temp, dest).await?;
         Ok(())
     }
 
@@ -131,11 +143,19 @@ impl ChunkStore {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
+        // Same atomicity invariant as `materialize_to_file`: write
+        // to a `.partial` sibling, rename only on full success.
+        // Without this, a mid-write failure would leave a file at
+        // `dest` with `total_bytes` zero-filler — and any caller
+        // probing size as "is this materialized?" (e.g.
+        // PooledBackend's fast-path) would treat it as a success
+        // and feed a junk rootfs to FC / VZ.
+        let temp = temp_for(dest);
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(dest)
+            .open(&temp)
             .await?;
         file.set_len(manifest.total_bytes).await?;
         for entry in &manifest.chunks {
@@ -148,8 +168,29 @@ impl ChunkStore {
             file.write_all(&bytes).await?;
         }
         file.flush().await?;
+        drop(file);
+        fs::rename(&temp, dest).await?;
         Ok(())
     }
+}
+
+/// Sibling temp path used by `materialize_to_file*` for the
+/// write-then-rename atomicity guard. Includes a per-process
+/// random suffix so concurrent materializes against the same
+/// `dest` don't collide on the temp path.
+///
+/// (The outer `materialize_chunked_rootfs` in `pooled_backend`
+/// already serialises concurrent writers via a mutex, but
+/// `materialize_to_file*` is also called directly by tests and
+/// could be called by future code without that mutex.)
+fn temp_for(dest: &Path) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut path = dest.as_os_str().to_owned();
+    path.push(format!(".partial-{nonce}"));
+    std::path::PathBuf::from(path)
 }
 
 fn is_all_zero(buf: &[u8]) -> bool {
@@ -326,5 +367,88 @@ mod tests {
         for entry in &m.chunks {
             assert!(cache.contains(entry.hash).await);
         }
+    }
+
+    /// Atomicity invariant: a failed materialize must NOT leave a
+    /// file at `dest`. Specifically, a previous bug let
+    /// `materialize_to_file` (and _cached) zero-fill via
+    /// `set_len(total_bytes)` before the chunk loop ran; if the
+    /// chunk loop errored, the file was left at full size full of
+    /// zeros, fooling any downstream size-based fast-path check
+    /// (PooledBackend's "already materialized") into clone-ing a
+    /// poisoned rootfs to the guest. After the write-temp-then-
+    /// rename fix, an errored materialize leaves no `dest` at all
+    /// — only a `.partial-*` sibling.
+    #[tokio::test]
+    async fn errored_materialize_leaves_no_dest_file() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+
+        // Reference a chunk hash that was never stored. The
+        // chunk loop's first iteration will hit `get_chunk` and
+        // surface NotFound.
+        let phantom = crate::manifest::ChunkHash::of(b"never-stored");
+        let bad_manifest = Manifest {
+            schema_version: 1,
+            kind: ManifestKind::Disk,
+            total_bytes: 4096,
+            chunk_size: crate::manifest::ChunkSize::bytes(4096),
+            chunks: vec![crate::manifest::ChunkRef {
+                offset: 0,
+                hash: phantom,
+            }],
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+
+        let dest = work.path().join("rootfs.ext4");
+        assert!(s.materialize_to_file(&bad_manifest, &dest).await.is_err());
+        assert!(
+            !dest.exists(),
+            "errored materialize must NOT leave the canonical file behind"
+        );
+        // The partial may exist (atomic rename happens only on
+        // success); verify the canonical name is clean. Production
+        // callers probe `dest` for the fast-path; that probe must
+        // miss after an error.
+    }
+
+    /// Same invariant for the cached path. Different code path —
+    /// must also be temp-and-rename clean.
+    #[tokio::test]
+    async fn errored_materialize_cached_leaves_no_dest_file() {
+        let (s, _d) = store().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new(ChunkCacheConfig {
+            root: cache_dir.path().to_path_buf(),
+            budget_bytes: 1024 * 1024,
+        });
+        let work = tempfile::tempdir().unwrap();
+
+        let phantom = crate::manifest::ChunkHash::of(b"never-stored-cached");
+        let bad_manifest = Manifest {
+            schema_version: 1,
+            kind: ManifestKind::Disk,
+            total_bytes: 4096,
+            chunk_size: crate::manifest::ChunkSize::bytes(4096),
+            chunks: vec![crate::manifest::ChunkRef {
+                offset: 0,
+                hash: phantom,
+            }],
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+
+        let dest = work.path().join("rootfs.ext4");
+        assert!(s
+            .materialize_to_file_cached(&bad_manifest, &dest, &cache)
+            .await
+            .is_err());
+        assert!(
+            !dest.exists(),
+            "errored cached materialize must NOT leave the canonical file behind"
+        );
     }
 }
