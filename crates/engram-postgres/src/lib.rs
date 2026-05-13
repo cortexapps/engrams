@@ -287,6 +287,26 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn touch_host_heartbeat(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
+        let n = sqlx::query(
+            r#"UPDATE hosts
+                  SET status = $2,
+                      last_heartbeat_at = NOW(),
+                      updated_at = NOW()
+                WHERE id = $1"#,
+        )
+        .bind(id.as_uuid())
+        .bind(status.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         // `make_interval` keeps the threshold parameterised without
         // string-templating an INTERVAL literal. Cast to BIGINT so a

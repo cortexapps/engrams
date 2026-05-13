@@ -149,6 +149,14 @@ impl MetadataStore for MockMetadataStore {
         Ok(())
     }
 
+    async fn touch_host_heartbeat(
+        &self,
+        _id: HostId,
+        _status: HostStatus,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         // Mock doesn't track heartbeat timestamps; existing tests
         // don't exercise the dead-host detector path.

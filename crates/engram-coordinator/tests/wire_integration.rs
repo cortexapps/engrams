@@ -111,6 +111,9 @@ impl MetadataStore for MiniMeta {
     async fn set_host_status(&self, _id: HostId, _s: HostStatus) -> Result<(), MetaError> {
         Ok(())
     }
+    async fn touch_host_heartbeat(&self, _id: HostId, _s: HostStatus) -> Result<(), MetaError> {
+        Ok(())
+    }
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         Ok(Vec::new())
     }

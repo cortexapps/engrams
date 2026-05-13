@@ -80,6 +80,14 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
+    /// Record a heartbeat from `host_id`: bump `last_heartbeat_at` to
+    /// NOW() and set `status`. Distinct from `set_host_status` because
+    /// drain/dead transitions imply nothing about liveness and must
+    /// not refresh the dead-host detector's timestamp. The WS dialer's
+    /// heartbeat handler is the only caller; in `--mode=all` the
+    /// in-process timer calls `upsert_host` instead.
+    async fn touch_host_heartbeat(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
+
     /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
     /// AND whose status is `Ready` or `Draining`. The dead-host detector
     /// polls this every ~10s and races other coordinator replicas via

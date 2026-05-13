@@ -278,7 +278,7 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
                 if let Err(e) = state
                     .services
                     .meta
-                    .set_host_status(host_id, row_status)
+                    .touch_host_heartbeat(host_id, row_status)
                     .await
                 {
                     tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");
