@@ -159,7 +159,7 @@ enum HostCmd {
     /// List hosts the coordinator knows about (Postgres rows + live
     /// scheduler view).
     List,
-    /// Print one host's row + capacity / warm-pool view.
+    /// Print one host's row + capacity / local-snapshot view.
     Get { id: String },
     /// Flip a host to `draining`. New sessions won't be assigned to
     /// it; in-flight sessions stay (evacuation lands in 3d).
@@ -821,18 +821,18 @@ async fn host_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Resu
         return Ok(());
     }
     println!(
-        "{:<36}  {:<10}  {:<10}  {:<10}  WARM_POOLS",
+        "{:<36}  {:<10}  {:<10}  {:<10}  SNAPSHOTS",
         "ID", "STATUS", "USED_MIB", "TOTAL_MIB"
     );
     for h in hosts {
-        let warm_count = h["warm_pools"].as_array().map(|v| v.len()).unwrap_or(0);
+        let snap_count = h["local_snapshots"].as_u64().unwrap_or(0);
         println!(
             "{:<36}  {:<10}  {:<10}  {:<10}  {}",
             h["id"].as_str().unwrap_or(""),
             h["status"].as_str().unwrap_or(""),
             h["capacity_used_mib"].as_u64().unwrap_or(0),
             h["capacity_total_mib"].as_u64().unwrap_or(0),
-            warm_count,
+            snap_count,
         );
     }
     Ok(())
@@ -874,18 +874,6 @@ async fn host_get(
         "local_snapshots : {}",
         body["local_snapshots"].as_u64().unwrap_or(0)
     );
-    if let Some(pools) = body["warm_pools"].as_array() {
-        println!("warm_pools      :");
-        for p in pools {
-            println!(
-                "  - {repo} {tag}: {ready}/{target}",
-                repo = p["repo"].as_str().unwrap_or(""),
-                tag = p["image_version"].as_str().unwrap_or(""),
-                ready = p["ready"].as_u64().unwrap_or(0),
-                target = p["target"].as_u64().unwrap_or(0),
-            );
-        }
-    }
     Ok(())
 }
 

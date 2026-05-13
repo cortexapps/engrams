@@ -333,7 +333,6 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
-        default_warm_pool_size: 0,
         ..CoordinatorConfig::default()
     };
     let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
@@ -463,7 +462,6 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-test".into(),
-        default_warm_pool_size: 0,
         ..CoordinatorConfig::default()
     };
     let app = api::router(Arc::new(AppState::new_with_registry(

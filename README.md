@@ -2,7 +2,7 @@
 
 Self-hosted, open-source orchestrator for ephemeral AI agent sandboxes.
 
-Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: warm pools, snapshot lifecycle (UFFD-backed restore), multi-host scheduling, a pluggable cloud abstraction, and chunked-immutable content-addressed durability so cross-host migration costs ~1–2 s and `1000 × 4 GiB` sessions consume `~100 GiB` total (canonical + per-session deltas), not `4 TiB`. A subprocess-based dev backend lets the entire orchestration layer run on macOS during development; an Apple Silicon backend (Apple Virtualization.framework) gives Mac devs real microVM isolation locally. Production isolation is always Firecracker.
+Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: chunked-OCI rootfs + canonical-memory restore (sub-second cold start, no pre-warming required), snapshot lifecycle (UFFD-backed resume), multi-host scheduling, a pluggable cloud abstraction, and chunked-immutable content-addressed durability so cross-host migration costs ~1–2 s and `1000 × 4 GiB` sessions consume `~100 GiB` total (canonical + per-session deltas), not `4 TiB`. A subprocess-based dev backend lets the entire orchestration layer run on macOS during development; an Apple Silicon backend (Apple Virtualization.framework) gives Mac devs real microVM isolation locally. Production isolation is always Firecracker.
 
 It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to open source so any organization can run their own without vendor lock-in.
 
@@ -24,14 +24,13 @@ Three process classes, four storage primitives, three wire surfaces.
               │                  (axum, stateless, N replicas)    │
               │                                                   │
    HTTP +     │   - HTTP API: /sessions, /events (SSE), /admin    │
-   SSE  ◄────►│   - Scheduler: snapshot affinity → warm pool      │
-              │     → capacity-fit                                │
+   SSE  ◄────►│   - Scheduler: snapshot affinity → capacity-fit   │
               │   - Idle evictor, dead-host detector,             │
               │     chunk-store GC scheduler                      │
               │   - Postgres LISTEN/NOTIFY for cross-replica      │
               │     event fan-out + dead-host coordination        │
               └─────────────┬─────────────────────────────────────┘
-                            │ bincode-over-WS, WIRE_VERSION=4
+                            │ bincode-over-WS, WIRE_VERSION=5
                             │ (Frame { req_id, trace, kind })
                             │ Coord ↔ Host: hosts DIAL coord
                             │ (NAT-friendly; no inbound
@@ -45,9 +44,9 @@ Three process classes, four storage primitives, three wire surfaces.
         │ host-   │   │ host-   │   │ host-   │   │         │
         │ agent   │   │ agent   │   │ agent   │   │         │
         │         │   │         │   │         │   │         │
-        │  warm   │   │  warm   │   │  warm   │   │         │
-        │  pool   │   │  pool   │   │  pool   │   │         │
-        │         │   │         │   │         │   │         │
+        │ chunked │   │ chunked │   │ chunked │   │         │
+        │ -OCI    │   │ -OCI    │   │ -OCI    │   │         │
+        │ cache   │   │ cache   │   │ cache   │   │         │
         │  NBD    │   │  NBD    │   │  NBD    │   │         │
         │  daemon │   │  daemon │   │  daemon │   │         │
         │  (FC)   │   │  (FC)   │   │  (FC)   │   │         │
@@ -95,10 +94,10 @@ Three process classes, four storage primitives, three wire surfaces.
 
 **`engram-coordinator`** — stateless HTTP service (axum). Owns the public API, scheduling, idle eviction, dead-host detection, chunk-store GC, the persistent SSE event bus. Backed by Postgres. Multiple replicas behind a load balancer; replicas reconcile via `LISTEN/NOTIFY` on `session_events` + `host_dead` and race via `pg_try_advisory_lock` for exclusive-write operations (dead-host eviction). `--mode=all` registers a local host-agent in-process for single-binary `just dev`.
 
-**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Drives the `SandboxBackend` for one of three production-grade isolation modes (see below). Hosts the warm pool, the harness hub (TCP listener for in-VM harness adapters), the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the egress proxy (ADR 0006). Heartbeats `(capacity, warm_pools, local_snapshots, draining)` every 5 s.
+**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Drives the `SandboxBackend` for one of three production-grade isolation modes (see below). Hosts the chunked-OCI image cache + tiered chunk resolver, the harness hub (TCP listener for in-VM harness adapters), the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the egress proxy (ADR 0006). Heartbeats `(capacity, local_snapshots, draining)` every 5 s.
 
 **In-guest binaries** (live inside each microVM, baked into the rootfs by `engram-image-builder`):
-- `engram-bootstrap` — PID 1's child after the init shim. Listens for `BootstrapLaunch` frames from the host-agent over vsock (FC) / virtio-console (VZ); on each frame, kills the previous harness child and spawns a fresh one. Necessary because the warm-pool spec is agent-blind and because FC snapshot/restore needs a clean re-spawn point on resume.
+- `engram-bootstrap` — PID 1's child after the init shim. Listens for `BootstrapLaunch` frames from the host-agent over vsock (FC) / virtio-console (VZ); on each frame, kills the previous harness child and spawns a fresh one. Necessary because `SandboxSpec` is agent-blind (per-session argv would freeze at the first session's id) and because FC snapshot/restore needs a clean re-spawn point on resume.
 - `engram-agentd` — exec daemon. Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `Ping`, `Shutdown`. Token-handshake gated.
 - `engram-harness-{noop,claude}` — the agent runtime (Claude Code or a deterministic test harness). Reports run state + tool calls back through the harness hub.
 
@@ -153,7 +152,6 @@ POST /sessions
   ↓
 Coord scheduler picks a host:
   - snapshot affinity (if resuming)
-  - warm-pool match on (image_uri)
   - capacity-fit
   ↓
 host-agent.PooledBackend.create(spec)
@@ -212,7 +210,7 @@ crates/
   engram-harness-claude             # Claude Code adapter — reference agent harness
   engram-transport                  # vsock (FC) / virtio-console (VZ) abstraction
   engram-coordinator                # binary: HTTP API + scheduler + GC scheduler
-  engram-host-agent                 # binary: per-host daemon (warm pool, NBD, reaper)
+  engram-host-agent                 # binary: per-host daemon (chunked-OCI, NBD, reaper)
   engram-image-builder              # binary: warm-image baker (Directory + Ext4)
   engram-cli                        # binary: ops/admin tool
   engram-agentd                     # binary: in-guest exec daemon
@@ -240,7 +238,7 @@ The orchestration layer is VMM-agnostic — anything that implements `SandboxBac
 | `engram-sandbox-vz` | microVM (Hypervisor.framework) | APFS clone of rootfs | macOS 12+ on Apple Silicon | Mac dev with real microVM isolation. Sub-second cold boot, sub-second cold resume. ADR 0003. |
 | `engram-sandbox-firecracker` | microVM (KVM) | FC memory snapshot + UFFD lazy paging + NBD chunked disk | Linux + KVM | Production. Real isolation, real resource enforcement, sub-100ms hot resume. |
 
-`process` and `vz` are dev-side: `process` for the fastest possible iteration loop, `vz` for fidelity to the FC code paths (same `engram-bootstrap` + `engram-agentd` + harness binaries; same warm-pool semantics). Production isolation is always Firecracker.
+`process` and `vz` are dev-side: `process` for the fastest possible iteration loop, `vz` for fidelity to the FC code paths (same `engram-bootstrap` + `engram-agentd` + harness binaries; same chunked-OCI session-create semantics). Production isolation is always Firecracker.
 
 ## Quick start (dev, macOS or Linux)
 

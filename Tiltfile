@@ -144,9 +144,9 @@ local_resource('seed-buckets',
 # Defaults to `auto_init=True` so it starts on `tilt up`, but
 # `trigger_mode=TRIGGER_MODE_MANUAL` keeps it running through Rust
 # edits. Click "rebuild" in Tilt's UI when you want to pick up
-# code changes — we don't auto-restart because losing warm-pool
-# state on every save during dev is more expensive than the
-# benefit of "edits are live".
+# code changes — we don't auto-restart because losing the in-memory
+# chunk cache / OCI client / scheduler state on every save during
+# dev is more expensive than the benefit of "edits are live".
 #
 # On macOS the build → codesign → exec sequence is atomic: cargo
 # rebuild produces fresh unsigned bytes, so codesign has to run
@@ -165,7 +165,6 @@ coord_env = {
     'ENGRAM_LOCAL_PATH': './var/engram',
     kernel_key: kernel_path,
     'ENGRAM_DEFAULT_IMAGE': env_or('ENGRAM_DEFAULT_IMAGE', 'warm-1'),
-    'ENGRAM_WARM_POOL_SIZE': env_or('ENGRAM_WARM_POOL_SIZE', '1'),
     'ENGRAM_KEK_MASTER_KEY': env_or('ENGRAM_KEK_MASTER_KEY', ''),
     # ADR 0005 / Stage 4: cold-tier blob durability. Default to the
     # local fs backend; flip to `gcs` against the fake-gcs-server

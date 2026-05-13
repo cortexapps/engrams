@@ -288,6 +288,48 @@ punch list: [`docs/chunked-storage-rollout.md`](./chunked-storage-rollout.md).
 
 ---
 
+## Phase 8 — Chunks-in-OCI + warm-pool retirement (May 2026)
+
+**Goal**: make the OCI image URI self-contained again (ADR 0007's
+BlobStorage-as-source-of-truth bricked cross-namespace pulls), and
+take the resulting cold-start improvement to retire warm pools.
+
+- **Chunks-in-OCI with tiered cache (ADR 0008)** — bake produces
+  Nydus-shaped artifacts (`bootstrap_disk.json` + `chunks_disk.blob`
+  layers; same shape for memory chunks when canonical-memory
+  capture ran). Chunk fault path becomes
+  `NVMe → BlobStorage → OCI registry`, with CDN-fill tee-back to
+  BlobStorage on registry hits. `ChunkResolver` trait in
+  `engram-chunk-store`; `TieredChunkResolver` composes the two
+  backends with the NVMe cache.
+- **Closure-based `ChunkCache`** — refactored so the cache holds no
+  reference to a specific `ChunkStore`; callers pass a fetcher
+  closure per-`get`. Lets the host swap in a tiered resolver for a
+  specific session without rebuilding the cache, and avoids the
+  cross-namespace bricked-image bug we shipped in Phase 7.
+- **Atomic materialize** — `materialize_to_file{,_cached}` write to
+  `<dest>.partial-<nonce>` then atomic rename. Fixes a kernel-panic
+  failure mode where a partial write left a zero-byte file under
+  the canonical name; subsequent fast-path checks served the
+  zero file forever.
+- **Warm pool deletion (WIRE v5)** — the pre-Phase-8 host-side
+  warm pool (`Pool` + `PoolKey` + replenish loop) shipped through
+  Phase 3 with a series of correctness sharp edges (key ignored
+  `repo`, then ignored `harness_substrate`, then needed
+  `rootfs_source` to be a content-addressed digest). With
+  chunked-OCI restore + canonical-memory bringing cold start
+  under the warm-pool checkout time, the lifecycle complexity
+  stopped paying for itself. Deleted entirely: heartbeat shape no
+  longer carries `warm_pools`, scheduler no longer ranks on
+  warm-slot affinity, host-agent no longer replenishes. `Heartbeat`
+  wire shape changed → `WIRE_VERSION = 5`.
+
+ADR 0008 captures the design (chunks-in-OCI, scanner mitigation,
+base/diff layers, alternative paths considered). Warm-pool deletion
+rationale lives in the heartbeat doc-comment + this entry.
+
+---
+
 ## Cross-cutting
 
 These don't fit one phase but track across the timeline:

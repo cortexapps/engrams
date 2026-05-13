@@ -41,7 +41,7 @@ pub async fn connect(State(state): State<SharedState>, ws: WebSocketUpgrade) -> 
 
 /// `GET /api/hosts` — list all hosts the coordinator knows about,
 /// merging the persisted Postgres rows with the live in-memory
-/// scheduler state (capacity, warm pools, local snapshots, draining).
+/// scheduler state (capacity, local snapshots, draining).
 pub async fn list(State(state): State<SharedState>) -> Result<Json<ListHostsResponse>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
     let hosts = rows
@@ -101,16 +101,8 @@ pub struct HostView {
     pub capacity_total_mib: u64,
     pub capacity_used_mib: u64,
     pub running_sandboxes: u32,
-    pub warm_pools: Vec<WarmPoolView>,
     pub local_snapshots: usize,
     pub last_heartbeat_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Serialize)]
-pub struct WarmPoolView {
-    pub image_version: String,
-    pub ready: u32,
-    pub target: u32,
 }
 
 impl HostView {
@@ -126,15 +118,6 @@ impl HostView {
             capacity_total_mib: live.capacity.total_mib,
             capacity_used_mib: live.capacity.used_mib,
             running_sandboxes: live.capacity.running_sandboxes,
-            warm_pools: live
-                .warm_pools
-                .into_iter()
-                .map(|p| WarmPoolView {
-                    image_version: p.image_version,
-                    ready: p.ready,
-                    target: p.target,
-                })
-                .collect(),
             local_snapshots: live.local_snapshots.len(),
             last_heartbeat_at: row.last_heartbeat_at,
         }
@@ -249,13 +232,12 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
         match notify {
             NotifyKind::Heartbeat(hb) => {
                 // Refresh the in-memory scheduler view first so the
-                // next session creation sees the updated capacity /
-                // warm pools / local snapshots.
+                // next session creation sees the updated capacity and
+                // local snapshots.
                 state.host_registry.update_state(
                     host_id,
                     HostState {
                         capacity: hb.capacity.clone(),
-                        warm_pools: hb.warm_pools.clone(),
                         local_snapshots: hb.local_snapshots.clone(),
                         draining: hb.draining,
                     },

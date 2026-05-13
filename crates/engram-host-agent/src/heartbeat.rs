@@ -30,7 +30,6 @@ pub fn build_heartbeat(
             used_mib: cap.used_mib,
             running_sandboxes: cap.running_sandboxes,
         },
-        warm_pools: Vec::new(),
         local_snapshots: Vec::new(),
         draining,
     }
@@ -60,9 +59,8 @@ mod tests {
         assert_eq!(hb.capacity.used_mib, 12_288);
         assert_eq!(hb.capacity.running_sandboxes, 3);
         assert!(!hb.draining);
-        // Phase 1: warm pool + local snapshot fields aren't populated by
-        // the helper. They get filled by the host agent before send.
-        assert!(hb.warm_pools.is_empty());
+        // Phase 1: the local snapshot field isn't populated by the
+        // helper. It gets filled by the host agent before send.
         assert!(hb.local_snapshots.is_empty());
     }
 

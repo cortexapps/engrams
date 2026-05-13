@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Per-host daemon: warm pool, snapshot manager, resource governor."
+description = "Per-host daemon: chunked-OCI session create, snapshot manager, resource governor."
 
 # ADR 0007 Phase 4: the NBD daemon's `disk_daemon::runtime` module
 # wraps Linux kernel ioctls (`NBD_SET_SOCK`, `socketpair`, raw fd

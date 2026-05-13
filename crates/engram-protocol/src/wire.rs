@@ -51,7 +51,14 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 ///   own local staging dir; the metadata's manifest refs are the
 ///   cross-host durability primitive, paths are host-local
 ///   caches. Wire shape change to RequestKind variants.
-pub const WIRE_VERSION: u32 = 4;
+/// - v5: warm pools deleted. `Heartbeat.warm_pools:
+///   Vec<WarmPoolReport>` field removed; `WarmPoolReport` type
+///   removed. Bincode is positional so dropping a Vec mid-struct
+///   shifts every subsequent byte — pure wire break, no graceful
+///   downgrade. See the deletion commit's message for context
+///   on why warm pools were retired in favor of chunked-OCI cold
+///   start + canonical-memory restore.
+pub const WIRE_VERSION: u32 = 5;
 
 /// Top-level frame on the wire.
 ///

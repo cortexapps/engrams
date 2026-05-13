@@ -1,7 +1,8 @@
 //! Scheduling logic. Phase 1: trivial — there's only one host (the
 //! local one) and one in-process SandboxBackend, so every session
 //! lands here. Phase 3 grows this into a real router that picks
-//! "host with snapshot local → host with warm pool → host with capacity".
+//! "host with snapshot local → host with capacity". (Pre-v5 also had
+//! a warm-pool tier; deleted with ADR 0008.)
 
 use engram_core::types::HostRecord;
 

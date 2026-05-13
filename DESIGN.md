@@ -1,6 +1,6 @@
 # Engram — Design
 
-A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: warm pools, FC snapshot lifecycle (UFFD-backed hot resume), multi-host scheduling, chunked-immutable content-addressed durability, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS for fastest-possible iteration; an Apple Silicon backend drives Apple's Virtualization.framework for real microVM isolation locally. Production isolation is always Firecracker.
+A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: chunked-OCI rootfs + canonical-memory restore (sub-second cold start without pre-warming), FC snapshot lifecycle (UFFD-backed hot resume), multi-host scheduling, chunked-immutable content-addressed durability, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS for fastest-possible iteration; an Apple Silicon backend drives Apple's Virtualization.framework for real microVM isolation locally. Production isolation is always Firecracker.
 
 > This file is the **design** layer — architecture, traits, components,
 > rationale. The chronological "what shipped when" log lives in
@@ -56,7 +56,7 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 
 We want a Modal-style sandbox-as-a-service for AI coding agents (think Stripe's Minions, Ramp's Inspect) — but **open-source and self-hostable**, so any organization can run their own without vendor lock-in.
 
-The unsolved gap: existing open-source primitives (Firecracker, Cloud Hypervisor, libkrun, E2B's infra repo) give you per-VM mechanics. Nobody ships the **orchestration layer above the VM** in a clean, portable way: warm pools, snapshot tiering, multi-host scheduling, cloud-backend abstraction, spot/preemptible eviction handling. Engram fills that gap, on top of Firecracker.
+The unsolved gap: existing open-source primitives (Firecracker, Cloud Hypervisor, libkrun, E2B's infra repo) give you per-VM mechanics. Nobody ships the **orchestration layer above the VM** in a clean, portable way: chunked-OCI image distribution, snapshot tiering, multi-host scheduling, cloud-backend abstraction, spot/preemptible eviction handling. Engram fills that gap, on top of Firecracker.
 
 Cortex (our org) runs on GCP. Other adopters will run on AWS, Hetzner, k8s, or bare metal. Engram is built **GCP-first but cloud-agnostic**: all cloud-specific surfaces live behind traits with stub implementations for non-GCP backends shipped from day one.
 
@@ -66,7 +66,7 @@ The architecture comes out of an extended design discussion that explored: Strip
 
 ## Goals
 
-1. **Sub-second sandbox spawn** for warm-pool checkouts (cold starts hidden behind a pre-warmed pool of microVMs per repo).
+1. **Sub-second sandbox spawn** without pre-warming — chunked-OCI rootfs + canonical-memory restore (ADR 0008) makes cold start fast enough that a warm pool isn't worth the complexity.
 2. **Snapshot-evict mechanic** for time-sharing host RAM across more sessions than fit at once.
 3. **Pluggable cloud backend** so the project ports cleanly between GCP, AWS, Hetzner, and self-hosted bare metal.
 4. **Pluggable storage backend** (GCS, S3, MinIO, local) for snapshot durability.
@@ -112,7 +112,8 @@ The Modal/E2B/Ramp pattern: spawn an ephemeral, isolated environment per task; p
          │   ▼     │         │   ▼     │         │   ▼     │
          │firecrkr │         │firecrkr │         │firecrkr │
          │ +UFFD   │         │ +UFFD   │         │ +UFFD   │
-         │warm pool│         │warm pool│         │warm pool│
+         │chunked  │         │chunked  │         │chunked  │
+         │-OCI cache│        │-OCI cache│        │-OCI cache│
          │harness  │         │harness  │         │harness  │
          │  hub    │         │  hub    │         │  hub    │
          └────┬────┘         └────┬────┘         └────┬────┘
@@ -136,8 +137,8 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
   - `engram-sandbox-firecracker` — Linux + KVM. Production. Firecracker's HTTP-over-Unix-socket API + UFFD-backed memory restore.
   - `engram-sandbox-vz` — macOS Apple Silicon. Apple Virtualization.framework via `objc2-virtualization` bindings. APFS clone-based snapshots. Mac dev with real microVM isolation. (ADR 0003.)
   - `engram-sandbox-process` — anywhere. Subprocesses, no isolation. Fastest iteration loop for orchestration-layer work.
-- Maintains warm pool (host-side `PooledBackend` wrapper, agnostic of which backend), `HarnessHub` TCP listener for in-VM harness adapters dialing back, preemption signal handler. Heartbeats `(capacity, warm_pools, local_snapshots, draining)` to the coordinator.
-- **`engram-bootstrap`**: in-VM supervisor (lives at `/sbin/engram-bootstrap`). Listens on the host↔guest control transport for `BootstrapLaunch` frames; on each frame, kills the previous harness child and spawns a fresh one. Necessary because the warm-pool spec is agent-blind (per-session argv can't ride on the spec template) and because FC snapshot/restore needs a clean re-spawn point on resume.
+- Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back, preemption signal handler. Heartbeats `(capacity, local_snapshots, draining)` to the coordinator.
+- **`engram-bootstrap`**: in-VM supervisor (lives at `/sbin/engram-bootstrap`). Listens on the host↔guest control transport for `BootstrapLaunch` frames; on each frame, kills the previous harness child and spawns a fresh one. Necessary because `SandboxSpec` is agent-blind (per-session argv would freeze at the first session's id) and because FC snapshot/restore needs a clean re-spawn point on resume.
 - **`engram-agentd`**: in-VM exec daemon. Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `Ping`, `Shutdown`. First-frame token handshake (server side) gates non-trivial verbs.
 - **`engram-transport`**: backend-agnostic transport trait. `VsockTransport` (FC) and `ConsoleTransport` (VZ); chosen at runtime via `ENGRAM_TRANSPORT` set by the bake's init shim.
 - **`engram-image-builder`**: warm-image baker. `Dockerfile` + `engram.toml` → `docker build` → `docker create + export | tar -x` → optional `mke2fs -t ext4 -F -d`. Injects static-musl `engram-agentd` + `engram-bootstrap` + harness binaries + `/sbin/engram-init` shim into the rootfs.
@@ -168,9 +169,9 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 
 **Responsibilities:**
 - Receive session requests (`POST /sessions`). Pick a host, return session id + persistent SSE event stream.
-- Maintain host registry. Heartbeats from each host every 5s: capacity (vCPU / memory / disk), warm pool state per `image_version`, local snapshots held, draining flag.
+- Maintain host registry. Heartbeats from each host every 5s: capacity (vCPU / memory / disk), local snapshots held, draining flag.
 - Track session ↔ host ↔ sandbox routing in Postgres so coordinator restart restores active sessions.
-- Drive scheduling decisions: prefer host with snapshot local → host with warm pool match → any host with capacity → fail.
+- Drive scheduling decisions: prefer host with snapshot local → host with largest free capacity → fail. (Pre-v5 also had a "host with warm pool match" tier between the two; deleted with ADR 0008.)
 - Drive idle-eviction policy: per-session idle TTL → snapshot + destroy → `Idle` → auto-resume on next request.
 - Detect dead hosts via missed heartbeats; race other replicas via `pg_try_advisory_lock`; mark host's sessions `Dead` (ADR 0002 — no cross-host fallover).
 - Re-broadcast events between replicas via Postgres `LISTEN/NOTIFY` on `session_events` + `host_dead`.
@@ -187,14 +188,13 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Host agent (`engram-host-agent`)
 
 **Responsibilities:**
-- Maintain warm pool of N microVMs per active `image_version` (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped).
-- On checkout: hand a warm VM to a session, replenish pool in background.
+- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and NBD pool onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend.
 - Drive `SandboxBackend` for VM lifecycle (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`).
 - Run snapshot manager (host-local; see below).
 - Subscribe to `cloud.preemption_signal()`; on notice fan out best-effort `checkpoint_session` to live sandboxes in parallel with a 25s deadline (Phase 4 Track D).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
 - Enforce per-VM resource limits via the production backend (Firecracker enforces RAM/CPU/disk at the VMM boundary; the dev backend ignores them with a documented caveat).
-- Heartbeat coordinator with capacity + warm pool state + local snapshots.
+- Heartbeat coordinator with capacity + local snapshots.
 
 **Tech:**
 - Rust 2021, tokio
@@ -238,7 +238,7 @@ Git is **not** in this table. Agents that want their work to land in a remote do
   5. Push to image registry with tag `<repo>:warm-<timestamp>`.
   6. Mark in Postgres `image_versions` table: `(repo, tag, created_at, status)`.
 - Old images GC'd after configurable TTL (default 24h).
-- Refresh failures alert via observability stack but don't break warm pool — old image remains until next successful build.
+- Refresh failures alert via observability stack but don't break running sessions — old image remains until next successful build.
 
 ---
 
@@ -358,7 +358,6 @@ This section documents the design for **coordinator ↔ host-agent** and **host 
    │              │                             │              │
    │              │ ──── Heartbeat (5s) ──────► │              │
    │              │ ──── CapacityReport ──────► │              │
-   │              │ ──── WarmPoolReport ──────► │              │
    │              │ ──── LocalSnapshots ──────► │              │
    │              │                             │              │
    │              │ ◄─── AssignSession ──────── │              │
@@ -390,7 +389,6 @@ Defined in `engram-protocol` with serde. The discriminant is `type` (tagged enum
 |---|---|---|
 | `Hello` | `{ host_id, version, capabilities, hostname, cloud_metadata }` | once on connect |
 | `Heartbeat` | `{ host_id, sent_at, capacity, draining }` | every 5s |
-| `WarmPoolReport` | `{ pools: [{ repo, image_version, ready, target }] }` | on change |
 | `LocalSnapshotInventory` | `{ snapshots: [{ id, session_id, size_bytes, replicated }] }` | on change |
 | `SessionEvent` | An `IndexedEvent` from a session this host owns — forwarded to coordinator's persistent log + bus | live during exec |
 | `Pong` | `{ id }` | response to coordinator-initiated `Ping` |
@@ -907,7 +905,7 @@ Each phase has its own verification, summarized:
 | 3 ✅ | Stand up 2 hosts. Spawn sessions, verify even distribution per `engram host list`. `kill -9` one host, observe sessions transition `Active → Dead` within 30s via the dead-host detector. Restart a coordinator replica; SSE streams reconnect via `Last-Event-ID`. |
 | 4 ✅ | Same orchestration runs against the same coord backend whether the host is FC, VZ, or process. Per-run git checkpoint pushes; idle-evict + auto-resume; `engram session fork` from a Dead session. ADRs 0001 + 0002. |
 | 4.5 ✅ | macOS Apple Silicon: `just vz-pull-kernel && just vz-bake-demo && just dev-vz`. Cold boot <1s; full lifecycle (`harness_idle → snapshot_taken → evicted → idle → resumed → active`) end-to-end. ADR 0003. |
-| 5 | Watch image-builder cron run, verify new image appears in `image_versions` with `status=ready`, observe warm pool VMs spawning from new tag without disrupting in-flight sessions. |
+| 5 | Watch image-builder cron run, verify new image appears in `image_versions` with `status=ready`, observe new sessions for that image picking up the new tag without disrupting in-flight sessions. |
 | 6 | Run on GCE Spot. Trigger preemption via `gcloud compute instances simulate-maintenance-event`, verify the host-agent's preemption handler fires `checkpoint_session` for each live sandbox before the VM dies. Sessions land `Dead`; calling system forks the workspace to continue. Production hardening (TLS, auth, broker proxy, jailer) all green. |
 | 7 | Load test with locust/k6: 100 concurrent sessions. Chaos test: kill coordinator, kill hosts, kill Postgres briefly. Web app + Slack bot consume `/events` SSE in real time. |
 
@@ -956,7 +954,7 @@ The pieces that load-bear the Phase 1+2 surface, for new contributors finding th
 - `crates/engram-core/src/error.rs` — `SandboxError` / `MetaError` / `StorageError` / `BackendError`
 - `crates/engram-coordinator/src/api/{sessions,exec,events,snapshot,auth,health}.rs` — HTTP surface
 - `crates/engram-coordinator/src/state.rs` — `SessionEventBus`, `SandboxRegistry`, `AppState`
-- `crates/engram-host-agent/src/{pool,snapshot}.rs` — warm pool, snapshot manager scaffold
+- `crates/engram-host-agent/src/{pooled_backend,snapshot}.rs` — chunked-OCI / image cache / egress composition; snapshot manager scaffold
 - `crates/engram-sandbox-firecracker/src/{lib,client}.rs` — FC HTTP-over-UDS client + backend impl
 - `crates/engram-agentd/src/{proto,handler,main}.rs` — in-guest agent + wire protocol
 - `crates/engram-uffd-handler/src/{proto,runtime,main}.rs` — UFFD page-fault handler

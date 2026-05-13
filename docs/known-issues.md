@@ -5,23 +5,19 @@ deadline. Each item has the file/line of the offending code and a
 sketch of the proper fix so a future visitor (you, me, an agent) can
 land it without rediscovering the problem.
 
-## 1. ~~Warm-pool key ignores `repo`~~ (FIXED)
+## 1. ~~Warm-pool key ignores `repo`~~ (RETIRED with the warm pool)
 
-**Resolved.** `PoolKey` now carries `rootfs_source` alongside
-`image_version`. Two specs with the same `image` tag but different
-rootfs paths (the original `local://demo/warm-1` vs
-`local://claude-oauth/warm-1` collision) now hash to distinct keys,
-so the second checkout can't silently return a sandbox configured
-with the first spec's rootfs.
-
-In the OCI production path the image cache rewrites `rootfs_source`
-to a content-addressed digest path before pool keying, so two
-sessions sharing one OCI image_uri still share a single warm slot —
-the original Phase 3 efficiency property is preserved.
-
-Wire shape (`WarmPoolReport`) is unchanged; the disambiguator lives
-entirely host-local. Regression at
-`crates/engram-host-agent/src/pooled_backend.rs::tests::same_image_tag_but_different_rootfs_does_not_collide`.
+**Resolved by deletion.** Warm pools shipped through Phase 3 had a
+series of correctness sharp edges (pool key ignored `repo`, then
+ignored `harness_substrate`, then needed `rootfs_source` to be the
+content-addressed digest) on top of an increasingly thin
+performance benefit: chunked-OCI rootfs + canonical-memory restore
+(ADR 0008) made cold start fast enough that pre-warming wasn't
+worth the lifecycle complexity. The entire `Pool` / `PoolKey` /
+warm-pool replenish path was deleted; sessions now always take the
+chunked-OCI cold path. See the deletion commit for the full
+rationale. WIRE_VERSION bumped to v5 (heartbeat no longer carries
+`warm_pools`).
 
 ## 2. VZ disk-attach failures leak the cloned rootfs
 

@@ -1,7 +1,7 @@
-//! Per-host daemon. Wraps a [`SandboxBackend`], maintains a warm pool of
-//! microVMs per active repo, runs the snapshot manager and resource
-//! governor, and heartbeats the coordinator with capacity + warm-pool +
-//! local-snapshot state.
+//! Per-host daemon. Wraps a [`SandboxBackend`], composes the
+//! chunked-OCI image cache / tiered chunk resolver / egress proxy /
+//! NBD pool, runs the snapshot manager and resource governor, and
+//! heartbeats the coordinator with capacity + local-snapshot state.
 //!
 //! Phase 1 wires create/exec/destroy through the SandboxBackend trait —
 //! currently `engram-sandbox-process` for fast dev loops, with
@@ -28,7 +28,6 @@ pub mod harness;
 pub mod heartbeat;
 pub mod image_cache;
 pub mod orphan_reap;
-pub mod pool;
 pub mod pooled_backend;
 pub mod resource;
 pub mod snapshot;
@@ -179,16 +178,11 @@ impl HostAgent {
                 "dialing coordinator",
             );
             // Wrap the underlying SandboxBackend in a PooledBackend so
-            // `create()` opportunistically returns warm slots and the
-            // heartbeat ships real `(ready, target)` counts to the
-            // coordinator's scheduler. With this in place the
-            // scheduler's warm-pool branch in pick_for_session
-            // actually fires instead of falling through to capacity.
+            // session creation can attach the egress / chunk-store /
+            // image-cache state without burdening the underlying VZ /
+            // FC drivers with knowledge of those subsystems.
             let pooled = {
-                let mut p = pooled_backend::PooledBackend::new(
-                    self.sandbox.clone(),
-                    self.cfg.warm_pool_size,
-                );
+                let mut p = pooled_backend::PooledBackend::new(self.sandbox.clone());
                 if let Some(egress) = self.egress.clone() {
                     p = p.with_egress(egress);
                 }
@@ -212,11 +206,9 @@ impl HostAgent {
                 Arc::new(p)
             };
             let pooled_for_dialer: Arc<dyn engram_core::traits::SandboxBackend> = pooled.clone();
-            let pooled_for_hb = pooled.clone();
             let provider: dialer::HeartbeatProvider = std::sync::Arc::new(move || {
                 (
                     engram_protocol::HostCapacityReport::default(),
-                    pooled_for_hb.snapshot_warm_pools(),
                     Vec::new(),
                     false,
                 )

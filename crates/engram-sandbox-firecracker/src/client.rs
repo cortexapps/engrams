@@ -180,8 +180,8 @@ impl FirecrackerClient {
     /// VM is fully running again (`resume_vm: true`).
     ///
     /// File mode synchronously reads `mem_path` into the guest's
-    /// address space — fine for warm-pool restore on a slow loop, slow
-    /// for fast eviction-resume. Use [`Self::load_snapshot_uffd`] in
+    /// address space — fine for dev/test loops but slow for fast
+    /// eviction-resume. Use [`Self::load_snapshot_uffd`] in
     /// production-grade resume paths.
     pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {

@@ -268,7 +268,6 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
-        default_warm_pool_size: 0,
         ..CoordinatorConfig::default()
     };
     let state = Arc::new(AppState::new(cfg, services));

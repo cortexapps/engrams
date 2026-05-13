@@ -321,11 +321,10 @@ pub struct AppState {
     pub events: Arc<SessionEventBus>,
     /// Multi-host routing layer. In `--mode=all` this has exactly one
     /// entry registered at startup (the local backend, wrapped in
-    /// `engram_host_agent::pooled_backend::PooledBackend` so warm-pool
-    /// semantics still apply); `--mode=coordinator` fills it in as
-    /// hosts dial `/api/hosts/connect`. The warm pool is host-side
-    /// now — the coordinator just routes via the scheduler and lets
-    /// each host's `PooledBackend` handle checkout/replenish.
+    /// `engram_host_agent::pooled_backend::PooledBackend` so the
+    /// chunked-OCI / image-cache / egress wiring is consistent with
+    /// production host-agents); `--mode=coordinator` fills it in as
+    /// hosts dial `/api/hosts/connect`.
     pub host_registry: Arc<HostRegistry>,
     /// Phase 4: harness ↔ host vsock channel hub. Holds one
     /// connection per attached harness; routes inbound HarnessEvents
@@ -351,11 +350,12 @@ pub struct AppState {
 impl AppState {
     /// Convenience constructor for tests and `--mode=all`-flavoured
     /// embeddings: builds a fresh `HostRegistry` and pre-registers
-    /// `services.sandbox` as the sole host. Callers that want warm-
-    /// pool semantics in this single-host setup should pass a
-    /// `PooledBackend`-wrapped `services.sandbox`. Production
-    /// `--mode=coordinator` should use [`AppState::new_with_registry`]
-    /// to thread a registry that hosts dial into via WS.
+    /// `services.sandbox` as the sole host. Callers that want the
+    /// chunked-OCI / image-cache / egress wiring in this single-host
+    /// setup should pass a `PooledBackend`-wrapped `services.sandbox`.
+    /// Production `--mode=coordinator` should use
+    /// [`AppState::new_with_registry`] to thread a registry that hosts
+    /// dial into via WS.
     pub fn new(cfg: CoordinatorConfig, services: Services) -> Self {
         let registry = Arc::new(HostRegistry::new());
         registry.register(HostId::new(), services.sandbox.clone());

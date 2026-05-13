@@ -51,10 +51,6 @@ struct Cli {
     #[arg(long, env = "ENGRAM_COORDINATOR_TOKEN")]
     coordinator_token: Option<String>,
 
-    /// Default warm-pool size per active image_version.
-    #[arg(long, env = "ENGRAM_WARM_POOL_SIZE", default_value_t = 2)]
-    warm_pool_size: u32,
-
     /// Which sandbox backend to wrap. `firecracker` (Linux+KVM) or
     /// `vz` (macOS Apple Silicon). The Process backend is a test
     /// fixture and is intentionally not selectable here.
@@ -163,7 +159,6 @@ async fn main() -> Result<(), HostAgentError> {
     let cli = Cli::parse();
     let cfg = HostAgentConfig {
         work_dir: cli.work_dir.clone(),
-        warm_pool_size: cli.warm_pool_size,
         coordinator_endpoint: cli.coordinator.clone(),
         coordinator_token: cli.coordinator_token.clone(),
         ..HostAgentConfig::default()

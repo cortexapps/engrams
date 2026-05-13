@@ -13,8 +13,11 @@
 //! 3. Aggregating `list` across all connected hosts.
 //!
 //! Phase 3a single-host: the scheduler is trivial — pick the only
-//! registered host. Phase 3b grows this into a real ranking with
-//! snapshot affinity / warm pool / capacity inputs.
+//! registered host. Phase 3b grows this into a real ranking by
+//! snapshot affinity and capacity. Pre-v5 also had a warm-pool tier;
+//! deleted with ADR 0008 (chunked-OCI restore + canonical-memory
+//! make the create-time savings warm pools amortised no longer worth
+//! the complexity).
 
 use std::sync::Arc;
 
@@ -24,7 +27,7 @@ use engram_core::traits::SandboxBackend;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
-use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport, WarmPoolReport};
+use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
 use parking_lot::RwLock;
 
 /// Per-host record kept in-memory. Backend dispatches RPCs over the
@@ -45,7 +48,6 @@ struct HostEntry {
 #[derive(Clone, Debug, Default)]
 pub struct HostState {
     pub capacity: HostCapacityReport,
-    pub warm_pools: Vec<WarmPoolReport>,
     pub local_snapshots: Vec<LocalSnapshotReport>,
     pub draining: bool,
 }
@@ -53,8 +55,9 @@ pub struct HostState {
 /// Inputs the scheduler considers when picking a host. [`SandboxBackend`]
 /// trait calls don't carry these, so handlers that want session-aware
 /// scheduling call [`HostRegistry::create_for_session`] explicitly. The
-/// trait impl uses [`HostRegistry::pick_any`] (which is the warm-pool
-/// replenish path — anonymous slots, no affinity).
+/// trait impl uses [`HostRegistry::pick_any`] (no affinity — used for
+/// anonymous flows like list / restore where the request doesn't carry
+/// session context).
 #[derive(Clone, Debug)]
 pub struct ScheduleContext<'a> {
     pub repo: &'a str,
@@ -161,8 +164,9 @@ impl HostRegistry {
     }
 
     /// Trivial Phase-3a scheduler: pick any non-draining registered
-    /// host. Used by the `SandboxBackend` trait impl for warm-pool
-    /// replenish (anonymous slots — no session affinity).
+    /// host. Used by the `SandboxBackend` trait impl for anonymous
+    /// flows (list, restore from a global metadata) where the caller
+    /// hasn't supplied session-aware [`ScheduleContext`].
     fn pick_any(&self) -> Option<(HostId, Arc<dyn SandboxBackend>)> {
         self.hosts
             .iter()
@@ -171,18 +175,20 @@ impl HostRegistry {
             .map(|e| (*e.key(), e.value().backend.clone()))
     }
 
-    /// Phase 3b session scheduler. Inputs the per-host heartbeat state
-    /// (capacity / warm pools / local snapshots / draining) and ranks:
+    /// Session scheduler. Inputs the per-host heartbeat state (capacity,
+    /// local snapshots, draining) and ranks:
     ///
     /// 1. Host with `prefer_snapshot_id` in `local_snapshots` — zero-
     ///    cost hot-tier hit.
-    /// 2. Host with `(repo, image_version)` in `warm_pools` (highest
-    ///    `ready` count wins).
-    /// 3. Host with the largest free capacity (`total - used`), filtered
+    /// 2. Host with the largest free capacity (`total - used`), filtered
     ///    against `memory_mib` if provided.
-    /// 4. Else any non-draining host.
-    /// 5. Else `None` (the coordinator surfaces this as a 503 / typed
+    /// 3. Else any non-draining host.
+    /// 4. Else `None` (the coordinator surfaces this as a 503 / typed
     ///    `BackendError::NotSupported("no host available")`).
+    ///
+    /// The pre-v5 warm-pool tier was deleted with ADR 0008 — chunked-
+    /// OCI rootfs + canonical-memory restore made the create-time
+    /// savings warm pools amortised no longer worth the complexity.
     pub fn pick_for_session(
         &self,
         ctx: &ScheduleContext<'_>,
@@ -198,32 +204,6 @@ impl HostRegistry {
                     return Some((*entry.key(), entry.value().backend.clone()));
                 }
             }
-        }
-
-        // Warm-pool affinity: highest `ready` count for this
-        // `image_version` wins. The pool's `repo` field is diagnostic
-        // only — host-side `PooledBackend` keys on image_version
-        // alone, so two repos sharing an image share warm slots,
-        // which is the right behaviour: the pool's job is to amortise
-        // create-time cost per image, not enforce per-repo isolation.
-        let mut best_warm: Option<(u32, HostId, Arc<dyn SandboxBackend>)> = None;
-        for entry in self.hosts.iter() {
-            let st = entry.value().state.read();
-            if st.draining {
-                continue;
-            }
-            for pool in &st.warm_pools {
-                if pool.image_version == ctx.image_version && pool.ready > 0 {
-                    let candidate = (pool.ready, *entry.key(), entry.value().backend.clone());
-                    best_warm = match best_warm {
-                        Some((cur, _, _)) if cur >= pool.ready => best_warm,
-                        _ => Some(candidate),
-                    };
-                }
-            }
-        }
-        if let Some((_, host_id, backend)) = best_warm {
-            return Some((host_id, backend));
         }
 
         // Capacity-fit: largest free RAM that meets `memory_mib`.
@@ -553,7 +533,6 @@ mod tests {
                     used_mib: 0,
                     running_sandboxes: 0,
                 },
-                warm_pools: Vec::new(),
                 local_snapshots: Vec::new(),
                 draining: false,
             },
@@ -566,7 +545,6 @@ mod tests {
                     used_mib: 512,
                     running_sandboxes: 1,
                 },
-                warm_pools: Vec::new(),
                 local_snapshots: vec![LocalSnapshotReport {
                     snapshot_id: snap,
                     session_id: engram_core::SessionId::new(),
@@ -592,28 +570,23 @@ mod tests {
     }
 
     #[test]
-    fn pick_for_session_falls_through_to_warm_pool_then_capacity() {
+    fn pick_for_session_chooses_largest_free_capacity() {
         let reg = HostRegistry::new();
         let (b1, _d1) = dummy_backend();
         let (b2, _d2) = dummy_backend();
-        let h_warm = HostId::new();
+        let h_small = HostId::new();
         let h_big = HostId::new();
-        reg.register(h_warm, b1);
+        reg.register(h_small, b1);
         reg.register(h_big, b2);
 
         reg.update_state(
-            h_warm,
+            h_small,
             HostState {
                 capacity: HostCapacityReport {
                     total_mib: 1024,
                     used_mib: 512,
                     running_sandboxes: 0,
                 },
-                warm_pools: vec![WarmPoolReport {
-                    image_version: "v".into(),
-                    ready: 2,
-                    target: 4,
-                }],
                 local_snapshots: Vec::new(),
                 draining: false,
             },
@@ -626,13 +599,11 @@ mod tests {
                     used_mib: 0,
                     running_sandboxes: 0,
                 },
-                warm_pools: Vec::new(),
                 local_snapshots: Vec::new(),
                 draining: false,
             },
         );
 
-        // Warm-pool hit beats raw capacity.
         let ctx = ScheduleContext {
             repo: "r",
             image_version: "v",
@@ -640,30 +611,7 @@ mod tests {
             memory_mib: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
-        assert_eq!(picked, h_warm);
-
-        // Different repo, same image: warm pool still applies because
-        // the host-side pool keys on image_version only. The h_warm
-        // host's warm slot for image "v" services any repo using v.
-        let ctx = ScheduleContext {
-            repo: "other",
-            image_version: "v",
-            prefer_snapshot_id: None,
-            memory_mib: None,
-        };
-        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
-        assert_eq!(picked, h_warm);
-
-        // Different image: warm-pool match doesn't apply, capacity
-        // wins (h_big has 16x more free RAM than h_warm).
-        let ctx = ScheduleContext {
-            repo: "r",
-            image_version: "other-image",
-            prefer_snapshot_id: None,
-            memory_mib: None,
-        };
-        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
-        assert_eq!(picked, h_big);
+        assert_eq!(picked, h_big, "larger free capacity wins");
     }
 
     #[test]
@@ -676,8 +624,7 @@ mod tests {
         reg.register(h_drain, b1);
         reg.register(h_ready, b2);
 
-        // Draining host has the warm pool match and capacity, but
-        // shouldn't be picked.
+        // Draining host has more free capacity, but shouldn't be picked.
         reg.update_state(
             h_drain,
             HostState {
@@ -686,11 +633,6 @@ mod tests {
                     used_mib: 0,
                     running_sandboxes: 0,
                 },
-                warm_pools: vec![WarmPoolReport {
-                    image_version: "v".into(),
-                    ready: 4,
-                    target: 4,
-                }],
                 local_snapshots: Vec::new(),
                 draining: true,
             },
@@ -703,7 +645,6 @@ mod tests {
                     used_mib: 512,
                     running_sandboxes: 0,
                 },
-                warm_pools: Vec::new(),
                 local_snapshots: Vec::new(),
                 draining: false,
             },

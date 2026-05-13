@@ -30,11 +30,9 @@ runs the coordinator with:
 - `ENGRAM_DEV_AUTO_NOOP=1` — every new session auto-spawns the
   noop harness adapter, which dials the host-agent's harness TCP
   listener.
-- `ENGRAM_WARM_POOL_SIZE=1` — pre-spawn one warm slot per
-  `(repo, image_version)` so the second session checkout is
-  sub-second. Warm slots are agent-blind: the per-session
-  `AgentSpec` is supplied at `start_agent` time, after the
-  coordinator binds the session→sandbox routing.
+Sessions go through the chunked-OCI cold path on every create
+(warm pools were retired with ADR 0008; chunk-cache hits keep the
+hot path fast).
 
 Wait until you see:
 

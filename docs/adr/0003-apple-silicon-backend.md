@@ -128,13 +128,15 @@ which downloads the Kata release and extracts just the kernel
 (`tsc=reliable panic=0 quiet`), measured cold boot is **562 ms**;
 cold resume is **746 ms**.
 
-### 5. Warm pool reuses the existing `PooledBackend` wrapper
+### 5. Reuses the existing `PooledBackend` wrapper
 
-The warm pool is a generic `SandboxBackend` wrapper that calls
-`inner.create()` to fill the pool. It's already backend-agnostic — we
-got VZ pool support for free, no VZ-specific code changes. Pool
-checkout: ~30 ms. Same code path as FC, exercised the same way during
-local Mac testing.
+`PooledBackend` is a generic `SandboxBackend` wrapper that composes
+the chunked-OCI image cache, tiered chunk resolver, egress proxy, and
+NBD pool onto any underlying backend. It's already backend-agnostic —
+we got VZ session-create support for free, no VZ-specific code
+changes. (Pre-v5 the wrapper also held a warm pool of pre-created
+sandboxes per `(image, rootfs_source)`; retired with ADR 0008 because
+chunked-OCI restore made cold start fast enough.)
 
 ## Consequences
 
@@ -207,7 +209,6 @@ local Mac testing.
   --platform linux/arm64` + `mke2fs -t ext4 -F -d` (e2fsprogs from
   Homebrew, PATH-prepended).
 - `just dev-vz` — codesigns + launches coord with the VZ backend.
-  Default `ENGRAM_WARM_POOL_SIZE=1`, matching `dev-firecracker`.
 - CI: `.github/workflows/ci-macos-vz.yml` runs the unit tests on
   `macos-15` arm64.
 - Demo runbook: `docs/demo-vz.md`.

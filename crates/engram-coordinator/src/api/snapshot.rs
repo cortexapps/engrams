@@ -241,9 +241,10 @@ async fn resume_from_fc_snapshot(
     // typed SandboxError::Snapshot on missing artifacts, which
     // we map to 410 Gone below.
     let session_for_ctx = session.clone();
-    // ScheduleContext keys warm-pool affinity by `(repo, tag)`. With
-    // raw-URI image refs we split here for the affinity hint —
-    // `repo` becomes `host[:port]/repo[/path]`, `image_version`
+    // ScheduleContext carries `(repo, tag)` for telemetry / future
+    // affinity hooks; the live scheduler currently keys only on
+    // snapshot affinity + capacity. With raw-URI image refs we split
+    // here — `repo` becomes `host[:port]/repo[/path]`, `image_version`
     // becomes the tag.
     let (image_repo, image_tag) =
         engram_core::types::session::split_image_ref(&session_for_ctx.image);

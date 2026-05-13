@@ -12,10 +12,6 @@ pub struct CoordinatorConfig {
     pub local_path: PathBuf,
     pub sandbox_backend: SandboxBackendChoice,
     pub default_image_version: String,
-    /// Target warm-pool size for any image the coordinator has seen
-    /// a session for. 0 disables the warm pool (every session creates
-    /// a fresh sandbox synchronously).
-    pub default_warm_pool_size: u32,
     /// Bearer tokens accepted on protected endpoints. Empty = auth
     /// disabled (dev mode). When non-empty, every request to anything
     /// other than `/healthz` must carry `Authorization: Bearer <t>`
@@ -43,10 +39,6 @@ impl Default for CoordinatorConfig {
             local_path: PathBuf::from("./var/engram"),
             sandbox_backend: SandboxBackendChoice::Firecracker,
             default_image_version: "warm-bootstrap".into(),
-            // Modest dev default: one warm sandbox per image so the
-            // second session checkout is sub-second. Production tunes
-            // this per-image via the per-host-agent config.
-            default_warm_pool_size: 1,
             // Empty = auth disabled. Production deployments populate
             // this from `ENGRAM_AUTH_TOKENS` (or a future secret-store
             // hookup) at startup.

@@ -329,7 +329,7 @@ impl MetadataStore for MockMetadataStore {
 // ---------------------------------------------------------------------
 
 fn build_app(meta: Arc<MockMetadataStore>) -> axum::Router {
-    TestFixture::new(meta, InMemorySecretStore::new(), 0).app
+    TestFixture::new(meta, InMemorySecretStore::new()).app
 }
 
 /// Like `build_app` but seeds the bearer-token allow-list. Used by the
@@ -361,7 +361,6 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
-        default_warm_pool_size: 0,
         auth_tokens: tokens,
         ..CoordinatorConfig::default()
     };
@@ -378,26 +377,19 @@ struct TestFixture {
 }
 
 impl TestFixture {
-    fn new(
-        meta: Arc<MockMetadataStore>,
-        secrets: InMemorySecretStore,
-        warm_pool_size: u32,
-    ) -> Self {
+    fn new(meta: Arc<MockMetadataStore>, secrets: InMemorySecretStore) -> Self {
         // Separate tempdirs for each on-disk component so they can't
         // accidentally collide. All leak (`keep()`) because the axum
         // router needs to outlive this function — the OS cleans up
         // `/tmp` later.
         let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
         // Match production wiring: the host-side PooledBackend wraps
-        // the real backend so warm-pool semantics (checkout / configure /
-        // replenish) work the same way the multi-host setup runs them.
-        // `warm_pool_size = 0` skips pooling entirely (every session
-        // takes the cold path).
+        // the real backend so the chunked-OCI / image-cache / egress
+        // helpers fire the same way the multi-host setup runs them.
         let raw: Arc<dyn engram_core::traits::SandboxBackend> =
             Arc::new(ProcessBackend::new(sandbox_dir));
-        let backend: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(
-            engram_host_agent::pooled_backend::PooledBackend::new(raw, warm_pool_size),
-        );
+        let backend: Arc<dyn engram_core::traits::SandboxBackend> =
+            Arc::new(engram_host_agent::pooled_backend::PooledBackend::new(raw));
         let services = Services {
             meta: meta.clone(),
             cloud: Arc::new(MockCloud::new()),
@@ -422,7 +414,6 @@ impl TestFixture {
         };
         let cfg = CoordinatorConfig {
             default_image_version: "warm-bootstrap".into(),
-            default_warm_pool_size: warm_pool_size,
             ..CoordinatorConfig::default()
         };
         let state = Arc::new(AppState::new(cfg, services));
@@ -683,7 +674,7 @@ async fn create_session_with_explicit_image_persists_full_row() {
     // image lands, Empty workspace + None harness defaults work,
     // session transitions to Active.
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store.clone(), InMemorySecretStore::new(), 0);
+    let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
     f.write_image("cortex/api", "warm-pinned", r#"name = "cortex-api""#);
     let app = f.app;
 
@@ -2056,7 +2047,7 @@ async fn wrong_method_on_known_route_returns_405() {
 #[tokio::test]
 async fn manifest_env_lands_in_sandbox_environment() {
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
+    let f = TestFixture::new(store, InMemorySecretStore::new());
     f.write_image(
         "cortex/api",
         "warm-1",
@@ -2107,7 +2098,7 @@ async fn manifest_env_lands_in_sandbox_environment() {
 #[ignore = "rootfs is registry-pulled post-Stage-B1; covered by registry_e2e.rs"]
 async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
+    let f = TestFixture::new(store, InMemorySecretStore::new());
     f.write_image("cortex/api", "warm-1", r#"name = "cortex-api""#);
     let app = f.app;
 
@@ -2145,7 +2136,7 @@ async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
 async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
     let store = MockMetadataStore::arc();
     let secrets = InMemorySecretStore::with_secrets([("GITHUB_TOKEN", "ghp_test_value")]);
-    let f = TestFixture::new(store, secrets, 0);
+    let f = TestFixture::new(store, secrets);
     f.write_image(
         "cortex/api",
         "warm-1",
@@ -2191,7 +2182,7 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
 async fn required_secret_missing_in_store_fails_session_create() {
     let store = MockMetadataStore::arc();
     let secrets = InMemorySecretStore::new(); // empty
-    let f = TestFixture::new(store, secrets, 0);
+    let f = TestFixture::new(store, secrets);
     f.write_image(
         "cortex/api",
         "warm-1",
@@ -2229,7 +2220,7 @@ async fn required_secret_missing_in_store_fails_session_create() {
 async fn optional_secret_absence_is_silently_ok() {
     let store = MockMetadataStore::arc();
     let secrets = InMemorySecretStore::with_secrets([("GITHUB_TOKEN", "real")]);
-    let f = TestFixture::new(store, secrets, 0);
+    let f = TestFixture::new(store, secrets);
     f.write_image(
         "cortex/api",
         "warm-1",
@@ -2287,7 +2278,7 @@ async fn broker_mode_emits_placeholders_not_real_values() {
     // fail in this test setup. We just assert the env is a placeholder.
     let store = MockMetadataStore::arc();
     let secrets = InMemorySecretStore::with_secrets([("GITHUB_TOKEN", "ghp_real_secret_value")]);
-    let f = TestFixture::new(store, secrets, 0);
+    let f = TestFixture::new(store, secrets);
     f.write_image(
         "cortex/api",
         "warm-1",
@@ -2339,7 +2330,7 @@ async fn broker_mode_emits_placeholders_not_real_values() {
 #[tokio::test]
 async fn manifest_resource_hints_override_defaults() {
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new(), 0);
+    let f = TestFixture::new(store, InMemorySecretStore::new());
     f.write_image(
         "cortex/api",
         "warm-1",
@@ -2372,37 +2363,21 @@ async fn manifest_resource_hints_override_defaults() {
 }
 
 // ---------------------------------------------------------------------
-// Warm pool — checkout, replenish, fallback
+// Session-id injection
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn first_session_uses_cold_path_then_pool_warms() {
-    // With warm_pool_size=1 and no pre-warmed sandbox, the first
-    // session creates synchronously. After that request returns, a
-    // background replenish brings the pool to 1. The second session
-    // *should* check out the warm one.
-    //
-    // We can't observe directly from the API which path was taken —
-    // both produce the same SessionStatus::Active response. So we
-    // measure latency: warm checkout is sub-ms (pool.checkout +
-    // existing sandbox); cold create involves backend.create which
-    // even for ProcessBackend is mkdir + rootfs materialization.
-    //
-    // For ProcessBackend on Mac this is a few hundred microseconds
-    // either way, so the timing difference isn't reliable in CI.
-    // Instead we inspect Pool state directly via the AppState — but
-    // the integration test doesn't have access to it. So this test
-    // just asserts that two consecutive create calls succeed and
-    // produce distinct sessions. The pool plumbing is exercised; its
-    // unit tests in `engram-host-agent::pool` cover the actual
-    // warm/cold branching.
+async fn back_to_back_session_creates_succeed() {
+    // Smoke test: two consecutive create calls on the same image
+    // succeed and produce distinct sessions. Pre-v5 this test
+    // exercised the warm-pool checkout/replenish path; with warm
+    // pools deleted (ADR 0008) it now just sanity-checks the
+    // chunked-OCI cold path doesn't deadlock on a second create.
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new(), 1);
+    let f = TestFixture::new(store, InMemorySecretStore::new());
     let app = f.app;
 
     let id_a = api_create_session(app.clone(), "warm/test").await;
-    // Give the background replenish a moment.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let id_b = api_create_session(app.clone(), "warm/test").await;
     assert_ne!(id_a, id_b);
 
@@ -2421,12 +2396,11 @@ async fn first_session_uses_cold_path_then_pool_warms() {
 }
 
 #[tokio::test]
-async fn engram_session_id_is_injected_per_exec_not_baked_into_pool() {
-    // The pool serves anonymous sandboxes; ENGRAM_SESSION_ID must be
-    // injected at exec time so each session sees its own id even
-    // when the sandbox came from the warm pool.
+async fn engram_session_id_is_injected_per_exec() {
+    // ENGRAM_SESSION_ID must be injected at exec time, not baked in
+    // at sandbox creation, so each session sees its own id.
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new(), 1);
+    let f = TestFixture::new(store, InMemorySecretStore::new());
     let app = f.app;
 
     let id = api_create_session(app.clone(), "warm/test").await;

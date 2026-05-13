@@ -210,7 +210,6 @@ dev-firecracker: db-up registry-up bootstrap
     ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_KERNEL_IMAGE_PATH=$ENGRAM_KERNEL_IMAGE_PATH \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-bootstrap} \
-    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
     RUST_LOG=info,engram=debug \
     cargo run -p engram-coordinator
 
@@ -358,7 +357,6 @@ dev-vz: db-up registry-up bootstrap vz-codesign
     ENGRAM_LOCAL_PATH=./var/engram \
     ENGRAM_VZ_KERNEL_PATH=${ENGRAM_VZ_KERNEL_PATH:-$HOME/.cache/engram-vz-test/vmlinux-arm64} \
     ENGRAM_DEFAULT_IMAGE=${ENGRAM_DEFAULT_IMAGE:-warm-1} \
-    ENGRAM_WARM_POOL_SIZE=${ENGRAM_WARM_POOL_SIZE:-1} \
     RUST_LOG=info,engram=debug \
     target/debug/engram-coordinator
 

@@ -2,14 +2,21 @@ use chrono::{DateTime, Utc};
 use engram_core::{HostId, SessionId, SnapshotId};
 use serde::{Deserialize, Serialize};
 
-/// Heartbeat message: host -> coordinator, every ~5s. Reports current
-/// capacity, warm-pool state, and the snapshots held locally.
+/// Heartbeat message: host -> coordinator, every ~5s. Reports
+/// current capacity and the snapshots held locally.
+///
+/// Pre-v5: this carried a `warm_pools: Vec<WarmPoolReport>` field
+/// that reported per-image-version warm-slot ready/target counts.
+/// Warm pools were deleted as part of the ADR 0008 follow-up — the
+/// scheduling preference they enabled (route a session to a host
+/// that already had a matching warm slot) gave way to chunked-OCI
+/// content-addressable rootfs + canonical-memory restore (FC) and
+/// straight cold start (VZ). See the deletion commit for context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub host_id: HostId,
     pub sent_at: DateTime<Utc>,
     pub capacity: HostCapacityReport,
-    pub warm_pools: Vec<WarmPoolReport>,
     pub local_snapshots: Vec<LocalSnapshotReport>,
     pub draining: bool,
 }
@@ -19,18 +26,6 @@ pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,
     pub running_sandboxes: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WarmPoolReport {
-    /// Image identifier the pool key is bucketed by. Phase 2 made
-    /// images decoupled from workspace identity, so the redundant
-    /// `repo` half of the legacy `(repo, image_version)` key is gone
-    /// — pool slots can serve sessions across many git URLs as long
-    /// as they share an image.
-    pub image_version: String,
-    pub ready: u32,
-    pub target: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,11 +58,6 @@ mod tests {
                 used_mib: 64_000,
                 running_sandboxes: 7,
             },
-            warm_pools: vec![WarmPoolReport {
-                image_version: "warm-2026-04".into(),
-                ready: 2,
-                target: 4,
-            }],
             local_snapshots: vec![LocalSnapshotReport {
                 snapshot_id: SnapshotId::new(),
                 session_id: SessionId::new(),
@@ -91,10 +81,6 @@ mod tests {
             back.capacity.running_sandboxes,
             original.capacity.running_sandboxes
         );
-        assert_eq!(back.warm_pools.len(), 1);
-        assert_eq!(back.warm_pools[0].image_version, "warm-2026-04");
-        assert_eq!(back.warm_pools[0].ready, 2);
-        assert_eq!(back.warm_pools[0].target, 4);
         assert_eq!(back.local_snapshots.len(), 1);
         assert_eq!(
             back.local_snapshots[0].snapshot_id,
@@ -116,15 +102,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_warm_pools_and_snapshots_serialize_as_arrays() {
+    fn empty_local_snapshots_serializes_as_array() {
         // Defending against an accidental switch to Option<Vec<_>> or
         // skip_serializing_if which would change the wire shape and
         // break the host-side parser.
         let mut h = sample();
-        h.warm_pools.clear();
         h.local_snapshots.clear();
         let v: serde_json::Value = serde_json::to_value(&h).unwrap();
-        assert_eq!(v["warm_pools"], serde_json::json!([]));
         assert_eq!(v["local_snapshots"], serde_json::json!([]));
     }
 }

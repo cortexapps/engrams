@@ -275,7 +275,7 @@ impl E2eFixture {
 
     fn pooled_backend(&self, inner: Arc<dyn SandboxBackend>) -> Arc<PooledBackend> {
         Arc::new(
-            PooledBackend::new(inner, 0)
+            PooledBackend::new(inner)
                 .with_chunk_store(
                     (*self.chunk_store).clone(),
                     self.work_dir.join("materialized"),

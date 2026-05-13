@@ -53,11 +53,10 @@ pub trait SandboxBackend: Send + Sync {
     /// a second call with the agent already running is a no-op.
     ///
     /// **Why agent argv is supplied here, not on `SandboxSpec`.**
-    /// The warm pool reuses one `SandboxSpec` template across many
-    /// sessions in a `(repo, image_version)` bucket. Per-session
-    /// agent argv (carrying `session_id`, the attach token, etc.)
-    /// can't ride on that template — it'd freeze at the first
-    /// session's id. The caller supplies the per-session agent at
+    /// `SandboxSpec` is a per-image template; per-session agent argv
+    /// (carrying `session_id`, the attach token, etc.) can't ride on
+    /// it without conflating "what this image runs" with "what this
+    /// session is." The caller supplies the per-session agent at
     /// checkout time.
     ///
     /// **Why this is separate from `create`.** The coordinator

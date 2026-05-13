@@ -111,9 +111,8 @@ async fn build_app_state(
 
     let raw: Arc<dyn engram_core::traits::SandboxBackend> =
         Arc::new(engram_sandbox_process::ProcessBackend::new(work_dir));
-    let pooled: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(
-        engram_host_agent::pooled_backend::PooledBackend::new(raw, 0),
-    );
+    let pooled: Arc<dyn engram_core::traits::SandboxBackend> =
+        Arc::new(engram_host_agent::pooled_backend::PooledBackend::new(raw));
 
     let services = Services {
         meta: meta.clone(),

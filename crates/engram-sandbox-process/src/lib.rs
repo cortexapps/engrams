@@ -6,10 +6,10 @@
 //!
 //! **There is no isolation here.** This backend exists so the entire
 //! orchestration layer (coordinator API, scheduler, snapshot manager,
-//! warm pool, blob storage, host-agent loops) can be exercised on a
-//! developer's laptop — including macOS Apple Silicon, where the
-//! production VMM (Firecracker, KVM-only) cannot run. Real isolation
-//! comes from `engram-sandbox-firecracker` on Linux production hosts.
+//! blob storage, host-agent loops) can be exercised on a developer's
+//! laptop — including macOS Apple Silicon, where the production VMM
+//! (Firecracker, KVM-only) cannot run. Real isolation comes from
+//! `engram-sandbox-firecracker` on Linux production hosts.
 //!
 //! NEVER use this backend with untrusted input or in any deployment.
 //! It runs whatever shell command it's given as the same user as the
@@ -129,9 +129,8 @@ impl SandboxBackend for ProcessBackend {
             .ok_or(SandboxError::NotFound)?
             .clone();
         // Idempotent: a second call with the agent already running
-        // is a no-op. The warm-pool path may call start_agent more
-        // than once if the same sandbox is resumed-then-checkpointed-
-        // then-resumed; we keep the first agent.
+        // is a no-op. Resumed-then-checkpointed-then-resumed flows may
+        // call start_agent more than once; we keep the first agent.
         if self.agent_children.contains_key(&id) {
             return Ok(());
         }

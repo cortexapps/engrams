@@ -13,25 +13,17 @@ use engram_core::HostId;
 use engram_protocol::heartbeat::Heartbeat;
 use engram_protocol::server::{HostAdminHandler, HostSession};
 use engram_protocol::wire::NotifyKind;
-use engram_protocol::{HostCapacityReport, LocalSnapshotReport, WarmPoolReport};
+use engram_protocol::{HostCapacityReport, LocalSnapshotReport};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header;
 
 /// Callback the dialer invokes on each heartbeat tick. Returns the
-/// fresh state the host wants to publish: capacity / warm pools /
-/// local snapshots / draining flag. Callers (the HostAgent) close
-/// over their `Pool` + future SnapshotIndex so the WS payload always
-/// reflects the current state.
-pub type HeartbeatProvider = Arc<
-    dyn Fn() -> (
-            HostCapacityReport,
-            Vec<WarmPoolReport>,
-            Vec<LocalSnapshotReport>,
-            bool,
-        ) + Send
-        + Sync,
->;
+/// fresh state the host wants to publish: capacity / local snapshots
+/// / draining flag. Callers (the HostAgent) close over their backend
+/// state so the WS payload always reflects the current state.
+pub type HeartbeatProvider =
+    Arc<dyn Fn() -> (HostCapacityReport, Vec<LocalSnapshotReport>, bool) + Send + Sync>;
 
 /// Configuration for [`run_dialer`]. Pulled out of HostAgentConfig so
 /// it stays self-contained.
@@ -170,15 +162,14 @@ async fn heartbeat_loop(
     tick.tick().await; // first tick fires immediately; skip
     loop {
         tick.tick().await;
-        let (capacity, warm_pools, local_snapshots, draining) = match provider.as_ref() {
+        let (capacity, local_snapshots, draining) = match provider.as_ref() {
             Some(f) => f(),
-            None => (HostCapacityReport::default(), Vec::new(), Vec::new(), false),
+            None => (HostCapacityReport::default(), Vec::new(), false),
         };
         let hb = Heartbeat {
             host_id,
             sent_at: chrono::Utc::now(),
             capacity,
-            warm_pools,
             local_snapshots,
             draining,
         };

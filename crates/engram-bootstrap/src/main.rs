@@ -10,12 +10,11 @@
 //! re-establish the per-session agent (e.g. after FC snapshot/restore
 //! invalidates the previous adapter's connection).
 //!
-//! This indirection exists because the warm pool's `SandboxSpec` is
-//! agent-blind: per-session argv (carrying `session_id`, attach
-//! token, etc.) can't ride on the spec template. The host populates
-//! the per-session AgentSpec at `start_agent` time, after the
-//! coordinator has bound the session→sandbox routing in the
-//! HarnessHub.
+//! This indirection exists because `SandboxSpec` is agent-blind:
+//! per-session argv (carrying `session_id`, attach token, etc.) can't
+//! ride on the spec template. The host populates the per-session
+//! AgentSpec at `start_agent` time, after the coordinator has bound
+//! the session→sandbox routing in the HarnessHub.
 //!
 //! Why supervise instead of `exec`. Earlier revisions exec'd into
 //! the harness so bootstrap exited and didn't hang around. That broke

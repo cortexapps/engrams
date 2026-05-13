@@ -1,16 +1,17 @@
-//! `SandboxBackend` wrapper that opportunistically returns warm-pool
-//! sandboxes on `create()` and reports its pool state for heartbeats.
+//! `SandboxBackend` wrapper that adds host-side resource resolution
+//! (image cache, chunk store, materialize-to-file, optional NBD,
+//! optional egress proxy) on top of the inner backend (VZ or FC).
 //!
-//! The host-agent owns one `PooledBackend` wrapping its real backend
-//! (Process or Firecracker). Coordinator-side `--mode=all` also wraps
-//! the local backend in a `PooledBackend` so warm-pool semantics apply
-//! identically to single-binary dev and multi-host production.
-//!
-//! Pool key is `image_version` (i.e. `spec.image`). With image
-//! identity decoupled from workspace identity in phase 2, a single
-//! warm slot serves any session referencing the same image — the
-//! pool's job is to amortise the create-time cost of a given image,
-//! not enforce per-repo isolation.
+//! Originally this also held a warm pool of pre-created sandboxes;
+//! that was deleted as part of the ADR 0008 follow-up — see commit
+//! history for context. Briefly: warm pools' value (~30 ms saved on
+//! cold start) didn't earn its complexity in the multi-tenant
+//! world we'd grown into (every session is a different
+//! SandboxSpec, so the per-key warm-slot hit rate trended to
+//! zero), and the FC production-target replacement
+//! (canonical-memory restore from ADR 0007 Phase 5) is strictly
+//! better. VZ dev now pays full cold-boot (~1 s) per session;
+//! that's the explicit tradeoff.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,13 +24,11 @@ use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
-use engram_protocol::WarmPoolReport;
 use tokio::fs;
 use tokio::sync::Mutex;
 
 use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageBundle, ImageCache};
-use crate::pool::{Pool, PoolKey};
 
 /// Cross-platform optional NBD state slot. Linux carries the real
 /// state; non-Linux is `()` so the `resolve_rootfs` return signature
@@ -66,22 +65,27 @@ fn legacy_rootfs_path(cached: &CachedImage) -> Result<PathBuf, SandboxError> {
     })
 }
 
-/// Wraps an inner [`SandboxBackend`] with warm-pool semantics. `create`
-/// looks for a warm slot first; on miss it forwards to `inner` and
-/// kicks off a background `replenish` so the next session gets the
-/// freshly-created slot. Other methods just delegate.
+/// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
+/// resource resolution: image cache, chunk store, materialize-to-
+/// file, optional NBD daemon, optional egress proxy.
+///
+/// Pre-warm-pool-deletion this also held a `Pool` of pre-created
+/// sandboxes and a `pool_key`-based checkout dance. Both are gone;
+/// `create` just resolves resources and forwards to `inner`.
+/// Cold-create cost on each backend:
+///
+/// - **FC + canonical-memory-baked image**: ~100-500 ms via UFFD-
+///   from-chunks restore. The "warm" of post-warm-pool-world.
+/// - **FC, legacy bake**: ~500-700 ms full cold boot.
+/// - **VZ**: ~1 s full cold boot. No memory-snapshot primitive
+///   available on macOS arm64 Linux (Apple-side bug).
 pub struct PooledBackend {
     inner: Arc<dyn SandboxBackend>,
-    pool: Pool,
-    /// Default target size used when `create()` first sees a new
-    /// `(image_version)`. `0` disables pooling: every session gets a
-    /// fresh sandbox.
-    default_target: u32,
     /// Phase 5+: if `Some`, `create()` resolves `spec.image_uri`
-    /// through this cache before delegating to `inner`. Setting the
-    /// cached `rootfs.ext4` path on `spec.rootfs_source` lets the
-    /// existing warm-pool logic and inner backend keep working
-    /// unchanged. `None` is the legacy single-host path.
+    /// through this cache before delegating to `inner`. The cache
+    /// owns OCI pull + on-disk layout; `create` reads
+    /// `cached.bundle` to decide between rootfs paths (legacy
+    /// ext4, ADR 0007 chunked manifest, ADR 0008 chunked-OCI).
     image_cache: Option<ImageCache>,
     /// ADR 0006: per-host egress proxy. When attached, incoming
     /// `notify_session_policy` calls register against the local
@@ -90,8 +94,7 @@ pub struct PooledBackend {
     egress: Option<Arc<HostEgress>>,
     /// `sandbox_id → session_id` index so `destroy(sandbox_id)` can
     /// call `Registry::unregister(session_id)`. Populated when a
-    /// policy frame arrives. Skipped for sandboxes never policied
-    /// (warm-pool slots that never bound to a session).
+    /// policy frame arrives.
     egress_sessions: DashMap<SandboxId, SessionId>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
@@ -146,11 +149,9 @@ pub struct PooledBackend {
 }
 
 impl PooledBackend {
-    pub fn new(inner: Arc<dyn SandboxBackend>, default_target: u32) -> Self {
+    pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
         Self {
-            pool: Pool::new(inner.clone()),
             inner,
-            default_target,
             image_cache: None,
             egress: None,
             egress_sessions: DashMap::new(),
@@ -228,13 +229,6 @@ impl PooledBackend {
     pub fn with_egress(mut self, egress: Arc<HostEgress>) -> Self {
         self.egress = Some(egress);
         self
-    }
-
-    /// Snapshot the pool's `(ready, target)` counts per image_version
-    /// for inclusion in the next outbound heartbeat. Cheap (locks the
-    /// pool's mutex briefly).
-    pub fn snapshot_warm_pools(&self) -> Vec<WarmPoolReport> {
-        self.pool.snapshot_reports()
     }
 
     /// Resolve the disk for a cached image. Three branches in
@@ -496,20 +490,6 @@ impl PooledBackend {
             "materialised memory.bin from chunked memory manifest",
         );
         Ok(())
-    }
-
-    fn pool_key(spec: &SandboxSpec) -> PoolKey {
-        // `rootfs_source` is set by the image cache (OCI path) or
-        // the caller (local:// dev) before this is called — see
-        // `create()`. Two specs with the same `image` tag but
-        // different rootfs files now hash to distinct keys, so the
-        // known-issues-#1 collision (two `local://` repos sharing
-        // `image: "warm-1"` but shipping different rootfs) can't
-        // happen.
-        PoolKey {
-            image_version: spec.image.clone(),
-            rootfs_source: spec.rootfs_source.clone(),
-        }
     }
 }
 
@@ -875,28 +855,7 @@ impl SandboxBackend for PooledBackend {
             }
         }
 
-        let key = Self::pool_key(&spec);
-
-        // Warm-slot path: a previously-created sandbox is sitting in
-        // the pool, ready to serve. Return it immediately and queue
-        // a replenish to top the pool back up.
-        if let Some(id) = self.pool.checkout(&key) {
-            tracing::debug!(image = %spec.image, sandbox_id = %id, "pool checkout hit");
-            self.spawn_replenish(key);
-            return Ok(id);
-        }
-
-        // First-session-for-this-image path: configure the pool with
-        // this spec so future replenishes know what to create, then
-        // do the actual create on the wrapped backend.
-        if self.default_target > 0 {
-            self.pool
-                .configure(key.clone(), self.default_target, spec.clone());
-        }
         let sandbox_id = self.inner.create(spec).await?;
-        if self.default_target > 0 {
-            self.spawn_replenish(key);
-        }
         // Stash any spawned NBD daemon under the freshly-assigned
         // sandbox id. `destroy()` removes the entry (Drop tears
         // down the daemon + returns the slot); `snapshot()` reads
@@ -1081,21 +1040,6 @@ impl SandboxBackend for PooledBackend {
     }
 }
 
-impl PooledBackend {
-    fn spawn_replenish(&self, key: PoolKey) {
-        let pool = self.pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = pool.replenish(&key).await {
-                tracing::warn!(
-                    error = %e,
-                    image = %key.image_version,
-                    "background pool replenish failed",
-                );
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,108 +1062,6 @@ mod tests {
             network: Default::default(),
             canonical_memory_manifest: None,
         }
-    }
-
-    #[tokio::test]
-    async fn create_with_target_zero_skips_pool_and_just_forwards() {
-        let dir = tempfile::tempdir().unwrap();
-        let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
-        let pooled = PooledBackend::new(inner, 0);
-
-        // Each call produces a fresh id; nothing accumulates in the pool.
-        let _id1 = pooled.create(live_spec("warm-test")).await.unwrap();
-        let reports = pooled.snapshot_warm_pools();
-        assert!(
-            reports.is_empty(),
-            "target=0 must not configure any pool entries"
-        );
-    }
-
-    #[tokio::test]
-    async fn second_create_for_same_image_can_hit_warm_slot() {
-        // Sequence: first create configures the pool and triggers a
-        // background replenish (target=2). After awaiting a tick the
-        // replenisher has filled one or two slots. A second create
-        // with the same image should checkout from that pool.
-        let dir = tempfile::tempdir().unwrap();
-        let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
-        let pooled = PooledBackend::new(inner, 2);
-
-        let _first = pooled.create(live_spec("warm-test")).await.unwrap();
-
-        // Yield long enough for the spawned replenish task to start
-        // and create at least one slot. ProcessBackend's create is
-        // sync-cheap (just creates a tempdir).
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let reports = pooled.snapshot_warm_pools();
-        assert!(
-            !reports.is_empty(),
-            "configured pool must show in snapshot_warm_pools",
-        );
-        let report = &reports[0];
-        assert_eq!(report.target, 2);
-        assert_eq!(report.image_version, "warm-test");
-    }
-
-    #[tokio::test]
-    async fn different_images_get_separate_pool_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
-        let pooled = PooledBackend::new(inner, 1);
-
-        let _ = pooled.create(live_spec("warm-a")).await.unwrap();
-        let _ = pooled.create(live_spec("warm-b")).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let mut reports = pooled.snapshot_warm_pools();
-        reports.sort_by(|a, b| a.image_version.cmp(&b.image_version));
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].image_version, "warm-a");
-        assert_eq!(reports[1].image_version, "warm-b");
-    }
-
-    #[tokio::test]
-    async fn same_image_tag_but_different_rootfs_does_not_collide() {
-        // Known-issues #1 regression at the PooledBackend layer: two
-        // specs with identical `image` strings but different
-        // `rootfs_source` paths must not share a warm slot. Before
-        // the fix the second `create` would hand back a sandbox
-        // configured with the first spec's rootfs and the harness
-        // would silently load wrong-image binaries.
-        let dir = tempfile::tempdir().unwrap();
-        let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
-        let pooled = PooledBackend::new(inner, 1);
-
-        // ProcessBackend materialises `rootfs_source` (it copies a
-        // directory tree into the sandbox cwd), so both paths have
-        // to be real directories. Their contents don't matter for
-        // the pool-key test — only the path strings do.
-        let demo_rootfs = dir.path().join("demo");
-        let oauth_rootfs = dir.path().join("oauth");
-        std::fs::create_dir_all(&demo_rootfs).unwrap();
-        std::fs::create_dir_all(&oauth_rootfs).unwrap();
-
-        let mut demo = live_spec("warm-1");
-        demo.rootfs_source = Some(demo_rootfs);
-        let mut oauth = live_spec("warm-1");
-        oauth.rootfs_source = Some(oauth_rootfs);
-
-        let _ = pooled.create(demo).await.unwrap();
-        let _ = pooled.create(oauth).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Two pool entries, both reported under the same
-        // `image_version` (heartbeat shape is unchanged) but
-        // internally keyed on distinct rootfs paths.
-        let reports = pooled.snapshot_warm_pools();
-        assert_eq!(
-            reports.len(),
-            2,
-            "specs with distinct rootfs must produce two pool entries even when image strings match",
-        );
-        assert!(reports.iter().all(|r| r.image_version == "warm-1"));
     }
 
     #[tokio::test]
@@ -1406,7 +1248,7 @@ mod tests {
             staging_root: tmp.path().join("fc-snaps"),
         });
         let materialize_dir = tmp.path().join("materialized");
-        let pooled = PooledBackend::new(inner, 0).with_chunk_store(cs.clone(), materialize_dir);
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs.clone(), materialize_dir);
 
         // 4. Take the snapshot. PooledBackend's wrap chunks
         //    memory.bin and patches manifest.json.
@@ -1446,7 +1288,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir));
-        let pooled = PooledBackend::new(inner, 0);
+        let pooled = PooledBackend::new(inner);
 
         let _id = pooled.create(live_spec("warm-test")).await.unwrap();
         // ProcessBackend's snapshot writes the directory structure
@@ -1580,7 +1422,7 @@ mod tests {
             "precondition: memory.bin must be absent before restore"
         );
 
-        let pooled = PooledBackend::new(inner.clone(), 0)
+        let pooled = PooledBackend::new(inner.clone())
             .with_chunk_store(cs.clone(), tmp.path().join("materialized"));
 
         // Restore — should materialise memory.bin then delegate.
@@ -1704,7 +1546,7 @@ mod tests {
             snap_dir: snap_dir.clone(),
         });
         let pooled =
-            PooledBackend::new(inner, 0).with_chunk_store(cs, tmp.path().join("materialized"));
+            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized"));
         let metadata = SnapshotMetadata {
             id: engram_core::SnapshotId::new(),
             size_bytes: 0,
@@ -1919,10 +1761,10 @@ mod tests {
         let inner: Arc<dyn SandboxBackend> = captured.clone();
 
         // 5. PooledBackend wires both image cache + chunk store +
-        //    materialize dir. target_size=0 to skip warm-pool
-        //    replenish (we only care about the single create path).
+        //    materialize dir. We only care about the single create
+        //    path here.
         let materialize_dir = tmp.path().join("materialized");
-        let pooled = PooledBackend::new(inner, 0)
+        let pooled = PooledBackend::new(inner)
             .with_image_cache(cache)
             .with_chunk_store(cs.clone(), materialize_dir.clone());
 

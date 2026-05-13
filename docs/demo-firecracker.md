@@ -70,7 +70,6 @@ Cache the FC test artifacts on the VM (kernel + ubuntu rootfs):
   'cd ~/engrams && /nix/var/nix/profiles/default/bin/nix develop --command \
    env ENGRAM_KERNEL_IMAGE_PATH=\$HOME/.cache/engram-fc-test/vmlinux-5.10.223 \
        ENGRAM_DEFAULT_IMAGE=warm-1 \
-       ENGRAM_WARM_POOL_SIZE=0 \
        just dev-firecracker > /tmp/engram-coord.log 2>&1'"
 
 # wait for the build + boot

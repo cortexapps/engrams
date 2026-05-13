@@ -48,7 +48,7 @@ pub trait NotifyHandler: Send + Sync {
 
     /// Called for each `NotifyKind::Heartbeat`. The coordinator
     /// updates `hosts.last_heartbeat_at` and refreshes its in-memory
-    /// view of capacity / warm-pool / local-snapshot state.
+    /// view of capacity / local-snapshot state.
     async fn on_heartbeat(&self, hb: Heartbeat) -> HeartbeatAck;
 }
 

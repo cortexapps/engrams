@@ -77,10 +77,6 @@ struct Cli {
     #[arg(long, env = "ENGRAM_VZ_KERNEL_PATH")]
     vz_kernel_path: Option<PathBuf>,
 
-    /// Target warm-pool size per (repo, image_version). 0 = disable.
-    #[arg(long, env = "ENGRAM_WARM_POOL_SIZE", default_value_t = 1)]
-    warm_pool_size: u32,
-
     /// Comma-separated list of bearer tokens accepted on protected
     /// endpoints. Empty (the default) disables auth and is intended
     /// for local dev only. Production deployments populate this from
@@ -221,7 +217,6 @@ async fn main() -> Result<(), CoordinatorError> {
         local_path: cli.local_path.clone(),
         sandbox_backend: cli.sandbox_backend,
         default_image_version: cli.default_image_version.clone(),
-        default_warm_pool_size: cli.warm_pool_size,
         // clap's value_delimiter splits even an empty default into a
         // single "" entry — strip those so an unset env reads as truly
         // empty (auth-off) rather than "exactly one token: empty string".
@@ -417,18 +412,15 @@ async fn main() -> Result<(), CoordinatorError> {
                 }
             }
         };
-        // Wrap in PooledBackend so warm-pool semantics still apply in
-        // --mode=all (the same wrapper that production multi-host
-        // deployments run inside their host-agent process). Without
-        // this, single-binary dev would lose sub-second session
-        // checkout for repeat (repo, image_version) hits.
+        // Wrap in PooledBackend so the chunked-OCI / image-cache /
+        // egress / chunk-store wiring is shared between `--mode=all`
+        // (single-binary dev) and production host-agents (which build
+        // the same wrapper in `engram-host-agent::lib::run`).
         //
-        // Phase 5+: attach an ImageCache so SandboxSpec.image_uri /
-        // harness_pack_uri get resolved through the OCI puller before
-        // the warm-pool key is derived. Cache root lives under
-        // `<local_path>/oci-cache` so it doesn't collide with the
-        // legacy on-disk image registry tree. Reuses the OCI client
-        // built up-front (also shared with `/api/enabled-images`).
+        // The cache root lives under `<local_path>/oci-cache` so it
+        // doesn't collide with the legacy on-disk image registry tree.
+        // Reuses the OCI client built up-front (also shared with
+        // `/api/enabled-images`).
         let oci_cache_root = cli.local_path.join("oci-cache");
         let image_cache =
             engram_host_agent::image_cache::ImageCache::open(oci_cache_root, (*oci_client).clone())
@@ -513,17 +505,14 @@ async fn main() -> Result<(), CoordinatorError> {
         };
 
         let pooled_backend: Arc<dyn SandboxBackend> = Arc::new({
-            let mut p = engram_host_agent::pooled_backend::PooledBackend::new(
-                raw_backend,
-                cli.warm_pool_size,
-            )
-            // ADR 0008 Phase 5: feed the OciClient to the pooled
-            // backend so chunked-OCI images can fault chunks from
-            // the registry on BlobStorage miss.
-            .with_oci_client((*oci_client).clone())
-            .with_image_cache(image_cache)
-            .with_chunk_store(chunk_store, materialize_dir)
-            .with_chunk_cache(chunk_cache);
+            let mut p = engram_host_agent::pooled_backend::PooledBackend::new(raw_backend)
+                // ADR 0008 Phase 5: feed the OciClient to the pooled
+                // backend so chunked-OCI images can fault chunks from
+                // the registry on BlobStorage miss.
+                .with_oci_client((*oci_client).clone())
+                .with_image_cache(image_cache)
+                .with_chunk_store(chunk_store, materialize_dir)
+                .with_chunk_cache(chunk_cache);
             if let Some(egress) = host_egress.clone() {
                 p = p.with_egress(egress);
             }
@@ -594,7 +583,6 @@ async fn main() -> Result<(), CoordinatorError> {
         });
         tracing::info!(
             host_id = %in_proc_host,
-            warm_pool_size = cli.warm_pool_size,
             "registered in-process host (--mode=all bypasses the WS path)",
         );
     } else {

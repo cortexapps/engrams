@@ -85,9 +85,9 @@ pub struct SandboxSpec {
 /// Argv + env for the long-running "agent" process (Claude Code,
 /// the dev noop harness, future adapters). Passed to
 /// `SandboxBackend::start_agent` at session-bind time — *not*
-/// stored on `SandboxSpec`, because the warm pool reuses one spec
-/// across sessions and the agent's argv is per-session
-/// (`session_id`, attach token, etc.).
+/// stored on `SandboxSpec`, because the agent's argv is per-session
+/// (`session_id`, attach token, etc.) while `SandboxSpec` is a
+/// per-image template.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentSpec {
     /// Argv. `argv[0]` must be reachable by the backend — for

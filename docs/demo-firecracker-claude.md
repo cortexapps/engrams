@@ -68,7 +68,6 @@ Rootfs is ~400 MB. Acceptable for the demo.
        ENGRAM_KERNEL_IMAGE_PATH=$HOME/.cache/engram-fc-test/vmlinux-5.10.223 \
        ENGRAM_DEFAULT_IMAGE=warm-1 \
        ENGRAM_DEV_AUTO_AGENT=claude \
-       ENGRAM_WARM_POOL_SIZE=0 \
        just dev-firecracker > /tmp/engram-coord.log 2>&1'"
 ```
 
@@ -76,9 +75,8 @@ Notes:
 - `ENGRAM_DEV_AUTO_AGENT=claude` flips `build_dev_agent` to
   pick `dev_claude_harness_path` (defaulted to
   `/sbin/engram-harness-claude` by the dev-firecracker recipe).
-- `ENGRAM_WARM_POOL_SIZE=0` keeps every session a fresh boot —
-  simpler to reason about end-to-end. Bump to 1 to see warm-pool
-  reuse.
+- Sessions take the chunked-OCI cold path; warm pools were retired
+  with ADR 0008.
 
 ## Drive the demo
 
