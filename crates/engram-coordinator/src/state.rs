@@ -442,6 +442,32 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// Replay a harness event that arrived from a remote host (via
+/// `NotifyKind::HarnessEvent`) through the coord's local hub. The
+/// hub's `EventSink` — built by `harness_event_sink` below — does
+/// the session_events append + SSE publish, dedup, etc. From the
+/// perspective of subscribers this is indistinguishable from a
+/// mode=all event flowing through the in-proc EventSink.
+///
+/// `at` is the host's wall-clock at observation time, captured at
+/// the source and round-tripped through the WS. We forward it for
+/// future use (per-event timestamps on the persisted row); today the
+/// sink's `SessionEvent::from_harness` stamps its own `Utc::now()`
+/// because the persisted event row already has a `created_at`.
+pub async fn emit_harness_event(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: engram_core::SandboxId,
+    event: engram_harness_proto::HarnessEvent,
+    _at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::error::ApiError> {
+    state
+        .harness_hub
+        .emit_external(session_id, sandbox_id, event)
+        .await;
+    Ok(())
+}
+
 /// Build the [`EventSink`] that forwards harness events into
 /// `session_events` and triggers Track C.9 auto-checkpoints on
 /// `Idle` / `RunCompleted` for Git sessions. Captures clones of

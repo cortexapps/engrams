@@ -295,6 +295,31 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
                 // back, it's a confused peer. Drop.
                 tracing::debug!(host_id = %host_id, "host sent unexpected SessionEgressPolicy; ignoring");
             }
+            NotifyKind::HarnessEvent {
+                session_id,
+                sandbox_id,
+                event,
+                at,
+            } => {
+                // Forwarded by the host-agent's local HarnessHub on every
+                // adapter event. We re-emit through `state.emit` so SSE
+                // subscribers see the same stream they would in mode=all,
+                // where the hub's `EventSink` writes to session_events
+                // directly. Mirrors the closure built by
+                // `harness_event_sink(...)` in state.rs.
+                if let Err(e) =
+                    crate::state::emit_harness_event(&state, session_id, sandbox_id, event, at)
+                        .await
+                {
+                    tracing::warn!(
+                        host_id = %host_id,
+                        session_id = %session_id,
+                        sandbox_id = %sandbox_id,
+                        error = %e,
+                        "failed to emit forwarded harness event",
+                    );
+                }
+            }
         }
     }
 

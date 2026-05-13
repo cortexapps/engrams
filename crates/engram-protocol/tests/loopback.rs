@@ -287,3 +287,70 @@ async fn destroy_unknown_sandbox_id_is_idempotent_through_the_wire() {
         .await
         .expect("ProcessBackend's destroy is idempotent on unknown ids; wire must round-trip Ok");
 }
+
+#[tokio::test]
+async fn harness_event_forwards_via_wire_to_coord_notify_channel() {
+    // Phase 2 surface: the host-agent's local `HarnessHub` ships
+    // every adapter event over the WS as `NotifyKind::HarnessEvent`,
+    // and the coord's read loop replays it through its in-proc
+    // hub's EventSink. Here we wire just the host side: build a
+    // `HarnessHub` with an `EventSink` closure that drops the event
+    // into a `NotifyKind::HarnessEvent` on the host's session, then
+    // drive `hub.emit_external(...)` and confirm the coord-side
+    // `notify_rx` channel surfaces the same payload.
+    use engram_harness_proto::HarnessEvent;
+    use engram_protocol::wire::NotifyKind;
+
+    // A: coord -> host    B: host -> coord
+    let (coord_tx_a, host_rx_a) = futures::channel::mpsc::unbounded::<TungMessage>();
+    let (host_tx_b, coord_rx_b) = futures::channel::mpsc::unbounded::<TungMessage>();
+
+    let coord_sink =
+        coord_tx_a.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
+    let coord_stream = coord_rx_b.map(Ok::<TungMessage, TungError>);
+    let host_sink = host_tx_b.sink_map_err(|e| TungError::Io(std::io::Error::other(e.to_string())));
+    let _host_stream = host_rx_a.map(Ok::<TungMessage, TungError>);
+
+    let (_connected, mut notify_rx, _demux) =
+        ConnectedHost::spawn(Box::pin(coord_sink), Box::pin(coord_stream));
+    let session = HostSession::new(Box::pin(host_sink));
+
+    // EventSink closure mirrors what host-agent::lib.rs builds: it
+    // captures the live HostSession and ships every event as a
+    // NotifyKind::HarnessEvent.
+    let session_for_sink = session.clone();
+    let event_sink = event_sink_to(move |session_id, sandbox_id, ev| {
+        let s = session_for_sink.clone();
+        async move {
+            let frame = NotifyKind::HarnessEvent {
+                session_id,
+                sandbox_id,
+                event: ev,
+                at: chrono::Utc::now(),
+            };
+            s.notify(frame).await.expect("send harness event over wire");
+        }
+    });
+    let hub = HarnessHub::new(event_sink);
+    let session_id = engram_core::SessionId::new();
+    let sandbox_id = engram_core::SandboxId::new();
+    hub.emit_external(session_id, sandbox_id, HarnessEvent::Idle)
+        .await;
+
+    let observed = tokio::time::timeout(Duration::from_secs(2), notify_rx.recv())
+        .await
+        .expect("notify arrives within timeout")
+        .expect("notify channel still open");
+    match observed {
+        NotifyKind::HarnessEvent {
+            session_id: got_sid,
+            sandbox_id: got_sandbox,
+            event: HarnessEvent::Idle,
+            ..
+        } => {
+            assert_eq!(got_sid, session_id);
+            assert_eq!(got_sandbox, sandbox_id);
+        }
+        other => panic!("expected HarnessEvent::Idle, got {other:?}"),
+    }
+}

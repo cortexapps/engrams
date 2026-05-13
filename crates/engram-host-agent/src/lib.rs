@@ -259,14 +259,51 @@ impl HostAgent {
                 }
                 Arc::new(p)
             };
-            // Construct a local HarnessHub + LocalHostClient. The hub's
-            // event sink is wired up in Phase 2 (over-WS forwarding);
-            // for now we use a no-op sink so the trait surface is
-            // satisfied. With the local hub in place,
-            // `pooled.set_harness_sink` will deliver vsock dials into
-            // it once Phase 2 lands the registration.
-            let event_sink = crate::harness::event_sink_to(|_, _, _| async {});
+            // Construct a local HarnessHub whose EventSink ships
+            // `NotifyKind::HarnessEvent` over the WS dialer. The
+            // dialer populates `harness_session_handle` on every
+            // connect and clears it on disconnect, so a brief gap
+            // during reconnect just drops a handful of events
+            // (the host's hub still drives idle eviction locally).
+            let harness_session_handle: crate::ws_auth::SessionHandle =
+                Arc::new(tokio::sync::RwLock::new(None));
+            let sink_handle = harness_session_handle.clone();
+            let event_sink = crate::harness::event_sink_to(move |session_id, sandbox_id, ev| {
+                let handle = sink_handle.clone();
+                async move {
+                    let guard = handle.read().await;
+                    let Some(session) = guard.clone() else {
+                        tracing::trace!(
+                            %session_id, %sandbox_id,
+                            "no live coord session; dropping harness event",
+                        );
+                        return;
+                    };
+                    drop(guard);
+                    let frame = engram_protocol::wire::NotifyKind::HarnessEvent {
+                        session_id,
+                        sandbox_id,
+                        event: ev,
+                        at: chrono::Utc::now(),
+                    };
+                    if let Err(e) = session.notify(frame).await {
+                        tracing::debug!(
+                            %session_id, %sandbox_id, error = %e,
+                            "forward harness event over WS failed",
+                        );
+                    }
+                }
+            });
             let harness_hub = std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink));
+            // Plumb the hub into the FC/VZ backend's vsock-accept
+            // sink so inbound harness connections land on the local
+            // hub's adapter loop. Without this the FC backend drops
+            // every dial with "no sink registered" — the bug Phase 2
+            // closes.
+            let sink_hub = harness_hub.clone();
+            let sink: engram_core::traits::HarnessSink =
+                std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
+            pooled.set_harness_sink(sink);
             let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
                 crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub),
             );
@@ -318,6 +355,7 @@ impl HostAgent {
                 heartbeat_interval: self.cfg.heartbeat_interval,
                 heartbeat_provider: Some(provider),
                 auth_session_handle: self.auth_session_handle.clone(),
+                harness_session_handle: Some(harness_session_handle),
                 admin_handler,
             };
             let dialer_task = tokio::spawn(async move {

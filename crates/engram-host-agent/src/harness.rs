@@ -111,6 +111,24 @@ struct ConnectionHandle {
 }
 
 impl HarnessHub {
+    /// Drive the hub's `EventSink` for a harness event that didn't
+    /// originate from a local adapter loop. Used by the coord-side
+    /// ingest path: a remote host's hub fires its sink to ship a
+    /// `NotifyKind::HarnessEvent` over the WS, and the coord's read
+    /// loop replays the event through *its* hub so the in-proc
+    /// session_events emit closure (built by `harness_event_sink`)
+    /// gets the same view it would in mode=all.
+    pub async fn emit_external(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        event: HarnessEvent,
+    ) {
+        let fut: Box<dyn Future<Output = ()> + Send + Unpin> =
+            (self.inner.event_sink)(session_id, sandbox_id, event);
+        Box::into_pin(fut).await;
+    }
+
     pub fn new(event_sink: EventSink) -> Self {
         Self {
             inner: Arc::new(HubInner {

@@ -302,6 +302,17 @@ pub enum NotifyKind {
     /// `SandboxBackend` trait can name it without depending on this
     /// crate. ADR 0006.
     SessionEgressPolicy(SessionEgressPolicy),
+    /// Host → coord. One frame per harness event the host's local
+    /// `HarnessHub` adapter would otherwise emit through its
+    /// `EventSink`. The coord's `api/hosts.rs` read loop ingests
+    /// these and calls `state.emit` so SSE subscribers see the same
+    /// stream they would in `--mode=all`.
+    HarnessEvent {
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        event: engram_harness_proto::HarnessEvent,
+        at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// Wire-friendly mirror of [`engram_core::types::sandbox::ExecRequest`].

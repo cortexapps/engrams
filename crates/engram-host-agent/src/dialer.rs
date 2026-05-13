@@ -60,6 +60,13 @@ pub struct DialerConfig {
     /// OCI client falls back to whatever resolver the binary
     /// configured at startup.
     pub auth_session_handle: Option<crate::ws_auth::SessionHandle>,
+    /// Same shape as `auth_session_handle` but used by the host-agent's
+    /// local `HarnessHub` to ship `NotifyKind::HarnessEvent` over the
+    /// WS for every event its adapter loop would have written to the
+    /// session_events log in mode=all. `None` skips event forwarding
+    /// — the host's hub still drives idle eviction etc. locally, but
+    /// no events reach the coord.
+    pub harness_session_handle: Option<crate::ws_auth::SessionHandle>,
     /// ADR 0007: host-side admin RPC handler (e.g. materialize-dir
     /// orphan reap). `None` means the host rejects admin RPCs with
     /// a typed error — `--mode=coordinator` fanouts then see the
@@ -126,6 +133,9 @@ async fn connect_once(
     if let Some(h) = cfg.auth_session_handle.as_ref() {
         *h.write().await = Some(session.clone());
     }
+    if let Some(h) = cfg.harness_session_handle.as_ref() {
+        *h.write().await = Some(session.clone());
+    }
 
     // First frame: Hello. Failure here means the coordinator never
     // sees us as registered; bail out to retry.
@@ -158,6 +168,9 @@ async fn connect_once(
     // Clear the auth handle so any pull issued mid-disconnect fails
     // fast instead of trying to RPC against a dead session.
     if let Some(h) = cfg.auth_session_handle.as_ref() {
+        *h.write().await = None;
+    }
+    if let Some(h) = cfg.harness_session_handle.as_ref() {
         *h.write().await = None;
     }
     Ok(())

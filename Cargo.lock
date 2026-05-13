@@ -1156,6 +1156,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "engram-core",
+ "engram-harness-proto",
  "engram-host-agent",
  "engram-sandbox-process",
  "futures",
