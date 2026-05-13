@@ -82,17 +82,14 @@ function computeStats(
   const h = hosts ?? [];
   const s = sessions ?? [];
 
-  const warm = h.reduce(
-    (acc, host) => acc + host.warm_pools.reduce((a, p) => a + p.ready, 0),
-    0,
-  );
+  const snapshots = h.reduce((acc, host) => acc + host.local_snapshots, 0);
   const active = s.filter((x) => x.status === 'active').length;
   const idle = s.filter((x) => x.status === 'idle').length;
   const dead = s.filter((x) => x.status === 'dead').length;
 
   return [
     { label: 'HOSTS', value: h.length },
-    { label: 'WARM', value: warm },
+    { label: 'SNAPSHOTS', value: snapshots },
     { label: 'ACTIVE', value: active },
     { label: 'IDLE', value: idle },
     { label: 'DEAD', value: dead },

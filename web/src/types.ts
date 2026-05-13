@@ -3,7 +3,7 @@
 //
 // Shapes traced from:
 //   crates/engram-core/src/types/session.rs       (Session, SessionStatus)
-//   crates/engram-coordinator/src/api/hosts.rs    (HostView, WarmPoolView)
+//   crates/engram-coordinator/src/api/hosts.rs    (HostView)
 //   crates/engram-coordinator/src/state.rs        (SessionEvent enum)
 //   crates/engram-harness-proto/src/lib.rs        (AgentRole)
 
@@ -42,12 +42,6 @@ export interface ListSessionsResponse {
   sessions: Session[];
 }
 
-export interface WarmPoolView {
-  image_version: string;
-  ready: number;
-  target: number;
-}
-
 export type HostStatus = 'ready' | 'draining' | 'dead';
 
 export interface HostView {
@@ -57,7 +51,6 @@ export interface HostView {
   capacity_total_mib: number;
   capacity_used_mib: number;
   running_sandboxes: number;
-  warm_pools: WarmPoolView[];
   local_snapshots: number;
   last_heartbeat_at: string;
 }

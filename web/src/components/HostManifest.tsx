@@ -1,10 +1,8 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { PoolSlot } from './Glyph';
 import type { HostView } from '../types';
 
 // "Manifest" because the visual model is a typeset ledger — entries
-// listed in order, each with its own short heading and a row of slot
-// glyphs marking warm-pool fill state.
+// listed in order with capacity / snapshot counts in a tabular row.
 
 export function HostManifest({ hosts }: { hosts: HostView[] | undefined }) {
   return (
@@ -73,68 +71,6 @@ function HostBlock({ host }: { host: HostView }) {
           {host.local_snapshots > 0 && ` · ${host.local_snapshots} snapshots`}
         </span>
       </div>
-
-      <div className="mt-2 ml-6 space-y-1.5">
-        <AnimatePresence>
-          {host.warm_pools.map((p) => (
-            <PoolRow
-              key={p.image_version}
-              imageVersion={p.image_version}
-              ready={p.ready}
-              target={p.target}
-            />
-          ))}
-        </AnimatePresence>
-        {host.warm_pools.length === 0 && (
-          <span
-            className="font-display italic text-[0.85rem]"
-            style={{ color: 'var(--color-ink-quiet)' }}
-          >
-            (no warm pools)
-          </span>
-        )}
-      </div>
-    </motion.div>
-  );
-}
-
-function PoolRow({
-  imageVersion,
-  ready,
-  target,
-}: {
-  imageVersion: string;
-  ready: number;
-  target: number;
-}) {
-  const slots = Math.max(target, ready, 1);
-  return (
-    <motion.div
-      layout
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.4 }}
-      className="flex items-baseline gap-3 font-mono text-[0.82rem]"
-    >
-      <span
-        className="inline-block"
-        style={{ color: 'var(--color-ink-faded)', minWidth: '24ch' }}
-      >
-        {imageVersion}
-      </span>
-      <span className="inline-flex gap-1.5">
-        {Array.from({ length: slots }).map((_, i) => (
-          <PoolSlot key={i} filled={i < ready} />
-        ))}
-      </span>
-      <span
-        className="ml-auto"
-        style={{ color: 'var(--color-ink-quiet)' }}
-        data-tabular
-      >
-        {ready} / {target}
-      </span>
     </motion.div>
   );
 }

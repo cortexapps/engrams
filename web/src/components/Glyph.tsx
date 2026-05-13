@@ -40,25 +40,6 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
   );
 }
 
-/** Filled vs hollow circle for warm-pool slot rendering. */
-export function PoolSlot({ filled }: { filled: boolean }) {
-  return (
-    <motion.span
-      key={filled ? 'on' : 'off'}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      transition={{ duration: 0.35 }}
-      className="glyph"
-      style={{
-        color: filled ? 'var(--color-ink)' : 'var(--color-rule)',
-      }}
-      aria-label={filled ? 'ready' : 'unfilled'}
-    >
-      {filled ? '●' : '◌'}
-    </motion.span>
-  );
-}
-
 function glyphFor(status: SessionStatus): string {
   switch (status) {
     case 'pending':
