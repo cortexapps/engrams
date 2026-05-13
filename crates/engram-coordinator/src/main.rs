@@ -477,7 +477,6 @@ async fn main() -> Result<(), CoordinatorError> {
             engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
                 cli.local_path.join("chunk-cache"),
             ),
-            chunk_store.clone(),
         );
         // ADR 0007 Phase 4: optional NBD daemon for chunked
         // rootfs. `ENGRAM_NBD_DEVICES` is a comma-separated list

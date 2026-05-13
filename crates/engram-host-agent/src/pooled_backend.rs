@@ -330,23 +330,13 @@ impl PooledBackend {
             "rootfs branch: materialize-to-file",
         );
 
-        // ADR 0008 Phase 5: when the chunk_store was upgraded with
-        // a tiered resolver, the global `ChunkCache` (constructed
-        // at startup with the un-upgraded store) is now stale —
-        // its miss-path would route through the wrong store and
-        // bypass the OCI fallback, producing exactly the
-        // `materialize ... blob not found` we'd hit otherwise.
-        // Rebind to a per-call cache wrapping `effective_store`.
-        // The on-disk LRU pool stays shared via the same root path;
-        // only singleflight + pinned state are per-instance.
-        let effective_cache = self
-            .chunk_cache
-            .as_ref()
-            .map(|c| c.with_store(effective_store.clone()));
-
+        // ADR 0008: chunk reads inside `materialize_to_file_cached`
+        // route through `effective_store` (the per-session tiered
+        // store) via the cache's closure-based fetcher. The cache
+        // itself is backend-agnostic — no rebind needed.
         let path = materialize_chunked_rootfs(
             &effective_store,
-            effective_cache.as_ref(),
+            self.chunk_cache.as_ref(),
             materialize_dir,
             uri,
             bundle,
@@ -1745,10 +1735,7 @@ mod tests {
             engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
         );
         let cs = ChunkStore::new(blob);
-        let cache = ChunkCache::new(
-            ChunkCacheConfig::new(tmp.path().join("chunk-cache")),
-            cs.clone(),
-        );
+        let cache = ChunkCache::new(ChunkCacheConfig::new(tmp.path().join("chunk-cache")));
 
         // Plant a small source + manifest.
         let src = tmp.path().join("source.ext4");

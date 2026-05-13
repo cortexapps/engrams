@@ -139,7 +139,11 @@ impl ChunkStore {
             .await?;
         file.set_len(manifest.total_bytes).await?;
         for entry in &manifest.chunks {
-            let bytes: Bytes = cache.get(entry.hash).await?;
+            // Cache miss → fetch through `self` (whatever resolver
+            // `self` carries — including the per-session tiered
+            // resolver from ADR 0008 Phase 5). The cache is
+            // backend-agnostic; each call site chooses.
+            let bytes: Bytes = cache.get(entry.hash, || self.get_chunk(entry.hash)).await?;
             file.seek(SeekFrom::Start(entry.offset)).await?;
             file.write_all(&bytes).await?;
         }
@@ -301,13 +305,10 @@ mod tests {
         let blob = tempfile::tempdir().unwrap();
         let _ = blob; // already held by store via _d
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(
-            ChunkCacheConfig {
-                root: cache_dir.path().to_path_buf(),
-                budget_bytes: 1024 * 1024 * 1024,
-            },
-            s.clone(),
-        );
+        let cache = ChunkCache::new(ChunkCacheConfig {
+            root: cache_dir.path().to_path_buf(),
+            budget_bytes: 1024 * 1024 * 1024,
+        });
         let work = tempfile::tempdir().unwrap();
         let data = (0..40u8).cycle().take(5 * 1024 * 1024).collect::<Vec<_>>();
         let src = work.path().join("src.bin");

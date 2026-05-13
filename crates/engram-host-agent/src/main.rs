@@ -245,7 +245,6 @@ async fn main() -> Result<(), HostAgentError> {
         engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
             cli.work_dir.join("chunk-cache"),
         ),
-        chunk_store.clone(),
     );
 
     // OCI auth resolver. The standalone host-agent doesn't have

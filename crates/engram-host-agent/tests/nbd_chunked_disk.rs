@@ -133,7 +133,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     let store = Arc::new(ChunkStore::new(blob));
     let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 256 * 1024 * 1024;
-    let cache = ChunkCache::new(cache_cfg, (*store).clone());
+    let cache = ChunkCache::new(cache_cfg);
 
     let manifest = store
         .chunk_file(&rootfs_src, ManifestKind::Disk, None)

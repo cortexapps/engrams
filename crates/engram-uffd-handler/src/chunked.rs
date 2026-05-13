@@ -49,7 +49,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use engram_chunk_store::{ChunkCache, ChunkHash, Manifest, ManifestKind};
+use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore, Manifest, ManifestKind};
 use engram_core::traits::BlobStorage;
 
 /// What the per-fault resolver returns. The `Canonical` arm tells
@@ -139,6 +139,10 @@ pub struct ChunkedMemoryBackend {
     canonical: PositionalManifest,
     session: PositionalManifest,
     cache: ChunkCache,
+    /// Backend the cache calls into on miss. Held here (rather
+    /// than on the cache itself) so the cache stays
+    /// backend-agnostic — see the docstring on `ChunkCache`.
+    store: ChunkStore,
 }
 
 /// Anything that can go wrong in this module. Kept distinct from
@@ -186,12 +190,13 @@ impl From<engram_chunk_store::ChunkStoreError> for ChunkedBackendError {
 
 impl ChunkedMemoryBackend {
     /// Build from already-loaded canonical + session manifests
-    /// and a chunk cache (which already knows its underlying
-    /// store + blob backend).
+    /// and a chunk cache + the store the cache should miss
+    /// through.
     pub fn new(
         canonical: &Manifest,
         session: &Manifest,
         cache: ChunkCache,
+        store: ChunkStore,
     ) -> Result<Self, ChunkedBackendError> {
         let canonical = PositionalManifest::from_manifest(canonical)?;
         let session = PositionalManifest::from_manifest(session)?;
@@ -211,6 +216,7 @@ impl ChunkedMemoryBackend {
             canonical,
             session,
             cache,
+            store,
         })
     }
 
@@ -230,8 +236,8 @@ impl ChunkedMemoryBackend {
         let session = store.get_manifest(session_ref).await?;
         let mut cfg = engram_chunk_store::cache::ChunkCacheConfig::new(cache_root.to_path_buf());
         cfg.budget_bytes = cache_budget_bytes;
-        let cache = ChunkCache::new(cfg, store);
-        Self::new(&canonical, &session, cache)
+        let cache = ChunkCache::new(cfg);
+        Self::new(&canonical, &session, cache, store)
     }
 
     /// Bytes per chunk. UFFDIO_COPY copies a full chunk at a time
@@ -286,7 +292,10 @@ impl ChunkedMemoryBackend {
     /// `ChunkCache`'s singleflight + local-NVMe layer so multiple
     /// faults on the same chunk in flight share one fetch.
     pub async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes, ChunkedBackendError> {
-        self.cache.get(hash).await.map_err(Into::into)
+        self.cache
+            .get(hash, || self.store.get_chunk(hash))
+            .await
+            .map_err(Into::into)
     }
 
     /// Chunk-start byte offsets where the session manifest holds
@@ -338,13 +347,13 @@ mod tests {
         }
     }
 
-    fn make_cache() -> (ChunkCache, tempfile::TempDir) {
+    fn make_cache_and_store() -> (ChunkCache, ChunkStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let cs = ChunkStore::new(blob);
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        (ChunkCache::new(cfg, cs), dir)
+        (ChunkCache::new(cfg), cs, dir)
     }
 
     /// Synthesize a distinct ChunkHash per byte tag. The actual
@@ -363,8 +372,8 @@ mod tests {
         // — runtime copies from the canonical mmap.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
-        let (cache, _dir) = make_cache();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache).unwrap();
+        let (cache, store, _dir) = make_cache_and_store();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
         assert!(matches!(
             b.resolve(0),
             Some(ResolvedPage::Canonical {
@@ -385,8 +394,8 @@ mod tests {
         // runtime fetches via the cache.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(7))]);
-        let (cache, _dir) = make_cache();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache).unwrap();
+        let (cache, store, _dir) = make_cache_and_store();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
         match b.resolve(512) {
             Some(ResolvedPage::Chunk { hash }) => assert_eq!(hash, h(7)),
             other => panic!("expected Chunk(h(7)), got {other:?}"),
@@ -401,8 +410,8 @@ mod tests {
         // chunk's bytes via the runtime's full-chunk COPY policy.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
-        let (cache, _dir) = make_cache();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache).unwrap();
+        let (cache, store, _dir) = make_cache_and_store();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
         let r = b.resolve(600).unwrap();
         match r {
             ResolvedPage::Canonical { canonical_offset } => assert_eq!(canonical_offset, 512),
@@ -417,8 +426,8 @@ mod tests {
         // chunk fetch needed.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
-        let (cache, _dir) = make_cache();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache).unwrap();
+        let (cache, store, _dir) = make_cache_and_store();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
         assert!(matches!(
             b.resolve(512),
             Some(ResolvedPage::Canonical {
@@ -431,8 +440,8 @@ mod tests {
     fn resolves_past_eof_returns_none() {
         let canonical = synth_manifest(1024, 512, vec![]);
         let session = synth_manifest(1024, 512, vec![]);
-        let (cache, _dir) = make_cache();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache).unwrap();
+        let (cache, store, _dir) = make_cache_and_store();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
         assert!(b.resolve(1024).is_none(), "exactly at total_bytes");
         assert!(b.resolve(99999).is_none(), "past total_bytes");
     }
@@ -441,11 +450,11 @@ mod tests {
     fn rejects_chunk_size_mismatch() {
         let canonical = synth_manifest(1024, 512, vec![]);
         let session = synth_manifest(1024, 256, vec![]);
-        let (cache, _dir) = make_cache();
+        let (cache, store, _dir) = make_cache_and_store();
         // `ChunkedMemoryBackend` doesn't impl Debug (the underlying
         // mmap pointer would be misleading), so we can't use
         // `unwrap_err`. Match by hand.
-        match ChunkedMemoryBackend::new(&canonical, &session, cache) {
+        match ChunkedMemoryBackend::new(&canonical, &session, cache, store) {
             Ok(_) => panic!("chunk_size mismatch must reject"),
             Err(e) => assert!(format!("{e}").contains("chunk_size")),
         }
@@ -455,8 +464,8 @@ mod tests {
     fn rejects_total_bytes_mismatch() {
         let canonical = synth_manifest(2048, 512, vec![]);
         let session = synth_manifest(1024, 512, vec![]);
-        let (cache, _dir) = make_cache();
-        match ChunkedMemoryBackend::new(&canonical, &session, cache) {
+        let (cache, store, _dir) = make_cache_and_store();
+        match ChunkedMemoryBackend::new(&canonical, &session, cache, store) {
             Ok(_) => panic!("total_bytes mismatch must reject"),
             Err(e) => assert!(format!("{e}").contains("total_bytes")),
         }
@@ -467,8 +476,8 @@ mod tests {
         let mut disk = synth_manifest(1024, 512, vec![]);
         disk.kind = ManifestKind::Disk;
         let session = synth_manifest(1024, 512, vec![]);
-        let (cache, _dir) = make_cache();
-        match ChunkedMemoryBackend::new(&disk, &session, cache) {
+        let (cache, store, _dir) = make_cache_and_store();
+        match ChunkedMemoryBackend::new(&disk, &session, cache, store) {
             Ok(_) => panic!("non-memory manifest must reject"),
             Err(e) => assert!(format!("{e}").contains("Memory")),
         }

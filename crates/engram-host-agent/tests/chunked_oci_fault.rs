@@ -386,18 +386,16 @@ async fn tiered_resolver_fails_loudly_when_chunk_missing_from_all_tiers() {
     );
 }
 
-/// Reproduces the *second* layer of the cross-namespace bug:
-/// `ChunkCache::get` routes misses through its **own** internal
-/// ChunkStore reference (the one pinned at cache construction
-/// time), not through whatever store the caller passes to
-/// `materialize_to_file_cached`. When the global cache was wired
-/// at startup with a non-tiered store, the upgraded-tiered store
-/// passed to materialize gets silently bypassed and chunks
-/// resolve via BlobStorage only → "blob not found" on empty
-/// BlobStorage namespaces. `ChunkCache::with_store` is the fix:
-/// rebind the cache to the tiered store before materialize.
+/// End-to-end: `materialize_to_file_cached` with a global
+/// `ChunkCache` (constructed without any backend reference) routes
+/// chunk misses through the **tiered store** passed at call time.
+/// No rebind dance, no stale-backend bug — the cache stays
+/// backend-agnostic.
+///
+/// This is the contract that prevents the original cross-namespace
+/// failure mode from re-emerging through the cache layer.
 #[tokio::test]
-async fn chunk_cache_rebound_to_tiered_store_faults_through_oci() {
+async fn materialize_to_file_cached_uses_caller_supplied_store() {
     use engram_chunk_store::{
         cache::ChunkCacheConfig, ChunkCache, ChunkRef as CsChunkRef, ChunkSize, Manifest,
         ManifestKind, ManifestRef,
@@ -473,28 +471,23 @@ async fn chunk_cache_rebound_to_tiered_store_faults_through_oci() {
     ));
     let tiered_store = base_store.with_resolver(tiered);
 
-    // The bug shape: a `ChunkCache` constructed at startup against
-    // the un-upgraded `base_store`. Without `with_store`, its
-    // miss-path would 404.
+    // A plain global ChunkCache — backend-agnostic now. No store
+    // reference held; cannot drift.
     let cache_dir = tempfile::tempdir().unwrap();
-    let stale_cache = ChunkCache::new(
-        ChunkCacheConfig {
-            root: cache_dir.path().to_path_buf(),
-            budget_bytes: 100 * 1024 * 1024,
-        },
-        ChunkStore::new(blob.clone()), // un-upgraded
-    );
+    let cache = ChunkCache::new(ChunkCacheConfig {
+        root: cache_dir.path().to_path_buf(),
+        budget_bytes: 100 * 1024 * 1024,
+    });
 
-    // The fix: rebind the cache to the tiered store.
-    let rebound_cache = stale_cache.with_store(tiered_store.clone());
-
-    // materialize_to_file_cached now routes chunk misses through
-    // tiered_store → BlobStorage (miss) → OCI (hit) → tee-fill.
+    // materialize_to_file_cached on the tiered store: cache misses
+    // route through `tiered_store.get_chunk` (the closure the new
+    // materialize_to_file_cached passes), which falls through
+    // BlobStorage → OCI → tee-fill.
     let dest = tempfile::NamedTempFile::new().unwrap();
     tiered_store
-        .materialize_to_file_cached(&manifest, dest.path(), &rebound_cache)
+        .materialize_to_file_cached(&manifest, dest.path(), &cache)
         .await
-        .expect("materialize through rebound cache + tiered store");
+        .expect("materialize through cache + tiered store");
 
     // Bytes are correct (rebuilt from the bootstrap entries).
     let got = std::fs::read(dest.path()).unwrap();
@@ -507,7 +500,7 @@ async fn chunk_cache_rebound_to_tiered_store_faults_through_oci() {
     assert_eq!(
         registry.fetches.load(Ordering::Relaxed),
         2,
-        "rebound cache must drive misses through tiered → OCI"
+        "cache must drive misses through tiered_store → OCI"
     );
 
     // BlobStorage was tee-filled by the tiered resolver.

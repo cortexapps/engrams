@@ -207,7 +207,7 @@ impl E2eFixture {
         let cs = Arc::new(ChunkStore::new(blob));
         let mut cache_cfg = ChunkCacheConfig::new(tmp.path().join("chunk-cache"));
         cache_cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cache_cfg, (*cs).clone());
+        let cache = ChunkCache::new(cache_cfg);
         let work_dir = tmp.path().join("work");
         std::fs::create_dir_all(&work_dir).unwrap();
         Self {

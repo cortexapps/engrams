@@ -451,7 +451,7 @@ impl ChunkedDiskBackend {
             .copied()
             .flatten();
         match hash {
-            Some(hash) => Ok(self.cache.get(hash).await?),
+            Some(hash) => Ok(self.cache.get(hash, || self.store.get_chunk(hash)).await?),
             // Zero-filled hole — the manifest had no entry here.
             None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
         }
@@ -485,7 +485,7 @@ impl ChunkedDiskBackend {
             .copied()
             .flatten();
         let base_bytes = match hash {
-            Some(hash) => self.cache.get(hash).await?,
+            Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
             None => Bytes::from(vec![0u8; chunk_len]),
         };
         let mut dirty = self.dirty.lock().await;
@@ -533,7 +533,7 @@ mod tests {
         let store = Arc::new(ChunkStore::new(blob));
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let manifest_ref = ManifestRef::new();
         store.put_manifest(manifest_ref, manifest).await.unwrap();
         let backend =
@@ -563,7 +563,7 @@ mod tests {
         store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
 
         let bytes = backend.read(0, 4096).await.unwrap();
@@ -588,7 +588,7 @@ mod tests {
         store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
 
         // 2 KiB straddle: last 2 KiB of chunk 0 + first 2 KiB of chunk 1.
@@ -631,7 +631,7 @@ mod tests {
         store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
 
         backend.write(0, &[0xcc; 16]).await.unwrap();
@@ -664,7 +664,7 @@ mod tests {
         store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let backend =
             ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone()).unwrap();
 
@@ -711,7 +711,7 @@ mod tests {
         let store = Arc::new(ChunkStore::new(blob));
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let err = ChunkedDiskBackend::new(ManifestRef::new(), &mem, cache, store)
             .err()
             .unwrap();
@@ -747,7 +747,7 @@ mod tests {
         store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg, (*store).clone());
+        let cache = ChunkCache::new(cfg);
         let backend =
             ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone()).unwrap();
 
