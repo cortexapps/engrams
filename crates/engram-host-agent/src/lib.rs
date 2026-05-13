@@ -31,6 +31,7 @@ pub mod live_attach;
 pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod resource;
+pub mod shutdown;
 pub mod snapshot;
 pub mod ws_auth;
 
@@ -313,6 +314,16 @@ impl HostAgent {
             });
             shutdown_signal().await;
             dialer_task.abort();
+
+            // ADR 0009 Phase 7: SIGTERM-checkpoint pipeline. Runs
+            // only when `ENGRAM_GRACEFUL_SHUTDOWN=1` (opt-in for
+            // now). On signal: drain → checkpoint every live
+            // sandbox in parallel → update each sandbox.json's
+            // `last_local_snapshot` so the Phase 8 reattach can
+            // restore from local NVMe when pidfd-path-1 fails
+            // (case C', graceful host reboot).
+            let scfg = crate::shutdown::ShutdownConfig::from_env();
+            let _ = crate::shutdown::run(&scfg, pooled.clone(), self.cfg.work_dir.clone()).await;
         } else {
             tracing::info!("no coordinator_endpoint set; standalone dev mode (ctrl-c to exit)");
             shutdown_signal().await;
