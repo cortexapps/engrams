@@ -17,7 +17,7 @@ mod registries;
 mod sessions;
 mod sessions_inspect;
 mod shell;
-mod snapshot;
+pub mod snapshot;
 
 pub fn router(state: SharedState) -> Router {
     // The protected sub-router gets the bearer-token layer.

@@ -19,6 +19,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
+use engram_core::traits::storage::BlobStorage;
+use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{Session, SessionStatus};
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -63,6 +65,17 @@ pub async fn snapshot(
     // chunk store (`disk_manifest` / `memory_manifest`); the local dir
     // is a per-host cache the same-host fast-resume reads from.
     let host_id = state.host_registry.host_of(sandbox_id);
+    // ADR 0009 Phase 2: HEAD-verify the chunked manifests are
+    // durable in BlobStorage before flipping `recoverable=true`.
+    // Backends that produced no manifest (Process; VZ memory) flip
+    // to false, which means a sandbox-loss reconcile will Dead them
+    // — correct, since there's no chunked artifact to resume from.
+    let recoverable = verify_snapshot_recoverable(
+        state.services.blob.as_ref(),
+        metadata.disk_manifest.as_ref(),
+        metadata.memory_manifest.as_ref(),
+    )
+    .await;
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: id,
@@ -76,13 +89,7 @@ pub async fn snapshot(
         // VZ produces disk_manifest only; Process produces neither.
         disk_manifest: metadata.disk_manifest,
         memory_manifest: metadata.memory_manifest,
-        // ADR 0009: snapshot is recoverable iff the canonical
-        // manifests are durably present in BlobStorage. Phase 2 of
-        // the rollout will HEAD-verify here before flipping to
-        // true; Phase 1 ships the column as default-false. Until
-        // Phase 2 lands, sessions whose sandbox vanishes transition
-        // to `Dead` (vs `Idle`), which matches today's behaviour.
-        recoverable: false,
+        recoverable,
     };
     state.services.meta.record_snapshot(record).await?;
 
@@ -527,4 +534,140 @@ pub async fn evict_local(
         )
         .await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// ADR 0009 Phase 2: HEAD-verify the chunked manifests are durable
+/// in BlobStorage. Returns `true` only when every present manifest
+/// ref responds HEAD-ok; a backend that produced no manifests at
+/// all (process; legacy) returns `false` so a sandbox-loss
+/// reconcile transitions the session to `Dead` rather than promising
+/// an Idle/resume path that can't be delivered.
+///
+/// Transient blob outages flip the column false, which means the
+/// session would Dead-on-sandbox-loss instead of Idle. That's the
+/// safe direction: a snapshot that was uploaded a few seconds ago
+/// but failed HEAD here may still be recoverable, but until the
+/// chunk-store GC actually reaps it the column will be re-flipped
+/// to true on the next snapshot. Idle-when-not-actually-recoverable
+/// is the worse failure (user clicks resume, gets `blob not found`).
+pub async fn verify_snapshot_recoverable(
+    blob: &(dyn BlobStorage + 'static),
+    disk: Option<&ManifestRef>,
+    memory: Option<&ManifestRef>,
+) -> bool {
+    let mut any_present = false;
+    if let Some(r) = disk {
+        any_present = true;
+        match blob.head(&r.storage_key()).await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    manifest_key = %r.storage_key(),
+                    error = %e,
+                    "disk manifest HEAD failed; snapshot recorded as not-recoverable"
+                );
+                return false;
+            }
+        }
+    }
+    if let Some(r) = memory {
+        any_present = true;
+        match blob.head(&r.storage_key()).await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    manifest_key = %r.storage_key(),
+                    error = %e,
+                    "memory manifest HEAD failed; snapshot recorded as not-recoverable"
+                );
+                return false;
+            }
+        }
+    }
+    any_present
+}
+
+#[cfg(test)]
+mod recoverable_tests {
+    use super::*;
+    use engram_storage_local::LocalBlobStorage;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn make_blob() -> (Arc<LocalBlobStorage>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Arc::new(LocalBlobStorage::new(dir.path())), dir)
+    }
+
+    fn make_ref() -> ManifestRef {
+        ManifestRef {
+            manifest_id: Uuid::new_v4(),
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_false_when_no_manifests_present() {
+        // Process backend produces neither disk nor memory manifest.
+        // Phase 2's contract: no manifests → reconcile flips to Dead
+        // on sandbox loss, not Idle (no chunked artifact to resume).
+        let (blob, _g) = make_blob();
+        let r = verify_snapshot_recoverable(blob.as_ref(), None, None).await;
+        assert!(!r);
+    }
+
+    #[tokio::test]
+    async fn returns_true_when_both_manifests_head_ok() {
+        let (blob, _g) = make_blob();
+        let disk = make_ref();
+        let mem = make_ref();
+        // Seed the manifest keys with arbitrary bytes; HEAD only
+        // cares about existence + size, not content.
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        blob.put(&mem.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), Some(&mem)).await;
+        assert!(r, "both manifests durable → recoverable=true");
+    }
+
+    #[tokio::test]
+    async fn returns_false_when_disk_manifest_missing() {
+        let (blob, _g) = make_blob();
+        let disk = make_ref();
+        // Don't seed; HEAD will fail.
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None).await;
+        assert!(!r);
+    }
+
+    #[tokio::test]
+    async fn returns_false_when_memory_manifest_missing_with_present_disk() {
+        let (blob, _g) = make_blob();
+        let disk = make_ref();
+        let mem = make_ref();
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        // mem not seeded.
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), Some(&mem)).await;
+        assert!(
+            !r,
+            "any missing manifest disqualifies recoverable (partial recovery is worse than Dead)"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_true_for_disk_only_when_memory_absent_by_design() {
+        // VZ disk-only snapshots intentionally have no memory manifest.
+        // recoverable should still be true if the disk manifest is durable.
+        let (blob, _g) = make_blob();
+        let disk = make_ref();
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None).await;
+        assert!(r, "disk-only snapshots are recoverable on cold-boot");
+    }
 }

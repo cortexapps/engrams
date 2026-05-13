@@ -93,6 +93,17 @@ pub fn spawn(
 /// `engram_chunk_store::gc::run` plus the live-set size for
 /// telemetry — operators want both axes to spot a stuck DB query
 /// vs. a stuck blob backend.
+///
+/// ADR 0009 Phase 2: a future addition here would re-verify
+/// `snapshots.recoverable=true` rows by HEAD-checking their
+/// manifests against the chunk store and flipping any that fail
+/// back to false. In the current GC semantics that's a no-op:
+/// `live_manifest_ids` IS the set of manifests referenced by any
+/// `snapshots` row, so by construction every reaped manifest has
+/// no referencing row to flip. The defensive sweep only matters
+/// for catastrophic blob loss (S3 lifecycle, region failure,
+/// operator error) — out of scope for Phase 2; tracked under
+/// observability as a future periodic verifier.
 pub async fn run_once(state: &SharedState, retain_for: Duration) -> Result<RunStats, ChunkGcError> {
     // Union of disk + memory live sets — both axes back onto the
     // same chunk store. Filtering on only one would prematurely

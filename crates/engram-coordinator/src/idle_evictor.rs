@@ -140,9 +140,15 @@ pub async fn evict_idle_session(
         // ADR 0007: chunked manifests are the durability primitive.
         disk_manifest: metadata.disk_manifest,
         memory_manifest: metadata.memory_manifest,
-        // ADR 0009: Phase 2 flips this true after BlobStorage
-        // HEAD-verify; Phase 1 leaves it default-false.
-        recoverable: false,
+        // ADR 0009 Phase 2: HEAD-verify the chunked manifests so
+        // reconcile flips this session to Idle (not Dead) on a
+        // future sandbox-loss event.
+        recoverable: crate::api::snapshot::verify_snapshot_recoverable(
+            state.services.blob.as_ref(),
+            metadata.disk_manifest.as_ref(),
+            metadata.memory_manifest.as_ref(),
+        )
+        .await,
     };
     state
         .services
