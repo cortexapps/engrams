@@ -27,6 +27,32 @@ pub trait MetadataStore: Send + Sync {
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
+
+    /// ADR 0009 reconcile pass: enumerate the `(session_id,
+    /// sandbox_id)` pairs for every `status='active'` session
+    /// assigned to `host_id` whose `sandbox_id` is populated. The
+    /// reconcile pass intersects this against the host's
+    /// heartbeat-reported `running_sandboxes`. Missing-from-host
+    /// → strike counter increments; N strikes → flip per ADR §3.
+    ///
+    /// Default impl scans `list_active_sessions()` and filters in
+    /// memory — fine for in-memory test mocks. Postgres overrides
+    /// with an indexed `WHERE (host_id, status)` query so the
+    /// per-heartbeat cost stays O(sandboxes-on-host), not
+    /// O(total-active-sessions).
+    async fn list_active_sandbox_assignments_on_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+        let all = self.list_active_sessions().await?;
+        Ok(all
+            .into_iter()
+            .filter_map(|s| match (s.status, s.host_id, s.sandbox_id) {
+                (SessionStatus::Active, Some(h), Some(sb)) if h == host_id => Some((s.id, sb)),
+                _ => None,
+            })
+            .collect())
+    }
     async fn set_session_status(
         &self,
         id: SessionId,

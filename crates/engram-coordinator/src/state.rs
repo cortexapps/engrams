@@ -345,6 +345,10 @@ pub struct AppState {
     /// reads this to plumb `ENGRAM_HARNESS_ADDR` into the spawned
     /// agent's env. `None` until the listener is up.
     pub harness_listen_addr: parking_lot::Mutex<Option<std::net::SocketAddr>>,
+    /// ADR 0009 reconciliation pass. Holds the per-coord strikes
+    /// counter and the policy knob (`grace_ticks`). Invoked on
+    /// every inbound `NotifyKind::Heartbeat` in `api/hosts.rs`.
+    pub reconciler: crate::reconcile::Reconciler,
 }
 
 impl AppState {
@@ -374,6 +378,8 @@ impl AppState {
             events.clone(),
             services.meta.clone(),
         )));
+        let reconciler =
+            crate::reconcile::Reconciler::new(crate::reconcile::grace_ticks_from_env());
         Self {
             cfg,
             services,
@@ -382,6 +388,7 @@ impl AppState {
             host_registry,
             harness_hub,
             harness_listen_addr: parking_lot::Mutex::new(None),
+            reconciler,
         }
     }
 

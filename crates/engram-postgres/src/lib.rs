@@ -126,6 +126,39 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::session_from_row).collect()
     }
 
+    async fn list_active_sandbox_assignments_on_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+        // ADR 0009 reconcile pass query. Per-host, every heartbeat:
+        // ~50 sandboxes/host × 5s cadence × N hosts = trivial DB load.
+        // Indexed via `idx_sessions_host_status` (existing).
+        let rows = sqlx::query(
+            r#"
+            SELECT id, sandbox_id
+            FROM sessions
+            WHERE host_id = $1
+              AND status = 'active'
+              AND sandbox_id IS NOT NULL
+            "#,
+        )
+        .bind(host_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let session: Uuid = r
+                .try_get("id")
+                .map_err(|e| MetaError::Serialization(format!("active-assignments: id: {e}")))?;
+            let sandbox: Uuid = r.try_get("sandbox_id").map_err(|e| {
+                MetaError::Serialization(format!("active-assignments: sandbox_id: {e}"))
+            })?;
+            out.push((SessionId::from(session), SandboxId::from(sandbox)));
+        }
+        Ok(out)
+    }
+
     async fn set_session_status(
         &self,
         id: SessionId,

@@ -20,6 +20,7 @@ pub mod host_registry;
 pub mod idle_evictor;
 pub mod pg_listener;
 pub mod preemption_drain;
+pub mod reconcile;
 pub mod scheduler;
 pub mod state;
 

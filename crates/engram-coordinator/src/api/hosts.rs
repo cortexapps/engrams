@@ -231,6 +231,25 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
     while let Some(notify) = notify_rx.recv().await {
         match notify {
             NotifyKind::Heartbeat(hb) => {
+                // ADR 0009 §1-§3: run the reconcile pass synchronously
+                // on every heartbeat ingest. Cheap (one indexed
+                // SELECT per host); the strike-counter keeps it from
+                // flapping on transient `backend.list()` errors. Any
+                // session transitions land before the rest of the
+                // heartbeat-handler work so subsequent metrics +
+                // host-state updates reflect the post-flip view.
+                let flipped = state
+                    .reconciler
+                    .reconcile_host(&state, host_id, &hb.running_sandboxes)
+                    .await;
+                if !flipped.is_empty() {
+                    tracing::info!(
+                        host_id = %host_id,
+                        count = flipped.len(),
+                        "reconcile flipped missing-sandbox sessions"
+                    );
+                }
+
                 // Refresh the in-memory scheduler view first so the
                 // next session creation sees the updated capacity and
                 // local snapshots.
