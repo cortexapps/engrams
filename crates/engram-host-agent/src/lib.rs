@@ -27,6 +27,7 @@ pub mod egress;
 pub mod harness;
 pub mod heartbeat;
 pub mod image_cache;
+pub mod live_attach;
 pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod resource;
@@ -65,6 +66,14 @@ pub struct HostAgent {
     /// daemon allocates from when serving chunked rootfs disks.
     /// `None` keeps the legacy materialize-to-file path active.
     pub nbd_pool: Option<Arc<disk_daemon::NbdSlotAllocator>>,
+    /// ADR 0009 §6: typed handle on the FC backend (when this host
+    /// uses Firecracker) so the live-attach pass at startup can
+    /// invoke `reattach_sandbox`. The `Arc<dyn SandboxBackend>` in
+    /// `sandbox` can't be downcast to a concrete type (the trait
+    /// doesn't extend `Any`), so callers that want live-attach
+    /// must wire this separately. `None` skips reattach entirely
+    /// (clean-slate startup; matches today's behaviour).
+    pub fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>>,
     /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
     /// snapshots' `trace_host_hint` (so cross-host restore knows
     /// which trace to prefault) AND passed to the UFFD handler
@@ -90,7 +99,21 @@ impl HostAgent {
             chunk_cache: None,
             nbd_pool: None,
             host_id: None,
+            fc_for_reattach: None,
         }
+    }
+
+    /// ADR 0009 §6: register the concrete FC backend for the
+    /// startup reattach pass. Optional — only meaningful when
+    /// `--sandbox-backend=firecracker` AND `ENGRAM_LIVE_ATTACH=1`.
+    /// When unset, the host-agent starts clean-slate (reconcile
+    /// then flips orphaned sessions per §3).
+    pub fn with_fc_reattach(
+        mut self,
+        fc: Arc<engram_sandbox_firecracker::FirecrackerBackend>,
+    ) -> Self {
+        self.fc_for_reattach = Some(fc);
+        self
     }
 
     /// Set this host's stable `HostId`. Pair with the same id
@@ -164,6 +187,34 @@ impl HostAgent {
     pub async fn run(self) -> Result<(), HostAgentError> {
         tracing::info!(?self.cfg.work_dir, "host-agent starting");
         let _ = self.cloud.host_metadata().await;
+
+        // ADR 0009 §6: live-VM reattach pass. Runs once at startup,
+        // before connecting to coord, so reattached sandboxes show
+        // up in the very first heartbeat's `running_sandboxes`
+        // field — coord sees them as continuously-present and
+        // doesn't strike-out / flip the owning sessions. Gated by
+        // `ENGRAM_LIVE_ATTACH` and only meaningful when the
+        // concrete FC backend was wired via `with_fc_reattach`.
+        if std::env::var("ENGRAM_LIVE_ATTACH").ok().as_deref() == Some("1") {
+            if let Some(fc) = self.fc_for_reattach.as_ref() {
+                match live_attach::reattach_pass(&self.cfg.work_dir, fc).await {
+                    Ok(report) => {
+                        tracing::info!("{}", report.summary());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "live-attach pass failed; continuing with clean-slate startup"
+                        );
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "ENGRAM_LIVE_ATTACH=1 set but no FC backend registered for reattach \
+                     (call with_fc_reattach to enable); skipping reattach pass"
+                );
+            }
+        }
 
         if let Some(coord_url) = self.cfg.coordinator_endpoint.clone() {
             // Re-use the host_id that was stamped on the FC

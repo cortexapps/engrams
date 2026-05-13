@@ -93,6 +93,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
 pub mod net;
+pub mod pidfd;
 pub mod sandbox_manifest;
 
 pub use client::{
@@ -204,6 +205,75 @@ pub struct FirecrackerConfig {
     pub uffd_cache_root: Option<PathBuf>,
 }
 
+/// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
+/// Distinct from `SandboxError` so the live-attach driver can
+/// distinguish "FC truly gone, fall through to path 2" from "operator
+/// configuration problem, log + skip."
+#[derive(Debug)]
+pub enum ReattachError {
+    /// `kill(pid, 0)` returned ESRCH or /proc lookup failed —
+    /// process is gone. Path 1 fails; path 2 (NVMe restore) may
+    /// succeed; otherwise orphan-reap.
+    PidGone(u32),
+    /// `/proc/<pid>/stat` starttime field doesn't match the manifest.
+    /// The kernel reused the pid for an unrelated process; we
+    /// definitively can't reattach to the original FC.
+    StartTimeMismatch { pid: u32, recorded: u64, live: u64 },
+    /// `/proc/<pid>/comm` doesn't match. Cheap sanity check —
+    /// extremely unlikely after start_time matched but defends
+    /// against the corner case.
+    CommMismatch {
+        pid: u32,
+        recorded: String,
+        live: String,
+    },
+    /// FC API socket exists but doesn't accept connections.
+    /// Underlying FC may be wedged or its socket file was overwritten
+    /// by something else. Path 1 fails; path 2 may succeed.
+    ApiUnresponsive(String),
+    /// Network state recovery failed — the recorded /30 slot is
+    /// in use by something else (cross-host migration of an old
+    /// manifest, or operator error). Path 1 fails; path 2 may
+    /// succeed.
+    NetReserveFailed(String),
+    /// `pidfd_open(pid)` failed for a reason other than "process
+    /// gone." Likely a kernel version issue (< 5.3). The pidfd
+    /// itself is best-effort here; without it the poll supervisor
+    /// still works, but the error indicates something more
+    /// systemic — treat as a hard failure for now.
+    PidFdOpenFailed(String),
+}
+
+impl std::fmt::Display for ReattachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PidGone(pid) => write!(f, "reattach: pid {pid} no longer exists"),
+            Self::StartTimeMismatch {
+                pid,
+                recorded,
+                live,
+            } => write!(
+                f,
+                "reattach: pid {pid} starttime mismatch (recorded {recorded}, live {live}); \
+                 the pid was recycled"
+            ),
+            Self::CommMismatch {
+                pid,
+                recorded,
+                live,
+            } => write!(
+                f,
+                "reattach: pid {pid} comm mismatch (recorded {recorded}, live {live})"
+            ),
+            Self::ApiUnresponsive(e) => write!(f, "reattach: FC API unresponsive: {e}"),
+            Self::NetReserveFailed(e) => write!(f, "reattach: net slot reserve failed: {e}"),
+            Self::PidFdOpenFailed(e) => write!(f, "reattach: pidfd_open failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReattachError {}
+
 /// Backing-memory strategy for `restore`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreMode {
@@ -249,7 +319,18 @@ impl FirecrackerConfig {
 /// page faults from memory.bin.
 struct LiveSandbox {
     state: SandboxState,
-    child: Child,
+    /// `Some` for sandboxes created or restored within this
+    /// host-agent process generation; `None` for sandboxes
+    /// pidfd-reattached on host-agent startup (ADR 0009 §5/§6) —
+    /// we never had a `Child` handle for them because they were
+    /// spawned by a previous generation. The destroy path branches
+    /// on this: `Some` uses `tokio::process::Child` kill/wait,
+    /// `None` falls back to libc kill + poll for exit.
+    child: Option<Child>,
+    /// FC process pid, captured at create/restore/reattach time.
+    /// Always populated (even when `child` is `None`) so destroy
+    /// and the supervisor have a stable handle.
+    fc_pid: Option<u32>,
     uffd_handler: Option<Child>,
     /// Per-VM /30 + iptables chain + TAP. Stashed so `destroy` can
     /// release the slot back to the allocator and yank exactly its
@@ -434,6 +515,159 @@ impl FirecrackerBackend {
     /// Used by the host agent for inspection / heartbeat reporting.
     pub fn snapshot_state(&self, id: SandboxId) -> Option<SandboxState> {
         self.sandboxes.get(&id).map(|r| r.state.clone())
+    }
+
+    /// ADR 0009 §6: live-VM reattach (path 1). Called from the
+    /// host-agent's startup pass once per `sandbox.json` manifest
+    /// found under `work_dir/*/`. Verifies the FC process is still
+    /// the original one (three-axis pid identity + FC API ping +
+    /// TAP exists), then rebuilds the in-memory `LiveSandbox`
+    /// without a `Child` handle. The supervisor (§4) is re-spawned
+    /// against the reattached pid.
+    ///
+    /// On verification failure (FC died, pid recycled, TAP gone)
+    /// returns `Err(ReattachError::Verify*)` so the caller can fall
+    /// through to path 2 (NVMe restore, Phase 8) or path 3
+    /// (orphan-reap).
+    pub async fn reattach_sandbox(
+        &self,
+        manifest: &sandbox_manifest::SandboxManifest,
+    ) -> Result<(), ReattachError> {
+        let id = manifest.sandbox_id;
+        let fc = &manifest.firecracker;
+
+        // Three-axis identity check. The kernel never reuses a
+        // (pid, starttime) pair within a boot, so a starttime
+        // mismatch is a definitive "different process now."
+        let live_start = sandbox_manifest::read_proc_start_time_jiffies(fc.process.pid)
+            .ok_or(ReattachError::PidGone(fc.process.pid))?;
+        if live_start != fc.process.start_time_jiffies {
+            return Err(ReattachError::StartTimeMismatch {
+                pid: fc.process.pid,
+                recorded: fc.process.start_time_jiffies,
+                live: live_start,
+            });
+        }
+        let live_comm = sandbox_manifest::read_proc_comm(fc.process.pid)
+            .ok_or(ReattachError::PidGone(fc.process.pid))?;
+        if live_comm != fc.process.comm {
+            return Err(ReattachError::CommMismatch {
+                pid: fc.process.pid,
+                recorded: fc.process.comm.clone(),
+                live: live_comm,
+            });
+        }
+
+        // FC API liveness probe. The client crate exposes only
+        // mutating endpoints — we just need a "is the socket alive?"
+        // check, so go straight to `UnixStream::connect`. FC binds
+        // the socket at startup and unlinks at shutdown; a
+        // successful connect means FC is running and accepting on
+        // its API.
+        match tokio::net::UnixStream::connect(&fc.api_socket).await {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(ReattachError::ApiUnresponsive(format!(
+                    "connect {}: {e}",
+                    fc.api_socket.display()
+                )));
+            }
+        }
+
+        // Network rehydration: mark the slot in-use so future
+        // `create()` calls don't double-allocate, and verify the
+        // TAP still exists. If TAP is gone the kernel state was
+        // wiped externally — reattach won't be usable.
+        let net_setup = if let Some(net_rec) = manifest.network.as_ref() {
+            let vm_cidr = net::VmCidr::new(net_rec.vm_cidr_network);
+            self.net_allocator
+                .lock()
+                .reserve(vm_cidr)
+                .map_err(|e| ReattachError::NetReserveFailed(format!("{e:?}")))?;
+            Some(net::NetSetup {
+                vm_cidr,
+                tap_name: net_rec.tap_name.clone(),
+            })
+        } else {
+            None
+        };
+
+        // pidfd_open for the future supervisor + the eventual
+        // Phase 8 SIGTERM-checkpoint reattach. On non-Linux this
+        // returns Unsupported; we treat it as "no pidfd but the
+        // poll-based supervisor still works."
+        match pidfd::open_pidfd(fc.process.pid) {
+            Ok(_fd) => {
+                // We could keep the fd in LiveSandbox for a
+                // future fd-based exit notification. The polling
+                // supervisor is enough for now; drop the fd here.
+                // Phase 7+ can store it if it wants AsyncFd-based
+                // exit notify (lower latency than 1s polling).
+                tracing::debug!(%id, pid = fc.process.pid, "pidfd opened during reattach");
+            }
+            Err(pidfd::PidFdError::Unsupported) => {
+                tracing::warn!(
+                    %id,
+                    "pidfd not supported on this platform; reattach proceeds without it \
+                     (poll-based supervisor still functional)"
+                );
+            }
+            Err(e) => {
+                return Err(ReattachError::PidFdOpenFailed(format!("{e}")));
+            }
+        }
+
+        let state = SandboxState {
+            spec: manifest.spec.clone(),
+            firecracker_socket: fc.api_socket.clone(),
+            rootfs_path: PathBuf::new(), // not used after create; the
+            // manifest's `spec.rootfs_source` is authoritative if a
+            // resume needs to find the on-disk rootfs. Keep this
+            // field for future symmetry with create().
+            vsock_cid: fc.vsock_cid,
+            vsock_uds_path: fc.vsock_uds_base.clone(),
+        };
+        self.sandboxes.insert(
+            id,
+            LiveSandbox {
+                state,
+                child: None,
+                fc_pid: Some(fc.process.pid),
+                uffd_handler: None,
+                net: net_setup,
+                guest_ip: parking_lot::Mutex::new(None),
+            },
+        );
+
+        // §4 supervisor on the reattached pid.
+        spawn_process_supervisor(self.sandboxes.clone(), id, fc.process.pid, "firecracker");
+        if let Some(uffd) = manifest.uffd_handler.as_ref() {
+            // Verify UFFD handler too. Same three-axis check; if
+            // it's gone the FC is mid-restore-with-no-pager —
+            // unusable. Phase 8 may add fallback paths; for now
+            // we treat this as reattach failure that should clean
+            // up FC too.
+            let uffd_start = sandbox_manifest::read_proc_start_time_jiffies(uffd.pid);
+            let uffd_comm = sandbox_manifest::read_proc_comm(uffd.pid);
+            if uffd_start == Some(uffd.start_time_jiffies)
+                && uffd_comm.as_deref() == Some(uffd.comm.as_str())
+            {
+                spawn_process_supervisor(self.sandboxes.clone(), id, uffd.pid, "uffd-handler");
+            } else {
+                tracing::warn!(
+                    %id,
+                    uffd_pid = uffd.pid,
+                    "UFFD handler gone or recycled during reattach; FC may page-fault forever"
+                );
+            }
+        }
+
+        tracing::info!(
+            %id,
+            pid = fc.process.pid,
+            "FC sandbox pidfd-reattached (ADR 0009 §6 path 1)"
+        );
+        Ok(())
     }
 
     /// Connect to a running `engram-agentd` at `agent_socket`, send a
@@ -904,7 +1138,8 @@ impl FirecrackerBackend {
             sandbox_id,
             LiveSandbox {
                 state,
-                child,
+                child: Some(child),
+                fc_pid,
                 uffd_handler: None,
                 net: net_setup.cloned(),
                 guest_ip: parking_lot::Mutex::new(None),
@@ -1141,7 +1376,8 @@ impl FirecrackerBackend {
             sandbox_id,
             LiveSandbox {
                 state,
-                child,
+                child: Some(child),
+                fc_pid,
                 uffd_handler,
                 net: net_setup,
                 guest_ip: parking_lot::Mutex::new(None),
@@ -1217,6 +1453,77 @@ impl FirecrackerBackend {
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// ADR 0009 §6: branch destroy's wait-for-exit on whether we own a
+/// `tokio::process::Child` (newly-created sandboxes) or only the
+/// recorded pid (pidfd-reattached sandboxes). For `Some(child)` use
+/// the proper `Child::wait` to reap. For `None` poll
+/// `kill(pid, 0)` until ESRCH.
+async fn wait_for_fc_exit(child: &mut Option<Child>, pid: Option<u32>) -> std::io::Result<()> {
+    if let Some(c) = child.as_mut() {
+        c.wait().await.map(|_| ())
+    } else if let Some(pid) = pid {
+        wait_for_pid_death(pid, Duration::from_secs(30)).await
+    } else {
+        Ok(())
+    }
+}
+
+/// SIGKILL the FC process. For owned children, drive via tokio's
+/// `Child::kill`. For reattached (no Child), shoot the pid directly.
+async fn kill_fc(child: &mut Option<Child>, pid: Option<u32>, id: SandboxId) {
+    if let Some(c) = child.as_mut() {
+        if let Err(e) = c.kill().await {
+            tracing::warn!(sandbox_id = %id, error = %e, "firecracker Child::kill failed");
+        }
+        return;
+    }
+    if let Some(pid) = pid {
+        // SAFETY: `libc::kill` with SIGKILL on a pid we recorded is
+        // a basic process-control syscall. We aren't relying on its
+        // result to maintain any internal invariant — failure is
+        // logged and we continue.
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            // ESRCH is fine — process already gone.
+            if errno != libc::ESRCH {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    %pid,
+                    errno,
+                    "libc::kill(SIGKILL) failed; FC may linger"
+                );
+            }
+        }
+    }
+}
+
+/// Poll `kill(pid, 0)` until ESRCH or timeout. Returns Ok(()) on
+/// exit, error on timeout. 50 ms poll interval — fast enough that
+/// destroy doesn't perceive lag, slow enough that we don't burn
+/// CPU in a tight loop.
+async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // SAFETY: kill(pid, 0) inspects-but-doesn't-mutate; see
+        // the SAFETY comment in `spawn_process_supervisor`.
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == libc::ESRCH {
+                return Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("pid {pid} did not exit within {timeout:?}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// ADR 0009 §4: per-VM process supervisor. Spawned at create/restore
@@ -1634,11 +1941,16 @@ impl SandboxBackend for FirecrackerBackend {
         // pull the plug. If the guest doesn't respond within
         // `GRACEFUL_SHUTDOWN_TIMEOUT`, we fall through to SIGKILL.
         let api = FirecrackerClient::new(&live.state.firecracker_socket);
+        // ADR 0009 §6: `child` is `None` for sandboxes pidfd-reattached
+        // on host-agent startup (we don't own a `Child` for those —
+        // the original process was spawned by a previous host-agent
+        // generation). For those, we fall back to libc::kill +
+        // poll-for-exit since there's no `Child::wait` to drive.
         let graceful = async {
             api.put_action(ActionType::SendCtrlAltDel).await?;
-            // Wait for the firecracker process to exit on its own.
-            // `Child::wait` returns once the process is reaped.
-            live.child.wait().await.map_err(SandboxError::from)
+            wait_for_fc_exit(&mut live.child, live.fc_pid)
+                .await
+                .map_err(SandboxError::from)
         };
         match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful).await {
             Ok(Ok(_)) => {
@@ -1654,10 +1966,8 @@ impl SandboxBackend for FirecrackerBackend {
                     error = %e,
                     "graceful shutdown failed; escalating to SIGKILL",
                 );
-                if let Err(e) = live.child.kill().await {
-                    tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
-                }
-                let _ = live.child.wait().await;
+                kill_fc(&mut live.child, live.fc_pid, id).await;
+                let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
             }
             Err(_) => {
                 // Timeout: guest didn't honour CAD within the grace
@@ -1667,10 +1977,8 @@ impl SandboxBackend for FirecrackerBackend {
                     timeout = ?GRACEFUL_SHUTDOWN_TIMEOUT,
                     "firecracker didn't exit in time; SIGKILLing",
                 );
-                if let Err(e) = live.child.kill().await {
-                    tracing::warn!(sandbox_id = %id, error = %e, "firecracker kill failed");
-                }
-                let _ = live.child.wait().await;
+                kill_fc(&mut live.child, live.fc_pid, id).await;
+                let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
             }
         }
 

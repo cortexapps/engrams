@@ -171,6 +171,12 @@ async fn main() -> Result<(), HostAgentError> {
     // by host A becomes restoreable on host B with B reusing A's
     // recorded trace.
     let host_id = engram_core::HostId::new();
+    // ADR 0009 §6: when the backend is FC, keep a typed Arc on the
+    // side so the host-agent's startup live-attach pass can call
+    // `reattach_sandbox` (the trait can't downcast `dyn`). `None`
+    // for non-FC backends — the live-attach pass becomes a no-op
+    // and the host-agent starts clean-slate.
+    let mut fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>> = None;
     let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
         BackendChoice::Firecracker => {
             let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
@@ -182,10 +188,12 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
-            Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
+            let fc = Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
                 fc_cfg,
-            ))
+            ));
+            fc_for_reattach = Some(fc.clone());
+            fc
         }
         BackendChoice::Vz => {
             #[cfg(target_os = "macos")]
@@ -264,6 +272,9 @@ async fn main() -> Result<(), HostAgentError> {
         .with_image_cache(image_cache)
         .with_auth_session_handle(auth_session_handle)
         .with_host_id(host_id);
+    if let Some(fc) = fc_for_reattach {
+        agent = agent.with_fc_reattach(fc);
+    }
     // ADR 0007 Phase 4: opt-in NBD daemon. `ENGRAM_NBD_DEVICES`
     // is a comma-separated list of `/dev/nbdN` paths the daemon
     // allocates from. Empty / unset → keep the materialize-to-
