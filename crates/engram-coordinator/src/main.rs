@@ -9,7 +9,7 @@ use engram_coordinator::{
     config::{CloudBackendChoice, RunMode, SandboxBackendChoice},
     CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
-use engram_core::traits::{CloudBackend, SandboxBackend, SecretStore};
+use engram_core::traits::{CloudBackend, HostClient, SandboxBackend, SecretStore};
 use engram_core::HostId;
 use engram_postgres::PostgresStore;
 use engram_sandbox_firecracker::FirecrackerBackend;
@@ -338,6 +338,12 @@ async fn main() -> Result<(), CoordinatorError> {
         .expect("stable in-proc host UUID must parse")
         .into();
 
+    // Captured inside the `--mode=all` branch; threaded to
+    // `run_with_registry_and_local` below so AppState's `HarnessHub`
+    // is in scope when we wrap it as a `LocalHostClient` and register
+    // it.
+    let mut in_proc_local_backend: Option<Arc<dyn SandboxBackend>> = None;
+
     if matches!(cli.mode, RunMode::All) {
         let raw_backend: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
             SandboxBackendChoice::Firecracker => {
@@ -532,7 +538,12 @@ async fn main() -> Result<(), CoordinatorError> {
         // `in_proc_host` is computed at top of the function so the
         // FC config (built earlier in this branch) can stamp the
         // same id on `host_id` for trace replay.
-        host_registry.register(in_proc_host, pooled_backend);
+        //
+        // We defer the actual `host_registry.register` until after
+        // AppState is built (via `run_with_registry_and_local` below),
+        // because `LocalHostClient` needs the AppState's `HarnessHub`
+        // — and that hub doesn't exist until AppState is constructed.
+        in_proc_local_backend = Some(pooled_backend.clone());
         // Persist a row in `hosts` so any FK-bearing insert (snapshots
         // record the host that wrote them, sessions track host_id)
         // doesn't trip on a phantom host. The dialer-driven multi-host
@@ -626,7 +637,7 @@ async fn main() -> Result<(), CoordinatorError> {
     let services = Services {
         meta: meta_arc.clone(),
         cloud,
-        sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
+        host: host_registry.clone() as Arc<dyn HostClient>,
         secrets,
         kek,
         oci: oci_client,
@@ -636,7 +647,13 @@ async fn main() -> Result<(), CoordinatorError> {
         materialize_dir: coord_materialize_dir,
     };
 
-    engram_coordinator::run_with_registry(cfg, services, host_registry).await
+    engram_coordinator::run_with_registry_and_local(
+        cfg,
+        services,
+        host_registry,
+        in_proc_local_backend.map(|b| (in_proc_host, b)),
+    )
+    .await
 }
 
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`

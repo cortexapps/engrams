@@ -65,7 +65,7 @@ pub async fn shell(
             .into_response();
     };
 
-    let Some(guest_ip) = state.services.sandbox.guest_ip(sandbox_id).await else {
+    let Some(guest_ip) = state.services.host.guest_ip(sandbox_id).await else {
         // FC has no networking wired (see docs/known-issues.md);
         // VZ may also return None briefly between create and the
         // first DHCP lease landing. Either way the right thing is

@@ -250,7 +250,9 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
     let services = Services {
         meta: meta.clone(),
         cloud: Arc::new(MockCloud::new()),
-        sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
+            ProcessBackend::new(sandbox_dir),
+        ))),
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0xab; 32], "test:v1",

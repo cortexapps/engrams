@@ -16,7 +16,7 @@ use std::time::Duration;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::{HostId, SandboxId};
+use engram_core::{HostId, SandboxId, SessionId};
 use serde::{Deserialize, Serialize};
 
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
@@ -27,55 +27,7 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 /// schemaless, so a single mismatched int between coord and host
 /// silently misaligns every subsequent byte — version-gating the
 /// connection is the only safe way to roll mixed-version deploys.
-///
-/// History:
-/// - v1: introduced alongside ADR 0007's chunked-storage rollout.
-///   `SnapshotMetadata.disk_manifest` was the trigger — bincode's
-///   schemaless positional encoding doesn't honor `#[serde(default)]`
-///   the way JSON does, so adding it broke wire compat with any
-///   pre-rollout binary.
-/// - v2: added `RequestKind::ResolveRegistryAuth` +
-///   `ResponseKind::RegistryAuth` + the `RegistryCreds` wire type
-///   so the standalone host-agent can resolve OCI auth via the
-///   coord's `PgAuthResolver`. New enum variants shift discriminants
-///   in bincode and are a wire break.
-/// - v3: added `RequestKind::ReapMaterializeDir` +
-///   `ResponseKind::MaterializeDirReaped` + the `WireReapStats`
-///   wire type so the coord can fan out the materialize-dir
-///   orphan reap to every connected host in `--mode=coordinator`.
-///   Adding enum variants shifts discriminants; another wire break.
-/// - v4: ADR 0007 Phase 6 destructive trait reshape. Dropped
-///   `dest_path` from `RequestKind::Snapshot` and replaced
-///   `src_path: String` on `RequestKind::Restore` with
-///   `metadata: SnapshotMetadata`. The backend now chooses its
-///   own local staging dir; the metadata's manifest refs are the
-///   cross-host durability primitive, paths are host-local
-///   caches. Wire shape change to RequestKind variants.
-/// - v5: warm pools deleted. `Heartbeat.warm_pools:
-///   Vec<WarmPoolReport>` field removed; `WarmPoolReport` type
-///   removed. Bincode is positional so dropping a Vec mid-struct
-///   shifts every subsequent byte — pure wire break, no graceful
-///   downgrade. See the deletion commit's message for context
-///   on why warm pools were retired in favor of chunked-OCI cold
-///   start + canonical-memory restore.
-/// - v6: ADR 0009 reconciliation primitive. `Heartbeat` gains
-///   `running_sandboxes: Vec<SandboxId>` populated from the host
-///   agent's `backend.list()`. The coord intersects this against
-///   expected-active sessions every tick; missing sandboxes
-///   transition to Idle (if `snapshots.recoverable=true`) or Dead.
-///   Closes case B (the four-stuck-sessions bug pattern) and the
-///   broader host/coord divergence class. Additive on host side,
-///   but bincode is positional so any new field is a wire break.
-/// - v7: `RequestKind::StartAgent` + `ResponseKind::AgentStarted`.
-///   Closes the mode=coordinator harness gap — the WS protocol can
-///   now carry per-session agent argv/env to a remote host, so
-///   harness sessions work in split mode (previously
-///   `RemoteSandboxBackend::start_agent` inherited the trait default
-///   that errors `"this backend doesn't support start_agent yet"`).
-///   Bincode discriminants for enum variants are positional; adding
-///   a new variant is a wire break for older peers even though it's
-///   strictly additive in source.
-pub const WIRE_VERSION: u32 = 7;
+pub const WIRE_VERSION: u32 = 1;
 
 /// Top-level frame on the wire.
 ///
@@ -228,16 +180,31 @@ pub enum RequestKind {
         live_disk_manifest_ids: Vec<uuid::Uuid>,
     },
     /// Launch the long-running "agent" process inside an existing
-    /// sandbox. Mirrors `SandboxBackend::start_agent` — argv is
-    /// per-session (carries `session_id`, attach token, etc.) so
-    /// it can't ride on `SandboxSpec`. Frame ordering on a single
-    /// WS connection guarantees this is processed after any
+    /// sandbox. Mirrors `HostClient::start_agent`. Frame ordering on
+    /// a single WS connection guarantees this is processed after any
     /// preceding `NotifyKind::SessionEgressPolicy` for the same
     /// sandbox, so the host's egress proxy registry is live before
     /// the harness can dial out.
     StartAgent {
         sandbox_id: SandboxId,
         agent: AgentSpec,
+    },
+    /// Tell the host that an upcoming harness connection identifying
+    /// itself with `session_id` should be routed to `sandbox_id`.
+    /// `HostClient::bind_session`.
+    BindHarnessSession {
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+    },
+    /// Drop the session→sandbox binding on the host. `HostClient::unbind_session`.
+    UnbindHarnessSession {
+        session_id: SessionId,
+    },
+    /// Forward a user prompt to the harness attached to `sandbox_id`
+    /// on this host. `HostClient::send_prompt`.
+    SendHarnessPrompt {
+        sandbox_id: SandboxId,
+        text: String,
     },
 }
 
@@ -271,6 +238,11 @@ pub enum ResponseKind {
     /// inside the guest; the coord only learns about its lifecycle
     /// through subsequent harness-channel frames.
     AgentStarted,
+    /// Generic ack reused by `BindHarnessSession`,
+    /// `UnbindHarnessSession`, and `SendHarnessPrompt`. The body is
+    /// empty because all three operations either succeed or fail —
+    /// failure rides the `RemoteError` path.
+    HarnessOk,
 }
 
 /// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.

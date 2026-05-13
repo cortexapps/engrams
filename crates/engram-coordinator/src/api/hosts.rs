@@ -2,7 +2,7 @@
 //! `GET /api/hosts/connect` (with `Authorization: Bearer <token>` so
 //! the existing auth middleware applies). After the upgrade the host's
 //! first frame must be a [`NotifyKind::Hello`] carrying its `HostId`;
-//! the coordinator then registers a [`RemoteSandboxBackend`] in
+//! the coordinator then registers a [`RemoteHostClient`] in
 //! [`HostRegistry`] so all subsequent SandboxBackend calls route over
 //! the wire.
 //!
@@ -19,7 +19,7 @@ use axum::Json;
 use chrono::Utc;
 use engram_core::types::host::{HostCapacity, HostMetadata, HostRecord, HostStatus};
 use engram_core::HostId;
-use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
+use engram_protocol::client::{ConnectedHost, RemoteHostClient};
 use engram_protocol::wire::NotifyKind;
 use engram_protocol::HeartbeatAck;
 use serde::Serialize;
@@ -186,12 +186,12 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
         }
     };
 
-    // Register: the RemoteSandboxBackend is a thin SandboxBackend impl
-    // wrapping the ConnectedHost demuxer. Cloning `host` lets the
+    // Register: `RemoteHostClient` is a thin `HostClient` impl
+    // wrapping the `ConnectedHost` demuxer. Cloning `host` lets the
     // supervisor task keep a handle for ack'ing heartbeats while the
     // backend trait object owns its own copy.
-    let backend: Arc<dyn engram_core::traits::SandboxBackend> =
-        Arc::new(RemoteSandboxBackend::new(host.clone()));
+    let backend: Arc<dyn engram_core::traits::HostClient> =
+        Arc::new(RemoteHostClient::new(host.clone()));
     // Hand a second clone to the registry as the admin client so
     // out-of-band RPCs (materialize-dir reap fanout, ADR 0007) can
     // reach this host directly.

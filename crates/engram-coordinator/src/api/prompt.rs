@@ -56,7 +56,8 @@ pub async fn prompt(
 
     let prompt_text = req.text;
     state
-        .harness_hub
+        .services
+        .host
         .send_prompt(sandbox_id, prompt_text.clone())
         .await
         .map_err(|e| ApiError::Internal(format!("forward prompt to harness: {e}")))?;

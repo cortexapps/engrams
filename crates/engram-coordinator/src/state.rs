@@ -354,19 +354,19 @@ pub struct AppState {
 impl AppState {
     /// Convenience constructor for tests and `--mode=all`-flavoured
     /// embeddings: builds a fresh `HostRegistry` and pre-registers
-    /// `services.sandbox` as the sole host. Callers that want the
+    /// `services.host` as the sole host. Callers that want the
     /// chunked-OCI / image-cache / egress wiring in this single-host
-    /// setup should pass a `PooledBackend`-wrapped `services.sandbox`.
-    /// Production `--mode=coordinator` should use
-    /// [`AppState::new_with_registry`] to thread a registry that hosts
-    /// dial into via WS.
+    /// setup should pass a `LocalHostClient` wrapping a
+    /// `PooledBackend`-flavoured `SandboxBackend`. Production
+    /// `--mode=coordinator` should use [`AppState::new_with_registry`]
+    /// to thread a registry that hosts dial into via WS.
     pub fn new(cfg: CoordinatorConfig, services: Services) -> Self {
         let registry = Arc::new(HostRegistry::new());
-        registry.register(HostId::new(), services.sandbox.clone());
+        registry.register(HostId::new(), services.host.clone());
         Self::new_with_registry(cfg, services, registry)
     }
 
-    /// Construct an AppState whose `services.sandbox` already routes
+    /// Construct an AppState whose `services.host` already routes
     /// via the supplied `HostRegistry`.
     pub fn new_with_registry(
         cfg: CoordinatorConfig,
@@ -397,6 +397,23 @@ impl AppState {
     /// loss. Cross-host durability for sessions is git, not snapshots.
     pub fn snapshot_dir(&self) -> std::path::PathBuf {
         self.cfg.local_path.join("snapshots")
+    }
+
+    /// Register a local VMM backend as an in-process host. Wraps it
+    /// in a `LocalHostClient` bound to this AppState's `HarnessHub`,
+    /// so harness ops (bind/unbind/send_prompt) routed via
+    /// `services.host` land on the same hub that
+    /// `lib.rs::set_harness_sink` plumbs vsock dials into. Used by
+    /// `--mode=all`'s startup wiring after AppState is built.
+    pub fn register_local_host(
+        &self,
+        host_id: engram_core::HostId,
+        sandbox: Arc<dyn engram_core::traits::SandboxBackend>,
+    ) {
+        let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::new(sandbox, self.harness_hub.clone()),
+        );
+        self.host_registry.register(host_id, client);
     }
 
     /// Persist `event` to the session's event log, then publish it on

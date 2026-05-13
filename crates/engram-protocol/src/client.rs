@@ -6,9 +6,9 @@
 //! `Frame::Response` to a oneshot and any preceding `Frame::Stream`
 //! items to an mpsc keyed by the same id.
 //!
-//! The matching [`RemoteSandboxBackend`] wraps a `ConnectedHost` and
-//! implements [`SandboxBackend`] by sending one Request per trait
-//! method and awaiting the response.
+//! The matching [`RemoteHostClient`] wraps a `ConnectedHost` and
+//! implements [`engram_core::traits::HostClient`] by sending one
+//! Request per trait method and awaiting the response.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use engram_core::traits::SandboxBackend;
 use engram_core::types::sandbox::{ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId};
@@ -517,21 +516,21 @@ where
     }
 }
 
-/// `SandboxBackend` impl that forwards every method to a [`ConnectedHost`].
-/// This is what the coordinator stores per registered host so existing
-/// call sites keep working without rewrites.
-pub struct RemoteSandboxBackend {
+/// `HostClient` impl that forwards every method to a [`ConnectedHost`].
+/// This is what the coordinator stores per registered host so
+/// coord-side call sites talk to the wire layer transparently.
+pub struct RemoteHostClient {
     host: ConnectedHost,
 }
 
-impl RemoteSandboxBackend {
+impl RemoteHostClient {
     pub fn new(host: ConnectedHost) -> Self {
         Self { host }
     }
 }
 
 #[async_trait]
-impl SandboxBackend for RemoteSandboxBackend {
+impl engram_core::traits::HostClient for RemoteHostClient {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         match self.host.unary(RequestKind::CreateSandbox { spec }).await {
             Ok(ResponseKind::SandboxCreated { sandbox_id }) => Ok(sandbox_id),
@@ -594,21 +593,6 @@ impl SandboxBackend for RemoteSandboxBackend {
         }
     }
 
-    fn snapshot_path_for(
-        &self,
-        _snapshot_id: engram_core::types::SnapshotId,
-    ) -> std::path::PathBuf {
-        // ADR 0007 Phase 6 contract: `snapshot_path_for` is host-
-        // local. RemoteSandboxBackend wraps a connection to a
-        // different host — paths there are meaningless here.
-        // PooledBackend (the only legitimate caller) is host-side
-        // and never wraps a RemoteSandboxBackend, so this branch
-        // shouldn't be reached in production. The sentinel path
-        // is intentionally implausible so any errant caller fails
-        // loudly on file I/O rather than corrupting a real path.
-        std::path::PathBuf::from("/__engram_remote_backend_no_local_path__")
-    }
-
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
         match self
             .host
@@ -663,6 +647,61 @@ impl SandboxBackend for RemoteSandboxBackend {
             .await
         {
             Ok(ResponseKind::AgentStarted) => Ok(()),
+            Ok(other) => Err(SandboxError::Vm(Box::new(StringError(format!(
+                "unexpected response: {other:?}"
+            ))))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+        // Not yet a wire RPC. The coord-side caller is shell.rs's
+        // ttyd proxy, which needs a guest IP routable from *the
+        // host* — meaningless to ask a remote host for it from the
+        // coord's perspective. Returns `None` so the shell endpoint
+        // falls back to its "shell unavailable" branch on remote
+        // hosts; mode=all (where the in-proc PooledBackend wraps
+        // VZ/Process) keeps working because LocalHostClient delegates
+        // to the inner backend.
+        None
+    }
+
+    async fn bind_session(&self, session_id: engram_core::SessionId, sandbox_id: SandboxId) {
+        if let Err(e) = self
+            .host
+            .unary(RequestKind::BindHarnessSession {
+                session_id,
+                sandbox_id,
+            })
+            .await
+        {
+            tracing::warn!(
+                %session_id, %sandbox_id, error = ?e,
+                "bind_session over WS failed; harness will rely on session-id lookup",
+            );
+        }
+    }
+
+    async fn unbind_session(&self, session_id: engram_core::SessionId) {
+        if let Err(e) = self
+            .host
+            .unary(RequestKind::UnbindHarnessSession { session_id })
+            .await
+        {
+            tracing::warn!(
+                %session_id, error = ?e,
+                "unbind_session over WS failed; host's binding map may have a stale entry",
+            );
+        }
+    }
+
+    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError> {
+        match self
+            .host
+            .unary(RequestKind::SendHarnessPrompt { sandbox_id, text })
+            .await
+        {
+            Ok(ResponseKind::HarnessOk) => Ok(()),
             Ok(other) => Err(SandboxError::Vm(Box::new(StringError(format!(
                 "unexpected response: {other:?}"
             ))))),

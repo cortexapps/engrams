@@ -1,18 +1,17 @@
 //! Host-side WebSocket server: dispatches incoming frames to a local
-//! [`SandboxBackend`] and streams responses back to the coordinator.
+//! [`HostClient`] and streams responses back to the coordinator.
 //!
-//! The host is the *server* of the SandboxBackend RPC even though it
+//! The host is the *server* of the HostClient RPC even though it
 //! dialled the coordinator — once the WebSocket is up, frames flow
 //! both ways. The host originates only Notifies (Hello, Heartbeat);
 //! all Requests come from the coordinator.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use engram_core::traits::SandboxBackend;
+use engram_core::traits::HostClient;
 use engram_core::types::sandbox::ExecEvent;
 use engram_core::SandboxError;
 use futures::sink::SinkExt;
@@ -54,12 +53,9 @@ pub trait NotifyHandler: Send + Sync {
 
 /// Host-side admin operations the coord can fan out via WS-RPC.
 ///
-/// Distinct from [`SandboxBackend`] because these aren't session-
+/// Distinct from [`HostClient`] because these aren't session-
 /// lifecycle calls — they're per-host operational primitives the
-/// coord drives on a cadence or via `POST /api/admin/*`. Adding
-/// them to `SandboxBackend` would force every backend (Process,
-/// VZ, FC) to implement orchestration concerns that don't belong
-/// to a single sandbox.
+/// coord drives on a cadence or via `POST /api/admin/*`.
 ///
 /// `None` on `serve()` is the supported zero-config default — the
 /// host returns `RemoteError::Other("...not configured")` for any
@@ -84,7 +80,7 @@ pub trait HostAdminHandler: Send + Sync {
 /// RPCs like `ReapMaterializeDir`; `None` rejects those with a
 /// typed error. Returns when the read half ends or errors.
 pub async fn serve<W, R>(
-    backend: Arc<dyn SandboxBackend>,
+    backend: Arc<dyn HostClient>,
     notify_handler: Option<Arc<dyn NotifyHandler>>,
     admin_handler: Option<Arc<dyn HostAdminHandler>>,
     writer: W,
@@ -175,7 +171,7 @@ impl HostSession {
     /// `admin_handler`. Returns when the reader ends or errors.
     pub async fn serve_with_reader<R>(
         &self,
-        backend: Arc<dyn SandboxBackend>,
+        backend: Arc<dyn HostClient>,
         notify_handler: Option<Arc<dyn NotifyHandler>>,
         admin_handler: Option<Arc<dyn HostAdminHandler>>,
         mut reader: R,
@@ -321,7 +317,7 @@ async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, noti
 }
 
 async fn handle_request(
-    backend: Arc<dyn SandboxBackend>,
+    backend: Arc<dyn HostClient>,
     admin_handler: Option<Arc<dyn HostAdminHandler>>,
     writer: SharedSink,
     req_id: u64,
@@ -422,6 +418,23 @@ async fn handle_request(
                 Err(e) => Err(RemoteError::from_sandbox(e)),
             }
         }
+        RequestKind::BindHarnessSession {
+            session_id,
+            sandbox_id,
+        } => {
+            backend.bind_session(session_id, sandbox_id).await;
+            Ok(ResponseKind::HarnessOk)
+        }
+        RequestKind::UnbindHarnessSession { session_id } => {
+            backend.unbind_session(session_id).await;
+            Ok(ResponseKind::HarnessOk)
+        }
+        RequestKind::SendHarnessPrompt { sandbox_id, text } => {
+            match backend.send_prompt(sandbox_id, text).await {
+                Ok(()) => Ok(ResponseKind::HarnessOk),
+                Err(e) => Err(RemoteError::from_sandbox(e)),
+            }
+        }
     };
 
     send_frame(&writer, Frame::Response { req_id, result }).await;
@@ -438,6 +451,9 @@ fn request_kind_name(kind: &RequestKind) -> &'static str {
         RequestKind::ResolveRegistryAuth { .. } => "resolve_registry_auth",
         RequestKind::ReapMaterializeDir { .. } => "reap_materialize_dir",
         RequestKind::StartAgent { .. } => "start_agent",
+        RequestKind::BindHarnessSession { .. } => "bind_harness_session",
+        RequestKind::UnbindHarnessSession { .. } => "unbind_harness_session",
+        RequestKind::SendHarnessPrompt { .. } => "send_harness_prompt",
     }
 }
 
@@ -477,17 +493,17 @@ async fn drain_exec_stream(
 }
 
 /// Shared by the unit tests in this module and the duplex-pair fixture
-/// in `engram-coordinator`. Wraps a [`SandboxBackend`] so a test can
+/// in `engram-coordinator`. Wraps a [`HostClient`] so a test can
 /// observe the calls that crossed the wire.
 #[doc(hidden)]
 pub struct RecordingBackend {
-    inner: Arc<dyn SandboxBackend>,
+    inner: Arc<dyn HostClient>,
     pub created: parking_lot::Mutex<u32>,
     pub destroyed: parking_lot::Mutex<u32>,
 }
 
 impl RecordingBackend {
-    pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
+    pub fn new(inner: Arc<dyn HostClient>) -> Self {
         Self {
             inner,
             created: parking_lot::Mutex::new(0),
@@ -497,7 +513,7 @@ impl RecordingBackend {
 }
 
 #[async_trait]
-impl SandboxBackend for RecordingBackend {
+impl HostClient for RecordingBackend {
     async fn create(
         &self,
         spec: engram_core::types::sandbox::SandboxSpec,
@@ -528,10 +544,6 @@ impl SandboxBackend for RecordingBackend {
         self.inner.restore(metadata).await
     }
 
-    fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> PathBuf {
-        self.inner.snapshot_path_for(snapshot_id)
-    }
-
     async fn destroy(&self, id: engram_core::SandboxId) -> Result<(), SandboxError> {
         *self.destroyed.lock() += 1;
         self.inner.destroy(id).await
@@ -539,5 +551,44 @@ impl SandboxBackend for RecordingBackend {
 
     async fn list(&self) -> Result<Vec<engram_core::SandboxId>, SandboxError> {
         self.inner.list().await
+    }
+
+    async fn start_agent(
+        &self,
+        id: engram_core::SandboxId,
+        agent: engram_core::types::sandbox::AgentSpec,
+    ) -> Result<(), SandboxError> {
+        self.inner.start_agent(id, agent).await
+    }
+
+    async fn notify_session_policy(
+        &self,
+        policy: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        self.inner.notify_session_policy(policy).await
+    }
+
+    async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+        self.inner.guest_ip(id).await
+    }
+
+    async fn bind_session(
+        &self,
+        session_id: engram_core::SessionId,
+        sandbox_id: engram_core::SandboxId,
+    ) {
+        self.inner.bind_session(session_id, sandbox_id).await
+    }
+
+    async fn unbind_session(&self, session_id: engram_core::SessionId) {
+        self.inner.unbind_session(session_id).await
+    }
+
+    async fn send_prompt(
+        &self,
+        sandbox_id: engram_core::SandboxId,
+        text: String,
+    ) -> Result<(), SandboxError> {
+        self.inner.send_prompt(sandbox_id, text).await
     }
 }

@@ -122,7 +122,7 @@ pub async fn evict_idle_session(
     // flows through the chunked manifests on `SnapshotMetadata`.
     let metadata = state
         .services
-        .sandbox
+        .host
         .snapshot(sandbox_id)
         .await
         .map_err(EvictError::Sandbox)?;
@@ -161,7 +161,7 @@ pub async fn evict_idle_session(
     // still want to mark the session Idle so a future resume doesn't
     // try to route to a dead sandbox.
     state.registry.unbind(session_id);
-    if let Err(e) = state.services.sandbox.destroy(sandbox_id).await {
+    if let Err(e) = state.services.host.destroy(sandbox_id).await {
         tracing::warn!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -299,11 +299,16 @@ mod tests {
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes")));
         let host_registry = Arc::new(HostRegistry::new());
-        host_registry.register(engram_core::HostId::new(), backend.clone());
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
         let services = Services {
             meta: Arc::new(MiniMeta::new(session)),
             cloud: Arc::new(MockCloud::new()),
-            sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",
@@ -368,7 +373,7 @@ mod tests {
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
 
-        let sandbox_id = state.services.sandbox.create(process_spec()).await.unwrap();
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
         state.registry.bind(session_id, sandbox_id);
         state
             .services
@@ -384,7 +389,7 @@ mod tests {
             workdir: None,
             timeout: Some(Duration::from_secs(5)),
         };
-        state.services.sandbox.exec(sandbox_id, req).await.unwrap();
+        state.services.host.exec(sandbox_id, req).await.unwrap();
 
         let mut sub = state.events.subscribe(session_id);
 

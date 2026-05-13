@@ -99,7 +99,7 @@ pub async fn exec(
 
     let stream = state
         .services
-        .sandbox
+        .host
         .exec_stream(sandbox_id, sandbox_req)
         .await?;
     let exec_id = stream.exec_id.clone();
@@ -205,7 +205,7 @@ pub async fn exec_stream(
 
     let backend_stream = state
         .services
-        .sandbox
+        .host
         .exec_stream(sandbox_id, sandbox_req)
         .await?;
     let exec_id = backend_stream.exec_id.clone();

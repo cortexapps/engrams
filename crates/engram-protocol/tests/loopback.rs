@@ -11,11 +11,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engram_core::traits::SandboxBackend;
+use engram_core::traits::{HostClient, SandboxBackend};
 use engram_core::types::sandbox::{
     CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec,
 };
-use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
+use engram_host_agent::harness::{event_sink_to, HarnessHub};
+use engram_host_agent::LocalHostClient;
+use engram_protocol::client::{ConnectedHost, RemoteHostClient};
 use engram_protocol::server::HostSession;
 use engram_sandbox_process::ProcessBackend;
 use futures::sink::SinkExt;
@@ -42,11 +44,12 @@ fn live_spec() -> SandboxSpec {
 }
 
 /// Wire one ConnectedHost (coord side) to one HostSession (host side)
-/// via a pair of mpsc channels. Returns the coord-side handle and a
-/// JoinHandle for the host-side serve loop.
-async fn pair(
-    backend: Arc<dyn SandboxBackend>,
-) -> (RemoteSandboxBackend, tokio::task::JoinHandle<()>) {
+/// via a pair of mpsc channels. Wraps the supplied VMM backend in a
+/// `LocalHostClient` so the server-side `HostSession` sees the full
+/// `HostClient` surface (sandbox + harness ops). Returns the coord-
+/// side `RemoteHostClient` and a JoinHandle for the host-side serve
+/// loop.
+async fn pair(backend: Arc<dyn SandboxBackend>) -> (RemoteHostClient, tokio::task::JoinHandle<()>) {
     // A: coord -> host    B: host -> coord
     let (coord_tx_a, host_rx_a) = futures::channel::mpsc::unbounded::<TungMessage>();
     let (host_tx_b, coord_rx_b) = futures::channel::mpsc::unbounded::<TungMessage>();
@@ -62,14 +65,15 @@ async fn pair(
         ConnectedHost::spawn(Box::pin(coord_sink), Box::pin(coord_stream));
     let session = HostSession::new(Box::pin(host_sink));
 
-    let backend_clone = backend.clone();
+    let hub = Arc::new(HarnessHub::new(event_sink_to(|_, _, _| async {})));
+    let local: Arc<dyn HostClient> = Arc::new(LocalHostClient::new(backend, hub));
     let serve_handle = tokio::spawn(async move {
         session
-            .serve_with_reader(backend_clone, None, None, Box::pin(host_stream))
+            .serve_with_reader(local, None, None, Box::pin(host_stream))
             .await;
     });
 
-    (RemoteSandboxBackend::new(connected), serve_handle)
+    (RemoteHostClient::new(connected), serve_handle)
 }
 
 #[tokio::test]

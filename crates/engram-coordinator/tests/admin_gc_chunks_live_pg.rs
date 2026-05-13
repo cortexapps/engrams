@@ -26,7 +26,7 @@ use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use engram_cloud_mock::MockCloud;
 use engram_coordinator::{api, AppState, CoordinatorConfig, HostRegistry, Services};
-use engram_core::traits::{MetadataStore, SandboxBackend};
+use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::{HarnessSpec, SessionSpec};
 use engram_core::types::SnapshotRecord;
@@ -87,7 +87,9 @@ async fn gc_chunks_endpoint_reports_live_manifest_count_from_db() {
     let services = Services {
         meta,
         cloud: Arc::new(MockCloud::new()),
-        sandbox: Arc::new(ProcessBackend::new(sandbox_dir)) as Arc<dyn SandboxBackend>,
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
+            ProcessBackend::new(sandbox_dir),
+        ))),
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",

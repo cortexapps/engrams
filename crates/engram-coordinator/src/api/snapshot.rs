@@ -56,7 +56,7 @@ pub async fn snapshot(
     // for the on-disk location. Cross-host durability flows
     // through the chunked manifests on `SnapshotMetadata`, not
     // through the local path.
-    let metadata = state.services.sandbox.snapshot(sandbox_id).await?;
+    let metadata = state.services.host.snapshot(sandbox_id).await?;
 
     let now = Utc::now();
     // Record the host that wrote this snapshot to its local disk so
@@ -367,12 +367,7 @@ async fn resume_from_fc_snapshot(
             .ok()
             .flatten();
     if let Some(agent) = agent_opt {
-        if let Err(e) = state
-            .services
-            .sandbox
-            .start_agent(new_sandbox_id, agent)
-            .await
-        {
+        if let Err(e) = state.services.host.start_agent(new_sandbox_id, agent).await {
             tracing::warn!(
                 session_id = %id,
                 sandbox_id = %new_sandbox_id,
@@ -439,7 +434,7 @@ async fn bind_resumed_session(
     // hit `accept_via_session_lookup` → "no sandbox bound to this
     // session_id" and bounce. The original `bind_session` from
     // `create_session` pointed at the now-destroyed sandbox.
-    state.harness_hub.bind_session(id, sandbox_id);
+    state.services.host.bind_session(id, sandbox_id).await;
 }
 
 async fn finalize_resume(
@@ -497,7 +492,7 @@ pub async fn evict_local(
     }
 
     if let Some(sandbox_id) = state.registry.unbind(id) {
-        if let Err(e) = state.services.sandbox.destroy(sandbox_id).await {
+        if let Err(e) = state.services.host.destroy(sandbox_id).await {
             // Best-effort: even if destroy fails we drop the binding
             // and mark Idle. The sandbox is the cache, not source of truth.
             tracing::warn!(

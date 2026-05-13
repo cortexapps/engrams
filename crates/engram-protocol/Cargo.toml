@@ -26,6 +26,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+engram-host-agent.workspace = true
 engram-sandbox-process.workspace = true
 futures.workspace = true
 tempfile = "3"

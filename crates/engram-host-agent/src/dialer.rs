@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engram_core::traits::SandboxBackend;
+use engram_core::traits::HostClient;
 use engram_core::{HostId, SandboxId};
 use engram_protocol::heartbeat::Heartbeat;
 use engram_protocol::server::{HostAdminHandler, HostSession};
@@ -74,7 +74,7 @@ pub struct DialerConfig {
 pub async fn run_dialer(
     cfg: DialerConfig,
     host_id: HostId,
-    backend: Arc<dyn SandboxBackend>,
+    backend: Arc<dyn HostClient>,
 ) -> std::io::Result<()> {
     let mut backoff = Duration::from_millis(500);
     const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -97,7 +97,7 @@ pub async fn run_dialer(
 async fn connect_once(
     cfg: &DialerConfig,
     host_id: HostId,
-    backend: Arc<dyn SandboxBackend>,
+    backend: Arc<dyn HostClient>,
 ) -> std::io::Result<()> {
     let target = build_ws_url(&cfg.coordinator_url);
     let mut request = target

@@ -534,7 +534,7 @@ pub async fn create_session(
     // Skipped only when the backend has no guest IP for this
     // sandbox (process backend, VZ in some configs). Host-agents
     // with no local proxy attached treat the frame as a no-op.
-    if let Some(guest_ip_str) = state.services.sandbox.guest_ip(sandbox_id).await {
+    if let Some(guest_ip_str) = state.services.host.guest_ip(sandbox_id).await {
         if let Ok(guest_ip) = guest_ip_str.parse::<std::net::Ipv4Addr>() {
             let mut secrets = Vec::new();
             for (name, resolved) in &secret_bundle.secrets {
@@ -557,7 +557,7 @@ pub async fn create_session(
                 secrets,
                 secret_mode: manifest.secret_mode,
             };
-            if let Err(e) = state.services.sandbox.notify_session_policy(policy).await {
+            if let Err(e) = state.services.host.notify_session_policy(policy).await {
                 // Don't fail session create — the policy frame is
                 // best-effort. Hosts without an attached proxy
                 // silently no-op; transient WS issues should retry
@@ -571,10 +571,16 @@ pub async fn create_session(
             }
         }
     }
-    // Bind the routing in the hub *before* the agent has a chance
-    // to dial. `backend.create()` returns with the sandbox ready
-    // to accept exec but the agent (if any) NOT yet spawned.
-    state.harness_hub.bind_session(session_id, sandbox_id);
+    // Bind the routing on the host that owns this sandbox *before*
+    // the agent has a chance to dial. `backend.create()` returns with
+    // the sandbox ready to accept exec but the agent (if any) NOT
+    // yet spawned. HostClient dispatches by sandbox_id so this routes
+    // to the right host (local in mode=all, WS in mode=coordinator).
+    state
+        .services
+        .host
+        .bind_session(session_id, sandbox_id)
+        .await;
 
     // -------- 6. Start the agent (if any) --------
     //
@@ -582,13 +588,13 @@ pub async fn create_session(
     // `/workspace` is the workspace; nothing for the platform to do
     // here.
     if let Some(agent) = agent_for_session {
-        if let Err(e) = state.services.sandbox.start_agent(sandbox_id, agent).await {
+        if let Err(e) = state.services.host.start_agent(sandbox_id, agent).await {
             let _ = state
                 .services
                 .meta
                 .set_session_status(session_id, SessionStatus::Failed)
                 .await;
-            state.harness_hub.unbind_session(session_id);
+            state.services.host.unbind_session(session_id).await;
             return Err(e.into());
         }
     }
@@ -684,7 +690,7 @@ pub async fn delete_session(
     if let Some(sandbox_id) = state.registry.unbind(id) {
         // Best-effort: a session being deleted shouldn't fail the API
         // because the underlying VM already crashed or never came up.
-        if let Err(e) = state.services.sandbox.destroy(sandbox_id).await {
+        if let Err(e) = state.services.host.destroy(sandbox_id).await {
             tracing::warn!(
                 session_id = %id,
                 sandbox_id = %sandbox_id,
@@ -717,7 +723,7 @@ pub async fn delete_session(
             },
         )
         .await?;
-    state.harness_hub.unbind_session(id);
+    state.services.host.unbind_session(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -757,7 +763,7 @@ pub(crate) fn resolve_harness(
     }
 
     let guest_path = crate::harness_paths::guest_argv0(name);
-    let argv = match state.services.sandbox.harness_dial() {
+    let argv = match state.services.host.harness_dial() {
         engram_core::traits::HarnessDial::HostTcp => {
             let addr = match *state.harness_listen_addr.lock() {
                 Some(addr) => addr,

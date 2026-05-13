@@ -25,6 +25,8 @@ pub mod dialer;
 pub mod disk_daemon;
 pub mod egress;
 pub mod harness;
+pub mod host_client;
+pub use host_client::LocalHostClient;
 pub mod heartbeat;
 pub mod image_cache;
 pub mod live_attach;
@@ -257,7 +259,18 @@ impl HostAgent {
                 }
                 Arc::new(p)
             };
-            let pooled_for_dialer: Arc<dyn engram_core::traits::SandboxBackend> = pooled.clone();
+            // Construct a local HarnessHub + LocalHostClient. The hub's
+            // event sink is wired up in Phase 2 (over-WS forwarding);
+            // for now we use a no-op sink so the trait surface is
+            // satisfied. With the local hub in place,
+            // `pooled.set_harness_sink` will deliver vsock dials into
+            // it once Phase 2 lands the registration.
+            let event_sink = crate::harness::event_sink_to(|_, _, _| async {});
+            let harness_hub = std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink));
+            let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub),
+            );
+            let host_for_dialer = local_host.clone();
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
             // intersects this against expected-active sessions to
@@ -308,7 +321,7 @@ impl HostAgent {
                 admin_handler,
             };
             let dialer_task = tokio::spawn(async move {
-                if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, pooled_for_dialer).await {
+                if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, host_for_dialer).await {
                     tracing::error!(error = %e, "dialer terminated with error");
                 }
             });

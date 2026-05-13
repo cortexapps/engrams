@@ -1,32 +1,25 @@
 //! Coordinator-side registry of connected hosts.
 //!
-//! Replaces the Phase 1+2 single in-process `Arc<dyn SandboxBackend>` —
-//! each host registers a backend (typically a [`RemoteSandboxBackend`]
-//! wrapping a WS connection, or in `--mode=all` a local trait object).
-//! `HostRegistry` itself implements [`SandboxBackend`] by:
+//! Each host registers a [`HostClient`] (typically a [`RemoteHostClient`]
+//! wrapping a WS connection, or in `--mode=all` a [`LocalHostClient`]).
+//! `HostRegistry` itself implements [`HostClient`] by:
 //!
 //! 1. Routing `create` / `restore` to a scheduler-picked host and
 //!    recording the resulting `SandboxId → HostId` so subsequent calls
 //!    against that id reach the right host.
-//! 2. Routing `exec_stream` / `snapshot` / `destroy` by looking up the
-//!    `HostId` for the supplied `SandboxId`.
+//! 2. Routing `exec_stream` / `snapshot` / `destroy` / `start_agent` /
+//!    `bind_session` / `unbind_session` / `send_prompt` by looking up
+//!    the `HostId` for the supplied `SandboxId`.
 //! 3. Aggregating `list` across all connected hosts.
-//!
-//! Phase 3a single-host: the scheduler is trivial — pick the only
-//! registered host. Phase 3b grows this into a real ranking by
-//! snapshot affinity and capacity. Pre-v5 also had a warm-pool tier;
-//! deleted with ADR 0008 (chunked-OCI restore + canonical-memory
-//! make the create-time savings warm pools amortised no longer worth
-//! the complexity).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use engram_core::traits::SandboxBackend;
+use engram_core::traits::{HarnessDial, HostClient};
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
+use engram_core::{HostId, SandboxError, SandboxId, SessionId, SnapshotId};
 use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
 use parking_lot::RwLock;
 
@@ -38,7 +31,7 @@ use parking_lot::RwLock;
 /// `None` for `--mode=all` test-registered backends that aren't
 /// routed through the wire layer.
 struct HostEntry {
-    backend: Arc<dyn SandboxBackend>,
+    backend: Arc<dyn HostClient>,
     state: RwLock<HostState>,
     admin_client: Option<engram_protocol::client::ConnectedHost>,
 }
@@ -87,7 +80,7 @@ impl HostRegistry {
 
     /// Register a host. Replaces any prior registration for the same id
     /// (host reconnect after a network blip uses the same `HostId`).
-    pub fn register(&self, host_id: HostId, backend: Arc<dyn SandboxBackend>) {
+    pub fn register(&self, host_id: HostId, backend: Arc<dyn HostClient>) {
         self.hosts.insert(
             host_id,
             HostEntry {
@@ -106,7 +99,7 @@ impl HostRegistry {
     pub fn register_remote(
         &self,
         host_id: HostId,
-        backend: Arc<dyn SandboxBackend>,
+        backend: Arc<dyn HostClient>,
         admin_client: engram_protocol::client::ConnectedHost,
     ) {
         self.hosts.insert(
@@ -164,7 +157,7 @@ impl HostRegistry {
     /// to call `backend.list()` on each tick. Cloning the trait
     /// object is cheap (Arc bump) so callers don't have to hold the
     /// registry's internal entry across `await` points.
-    pub fn backend_of(&self, host_id: HostId) -> Option<Arc<dyn SandboxBackend>> {
+    pub fn backend_of(&self, host_id: HostId) -> Option<Arc<dyn HostClient>> {
         self.hosts.get(&host_id).map(|e| e.value().backend.clone())
     }
 
@@ -176,7 +169,7 @@ impl HostRegistry {
     /// host. Used by the `SandboxBackend` trait impl for anonymous
     /// flows (list, restore from a global metadata) where the caller
     /// hasn't supplied session-aware [`ScheduleContext`].
-    fn pick_any(&self) -> Option<(HostId, Arc<dyn SandboxBackend>)> {
+    fn pick_any(&self) -> Option<(HostId, Arc<dyn HostClient>)> {
         self.hosts
             .iter()
             .find(|e| !e.value().state.read().draining)
@@ -201,7 +194,7 @@ impl HostRegistry {
     pub fn pick_for_session(
         &self,
         ctx: &ScheduleContext<'_>,
-    ) -> Option<(HostId, Arc<dyn SandboxBackend>)> {
+    ) -> Option<(HostId, Arc<dyn HostClient>)> {
         // Snapshot-affinity: any host carrying the requested snapshot.
         if let Some(target) = ctx.prefer_snapshot_id {
             for entry in self.hosts.iter() {
@@ -217,7 +210,7 @@ impl HostRegistry {
 
         // Capacity-fit: largest free RAM that meets `memory_mib`.
         let need = ctx.memory_mib.unwrap_or(0) as u64;
-        let mut best_cap: Option<(u64, HostId, Arc<dyn SandboxBackend>)> = None;
+        let mut best_cap: Option<(u64, HostId, Arc<dyn HostClient>)> = None;
         for entry in self.hosts.iter() {
             let st = entry.value().state.read();
             if st.draining {
@@ -291,7 +284,7 @@ impl HostRegistry {
         self.sandbox_owner.insert(sandbox_id, host_id);
     }
 
-    fn lookup(&self, sandbox_id: SandboxId) -> Result<Arc<dyn SandboxBackend>, SandboxError> {
+    fn lookup(&self, sandbox_id: SandboxId) -> Result<Arc<dyn HostClient>, SandboxError> {
         let host_id = self
             .sandbox_owner
             .get(&sandbox_id)
@@ -322,21 +315,18 @@ impl std::fmt::Display for StringError {
 impl std::error::Error for StringError {}
 
 #[async_trait]
-impl SandboxBackend for HostRegistry {
+impl HostClient for HostRegistry {
     // Capability methods report a deployment-wide answer — they're
     // queried before a per-session host pick happens (e.g. by
     // `resolve_harness`), so we assume all registered hosts agree on
     // the answer. In --mode=all there's exactly one host; in
     // --mode=coordinator with mixed-backend hosts the first host wins.
-    fn harness_dial(&self) -> engram_core::traits::HarnessDial {
-        // First registered host's value; default Vsock when empty
-        // (no hosts yet — the API will fail before reaching here for
-        // real session creation).
+    fn harness_dial(&self) -> HarnessDial {
         self.hosts
             .iter()
             .next()
             .map(|entry| entry.value().backend.harness_dial())
-            .unwrap_or(engram_core::traits::HarnessDial::Vsock)
+            .unwrap_or(HarnessDial::Vsock)
     }
 
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
@@ -358,20 +348,6 @@ impl SandboxBackend for HostRegistry {
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let backend = self.lookup(id)?;
         backend.snapshot(id).await
-    }
-
-    fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
-        // HostRegistry is the coord-side "any backend" router; an
-        // individual snapshot_path_for question is only meaningful
-        // when paired with a known host. Coord callers should never
-        // ask the registry for a per-snapshot host-local path.
-        // Return a sentinel that's implausible enough to fail loudly
-        // on any actual file I/O (matches RemoteSandboxBackend's
-        // contract).
-        std::path::PathBuf::from(format!(
-            "/__engram_host_registry_no_local_path__/{}",
-            snapshot_id,
-        ))
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
@@ -402,22 +378,11 @@ impl SandboxBackend for HostRegistry {
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
         // Route by `sandbox_id` — the policy targets the host that
-        // owns that sandbox. Looked-up backend dispatches:
-        // RemoteSandboxBackend forwards over its WS; an in-process
-        // local backend applies directly.
+        // owns that sandbox. The looked-up `HostClient` dispatches:
+        // `RemoteHostClient` forwards over its WS; a `LocalHostClient`
+        // applies directly.
         let backend = self.lookup(policy.sandbox_id)?;
         backend.notify_session_policy(policy).await
-    }
-
-    fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
-        // Fan out to every currently-registered host's backend so
-        // the FC sandbox listeners can route inbound vsock harness
-        // dials into the same hub. Hosts registered after this call
-        // miss it — re-call after registering new hosts in
-        // `--mode=all` flows where order can drift.
-        for entry in self.hosts.iter() {
-            entry.value().backend.set_harness_sink(sink.clone());
-        }
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -434,6 +399,37 @@ impl SandboxBackend for HostRegistry {
     async fn guest_ip(&self, id: SandboxId) -> Option<String> {
         let backend = self.lookup(id).ok()?;
         backend.guest_ip(id).await
+    }
+
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+        if let Ok(backend) = self.lookup(sandbox_id) {
+            backend.bind_session(session_id, sandbox_id).await;
+        }
+    }
+
+    async fn unbind_session(&self, session_id: SessionId) {
+        // No sandbox routing for the unbind — fan out to every
+        // connected host so whichever one had the binding clears it.
+        // Each host's `unbind_session` is a no-op for unknown session
+        // ids, so the broadcast is cheap.
+        for entry in self.hosts.iter() {
+            entry.value().backend.unbind_session(session_id).await;
+        }
+    }
+
+    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError> {
+        let backend = self.lookup(sandbox_id)?;
+        backend.send_prompt(sandbox_id, text).await
+    }
+
+    fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
+        // Fan out to every registered host. `LocalHostClient` wires
+        // it onto its inner VMM backend; `RemoteHostClient`'s default
+        // no-op silently drops the closure (the remote host owns its
+        // own local sink wiring).
+        for entry in self.hosts.iter() {
+            entry.value().backend.set_harness_sink(sink.clone());
+        }
     }
 }
 
@@ -463,8 +459,10 @@ mod tests {
     #[tokio::test]
     async fn create_then_destroy_routes_through_recorded_host() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn SandboxBackend> =
+        let raw: Arc<dyn engram_core::traits::SandboxBackend> =
             Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path()));
+        let backend: Arc<dyn HostClient> =
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(raw));
         let reg = HostRegistry::new();
         let host = HostId::new();
         reg.register(host, backend);
@@ -514,10 +512,12 @@ mod tests {
         assert!(matches!(err, SandboxError::NotFound));
     }
 
-    fn dummy_backend() -> (Arc<dyn SandboxBackend>, tempfile::TempDir) {
+    fn dummy_backend() -> (Arc<dyn HostClient>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
+        let raw: Arc<dyn engram_core::traits::SandboxBackend> =
+            Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path()));
         (
-            Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path())) as _,
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(raw)),
             dir,
         )
     }
@@ -694,8 +694,10 @@ mod tests {
 
         // Host re-registers (same host_id). Now routing works.
         let dir = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn SandboxBackend> =
+        let raw: Arc<dyn engram_core::traits::SandboxBackend> =
             Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path()));
+        let backend: Arc<dyn HostClient> =
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(raw));
         reg.register(host, backend);
 
         // The (idempotent) destroy on a ProcessBackend with an unknown

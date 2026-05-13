@@ -1,5 +1,5 @@
 //! End-to-end integration test of the Phase 3a wire path:
-//! `POST /sessions` → AppState → HostRegistry → RemoteSandboxBackend
+//! `POST /sessions` → AppState → HostRegistry → RemoteHostClient
 //! → mpsc-channel pair → HostSession::serve_with_reader → ProcessBackend.
 //!
 //! Smaller than `tests/api.rs` (which exercises the in-process backend
@@ -21,7 +21,7 @@ use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SessionId};
-use engram_protocol::client::{ConnectedHost, RemoteSandboxBackend};
+use engram_protocol::client::{ConnectedHost, RemoteHostClient};
 use engram_protocol::server::HostSession;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
@@ -272,7 +272,7 @@ impl MetadataStore for MiniMeta {
     }
 }
 
-/// Build an AppState whose services.sandbox routes through a HostRegistry
+/// Build an AppState whose services.host routes through a HostRegistry
 /// → wire → ProcessBackend chain. Exercises the same path a real
 /// `--mode=coordinator` + `engram-host-agent` deployment uses, just
 /// without an actual TCP/WS handshake (mpsc channels carry the frames).
@@ -296,17 +296,21 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
         ConnectedHost::spawn(Box::pin(coord_sink), Box::pin(coord_stream));
     let session = HostSession::new(Box::pin(host_sink));
 
-    // Host-side: ProcessBackend serves the requests.
-    let local_backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_dir));
+    // Host-side: ProcessBackend wrapped as a LocalHostClient serves
+    // the requests.
+    let raw: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(sandbox_dir));
+    let local_host: Arc<dyn engram_core::traits::HostClient> =
+        Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(raw));
     let serve_handle = tokio::spawn(async move {
         session
-            .serve_with_reader(local_backend, None, None, Box::pin(host_stream))
+            .serve_with_reader(local_host, None, None, Box::pin(host_stream))
             .await;
     });
 
     // Coordinator-side: register the wire-connected backend in HostRegistry.
     let host_registry = Arc::new(HostRegistry::new());
-    let remote: Arc<dyn SandboxBackend> = Arc::new(RemoteSandboxBackend::new(connected));
+    let remote: Arc<dyn engram_core::traits::HostClient> =
+        Arc::new(RemoteHostClient::new(connected));
     host_registry.register(HostId::new(), remote);
 
     let meta = Arc::new(MiniMeta::default());
@@ -315,7 +319,7 @@ fn build_wired_router() -> (axum::Router, tokio::task::JoinHandle<()>) {
     let services = Services {
         meta,
         cloud: Arc::new(MockCloud::new()),
-        sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
+        host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
@@ -373,7 +377,7 @@ async fn create_then_exec_round_trips_via_wire() {
     let (app, _serve) = build_wired_router();
 
     // 1. POST /sessions — coordinator's create_session calls
-    //    services.sandbox.create() which is HostRegistry → wire →
+    //    services.host.create() which is HostRegistry → wire →
     //    ProcessBackend.
     let create = app
         .clone()
@@ -444,7 +448,7 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
     let services = Services {
         meta,
         cloud: Arc::new(MockCloud::new()),
-        sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
+        host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",

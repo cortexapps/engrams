@@ -99,11 +99,14 @@ mod tests {
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
         let host_registry = Arc::new(HostRegistry::new());
-        host_registry.register(engram_core::HostId::new(), backend.clone());
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(engram_core::HostId::new(), local_host);
         let services = Services {
             meta: Arc::new(MiniMeta::new(session)),
             cloud: Arc::new(MockCloud::new()),
-            sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",

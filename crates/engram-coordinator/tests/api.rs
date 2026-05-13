@@ -348,7 +348,9 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
     let services = Services {
         meta,
         cloud: Arc::new(MockCloud::new()),
-        sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
+            ProcessBackend::new(sandbox_dir),
+        ))),
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
@@ -401,7 +403,7 @@ impl TestFixture {
         let services = Services {
             meta: meta.clone(),
             cloud: Arc::new(MockCloud::new()),
-            sandbox: backend,
+            host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(backend)),
             secrets: Arc::new(secrets),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",
@@ -1969,7 +1971,9 @@ async fn create_session_failure_marks_session_failed() {
     let services = Services {
         meta: store.clone(),
         cloud: Arc::new(MockCloud::new()),
-        sandbox: Arc::new(AlwaysFailSandbox),
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
+            AlwaysFailSandbox,
+        ))),
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
@@ -2917,7 +2921,9 @@ async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
     let services = Services {
         meta: store,
         cloud: Arc::new(MockCloud::new()),
-        sandbox: Arc::new(ProcessBackend::new(sandbox_dir)),
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
+            ProcessBackend::new(sandbox_dir),
+        ))),
         secrets: Arc::new(InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",

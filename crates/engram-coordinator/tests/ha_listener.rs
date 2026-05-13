@@ -117,7 +117,7 @@ async fn build_app_state(
     let services = Services {
         meta: meta.clone(),
         cloud: Arc::new(MockCloud::new()),
-        sandbox: pooled,
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(pooled)),
         secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
@@ -141,7 +141,7 @@ async fn build_app_state(
         ..CoordinatorConfig::default()
     };
     let registry = Arc::new(HostRegistry::new());
-    registry.register(engram_core::HostId::new(), services.sandbox.clone());
+    registry.register(engram_core::HostId::new(), services.host.clone());
     let state = Arc::new(AppState::new_with_registry(cfg, services, registry));
 
     // Spawn a pg_listener bound to this AppState's event bus.

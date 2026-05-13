@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use engram_core::traits::{BlobStorage, CloudBackend, MetadataStore, SandboxBackend, SecretStore};
+use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, SecretStore};
 
 pub mod api;
 pub mod blob;
@@ -34,7 +34,7 @@ pub use state::AppState;
 pub struct Services {
     pub meta: Arc<dyn MetadataStore>,
     pub cloud: Arc<dyn CloudBackend>,
-    pub sandbox: Arc<dyn SandboxBackend>,
+    pub host: Arc<dyn HostClient>,
     pub secrets: Arc<dyn SecretStore>,
     /// Master key provider used to wrap/unwrap registry-credential
     /// DEKs. Initialised from `--kek-provider`. Phase 5+; envelope-
@@ -84,12 +84,34 @@ pub async fn run_with_registry(
     services: Services,
     host_registry: Arc<HostRegistry>,
 ) -> Result<(), CoordinatorError> {
+    run_with_registry_and_local(cfg, services, host_registry, None).await
+}
+
+/// Variant of [`run_with_registry`] that also accepts a local VMM
+/// backend to register as an in-process host. Used by `--mode=all`:
+/// the backend is wrapped in a `LocalHostClient` that shares the
+/// AppState's `HarnessHub`, so harness ops routed through
+/// `services.host` land on the same hub that `lib.rs::set_harness_sink`
+/// plumbs vsock dials into. Without this, in-process harness routing
+/// would target a different hub than the FC backend's sink writes to.
+pub async fn run_with_registry_and_local(
+    cfg: CoordinatorConfig,
+    services: Services,
+    host_registry: Arc<HostRegistry>,
+    in_proc_local: Option<(
+        engram_core::HostId,
+        Arc<dyn engram_core::traits::SandboxBackend>,
+    )>,
+) -> Result<(), CoordinatorError> {
     let meta_for_listener = services.meta.clone();
     let state = Arc::new(AppState::new_with_registry(
         cfg.clone(),
         services,
         host_registry,
     ));
+    if let Some((host_id, backend)) = in_proc_local {
+        state.register_local_host(host_id, backend);
+    }
 
     // Phase 3 follow-up: rebuild in-memory routing maps from
     // sessions persisted in Postgres. After a coordinator restart
@@ -222,7 +244,7 @@ pub async fn run_with_registry(
         let sink: engram_core::traits::HarnessSink = std::sync::Arc::new(move |stream| {
             hub.accept_via_session_lookup(stream);
         });
-        state.services.sandbox.set_harness_sink(sink);
+        state.services.host.set_harness_sink(sink);
     }
 
     let app = api::router(state.clone());

@@ -157,7 +157,7 @@ pub async fn drain_session(
     // just lets us release Firecracker handles cleanly. Failure is
     // expected sometimes (mid-shutdown FC API may be unresponsive).
     state.registry.unbind(session_id);
-    if let Err(e) = state.services.sandbox.destroy(sandbox_id).await {
+    if let Err(e) = state.services.host.destroy(sandbox_id).await {
         tracing::debug!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -267,11 +267,16 @@ mod tests {
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes")));
         let host_registry = Arc::new(HostRegistry::new());
-        host_registry.register(engram_core::HostId::new(), backend.clone());
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
         let services = Services {
             meta: Arc::new(MiniMeta::new(session)),
             cloud,
-            sandbox: host_registry.clone() as Arc<dyn SandboxBackend>,
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
                 [0u8; 32], "test:v1",
@@ -344,7 +349,7 @@ mod tests {
             cloud,
         );
 
-        let sandbox_id = state.services.sandbox.create(process_spec()).await.unwrap();
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
         state.registry.bind(session_id, sandbox_id);
         state
             .services
@@ -387,7 +392,7 @@ mod tests {
             cloud,
         );
 
-        let sandbox_id = state.services.sandbox.create(process_spec()).await.unwrap();
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
         state.registry.bind(session_id, sandbox_id);
         state
             .services
