@@ -300,6 +300,24 @@ just dev-vz             # coordinator wired to the Apple Silicon backend (macOS 
 just clean-var          # rm -rf the local sandbox cwds + snapshots
 ```
 
+**macOS one-time setup for nextest.** The workspace has ~800 test
+binaries; `cargo nextest` spawns all of them in parallel for the
+`--list` phase. On a fresh macOS install, `syspolicyd` queues each
+ad-hoc-signed binary for signature verification, and the queue
+stalls — every test binary hangs in `_dyld_start` and the run never
+completes. The fix is a one-time `Developer Tools` grant for your
+terminal:
+
+```bash
+spctl developer-mode enable-terminal
+# then: System Settings → Privacy & Security → Developer Tools →
+# add your terminal app (Terminal, iTerm, Ghostty, ...) → relaunch it.
+```
+
+After relaunching the terminal, `just check` and `cargo nextest`
+runs complete in ~30s instead of hanging indefinitely. See
+[nextest's own docs](https://nexte.st/docs/installation/macos/#how-to-add-your-terminal-to-developer-tools).
+
 ## Sessions are bake-image sandboxes with chunked-immutable durability
 
 A session is one bounded unit of agent work. It's two things on the wire: an `image` (the OCI URI of a baked rootfs) and an optional `harness` (which agent process to attach). The bake image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
