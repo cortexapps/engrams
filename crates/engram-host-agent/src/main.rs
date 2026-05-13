@@ -176,7 +176,7 @@ async fn main() -> Result<(), HostAgentError> {
     // `reattach_sandbox` (the trait can't downcast `dyn`). `None`
     // for non-FC backends — the live-attach pass becomes a no-op
     // and the host-agent starts clean-slate.
-    let mut fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>> = None;
+    let fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>>;
     let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
         BackendChoice::Firecracker => {
             let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
@@ -212,6 +212,7 @@ async fn main() -> Result<(), HostAgentError> {
                         )
                     })?;
                 let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
+                fc_for_reattach = None;
                 Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
                         .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?,
