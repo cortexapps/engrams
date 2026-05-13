@@ -25,11 +25,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use engram_core::traits::MetadataStore;
 use engram_core::types::SessionStatus;
 use engram_core::{HostId, SandboxId, SessionId};
 use parking_lot::Mutex;
 
-use crate::state::{SessionEvent, SharedState};
+use crate::state::{SessionEvent, SessionEventBus, SharedState};
 
 /// Default number of consecutive heartbeats a sandbox must be
 /// missing-from-host before the reconcile pass transitions the
@@ -79,25 +80,39 @@ impl Reconciler {
         self.strikes.lock().clone()
     }
 
-    /// Reconcile this host's view. Called from the heartbeat
-    /// supervisor in `api/hosts.rs` on every inbound
-    /// `NotifyKind::Heartbeat`. Returns the list of session-ids
-    /// that crossed the strike threshold and got flipped this
-    /// tick — caller can log / emit events / surface in
-    /// `/api/admin/reconcile-now` responses.
+    /// Reconcile this host's view via the live `SharedState`. Thin
+    /// wrapper around [`Self::reconcile_with_deps`] for the heartbeat
+    /// handler in `api/hosts.rs`. Tests bypass this in favour of
+    /// `reconcile_with_deps` so they don't have to stand up a full
+    /// Services struct.
     pub async fn reconcile_host(
         &self,
         state: &SharedState,
         host_id: HostId,
         running_sandboxes: &[SandboxId],
     ) -> Vec<SessionId> {
+        self.reconcile_with_deps(
+            state.services.meta.as_ref(),
+            &state.events,
+            host_id,
+            running_sandboxes,
+        )
+        .await
+    }
+
+    /// Dependency-injected version. Called from `reconcile_host` and
+    /// tests. Returns the list of session-ids that crossed the strike
+    /// threshold and got flipped this tick — caller can log / emit
+    /// events / surface in `/api/admin/reconcile-now` responses.
+    pub async fn reconcile_with_deps(
+        &self,
+        meta: &dyn MetadataStore,
+        events: &SessionEventBus,
+        host_id: HostId,
+        running_sandboxes: &[SandboxId],
+    ) -> Vec<SessionId> {
         let running: HashSet<SandboxId> = running_sandboxes.iter().copied().collect();
-        let assignments = match state
-            .services
-            .meta
-            .list_active_sandbox_assignments_on_host(host_id)
-            .await
-        {
+        let assignments = match meta.list_active_sandbox_assignments_on_host(host_id).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(host_id = %host_id, error = %e, "reconcile: meta query failed; skipping tick");
@@ -111,117 +126,133 @@ impl Reconciler {
         };
 
         for session_id in &to_flip {
-            self.flip_missing(state, *session_id, host_id).await;
+            flip_missing(meta, events, *session_id, host_id).await;
         }
         to_flip
     }
+}
 
-    async fn flip_missing(&self, state: &SharedState, session_id: SessionId, host_id: HostId) {
-        // Recoverability check: latest snapshot's `recoverable`
-        // column. Phase 2 of the rollout sets this true after HEAD-
-        // verifying the chunked manifests are durable in BlobStorage.
-        let recoverable = match state
-            .services
-            .meta
-            .latest_snapshot_for_session(session_id)
-            .await
-        {
-            Ok(Some(s)) => s.recoverable,
-            Ok(None) => false,
+async fn flip_missing(
+    meta: &dyn MetadataStore,
+    events: &SessionEventBus,
+    session_id: SessionId,
+    host_id: HostId,
+) {
+    // Recoverability check: latest snapshot's `recoverable`
+    // column. Phase 2 of the rollout sets this true after HEAD-
+    // verifying the chunked manifests are durable in BlobStorage.
+    let recoverable = match meta.latest_snapshot_for_session(session_id).await {
+        Ok(Some(s)) => s.recoverable,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "reconcile: latest_snapshot_for_session failed; treating as not-recoverable"
+            );
+            false
+        }
+    };
+
+    let new_status = if recoverable {
+        SessionStatus::Idle
+    } else {
+        SessionStatus::Dead
+    };
+
+    // Cheap idempotency: if the session is already in target state
+    // (or terminal beyond it), skip. Avoids racing with an operator
+    // who manually killed the session between the strike-out and now.
+    let session = match meta.get_session(session_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "reconcile: get_session failed; skipping flip");
+            return;
+        }
+    };
+    let prev = session.status;
+    if matches!(
+        prev,
+        SessionStatus::Idle
+            | SessionStatus::Dead
+            | SessionStatus::Completed
+            | SessionStatus::Failed
+    ) {
+        tracing::debug!(
+            session_id = %session_id,
+            ?prev,
+            "reconcile: session already in non-active state; skipping flip"
+        );
+        return;
+    }
+
+    // Clear sandbox_id so coord routing and a future restart's
+    // `repopulate_routing` don't try to talk to the dead sandbox.
+    if let Err(e) = meta.assign_session_sandbox(session_id, None).await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "reconcile: clearing sandbox_id failed; continuing with status flip"
+        );
+    }
+
+    if let Err(e) = meta.set_session_status(session_id, new_status).await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            ?new_status,
+            "reconcile: set_session_status failed; will retry next tick"
+        );
+        return;
+    }
+
+    let now = Utc::now();
+    let status_changed = SessionEvent::StatusChanged {
+        from: prev,
+        to: new_status,
+        at: now,
+    };
+    // Persist + publish via the same idx-allocation pattern as
+    // `AppState::emit`. Done inline (rather than via `AppState`) so
+    // the reconcile pass can be unit-tested without standing up the
+    // full Services struct.
+    let kind = status_changed.kind();
+    match serde_json::to_value(&status_changed) {
+        Ok(payload) => match meta.append_session_event(session_id, kind, payload).await {
+            Ok(idx) => {
+                events.publish(
+                    session_id,
+                    crate::state::IndexedEvent {
+                        idx,
+                        event: status_changed,
+                    },
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     session_id = %session_id,
                     error = %e,
-                    "reconcile: latest_snapshot_for_session failed; treating as not-recoverable"
+                    "reconcile: append_session_event failed; flip recorded but no event emitted"
                 );
-                false
             }
-        };
-
-        let new_status = if recoverable {
-            SessionStatus::Idle
-        } else {
-            SessionStatus::Dead
-        };
-
-        // Cheap idempotency: if the session is already in target
-        // state (or terminal beyond it), skip. Avoids racing with
-        // an operator who manually killed the session between the
-        // strike-out and now.
-        let session = match state.services.meta.get_session(session_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(session_id = %session_id, error = %e, "reconcile: get_session failed; skipping flip");
-                return;
-            }
-        };
-        let prev = session.status;
-        if matches!(
-            prev,
-            SessionStatus::Idle
-                | SessionStatus::Dead
-                | SessionStatus::Completed
-                | SessionStatus::Failed
-        ) {
-            tracing::debug!(
-                session_id = %session_id,
-                ?prev,
-                "reconcile: session already in non-active state; skipping flip"
-            );
-            return;
-        }
-
-        // Clear sandbox_id so coord routing and a future restart's
-        // `repopulate_routing` don't try to talk to the dead sandbox.
-        if let Err(e) = state
-            .services
-            .meta
-            .assign_session_sandbox(session_id, None)
-            .await
-        {
+        },
+        Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
-                "reconcile: clearing sandbox_id failed; continuing with status flip"
+                "reconcile: status-changed event serialize failed; flip recorded but no event emitted"
             );
         }
-
-        if let Err(e) = state
-            .services
-            .meta
-            .set_session_status(session_id, new_status)
-            .await
-        {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                ?new_status,
-                "reconcile: set_session_status failed; will retry next tick"
-            );
-            return;
-        }
-
-        let now = Utc::now();
-        let _ = state
-            .emit(
-                session_id,
-                SessionEvent::StatusChanged {
-                    from: prev,
-                    to: new_status,
-                    at: now,
-                },
-            )
-            .await;
-
-        tracing::info!(
-            session_id = %session_id,
-            host_id = %host_id,
-            from = ?prev,
-            to = ?new_status,
-            recoverable,
-            "ADR 0009 reconcile: flipped session whose sandbox is missing from heartbeat"
-        );
     }
+
+    tracing::info!(
+        session_id = %session_id,
+        host_id = %host_id,
+        from = ?prev,
+        to = ?new_status,
+        recoverable,
+        "ADR 0009 reconcile: flipped session whose sandbox is missing from heartbeat"
+    );
 }
 
 /// Pure strikes-counter update. Extracted from `reconcile_host` so
