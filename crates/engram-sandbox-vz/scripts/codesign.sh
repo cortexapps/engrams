@@ -14,6 +14,14 @@
 # locally-built dev binaries on Apple Silicon; CI runs the same
 # script. Distribution to other machines would need a real signing
 # identity + notarization, which is out of scope.
+#
+# Hot-path optimization: each signed binary gets a sibling
+# `<binary>.signed` marker file containing the combined sha256 of
+# the binary + the entitlements plist at sign time. Re-runs hash
+# the current binary + ENT and short-circuit when the marker
+# matches. Steady-state Tilt rebuilds with no source changes drop
+# from "sign N binaries, ~Ns total" to "shasum N binaries,
+# ~50ms total." Markers live in `target/` (gitignored).
 
 set -euo pipefail
 
@@ -30,36 +38,76 @@ if [ ! -f "$ENT" ]; then
     exit 1
 fi
 
+# Combined sha of one binary + ENT. Used as the marker contents
+# so that any change to either invalidates the cache and forces a
+# re-sign. Stripping paths via awk keeps the value stable across
+# absolute/relative `bin` invocations (Tilt runs us from repo root,
+# but a defensive measure).
+sha_of_pair() {
+    local bin="$1"
+    shasum -a 256 "$bin" "$ENT" | awk '{print $1}'
+}
+
+# Sign `$1` only if its (binary, ENT) sha pair differs from the
+# marker file beside it. Increments `count` only when we actually
+# signed — so the "no binaries found" fail-fast at the bottom of
+# the script still works.
+sign_if_needed() {
+    local bin="$1"
+    local marker="${bin}.signed"
+    local cur
+    cur="$(sha_of_pair "$bin")"
+    if [ -f "$marker" ] && [ "$(cat "$marker")" = "$cur" ]; then
+        # Bytes haven't changed since the last sign and the
+        # entitlements file hasn't either. Trust the existing
+        # signature — codesign --verify would do more work for
+        # the same information.
+        return 0
+    fi
+    echo "codesign $bin"
+    codesign --force --sign - --entitlements "$ENT" "$bin"
+    # Re-compute sha *after* signing — `codesign --force` mutates
+    # the Mach-O's load commands to embed the signature, so the
+    # post-sign hash is what we need to compare against next time.
+    sha_of_pair "$bin" > "$marker"
+    count=$((count + 1))
+}
+
+# `count` here tracks *signed* binaries — `examined` is the total
+# (signed + skipped). Both drive the fail-fast and the summary.
 count=0
+examined=0
 
 # Coordinator binary.
 BIN="target/$PROFILE/engram-coordinator"
 if [ -x "$BIN" ] && [ -f "$BIN" ]; then
-    echo "codesign $BIN"
-    codesign --force --sign - --entitlements "$ENT" "$BIN"
-    count=$((count + 1))
+    sign_if_needed "$BIN"
+    examined=$((examined + 1))
 fi
 
 # Test binaries: target/$PROFILE/deps/engram_sandbox_vz-<16hex>
 # (no extension). We skip .d / .o / .rmeta / etc. by checking the
 # magic bytes via `file`, which is reliable across cargo's varied
-# intermediate file naming.
+# intermediate file naming. Also skip our own `.signed` markers.
 shopt -s nullglob
 for T in target/"$PROFILE"/deps/engram_sandbox_vz-*; do
+    case "$T" in
+        *.signed) continue ;;  # our marker, not a binary
+    esac
     if [ -x "$T" ] && [ -f "$T" ]; then
         case "$(file -b "$T")" in
             "Mach-O 64-bit executable"*)
-                echo "codesign $T"
-                codesign --force --sign - --entitlements "$ENT" "$T"
-                count=$((count + 1))
+                sign_if_needed "$T"
+                examined=$((examined + 1))
                 ;;
         esac
     fi
 done
 
-if [ "$count" -eq 0 ]; then
+if [ "$examined" -eq 0 ]; then
     echo "codesign.sh: no binaries found under target/$PROFILE/ — was --tests forgotten?" >&2
     exit 1
 fi
 
-echo "codesign.sh: signed $count binary/binaries with $ENT"
+skipped=$((examined - count))
+echo "codesign.sh: signed $count, skipped $skipped (already up-to-date)"
