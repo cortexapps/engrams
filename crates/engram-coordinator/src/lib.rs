@@ -162,6 +162,29 @@ pub async fn run_with_registry(
     // Caller-driven recovery via `POST /sessions/:id/resume`.
     let _preemption_drain = preemption_drain::spawn(state.clone());
 
+    // ADR 0009 §1-§3: in-process reconcile driver. In `--mode=all`
+    // (single-process coord+host) and `--mode=host` test fixtures
+    // there's no WS heartbeat path — the reconcile hook in
+    // `api/hosts.rs::handle_connection` only fires for hosts that
+    // dialed `/api/hosts/connect`. Without this background task the
+    // in-proc host's stuck-sandbox sessions would sit `active`
+    // forever (the exact bug ADR 0009 is meant to close).
+    //
+    // In `--mode=coordinator` the WS path already drives reconcile
+    // for every connected host, and `host_registry.host_ids()` is
+    // empty at startup (hosts dial in later, each WS connection
+    // calls reconcile directly), so this task is harmless even when
+    // it runs — but we skip it in coordinator-only mode to keep the
+    // wire path the single source of truth.
+    let _reconcile_driver = if matches!(state.cfg.mode, crate::config::RunMode::All) {
+        Some(reconcile::spawn_in_proc(
+            state.clone(),
+            reconcile::DEFAULT_TICK_INTERVAL,
+        ))
+    } else {
+        None
+    };
+
     // ADR 0007: cold-tier flush + disk-pressure detector retired in
     // Phase 7. Durability now flows through the chunk store: chunks
     // are durable in BlobStorage at snapshot time, the chunk-store

@@ -159,6 +159,15 @@ impl HostRegistry {
         self.hosts.len()
     }
 
+    /// Backend `Arc` for `host_id`, or `None` if not registered. Used
+    /// by the ADR 0009 in-process reconcile driver (`reconcile::spawn_in_proc`)
+    /// to call `backend.list()` on each tick. Cloning the trait
+    /// object is cheap (Arc bump) so callers don't have to hold the
+    /// registry's internal entry across `await` points.
+    pub fn backend_of(&self, host_id: HostId) -> Option<Arc<dyn SandboxBackend>> {
+        self.hosts.get(&host_id).map(|e| e.value().backend.clone())
+    }
+
     pub fn host_ids(&self) -> Vec<HostId> {
         self.hosts.iter().map(|e| *e.key()).collect()
     }

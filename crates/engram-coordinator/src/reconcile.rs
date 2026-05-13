@@ -23,12 +23,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::SessionStatus;
 use engram_core::{HostId, SandboxId, SessionId};
 use parking_lot::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::state::{SessionEvent, SessionEventBus, SharedState};
 
@@ -253,6 +255,65 @@ async fn flip_missing(
         recoverable,
         "ADR 0009 reconcile: flipped session whose sandbox is missing from heartbeat"
     );
+}
+
+/// Default cadence for the in-process reconciliation driver
+/// (`spawn_in_proc`). Matches the heartbeat interval — both paths
+/// run reconcile every 5 s.
+pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn the in-process reconciliation driver. Required in
+/// `--mode=all` (single-process coord + host) where there's no WS
+/// path delivering `NotifyKind::Heartbeat` — the WS-handler reconcile
+/// hook (`api/hosts.rs`) never fires, and without this driver the
+/// pass would never run. In `--mode=coordinator` the WS handler
+/// already drives reconcile for each remote host; this driver is
+/// redundant there and the spawn site should skip it.
+///
+/// Walks every host in the registry on each tick, calls
+/// `backend.list()`, and feeds the result through the shared
+/// `Reconciler`. Errors during `list()` are logged and absorbed by
+/// the strike-counter grace window (the host's sandboxes drop to an
+/// empty set for one tick; next tick recovers).
+pub fn spawn_in_proc(state: SharedState, tick: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tick);
+        // Skip the immediate-fire first tick so a coord that's just
+        // bound the local backend doesn't insta-strike a session
+        // whose create() is mid-flight.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let host_ids = state.host_registry.host_ids();
+            for host_id in host_ids {
+                let Some(backend) = state.host_registry.backend_of(host_id) else {
+                    continue;
+                };
+                let running = match backend.list().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            error = %e,
+                            "in-proc reconcile: backend.list() failed; reporting empty (strike grace absorbs)"
+                        );
+                        Vec::new()
+                    }
+                };
+                let flipped = state
+                    .reconciler
+                    .reconcile_host(&state, host_id, &running)
+                    .await;
+                if !flipped.is_empty() {
+                    tracing::info!(
+                        host_id = %host_id,
+                        count = flipped.len(),
+                        "in-proc reconcile flipped missing-sandbox sessions"
+                    );
+                }
+            }
+        }
+    })
 }
 
 /// Pure strikes-counter update. Extracted from `reconcile_host` so
