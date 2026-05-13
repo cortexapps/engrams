@@ -141,6 +141,31 @@ impl ChunkCache {
         }
     }
 
+    /// Return a new `ChunkCache` that shares this one's on-disk
+    /// root + budget but routes misses through `store` instead.
+    /// Used by ADR 0008 Phase 5 callers that need to temporarily
+    /// rebind the cache against an upgraded (tiered) ChunkStore
+    /// — the per-session chunked-OCI fault path can't go through
+    /// the global cache's pinned-at-startup `ChunkStore` because
+    /// that one lacks the `OciChunkResolver` tier.
+    ///
+    /// Note that `inflight` / `pinned` state is **not** shared
+    /// across rebindings — singleflight is per-instance. For
+    /// per-session use this is the correct semantic (different
+    /// sessions don't need to coalesce fetches). The on-disk LRU
+    /// pool IS shared via the same root path: a chunk written to
+    /// disk by one rebinding is visible to all others.
+    pub fn with_store(&self, store: ChunkStore) -> Self {
+        Self {
+            inner: Arc::new(CacheInner {
+                config: self.inner.config.clone(),
+                store,
+                inflight: Mutex::new(std::collections::HashMap::new()),
+                pinned: Mutex::new(HashSet::new()),
+            }),
+        }
+    }
+
     fn path_for(&self, hash: ChunkHash) -> PathBuf {
         let hex = hash.to_hex();
         self.inner.config.root.join(&hex[..2]).join(&hex[2..])

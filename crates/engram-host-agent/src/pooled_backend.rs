@@ -330,9 +330,23 @@ impl PooledBackend {
             "rootfs branch: materialize-to-file",
         );
 
+        // ADR 0008 Phase 5: when the chunk_store was upgraded with
+        // a tiered resolver, the global `ChunkCache` (constructed
+        // at startup with the un-upgraded store) is now stale —
+        // its miss-path would route through the wrong store and
+        // bypass the OCI fallback, producing exactly the
+        // `materialize ... blob not found` we'd hit otherwise.
+        // Rebind to a per-call cache wrapping `effective_store`.
+        // The on-disk LRU pool stays shared via the same root path;
+        // only singleflight + pinned state are per-instance.
+        let effective_cache = self
+            .chunk_cache
+            .as_ref()
+            .map(|c| c.with_store(effective_store.clone()));
+
         let path = materialize_chunked_rootfs(
             &effective_store,
-            self.chunk_cache.as_ref(),
+            effective_cache.as_ref(),
             materialize_dir,
             uri,
             bundle,

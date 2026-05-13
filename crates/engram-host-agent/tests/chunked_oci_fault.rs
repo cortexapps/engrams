@@ -386,6 +386,139 @@ async fn tiered_resolver_fails_loudly_when_chunk_missing_from_all_tiers() {
     );
 }
 
+/// Reproduces the *second* layer of the cross-namespace bug:
+/// `ChunkCache::get` routes misses through its **own** internal
+/// ChunkStore reference (the one pinned at cache construction
+/// time), not through whatever store the caller passes to
+/// `materialize_to_file_cached`. When the global cache was wired
+/// at startup with a non-tiered store, the upgraded-tiered store
+/// passed to materialize gets silently bypassed and chunks
+/// resolve via BlobStorage only → "blob not found" on empty
+/// BlobStorage namespaces. `ChunkCache::with_store` is the fix:
+/// rebind the cache to the tiered store before materialize.
+#[tokio::test]
+async fn chunk_cache_rebound_to_tiered_store_faults_through_oci() {
+    use engram_chunk_store::{
+        cache::ChunkCacheConfig, ChunkCache, ChunkRef as CsChunkRef, ChunkSize, Manifest,
+        ManifestKind, ManifestRef,
+    };
+
+    // Real registry serving a chunk blob; empty BlobStorage.
+    let bodies: [&[u8]; 2] = [b"DELTA___", b"EPSILON_"];
+    let mut concat = Vec::new();
+    let mut hashes = Vec::new();
+    for b in &bodies {
+        concat.extend_from_slice(b);
+        hashes.push(ChunkHash::of(b));
+    }
+    let blob_digest = format!(
+        "sha256:{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(&concat)
+    );
+    let mut blobs = HashMap::new();
+    blobs.insert(blob_digest.clone(), Bytes::from(concat));
+    let (addr, registry, _shutdown) = spawn_fake_registry(blobs).await;
+    let image_uri = format!("127.0.0.1:{}/cached:v1", addr.port());
+
+    let (blob, _blob_dir) = fresh_blob_storage();
+    let base_store = ChunkStore::new(blob.clone());
+
+    // Pre-stash the manifest in the runtime blob (simulates what
+    // ensure_chunked_manifest_in_blob_storage does upstream).
+    let manifest_ref = ManifestRef::new();
+    let manifest = Manifest {
+        schema_version: 1,
+        kind: ManifestKind::Disk,
+        total_bytes: 16,
+        chunk_size: ChunkSize::bytes(8),
+        chunks: vec![
+            CsChunkRef {
+                offset: 0,
+                hash: hashes[0],
+            },
+            CsChunkRef {
+                offset: 8,
+                hash: hashes[1],
+            },
+        ],
+        parent: None,
+        working_set_trace: None,
+        annotations: serde_json::Value::Null,
+    };
+    base_store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .unwrap();
+
+    // Build the tiered store (what upgrade_chunk_store_for_chunked_oci
+    // produces in production).
+    let mut index = OciChunkIndex::new();
+    for (i, h) in hashes.iter().enumerate() {
+        index.insert(
+            *h,
+            OciBlobLocator {
+                blob_digest: blob_digest.clone(),
+                offset: (i * 8) as u64,
+                length: 8,
+            },
+        );
+    }
+    let oci_client = OciClient::new(Arc::new(AnonymousResolver));
+    let oci_resolver: Arc<dyn ChunkResolver> =
+        Arc::new(OciChunkResolver::new(oci_client, image_uri.clone(), index));
+    let cache_resolver: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(blob.clone()));
+    let tiered: Arc<dyn ChunkResolver> = Arc::new(TieredChunkResolver::new(
+        vec![cache_resolver, oci_resolver],
+        Some(blob.clone()),
+    ));
+    let tiered_store = base_store.with_resolver(tiered);
+
+    // The bug shape: a `ChunkCache` constructed at startup against
+    // the un-upgraded `base_store`. Without `with_store`, its
+    // miss-path would 404.
+    let cache_dir = tempfile::tempdir().unwrap();
+    let stale_cache = ChunkCache::new(
+        ChunkCacheConfig {
+            root: cache_dir.path().to_path_buf(),
+            budget_bytes: 100 * 1024 * 1024,
+        },
+        ChunkStore::new(blob.clone()), // un-upgraded
+    );
+
+    // The fix: rebind the cache to the tiered store.
+    let rebound_cache = stale_cache.with_store(tiered_store.clone());
+
+    // materialize_to_file_cached now routes chunk misses through
+    // tiered_store → BlobStorage (miss) → OCI (hit) → tee-fill.
+    let dest = tempfile::NamedTempFile::new().unwrap();
+    tiered_store
+        .materialize_to_file_cached(&manifest, dest.path(), &rebound_cache)
+        .await
+        .expect("materialize through rebound cache + tiered store");
+
+    // Bytes are correct (rebuilt from the bootstrap entries).
+    let got = std::fs::read(dest.path()).unwrap();
+    let mut expected = vec![0u8; 16];
+    expected[0..8].copy_from_slice(b"DELTA___");
+    expected[8..16].copy_from_slice(b"EPSILON_");
+    assert_eq!(got, expected);
+
+    // OCI was consulted (2 chunks, 2 fetches).
+    assert_eq!(
+        registry.fetches.load(Ordering::Relaxed),
+        2,
+        "rebound cache must drive misses through tiered → OCI"
+    );
+
+    // BlobStorage was tee-filled by the tiered resolver.
+    for h in &hashes {
+        assert!(
+            blob.exists(&h.storage_key()).await.unwrap(),
+            "chunk should be tee-filled into BlobStorage on tiered hit"
+        );
+    }
+}
+
 /// Reproduces the cross-namespace bricked-image bug:
 /// `materialize_chunked_rootfs` calls `chunk_store.get_manifest`
 /// which reads straight from BlobStorage, not through the
