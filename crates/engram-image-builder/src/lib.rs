@@ -262,6 +262,17 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 # case the gateway resolver is unreachable (e.g. on Linux/FC where
 # the bridge isn't VZ NAT). Writing both is safe — glibc tries them
 # in order. Skip if /etc/resolv.conf already exists (operator override).
+#
+# FIXME(dns-exfil): the egress proxy enforces `manifest.network.
+# allow_hosts` for outbound *connections*, but DNS itself goes
+# straight to 1.1.1.1. A malicious harness can encode data into
+# subdomains of an attacker-controlled name and exfiltrate via DNS
+# queries even when the proxy blocks every TCP connection. Fix:
+# host the egress proxy on udp/53 as well, iptables-REDIRECT
+# guest→udp/53 there, and have it answer only for names in
+# `allow_hosts` (NXDOMAIN otherwise). For FC, that lets us also
+# drop the `ACCEPT VM→1.1.1.1 udp/53` rule. Until that lands, the
+# DNS path is an unfiltered side channel.
 mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
