@@ -107,7 +107,47 @@ WS via `NotifyKind::SessionEgressPolicy`, applied to the local
 proxy registry before the harness starts. Broker mode now works
 end-to-end. See [ADR 0006](./adr/0006-host-agent-egress-proxy.md).
 
-## 7. Idle auto-eviction doesn't fire in `--mode=coordinator`
+## 7. Active sessions can stick forever after a coord/host restart (ADR 0009 proposed)
+
+**Status: known gap; design captured in ADR 0009, implementation pending.**
+
+When a coord restart (in `--mode=all`) or a host-agent process
+restart wipes the in-memory `SandboxBackend` map but the
+Postgres `sessions` rows still point at the now-orphaned
+sandbox_ids, today's dead-host detector + idle evictor don't
+fire on those sessions:
+
+- `dead_host.rs` only flips sessions when the host's
+  heartbeats *stop*; in `--mode=all` the same process owns
+  both, so a restart kills the VMs AND keeps the host alive.
+- `idle_evictor.rs` only walks the harness `connections` map
+  (`harness.rs:360`); `harness: none` sessions are invisible
+  to it, and any session whose harness disconnected before
+  the restart is dropped from that map.
+- `repopulate_routing` reads `sessions.sandbox_id` from
+  Postgres but **never intersects against the host's actual
+  `backend.list()`** — phantom routing persists forever.
+
+Observed: four sessions (`21815fbc`, `bcf2917d`, `689278fe`,
+`d08707e8`) sit `Active` pointing at sandbox_ids that no
+longer exist anywhere after a `--mode=all` redeploy. Today
+the only cleanup path is manual `psql` / API delete.
+
+**Fix**: ADR 0009 ships a periodic reconciliation primitive
+that rides the existing 5 s heartbeat. The host adds
+`running_sandboxes: Vec<SandboxId>` from `backend.list()`;
+the coord intersects against expected-active rows and flips
+missing sessions to `Idle` (if `snapshots.recoverable`) or
+`Dead` (otherwise) within ~20 s. The ADR also covers the
+production host-agent redeploy case (case C — FC processes
+survive code redeploys via on-disk manifests + pidfd
+reattach) and graceful host reboot (case C' — SIGTERM-time
+NVMe checkpoint, restored from local on startup).
+
+Retire this entry when Phase 3 of the rollout
+(`docs/state-reconciliation-rollout.md`) lands.
+
+## 8. Idle auto-eviction doesn't fire in `--mode=coordinator`
 
 **Files**: `crates/engram-coordinator/src/idle_evictor.rs`,
 `crates/engram-host-agent/src/harness.rs`.
@@ -134,7 +174,7 @@ The coordinator's `evict_idle_session` pipeline function is
 already split out and can stay where it is — only the driver
 moves.
 
-## 8. No system-wide event stream on the coordinator
+## 9. No system-wide event stream on the coordinator
 
 The dashboard's Overview page only polls `GET /sessions` and
 `GET /api/hosts` at 1Hz — no SSE. Live event streaming is reserved
@@ -151,7 +191,7 @@ broadcast buses into one SSE feed. That'd let a dashboard show
 real-time activity across the whole system over a single connection.
 Out of scope until there's a concrete need.
 
-## 9. ~~NBD disk adapter for Firecracker not implemented~~
+## 10. ~~NBD disk adapter for Firecracker not implemented~~
 
 **Resolved**: Phase 4 NBD daemon shipped (commits `55dd889`,
 `c770b6f`, `645afd8`, `e4f7500`, `94e9a52`). Host-agent's
@@ -163,7 +203,7 @@ Linux-gated CI test at
 `crates/engram-host-agent/tests/nbd_chunked_disk.rs` boots a
 real microVM against `/dev/nbd0` served by the daemon.
 
-## 10. ~~UFFD-from-chunks for memory not implemented~~
+## 11. ~~UFFD-from-chunks for memory not implemented~~
 
 **Resolved**: Phase 5 UFFD-from-chunks + canonical-base
 MAP_PRIVATE + working-set record-and-replay shipped. Image-
@@ -177,7 +217,7 @@ restores. `FirecrackerBackend::{snapshot,restore}` thread
 PooledBackend materializes `memory.bin` from chunks on
 cross-host restore when not present locally.
 
-## 11. ~~`snapshots` table still carries cold-tier columns~~
+## 12. ~~`snapshots` table still carries cold-tier columns~~
 
 **Resolved**: Phase 7 (ADR 0007) shipped. Migration `0020_drop_cold_tier.sql`
 dropped the cold-tier columns (`local_path`, `blob_present`,
@@ -188,7 +228,7 @@ dropped the cold-tier columns (`local_path`, `blob_present`,
 deleted. `SealedBlobRef` deleted from `engram-core::traits`. The
 chunked manifest refs are the single durability primitive.
 
-## 12. No metrics on the chunked-storage code paths
+## 13. No metrics on the chunked-storage code paths
 
 Zero observability on the new pieces: cache hit rate, chunk
 fetch latency, materialize time, GC counts, manifest puts/gets.
@@ -206,7 +246,7 @@ without an exporter.
 
 **Tracked**: `docs/chunked-storage-rollout.md` Tier 4 #7.
 
-## 13. ~~Materialized-rootfs files leak between manifest updates~~
+## 14. ~~Materialized-rootfs files leak between manifest updates~~
 
 **Resolved**: `engram_host_agent::orphan_reap::reap_materialize_dir`
 shipped as both a library primitive and a `POST /api/admin/reap-materialize-dir`
@@ -219,7 +259,7 @@ host fanout shipped via WS-RPC in commit `2971115` (WIRE v3 /
 the admin endpoint walks every connected host and aggregates per-
 host outcomes.
 
-## 14. Wire compatibility is enforced at hello but bincode-positional
+## 15. Wire compatibility is enforced at hello but bincode-positional
 
 `engram-protocol::WIRE_VERSION` (v4 today) + the hello-frame
 handshake reject coord/host-agent version mismatches loudly.
@@ -240,7 +280,7 @@ that must bump WIRE_VERSION. Future contributors editing
 `engram-protocol::wire` should bump the version and add a
 history note alongside any structural change.
 
-## 15. ~~Cross-namespace bricked images: chunks live in BlobStorage, OCI artifact is just metadata~~ (FIXED, ADR 0008)
+## 16. ~~Cross-namespace bricked images: chunks live in BlobStorage, OCI artifact is just metadata~~ (FIXED, ADR 0008)
 
 **Resolved.** ADR 0007's chunked-storage push (the `d79094f`
 "skip the rootfs.ext4 layer when bundle.json is present"
@@ -275,3 +315,38 @@ See `docs/adr/0008-chunks-in-oci.md` for the full
 architectural picture and the five-phase rollout
 (`b04834b → 7279232 → 77d53f9 → fb719dd → 4cdbebd → d711697
 → 73ab684 → fc9437c → a2b7bdd`).
+
+## 17. Ephemeral-host preemption loses active sessions (future preemption-drain ADR)
+
+**Status: known gap; sketched in ADR 0009's "What this ADR does NOT cover."**
+
+When the host itself goes away — GCE Spot preemption, autoscale-down,
+hardware death, kernel panic — local NVMe disappears with it. ADR
+0009's SIGTERM checkpoint writes to NVMe, so it doesn't help here.
+The only existing recovery path is the BlobStorage cold-tier
+(ADR 0005), which requires a snapshot to have happened recently
+enough.
+
+The current `preemption_drain.rs` admits this directly:
+
+> "Important: this does NOT take a snapshot. Preemption is
+> seconds-budget; FC memory snapshots are GB-scale and die with
+> the host anyway."
+
+That comment is now stale — the chunked-memory architecture (ADR
+0007) makes a preemption-time snapshot newly feasible:
+
+- 4 GiB VM × ~100 MiB dirty since last snapshot = ~200 chunks
+- BlobStorage upload at ~10 ms / chunk = ~2 s wall-clock
+- Fits comfortably in the 25 s GCE Spot preemption window even
+  for loaded hosts (parallelize across sandboxes).
+
+**Fix**: a future preemption-drain ADR rewrites the handler to
+take a chunked snapshot and upload to BlobStorage before destroy.
+The session then transitions to `Idle` (recoverable via cold-tier
+on a different host) rather than `Dead`. Forks naturally onto the
+cross-host migration story ADR 0005 deferred. Out of scope for
+ADR 0009 because the SIGTERM path that ADR 0009 ships goes to
+NVMe (faster, simpler, fits the redeploy use case). Ephemeral-
+host preemption is a strictly bigger problem with a different
+performance contour and deserves its own ADR.
