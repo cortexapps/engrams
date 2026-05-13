@@ -266,6 +266,7 @@ async fn checkpoint_one(
         };
     manifest.last_local_snapshot = Some(
         engram_sandbox_firecracker::sandbox_manifest::LocalSnapshotRef {
+            snapshot_id: Some(metadata.id),
             disk_manifest_id: metadata
                 .disk_manifest
                 .as_ref()

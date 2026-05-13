@@ -142,17 +142,45 @@ pub async fn reattach_pass(
                     pid: manifest.firecracker.process.pid,
                 });
             }
-            Err(e) => {
-                let reason = format!("{e}");
-                tracing::warn!(
+            Err(path1_err) => {
+                let reason = format!("{path1_err}");
+                tracing::info!(
                     sandbox_id = %sandbox_id_str,
                     error = %reason,
-                    "reattach pass: path 1 failed; deleting manifest + falling through (path 2 / orphan-reap)"
+                    "reattach pass: path 1 failed; trying path 2 (NVMe local-snapshot restore)"
                 );
-                // Phase 8 will check `manifest.last_local_snapshot`
-                // here for path-2 restore. For now, drop the
-                // manifest so a future startup doesn't repeatedly
-                // try to reattach a stale entry.
+                // ADR 0009 Phase 8 path 2: when path 1 fails AND
+                // the manifest carries a SIGTERM checkpoint
+                // reference, re-spawn FC from the local snapshot
+                // preserving the original sandbox_id. The coord's
+                // routing then continues working without flipping
+                // the session.
+                match try_path2_restore(backend, &manifest).await {
+                    Some(Ok(())) => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id_str,
+                            "reattach pass: path 2 success (NVMe local-snapshot restore)"
+                        );
+                        report.reattached.push(ReattachOutcome::Reattached {
+                            sandbox_id: sandbox_id_str,
+                            pid: 0,
+                        });
+                        continue;
+                    }
+                    Some(Err(path2_err)) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id_str,
+                            error = %path2_err,
+                            "reattach pass: path 2 failed; falling through to orphan-reap"
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            sandbox_id = %sandbox_id_str,
+                            "reattach pass: no last_local_snapshot in manifest; path 2 not applicable"
+                        );
+                    }
+                }
                 engram_sandbox_firecracker::sandbox_manifest::delete_manifest(&manifest_path);
                 report.orphaned.push(ReattachOutcome::Orphaned {
                     sandbox_id: sandbox_id_str,
@@ -164,6 +192,24 @@ pub async fn reattach_pass(
     }
 
     Ok(report)
+}
+
+/// ADR 0009 Phase 8: path 2 NVMe restore. Returns `Some(Ok)` on
+/// successful restore, `Some(Err)` on failure (FC restore errored
+/// out — caller falls through to orphan), `None` when the manifest
+/// has no `last_local_snapshot` (no SIGTERM checkpoint was taken;
+/// path 2 isn't applicable — caller orphans).
+async fn try_path2_restore(
+    backend: &Arc<engram_sandbox_firecracker::FirecrackerBackend>,
+    manifest: &engram_sandbox_firecracker::sandbox_manifest::SandboxManifest,
+) -> Option<Result<(), engram_core::SandboxError>> {
+    let local = manifest.last_local_snapshot.as_ref()?;
+    let snapshot_id = local.snapshot_id?;
+    Some(
+        backend
+            .restore_as_sandbox_id(manifest.sandbox_id, snapshot_id)
+            .await,
+    )
 }
 
 /// Trait-level entry point that takes any `SandboxBackend` and

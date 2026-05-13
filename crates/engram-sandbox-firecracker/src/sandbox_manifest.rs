@@ -113,11 +113,19 @@ pub struct NetworkRecord {
 }
 
 /// Phase 8: reference to a SIGTERM-time local-NVMe snapshot for
-/// this sandbox. Path 2 of the reattach uses these manifest IDs
-/// (plus `chunk_store.has_all_chunks`) to decide whether NVMe
-/// restore is viable before spawning the restore pipeline.
+/// this sandbox. Path 2 of the reattach uses `snapshot_id` to
+/// locate `<work_dir>/snapshots/<snapshot_id>/` on disk (the FC
+/// state + memory + manifest.json the snapshot pipeline wrote)
+/// and calls `FirecrackerBackend::restore_as_sandbox_id` to
+/// re-spawn FC under the ORIGINAL sandbox_id (preserving coord
+/// routing). The chunk-manifest refs are diagnostic + future
+/// has-all-chunks check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalSnapshotRef {
+    /// SnapshotId of the just-taken local checkpoint. Path 2 uses
+    /// this to find `<work_dir>/snapshots/<snapshot_id>/`.
+    #[serde(default)]
+    pub snapshot_id: Option<engram_core::SnapshotId>,
     pub disk_manifest_id: uuid::Uuid,
     pub disk_manifest_version: u64,
     pub memory_manifest_id: Option<uuid::Uuid>,
