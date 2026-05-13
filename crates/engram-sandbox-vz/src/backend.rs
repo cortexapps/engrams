@@ -97,6 +97,33 @@ struct VzSandboxState {
     guest_ip: Mutex<Option<String>>,
 }
 
+// ADR 0009 §4 (host-side VM supervision) is FC-only by design. The
+// rationale for skipping VZ here:
+//
+//   - VZ VMs run **in-process** as `VZVirtualMachine` ObjC objects
+//     hosted by Apple's `Virtualization.framework`. There is no
+//     separate VM process whose pid we could poll the way the FC
+//     backend does. The VM's lifecycle is the `VzVm` Rust struct's
+//     Drop lifecycle.
+//   - The way a VZ VM dies "out from under" the host-agent is via
+//     internal state transitions surfaced through
+//     `VZVirtualMachineDelegate` callbacks
+//     (`virtualMachine:didStopWithError:` etc.). Wiring those
+//     properly requires creating an ObjC class that conforms to the
+//     delegate protocol and threading it through
+//     `objc2-virtualization` — significantly more work than the
+//     FC poll-based supervisor, and VZ is dev-only.
+//   - The bug case §4 is meant to catch (host-agent alive, VM dies
+//     unexpectedly) is significantly rarer for VZ. In dev the user
+//     restarting `just dev` kills the host-agent and the VM
+//     together; in that scenario reconcile's clean-slate startup
+//     path handles things correctly via the empty `running_sandboxes`
+//     heartbeat.
+//
+// If/when VZ VM crash detection becomes important (i.e. a sandbox
+// goes wedged-but-not-killed and we want eager pruning), the right
+// path is a `VZVirtualMachineDelegate` shim. Tracked in
+// `docs/state-reconciliation-rollout.md` as a future enhancement.
 pub struct VzBackend {
     work_dir: PathBuf,
     cfg: VzConfig,

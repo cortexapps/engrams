@@ -1184,6 +1184,7 @@ dependencies = [
  "engram-image-builder",
  "engram-storage-local",
  "futures",
+ "libc",
  "parking_lot",
  "rcgen",
  "rustls",

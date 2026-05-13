@@ -6,8 +6,14 @@ license.workspace = true
 repository.workspace = true
 description = "Production SandboxBackend driving Firecracker microVMs over its HTTP-over-Unix-socket API."
 
-[lints]
-workspace = true
+# ADR 0009 §4: `spawn_process_supervisor` calls `libc::kill(pid, 0)` to
+# poll FC process liveness. The libc syscall is `unsafe` by signature
+# (FFI), but the call itself with `sig=0` is provably safe — it inspects
+# but doesn't mutate. We loosen `unsafe_code` from the workspace's
+# `forbid` to `allow` here so the single supervisor block compiles;
+# every unsafe block carries a `// SAFETY:` comment explaining why.
+[lints.rust]
+unsafe_code = "allow"
 
 [dependencies]
 engram-core.workspace = true
@@ -17,6 +23,7 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
+libc = "0.2"
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

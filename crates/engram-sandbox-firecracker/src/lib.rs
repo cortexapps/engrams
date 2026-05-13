@@ -346,7 +346,12 @@ struct FcNetSnapshot {
 pub struct FirecrackerBackend {
     work_dir: PathBuf,
     config: FirecrackerConfig,
-    sandboxes: DashMap<SandboxId, LiveSandbox>,
+    /// `Arc<DashMap>` (rather than a bare `DashMap`) so the per-VM
+    /// supervisor task (ADR 0009 §4, `spawn_process_supervisor`) can
+    /// hold an independent reference and prune the entry on
+    /// unexpected exit. The Arc-overhead is one pointer per access
+    /// — negligible against the cost of any sandbox operation.
+    sandboxes: Arc<DashMap<SandboxId, LiveSandbox>>,
     /// Monotonic CID allocator. Each `create` bumps this. We don't
     /// reuse CIDs of destroyed VMs — a u32 gives us 4 billion before
     /// wrap, which is fine for any single host's lifetime.
@@ -387,7 +392,7 @@ impl FirecrackerBackend {
         Self {
             work_dir,
             config,
-            sandboxes: DashMap::new(),
+            sandboxes: Arc::new(DashMap::new()),
             next_cid: AtomicU32::new(FIRST_GUEST_CID),
             net_allocator,
             harness_sink: Arc::new(parking_lot::RwLock::new(None)),
@@ -841,6 +846,12 @@ impl FirecrackerBackend {
             vsock_cid,
             vsock_uds_path,
         };
+        // ADR 0009 §4: spawn a supervisor that watches for unexpected
+        // FC process exit (kernel OOM, segfault, manual kill) and
+        // prunes the entry from `sandboxes`. Without this,
+        // `backend.list()` would keep reporting a phantom sandbox
+        // whose underlying VM is dead, defeating reconcile.
+        let fc_pid = child.id();
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
@@ -851,6 +862,14 @@ impl FirecrackerBackend {
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
+        if let Some(pid) = fc_pid {
+            spawn_process_supervisor(self.sandboxes.clone(), sandbox_id, pid, "firecracker");
+        } else {
+            tracing::warn!(
+                %sandbox_id,
+                "firecracker Child has no pid (already exited?); supervisor not started"
+            );
+        }
         tracing::info!(%sandbox_id, jail = %jail_dir.display(), "firecracker microVM started");
         Ok(())
     }
@@ -1064,6 +1083,12 @@ impl FirecrackerBackend {
             vsock_cid,
             vsock_uds_path,
         };
+        // ADR 0009 §4: supervisor watches restored FC + (optional)
+        // UFFD handler. The UFFD handler is critical — if it dies
+        // mid-restore the FC process page-faults forever; we want
+        // the entry pruned so reconcile transitions the session.
+        let fc_pid = child.id();
+        let uffd_pid = uffd_handler.as_ref().and_then(|c| c.id());
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
@@ -1074,6 +1099,12 @@ impl FirecrackerBackend {
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
+        if let Some(pid) = fc_pid {
+            spawn_process_supervisor(self.sandboxes.clone(), sandbox_id, pid, "firecracker");
+        }
+        if let Some(pid) = uffd_pid {
+            spawn_process_supervisor(self.sandboxes.clone(), sandbox_id, pid, "uffd-handler");
+        }
         tracing::info!(
             %sandbox_id,
             jail = %jail_dir.display(),
@@ -1138,6 +1169,94 @@ impl FirecrackerBackend {
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// ADR 0009 §4: per-VM process supervisor. Spawned at create/restore
+/// time for each FC process (and the UFFD handler when present). Polls
+/// `kill(pid, 0)` every 1s; when the pid disappears (`ESRCH`), prunes
+/// the sandbox from the host's in-memory map so `backend.list()` no
+/// longer reports a phantom. The reconcile pass (ADR 0009 §1-§3)
+/// then catches the absence on the next heartbeat tick and flips the
+/// owning session per the §3 policy.
+///
+/// Polling vs `child.wait()`: `wait()` requires `&mut Child`, which
+/// can't be shared with the existing destroy path. Polling is simpler
+/// and has acceptable latency (1s detection + 15s reconcile grace =
+/// ~16s session-loss visibility, vs minutes-to-forever today).
+///
+/// Polling vs pidfd_open: pidfd is more accurate (immune to PID
+/// recycling) but requires Linux 5.3+. We use pidfd for Phase 6's
+/// reattach across host-agent restart where correctness depends on
+/// it; this supervisor is best-effort and tolerates the edge case
+/// where the OS recycles a PID before we notice (reconcile still
+/// catches eventually).
+///
+/// The watcher pings every 1s instead of every 100ms to keep host
+/// load negligible: with N sandboxes the per-second syscall rate is
+/// N × 1. For a fully-loaded 50-sandbox host that's 50 syscalls/sec
+/// — invisible against the FC API + vsock I/O.
+fn spawn_process_supervisor<V: Send + Sync + 'static>(
+    sandboxes: Arc<DashMap<SandboxId, V>>,
+    sandbox_id: SandboxId,
+    pid: u32,
+    role: &'static str,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // `kill(pid, 0)` is a no-op signal that returns 0 if the
+            // caller has permission to signal a process with that
+            // pid, -1 with ESRCH if the process doesn't exist. Same
+            // uid (we spawned the process) so permission is granted
+            // as long as the pid is live.
+            //
+            // SAFETY: `libc::kill` with `sig=0` is provably safe.
+            // The signature is `unsafe extern "C"` because libc can't
+            // express "this signal value never mutates kernel state,"
+            // but `0` is documented (man 2 kill) as the no-op /
+            // existence-check signal: returns 0 if a process with the
+            // given pid exists AND the caller could signal it,
+            // errno=ESRCH if not. No side effects, no UB.
+            let rc = unsafe { libc::kill(pid as i32, 0) };
+            if rc == 0 {
+                continue;
+            }
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno != libc::ESRCH {
+                // EPERM or some other unexpected error — log and
+                // bail. EPERM here would mean the pid was recycled
+                // to a process we can no longer signal; treat that
+                // as effectively gone.
+                tracing::warn!(
+                    %sandbox_id,
+                    %pid,
+                    role,
+                    errno,
+                    "process supervisor: kill(0) returned non-ESRCH error; treating as gone"
+                );
+            }
+            // Process exited unexpectedly (kernel OOM, segfault,
+            // manual kill, etc.) — destroy() would have removed
+            // the entry already, so this is the "supervisor wins
+            // the race" path.
+            if sandboxes.remove(&sandbox_id).is_some() {
+                tracing::warn!(
+                    %sandbox_id,
+                    %pid,
+                    role,
+                    "host-side VM supervisor (ADR 0009 §4) pruned unexpectedly-dead sandbox"
+                );
+            } else {
+                tracing::debug!(
+                    %sandbox_id,
+                    %pid,
+                    role,
+                    "process supervisor: entry already removed by destroy; no-op"
+                );
+            }
+            return;
+        }
+    });
 }
 
 /// Send the WireExecRequest, spawn the reader task that translates
@@ -1940,5 +2059,77 @@ mod tests {
             Err(SandboxError::NotFound) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// ADR 0009 §4: the supervisor must prune the entry from the
+    /// map when the watched pid disappears. Uses a real subprocess
+    /// (`sleep 600`) so the kill-detection is exercised end-to-end:
+    /// we kill the process, then assert the entry leaves the map
+    /// within the polling latency.
+    #[tokio::test]
+    async fn supervisor_prunes_entry_when_pid_disappears() {
+        let sandboxes: Arc<DashMap<SandboxId, ()>> = Arc::new(DashMap::new());
+        let id = SandboxId::new();
+        sandboxes.insert(id, ());
+
+        // Spawn a real child we can kill. `sleep 600` blocks the
+        // child for 10 minutes; we kill it explicitly below.
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child has pid");
+
+        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep");
+
+        // Initial: supervisor sees the pid alive, doesn't prune.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            sandboxes.contains_key(&id),
+            "supervisor must not prune while pid is alive"
+        );
+
+        // Kill the child. After ~1s the supervisor's next poll
+        // sees ESRCH and prunes.
+        child.kill().await.expect("kill child");
+        // Reap so we don't leak a zombie.
+        let _ = child.wait().await;
+
+        // Wait up to 3s for the supervisor to notice. The poll
+        // interval is 1s + reap latency.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if !sandboxes.contains_key(&id) {
+                return; // success
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("supervisor did not prune within 3s of pid death");
+    }
+
+    /// If the entry is already removed (e.g. destroy() got there
+    /// first) the supervisor's later poll-and-prune is a no-op.
+    /// Belt-and-suspenders against double-remove logic errors.
+    #[tokio::test]
+    async fn supervisor_removal_after_destroy_is_a_noop() {
+        let sandboxes: Arc<DashMap<SandboxId, ()>> = Arc::new(DashMap::new());
+        let id = SandboxId::new();
+        // Don't insert — simulates the entry already being gone.
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child has pid");
+        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep");
+
+        child.kill().await.expect("kill child");
+        let _ = child.wait().await;
+
+        // Wait long enough for the supervisor to have polled at
+        // least twice; the map should remain empty (no panic, no
+        // weird state).
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!sandboxes.contains_key(&id));
     }
 }
