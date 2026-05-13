@@ -23,4 +23,10 @@ description = "Canonical workspace image: debian:bookworm-slim + git + ttyd. Har
 # can run during the agent's workflow if the workspace wants it.
 [network]
 default = "deny"
-allow_hosts = ["registry.npmjs.org", "github.com", "api.github.com"]
+allow_hosts = [
+    "registry.npmjs.org",
+    "github.com",
+    "api.github.com",
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+]

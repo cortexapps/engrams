@@ -594,7 +594,7 @@ async fn main() -> Result<(), CoordinatorError> {
         });
         tracing::info!(
             host_id = %in_proc_host,
-            "registered in-process host (--mode=all bypasses the WS path)",
+            "registered in-process host as LocalHostClient",
         );
     } else {
         tracing::info!(
