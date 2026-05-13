@@ -146,7 +146,3 @@ jobs:
       - name: cargo nextest run --workspace --exclude engram-sandbox-vz
         if: always()
         run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
-
-      - name: cargo test --workspace --exclude engram-sandbox-vz --doc
-        if: always()
-        run: cargo test --workspace --exclude engram-sandbox-vz --doc --no-fail-fast

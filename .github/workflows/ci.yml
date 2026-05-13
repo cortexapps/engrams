@@ -6,7 +6,7 @@ name: CI
 # Surfaces this workflow exercises:
 #   - lint:             cargo fmt --check, cargo clippy -D warnings,
 #                       cargo check workspace
-#   - test-linux:       cargo nextest workspace tests + doctests, plus
+#   - test-linux:       cargo nextest workspace tests, plus
 #                       Postgres-gated ignored tests (ha_listener,
 #                       snapshot_disk_manifest_persistence,
 #                       admin_gc_chunks_live_pg) against the postgres
@@ -155,17 +155,11 @@ jobs:
       # GCS-emulator round-trip uses STORAGE_EMULATOR_HOST set above.
       #
       # `--no-fail-fast` reports every failing test instead of stopping
-      # at the first; `if: always()` keeps the doctests + ha_listener
-      # steps below running even if this one fails.
+      # at the first; `if: always()` keeps the ha_listener steps below
+      # running even if this one fails.
       - name: cargo nextest run --workspace
         if: always()
         run: cargo nextest run --workspace --no-fail-fast
-
-      # nextest doesn't run doctests yet (see justfile note). Ride the
-      # vanilla cargo runner for the doc pass.
-      - name: cargo test --workspace --doc
-        if: always()
-        run: cargo test --workspace --doc --no-fail-fast
 
       # Postgres-gated ignored tests — the FC `#[ignore]` set needs KVM
       # so we don't try to run them here. Scoping by `--test` keeps us

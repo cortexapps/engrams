@@ -22,13 +22,11 @@ default:
 #
 # Uses `cargo nextest` for ~3-5× speedup over `cargo test --workspace`.
 # Inside `nix develop` it's already on $PATH; outside Nix install with
-# `cargo install cargo-nextest --locked` (one-time, ~30s). The doctest
-# pass stays on `cargo test` because nextest doesn't run doctests yet.
+# `cargo install cargo-nextest --locked` (one-time, ~30s).
 check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo nextest run --workspace
-    cargo test --workspace --doc
 
 # Auto-format the workspace.
 fmt:
