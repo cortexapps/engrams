@@ -93,6 +93,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
 pub mod net;
+pub mod sandbox_manifest;
 
 pub use client::{
     ActionType, BootSource, DriveConfig, FirecrackerClient, MachineConfig, NetworkInterface,
@@ -852,6 +853,53 @@ impl FirecrackerBackend {
         // `backend.list()` would keep reporting a phantom sandbox
         // whose underlying VM is dead, defeating reconcile.
         let fc_pid = child.id();
+
+        // ADR 0009 §5: write the per-sandbox on-disk manifest before
+        // we hand control back to the caller. The Phase 6 reattach
+        // pass reads this on host-agent startup to decide whether to
+        // pidfd-attach (path 1) the still-live FC process. Manifest
+        // write failure is degrading-but-not-fatal: the supervisor
+        // (§4) still works, and a host-agent restart loses the
+        // ability to reattach this specific sandbox (treated as a
+        // missing-sandbox by reconcile, flips per the §3 policy).
+        if let Some(pid) = fc_pid {
+            let m = sandbox_manifest::SandboxManifest {
+                schema_version: sandbox_manifest::SCHEMA_VERSION,
+                sandbox_id,
+                backend: sandbox_manifest::BACKEND_FIRECRACKER.to_string(),
+                spec: state.spec.clone(),
+                firecracker: sandbox_manifest::FirecrackerProcessRecord {
+                    process: sandbox_manifest::ProcessRecord {
+                        pid,
+                        start_time_jiffies: sandbox_manifest::read_proc_start_time_jiffies(pid)
+                            .unwrap_or(0),
+                        comm: sandbox_manifest::read_proc_comm(pid).unwrap_or_default(),
+                    },
+                    api_socket: state.firecracker_socket.clone(),
+                    vsock_uds_base: state.vsock_uds_path.clone(),
+                    vsock_cid,
+                },
+                network: net_setup.map(|ns| sandbox_manifest::NetworkRecord {
+                    tap_name: ns.tap_name.clone(),
+                    vm_cidr_network: ns.vm_cidr.network(),
+                    host_ip: ns.vm_cidr.host(),
+                    guest_ip: ns.vm_cidr.guest(),
+                }),
+                uffd_handler: None,
+                last_local_snapshot: None,
+            };
+            let manifest_path = sandbox_manifest::manifest_path(&self.work_dir, sandbox_id);
+            if let Err(e) = sandbox_manifest::write_manifest(&manifest_path, &m) {
+                tracing::warn!(
+                    %sandbox_id,
+                    error = %e,
+                    "sandbox manifest write failed; reattach across host-agent restart \
+                     will be impossible for this sandbox (it'll flip per reconcile §3 \
+                     instead). Sandbox itself is fine."
+                );
+            }
+        }
+
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
