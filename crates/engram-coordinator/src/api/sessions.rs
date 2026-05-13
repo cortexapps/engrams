@@ -503,6 +503,18 @@ pub async fn create_session(
             // Best-effort: mark the row failed and bubble the error.
             // We don't tear down the row — Postgres remains the
             // audit trail for the failure.
+            //
+            // Log loud at error level — sessions that go to
+            // `failed` status without context were silent failures
+            // historically. Include image_uri + session_id so
+            // operators can grep coord logs to find the cause from
+            // a dashboard / API observation of `status=failed`.
+            tracing::error!(
+                session_id = %session_id,
+                image_uri = %req.image,
+                error = %e,
+                "session create failed: marking row failed; underlying SandboxError chained in error field",
+            );
             let _ = state
                 .services
                 .meta

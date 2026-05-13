@@ -224,6 +224,45 @@ impl Bootstrap {
     pub fn chunk_blob_len(&self) -> u64 {
         self.entries.iter().map(|e| e.length as u64).sum()
     }
+
+    /// Synthesize a `Manifest` covering the same chunks.
+    ///
+    /// ADR 0008 Phase 5 final piece: a chunked-OCI image's
+    /// `Manifest` lives in the bake's BlobStorage namespace, not
+    /// the runtime host's. The bootstrap layer (small, travels
+    /// with the OCI artifact) carries enough metadata to
+    /// reconstruct an equivalent `Manifest` on the runtime side:
+    /// chunk hashes + file offsets + size + kind. Dropped fields
+    /// (`blob_digest`, `blob_offset` on `BootstrapEntry`) are
+    /// OCI-specific — at runtime, chunks are fetched via the
+    /// tiered `ChunkResolver`, which knows how to find them in
+    /// BlobStorage or OCI.
+    ///
+    /// Caller is responsible for `put_manifest` under the
+    /// `ManifestRef` from `bundle.json::disk_manifest` (or
+    /// `canonical_memory_manifest` for memory bootstraps). After
+    /// that, every consumer of `chunk_store.get_manifest` —
+    /// materialize, NBD daemon, UFFD handler, chunk_gc reachability
+    /// — finds it in the local BlobStorage and works unchanged.
+    pub fn to_manifest(&self) -> Manifest {
+        Manifest {
+            schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: self.kind,
+            chunk_size: self.chunk_size,
+            total_bytes: self.total_bytes,
+            chunks: self
+                .entries
+                .iter()
+                .map(|e| crate::manifest::ChunkRef {
+                    offset: e.file_offset,
+                    hash: e.sha256,
+                })
+                .collect(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -515,6 +554,57 @@ mod tests {
         assert_eq!(ab, bb);
         // And all entries are self-blob (no parent → nothing to inherit).
         assert!(a.entries.iter().all(|e| e.blob_digest.is_none()));
+    }
+
+    /// `to_manifest` round-trip: build a Bootstrap from a Manifest,
+    /// then convert back. Chunks, offsets, sizes, kinds all
+    /// preserved. Drops fork-lineage / trace / annotations
+    /// (Bootstrap doesn't carry them) — caller adds those back if
+    /// needed.
+    #[tokio::test]
+    async fn to_manifest_round_trips_chunk_layout() {
+        let (s, _d) = store().await;
+        let bodies: [&[u8]; 3] = [b"AAA", b"BBBB", b"CC"];
+        let hashes: Vec<ChunkHash> = futures::future::join_all(
+            bodies
+                .iter()
+                .map(|b| async { s.put_chunk(b).await.unwrap() }),
+        )
+        .await;
+        let original = Manifest {
+            schema_version: 1,
+            kind: ManifestKind::Disk,
+            total_bytes: 64,
+            chunk_size: ChunkSize::bytes(16),
+            chunks: vec![
+                crate::manifest::ChunkRef {
+                    offset: 0,
+                    hash: hashes[0],
+                },
+                crate::manifest::ChunkRef {
+                    offset: 16,
+                    hash: hashes[1],
+                },
+                crate::manifest::ChunkRef {
+                    offset: 32,
+                    hash: hashes[2],
+                },
+            ],
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let (bootstrap, _blob) = Bootstrap::build_from_manifest(&s, &original).await.unwrap();
+        let round_tripped = bootstrap.to_manifest();
+        // Same chunk count, same offsets, same hashes.
+        assert_eq!(round_tripped.chunks.len(), original.chunks.len());
+        for (a, b) in round_tripped.chunks.iter().zip(original.chunks.iter()) {
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.hash, b.hash);
+        }
+        assert_eq!(round_tripped.kind, original.kind);
+        assert_eq!(round_tripped.chunk_size, original.chunk_size);
+        assert_eq!(round_tripped.total_bytes, original.total_bytes);
     }
 
     /// Builds against a never-stored ChunkHash should surface as a

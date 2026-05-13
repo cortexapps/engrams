@@ -259,26 +259,52 @@ impl PooledBackend {
         uri: &str,
         cached: &CachedImage,
     ) -> Result<(PathBuf, NbdStateSlot), SandboxError> {
+        // ADR 0008 Phase 5 final piece: chunked-OCI images carry
+        // the `Manifest` object only in the bake's BlobStorage
+        // namespace. The runtime host's namespace may be empty.
+        // Synthesize the manifest from the bootstrap sidecar (which
+        // arrived with the OCI pull) and persist it before either
+        // disk-resolution branch reads it. Idempotent — skips when
+        // the manifest is already present.
+        if let Some(cs) = self.chunk_store.as_ref() {
+            ensure_chunked_manifest_in_blob_storage(cs, cached)
+                .await
+                .map_err(|e| {
+                    tracing::error!(uri = %uri, error = %e, "chunked-OCI manifest synthesis failed");
+                    e
+                })?;
+        }
+
         // Branch 1: NBD daemon.
         #[cfg(target_os = "linux")]
         if let Some(state) = self.try_spawn_nbd(cached).await? {
             tracing::info!(
                 uri = %uri,
                 device = %state.device_path().display(),
-                "chunked rootfs served via NBD daemon",
+                "rootfs branch: NBD daemon",
             );
             return Ok((state.device_path().to_path_buf(), Some(state)));
         }
 
         // Branch 2: materialize-to-file (the chunked path).
-        let (chunk_store, materialize_dir) =
-            match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
-                (Some(cs), Some(dir)) => (cs, dir),
-                _ => return Ok((legacy_rootfs_path(cached)?, nbd_state_none())),
-            };
+        let (chunk_store, materialize_dir) = match (
+            self.chunk_store.as_ref(),
+            self.materialize_dir.as_ref(),
+        ) {
+            (Some(cs), Some(dir)) => (cs, dir),
+            _ => {
+                let path = legacy_rootfs_path(cached)?;
+                tracing::debug!(uri = %uri, path = %path.display(), "rootfs branch: legacy ext4 (no chunk store wired)");
+                return Ok((path, nbd_state_none()));
+            }
+        };
         let bundle = match cached.bundle.as_ref() {
             Some(b) => b,
-            None => return Ok((legacy_rootfs_path(cached)?, nbd_state_none())),
+            None => {
+                let path = legacy_rootfs_path(cached)?;
+                tracing::debug!(uri = %uri, path = %path.display(), "rootfs branch: legacy ext4 (no bundle)");
+                return Ok((path, nbd_state_none()));
+            }
         };
 
         // ADR 0008 Phase 5: when the image is chunked-OCI shaped AND
@@ -292,7 +318,17 @@ impl PooledBackend {
         // BlobStorage-only) we use the default chunk_store as-is.
         let effective_store = self
             .upgrade_chunk_store_for_chunked_oci(chunk_store, uri, cached)
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!(uri = %uri, error = %e, "chunk-store upgrade for chunked-OCI failed");
+                e
+            })?;
+        tracing::debug!(
+            uri = %uri,
+            manifest = %bundle.disk_manifest,
+            chunked_oci = cached.is_disk_chunked_oci(),
+            "rootfs branch: materialize-to-file",
+        );
 
         let path = materialize_chunked_rootfs(
             &effective_store,
@@ -473,6 +509,95 @@ impl PooledBackend {
     }
 }
 
+/// ADR 0008 Phase 5 final piece: ensure the disk `Manifest`
+/// referenced by `cached.bundle.disk_manifest` is reachable in
+/// the host's `BlobStorage`. For chunked-OCI images, the bake-
+/// side wrote the Manifest to its own BlobStorage namespace; the
+/// runtime host's namespace may be empty. We synthesize from the
+/// bootstrap sidecar (which arrived with the OCI pull) and
+/// persist via `put_manifest`. Idempotent — skips when the
+/// manifest is already in BlobStorage, or when the artifact is
+/// not chunked-OCI shaped (legacy bundle.json / no bundle).
+///
+/// Called from `resolve_rootfs` before either disk-resolution
+/// branch (NBD or materialize-to-file) reads the manifest.
+pub async fn ensure_chunked_manifest_in_blob_storage(
+    chunk_store: &ChunkStore,
+    cached: &CachedImage,
+) -> Result<(), SandboxError> {
+    // Three short-circuits — non-chunked-OCI images don't need
+    // this path at all.
+    let Some(bundle) = cached.bundle.as_ref() else {
+        return Ok(());
+    };
+    let Some(bs_path) = cached.disk_bootstrap_path.as_ref() else {
+        return Ok(());
+    };
+    let manifest_ref = bundle.disk_manifest;
+
+    // Already there? Most common case after the first session on a
+    // given image: cheap stat-shape lookup, no-op.
+    match chunk_store.get_manifest(manifest_ref).await {
+        Ok(_) => return Ok(()),
+        Err(engram_chunk_store::ChunkStoreError::Blob(engram_core::error::BlobError::NotFound)) => {
+        }
+        Err(e) => {
+            tracing::error!(
+                manifest_ref = %manifest_ref,
+                error = %e,
+                "chunked-OCI: probing for existing manifest hit unexpected error",
+            );
+            return Err(SandboxError::Vm(
+                format!("probe manifest {manifest_ref}: {e}").into(),
+            ));
+        }
+    }
+
+    // Synthesize from the bootstrap on disk and persist. The
+    // bootstrap was written by `pull_image` (`bootstrap.disk.json`
+    // sidecar); it carries every byte of Manifest info we need.
+    let bytes = fs::read(bs_path).await.map_err(|e| {
+        tracing::error!(path = %bs_path.display(), error = %e, "chunked-OCI: read bootstrap failed");
+        SandboxError::Vm(format!("read bootstrap {}: {e}", bs_path.display()).into())
+    })?;
+    let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(&bytes).map_err(|e| {
+        tracing::error!(path = %bs_path.display(), error = %e, "chunked-OCI: parse bootstrap failed");
+        SandboxError::Vm(format!("parse bootstrap {}: {e}", bs_path.display()).into())
+    })?;
+    let synthesized = bootstrap.to_manifest();
+    tracing::info!(
+        manifest_ref = %manifest_ref,
+        chunks = synthesized.chunks.len(),
+        total_bytes = synthesized.total_bytes,
+        kind = ?synthesized.kind,
+        "chunked-OCI: synthesizing manifest from bootstrap + persisting to BlobStorage",
+    );
+    match chunk_store.put_manifest(manifest_ref, &synthesized).await {
+        Ok(_) => Ok(()),
+        // VersionConflict means another concurrent caller raced us
+        // to put the same manifest. Synthesis is deterministic
+        // (same bootstrap → same chunk list at same offsets), so
+        // their version is identical to ours. Treat as success.
+        Err(engram_chunk_store::ChunkStoreError::VersionConflict { .. }) => {
+            tracing::debug!(
+                manifest_ref = %manifest_ref,
+                "chunked-OCI: concurrent put_manifest beat us; using their copy",
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                manifest_ref = %manifest_ref,
+                error = %e,
+                "chunked-OCI: put_manifest of synthesized manifest failed",
+            );
+            Err(SandboxError::Vm(
+                format!("persist synthesized manifest {manifest_ref}: {e}").into(),
+            ))
+        }
+    }
+}
+
 /// Materialize a chunked manifest to a content-addressed file under
 /// `materialize_dir`. The output path is named by
 /// `manifest_id-v{version}.ext4` so two sessions referencing the same
@@ -487,9 +612,14 @@ async fn materialize_chunked_rootfs(
     bundle: &ImageBundle,
     materialize_lock: &Mutex<()>,
 ) -> Result<PathBuf, SandboxError> {
-    fs::create_dir_all(materialize_dir)
-        .await
-        .map_err(|e| SandboxError::Vm(format!("materialize dir: {e}").into()))?;
+    fs::create_dir_all(materialize_dir).await.map_err(|e| {
+        tracing::error!(
+            dir = %materialize_dir.display(),
+            error = %e,
+            "materialize_chunked_rootfs: create dir failed",
+        );
+        SandboxError::Vm(format!("materialize dir: {e}").into())
+    })?;
     let manifest_ref = bundle.disk_manifest;
     let dest = materialize_dir.join(format!(
         "{}-v{}.ext4",
@@ -499,10 +629,15 @@ async fn materialize_chunked_rootfs(
     // Fast-path: file exists at the expected size. We trust local-
     // disk integrity here — the chunk store's content addressing
     // already validates bytes on the way in.
-    let manifest = chunk_store
-        .get_manifest(manifest_ref)
-        .await
-        .map_err(|e| SandboxError::Vm(format!("get manifest {manifest_ref}: {e}").into()))?;
+    let manifest = chunk_store.get_manifest(manifest_ref).await.map_err(|e| {
+        tracing::error!(
+            uri = %uri,
+            manifest_ref = %manifest_ref,
+            error = %e,
+            "materialize_chunked_rootfs: get_manifest failed",
+        );
+        SandboxError::Vm(format!("get manifest {manifest_ref}: {e}").into())
+    })?;
     if let Ok(meta) = fs::metadata(&dest).await {
         if meta.len() == manifest.total_bytes {
             tracing::debug!(
@@ -547,7 +682,18 @@ async fn materialize_chunked_rootfs(
         }
         None => chunk_store.materialize_to_file(&manifest, &dest).await,
     }
-    .map_err(|e| SandboxError::Vm(format!("materialize {manifest_ref}: {e}").into()))?;
+    .map_err(|e| {
+        tracing::error!(
+            uri = %uri,
+            manifest_ref = %manifest_ref,
+            dest = %dest.display(),
+            chunks = manifest.chunks.len(),
+            total_bytes = manifest.total_bytes,
+            error = %e,
+            "materialize_chunked_rootfs: materialize_to_file failed",
+        );
+        SandboxError::Vm(format!("materialize {manifest_ref}: {e}").into())
+    })?;
     Ok(dest)
 }
 

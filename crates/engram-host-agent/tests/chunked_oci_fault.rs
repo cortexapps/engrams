@@ -386,6 +386,152 @@ async fn tiered_resolver_fails_loudly_when_chunk_missing_from_all_tiers() {
     );
 }
 
+/// Reproduces the cross-namespace bricked-image bug:
+/// `materialize_chunked_rootfs` calls `chunk_store.get_manifest`
+/// which reads straight from BlobStorage, not through the
+/// resolver. If the `Manifest` was written to the bake's
+/// BlobStorage but the runtime host's BlobStorage is empty (the
+/// scenario ADR 0008 was meant to fix), get_manifest 404s and
+/// session create fails silently.
+///
+/// The Phase 5 final synthesis-on-pull fix:
+/// `ensure_chunked_manifest_in_blob_storage` reads the bootstrap
+/// sidecar and `put_manifest`s a synthesized Manifest into
+/// BlobStorage before any downstream consumer needs it. After
+/// that, materialize works against an empty BlobStorage.
+#[tokio::test]
+async fn manifest_synthesis_from_bootstrap_unblocks_materialize_when_blob_empty() {
+    use engram_chunk_store::{
+        Bootstrap, BootstrapEntry, ChunkRef as CsChunkRef, ChunkSize, Manifest, ManifestKind,
+        ManifestRef, BOOTSTRAP_SCHEMA_VERSION,
+    };
+
+    // Stage: a chunked-OCI image whose Manifest was committed to
+    // BlobStorage namespace A (the bake's), but the runtime host
+    // points at empty BlobStorage namespace B.
+    let bake_dir = tempfile::tempdir().unwrap();
+    let bake_blob: Arc<dyn BlobStorage> =
+        Arc::new(LocalBlobStorage::new(bake_dir.path().to_path_buf()));
+    let bake_store = ChunkStore::new(bake_blob.clone());
+
+    // Bake writes three chunks + a manifest to its blob.
+    let bodies: [&[u8]; 3] = [b"alpha___", b"beta____", b"gamma___"];
+    let mut chunks = Vec::with_capacity(3);
+    for (i, b) in bodies.iter().enumerate() {
+        let h = bake_store.put_chunk(b).await.unwrap();
+        chunks.push(CsChunkRef {
+            offset: (i * 8) as u64,
+            hash: h,
+        });
+    }
+    let manifest_ref = ManifestRef::new();
+    let bake_manifest = Manifest {
+        schema_version: 1,
+        kind: ManifestKind::Disk,
+        total_bytes: 24,
+        chunk_size: ChunkSize::bytes(8),
+        chunks: chunks.clone(),
+        parent: None,
+        working_set_trace: None,
+        annotations: serde_json::Value::Null,
+    };
+    bake_store
+        .put_manifest(manifest_ref, &bake_manifest)
+        .await
+        .unwrap();
+
+    // Bake also writes a bootstrap sidecar (what `pull_image`
+    // would land on the runtime host).
+    let bootstrap = Bootstrap {
+        schema_version: BOOTSTRAP_SCHEMA_VERSION,
+        kind: ManifestKind::Disk,
+        total_bytes: 24,
+        chunk_size: ChunkSize::bytes(8),
+        entries: chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| BootstrapEntry {
+                file_offset: c.offset,
+                blob_digest: None,
+                blob_offset: (i * 8) as u64,
+                length: 8,
+                sha256: c.hash,
+            })
+            .collect(),
+    };
+
+    let cache_root = tempfile::tempdir().unwrap();
+    let bs_path = cache_root.path().join("bootstrap.disk.json");
+    std::fs::write(&bs_path, serde_json::to_vec(&bootstrap).unwrap()).unwrap();
+
+    // Runtime host's BlobStorage is empty — the bug scenario.
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let runtime_blob: Arc<dyn BlobStorage> =
+        Arc::new(LocalBlobStorage::new(runtime_dir.path().to_path_buf()));
+    let runtime_store = ChunkStore::new(runtime_blob.clone());
+
+    // Pre-condition: manifest is NOT in the runtime blob.
+    assert!(matches!(
+        runtime_store.get_manifest(manifest_ref).await,
+        Err(engram_chunk_store::ChunkStoreError::Blob(
+            engram_core::error::BlobError::NotFound
+        ))
+    ));
+
+    // Build a `CachedImage` skeleton that points at the bootstrap
+    // sidecar we just wrote. This mirrors what
+    // `image_cache::ensure_image` produces after a chunked-OCI pull.
+    let cached = engram_host_agent::image_cache::CachedImage {
+        manifest_path: cache_root.path().join("manifest.toml"),
+        rootfs_path: None,
+        bundle: Some(engram_host_agent::image_cache::ImageBundle {
+            schema_version: 2,
+            disk_manifest: manifest_ref,
+            canonical_memory_manifest: None,
+            bootstrap_disk_available: true,
+            bootstrap_memory_available: false,
+        }),
+        disk_bootstrap_path: Some(bs_path),
+        disk_chunks_blob_digest: Some("sha256:notused_in_this_test".into()),
+        memory_bootstrap_path: None,
+        memory_chunks_blob_digest: None,
+        digest: "sha256:bug_repro".into(),
+    };
+
+    // Apply the Phase 5 final fix: synthesize + persist.
+    engram_host_agent::pooled_backend::ensure_chunked_manifest_in_blob_storage(
+        &runtime_store,
+        &cached,
+    )
+    .await
+    .expect("synthesis should succeed");
+
+    // Post-condition: manifest IS now in the runtime blob, and its
+    // chunks list matches the bake's exactly (deterministic
+    // synthesis from the bootstrap).
+    let restored = runtime_store
+        .get_manifest(manifest_ref)
+        .await
+        .expect("manifest should be persisted after synthesis");
+    assert_eq!(restored.kind, bake_manifest.kind);
+    assert_eq!(restored.chunk_size, bake_manifest.chunk_size);
+    assert_eq!(restored.total_bytes, bake_manifest.total_bytes);
+    assert_eq!(restored.chunks.len(), bake_manifest.chunks.len());
+    for (a, b) in restored.chunks.iter().zip(bake_manifest.chunks.iter()) {
+        assert_eq!(a.offset, b.offset);
+        assert_eq!(a.hash, b.hash);
+    }
+
+    // Idempotent re-run is a no-op success (no VersionConflict
+    // panic / propagation).
+    engram_host_agent::pooled_backend::ensure_chunked_manifest_in_blob_storage(
+        &runtime_store,
+        &cached,
+    )
+    .await
+    .expect("second call should be idempotent");
+}
+
 /// `PooledBackend`-level dispatch: when an image is chunked-OCI
 /// shaped AND an OciClient is configured, the upgrade path swaps
 /// in the tiered resolver. Exercises the `is_disk_chunked_oci` +
