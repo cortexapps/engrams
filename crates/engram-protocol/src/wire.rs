@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::types::egress::SessionEgressPolicy;
-use engram_core::types::sandbox::SandboxSpec;
+use engram_core::types::sandbox::{AgentSpec, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxId};
 use serde::{Deserialize, Serialize};
@@ -66,7 +66,16 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 ///   Closes case B (the four-stuck-sessions bug pattern) and the
 ///   broader host/coord divergence class. Additive on host side,
 ///   but bincode is positional so any new field is a wire break.
-pub const WIRE_VERSION: u32 = 6;
+/// - v7: `RequestKind::StartAgent` + `ResponseKind::AgentStarted`.
+///   Closes the mode=coordinator harness gap — the WS protocol can
+///   now carry per-session agent argv/env to a remote host, so
+///   harness sessions work in split mode (previously
+///   `RemoteSandboxBackend::start_agent` inherited the trait default
+///   that errors `"this backend doesn't support start_agent yet"`).
+///   Bincode discriminants for enum variants are positional; adding
+///   a new variant is a wire break for older peers even though it's
+///   strictly additive in source.
+pub const WIRE_VERSION: u32 = 7;
 
 /// Top-level frame on the wire.
 ///
@@ -218,6 +227,18 @@ pub enum RequestKind {
         /// is 16 MiB on the wire — well under bincode's defaults.
         live_disk_manifest_ids: Vec<uuid::Uuid>,
     },
+    /// Launch the long-running "agent" process inside an existing
+    /// sandbox. Mirrors `SandboxBackend::start_agent` — argv is
+    /// per-session (carries `session_id`, attach token, etc.) so
+    /// it can't ride on `SandboxSpec`. Frame ordering on a single
+    /// WS connection guarantees this is processed after any
+    /// preceding `NotifyKind::SessionEgressPolicy` for the same
+    /// sandbox, so the host's egress proxy registry is live before
+    /// the harness can dial out.
+    StartAgent {
+        sandbox_id: SandboxId,
+        agent: AgentSpec,
+    },
 }
 
 /// Successful response payloads. Errors take the [`RemoteError`] path
@@ -246,6 +267,10 @@ pub enum ResponseKind {
     /// pass; the coord aggregates across hosts in the admin
     /// endpoint's JSON response.
     MaterializeDirReaped { stats: WireReapStats },
+    /// Generic ack for `StartAgent`. The actual agent process is
+    /// inside the guest; the coord only learns about its lifecycle
+    /// through subsequent harness-channel frames.
+    AgentStarted,
 }
 
 /// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
@@ -592,6 +617,66 @@ mod tests {
             }
             other => panic!("wrong shape: {other:?}"),
         }
+    }
+
+    #[test]
+    fn start_agent_round_trips_argv_and_env() {
+        // Sanity: a non-trivial AgentSpec (multi-word argv, multi-key
+        // env including non-ASCII bytes) survives Request → bytes →
+        // Request through bincode. Same shape as the
+        // reap_materialize_dir test above; protects against discriminant
+        // realignment when new variants land.
+        let mut env = std::collections::HashMap::new();
+        env.insert("MARKER".to_string(), "wire-round-trip ñ".to_string());
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        let agent = AgentSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
+            env,
+        };
+        let sandbox_id = SandboxId::new();
+        let kind = RequestKind::StartAgent {
+            sandbox_id,
+            agent: agent.clone(),
+        };
+        let frame = Frame::Request {
+            req_id: 11,
+            trace: TraceContext::default(),
+            kind,
+        };
+        let bytes = bincode::serialize(&frame).unwrap();
+        let back: Frame = bincode::deserialize(&bytes).unwrap();
+        match back {
+            Frame::Request {
+                kind:
+                    RequestKind::StartAgent {
+                        sandbox_id: got_id,
+                        agent: got_agent,
+                    },
+                ..
+            } => {
+                assert_eq!(got_id, sandbox_id);
+                assert_eq!(got_agent.argv, agent.argv);
+                assert_eq!(got_agent.env, agent.env);
+            }
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_started_response_round_trips() {
+        let frame = Frame::Response {
+            req_id: 11,
+            result: Ok(ResponseKind::AgentStarted),
+        };
+        let bytes = bincode::serialize(&frame).unwrap();
+        let back: Frame = bincode::deserialize(&bytes).unwrap();
+        assert!(matches!(
+            back,
+            Frame::Response {
+                req_id: 11,
+                result: Ok(ResponseKind::AgentStarted),
+            }
+        ));
     }
 
     #[test]

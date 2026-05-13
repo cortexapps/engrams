@@ -197,6 +197,76 @@ async fn exec_stderr_round_trips_separately_from_stdout() {
 }
 
 #[tokio::test]
+async fn start_agent_round_trips_argv_and_env_through_the_wire() {
+    // Coord sends StartAgent over the WS, host's HostSession decodes
+    // and forwards to ProcessBackend::start_agent, which spawns the
+    // argv. Inspect the on-disk side effect (`marker` file) to confirm
+    // both argv elements and env entries crossed the wire intact.
+    let dir = TempDir::new().unwrap();
+    let local: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
+    let (remote, _serve) = pair(local).await;
+
+    let id = remote.create(live_spec()).await.unwrap();
+
+    // The sandbox cwd is `<root>/<sandbox-id>/`. ProcessBackend spawns
+    // the agent with that cwd, so a relative shell redirect lands in
+    // a known location.
+    let agent = engram_core::types::sandbox::AgentSpec {
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$MARKER_VALUE\" > marker; sleep 5".into(),
+        ],
+        env: [("MARKER_VALUE".to_string(), "wire-round-trip".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    remote
+        .start_agent(id, agent)
+        .await
+        .expect("start_agent round-trips");
+
+    // The sh redirect happens before sleep; poll briefly so we don't
+    // race the fork+exec.
+    let marker_path = dir.path().join(id.to_string()).join("marker");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !marker_path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let body = std::fs::read_to_string(&marker_path).expect("marker file written");
+    assert_eq!(body, "wire-round-trip");
+
+    let _ = remote.destroy(id).await;
+}
+
+#[tokio::test]
+async fn start_agent_propagates_invalid_spec_error_through_the_wire() {
+    // Empty argv → ProcessBackend returns InvalidSpec. Confirms the
+    // wire surfaces backend errors as SandboxError rather than
+    // swallowing them into a generic transport failure.
+    let dir = TempDir::new().unwrap();
+    let local: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir.path()));
+    let (remote, _serve) = pair(local).await;
+
+    let id = remote.create(live_spec()).await.unwrap();
+    let err = remote
+        .start_agent(
+            id,
+            engram_core::types::sandbox::AgentSpec {
+                argv: Vec::new(),
+                env: Default::default(),
+            },
+        )
+        .await
+        .expect_err("empty argv must propagate as a backend error");
+    assert!(
+        matches!(err, engram_core::SandboxError::InvalidSpec(_)),
+        "expected InvalidSpec, got {err:?}",
+    );
+    let _ = remote.destroy(id).await;
+}
+
+#[tokio::test]
 async fn destroy_unknown_sandbox_id_is_idempotent_through_the_wire() {
     // ProcessBackend's destroy is intentionally lenient (it's the
     // dev backend; the destroyed-twice path has to work because pool

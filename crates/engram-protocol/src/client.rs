@@ -648,4 +648,25 @@ impl SandboxBackend for RemoteSandboxBackend {
                 SandboxError::Vm(Box::new(StringError(format!("notify session policy: {e}"))))
             })
     }
+
+    async fn start_agent(
+        &self,
+        id: SandboxId,
+        agent: engram_core::types::sandbox::AgentSpec,
+    ) -> Result<(), SandboxError> {
+        match self
+            .host
+            .unary(RequestKind::StartAgent {
+                sandbox_id: id,
+                agent,
+            })
+            .await
+        {
+            Ok(ResponseKind::AgentStarted) => Ok(()),
+            Ok(other) => Err(SandboxError::Vm(Box::new(StringError(format!(
+                "unexpected response: {other:?}"
+            ))))),
+            Err(e) => Err(e.into()),
+        }
+    }
 }

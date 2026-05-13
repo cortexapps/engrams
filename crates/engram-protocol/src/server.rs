@@ -416,6 +416,12 @@ async fn handle_request(
                 "host did not register a HostAdminHandler; ReapMaterializeDir unsupported".into(),
             )),
         },
+        RequestKind::StartAgent { sandbox_id, agent } => {
+            match backend.start_agent(sandbox_id, agent).await {
+                Ok(()) => Ok(ResponseKind::AgentStarted),
+                Err(e) => Err(RemoteError::from_sandbox(e)),
+            }
+        }
     };
 
     send_frame(&writer, Frame::Response { req_id, result }).await;
@@ -431,6 +437,7 @@ fn request_kind_name(kind: &RequestKind) -> &'static str {
         RequestKind::Restore { .. } => "restore",
         RequestKind::ResolveRegistryAuth { .. } => "resolve_registry_auth",
         RequestKind::ReapMaterializeDir { .. } => "reap_materialize_dir",
+        RequestKind::StartAgent { .. } => "start_agent",
     }
 }
 
