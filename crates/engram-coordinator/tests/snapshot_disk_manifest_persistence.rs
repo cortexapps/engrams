@@ -67,6 +67,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         last_accessed_at: Utc::now(),
         disk_manifest: Some(mref),
         memory_manifest: None,
+        recoverable: false,
     };
     meta.record_snapshot(snap_with.clone())
         .await

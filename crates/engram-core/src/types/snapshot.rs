@@ -57,4 +57,21 @@ pub struct SnapshotRecord {
     /// before chunk-store wiring.
     #[serde(default)]
     pub memory_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0009: TRUE iff the canonical chunked manifests are
+    /// HEAD-verified durable in `BlobStorage` at snapshot-creation
+    /// time. The coord's reconcile pass reads this column to decide
+    /// whether a session whose sandbox has disappeared transitions
+    /// to `Idle` (resumable via cold-tier) or `Dead` (terminal).
+    ///
+    /// Cleared back to FALSE by the chunk-store GC when it reaps a
+    /// referenced manifest. Persistence semantics: column reflects
+    /// "as of the last GC sweep, the snapshot was recoverable" —
+    /// transient blob backend outages between GC sweeps don't flap
+    /// session state.
+    ///
+    /// Defaults to `false` so pre-migration rows and explicit
+    /// failures both surface a session as Dead-on-loss rather than
+    /// promising an Idle/resume path that can't be delivered.
+    #[serde(default)]
+    pub recoverable: bool,
 }

@@ -58,7 +58,15 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 ///   downgrade. See the deletion commit's message for context
 ///   on why warm pools were retired in favor of chunked-OCI cold
 ///   start + canonical-memory restore.
-pub const WIRE_VERSION: u32 = 5;
+/// - v6: ADR 0009 reconciliation primitive. `Heartbeat` gains
+///   `running_sandboxes: Vec<SandboxId>` populated from the host
+///   agent's `backend.list()`. The coord intersects this against
+///   expected-active sessions every tick; missing sandboxes
+///   transition to Idle (if `snapshots.recoverable=true`) or Dead.
+///   Closes case B (the four-stuck-sessions bug pattern) and the
+///   broader host/coord divergence class. Additive on host side,
+///   but bincode is positional so any new field is a wire break.
+pub const WIRE_VERSION: u32 = 6;
 
 /// Top-level frame on the wire.
 ///

@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use engram_core::SandboxId;
 use engram_protocol::{Heartbeat, HeartbeatAck, HostCapacityReport};
 
 use crate::resource::CapacitySnapshot;
@@ -20,6 +21,7 @@ pub trait HeartbeatSink: Send + Sync {
 pub fn build_heartbeat(
     host_id: engram_core::HostId,
     cap: &CapacitySnapshot,
+    running_sandboxes: Vec<SandboxId>,
     draining: bool,
 ) -> Heartbeat {
     Heartbeat {
@@ -31,6 +33,7 @@ pub fn build_heartbeat(
             running_sandboxes: cap.running_sandboxes,
         },
         local_snapshots: Vec::new(),
+        running_sandboxes,
         draining,
     }
 }
@@ -52,7 +55,7 @@ mod tests {
             used_mib: 12_288,
             running_sandboxes: 3,
         };
-        let hb = build_heartbeat(host, &cap, false);
+        let hb = build_heartbeat(host, &cap, Vec::new(), false);
 
         assert_eq!(hb.host_id, host);
         assert_eq!(hb.capacity.total_mib, 65_536);
@@ -62,13 +65,28 @@ mod tests {
         // Phase 1: the local snapshot field isn't populated by the
         // helper. It gets filled by the host agent before send.
         assert!(hb.local_snapshots.is_empty());
+        assert!(hb.running_sandboxes.is_empty());
     }
 
     #[test]
     fn build_heartbeat_propagates_drain_flag() {
         let cap = CapacitySnapshot::default();
-        let hb = build_heartbeat(HostId::new(), &cap, true);
+        let hb = build_heartbeat(HostId::new(), &cap, Vec::new(), true);
         assert!(hb.draining);
+    }
+
+    #[test]
+    fn build_heartbeat_preserves_running_sandboxes() {
+        // ADR 0009 §2: this field is the input to the coord's reconcile
+        // pass. The builder must propagate it through without mutation.
+        let sandboxes = vec![SandboxId::new(), SandboxId::new(), SandboxId::new()];
+        let hb = build_heartbeat(
+            HostId::new(),
+            &CapacitySnapshot::default(),
+            sandboxes.clone(),
+            false,
+        );
+        assert_eq!(hb.running_sandboxes, sandboxes);
     }
 
     #[test]
@@ -76,7 +94,12 @@ mod tests {
         // We don't pin sent_at, but it must be roughly "now" — verifying
         // catches a bug where someone replaces Utc::now() with epoch 0.
         let before = chrono::Utc::now();
-        let hb = build_heartbeat(HostId::new(), &CapacitySnapshot::default(), false);
+        let hb = build_heartbeat(
+            HostId::new(),
+            &CapacitySnapshot::default(),
+            Vec::new(),
+            false,
+        );
         let after = chrono::Utc::now();
         assert!(hb.sent_at >= before);
         assert!(hb.sent_at <= after);

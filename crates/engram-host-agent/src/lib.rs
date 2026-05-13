@@ -206,12 +206,31 @@ impl HostAgent {
                 Arc::new(p)
             };
             let pooled_for_dialer: Arc<dyn engram_core::traits::SandboxBackend> = pooled.clone();
+            // ADR 0009 §2: populate `running_sandboxes` from
+            // `backend.list()` on each heartbeat tick. The coord
+            // intersects this against expected-active sessions to
+            // detect divergence (missing sandbox → flip session per
+            // §3). On `list()` error, ship an empty list — the
+            // 3-strike grace window (15s) absorbs transient errors
+            // without flipping live sessions.
+            let pooled_for_provider = pooled.clone();
             let provider: dialer::HeartbeatProvider = std::sync::Arc::new(move || {
-                (
-                    engram_protocol::HostCapacityReport::default(),
-                    Vec::new(),
-                    false,
-                )
+                let backend = pooled_for_provider.clone();
+                Box::pin(async move {
+                    let running_sandboxes = match backend.list().await {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "backend.list() failed; reporting empty running_sandboxes");
+                            Vec::new()
+                        }
+                    };
+                    dialer::HeartbeatPayload {
+                        capacity: engram_protocol::HostCapacityReport::default(),
+                        local_snapshots: Vec::new(),
+                        running_sandboxes,
+                        draining: false,
+                    }
+                })
             });
             // ADR 0007: surface the reaper to the coord. The coord's
             // POST /api/admin/reap-materialize-dir fans this out

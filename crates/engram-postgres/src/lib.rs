@@ -336,14 +336,16 @@ impl MetadataStore for PostgresStore {
                 (id, session_id, host_id,
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
-                 memory_manifest_id, memory_manifest_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 memory_manifest_id, memory_manifest_version,
+                 recoverable)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
                 disk_manifest_version   = EXCLUDED.disk_manifest_version,
                 memory_manifest_id      = EXCLUDED.memory_manifest_id,
                 memory_manifest_version = EXCLUDED.memory_manifest_version,
+                recoverable             = EXCLUDED.recoverable,
                 updated_at              = NOW()
             "#,
         )
@@ -358,6 +360,7 @@ impl MetadataStore for PostgresStore {
         .bind(snap.disk_manifest.map(|m| m.version as i64))
         .bind(snap.memory_manifest.map(|m| m.manifest_id))
         .bind(snap.memory_manifest.map(|m| m.version as i64))
+        .bind(snap.recoverable)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -374,7 +377,8 @@ impl MetadataStore for PostgresStore {
                    image_version, size_bytes,
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
-                   memory_manifest_id, memory_manifest_version
+                   memory_manifest_id, memory_manifest_version,
+                   recoverable
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -395,7 +399,8 @@ impl MetadataStore for PostgresStore {
                    image_version, size_bytes,
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
-                   memory_manifest_id, memory_manifest_version
+                   memory_manifest_id, memory_manifest_version,
+                   recoverable
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,

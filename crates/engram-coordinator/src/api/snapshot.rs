@@ -76,6 +76,13 @@ pub async fn snapshot(
         // VZ produces disk_manifest only; Process produces neither.
         disk_manifest: metadata.disk_manifest,
         memory_manifest: metadata.memory_manifest,
+        // ADR 0009: snapshot is recoverable iff the canonical
+        // manifests are durably present in BlobStorage. Phase 2 of
+        // the rollout will HEAD-verify here before flipping to
+        // true; Phase 1 ships the column as default-false. Until
+        // Phase 2 lands, sessions whose sandbox vanishes transition
+        // to `Dead` (vs `Idle`), which matches today's behaviour.
+        recoverable: false,
     };
     state.services.meta.record_snapshot(record).await?;
 

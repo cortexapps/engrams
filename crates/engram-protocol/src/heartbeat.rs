@@ -1,9 +1,17 @@
 use chrono::{DateTime, Utc};
-use engram_core::{HostId, SessionId, SnapshotId};
+use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
 use serde::{Deserialize, Serialize};
 
 /// Heartbeat message: host -> coordinator, every ~5s. Reports
-/// current capacity and the snapshots held locally.
+/// current capacity, the snapshots held locally, and the set of
+/// sandbox_ids the host currently has live in its `SandboxBackend`.
+///
+/// `running_sandboxes` is the load-bearing input to ADR 0009's
+/// reconciliation pass: the coord intersects this against
+/// `sessions` rows where `host_id = this_host AND status = 'active'`,
+/// and any session whose sandbox is missing for N consecutive
+/// heartbeats transitions to `Idle` (if its latest snapshot is
+/// recoverable) or `Dead`.
 ///
 /// Pre-v5: this carried a `warm_pools: Vec<WarmPoolReport>` field
 /// that reported per-image-version warm-slot ready/target counts.
@@ -18,6 +26,12 @@ pub struct Heartbeat {
     pub sent_at: DateTime<Utc>,
     pub capacity: HostCapacityReport,
     pub local_snapshots: Vec<LocalSnapshotReport>,
+    /// Sandbox IDs currently live on this host (per `backend.list()`).
+    /// Empty on hosts that haven't enabled reconciliation yet (Phase 1
+    /// observation window) or where the backend returned an error.
+    /// ~12 B per id × ~50 sandboxes ≈ 600 B per heartbeat — trivial.
+    /// Ordered for deterministic test fixtures; the coord doesn't care.
+    pub running_sandboxes: Vec<SandboxId>,
     pub draining: bool,
 }
 
@@ -65,6 +79,7 @@ mod tests {
                 replicated: true,
                 last_accessed_at: Utc::now(),
             }],
+            running_sandboxes: vec![SandboxId::new(), SandboxId::new()],
             draining: false,
         }
     }
@@ -87,7 +102,22 @@ mod tests {
             original.local_snapshots[0].snapshot_id
         );
         assert!(back.local_snapshots[0].replicated);
+        assert_eq!(back.running_sandboxes, original.running_sandboxes);
         assert_eq!(back.draining, original.draining);
+    }
+
+    #[test]
+    fn empty_running_sandboxes_serializes_as_array() {
+        // ADR 0009: the coord's reconcile pass intersects the inbound
+        // `running_sandboxes` against expected-active sessions. An
+        // accidental `Option<Vec<_>>` or `skip_serializing_if` would
+        // make "host has no sandboxes" indistinguishable from "host
+        // didn't send the field," which would mis-flip every session
+        // on the host. Pin the wire shape.
+        let mut h = sample();
+        h.running_sandboxes.clear();
+        let v: serde_json::Value = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["running_sandboxes"], serde_json::json!([]));
     }
 
     #[test]

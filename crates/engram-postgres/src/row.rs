@@ -92,6 +92,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         }),
         _ => None,
     };
+    let recoverable: bool = row.try_get("recoverable").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: SessionId(session_id),
@@ -102,6 +103,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         last_accessed_at,
         disk_manifest,
         memory_manifest,
+        recoverable,
     })
 }
 

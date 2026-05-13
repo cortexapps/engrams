@@ -9,21 +9,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::SandboxBackend;
-use engram_core::HostId;
+use engram_core::{HostId, SandboxId};
 use engram_protocol::heartbeat::Heartbeat;
 use engram_protocol::server::{HostAdminHandler, HostSession};
 use engram_protocol::wire::NotifyKind;
 use engram_protocol::{HostCapacityReport, LocalSnapshotReport};
+use futures::future::BoxFuture;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header;
 
-/// Callback the dialer invokes on each heartbeat tick. Returns the
-/// fresh state the host wants to publish: capacity / local snapshots
-/// / draining flag. Callers (the HostAgent) close over their backend
-/// state so the WS payload always reflects the current state.
-pub type HeartbeatProvider =
-    Arc<dyn Fn() -> (HostCapacityReport, Vec<LocalSnapshotReport>, bool) + Send + Sync>;
+/// Per-tick state assembled by the host and shipped in `Heartbeat`.
+/// Async-returned so callers can await `backend.list()` (the source
+/// of truth for [`HeartbeatPayload::running_sandboxes`], the input
+/// to the coord's ADR 0009 reconcile pass).
+pub struct HeartbeatPayload {
+    pub capacity: HostCapacityReport,
+    pub local_snapshots: Vec<LocalSnapshotReport>,
+    pub running_sandboxes: Vec<SandboxId>,
+    pub draining: bool,
+}
+
+/// Callback the dialer invokes on each heartbeat tick. Async so the
+/// implementation can await `backend.list()` directly without
+/// blocking the tick thread. Returns the fresh state the host wants
+/// to publish.
+pub type HeartbeatProvider = Arc<dyn Fn() -> BoxFuture<'static, HeartbeatPayload> + Send + Sync>;
 
 /// Configuration for [`run_dialer`]. Pulled out of HostAgentConfig so
 /// it stays self-contained.
@@ -162,16 +173,22 @@ async fn heartbeat_loop(
     tick.tick().await; // first tick fires immediately; skip
     loop {
         tick.tick().await;
-        let (capacity, local_snapshots, draining) = match provider.as_ref() {
-            Some(f) => f(),
-            None => (HostCapacityReport::default(), Vec::new(), false),
+        let payload = match provider.as_ref() {
+            Some(f) => f().await,
+            None => HeartbeatPayload {
+                capacity: HostCapacityReport::default(),
+                local_snapshots: Vec::new(),
+                running_sandboxes: Vec::new(),
+                draining: false,
+            },
         };
         let hb = Heartbeat {
             host_id,
             sent_at: chrono::Utc::now(),
-            capacity,
-            local_snapshots,
-            draining,
+            capacity: payload.capacity,
+            local_snapshots: payload.local_snapshots,
+            running_sandboxes: payload.running_sandboxes,
+            draining: payload.draining,
         };
         if let Err(e) = session.notify(NotifyKind::Heartbeat(hb)).await {
             tracing::debug!(error = %e, "heartbeat send failed; stopping loop");

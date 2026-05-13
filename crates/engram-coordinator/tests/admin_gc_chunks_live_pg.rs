@@ -165,5 +165,6 @@ fn snapshot_for(session_id: SessionId, disk_manifest: Option<ManifestRef>) -> Sn
         last_accessed_at: Utc::now(),
         disk_manifest,
         memory_manifest: None,
+        recoverable: false,
     }
 }

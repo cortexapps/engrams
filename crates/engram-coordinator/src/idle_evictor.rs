@@ -140,6 +140,9 @@ pub async fn evict_idle_session(
         // ADR 0007: chunked manifests are the durability primitive.
         disk_manifest: metadata.disk_manifest,
         memory_manifest: metadata.memory_manifest,
+        // ADR 0009: Phase 2 flips this true after BlobStorage
+        // HEAD-verify; Phase 1 leaves it default-false.
+        recoverable: false,
     };
     state
         .services
