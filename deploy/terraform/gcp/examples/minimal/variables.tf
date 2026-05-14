@@ -15,10 +15,10 @@ variable "name_prefix" {
   default     = "engram-dev"
 }
 
-variable "coordinator_endpoint" {
-  type        = string
-  description = "ws:// or wss:// URL host-agents dial to reach the coord. Internal LB or service-mesh entry — never the public ingress."
-  default     = ""
+variable "coordinator_port" {
+  type        = number
+  description = "Port the coord's internal LB listens on. Matches the Helm chart's `service.port` (default 8080)."
+  default     = 8080
 }
 
 variable "coordinator_token" {

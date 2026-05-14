@@ -28,10 +28,18 @@ After `terraform apply`:
   snapshots), with a dedicated GSA that owns read+write on it.
 - A KMS key the coord uses for envelope-encrypting registry
   credentials + session secrets.
+- A **reserved internal IP** (`google_compute_address`,
+  `address_type = INTERNAL`, purpose `SHARED_LOADBALANCER_VIP`)
+  that the coord's K8s Service of type LoadBalancer will bind to
+  once Helm installs. Surfacing it as a Terraform resource lets the
+  FC host MIG be pointed at the address *before* the Service
+  exists — the host-agents retry their dial harmlessly until Helm
+  binds the LB.
 - A regional MIG of FC-capable VMs running the
-  `engram-host-agent` systemd unit. Auto-healing, autoscaling on
-  CPU, rolling updates with the per-host drain hook so sessions
-  migrate gracefully on replacement.
+  `engram-host-agent` systemd unit, already configured with the
+  reserved IP as `ENGRAM_COORDINATOR_ENDPOINT`. Auto-healing,
+  autoscaling on CPU, rolling updates with the per-host drain
+  hook so sessions migrate gracefully on replacement.
 - Per-host instance SA with the IAM grants needed to read+write
   chunks + decrypt registry creds via Workload Identity.
 - A coordinator SA + IAM scaffolding so the Helm chart's
@@ -53,25 +61,29 @@ pieces that are *specific to Engram*.
 
 ## Apply order
 
-The Helm chart for the coord needs the GKE cluster + Cloud SQL +
-Secret Manager entries in place first, so the recommended order:
+The chicken-and-egg between "MIG needs to know where the coord
+lives" and "Helm assigns the coord's LB IP" is broken by reserving
+the IP in Terraform up front. One TF apply, one Helm install:
 
 1. Build the host image with Packer (`deploy/packer/`) — produces
    the GCE image family the MIG consumes.
 2. Provision the supporting infra (GKE, Cloud SQL, Secret
    Manager) — out of scope for this reference.
 3. `terraform apply` in `examples/minimal/` — VPC, bucket, KMS,
-   MIG, coordinator SA. Outputs the values the Helm chart needs.
-4. `helm install` the coordinator + optional web (`deploy/helm/engram/`)
-   using those outputs.
-5. Reserve the coord's internal LB IP up front via
-   `google_compute_address` (purpose `SHARED_LOADBALANCER_VIP`,
-   address_type `INTERNAL`) and pass it to the MIG as
-   `coordinator_endpoint` *and* to Helm via
-   `serviceInternal.loadBalancerIP`. One `terraform apply` provisions
-   the MIG (host-agents will retry their dial until the LB lands);
-   one `helm install` binds the Service to the reserved IP and the
-   hosts connect.
+   reserved internal LB IP, MIG (already pointed at that IP),
+   coordinator SA. Capture the outputs (chunks bucket name, KEK
+   resource path, GSA email, **coordinator_internal_lb_ip**).
+4. `helm install` the chart (`deploy/helm/engram/`) with the TF
+   outputs threaded into values:
+   - `blob.gcs.bucket = <chunks_bucket>`
+   - `kek.gcpResource = <kek_resource>`
+   - `serviceAccount.annotations."iam.gke.io/gcp-service-account" = <coordinator_sa_email>`
+   - `serviceInternal.loadBalancerIP = <coordinator_internal_lb_ip>`
+5. FC host-agents reconnect on their next backoff tick (worst case
+   ~30s after the LB attaches). Verify via the coord's logs:
+   `kubectl logs -n engram deploy/engram-coordinator | grep 'Host registered'`.
+
+No second `terraform apply` is needed.
 
 ## Cloud-agnostic contract
 

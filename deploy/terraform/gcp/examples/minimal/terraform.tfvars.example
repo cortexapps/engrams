@@ -2,12 +2,10 @@ project_id  = "your-gcp-project"
 region      = "us-central1"
 name_prefix = "engram-dev"
 
-# Where host-agents dial. For a real deployment this is the
-# internal LB URL of the coord, prefixed with `ws://` or `wss://`.
-# Leave empty for a first plan/apply that only builds the
-# infrastructure; fill in once Helm install gives you the address.
-coordinator_endpoint = ""
-coordinator_token    = ""
+# Bearer token the FC host-agents send on WS upgrade. Must match one
+# of the comma-separated entries in the coord's ENGRAM_AUTH_TOKENS
+# Secret. Generate with `openssl rand -hex 32`.
+coordinator_token = ""
 
 host_count        = 3
 host_machine_type = "n2-standard-8"

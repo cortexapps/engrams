@@ -23,6 +23,16 @@ output "fc_host_instance_sa_email" {
   value       = module.fc_host_mig.instance_sa_email
 }
 
+output "coordinator_internal_lb_ip" {
+  description = "Reserved internal IP for the coord's K8s Service of type LoadBalancer. Pass to Helm as `serviceInternal.loadBalancerIP`."
+  value       = google_compute_address.coord_internal.address
+}
+
+output "coordinator_endpoint" {
+  description = "Full `ws://` URL the FC host MIG is already configured to dial. Use it to point CLI smoke-tests at the same internal LB."
+  value       = local.coordinator_endpoint
+}
+
 output "fc_host_mig_name" {
   description = "MIG name. `gcloud compute instance-groups managed describe <this>` to see fleet state."
   value       = module.fc_host_mig.mig_name

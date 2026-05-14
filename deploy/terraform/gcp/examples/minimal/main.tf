@@ -79,6 +79,30 @@ resource "google_service_account" "coordinator" {
   display_name = "Engram coordinator (${var.name_prefix})"
 }
 
+# Reserved internal IP for the coord's K8s Service of type
+# LoadBalancer (the `<release>-coordinator-internal` Service in the
+# Helm chart). Reserving the address in Terraform lets us pass it to
+# both the FC host MIG (as coordinator_endpoint) AND to Helm (via
+# `serviceInternal.loadBalancerIP`) before the cluster comes up, so
+# the bring-up is one `terraform apply` + one `helm install` with no
+# circular dependency.
+#
+# `SHARED_LOADBALANCER_VIP` is the right purpose for a GCE internal
+# LB consumed by a K8s Service. The address sits idle until Helm
+# binds the Service to it; once bound, FC host-agents that have been
+# retrying their dial connect on the next attempt.
+resource "google_compute_address" "coord_internal" {
+  name         = "${var.name_prefix}-coord-internal"
+  region       = var.region
+  subnetwork   = module.network.subnet_self_link
+  address_type = "INTERNAL"
+  purpose      = "SHARED_LOADBALANCER_VIP"
+}
+
+locals {
+  coordinator_endpoint = "ws://${google_compute_address.coord_internal.address}:${var.coordinator_port}"
+}
+
 # Coord needs:
 # - read+write on the chunks bucket (so it can run GC + bake-push)
 # - Encrypt/Decrypt on the KEK
@@ -108,7 +132,7 @@ module "fc_host_mig" {
   machine_type         = var.host_machine_type
   chunks_user_id       = module.storage.chunks_user_id
   chunks_bucket        = module.storage.bucket_name
-  coordinator_endpoint = var.coordinator_endpoint
+  coordinator_endpoint = local.coordinator_endpoint
   coordinator_token    = var.coordinator_token
   target_size          = var.host_count
 }
