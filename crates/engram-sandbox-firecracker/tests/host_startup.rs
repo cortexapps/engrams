@@ -84,8 +84,8 @@ async fn host_startup_no_proxy_is_idempotent_and_lacks_redirect() {
     }
     cleanup();
 
-    host_startup(None).await.expect("first host_startup");
-    host_startup(None).await.expect("second host_startup");
+    host_startup(None, None).await.expect("first host_startup");
+    host_startup(None, None).await.expect("second host_startup");
 
     let dump = iptables_save();
     // Hard-isolation rules present.
@@ -121,7 +121,7 @@ async fn host_startup_with_proxy_adds_redirect_and_default_deny() {
     }
     cleanup();
 
-    host_startup(Some(9443)).await.expect("host_startup");
+    host_startup(Some(9443), None).await.expect("host_startup");
 
     let dump = iptables_save();
     assert!(dump.contains("engram-proxy-redirect"));
