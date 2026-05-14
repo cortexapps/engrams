@@ -67,14 +67,21 @@ use super::slot::{NbdSlot, NbdSlotAllocator};
 // `_IO(0xab, N)` source convention — clippy's identity_op fires
 // even though removing them would change nothing.
 
+// Typed as `libc::Ioctl` (NOT `u64`) so the same `libc::ioctl` call
+// site type-checks on glibc (`Ioctl = c_ulong`) AND musl
+// (`Ioctl = c_int`). The OSS CI cross-musl lane only covers
+// agentd/bootstrap/harness binaries today, so musl-build of the
+// host-agent first showed this gap in the bake CI. All these NBD
+// command numbers are small (`(0xab << 8) | N`, max ~44_000) so the
+// values fit either width without a cast.
 #[allow(clippy::identity_op)]
-const NBD_SET_SOCK: u64 = (0xab << 8) | 0;
-const NBD_SET_BLKSIZE: u64 = (0xab << 8) | 1;
-const NBD_DO_IT: u64 = (0xab << 8) | 3;
-const NBD_CLEAR_SOCK: u64 = (0xab << 8) | 4;
-const NBD_SET_SIZE_BLOCKS: u64 = (0xab << 8) | 7;
-const NBD_DISCONNECT: u64 = (0xab << 8) | 8;
-const NBD_SET_FLAGS: u64 = (0xab << 8) | 10;
+const NBD_SET_SOCK: libc::Ioctl = (0xab << 8) | 0;
+const NBD_SET_BLKSIZE: libc::Ioctl = (0xab << 8) | 1;
+const NBD_DO_IT: libc::Ioctl = (0xab << 8) | 3;
+const NBD_CLEAR_SOCK: libc::Ioctl = (0xab << 8) | 4;
+const NBD_SET_SIZE_BLOCKS: libc::Ioctl = (0xab << 8) | 7;
+const NBD_DISCONNECT: libc::Ioctl = (0xab << 8) | 8;
+const NBD_SET_FLAGS: libc::Ioctl = (0xab << 8) | 10;
 
 /// `NBD_FLAG_HAS_FLAGS` bit. Required so the kernel honours the
 /// other capability bits we set. From `<linux/nbd.h>`.
@@ -365,7 +372,7 @@ pub async fn spawn(
 /// Run an NBD ioctl that takes a u64 argument. The kernel reads
 /// the argument as a `unsigned long`, so we pass it as `u64` and
 /// `libc::ioctl` handles the platform-specific width.
-fn ioctl_set(fd: RawFd, cmd: u64, arg: u64) -> io::Result<()> {
+fn ioctl_set(fd: RawFd, cmd: libc::Ioctl, arg: u64) -> io::Result<()> {
     // SAFETY: fd is an owned, valid kernel fd handed in by the
     // caller. NBD ioctl numbers don't carry direction bits — the
     // kernel reads `arg` as `unsigned long`, which is u64 on

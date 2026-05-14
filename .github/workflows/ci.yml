@@ -216,6 +216,20 @@ jobs:
             -p engram-harness-noop \
             -p engram-harness-claude
 
+      # The FC host image bake (private deploy repo's
+      # bake-fc-host-image workflow) ships this binary into the GCE
+      # image. Without this lane, musl regressions in host-agent
+      # only surface during a bake, which is too late. `libc::Ioctl`
+      # has a different width on musl (`c_int`) vs glibc (`c_ulong`)
+      # so anything passing raw `u64` ioctl numbers won't catch this
+      # on the gnu workspace check.
+      - name: build engram-host-agent (musl)
+        run: |
+          cargo build \
+            --target x86_64-unknown-linux-musl \
+            --release \
+            -p engram-host-agent
+
   web:
     name: web (pnpm)
     runs-on: blacksmith-2vcpu-ubuntu-2404
