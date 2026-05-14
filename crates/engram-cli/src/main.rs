@@ -1150,11 +1150,16 @@ async fn image_build(
     // NOT touch Postgres — once pushed, the image is reachable to
     // engram by URI alone. The auth resolver wired into the host-
     // agent's OCI client handles credential lookup at pull time.
-    // Anonymous push works for `localhost:5001` and other public
-    // registries; private targets need a `docker login`-equivalent
-    // upstream of this command (the CLI itself doesn't auth pushes).
+    //
+    // Push auth comes from the standard docker config — run
+    // `docker login <registry>` upstream and the creds get picked
+    // up. With no docker config the resolver returns no creds and
+    // the push falls through to anonymous (works for
+    // `localhost:5001` and public registries).
     if let Some(target) = push {
-        let oci = engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::AnonymousResolver));
+        let oci = engram_oci::OciClient::new(std::sync::Arc::new(
+            engram_oci::DockerConfigResolver::new(),
+        ));
         let push = builder
             .push_to_registry(&oci, &req, &outcome, target)
             .await
@@ -1354,7 +1359,14 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
 /// coordinator's encrypted creds resolver lands when that's
 /// genuinely needed.
 async fn harness_push(from: &Path, to: &str) -> Result<(), CliError> {
-    let oci = engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::AnonymousResolver));
+    // Auth via the standard docker config — run `docker login`
+    // upstream (locally via the docker CLI, in CI via
+    // `docker/login-action@v3` or equivalent). No docker config =
+    // anonymous push, which works for `localhost:5001` and public
+    // registries.
+    let oci = engram_oci::OciClient::new(std::sync::Arc::new(
+        engram_oci::DockerConfigResolver::new(),
+    ));
     tracing::info!(uri = %to, dir = %from.display(), "pushing harness pack");
     let digest = oci
         .push_harness(to, from)

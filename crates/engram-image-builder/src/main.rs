@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
-use engram_oci::{AnonymousResolver, OciClient};
+use engram_oci::{DockerConfigResolver, OciClient};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -147,13 +147,16 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
     let outcome = builder.build(&req).await?;
     println!("{}", outcome.image_dir.display());
 
-    // Optional: push to a Docker registry. The `--push` binary CLI
-    // only handles anonymous registries (local registry:2 / public
-    // registries). Authenticated push to a private registry needs
-    // a `docker login`-equivalent upstream of this command — the
-    // baker doesn't carry credentials.
+    // Optional: push to a Docker registry. Auth is read from the
+    // standard docker config (`$DOCKER_CONFIG/config.json` or
+    // `~/.docker/config.json`). Run `docker login <registry>`
+    // upstream of this command to populate it; CI can use any of
+    // the docker/login-action equivalents to drop creds into the
+    // same file. With no docker config present, the resolver
+    // returns no creds and the push falls through to anonymous —
+    // matches the previous behaviour for public/local registries.
     if let Some(target) = opts.push.as_deref() {
-        let oci = OciClient::new(Arc::new(AnonymousResolver));
+        let oci = OciClient::new(Arc::new(DockerConfigResolver::new()));
         let push = builder
             .push_to_registry(&oci, &req, &outcome, target)
             .await?;
