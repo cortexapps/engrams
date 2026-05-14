@@ -158,10 +158,15 @@ resource "google_compute_region_instance_group_manager" "fc_host" {
   }
 
   update_policy {
-    type                  = "PROACTIVE"
-    minimal_action        = "REPLACE"
+    type           = "PROACTIVE"
+    minimal_action = "REPLACE"
+    # GCP rejects rolling updates with surge=0 AND unavailable=0.
+    # Default behaviour: drain-then-create (surge 0, unavailable 1,
+    # brief capacity dip during rolls). When operator opts into
+    # parallel-zonal rolling by setting `update_max_surge >= zones`,
+    # flip unavailable to 0 so capacity never drops.
     max_surge_fixed       = var.update_max_surge
-    max_unavailable_fixed = 0
+    max_unavailable_fixed = var.update_max_surge == 0 ? 1 : 0
     # Drain hook (in the image) coordinates with the coord to
     # migrate sessions off before SIGTERM. 5min is enough for
     # the heaviest sessions; bump if your image carries multi-GB
