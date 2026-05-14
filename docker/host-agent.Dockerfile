@@ -10,7 +10,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p engram-host-agent \
     && cp target/release/engram-host-agent /tmp/engram-host-agent
 
-FROM debian:bookworm-slim
+# Trixie matches the builder's glibc — bookworm (2.36) refuses
+# binaries linked against trixie's glibc 2.39+.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

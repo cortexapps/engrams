@@ -10,7 +10,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p engram-coordinator \
     && cp target/release/engram-coordinator /tmp/engram-coordinator
 
-FROM debian:bookworm-slim
+# Trixie matches the glibc version `rust:1.95-slim` builds against
+# (currently 2.39). bookworm (2.36) would refuse to load the binary
+# with: `version GLIBC_2.39 not found`.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
