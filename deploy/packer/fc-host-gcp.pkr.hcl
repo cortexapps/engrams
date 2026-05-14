@@ -68,9 +68,9 @@ variable "source_image_family" {
 }
 
 variable "source_image_project_id" {
-  type        = string
-  description = "Project that hosts the source image family."
-  default     = "debian-cloud"
+  type        = list(string)
+  description = "Projects searched (in order) for `source_image_family`. The plugin's `googlecompute` source treats this as a fallback chain; a single-element list is the normal case."
+  default     = ["debian-cloud"]
 }
 
 variable "host_agent_gcs_url" {
