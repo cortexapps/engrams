@@ -124,9 +124,7 @@ impl RegistryAuthResolver for DockerConfigResolver {
             format!("https://{registry_host}/v2/"),
         ];
 
-        let entry = candidates
-            .iter()
-            .find_map(|k| config.auths.get(k.as_str()));
+        let entry = candidates.iter().find_map(|k| config.auths.get(k.as_str()));
 
         let Some(entry) = entry else {
             return Ok(None);

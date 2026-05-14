@@ -1364,9 +1364,8 @@ async fn harness_push(from: &Path, to: &str) -> Result<(), CliError> {
     // `docker/login-action@v3` or equivalent). No docker config =
     // anonymous push, which works for `localhost:5001` and public
     // registries.
-    let oci = engram_oci::OciClient::new(std::sync::Arc::new(
-        engram_oci::DockerConfigResolver::new(),
-    ));
+    let oci =
+        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
     tracing::info!(uri = %to, dir = %from.display(), "pushing harness pack");
     let digest = oci
         .push_harness(to, from)
