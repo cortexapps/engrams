@@ -160,7 +160,7 @@ resource "google_compute_region_instance_group_manager" "fc_host" {
   update_policy {
     type                  = "PROACTIVE"
     minimal_action        = "REPLACE"
-    max_surge_fixed       = 1
+    max_surge_fixed       = var.update_max_surge
     max_unavailable_fixed = 0
     # Drain hook (in the image) coordinates with the coord to
     # migrate sessions off before SIGTERM. 5min is enough for

@@ -166,6 +166,20 @@ variable "artifact_registry_repo_id" {
   default     = ""
 }
 
+variable "update_max_surge" {
+  type        = number
+  description = <<-EOT
+    `update_policy.max_surge_fixed` for the regional MIG. Regional
+    MIGs reject any value that isn't 0 or >= the number of zones in
+    the region (most US regions have 3 zones; us-central1 has 4).
+    Default 0 = drain-then-create rolling (no surge cost, brief
+    capacity dip). Set to >= number_of_zones for parallel zonal
+    rolls (no capacity dip, but pays for N extra hosts during the
+    rollout window).
+  EOT
+  default     = 0
+}
+
 variable "autoscale" {
   type = object({
     enabled      = bool
