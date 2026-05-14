@@ -19,9 +19,8 @@ export function HostManifest({ hosts }: { hosts: HostView[] | undefined }) {
             className="font-display italic"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            No hosts have registered yet. The coordinator runs in
-            single-process mode under <code className="font-mono">just dev</code>;
-            it will appear here on first heartbeat.
+            No hosts have registered yet. Hosts appear here once they
+            boot and complete their first heartbeat.
           </p>
         )}
       </div>
