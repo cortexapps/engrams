@@ -259,12 +259,18 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        // `ORDER BY id` is the cheapest stable sort: id is the PK, so
+        // the index walk is free, and UUIDs give a deterministic order
+        // across heartbeats. Without this, the heap-scan order shifts
+        // every ~5s as `UPDATE ... last_heartbeat_at = NOW()` touches
+        // rows, which makes the SPA's host list flip-flop on each poll.
         let rows = sqlx::query(
             r#"
             SELECT id, hostname, cloud_metadata,
                    capacity_total_gb, capacity_used_gb,
                    last_heartbeat_at, status
             FROM hosts WHERE status IN ('ready','draining')
+            ORDER BY id
             "#,
         )
         .fetch_all(&self.pool)
