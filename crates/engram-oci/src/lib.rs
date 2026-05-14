@@ -36,9 +36,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod chunk_resolver;
+pub mod docker_config;
 pub mod media_types;
 
 pub use chunk_resolver::{OciBlobLocator, OciChunkIndex, OciChunkResolver};
+pub use docker_config::DockerConfigResolver;
 pub use media_types::*;
 
 /// Resolves auth credentials for a given registry host.

@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 engram-chunk-store.workspace = true
 futures.workspace = true

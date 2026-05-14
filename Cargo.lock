@@ -1101,6 +1101,7 @@ name = "engram-oci"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "engram-chunk-store",
  "flate2",
