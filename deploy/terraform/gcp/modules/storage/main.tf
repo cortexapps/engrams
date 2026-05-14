@@ -40,20 +40,11 @@ resource "google_storage_bucket" "chunks" {
   })
 }
 
-# Service account that the coord + every host-agent's WI binding
-# maps to. Centralised here so the bucket's IAM grants name a
-# single principal rather than enumerating per-cluster KSAs.
-resource "google_service_account" "chunks_user" {
-  account_id   = var.user_sa_account_id
-  display_name = "Engram chunk-bucket reader/writer (${var.bucket_name})"
-}
-
-# Object-level R/W on the chunks bucket. The coord uses this for
-# the legacy seal-pipeline (Stage 4, retiring with Phase 7) and
-# the new chunk store. Host-agents use it for chunk reads +
-# session-time snapshot writes.
-resource "google_storage_bucket_iam_member" "chunks_rw" {
-  bucket = google_storage_bucket.chunks.name
-  role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.chunks_user.email}"
-}
+# IAM bindings live at the caller, not here. Each consumer (coord
+# GSA, every host-MIG instance SA) gets `roles/storage.objectAdmin`
+# on this bucket directly. The previous design wired a single
+# `chunks_user` SA + `tokenCreator` impersonation chain, but the
+# host-agent's GCS client uses ADC without impersonating, so the
+# chain was never walked and consumers 403'd. Dropping the
+# indirection keeps the model simple and matches what actually
+# happens at call time.

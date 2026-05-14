@@ -13,11 +13,6 @@ output "coordinator_sa_email" {
   value       = google_service_account.coordinator.email
 }
 
-output "chunks_user_sa_email" {
-  description = "Bind to the coord's KSA via WI so the coord can act as this SA when talking to GCS."
-  value       = module.storage.chunks_user_email
-}
-
 output "fc_host_instance_sa_email" {
   description = "Per-host SA — already attached to MIG instances."
   value       = module.fc_host_mig.instance_sa_email

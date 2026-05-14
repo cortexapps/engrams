@@ -15,12 +15,6 @@ variable "force_destroy" {
   default     = false
 }
 
-variable "user_sa_account_id" {
-  type        = string
-  description = "Account_id (no domain suffix) for the SA that reads + writes chunks."
-  default     = "engram-chunks-user"
-}
-
 variable "labels" {
   type        = map(string)
   description = "Labels merged into bucket + child resources."

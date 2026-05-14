@@ -71,11 +71,6 @@ variable "instance_sa_account_id" {
   default     = "engram-fc-host"
 }
 
-variable "chunks_user_id" {
-  type        = string
-  description = "Fully-qualified resource id of the chunks-bucket user SA. Output of the `storage` module."
-}
-
 variable "chunks_bucket" {
   type        = string
   description = "Name of the GCS chunks bucket. Output of the `storage` module."

@@ -46,9 +46,8 @@ module "storage" {
 
   # GCS bucket names must be globally unique; suffix with random
   # so two test deploys don't collide.
-  bucket_name        = "${var.name_prefix}-chunks-${random_string.suffix.result}"
-  location           = var.region
-  user_sa_account_id = "${var.name_prefix}-chunks-user"
+  bucket_name = "${var.name_prefix}-chunks-${random_string.suffix.result}"
+  location    = var.region
   labels = {
     env = var.name_prefix
   }
@@ -130,11 +129,20 @@ module "fc_host_mig" {
   subnet_self_link     = module.network.subnet_self_link
   iap_target_tag       = module.network.iap_target_tag
   machine_type         = var.host_machine_type
-  chunks_user_id       = module.storage.chunks_user_id
   chunks_bucket        = module.storage.bucket_name
   coordinator_endpoint = local.coordinator_endpoint
   coordinator_token    = var.coordinator_token
   target_size          = var.host_count
+}
+
+# Host instance SA needs objectAdmin on the chunks bucket — the
+# host-agent reads chunks + writes session-time snapshots through
+# GCS. ADC on GCE uses the instance SA directly, so this grant has
+# to name `instance_sa_email` (no impersonation chain).
+resource "google_storage_bucket_iam_member" "host_chunks_rw" {
+  bucket = module.storage.bucket_name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${module.fc_host_mig.instance_sa_email}"
 }
 
 # Host instance SA also needs Encrypt/Decrypt on the KEK for the

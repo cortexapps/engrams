@@ -57,16 +57,12 @@ resource "google_project_iam_member" "metric_writer" {
   member  = "serviceAccount:${google_service_account.fc_host.email}"
 }
 
-# The host needs read+write on the chunks bucket. We expect the
-# caller to grant that on the bucket itself (the storage module
-# does this for its own GSA; this module binds the host SA to
-# it via service-account-token-creator so the host can act as
-# that bucket SA — Workload Identity for GCE).
-resource "google_service_account_iam_member" "host_acts_as_chunks_user" {
-  service_account_id = var.chunks_user_id
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "serviceAccount:${google_service_account.fc_host.email}"
-}
+# The host needs read+write on the chunks bucket. Grant that
+# directly at the caller — bind `${instance_sa_email}` (this
+# module's output) to `roles/storage.objectAdmin` on the bucket.
+# We don't do it here because the bucket lives in a sibling module
+# and threading another required input through this one to lift
+# the binding into here adds API surface without value.
 
 # Optional: read-only on Artifact Registry so the host-agent can
 # pull harness packs + images by URI. Skipped if the caller
