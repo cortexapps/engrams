@@ -25,12 +25,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::cert_mint::CertMint;
 use crate::registry::{Decision, Registry};
 use crate::resolver::{default_resolver, UpstreamResolver};
-use crate::{bypass, intercept, sni};
+use crate::{bypass, dns, intercept, sni};
 
 /// How long we'll spend reading the TLS ClientHello before giving up.
 const SNI_PEEK_BUDGET: Duration = Duration::from_secs(5);
@@ -48,18 +48,33 @@ pub struct ProxyConfig {
     /// `SystemResolver` (host's DNS). Tests pass a `StaticResolver`
     /// to point a fixed hostname at a loopback fixture.
     pub resolver: Arc<dyn UpstreamResolver>,
+    /// Where the filtering DNS proxy listens (both UDP and TCP).
+    /// `None` disables the DNS path entirely — iptables would then
+    /// need to keep the unconditional `ACCEPT VM→1.1.1.1:53` rules
+    /// so the guest can resolve at all, accepting the DNS-exfil
+    /// channel. Production sets `Some(0.0.0.0:53)` and pairs it
+    /// with iptables `REDIRECT VM→{udp,tcp}/53 → :53`.
+    pub dns_bind_addr: Option<SocketAddr>,
+    /// Upstream resolver the DNS proxy forwards allowed queries to.
+    /// Defaults to Cloudflare's 1.1.1.1:53.
+    pub dns_upstream: SocketAddr,
 }
 
 impl ProxyConfig {
     /// Convenience constructor: production wiring with the system
     /// DNS resolver and the bind addr / registry / mint the caller
-    /// provides.
+    /// provides. DNS filter on by default at port 53 with 1.1.1.1
+    /// upstream — disable by setting `dns_bind_addr = None`.
     pub fn new(bind_addr: SocketAddr, registry: Arc<Registry>, mint: Arc<CertMint>) -> Self {
         Self {
             bind_addr,
             registry,
             mint,
             resolver: default_resolver(),
+            dns_bind_addr: Some("0.0.0.0:53".parse().expect("dns bind default parses")),
+            dns_upstream: dns::DEFAULT_UPSTREAM
+                .parse()
+                .expect("dns upstream default parses"),
         }
     }
 }
@@ -89,6 +104,40 @@ impl Proxy {
         let resolver = self.cfg.resolver.clone();
         let server_cfg = self.server_cfg.clone();
         let client_cfg = self.client_cfg.clone();
+
+        // Spawn the filtering DNS proxy. Bound on udp/53 + tcp/53
+        // (via the same dns_bind_addr); iptables REDIRECTs guest
+        // DNS traffic here regardless of the upstream IP they pick.
+        if let Some(dns_addr) = self.cfg.dns_bind_addr {
+            let udp_sock = match UdpSocket::bind(dns_addr).await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::error!(addr = %dns_addr, error = %e, "DNS/udp bind failed");
+                    return Err(e);
+                }
+            };
+            let tcp_listener = match TcpListener::bind(dns_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(addr = %dns_addr, error = %e, "DNS/tcp bind failed");
+                    return Err(e);
+                }
+            };
+            let upstream = self.cfg.dns_upstream;
+            let registry_for_udp = registry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dns::serve_udp(udp_sock, registry_for_udp, upstream).await {
+                    tracing::error!(error = %e, "DNS/udp serve loop ended");
+                }
+            });
+            let registry_for_tcp = registry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dns::serve_tcp(tcp_listener, registry_for_tcp, upstream).await {
+                    tracing::error!(error = %e, "DNS/tcp serve loop ended");
+                }
+            });
+        }
+
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(p) => p,

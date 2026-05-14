@@ -143,6 +143,12 @@ tls-parser = "0.12"
 nom = "7"
 socket2 = "0.6"
 
+# DNS wire-format parsing (used by the egress proxy's udp/53 + tcp/53
+# listeners to enforce allow_hosts on resolution, not just on
+# connection). Just the proto layer — no server framework, no
+# resolver.
+hickory-proto = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

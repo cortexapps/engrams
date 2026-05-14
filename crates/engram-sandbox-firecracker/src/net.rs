@@ -252,37 +252,34 @@ pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
     }
 
     // 3. host-INPUT protection: VMs can't reach the host directly
-    //    (no DNS server bound on the gateway, no SSH, no coord HTTP).
-    //    EXCEPT: when proxy mode is on, the iptables REDIRECT in
-    //    PREROUTING rewrites the destination IP to localhost; the
-    //    rewritten packet still has the VM's source IP and hits the
-    //    INPUT chain on its way to the proxy's listening socket. So
-    //    we need an explicit ACCEPT for the proxy port before the
-    //    blanket DROP. Order matters: ACCEPT first, DROP after.
+    //    (no SSH, no coord HTTP). EXCEPT: when proxy mode is on,
+    //    the PREROUTING REDIRECT rewrites the destination IP to
+    //    localhost; the rewritten packet still has the VM's source
+    //    IP and hits the INPUT chain on its way to the proxy's
+    //    listening sockets. So we need explicit ACCEPTs for the
+    //    proxy's TCP/443 port AND its DNS port (53, both udp + tcp)
+    //    before the blanket DROP. Order matters: ACCEPT first,
+    //    DROP after.
     if let Some(port) = proxy_port {
         out.push(format!(
             "-A INPUT -s {pool} -p tcp --dport {port} -j ACCEPT \
              -m comment --comment engram-proxy-input",
+        ));
+        out.push(format!(
+            "-A INPUT -s {pool} -p udp --dport 53 -j ACCEPT \
+             -m comment --comment engram-proxy-dns-input",
+        ));
+        out.push(format!(
+            "-A INPUT -s {pool} -p tcp --dport 53 -j ACCEPT \
+             -m comment --comment engram-proxy-dns-input",
         ));
     }
     out.push(format!(
         "-A INPUT -s {pool} -j DROP -m comment --comment engram-host-input",
     ));
 
-    // 4. DNS allow to public resolver. The guest's resolv.conf points
-    //    at 1.1.1.1; the proxy resolves hostnames itself, so DNS
-    //    inside the VM only happens for app-level lookups.
-    out.push(format!(
-        "-A FORWARD -s {pool} -p udp --dport 53 -d {PUBLIC_DNS} \
-         -j ACCEPT -m comment --comment engram-dns",
-    ));
-    out.push(format!(
-        "-A FORWARD -s {pool} -p tcp --dport 53 -d {PUBLIC_DNS} \
-         -j ACCEPT -m comment --comment engram-dns",
-    ));
-
     if let Some(port) = proxy_port {
-        // 5a. PROXY mode: REDIRECT VM→tcp/443 to the local proxy
+        // 4a. PROXY mode: REDIRECT VM→tcp/443 to the local proxy
         //     port. -t nat -A PREROUTING with -i tap-engr-+ matches
         //     any of our TAPs (the `+` is iptables' wildcard).
         out.push(format!(
@@ -290,19 +287,53 @@ pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
              -j REDIRECT --to-port {port} \
              -m comment --comment engram-proxy-redirect",
         ));
-        // 5b. After the REDIRECT, the connection is destined for
+        // 4b. REDIRECT VM DNS (both transports) to the local DNS
+        //     proxy on :53. This catches queries to ANY upstream IP
+        //     the guest tries — 1.1.1.1, 8.8.8.8, even attacker-
+        //     controlled — and routes them through the filtering
+        //     proxy. The proxy then enforces `allow_hosts` on the
+        //     QNAME, closing the DNS-exfiltration channel. Without
+        //     these rules, the guest could resolve arbitrary names
+        //     even when every TCP connection downstream was blocked.
+        out.push(
+            "-t nat -A PREROUTING -i tap-engr-+ -p udp --dport 53 \
+             -j REDIRECT --to-port 53 \
+             -m comment --comment engram-dns-redirect"
+                .to_string(),
+        );
+        out.push(
+            "-t nat -A PREROUTING -i tap-engr-+ -p tcp --dport 53 \
+             -j REDIRECT --to-port 53 \
+             -m comment --comment engram-dns-redirect"
+                .to_string(),
+        );
+        // 4c. After the REDIRECT, the connection is destined for
         //     the host's local socket; iptables FORWARD doesn't
         //     see it. So we don't need a separate ACCEPT for that
         //     traffic. We DO still want to forbid any *other*
-        //     egress: drop everything else from the pool.
+        //     egress: drop everything else from the pool. Notably,
+        //     there's no longer an unconditional ACCEPT for
+        //     VM→1.1.1.1:53 — every DNS query must come through
+        //     the proxy via REDIRECT.
         out.push(format!(
             "-A FORWARD -s {pool} -j DROP \
              -m comment --comment engram-default-deny",
         ));
     } else {
-        // 5c. NO-PROXY mode: allow non-LAN egress (the host-LAN
-        //     drops above already filtered). MASQUERADE is what
-        //     makes return traffic come back to the right VM.
+        // 4d. NO-PROXY mode: allow DNS to a public resolver
+        //     unconditionally (operator opted out of egress
+        //     filtering altogether, and DNS still has to work for
+        //     anything in the VM to function). The host-LAN drops
+        //     above already filtered private subnets, and
+        //     MASQUERADE makes return traffic find the right VM.
+        out.push(format!(
+            "-A FORWARD -s {pool} -p udp --dport 53 -d {PUBLIC_DNS} \
+             -j ACCEPT -m comment --comment engram-dns",
+        ));
+        out.push(format!(
+            "-A FORWARD -s {pool} -p tcp --dport 53 -d {PUBLIC_DNS} \
+             -j ACCEPT -m comment --comment engram-dns",
+        ));
     }
 
     // 6. MASQUERADE on POSTROUTING — required regardless of proxy
@@ -672,6 +703,54 @@ mod tests {
         assert!(lines.contains("engram-default-deny"));
         assert!(lines.contains("--dport 9443 -j ACCEPT"));
         assert!(lines.contains("engram-proxy-input"));
+    }
+
+    #[test]
+    fn host_startup_with_proxy_redirects_dns_through_filtering_proxy() {
+        // The DNS-exfil close: no unconditional ACCEPT to a public
+        // resolver; instead, REDIRECT every guest DNS query to the
+        // local filtering proxy on :53 regardless of which upstream
+        // IP they chose.
+        let lines = host_startup_lines(Some(9443));
+        let joined = lines.join("\n");
+        // No more blanket ACCEPT for VM→1.1.1.1:53 in proxy mode.
+        assert!(
+            !joined.contains("--dport 53 -d 1.1.1.1"),
+            "proxy mode must not have an unconditional ACCEPT to 1.1.1.1:53; \
+             that's exactly the DNS-exfil channel this change closes",
+        );
+        // REDIRECT for both transports.
+        assert!(joined.contains("-i tap-engr-+ -p udp --dport 53"));
+        assert!(joined.contains("-i tap-engr-+ -p tcp --dport 53"));
+        // INPUT accept for the proxy's DNS port (so REDIRECTed
+        // packets aren't caught by the blanket VM-INPUT drop).
+        assert!(joined.contains("-p udp --dport 53 -j ACCEPT"));
+        assert!(joined.contains("-p tcp --dport 53 -j ACCEPT"));
+        // INPUT accepts (incl. DNS) must sit before the
+        // engram-host-input DROP.
+        let drop_idx = lines
+            .iter()
+            .position(|l| l.contains("engram-host-input"))
+            .expect("host-input drop present");
+        let dns_input_idx = lines
+            .iter()
+            .position(|l| l.contains("engram-proxy-dns-input"))
+            .expect("dns input accept present");
+        assert!(
+            dns_input_idx < drop_idx,
+            "DNS input ACCEPT must precede the engram-host-input DROP",
+        );
+    }
+
+    #[test]
+    fn host_startup_no_proxy_keeps_dns_to_public_resolver() {
+        // The operator opted out of filtering altogether; we keep
+        // the legacy "DNS allowed to 1.1.1.1" path so the VM can
+        // resolve at all. The DNS-exfil hole is exactly the price
+        // of `--egress-proxy-port=0`.
+        let lines = host_startup_lines(None).join("\n");
+        assert!(lines.contains("--dport 53 -d 1.1.1.1"));
+        assert!(!lines.contains("engram-dns-redirect"));
     }
 
     #[test]

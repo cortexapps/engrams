@@ -29,6 +29,7 @@ socket2.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
+hickory-proto.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

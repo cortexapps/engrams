@@ -18,6 +18,7 @@
 pub mod bypass;
 pub mod ca;
 pub mod cert_mint;
+pub mod dns;
 pub mod intercept;
 pub mod policy;
 pub mod proxy;
