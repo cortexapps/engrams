@@ -17,6 +17,24 @@
 #   never drop below target capacity. Combined with the drain
 #   hook, this gives zero-loss rolling deploys.
 
+# Used to default `update_policy.max_surge_fixed` to the region's
+# zone count — regional MIGs reject any non-zero max_surge/
+# max_unavailable that's smaller than the number of zones.
+data "google_compute_zones" "region" {
+  region = var.region
+}
+
+locals {
+  zone_count = length(data.google_compute_zones.region.names)
+
+  # Defaults to parallel-zonal rolling: surge = zone_count, no
+  # unavailable. Sessions migrate onto the new hosts before the
+  # old ones drain (the drain hook is in the host image).
+  # Operator-set values fall through unchanged.
+  effective_max_surge       = var.update_max_surge != null ? var.update_max_surge : local.zone_count
+  effective_max_unavailable = local.effective_max_surge > 0 ? 0 : local.zone_count
+}
+
 resource "google_service_account" "fc_host" {
   account_id   = var.instance_sa_account_id
   display_name = "Engram FC host instance SA"
@@ -160,13 +178,16 @@ resource "google_compute_region_instance_group_manager" "fc_host" {
   update_policy {
     type           = "PROACTIVE"
     minimal_action = "REPLACE"
-    # GCP rejects rolling updates with surge=0 AND unavailable=0.
-    # Default behaviour: drain-then-create (surge 0, unavailable 1,
-    # brief capacity dip during rolls). When operator opts into
-    # parallel-zonal rolling by setting `update_max_surge >= zones`,
-    # flip unavailable to 0 so capacity never drops.
-    max_surge_fixed       = var.update_max_surge
-    max_unavailable_fixed = var.update_max_surge == 0 ? 1 : 0
+    # Regional MIG constraints: each of max_surge / max_unavailable
+    # must be 0 OR >= the number of zones in the region. They can't
+    # both be 0. Default to parallel-zonal rolling (surge =
+    # zone_count, unavailable = 0) so the fleet temporarily grows
+    # by one host per zone during rollouts and sessions migrate to
+    # the new hosts before the old ones drain. Operators tune via
+    # `var.update_max_surge`; `unavailable` is derived to stay
+    # GCP-valid.
+    max_surge_fixed       = local.effective_max_surge
+    max_unavailable_fixed = local.effective_max_unavailable
     # Drain hook (in the image) coordinates with the coord to
     # migrate sessions off before SIGTERM. 5min is enough for
     # the heaviest sessions; bump if your image carries multi-GB

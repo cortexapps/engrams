@@ -171,13 +171,15 @@ variable "update_max_surge" {
   description = <<-EOT
     `update_policy.max_surge_fixed` for the regional MIG. Regional
     MIGs reject any value that isn't 0 or >= the number of zones in
-    the region (most US regions have 3 zones; us-central1 has 4).
-    Default 0 = drain-then-create rolling (no surge cost, brief
-    capacity dip). Set to >= number_of_zones for parallel zonal
-    rolls (no capacity dip, but pays for N extra hosts during the
-    rollout window).
+    the region. `null` (default) → auto-derive to the region's zone
+    count (parallel-zonal rolling, no capacity dip; pays for one
+    extra host per zone during rollouts). `0` → drain-then-create
+    (paired with `max_unavailable = zone_count` derived behind the
+    scenes; one zone's worth of capacity drains during each roll).
+    Any positive integer → operator-tuned; must be >= zone count.
   EOT
-  default     = 0
+  default     = null
+  nullable    = true
 }
 
 variable "autoscale" {
