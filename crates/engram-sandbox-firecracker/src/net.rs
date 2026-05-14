@@ -231,7 +231,15 @@ pub fn tap_name_for(sandbox_id: SandboxId) -> String {
 /// None (test/dev mode), VM egress to the public internet is
 /// allowed under the standard MASQUERADE; only host-LAN and
 /// inter-VM traffic is dropped.
-pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
+///
+/// `dns_port`: when proxy mode is on, where the filtering DNS proxy
+/// is bound. Iptables REDIRECTs guest `{udp,tcp}/53` to this port
+/// so the proxy can enforce `allow_hosts` on resolution. Defaults to
+/// 5353 if the caller passes `None` while proxy mode is on —
+/// matching the default in `engram-egress-proxy::ProxyConfig::new`
+/// (chosen to avoid the systemd-resolved bind on 127.0.0.53:53).
+pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec<String> {
+    let dns_port = dns_port.unwrap_or(DEFAULT_DNS_PORT);
     let pool = ENGRAM_POOL_CIDR;
     let mut out = Vec::new();
 
@@ -266,11 +274,11 @@ pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
              -m comment --comment engram-proxy-input",
         ));
         out.push(format!(
-            "-A INPUT -s {pool} -p udp --dport 53 -j ACCEPT \
+            "-A INPUT -s {pool} -p udp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
         ));
         out.push(format!(
-            "-A INPUT -s {pool} -p tcp --dport 53 -j ACCEPT \
+            "-A INPUT -s {pool} -p tcp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
         ));
     }
@@ -295,18 +303,16 @@ pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
         //     QNAME, closing the DNS-exfiltration channel. Without
         //     these rules, the guest could resolve arbitrary names
         //     even when every TCP connection downstream was blocked.
-        out.push(
+        out.push(format!(
             "-t nat -A PREROUTING -i tap-engr-+ -p udp --dport 53 \
-             -j REDIRECT --to-port 53 \
-             -m comment --comment engram-dns-redirect"
-                .to_string(),
-        );
-        out.push(
+             -j REDIRECT --to-port {dns_port} \
+             -m comment --comment engram-dns-redirect",
+        ));
+        out.push(format!(
             "-t nat -A PREROUTING -i tap-engr-+ -p tcp --dport 53 \
-             -j REDIRECT --to-port 53 \
-             -m comment --comment engram-dns-redirect"
-                .to_string(),
-        );
+             -j REDIRECT --to-port {dns_port} \
+             -m comment --comment engram-dns-redirect",
+        ));
         // 4c. After the REDIRECT, the connection is destined for
         //     the host's local socket; iptables FORWARD doesn't
         //     see it. So we don't need a separate ACCEPT for that
@@ -352,6 +358,11 @@ pub fn host_startup_lines(proxy_port: Option<u16>) -> Vec<String> {
 pub const ENGRAM_POOL_CIDR: &str = "10.200.0.0/16";
 
 const PUBLIC_DNS: &str = "1.1.1.1";
+
+/// Default port the filtering DNS proxy binds on. 5353 not 53 so
+/// the host's systemd-resolved (bound on 127.0.0.53:53) can keep
+/// running for the host's own name resolution.
+pub const DEFAULT_DNS_PORT: u16 = 5353;
 
 const HOST_LAN_BLOCK: &[&str] = &[
     "10.0.0.0/8",
@@ -446,7 +457,7 @@ async fn run_iptables(line: &str) -> Result<(), NetError> {
 /// `--comment` tag and we check-then-insert so a coord restart
 /// doesn't double up.
 #[cfg(target_os = "linux")]
-pub async fn host_startup(proxy_port: Option<u16>) -> Result<(), NetError> {
+pub async fn host_startup(proxy_port: Option<u16>, dns_port: Option<u16>) -> Result<(), NetError> {
     if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await {
         return Err(NetError::Spawn(
             "write /proc/sys/net/ipv4/ip_forward".into(),
@@ -468,7 +479,7 @@ pub async fn host_startup(proxy_port: Option<u16>) -> Result<(), NetError> {
             ));
         }
     }
-    for line in host_startup_lines(proxy_port) {
+    for line in host_startup_lines(proxy_port, dns_port) {
         // Idempotency check: replace the leading `-A`/`-I` with `-C`
         // (or skip altogether for non-rule meta commands like
         // create-chain — none of our lines do that today). Order:
@@ -544,7 +555,10 @@ pub async fn teardown(setup: &NetSetup, allocator: &parking_lot::Mutex<NetworkAl
 
 // Non-Linux stubs.
 #[cfg(not(target_os = "linux"))]
-pub async fn host_startup(_proxy_port: Option<u16>) -> Result<(), NetError> {
+pub async fn host_startup(
+    _proxy_port: Option<u16>,
+    _dns_port: Option<u16>,
+) -> Result<(), NetError> {
     Err(NetError::Spawn(
         "host_startup".into(),
         std::io::Error::new(
@@ -679,7 +693,7 @@ mod tests {
 
     #[test]
     fn host_startup_no_proxy_drops_lan_but_allows_internet() {
-        let lines = host_startup_lines(None).join("\n");
+        let lines = host_startup_lines(None, None).join("\n");
         // Inter-VM block.
         assert!(lines.contains("-s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP"));
         // Host-LAN drops.
@@ -697,7 +711,7 @@ mod tests {
 
     #[test]
     fn host_startup_with_proxy_redirects_443_and_default_denies() {
-        let lines = host_startup_lines(Some(9443)).join("\n");
+        let lines = host_startup_lines(Some(9443), None).join("\n");
         assert!(lines.contains("-i tap-engr-+ -p tcp --dport 443"));
         assert!(lines.contains("--to-port 9443"));
         assert!(lines.contains("engram-default-deny"));
@@ -709,9 +723,9 @@ mod tests {
     fn host_startup_with_proxy_redirects_dns_through_filtering_proxy() {
         // The DNS-exfil close: no unconditional ACCEPT to a public
         // resolver; instead, REDIRECT every guest DNS query to the
-        // local filtering proxy on :53 regardless of which upstream
-        // IP they chose.
-        let lines = host_startup_lines(Some(9443));
+        // local filtering proxy regardless of which upstream IP
+        // they chose.
+        let lines = host_startup_lines(Some(9443), Some(5353));
         let joined = lines.join("\n");
         // No more blanket ACCEPT for VM→1.1.1.1:53 in proxy mode.
         assert!(
@@ -719,13 +733,14 @@ mod tests {
             "proxy mode must not have an unconditional ACCEPT to 1.1.1.1:53; \
              that's exactly the DNS-exfil channel this change closes",
         );
-        // REDIRECT for both transports.
+        // REDIRECT for both transports, targeting the proxy's DNS port.
         assert!(joined.contains("-i tap-engr-+ -p udp --dport 53"));
         assert!(joined.contains("-i tap-engr-+ -p tcp --dport 53"));
+        assert!(joined.contains("--to-port 5353"));
         // INPUT accept for the proxy's DNS port (so REDIRECTed
         // packets aren't caught by the blanket VM-INPUT drop).
-        assert!(joined.contains("-p udp --dport 53 -j ACCEPT"));
-        assert!(joined.contains("-p tcp --dport 53 -j ACCEPT"));
+        assert!(joined.contains("-p udp --dport 5353 -j ACCEPT"));
+        assert!(joined.contains("-p tcp --dport 5353 -j ACCEPT"));
         // INPUT accepts (incl. DNS) must sit before the
         // engram-host-input DROP.
         let drop_idx = lines
@@ -743,12 +758,22 @@ mod tests {
     }
 
     #[test]
+    fn host_startup_dns_port_defaults_to_5353_when_none() {
+        // None dns_port falls through to DEFAULT_DNS_PORT so the
+        // operator only needs to override when something else on the
+        // host already binds 5353.
+        let lines = host_startup_lines(Some(9443), None).join("\n");
+        assert!(lines.contains("--to-port 5353"));
+        assert!(lines.contains("--dport 5353 -j ACCEPT"));
+    }
+
+    #[test]
     fn host_startup_no_proxy_keeps_dns_to_public_resolver() {
         // The operator opted out of filtering altogether; we keep
         // the legacy "DNS allowed to 1.1.1.1" path so the VM can
         // resolve at all. The DNS-exfil hole is exactly the price
         // of `--egress-proxy-port=0`.
-        let lines = host_startup_lines(None).join("\n");
+        let lines = host_startup_lines(None, None).join("\n");
         assert!(lines.contains("--dport 53 -d 1.1.1.1"));
         assert!(!lines.contains("engram-dns-redirect"));
     }
@@ -759,7 +784,7 @@ mod tests {
         // blanket VM-INPUT drop catches the REDIRECTed proxy
         // traffic too. The two sit consecutively in the output;
         // assert ACCEPT line index < DROP line index.
-        let lines = host_startup_lines(Some(9443));
+        let lines = host_startup_lines(Some(9443), None);
         let accept_idx = lines.iter().position(|l| l.contains("engram-proxy-input"));
         let drop_idx = lines.iter().position(|l| l.contains("engram-host-input"));
         assert!(accept_idx.is_some() && drop_idx.is_some());

@@ -188,10 +188,34 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // When the egress proxy is enabled, plumb the matching
+            // TCP/443 port into the FC config so iptables installs
+            // the REDIRECT rule (and the matching default-deny on
+            // FORWARD). `egress_dns_port` stays at the default 5353
+            // — operators don't need to override unless something
+            // else on the host already binds that port.
+            if cli.egress_proxy_port > 0 {
+                fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
+            }
             let fc = Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
                 fc_cfg,
             ));
+            // Apply per-host iptables: inter-VM block, host-LAN drops,
+            // proxy REDIRECTs (TCP/443 + DNS), and the
+            // engram-default-deny that makes the proxy the only egress.
+            // Without this, FC sessions still come up but nothing
+            // touches iptables and the guest gets no NAT — every
+            // outbound packet from the VM goes nowhere. Mirrors the
+            // mode=all wiring in `engram-coordinator::main`.
+            if let Err(e) = fc.host_startup().await {
+                tracing::warn!(
+                    error = %e,
+                    "FC host_startup failed; per-VM networking will fail at session create. \
+                     Check that the host-agent runs as root (or with CAP_NET_ADMIN) and \
+                     iptables/ip are on PATH."
+                );
+            }
             fc_for_reattach = Some(fc.clone());
             fc
         }

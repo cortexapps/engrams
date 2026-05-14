@@ -20,5 +20,7 @@ exec sudo \
   ENGRAM_LOCAL_PATH=./var/engram \
   ENGRAM_BLOB_BACKEND=local \
   ENGRAM_KERNEL_IMAGE_PATH="$KERNEL" \
+  ENGRAM_EGRESS_PROXY_PORT=9443 \
+  ENGRAM_EGRESS_CA_SOURCE=local-disk \
   RUST_LOG=info,engram=debug \
   ./target/debug/engram-host-agent

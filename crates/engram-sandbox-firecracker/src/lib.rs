@@ -184,6 +184,14 @@ pub struct FirecrackerConfig {
     /// path. When `None` (test/dev), VMs get open egress with the
     /// standard hard-isolation drops.
     pub egress_proxy_port: Option<u16>,
+    /// UDP+TCP port the filtering DNS proxy listens on. Iptables
+    /// REDIRECTs guest `{udp,tcp}/53` to this port so the proxy can
+    /// enforce `manifest.network.allow_hosts` on resolution. Default
+    /// 5353 (avoids systemd-resolved's 127.0.0.53:53 bind on hosts
+    /// that run it). Ignored when `egress_proxy_port` is `None` —
+    /// no-proxy mode keeps the legacy unconditional ACCEPT to
+    /// 1.1.1.1:53.
+    pub egress_dns_port: Option<u16>,
     /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
     /// the FC sidecar JSON at snapshot time (so cross-host restore
     /// knows which host's working-set trace to prefault) AND
@@ -299,6 +307,7 @@ impl FirecrackerConfig {
         Self {
             net_pool: Some("10.200.0.0".parse().unwrap()),
             egress_proxy_port: None,
+            egress_dns_port: None,
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
                 .into(),
@@ -489,7 +498,7 @@ impl FirecrackerBackend {
         if self.config.net_pool.is_none() {
             return Ok(());
         }
-        net::host_startup(self.config.egress_proxy_port)
+        net::host_startup(self.config.egress_proxy_port, self.config.egress_dns_port)
             .await
             .map_err(SandboxError::from)
     }
@@ -2062,6 +2071,17 @@ impl SandboxBackend for FirecrackerBackend {
             if let Some(ip) = live.guest_ip.lock().clone() {
                 return Some(ip);
             }
+            // Fast path: the /30 allocator assigned the guest a
+            // deterministic .2 from the network address. We don't
+            // need to dial agentd to learn what we already know.
+            // Skips a ~2s vsock RTT on every fresh-session
+            // `notify_session_policy` call — critical because the
+            // coord-side policy registration races the agent's boot.
+            if let Some(net) = live.net.as_ref() {
+                let ip = net.vm_cidr.guest().to_string();
+                *live.guest_ip.lock() = Some(ip.clone());
+                return Some(ip);
+            }
         }
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id)?;
@@ -2204,6 +2224,7 @@ mod tests {
             restore_mode: RestoreMode::File,
             net_pool: None,
             egress_proxy_port: None,
+            egress_dns_port: None,
             host_id: None,
             uffd_cache_root: None,
         };

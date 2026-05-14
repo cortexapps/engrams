@@ -71,7 +71,11 @@ impl ProxyConfig {
             registry,
             mint,
             resolver: default_resolver(),
-            dns_bind_addr: Some("0.0.0.0:53".parse().expect("dns bind default parses")),
+            // 5353 by default — avoids the systemd-resolved bind on
+            // 127.0.0.53:53 on hosts that run it. Override via the
+            // host-agent's `--egress-dns-port`. Iptables REDIRECTs
+            // guest {udp,tcp}/53 to this port.
+            dns_bind_addr: Some("0.0.0.0:5353".parse().expect("dns bind default parses")),
             dns_upstream: dns::DEFAULT_UPSTREAM
                 .parse()
                 .expect("dns upstream default parses"),

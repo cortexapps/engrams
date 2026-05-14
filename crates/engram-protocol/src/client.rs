@@ -654,16 +654,19 @@ impl engram_core::traits::HostClient for RemoteHostClient {
         }
     }
 
-    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
-        // Not yet a wire RPC. The coord-side caller is shell.rs's
-        // ttyd proxy, which needs a guest IP routable from *the
-        // host* — meaningless to ask a remote host for it from the
-        // coord's perspective. Returns `None` so the shell endpoint
-        // falls back to its "shell unavailable" branch on remote
-        // hosts; mode=all (where the in-proc PooledBackend wraps
-        // VZ/Process) keeps working because LocalHostClient delegates
-        // to the inner backend.
-        None
+    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+        // Needed by the coord's `notify_session_policy` codepath:
+        // the egress proxy registry keys per-session state by guest
+        // IP, so without this round-trip the host's proxy would
+        // NXDOMAIN every DNS query from the guest (UnknownGuest).
+        match self
+            .host
+            .unary(RequestKind::GuestIp { sandbox_id: id })
+            .await
+        {
+            Ok(ResponseKind::GuestIp { ip }) => ip,
+            _ => None,
+        }
     }
 
     async fn bind_session(&self, session_id: engram_core::SessionId, sandbox_id: SandboxId) {

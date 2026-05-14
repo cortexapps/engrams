@@ -270,6 +270,7 @@ mod tests {
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
             net_pool: None,
             egress_proxy_port: None,
+            egress_dns_port: None,
             host_id: None,
             uffd_cache_root: None,
         };

@@ -222,12 +222,18 @@ impl HostSession {
                     ));
                 }
                 Frame::Notify(notify) => {
-                    if let Some(handler) = notify_handler.clone() {
-                        let writer = self.writer.clone();
-                        tokio::spawn(async move {
-                            handle_notify(handler, writer, notify).await;
-                        });
-                    }
+                    // Some Notifies (SessionEgressPolicy) need to reach
+                    // the local backend regardless of whether a
+                    // NotifyHandler is registered — they're how the
+                    // coord pushes per-session state without a Request
+                    // round-trip. Pass `backend` alongside `handler` so
+                    // the dispatch can reach both.
+                    let handler = notify_handler.clone();
+                    let backend_for_notify = backend.clone();
+                    let writer = self.writer.clone();
+                    tokio::spawn(async move {
+                        handle_notify(handler, backend_for_notify, writer, notify).await;
+                    });
                 }
                 Frame::Response { req_id, result } => {
                     // Demux against `pending` first — this is the
@@ -279,7 +285,12 @@ async fn send_frame(writer: &SharedSink, frame: Frame) {
     }
 }
 
-async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, notify: NotifyKind) {
+async fn handle_notify(
+    handler: Option<Arc<dyn NotifyHandler>>,
+    backend: Arc<dyn HostClient>,
+    writer: SharedSink,
+    notify: NotifyKind,
+) {
     match notify {
         NotifyKind::Hello {
             host_id,
@@ -296,11 +307,15 @@ async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, noti
                      subsequent frames will misalign. Rebuild both at the same commit, or drain before redeploy.",
                 );
             }
-            handler.on_hello(host_id, agent_version, wire_version).await
+            if let Some(h) = handler {
+                h.on_hello(host_id, agent_version, wire_version).await;
+            }
         }
         NotifyKind::Heartbeat(hb) => {
-            let ack = handler.on_heartbeat(hb).await;
-            send_frame(&writer, Frame::Notify(NotifyKind::HeartbeatAck(ack))).await;
+            if let Some(h) = handler {
+                let ack = h.on_heartbeat(hb).await;
+                send_frame(&writer, Frame::Notify(NotifyKind::HeartbeatAck(ack))).await;
+            }
         }
         NotifyKind::HeartbeatAck(_) => {
             // Coordinator-side ACKs flow the other direction; if a
@@ -313,11 +328,16 @@ async fn handle_notify(handler: Arc<dyn NotifyHandler>, writer: SharedSink, noti
             // outbound. Ignore.
             tracing::debug!("server received unexpected HarnessEvent; ignoring");
         }
-        NotifyKind::SessionEgressPolicy(_) => {
-            // Coordinator → host frame; if a host's server end of
-            // the WS got one back, it's a confused peer reflecting
-            // its own outbound. Ignore.
-            tracing::debug!("server received unexpected SessionEgressPolicy; ignoring");
+        NotifyKind::SessionEgressPolicy(policy) => {
+            // Coordinator → host: register the per-session egress
+            // policy on the local backend so the proxy's registry
+            // knows this guest IP's allow_hosts. Without dispatch
+            // here, the guest's DNS proxy denies every query with
+            // UnknownGuest and TCP/443 SNI peeks fall through to
+            // Reject — the entire egress path is dark.
+            if let Err(e) = backend.notify_session_policy(policy).await {
+                tracing::warn!(error = %e, "backend rejected SessionEgressPolicy");
+            }
         }
     }
 }
@@ -441,6 +461,10 @@ async fn handle_request(
                 Err(e) => Err(RemoteError::from_sandbox(e)),
             }
         }
+        RequestKind::GuestIp { sandbox_id } => {
+            let ip = backend.guest_ip(sandbox_id).await;
+            Ok(ResponseKind::GuestIp { ip })
+        }
     };
 
     send_frame(&writer, Frame::Response { req_id, result }).await;
@@ -460,6 +484,7 @@ fn request_kind_name(kind: &RequestKind) -> &'static str {
         RequestKind::BindHarnessSession { .. } => "bind_harness_session",
         RequestKind::UnbindHarnessSession { .. } => "unbind_harness_session",
         RequestKind::SendHarnessPrompt { .. } => "send_harness_prompt",
+        RequestKind::GuestIp { .. } => "guest_ip",
     }
 }
 

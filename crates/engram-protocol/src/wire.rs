@@ -206,6 +206,15 @@ pub enum RequestKind {
         sandbox_id: SandboxId,
         text: String,
     },
+    /// Ask the host for the IPv4 the guest's eth0 binds. The coord
+    /// needs this to build the per-session `SessionEgressPolicy`
+    /// payload (the egress proxy keys by guest IP). `HostClient::
+    /// guest_ip`. Returns `None` if the host has no IP for this id
+    /// yet (sandbox still booting) or no networking attached
+    /// (process backend).
+    GuestIp {
+        sandbox_id: SandboxId,
+    },
 }
 
 /// Successful response payloads. Errors take the [`RemoteError`] path
@@ -243,6 +252,10 @@ pub enum ResponseKind {
     /// empty because all three operations either succeed or fail —
     /// failure rides the `RemoteError` path.
     HarnessOk,
+    /// `GuestIp` reply. `None` if the host has no IP to report for
+    /// this sandbox (still booting, networking off, or the backend
+    /// just doesn't track guest IPs — e.g. `ProcessBackend`).
+    GuestIp { ip: Option<String> },
 }
 
 /// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
