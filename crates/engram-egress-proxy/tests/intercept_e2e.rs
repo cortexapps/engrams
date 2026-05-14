@@ -79,9 +79,27 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(stream).await.unwrap();
-        let mut buf = vec![0u8; 8192];
-        let n = tls.read(&mut buf).await.unwrap();
-        captured.lock().extend_from_slice(&buf[..n]);
+        // Drain until we see the HTTP headers terminator. A single
+        // `read()` is not enough — the proxy can flush the rewritten
+        // request across several TLS records, and which boundary a
+        // record lands on depends on scheduling. The body is empty in
+        // both test cases (Content-Length: 0), so `\r\n\r\n` marks the
+        // full request.
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            match tls.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        captured.lock().extend_from_slice(&buf);
         let _ = tls
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
