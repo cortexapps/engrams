@@ -2,14 +2,14 @@
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ include "engram-coordinator.fullname" . }}
+  name: {{ include "engram.coordinator.fullname" . }}
   labels:
-    {{- include "engram-coordinator.labels" . | nindent 4 }}
+    {{- include "engram.coordinator.labels" . | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "engram-coordinator.fullname" . }}
+    name: {{ include "engram.coordinator.fullname" . }}
   minReplicas: {{ .Values.hpa.minReplicas }}
   maxReplicas: {{ .Values.hpa.maxReplicas }}
   metrics:

@@ -1,0 +1,63 @@
+{{- if .Values.web.enabled -}}
+# nginx config for the web frontend. Mounted at /etc/nginx/conf.d/default.conf
+# by the web Deployment. The coord backend reference is templated from
+# the coord component's fullname so a release rename retargets cleanly.
+# nginx is configured for SPA routing (try_files → /index.html) and to
+# proxy the coord's HTTP API + SSE + WebSocket on the same hostname
+# (the browser only sees the IAP'd public LB; nginx splits per path).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "engram.web.fullname" . }}-config
+  labels:
+    {{- include "engram.web.labels" . | nindent 4 }}
+data:
+  default.conf: |
+    # Sets `Connection: upgrade` only when the client requested an
+    # Upgrade; otherwise leaves it alone so keep-alive works for
+    # plain HTTP. Standard nginx WS-proxy idiom. Must live at http{}
+    # context, which is what conf.d/*.conf top level resolves to.
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ''      '';
+    }
+
+    upstream engram_coord {
+      server {{ include "engram.coordinator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }};
+    }
+
+    server {
+      listen {{ .Values.web.containerPort }};
+      server_name _;
+      root /usr/share/nginx/html;
+      index index.html;
+
+      # Health probe target. Cheap and auth-free; the readiness
+      # probe hits this before the pod joins the Service.
+      location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+      }
+
+      # SPA: every unknown path falls through to index.html so
+      # client-side routing handles it.
+      location / {
+        try_files $uri $uri/ /index.html;
+      }
+
+      # Coord API. WS upgrade headers carried through so /v1/control
+      # works; proxy_buffering off so SSE on /v1/events streams.
+      location ~ ^/(v1|api|events)(/|$) {
+        proxy_pass http://engram_coord;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+      }
+    }
+{{- end -}}

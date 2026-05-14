@@ -1,0 +1,252 @@
+# Default values — cloud-agnostic. Override per-cloud via
+# `values-gcp.yaml` / `values-aws.yaml` overlays.
+#
+# Top-level keys configure the coordinator (the chart was originally
+# coord-only); the `web` block at the bottom owns the optional nginx
+# frontend that serves the React dashboard.
+
+# ─── coordinator ──────────────────────────────────────────────────
+
+replicaCount: 2
+
+image:
+  # Override at deploy: `image.repository=us-docker.pkg.dev/...`
+  repository: ghcr.io/cortexapps/engram-coordinator
+  tag: ""           # falls back to .Chart.AppVersion when unset
+  pullPolicy: IfNotPresent
+
+# Optional image pull secrets when the registry needs auth. Shared
+# between coord + web pods.
+imagePullSecrets: []
+# - name: engram-pull-secret
+
+# `--mode` flag: `coordinator` (multi-host production) or `all`
+# (single-binary dev). Production deploys must use `coordinator`;
+# the host-agent runs separately on FC-capable VMs.
+mode: coordinator
+
+# Sandbox backend the coord registers locally in `--mode=all`. Ignored
+# in `--mode=coordinator`. `firecracker` requires Linux + KVM in the
+# coord pod (uncommon for K8s); `vz` is macOS-only and won't help here.
+sandboxBackend: firecracker
+
+# Blob storage backend selection (ADR 0007). Production reads chunks
+# from the same bucket the image-builder writes to.
+blob:
+  # `local` or `gcs`. AWS S3 is reserved.
+  backend: gcs
+  # Required when backend=gcs.
+  gcs:
+    bucket: ""
+
+# KEK provider for envelope-encrypted creds + cold-tier blob seals.
+kek:
+  # `env-var` (dev/CI) or `gcp-kms` (production).
+  provider: gcp-kms
+  # env-var only — name of the env var carrying the base64 master key.
+  envVarName: ENGRAM_KEK_MASTER_KEY
+  # gcp-kms only — full resource path.
+  gcpResource: ""
+
+# Secrets backend for image manifest's `[secrets.*]` references.
+secrets:
+  # `env` (dev) or `gcp` (Secret Manager via Workload Identity).
+  backend: gcp
+  # Required when backend=gcp.
+  gcpProjectId: ""
+
+# Database: Postgres URL pulled from a Secret; the chart never lets
+# raw URLs sit in a ConfigMap.
+database:
+  existingSecret: engram-coordinator-secrets
+  secretKey: DATABASE_URL
+
+# Bearer tokens that gate the API. Comma-separated list lives in the
+# secret; an empty value (default) leaves auth disabled — fine for
+# dev/staging, NOT for production. The values overlay flips this on.
+auth:
+  existingSecret: ""
+  secretKey: ENGRAM_AUTH_TOKENS
+
+# Cloud-agnostic identity. Production overlays bind to a
+# cloud-specific SA via annotations (GKE Workload Identity, EKS IRSA).
+# Web pods use the namespace `default` SA — they make no cloud API
+# calls, so they don't need bindings.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod-level identity hints for the coord pod.
+podLabels: {}
+podAnnotations: {}
+
+# HTTP service exposing the coord's API + WS to in-cluster traffic
+# — primarily the engram web nginx pod proxying browser API calls.
+# Keep this as `ClusterIP`; the coord must never have a public IP,
+# and out-of-cluster (in-VPC) reach is `serviceInternal` below, not
+# this Service.
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# Internal LoadBalancer Service for FC host-agents dialing in over
+# WS from the host MIG (out of cluster, in VPC). Always created —
+# this chart targets production; `--mode=all` single-binary dev is
+# handled by Tilt/docker-compose, not Helm. Pin `loadBalancerIP`
+# from Terraform (a pre-reserved internal address) so the FC MIG's
+# coordinator_endpoint can be wired before Helm installs and the
+# whole bring-up is one TF apply + one Helm install.
+serviceInternal:
+  # Pre-reserved VPC-internal IP, e.g.
+  # `google_compute_address.coord_internal.address`. Leaving empty
+  # works (auto-assigned) but means a follow-up step to plumb the
+  # resulting IP back to the FC MIG. The LB port matches `service.port`.
+  loadBalancerIP: ""
+  # Cloud-specific internal-LB annotations live in the values
+  # overlay (values-gcp.yaml.example sets the GKE pair).
+  annotations: {}
+
+# Optional ingress for the coord itself. Off by default — the
+# supported topology is "browsers reach the web Ingress (below);
+# nginx proxies API calls to the coord ClusterIP." Only flip this on
+# if you're deploying without the web frontend AND want direct
+# external access to the coord API (e.g. CLI-only consumers gated
+# by bearer tokens). NEVER enable a coord ingress that lacks an
+# auth layer in front of it.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  # - host: engram.example.com
+  #   paths:
+  #     - path: /
+  #       pathType: Prefix
+  tls: []
+
+# HorizontalPodAutoscaler. The coord is stateless; scale on CPU.
+# Active sessions live on FC hosts so coord scaling is independent of
+# session count.
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# PodDisruptionBudget so rolling restarts never drop below quorum.
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# NetworkPolicy egress controls. The coord needs to reach Postgres,
+# the blob backend, and the OCI registry. Tighten per cloud.
+networkPolicy:
+  enabled: false
+  egress:
+    # CIDRs the coord can dial. `[]` allows all.
+    cidrs: []
+    # TCP ports for those CIDRs.
+    ports: []
+
+# Resource requests + limits. Default sizing fits the
+# small/medium-fleet shape; bump for high-throughput deploys.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# Pod scheduling for the coord.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Optional sidecars on the coord pod (e.g. cloudsql-proxy on GCP).
+# Each entry mirrors a k8s container spec.
+extraContainers: []
+
+# Optional environment vars on the coord pod not covered by the
+# structured fields above. Format: list of { name, value } or
+# { name, valueFrom }.
+extraEnv: []
+
+# Optional ConfigMap key/value pairs mounted as env vars on the coord.
+extraConfig: {}
+
+# Probes — defaults aligned with the coord's /healthz handler.
+probes:
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readiness:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+
+# ─── web ──────────────────────────────────────────────────────────
+#
+# nginx pod serving the React SPA + reverse-proxying API calls to
+# the in-cluster coord. The public Ingress (when enabled) fronts
+# this pod; the coord has no public surface.
+web:
+  enabled: true
+
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/cortexapps/engram-web
+    tag: ""           # falls back to .Chart.AppVersion when unset
+    pullPolicy: IfNotPresent
+
+  # nginx listens on a high port so the pod can run as the
+  # unprivileged `nginx` user (UID 101 in the alpine image). The
+  # web Service maps its `port` to this `containerPort`.
+  containerPort: 8080
+
+  service:
+    type: ClusterIP
+    port: 80
+    # Cloud-specific annotations land here. The IAP BackendConfig
+    # pointer goes on the Service (see values-iap.yaml.example), not
+    # on the Ingress.
+    annotations: {}
+
+  ingress:
+    # The single public surface of the whole deployment. On GCP this
+    # provisions a Google HTTPS LB; pair with a managed cert + IAP
+    # BackendConfig in the values overlay.
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    # - host: engram.example.com
+    #   paths:
+    #     - path: /
+    #       pathType: Prefix
+    tls: []
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  podLabels: {}
+  podAnnotations: {}
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

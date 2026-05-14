@@ -62,12 +62,16 @@ Secret Manager entries in place first, so the recommended order:
    Manager) — out of scope for this reference.
 3. `terraform apply` in `examples/minimal/` — VPC, bucket, KMS,
    MIG, coordinator SA. Outputs the values the Helm chart needs.
-4. `helm install` the coordinator (`deploy/helm/engram-coordinator/`)
+4. `helm install` the coordinator + optional web (`deploy/helm/engram/`)
    using those outputs.
-5. Once the coord's internal LB is up, capture its URL and
-   `terraform apply` again with `coordinator_endpoint` set — the
-   MIG rolling-updates with the new env file, host-agents dial
-   home.
+5. Reserve the coord's internal LB IP up front via
+   `google_compute_address` (purpose `SHARED_LOADBALANCER_VIP`,
+   address_type `INTERNAL`) and pass it to the MIG as
+   `coordinator_endpoint` *and* to Helm via
+   `serviceInternal.loadBalancerIP`. One `terraform apply` provisions
+   the MIG (host-agents will retry their dial until the LB lands);
+   one `helm install` binds the Service to the reserved IP and the
+   hosts connect.
 
 ## Cloud-agnostic contract
 

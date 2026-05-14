@@ -7,13 +7,13 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "engram-coordinator.fullname" . }}
+  name: {{ include "engram.coordinator.fullname" . }}
   labels:
-    {{- include "engram-coordinator.labels" . | nindent 4 }}
+    {{- include "engram.coordinator.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "engram-coordinator.selectorLabels" . | nindent 6 }}
+      {{- include "engram.coordinator.selectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
     - Egress

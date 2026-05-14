@@ -1,0 +1,33 @@
+# Keep the docker build context small. Without this, the Rust target/
+# and JS node_modules dirs (multi-GB) would be uploaded to the daemon
+# on every `docker build` from the repo root.
+
+# Rust
+target/
+**/target/
+
+# JavaScript / web
+node_modules/
+**/node_modules/
+web/dist/
+web/.vite/
+
+# Local state + caches
+var/
+.cache/
+.playwright-mcp/
+
+# VCS + editor
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+.envrc
+.env
+.env.local
+*.swp
+*.swo
+
+# Plan / claude state — not consumable by any image build.
+.claude/

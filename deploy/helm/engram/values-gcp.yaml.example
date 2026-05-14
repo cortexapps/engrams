@@ -1,0 +1,143 @@
+# GCP-flavored overlay. Apply with:
+#   helm install engram ./deploy/helm/engram -f values-gcp.yaml
+#
+# Assumptions:
+# - GKE cluster with Workload Identity enabled.
+# - A Google Service Account `engram-coordinator@<project>.iam.gserviceaccount.com`
+#   has been granted: roles/storage.objectAdmin on the chunks bucket,
+#   roles/cloudkms.cryptoKeyEncrypterDecrypter on the KEK,
+#   roles/secretmanager.secretAccessor on relevant secrets.
+# - The KSA → GSA binding is in place:
+#     gcloud iam service-accounts add-iam-policy-binding \
+#       --role roles/iam.workloadIdentityUser \
+#       --member "serviceAccount:<project>.svc.id.goog[<namespace>/engram-coordinator]" \
+#       engram-coordinator@<project>.iam.gserviceaccount.com
+# - The web component runs as the namespace `default` SA — it makes
+#   no cloud API calls, so no WI binding required.
+
+# ─── coordinator ──────────────────────────────────────────────────
+
+image:
+  repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
+  tag: ""           # let the chart's appVersion drive it
+  pullPolicy: IfNotPresent
+
+mode: coordinator
+
+blob:
+  backend: gcs
+  gcs:
+    bucket: REPLACE_BUCKET
+
+kek:
+  provider: gcp-kms
+  # Full resource name: projects/<P>/locations/<L>/keyRings/<R>/cryptoKeys/<K>
+  gcpResource: REPLACE_KMS_RESOURCE
+
+secrets:
+  backend: gcp
+  gcpProjectId: REPLACE_PROJECT
+
+database:
+  existingSecret: engram-coordinator-secrets
+  secretKey: DATABASE_URL
+
+auth:
+  existingSecret: engram-coordinator-secrets
+  secretKey: ENGRAM_AUTH_TOKENS
+
+serviceAccount:
+  create: true
+  name: engram-coordinator
+  annotations:
+    iam.gke.io/gcp-service-account: engram-coordinator@REPLACE_PROJECT.iam.gserviceaccount.com
+
+service:
+  # In-cluster traffic only — consumed by the web nginx pod
+  # reverse-proxying browser API calls. The coord has no public
+  # surface; out-of-cluster (FC host MIG) reach goes through the
+  # `serviceInternal` LB below.
+  type: ClusterIP
+  port: 8080
+
+serviceInternal:
+  # Pin to the Terraform-reserved internal address
+  # (`google_compute_address.coord_internal.address`) so the FC
+  # MIG's coordinator_endpoint can be plumbed before Helm installs.
+  loadBalancerIP: REPLACE_RESERVED_INTERNAL_IP
+  annotations:
+    # GKE: provision a regional Internal Application LB.
+    networking.gke.io/load-balancer-type: "Internal"
+    # Let FC hosts in other regions dial in too.
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
+
+# Coord ingress stays disabled — only the web component has a
+# public surface. Browsers hit the web Ingress → nginx →
+# in-cluster ClusterIP above.
+ingress:
+  enabled: false
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 65
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: 4000m
+    memory: 4Gi
+
+# GCP egress tightening: only Postgres + Cloud SQL Auth Proxy
+# socket, GCS object endpoints, Artifact Registry, and the
+# Workload Identity metadata server. Replace with your VPC CIDR
+# ranges. Keeping `networkPolicy.enabled=false` until the operator
+# is ready to lock down egress avoids accidental outage.
+networkPolicy:
+  enabled: false
+
+# ─── web ──────────────────────────────────────────────────────────
+
+web:
+  enabled: true
+
+  image:
+    repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/web
+    tag: ""           # let the chart's appVersion drive it
+    pullPolicy: IfNotPresent
+
+  replicaCount: 2
+
+  service:
+    type: ClusterIP
+    port: 80
+    # IAP integration: see values-iap.yaml.example. The
+    # `cloud.google.com/backend-config` annotation goes on this
+    # Service, not on the Ingress.
+    annotations: {}
+
+  ingress:
+    # The single public surface of the deployment. Google HTTPS LB
+    # + Google-managed certificate + IAP (via BackendConfig set in
+    # values-iap.yaml.example).
+    enabled: true
+    className: gce
+    annotations:
+      kubernetes.io/ingress.class: gce
+      # Reference the managed cert resource by name. Create the
+      # ManagedCertificate CRD separately (or via Terraform).
+      networking.gke.io/managed-certificates: engram-web-cert
+      # Optional: a static external IP reserved in Terraform.
+      # kubernetes.io/ingress.global-static-ip-name: engram-web-ip
+    hosts:
+      - host: engram.REPLACE_DOMAIN
+        paths:
+          - path: /
+            pathType: Prefix

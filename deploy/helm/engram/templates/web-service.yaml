@@ -1,0 +1,26 @@
+{{- if .Values.web.enabled -}}
+# ClusterIP Service for the web nginx pod. The public Ingress (see
+# web-ingress.yaml) targets this Service; the Service has no
+# externally reachable address on its own. The `cloud.google.com/backend-config`
+# annotation pattern (for IAP) is applied here when the values
+# overlay sets `web.service.annotations`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "engram.web.fullname" . }}
+  labels:
+    {{- include "engram.web.labels" . | nindent 4 }}
+  {{- with .Values.web.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.web.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "engram.web.selectorLabels" . | nindent 4 }}
+{{- end -}}

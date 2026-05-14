@@ -4,7 +4,7 @@ Operational guidance for running Engram on GCP. Code-level setup
 only.
 
 For the **actual deployment artifacts** see:
-- [`deploy/helm/engram-coordinator/`](../deploy/helm/engram-coordinator/) — Helm chart
+- [`deploy/helm/engram/`](../deploy/helm/engram/) — Helm chart (coordinator + optional web frontend)
 - [`deploy/packer/fc-host-gcp.pkr.hcl`](../deploy/packer/fc-host-gcp.pkr.hcl) — host image
 - [`deploy/terraform/gcp/`](../deploy/terraform/gcp/) — modules + minimal example
 - [`docs/chunked-storage-rollout.md`](./chunked-storage-rollout.md) — tier-laddered rollout tracker

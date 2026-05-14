@@ -477,7 +477,7 @@ For multi-host production (coordinator on GKE behind a load balancer, a pool of 
 - **`ENGRAM_LOG_FORMAT=json`** on both binaries for Cloud Logging ingestion.
 
 Deployment artifacts ship in-tree:
-- [`deploy/helm/engram-coordinator/`](./deploy/helm/engram-coordinator/) — Helm chart, cloud-agnostic templates.
+- [`deploy/helm/engram/`](./deploy/helm/engram/) — Helm chart, cloud-agnostic templates. Deploys the coordinator + optional nginx web frontend.
 - [`deploy/packer/`](./deploy/packer/) — Packer manifest for the GCE FC host image.
 - [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-mig) + `examples/minimal/`.
 

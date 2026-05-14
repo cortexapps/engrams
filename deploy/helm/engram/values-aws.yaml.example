@@ -1,16 +1,19 @@
 # AWS-flavored overlay. Apply with:
-#   helm install engram engram-coordinator -f values-aws.yaml
+#   helm install engram ./deploy/helm/engram -f values-aws.yaml
 #
 # NB: ADR 0007 ships GCS as the first-class blob backend.
 # `ENGRAM_BLOB_BACKEND=s3` is reserved but the engram-storage-s3
 # crate is a stub — see docs/chunked-storage-rollout.md "Tier 4 #1".
-# This overlay is a scaffold for when that lands.
+# This overlay is a scaffold for when that lands; mirrors the GCP
+# overlay's shape so the patterns line up.
 #
 # Assumptions:
 # - EKS cluster with IRSA enabled.
 # - An IAM role `engram-coordinator-role` has S3 read/write on the
 #   chunks bucket, kms:Encrypt/Decrypt on the KEK key, and
 #   secretsmanager:GetSecretValue on relevant secrets.
+
+# ─── coordinator ──────────────────────────────────────────────────
 
 image:
   repository: REPLACE_ACCOUNT.dkr.ecr.REPLACE_REGION.amazonaws.com/engram/coordinator
@@ -51,19 +54,19 @@ serviceAccount:
 service:
   type: ClusterIP
   port: 8080
+
+serviceInternal:
+  # Internal NLB targeting the coord, consumed by FC host-agents
+  # dialing in from a sibling ASG inside the same VPC.
+  loadBalancerIP: ""   # AWS NLBs don't honor loadBalancerIP; rely on Route53 + a stable DNS name instead.
   annotations:
-    # Internal NLB; flip to internet-facing when a public ingress
-    # is wired.
     service.beta.kubernetes.io/aws-load-balancer-type: nlb
     service.beta.kubernetes.io/aws-load-balancer-scheme: internal
 
+# Coord never has a public ingress. Public reach goes through
+# `web.ingress` below.
 ingress:
   enabled: false
-  className: alb
-  annotations:
-    kubernetes.io/ingress.class: alb
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
 
 hpa:
   enabled: true
@@ -82,3 +85,28 @@ resources:
   limits:
     cpu: 4000m
     memory: 4Gi
+
+# ─── web ──────────────────────────────────────────────────────────
+
+web:
+  enabled: true
+
+  image:
+    repository: REPLACE_ACCOUNT.dkr.ecr.REPLACE_REGION.amazonaws.com/engram/web
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  ingress:
+    # ALB fronting the web Service. Pair with Cognito-based auth for
+    # the AWS equivalent of IAP (or AWS Verified Access).
+    enabled: true
+    className: alb
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+    hosts:
+      - host: engram.REPLACE_DOMAIN
+        paths:
+          - path: /
+            pathType: Prefix

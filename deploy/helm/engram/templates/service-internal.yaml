@@ -1,0 +1,37 @@
+# Internal LoadBalancer Service for FC host-agents dialing in over WS.
+#
+# The primary Service (service.yaml) is for in-cluster traffic — the
+# engram-web nginx pod proxying browser API calls. This Service is
+# what consumers *outside* the cluster but *inside* the VPC use,
+# specifically the FC host MIG. A single ClusterIP can't be reached
+# from a sibling MIG; a public LoadBalancer would violate the
+# "coord has no public surface" invariant. The internal-LB
+# annotations live in values-<cloud>.yaml.example (this chart's
+# defaults stay cloud-agnostic).
+#
+# Pin `loadBalancerIP` to a pre-reserved VPC address (e.g.
+# `google_compute_address` with `address_type = "INTERNAL"`) so the
+# FC MIG's `coordinator_endpoint` can be plumbed by Terraform before
+# Helm installs the chart — that's what breaks the apply-twice cycle.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "engram.coordinator.fullname" . }}-internal
+  labels:
+    {{- include "engram.coordinator.labels" . | nindent 4 }}
+  {{- with .Values.serviceInternal.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: LoadBalancer
+  {{- with .Values.serviceInternal.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "engram.coordinator.selectorLabels" . | nindent 4 }}

@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "engram-coordinator.fullname" . }}
+  name: {{ include "engram.coordinator.fullname" . }}
   labels:
-    {{- include "engram-coordinator.labels" . | nindent 4 }}
+    {{- include "engram.coordinator.labels" . | nindent 4 }}
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -16,4 +16,4 @@ spec:
       targetPort: http
       protocol: TCP
   selector:
-    {{- include "engram-coordinator.selectorLabels" . | nindent 4 }}
+    {{- include "engram.coordinator.selectorLabels" . | nindent 4 }}

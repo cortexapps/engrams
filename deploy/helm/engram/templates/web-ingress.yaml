@@ -1,0 +1,44 @@
+{{- if and .Values.web.enabled .Values.web.ingress.enabled -}}
+# Public Ingress fronting the web nginx Service. On GCP this becomes
+# a Google HTTPS LB; the IAP integration is via the
+# `cloud.google.com/backend-config` annotation on the web Service
+# (set in values-iap.yaml.example) — there is no IAP-specific field
+# on the Ingress itself.
+#
+# Note: only the web component has a public Ingress. The coordinator
+# has no public surface; browsers reach the coord API only by
+# proxying through nginx (see web-configmap.yaml).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "engram.web.fullname" . }}
+  labels:
+    {{- include "engram.web.labels" . | nindent 4 }}
+  {{- with .Values.web.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.web.ingress.className }}
+  ingressClassName: {{ .Values.web.ingress.className }}
+  {{- end }}
+  {{- with .Values.web.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.web.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "engram.web.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
+    {{- end }}
+{{- end -}}
