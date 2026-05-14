@@ -138,7 +138,13 @@ build {
 
   # 1. Base apt packages. Pull a small set: tooling for KVM probing,
   #    iptables persistence, gsutil for the host-agent download.
+  #
+  # Inline provisioners below all set `inline_shebang` to bash:
+  # Packer's default `/bin/sh -e` resolves to dash on Debian, which
+  # doesn't support `set -o pipefail`. Bash is in the base image so
+  # the swap is free.
   provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
       "sudo apt-get update -y",
@@ -177,6 +183,7 @@ build {
     destination = "/tmp/engram-drain.sh"
   }
   provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
       "sudo install -m 0644 /tmp/engram-host-agent.service /etc/systemd/system/engram-host-agent.service",
@@ -192,6 +199,7 @@ build {
   #    build if kvm-ok complains here — the IMAGE will run on a real
   #    KVM-capable VM (n2-standard-N etc.) where /dev/kvm is present.
   provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
       "kvm-ok || echo 'kvm-ok complained on the build worker — fine; the resulting image runs on real KVM hosts'",
@@ -214,6 +222,7 @@ build {
 
   # 6. Engram-specific directories + permissions.
   provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
       # Working directory for sandbox state, materialized rootfs files,
@@ -234,6 +243,7 @@ build {
   #    the systemd unit is masked until the deployed instance has its
   #    env file (provisioned by the MIG's startup-script).
   provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
       "/usr/local/bin/firecracker --version",
