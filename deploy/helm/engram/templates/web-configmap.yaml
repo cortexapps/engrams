@@ -1,10 +1,13 @@
 {{- if .Values.web.enabled -}}
-# nginx config for the web frontend. Mounted at /etc/nginx/conf.d/default.conf
-# by the web Deployment. The coord backend reference is templated from
-# the coord component's fullname so a release rename retargets cleanly.
-# nginx is configured for SPA routing (try_files → /index.html) and to
-# proxy the coord's HTTP API + SSE + WebSocket on the same hostname
-# (the browser only sees the IAP'd public LB; nginx splits per path).
+# nginx config for the web frontend. Mounted at
+# /etc/nginx/templates/default.conf.template by the web Deployment;
+# the official nginx-alpine entrypoint runs envsubst on it at pod
+# start and writes the rendered config to /etc/nginx/conf.d/. The
+# coord backend reference is templated from the coord component's
+# fullname so a release rename retargets cleanly. nginx is configured
+# for SPA routing (try_files → /index.html) and to proxy the coord's
+# HTTP API + SSE + WebSocket on the same hostname (the browser only
+# sees the IAP'd public LB; nginx splits per path).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,7 +15,7 @@ metadata:
   labels:
     {{- include "engram.web.labels" . | nindent 4 }}
 data:
-  default.conf: |
+  default.conf.template: |
     # Sets `Connection: upgrade` only when the client requested an
     # Upgrade; otherwise leaves it alone so keep-alive works for
     # plain HTTP. Standard nginx WS-proxy idiom. Must live at http{}
@@ -47,7 +50,13 @@ data:
 
       # Coord API. WS upgrade headers carried through so /v1/control
       # works; proxy_buffering off so SSE on /v1/events streams.
-      location ~ ^/(v1|api|events)(/|$) {
+      #
+      # Bearer auth: the browser carries the IAP cookie (authenticated
+      # at the public LB) but no coord bearer. We stamp it here from
+      # an env var rendered by the nginx-alpine envsubst entrypoint —
+      # see web-deployment.yaml for the secret wiring. The {{`${...}`}}
+      # form survives Helm rendering and is substituted at pod start.
+      location ~ ^/(v1|api|events|sessions)(/|$) {
         proxy_pass http://engram_coord;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -56,6 +65,9 @@ data:
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
+        {{- if .Values.web.coordinatorToken.existingSecret }}
+        proxy_set_header Authorization "Bearer {{`${ENGRAM_API_TOKEN}`}}";
+        {{- end }}
         proxy_buffering off;
         proxy_read_timeout 3600s;
       }

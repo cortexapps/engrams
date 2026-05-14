@@ -214,6 +214,18 @@ web:
   # web Service maps its `port` to this `containerPort`.
   containerPort: 8080
 
+  # Bearer token nginx stamps onto every proxied API/SSE/WS request.
+  # The browser SPA itself never carries the token — IAP at the LB
+  # authenticates the user, then this pod (which lives behind IAP)
+  # attaches the coord-side bearer on every upstream call. The
+  # referenced secret key MUST hold a single token (not a comma list)
+  # that also appears in the coord's `ENGRAM_AUTH_TOKENS`.
+  # Leave both fields empty to disable injection (e.g. a dev deploy
+  # where the coord runs without auth).
+  coordinatorToken:
+    existingSecret: ""
+    secretKey: ENGRAM_AUTH_TOKENS
+
   service:
     type: ClusterIP
     port: 80

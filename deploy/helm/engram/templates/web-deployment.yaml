@@ -58,11 +58,32 @@ spec:
             - name: http
               containerPort: {{ .Values.web.containerPort }}
               protocol: TCP
+          {{- if .Values.web.coordinatorToken.existingSecret }}
+          # Bearer token injected into proxied requests by the nginx
+          # config (see web-configmap.yaml). The nginx-alpine entrypoint
+          # runs envsubst on /etc/nginx/templates/*.template at start;
+          # FILTER scopes substitution to our `ENGRAM_*` vars so the
+          # template's `$http_upgrade` / `$host` nginx variables aren't
+          # touched.
+          env:
+            - name: ENGRAM_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.web.coordinatorToken.existingSecret }}
+                  key: {{ .Values.web.coordinatorToken.secretKey }}
+            - name: NGINX_ENVSUBST_FILTER
+              value: "^ENGRAM_"
+          {{- end }}
           volumeMounts:
             - name: nginx-config
-              mountPath: /etc/nginx/conf.d/default.conf
-              subPath: default.conf
+              mountPath: /etc/nginx/templates/default.conf.template
+              subPath: default.conf.template
               readOnly: true
+            # readOnlyRootFilesystem: true means the entrypoint can't
+            # write the rendered config back to /etc/nginx/conf.d/ unless
+            # that path is mounted writable. emptyDir is the cheapest fit.
+            - name: nginx-conf-d
+              mountPath: /etc/nginx/conf.d
             - name: nginx-cache
               mountPath: /var/cache/nginx
             - name: nginx-run
@@ -89,6 +110,8 @@ spec:
         - name: nginx-config
           configMap:
             name: {{ include "engram.web.fullname" . }}-config
+        - name: nginx-conf-d
+          emptyDir: {}
         - name: nginx-cache
           emptyDir: {}
         - name: nginx-run
