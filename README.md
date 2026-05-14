@@ -30,7 +30,7 @@ Three process classes, four storage primitives, three wire surfaces.
               │   - Postgres LISTEN/NOTIFY for cross-replica      │
               │     event fan-out + dead-host coordination        │
               └─────────────┬─────────────────────────────────────┘
-                            │ bincode-over-WS, WIRE_VERSION=5
+                            │ bincode-over-WS, WIRE_VERSION=1
                             │ (Frame { req_id, trace, kind })
                             │ Coord ↔ Host: hosts DIAL coord
                             │ (NAT-friendly; no inbound
@@ -94,7 +94,7 @@ Three process classes, four storage primitives, three wire surfaces.
 
 **`engram-coordinator`** — stateless HTTP service (axum). Owns the public API, scheduling, idle eviction, dead-host detection, chunk-store GC, the persistent SSE event bus. Backed by Postgres. Multiple replicas behind a load balancer; replicas reconcile via `LISTEN/NOTIFY` on `session_events` + `host_dead` and race via `pg_try_advisory_lock` for exclusive-write operations (dead-host eviction). `--mode=all` registers a local host-agent in-process for single-binary `just dev`.
 
-**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Drives the `SandboxBackend` for one of three production-grade isolation modes (see below). Hosts the chunked-OCI image cache + tiered chunk resolver, the harness hub (TCP listener for in-VM harness adapters), the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the egress proxy (ADR 0006). Heartbeats `(capacity, local_snapshots, draining)` every 5 s.
+**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Composes a local `SandboxBackend` (FC / VZ / Process — the VMM driver) and a `HarnessHub` (in-VM adapter routing) into a `LocalHostClient`; that's what's served over the WS to the coord (ADR 0011 splits the trait surfaces: `SandboxBackend` = "what kind of VM," `HostClient` = "where the work happens"). Hosts the chunked-OCI image cache + tiered chunk resolver, the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the filtering egress proxy on TCP/443 + UDP/53 + TCP/53 (ADRs 0006, 0010). Heartbeats `(capacity, local_snapshots, draining, running_sandboxes)` every 5 s.
 
 **In-guest binaries** (live inside each microVM, baked into the rootfs by `engram-image-builder`):
 - `engram-bootstrap` — PID 1's child after the init shim. Listens for `BootstrapLaunch` frames from the host-agent over vsock (FC) / virtio-console (VZ); on each frame, kills the previous harness child and spawns a fresh one. Necessary because `SandboxSpec` is agent-blind (per-session argv would freeze at the first session's id) and because FC snapshot/restore needs a clean re-spawn point on resume.
@@ -132,18 +132,21 @@ Three protocol layers, each with explicit version negotiation where it matters.
 | Layer | From → To | Wire | Versioning |
 |---|---|---|---|
 | **Public API** | clients → coord | JSON over HTTP + SSE | `/v1/` prefix planned |
-| **Control plane** | coord ↔ host-agent | bincode `Frame` over WebSocket | `WIRE_VERSION=4` in `Hello`; mismatch refuses connection |
+| **Control plane** | coord ↔ host-agent | bincode `Frame` over WebSocket | `WIRE_VERSION=1` in `Hello`; mismatch refuses connection |
 | **In-guest** | host-agent ↔ agentd / bootstrap / harness | length-prefixed bincode over vsock (FC) or virtio-console (VZ) | first-frame token handshake |
 | **Image distribution** | host-agent → OCI registry | standard registry pull | OCI media types: `vnd.engram.manifest.v1+toml`, `vnd.engram.rootfs.ext4`, `vnd.engram.bundle.v1+json` |
 | **Storage** | chunk-store ↔ blob backend | `BlobStorage` trait | impl-specific (GCS, S3, local fs) |
 
-**Control plane wire** (`engram-protocol`):
-- `RequestKind`: `CreateSandbox`, `DestroySandbox`, `ListSandboxes`, `ExecStart`, `Snapshot`, `Restore`, `ResolveRegistryAuth` (host→coord for OCI creds), `ReapMaterializeDir` (coord→host for materialize-dir GC fanout).
-- `ResponseKind`: matched 1:1 with `RequestKind`.
+**Control plane wire** (`engram-protocol`). The trait the wire serves is `HostClient` (`engram-core::traits::host_client`), which composes the sandbox surface (FC/VZ/Process) with harness routing (bind/unbind/send_prompt) and a couple of admin operations. `RemoteHostClient` in `engram-protocol::client` is the coord-side wrapper; `LocalHostClient` in `engram-host-agent::host_client` is the host-side composition. ADR 0011.
+- `RequestKind`:
+  - sandbox lifecycle — `CreateSandbox`, `DestroySandbox`, `ListSandboxes`, `ExecStart`, `Snapshot`, `Restore`, `StartAgent`, `GuestIp`;
+  - harness routing — `BindHarnessSession`, `UnbindHarnessSession`, `SendHarnessPrompt`;
+  - admin — `ResolveRegistryAuth` (host→coord for OCI creds), `ReapMaterializeDir` (coord→host for materialize-dir GC fanout).
+- `ResponseKind`: matched roughly 1:1 with `RequestKind`; harness ops share a single `HarnessOk` ack since their failure modes flow on the `RemoteError` path.
 - `StreamItem`: `ExecStdout`, `ExecStderr`, `ExecExit` (terminal). One streaming RPC = one request id; demuxed by `ConnectedHost`.
-- `NotifyKind`: `Hello`, `Heartbeat`, `HeartbeatAck`, `SessionEgressPolicy`.
+- `NotifyKind`: `Hello`, `Heartbeat`, `HeartbeatAck`, `SessionEgressPolicy` (coord→host, per-session allow-list + secrets keyring), `HarnessEvent` (host→coord, per-event forwarding so a Claude/noop adapter event in mode=coord+host lands on the coord's SSE bus the same way it would in mode=all).
 
-Wire bumps are deliberate; the history is in `WIRE_VERSION`'s rustdoc.
+Nothing's deployed externally yet, so `WIRE_VERSION` is just `1` — every wire-incompatible change bumps it; the mismatch check at hello refuses the connection.
 
 ### Session lifecycle
 

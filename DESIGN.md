@@ -133,7 +133,7 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
 ### Component summary
 
 - **`engram-coordinator`**: stateless HTTP service (axum). Owns scheduling, host registry, session metadata, idle evictor, persistent SSE event bus. Backed by Postgres. Multiple replicas re-broadcast events to each other via `LISTEN/NOTIFY` on `session_events` + `host_dead`. `--mode=all` registers a local backend in-process for single-binary dev.
-- **`engram-host-agent`**: per-host daemon. Drives sandbox lifecycle and snapshot/restore through `SandboxBackend`. Three impls ship today:
+- **`engram-host-agent`**: per-host daemon. Composes a local `SandboxBackend` (the VMM driver — FC/VZ/Process) and a local `HarnessHub` (in-VM adapter routing) into a `LocalHostClient` that the coordinator talks to over WS via the matching `RemoteHostClient`. The `HostClient` trait (`engram-core::traits::host_client`) is the coord↔host boundary; `SandboxBackend` is strictly the local VMM seam. The split lands in ADR 0011 — before it, `SandboxBackend` was tangled with the wire surface, with `RemoteSandboxBackend` faking host-local methods (`snapshot_path_for`, harness routing) that don't have meaningful answers across a network. Three VMM impls ship today:
   - `engram-sandbox-firecracker` — Linux + KVM. Production. Firecracker's HTTP-over-Unix-socket API + UFFD-backed memory restore.
   - `engram-sandbox-vz` — macOS Apple Silicon. Apple Virtualization.framework via `objc2-virtualization` bindings. APFS clone-based snapshots. Mac dev with real microVM isolation. (ADR 0003.)
   - `engram-sandbox-process` — anywhere. Subprocesses, no isolation. Fastest iteration loop for orchestration-layer work.
@@ -188,8 +188,8 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Host agent (`engram-host-agent`)
 
 **Responsibilities:**
-- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and NBD pool onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend.
-- Drive `SandboxBackend` for VM lifecycle (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`).
+- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and NBD pool onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
+- Drive sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
 - Run snapshot manager (host-local; see below).
 - Subscribe to `cloud.preemption_signal()`; on notice fan out best-effort `checkpoint_session` to live sandboxes in parallel with a 25s deadline (Phase 4 Track D).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
@@ -313,19 +313,53 @@ pub trait MetadataStore: Send + Sync {
 }
 ```
 
-### `SandboxBackend` (in `engram-core`)
+### `HostClient` (in `engram-core::traits::host_client`)
 
-The VMM seam. Production = Firecracker on Linux. Dev = subprocesses (anywhere) or Apple Virtualization.framework (Mac). Future backends (Cloud Hypervisor, raw libkrun, Kata) plug into the same trait if we ever need them.
+The coord↔host boundary trait. Two impls — one composes a local VMM (`LocalHostClient` in `engram-host-agent::host_client`, used in mode=all and inside the host-agent itself), one wraps a WS connection (`RemoteHostClient` in `engram-protocol::client`). `HostRegistry` on the coord side stores `Arc<dyn HostClient>` per host, dispatches by `sandbox_id → host_id`, and itself implements `HostClient` so the rest of the coord routes through one type. ADR 0011.
+
+```rust
+#[async_trait]
+pub trait HostClient: Send + Sync {
+    // sandbox lifecycle — delegates to the local SandboxBackend on the host
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
+    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
+    async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
+    async fn exec_stream(&self, id: SandboxId, cmd: ExecRequest) -> Result<ExecStream, SandboxError>;
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError>;
+    async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
+    async fn guest_ip(&self, id: SandboxId) -> Option<String>;
+
+    // harness routing — delegates to the host's local HarnessHub
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId);
+    async fn unbind_session(&self, session_id: SessionId);
+    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError>;
+
+    fn harness_dial(&self) -> HarnessDial;
+    fn set_harness_sink(&self, _sink: HarnessSink) {}
+}
+```
+
+### `SandboxBackend` (in `engram-core::traits::sandbox`)
+
+The VMM seam — *strictly* host-local. Production = Firecracker on Linux. Dev = subprocesses (anywhere) or Apple Virtualization.framework (Mac). Future VMMs (Cloud Hypervisor, raw libkrun, Kata) plug into the same trait if we ever need them. The coord doesn't import this trait at all; only the host-agent's `LocalHostClient` does.
 
 ```rust
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
-    async fn exec(&self, id: SandboxId, cmd: ExecRequest) -> Result<ExecHandle, SandboxError>;
-    async fn snapshot(&self, id: SandboxId, dest: &Path) -> Result<SnapshotMetadata, SandboxError>;
-    async fn restore(&self, src: PathBuf) -> Result<SandboxId, SandboxError>;
+    async fn exec_stream(&self, id: SandboxId, cmd: ExecRequest) -> Result<ExecStream, SandboxError>;
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
+    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError>;
+    async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
+    async fn guest_ip(&self, id: SandboxId) -> Option<String>;
+    fn snapshot_path_for(&self, id: SnapshotId) -> PathBuf;        // host-local file path
+    fn set_harness_sink(&self, _sink: HarnessSink) {}              // closure: not crossable
+    fn harness_dial(&self) -> HarnessDial { HarnessDial::Vsock }
 }
 ```
 

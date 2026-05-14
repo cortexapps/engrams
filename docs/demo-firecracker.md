@@ -37,6 +37,11 @@ What this also exercises (after the harness path landed):
 
 What this does **not** exercise yet:
 - Cross-host migration. Single host, single coordinator.
+- Split-mode (separate `--mode=coordinator` + `--mode=host` processes
+  on the same VM). That's covered in
+  [`docs/demo-split-mode.md`](./demo-split-mode.md) — same FC stack
+  underneath, but exercises the WS path between coord and host
+  including harness-event forwarding and the filtering DNS proxy.
 - Git-session checkpoint push. Works in principle on this stack;
   add it after picking a real test repo.
 
@@ -205,37 +210,54 @@ curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
   step beyond the existing `TestFixture` shape — deferred until
   there's a concrete regression to motivate the infrastructure.
 
-## Networking + secrets architecture (post-Phase 6)
+## Networking + secrets architecture
 
 ```
 guest ──┐
         │ 1. TCP connect to <upstream-ip>:443
+        │    or DNS query to <any-resolver>:53
         ▼
    tap-engr-XXX  (host-side TAP, gateway IP .1, /30)
         │
-        │ 2. iptables PREROUTING: REDIRECT to 127.0.0.1:9443
+        │ 2. iptables PREROUTING (-t nat) catches all egress:
+        │      tcp/443 → REDIRECT to 127.0.0.1:9443
+        │      udp/53  → REDIRECT to 127.0.0.1:5353
+        │      tcp/53  → REDIRECT to 127.0.0.1:5353
         ▼
-   engram-egress-proxy (host)
-        │ 3. SO_ORIGINAL_DST recovers the upstream IP
-        │ 4. peer_addr → guest IP → SessionState lookup
-        │ 5. Peek SNI from ClientHello
-        │ 6. Decision per (manifest.network ∪ secrets.allow_hosts):
-        │       Reject  → close
-        │       Bypass  → splice (no MITM)
-        │       Intercept → terminate TLS, substitute placeholders
-        │                   from secret_bundle, re-encrypt to upstream
+   engram-egress-proxy (host) — three listeners on one process:
+   tcp/9443 (TLS-MITM):
+        │ a. SO_ORIGINAL_DST recovers the upstream IP
+        │ b. peer_addr → guest IP → SessionState lookup
+        │ c. Peek SNI from ClientHello
+        │ d. Decision per (manifest.network ∪ secrets.allow_hosts):
+        │      Reject  → close
+        │      Bypass  → splice (no MITM)
+        │      Intercept → terminate TLS, substitute placeholders
+        │                  from secret_bundle, re-encrypt to upstream
+        │
+   udp/5353, tcp/5353 (DNS filter, ADR 0010):
+        │ a. hickory-proto parses the query, pulls the first QNAME
+        │ b. peer source IP → SessionState (same Registry as TCP/443)
+        │ c. QNAME matches network_allow ∪ secrets.allow → forward
+        │    to 1.1.1.1 verbatim and ship the response back
+        │ d. Otherwise → synthetic NXDOMAIN (EDNS OPT echoed when
+        │    the query carried one)
         ▼
-   real upstream
+   real upstream (Anthropic API, GitHub, npm, 1.1.1.1, …)
 ```
 
-Iptables only enforces hard isolation:
+Iptables only enforces hard isolation + the REDIRECTs that pin the
+proxy as the *only* egress path:
 - DROP inter-VM (`-s 10.200/16 -d 10.200/16`)
 - DROP VM→RFC1918 / link-local / loopback
-- DROP VM→host-INPUT
-- ACCEPT VM→DNS to 1.1.1.1
+- DROP VM→host-INPUT (with explicit ACCEPTs first for the proxy's
+  TCP/443 listener and its DNS port — see `engram-sandbox-firecracker::net::host_startup_lines`)
 - REDIRECT VM→tcp/443 → proxy (when `--egress-proxy-port` set)
+- REDIRECT VM→udp/53, tcp/53 → proxy DNS port (default 5353)
 - DROP everything else (proxy is the only egress when enabled)
 - MASQUERADE on POSTROUTING for return traffic
+- (No-proxy mode keeps the legacy `ACCEPT VM→1.1.1.1:53` rules so
+  DNS still works when the operator opts out of filtering.)
 
 CA delivery: per-host CA persisted to
 `<work_dir>/egress-proxy/ca.{pem,key}`; the harness substrate

@@ -21,15 +21,19 @@ reflect chunks-in-`BlobStorage` rather than the legacy "hot tier
   behind a single load balancer. Talks to Cloud SQL Postgres for
   durable state, GCS for the chunk store (content-addressed
   manifests + chunks), and GCP Secret Manager for per-session
-  secret resolution.
+  secret resolution. Runs `--mode=coordinator`; never owns a local
+  VMM.
 - **FC host VMs**: pool of GCE instances, each running
-  `engram-host-agent` with `--sandbox-backend=firecracker`. They
-  dial the coordinator over WebSocket and serve as worker hosts
-  for Firecracker microVMs.
+  `engram-host-agent` with `--sandbox-backend=firecracker`
+  (= `--mode=host`). They dial the coordinator over WebSocket and
+  serve as worker hosts for Firecracker microVMs. The wire surface
+  is `HostClient` (ADR 0011): `LocalHostClient` runs in-process on
+  each host, `RemoteHostClient` is what the coord sees.
 - **Egress proxy**: runs on each FC host-agent (not the
-  coordinator). All hosts share a single CA cert chain so guest
-  substrates can trust the proxy's MITM leaves regardless of which
-  host they end up on.
+  coordinator). Three listeners on one process: tcp/443 (TLS-MITM,
+  ADR 0006), udp/5353 + tcp/5353 (filtering DNS, ADR 0010). All
+  hosts share a single CA cert chain so guest substrates can trust
+  the proxy's MITM leaves regardless of which host they end up on.
 
 ## Required env vars
 
@@ -65,6 +69,8 @@ production the cache lives on each host-agent.
 | `ENGRAM_GCS_BUCKET`            | Same bucket as the coord; host materialises chunks on demand         |
 | `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` | NVMe-backed LRU chunk cache budget (default 200 GiB)              |
 | `ENGRAM_NBD_DEVICES`           | `/dev/nbd0,/dev/nbd1,…` for the chunked-disk NBD daemon. Empty / unset falls back to materialize-to-file (correct, slower cold start). |
+| `ENGRAM_EGRESS_PROXY_PORT`     | TCP listener for the host-side TLS-MITM proxy (e.g. `9443`). `0` disables egress filtering entirely (legacy `ACCEPT VM→1.1.1.1:53` rules stay; guests get unfiltered network). When set, iptables REDIRECTs guest tcp/443 here and runs the filtering DNS proxy on the DNS port (default 5353) — see [ADR 0010](./adr/0010-dns-filtering.md). |
+| `ENGRAM_EGRESS_CA_SOURCE`      | `local-disk` (default) \| `env` \| `gcp-secret-manager`. See the Egress proxy section below for the per-source vars. |
 | `ENGRAM_LOG_FORMAT=json`       | Same as coordinator                                                  |
 
 ## KEK (key-encryption key)
@@ -167,16 +173,38 @@ is automatic: the cache filename includes the CA fingerprint).
 The coordinator ships `SessionEgressPolicy` (network allow-hosts
 + per-secret placeholder→real_value keyring + `SecretMode`) over
 the existing coordinator↔host WS as a notify frame. The host-agent
-registers it with its local proxy registry. WS-frame ordering
-guarantees the policy lands before the subsequent `start_agent`
-request, so the harness can't make egress calls before the proxy
-knows the policy. Cold resume re-issues the policy when a session
-moves hosts.
+registers it with its local proxy registry (which the DNS filter
+and the TCP/443 SNI peeker both read). WS-frame ordering guarantees
+the policy lands before the subsequent `start_agent` request, so
+the harness can't make egress calls before the proxy knows the
+policy. Cold resume re-issues the policy when a session moves hosts.
 
 `ENGRAM_EGRESS_PROXY_PORT=0` on a host-agent disables egress
-filtering for that host — guests get unfiltered network access.
-Mix-and-match is fine: some hosts can run with the proxy off
-during bring-up while others have it on.
+filtering for that host — guests get unfiltered network access
+and the iptables ruleset reverts to "ACCEPT VM→1.1.1.1:53" for
+DNS so resolution still works. Mix-and-match is fine: some hosts
+can run with the proxy off during bring-up while others have it on.
+
+### DNS filtering
+
+When the egress proxy is enabled, all guest DNS (both `udp/53` and
+`tcp/53`, regardless of which upstream IP the guest's resolv.conf
+points at) is iptables-REDIRECTed to the proxy. The proxy parses
+the query, checks the QNAME against the same `network.allow_hosts`
+list the TCP/443 SNI peeker uses, and either forwards to 1.1.1.1
+or responds with `NXDOMAIN`. The default DNS port is `5353` so
+the host's own `systemd-resolved` (on `127.0.0.53:53`) keeps
+working for the host's own name resolution. See
+[ADR 0010](./adr/0010-dns-filtering.md) for the architecture and
+the DNS-over-HTTPS residual gap.
+
+The one out-of-band exfil channel that the proxy can't close at
+the transport layer is **DNS-over-HTTPS**. If an operator allows
+a DoH endpoint (`cloudflare-dns.com`, `dns.google`,
+`doh.opendns.com`, …) in any manifest's `allow_hosts`, the guest
+can drive resolution via tcp/443 and bypass the DNS filter
+entirely. Mitigation is operator-side: don't include known DoH
+endpoints in `allow_hosts`.
 
 ## Secret resolution
 
@@ -202,17 +230,20 @@ coordinator-to-proxy registration step is not yet wired.
 
 ## Operational notes
 
-### Idle auto-eviction is a v2 feature
+### Idle auto-eviction in `--mode=coordinator`
 
-The idle evictor only fires in single-host `--mode=all`. In
-production multi-host deployments, sessions don't auto-suspend on
-idle until the host-agent grows its own `HarnessHub` (see
-`docs/known-issues.md` #7). For v1, sessions linger until their
-hard TTL or explicit `DELETE /sessions/:id`. There's no admin
-endpoint to "drain idle sessions" today — the ADR 0005 cold-
-tier flush endpoints (`POST /api/admin/sessions/:id/flush` and
-`POST /api/admin/flush-idle`) retired in Phase 7 when chunked-
-immutable storage became the single durability primitive.
+The host-agent now runs its own `HarnessHub` (ADR 0011 splits the
+coord↔host boundary; the hub lives wherever its connections terminate),
+so the routing path that fed the idle evictor in `--mode=all` is now
+present in split-mode too. The evictor itself still polls
+`state.harness_hub.idle_sandboxes(...)` on the coord side — the small
+shim of "ask each connected host for its idle candidates over WS" is
+the only remaining piece; tracked in `docs/known-issues.md` #8 with a
+clearly-scoped fix. For now, in `--mode=coordinator` the evictor runs
+and produces no candidates (harmless); sessions linger until their hard
+TTL or explicit `DELETE /sessions/:id`. The ADR 0005 cold-tier flush
+endpoints retired in Phase 7 when chunked-immutable storage became the
+single durability primitive.
 
 ### Chunk-store GC
 

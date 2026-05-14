@@ -107,72 +107,49 @@ WS via `NotifyKind::SessionEgressPolicy`, applied to the local
 proxy registry before the harness starts. Broker mode now works
 end-to-end. See [ADR 0006](./adr/0006-host-agent-egress-proxy.md).
 
-## 7. Active sessions can stick forever after a coord/host restart (ADR 0009 proposed)
+## 7. ~~Active sessions can stick forever after a coord/host restart~~ (FIXED, ADR 0009)
 
-**Status: known gap; design captured in ADR 0009, implementation pending.**
-
-When a coord restart (in `--mode=all`) or a host-agent process
-restart wipes the in-memory `SandboxBackend` map but the
-Postgres `sessions` rows still point at the now-orphaned
-sandbox_ids, today's dead-host detector + idle evictor don't
-fire on those sessions:
-
-- `dead_host.rs` only flips sessions when the host's
-  heartbeats *stop*; in `--mode=all` the same process owns
-  both, so a restart kills the VMs AND keeps the host alive.
-- `idle_evictor.rs` only walks the harness `connections` map
-  (`harness.rs:360`); `harness: none` sessions are invisible
-  to it, and any session whose harness disconnected before
-  the restart is dropped from that map.
-- `repopulate_routing` reads `sessions.sandbox_id` from
-  Postgres but **never intersects against the host's actual
-  `backend.list()`** — phantom routing persists forever.
-
-Observed: four sessions (`21815fbc`, `bcf2917d`, `689278fe`,
-`d08707e8`) sit `Active` pointing at sandbox_ids that no
-longer exist anywhere after a `--mode=all` redeploy. Today
-the only cleanup path is manual `psql` / API delete.
-
-**Fix**: ADR 0009 ships a periodic reconciliation primitive
-that rides the existing 5 s heartbeat. The host adds
-`running_sandboxes: Vec<SandboxId>` from `backend.list()`;
-the coord intersects against expected-active rows and flips
-missing sessions to `Idle` (if `snapshots.recoverable`) or
-`Dead` (otherwise) within ~20 s. The ADR also covers the
-production host-agent redeploy case (case C — FC processes
-survive code redeploys via on-disk manifests + pidfd
-reattach) and graceful host reboot (case C' — SIGTERM-time
-NVMe checkpoint, restored from local on startup).
-
-Retire this entry when Phase 3 of the rollout
-(`docs/state-reconciliation-rollout.md`) lands.
+**Resolved.** ADR 0009's reconciliation primitive landed across
+Phases 1-8. `Heartbeat` carries `running_sandboxes: Vec<SandboxId>`
+from `backend.list()`; the coord intersects against expected-active
+rows on every heartbeat and flips missing sessions to `Idle` (when
+`snapshots.recoverable=true`) or `Dead` (otherwise) within ~20 s.
+The production host-agent redeploy case (case C — FC processes
+survive code redeploys via on-disk manifests + pidfd reattach) and
+graceful host reboot (case C' — SIGTERM-time NVMe checkpoint,
+restored from local at startup) also shipped. See
+[`docs/state-reconciliation-rollout.md`](./state-reconciliation-rollout.md)
+for the per-phase landing trail.
 
 ## 8. Idle auto-eviction doesn't fire in `--mode=coordinator`
 
 **Files**: `crates/engram-coordinator/src/idle_evictor.rs`,
 `crates/engram-host-agent/src/harness.rs`.
 
-The idle evictor reads `state.harness_hub.idle_sandboxes(...)`. In
-`--mode=all` (dev/single-host) the hub sees every harness via the
-local sandbox backend's sink and the evictor works. In
-`--mode=coordinator` the `HarnessHub` lives on the coordinator but
-its source — `set_harness_sink` on the `RemoteSandboxBackend` —
-is the trait default no-op. The hub stays empty, `idle_sandboxes`
-returns nothing, and no sessions get auto-suspended on idle.
+**Update (post-ADR 0011)**: the architectural half of this gap closed
+with the `HostClient` split. The host-agent now runs its own
+`HarnessHub` and forwards events to the coord as
+`NotifyKind::HarnessEvent`; the coord's in-proc hub is the same
+struct it used in `--mode=all`, so it gets fed the same way. What
+remains is purely the driver wiring: `idle_evictor.rs` still polls
+`state.harness_hub.idle_sandboxes(...)` directly, which works in
+`--mode=all` but in `--mode=coordinator` only sees the events the
+host already forwarded — *not* the host's authoritative
+`last_event_at` / `last_idle_at` maps the hub uses to decide what's
+idle. The numbers diverge across the WS hop because the eviction
+TTL is checked against the coord's clock, not the host's.
 
 The driver still runs and is harmless (no false evictions); it
-just produces no candidates. Operators can manually suspend via
-`POST /api/admin/sessions/:id/flush` or
-`POST /api/admin/flush-idle`.
+just produces zero candidates in split-mode. Operators can manually
+suspend via the admin endpoints.
 
-**Fix** (v2): instantiate a `HarnessHub` inside the host-agent's
-`run` loop, wire the local backend's harness sink into it, ship
-`SessionId` to the host-agent so it can `bind_session` locally,
-poll `idle_sandboxes` there, and emit candidates over WS via a
-new `NotifyKind::IdleEvictionCandidates(Vec<(SessionId, SandboxId)>)`.
-The coordinator's `evict_idle_session` pipeline function is
-already split out and can stay where it is — only the driver
-moves.
+**Fix**: either (a) move the eviction *driver* to the host-agent
+and emit `NotifyKind::IdleEvictionCandidates` to the coord, or (b)
+add an `idle_sandboxes` method on `HostClient` and fan out from the
+coord every tick. (a) is the better long-term shape — the coord
+should be authoritative for *policy*, not for the host-local clock.
+Tracked separately from ADR 0011, which intentionally scoped to
+bind/unbind/send_prompt and left the idle loop for a follow-up.
 
 ## 9. No system-wide event stream on the coordinator
 
@@ -261,24 +238,19 @@ host outcomes.
 
 ## 15. Wire compatibility is enforced at hello but bincode-positional
 
-`engram-protocol::WIRE_VERSION` (v4 today) + the hello-frame
-handshake reject coord/host-agent version mismatches loudly.
-The handshake itself works.
+`engram-protocol::WIRE_VERSION` (`1` today, reset when nothing was
+deployed externally yet — the historical changelog comments were
+stripped at the same time) + the hello-frame handshake reject
+coord/host-agent version mismatches loudly. The handshake itself
+works.
 
-Version history (current trajectory):
-- v1 — `SnapshotMetadata.disk_manifest` add (`e68ee23`)
-- v2 — `RequestKind::ResolveRegistryAuth` for OCI auth WS-RPC (`ad13dc0`)
-- v3 — `RequestKind::ReapMaterializeDir` + `WireReapStats` for
-  multi-host materialize-dir reap fanout (`2971115`)
-- v4 — Phase 6 destructive trait reshape: `Snapshot` drops
-  `dest_path`; `Restore` takes `metadata: SnapshotMetadata` (`b8afb42`)
-
-What's *not* a known issue but worth knowing: bincode is
-schemaless positional encoding, so any future serde-derived
-field add/remove anywhere in the wire types is a hard break
-that must bump WIRE_VERSION. Future contributors editing
-`engram-protocol::wire` should bump the version and add a
-history note alongside any structural change.
+Bincode is schemaless positional encoding, so any future
+serde-derived field add/remove anywhere in the wire types is a
+hard break that must bump `WIRE_VERSION`. Future contributors
+editing `engram-protocol::wire` should bump the version (and add
+a brief comment on the constant explaining what changed) alongside
+any structural change. Once anything is deployed externally, the
+in-source changelog comes back.
 
 ## 16. ~~Cross-namespace bricked images: chunks live in BlobStorage, OCI artifact is just metadata~~ (FIXED, ADR 0008)
 

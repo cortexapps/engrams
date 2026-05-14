@@ -129,6 +129,17 @@ loopback. Cross-machine alternatives all hurt:
   writes `.engram-host/ca.pem` before `mke2fs`. No image-build-
   time wiring needed — the substrate is built per-host anyway.
 
+## Follow-up: DNS filtering (ADR 0010)
+
+ADR 0006 scoped enforcement to outbound TLS (the SNI peek + the
+MITM substitution path). DNS itself was an unconditional ACCEPT
+to a public resolver — a known DNS-exfil channel that this ADR
+deferred. [ADR 0010](./0010-dns-filtering.md) closes it by giving
+the egress proxy two more listeners (`udp/5353` + `tcp/5353`) and
+swapping the `ACCEPT VM→1.1.1.1:53` iptables rules for REDIRECTs.
+Same allow-list, same `Registry::lookup`, same operator-facing
+manifest knob (`network.allow_hosts`).
+
 ## Alternatives considered
 
 - **Coordinator-side proxy with DNAT.** Rejected: latency, blast

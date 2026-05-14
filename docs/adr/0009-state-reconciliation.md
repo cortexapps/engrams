@@ -1,7 +1,8 @@
 # ADR 0009: State reconciliation, graceful-shutdown checkpoint, and live-VM reattach
 
-Status: proposed (review pending), 2026-05-13
-Phase: 0 (design)
+Status: accepted (phases 1-8 landed), 2026-05-13
+Phase: 8 (landed) — see `docs/state-reconciliation-rollout.md` for
+the per-phase commit trail.
 Supersedes: nothing. Layers above ADR 0007's chunked storage and
 ADR 0008's chunks-in-OCI. The dead-host detector of Phase 3,
 the idle evictor of Phase 4, and the preemption drainer all
