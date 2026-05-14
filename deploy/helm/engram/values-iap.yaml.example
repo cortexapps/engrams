@@ -9,33 +9,26 @@
 # What this does
 # --------------
 # IAP guards the single public surface (the web nginx Service) so
-# only members of an authorized Google group can reach the dashboard
-# and the API calls nginx proxies through to the coord. The coord
-# itself stays unreachable from the internet — that invariant is set
-# in the base GCP overlay (`service.type: ClusterIP`,
-# `serviceInternal.annotations` = internal-only); this file does NOT
-# attach IAP to the coord and never should.
+# only authorized principals can reach the dashboard and the API
+# calls nginx proxies through to the coord. The coord itself stays
+# unreachable from the internet — that invariant is set in the base
+# GCP overlay (`service.type: ClusterIP`, `serviceInternal.annotations`
+# = internal-only); this file does NOT attach IAP to the coord and
+# never should.
 #
 # Pre-requisites the chart can't do for you
 # -----------------------------------------
 # 1. OAuth consent screen configured in the GCP console (User Type
-#    "Internal", support email set). One-time per project; can't be
-#    automated end-to-end.
-# 2. `google_iap_brand` + `google_iap_client` in Terraform — the
-#    brand depends on (1). The client gives you a client_id +
-#    client_secret pair.
-# 3. The client_secret stashed in a Secret named per
-#    `iap.oauthClientSecretName` below:
-#      apiVersion: v1
-#      kind: Secret
-#      metadata:
-#        name: engram-iap-oauth-client
-#      stringData:
-#        client_id: <from terraform>
-#        client_secret: <from terraform>
-# 4. A `BackendConfig` CRD applied alongside the Helm release
-#    (managed by Terraform in production, raw `kubectl apply` for
-#    smoke). Sample manifest:
+#    "Internal", support email set). One-time per project. Required
+#    so users see a branded login page; otherwise a generic Google
+#    consent prompt appears. No OAuth *client* needed — see (2).
+#
+# 2. A `BackendConfig` CRD applied alongside the Helm release. The
+#    post-Jan-2026 spec is minimal — the IAP OAuth Admin API was
+#    retired so the old `oauthclientCredentials` flow no longer
+#    functions. IAP now uses a Google-managed OAuth client per
+#    request:
+#
 #      apiVersion: cloud.google.com/v1
 #      kind: BackendConfig
 #      metadata:
@@ -43,13 +36,15 @@
 #      spec:
 #        iap:
 #          enabled: true
-#          oauthclientCredentials:
-#            secretName: engram-iap-oauth-client
+#
+#    See https://cloud.google.com/iap/docs/deprecations/migrate-oauth-client.
 #    The chart only needs to reference this BackendConfig by name
 #    via the Service annotation below.
-# 5. `roles/iap.httpsResourceAccessor` bound to your team's Google
-#    Group on the project (or on the backend service for tighter
-#    scoping).
+#
+# 3. `roles/iap.httpsResourceAccessor` bound to your authorized
+#    principals on the project (or on the backend service for tighter
+#    scoping). On GCP: `google_iap_web_iam_member` resources, one
+#    per principal.
 #
 # What this overlay sets
 # ----------------------
@@ -58,7 +53,7 @@ web:
   service:
     # The annotation that hooks the GKE Service → GCP Backend
     # Service → BackendConfig pipeline. The BackendConfig itself
-    # lives outside the chart (see pre-req #4).
+    # lives outside the chart (see pre-req #2).
     annotations:
       cloud.google.com/backend-config: '{"default":"engram-web-iap"}'
 
