@@ -1,0 +1,98 @@
+name: Bake container images
+
+# Builds the three engrams container images (coordinator, host-agent,
+# web) and pushes them to this repo's GHCR namespace:
+#
+#   ghcr.io/cortexapps/engrams/<image>:<sha>
+#   ghcr.io/cortexapps/engrams/<image>:<short-sha>
+#   ghcr.io/cortexapps/engrams/<image>:main          (on push to main only)
+#   ghcr.io/cortexapps/engrams/<image>:latest        (on push to main only)
+#
+# Anyone forking the repo gets the same workflow producing images
+# under their own org's GHCR namespace automatically — no changes
+# needed.
+
+on:
+  push:
+    branches: [main]
+    # Only re-run when something that affects the images changes —
+    # Cargo source, the Dockerfiles themselves, the migrations the
+    # coord image bundles, or the web SPA.
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'docker/**'
+      - 'deploy/migrations/**'
+      - 'web/**'
+      - '.github/workflows/bake-images.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Override ref to build (defaults to the dispatching ref).'
+        required: false
+
+permissions:
+  contents: read
+  packages: write   # push to GHCR under this repo's namespace
+
+concurrency:
+  group: bake-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bake:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    strategy:
+      # Surface every image's failure independently — easier to debug.
+      fail-fast: false
+      matrix:
+        image: [coordinator, host-agent, web]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is auto-minted per workflow and has
+          # `packages: write` for this repo's namespace.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Derive tags
+        id: tags
+        env:
+          IMAGE: ${{ matrix.image }}
+          SHA: ${{ github.sha }}
+        run: |
+          BASE="ghcr.io/${{ github.repository }}/$IMAGE"
+          SHORT="${SHA:0:7}"
+          TAGS=("$BASE:$SHA" "$BASE:$SHORT")
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAGS+=("$BASE:main" "$BASE:latest")
+          fi
+          # docker/build-push-action wants one tag per line.
+          printf '%s\n' "${TAGS[@]}" > /tmp/tags.txt
+          echo "Will tag:"
+          cat /tmp/tags.txt
+          { echo 'list<<EOF'; cat /tmp/tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+      - name: Build + push ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/${{ matrix.image }}.Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          # Use GHA's built-in cache so successive runs are fast.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
