@@ -36,7 +36,15 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/engram /run/engram
+# `RuntimeDirectory=engram` creates `/run/engram` (cleared on stop);
+# `StateDirectory=engram` creates `/var/lib/engram` (persistent across
+# restarts — sandbox work-dir lives under it). Both directives
+# implicitly add their path to the unit's writable namespace, so
+# no `ReadWritePaths=` is needed. The earlier explicit form 226-NAMESPACE'd
+# on first boot because the paths didn't exist yet — nothing else
+# in the image creates them.
+RuntimeDirectory=engram
+StateDirectory=engram
 # We intentionally do NOT use ProtectKernelTunables / ProtectKernelModules
 # because the host-agent's iptables work needs them, and PrivateDevices
 # would hide /dev/kvm.
