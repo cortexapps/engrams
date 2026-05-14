@@ -202,7 +202,10 @@ build {
     inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
-      "kvm-ok || echo 'kvm-ok complained on the build worker — fine; the resulting image runs on real KVM hosts'",
+      # `sudo` because cpu-checker installs kvm-ok at /usr/sbin/kvm-ok,
+      # and Packer's SSH session as the `packer` user has a stripped
+      # PATH that doesn't include sbin dirs. sudo's secure_path does.
+      "sudo kvm-ok || echo 'kvm-ok complained on the build worker — fine; the resulting image runs on real KVM hosts'",
       # Ensure kvm + nbd modules load at boot on the deployed VM.
       "echo kvm | sudo tee /etc/modules-load.d/engram-kvm.conf",
       "echo nbd | sudo tee /etc/modules-load.d/engram-nbd.conf",
