@@ -82,9 +82,28 @@ impl GcsBlobStorage {
 }
 
 fn map_http_err(e: GcsHttpError) -> BlobError {
-    match &e {
-        GcsHttpError::Response(resp) if resp.code == 404 => BlobError::NotFound,
-        _ => BlobError::Sdk(Box::new(e)),
+    // The SDK returns a 404 two different ways depending on which
+    // operation surfaced it. Object-metadata calls (`get_object`,
+    // `delete_object`) take the JSON envelope path and return
+    // `Response { code: 404, .. }`. Streaming downloads
+    // (`download_streamed_object`) skip the envelope parse — the
+    // body is the byte stream we want — and return the raw reqwest
+    // status error via `HttpClient` (or `RawResponse` when the
+    // body did get buffered before the status check failed).
+    // Both shapes mean the same thing: object doesn't exist.
+    // Collapse them so callers downstream of `get_streaming` get
+    // the same `BlobError::NotFound` that callers of `head` do.
+    let is_404 = match &e {
+        GcsHttpError::Response(resp) => resp.code == 404,
+        GcsHttpError::HttpClient(rq) | GcsHttpError::RawResponse(rq, _) => {
+            rq.status().is_some_and(|s| s.as_u16() == 404)
+        }
+        _ => false,
+    };
+    if is_404 {
+        BlobError::NotFound
+    } else {
+        BlobError::Sdk(Box::new(e))
     }
 }
 
