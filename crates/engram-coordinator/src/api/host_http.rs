@@ -145,6 +145,15 @@ pub struct HeartbeatRequest {
     pub running_sandboxes: Vec<SandboxId>,
     #[serde(default)]
     pub draining: bool,
+    /// ADR 0013: host's gRPC advertise address. Carried on every
+    /// heartbeat (not just register) so any coord pod can self-heal
+    /// its in-memory registry from heartbeat traffic alone — even
+    /// after a rolling restart where the new pod has no prior state
+    /// and the host won't re-register until the next agent restart.
+    /// Optional for backward-compat with pre-fix host-agents during
+    /// rollout; once they've all redeployed, presence is the norm.
+    #[serde(default)]
+    pub host_addr: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +171,33 @@ pub async fn heartbeat(
     Path(host_id): Path<HostId>,
     Json(hb): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
+    // ADR 0013 self-heal: ensure the host is in this pod's
+    // in-memory registry + the gRPC pool, even if we never saw
+    // the original `/api/hosts/register` POST (e.g. coord pod was
+    // just rolled by helm-deploy; the host already registered
+    // against the previous pod and won't re-register until its
+    // next agent restart). Heartbeat carries `host_addr` so we
+    // don't need a PG lookup; the warm + register are idempotent
+    // on the steady-state path.
+    if let Some(host_addr) = hb.host_addr.as_deref() {
+        if !state.host_registry.contains(host_id) {
+            tracing::info!(
+                host_id = %host_id,
+                host_addr = %host_addr,
+                "heartbeat for unregistered host; warming pool + registering",
+            );
+            state
+                .services
+                .host_pool
+                .warm(host_id, host_addr.to_string())
+                .await?;
+            let client = state.services.host_pool.get(host_id)?;
+            let backend: std::sync::Arc<dyn engram_core::traits::HostClient> =
+                std::sync::Arc::new(client);
+            state.host_registry.register(host_id, backend);
+        }
+    }
+
     // ADR 0009 §1-§3: reconcile first, so subsequent state updates
     // reflect the post-flip view. Same dispatch as the WS
     // supervisor loop (`api/hosts.rs:266-284`).

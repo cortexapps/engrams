@@ -92,6 +92,13 @@ impl HostRegistry {
         );
     }
 
+    /// Whether this host id has an entry. Used by the heartbeat
+    /// handler to decide whether to do an idempotent re-register
+    /// (coord-restart self-heal, ADR 0013).
+    pub fn contains(&self, host_id: HostId) -> bool {
+        self.hosts.contains_key(&host_id)
+    }
+
     /// Update a host's heartbeat-derived state. Called by the WS
     /// supervisor on each inbound `Heartbeat`; the scheduler reads
     /// the most recent value when picking a host.

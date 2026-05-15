@@ -132,6 +132,19 @@ pub async fn run_with_registry_and_local(
         tracing::warn!(error = %e, "routing-map repopulate at startup failed");
     }
 
+    // ADR 0013: hydrate the in-memory `HostRegistry` + `GrpcHostPool`
+    // from the `hosts` rows persisted in Postgres. Closes the gap
+    // between coord pod boot and the first heartbeat from each host
+    // (~5s otherwise). Without this, a session-create that lands on
+    // a freshly-booted pod within that window errors with "no hosts
+    // connected to the coordinator". Heartbeats then self-heal on
+    // their own tick (see the ADR 0013 path in
+    // `api/host_http::heartbeat`), but the startup hydrate cuts the
+    // first-request failure window to zero. Best-effort.
+    if let Err(e) = prewarm_host_registry(&state).await {
+        tracing::warn!(error = %e, "startup host-registry prewarm failed");
+    }
+
     // Phase 3c HA: every replica subscribes to the shared
     // `session_events` channel so SSE clients connected to any one
     // replica see events emitted via any other. The same listener
@@ -284,6 +297,73 @@ async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaErr
         tracing::info!(
             sessions = bound,
             "rebuilt in-memory routing for active sessions",
+        );
+    }
+    Ok(())
+}
+
+/// ADR 0013 startup hydrate. Read the `hosts` rows persisted in
+/// Postgres, and for each one whose `host_addr` is populated +
+/// status is Ready/Draining + last heartbeat is recent enough that
+/// the dead-host detector wouldn't reap it, warm the pool entry +
+/// register a `GrpcHostClient` into `HostRegistry`.
+///
+/// "Recent enough" is conservative: 60s, which is 2× the default
+/// dead-host threshold of 30s. Hosts whose heartbeats are older
+/// than that are likely actually dead — we skip them and let
+/// dead_host's detector do its job. Their `host_addr` row will be
+/// reused if they restart and re-register.
+async fn prewarm_host_registry(state: &AppState) -> Result<(), engram_core::MetaError> {
+    use chrono::Utc;
+    let rows = state.services.meta.list_active_hosts().await?;
+    let cutoff = Utc::now() - chrono::Duration::seconds(60);
+    let mut warmed = 0usize;
+    for row in rows {
+        let Some(host_addr) = row.host_addr.clone() else {
+            continue;
+        };
+        if row.last_heartbeat_at < cutoff {
+            tracing::debug!(
+                host_id = %row.id,
+                last_heartbeat_at = %row.last_heartbeat_at,
+                "skipping prewarm for stale host; dead-host detector will reap",
+            );
+            continue;
+        }
+        if let Err(e) = state
+            .services
+            .host_pool
+            .warm(row.id, host_addr.clone())
+            .await
+        {
+            tracing::warn!(
+                host_id = %row.id,
+                host_addr = %host_addr,
+                error = %e,
+                "startup pool.warm failed; heartbeat will self-heal",
+            );
+            continue;
+        }
+        let client = match state.services.host_pool.get(row.id) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    host_id = %row.id,
+                    error = %e,
+                    "startup pool.get failed after warm",
+                );
+                continue;
+            }
+        };
+        let backend: std::sync::Arc<dyn engram_core::traits::HostClient> =
+            std::sync::Arc::new(client);
+        state.host_registry.register(row.id, backend);
+        warmed += 1;
+    }
+    if warmed > 0 {
+        tracing::info!(
+            hosts = warmed,
+            "prewarmed host_registry + grpc pool from persisted hosts rows",
         );
     }
     Ok(())

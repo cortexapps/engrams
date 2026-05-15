@@ -404,6 +404,11 @@ impl HostAgent {
             let heartbeat_interval = self.cfg.heartbeat_interval;
             let coord_for_heartbeat = coord_client.clone();
             let pooled_for_heartbeat = pooled.clone();
+            // ADR 0013 self-heal: ship `host_addr` on every heartbeat
+            // so a freshly-restarted coord pod can warm its pool and
+            // register this host without waiting for the next agent
+            // restart.
+            let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -429,6 +434,7 @@ impl HostAgent {
                         local_snapshots: Vec::new(),
                         running_sandboxes,
                         draining: false,
+                        host_addr: host_addr_for_heartbeat.clone(),
                     };
                     if let Err(e) = coord_for_heartbeat.heartbeat(host_id, &req).await {
                         tracing::debug!(

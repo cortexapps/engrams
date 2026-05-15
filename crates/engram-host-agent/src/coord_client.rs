@@ -303,6 +303,14 @@ pub struct HeartbeatRequest {
     pub running_sandboxes: Vec<SandboxId>,
     #[serde(default)]
     pub draining: bool,
+    /// ADR 0013: gRPC advertise URL the host registered with. Sent on
+    /// every heartbeat so any coord pod can self-heal its in-memory
+    /// registry from heartbeat traffic alone (coord rolling restart
+    /// would otherwise leave the new pod empty until each host's
+    /// next agent restart). `None` when the agent has no addr to
+    /// advertise (`--grpc-listen-addr disabled`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_addr: Option<String>,
 }
 
 #[derive(Deserialize)]
