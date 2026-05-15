@@ -271,7 +271,7 @@ impl PooledBackend {
 
         // Branch 1: NBD daemon.
         #[cfg(target_os = "linux")]
-        if let Some(state) = self.try_spawn_nbd(cached).await? {
+        if let Some(state) = self.try_spawn_nbd(uri, cached).await? {
             tracing::info!(
                 uri = %uri,
                 device = %state.device_path().display(),
@@ -390,9 +390,17 @@ impl PooledBackend {
     /// prerequisite (pool / chunk_store / chunk_cache /
     /// bundle.disk_manifest) is missing. Caller falls back to
     /// materialize-to-file in that case.
+    ///
+    /// For chunked-OCI v2 images the store is wrapped with the
+    /// same `TieredChunkResolver` the materialize-to-file branch
+    /// uses, so NBD reads of chunks absent from BlobStorage fall
+    /// through to OCI Range GET and tee back into BlobStorage.
+    /// Without this the NBD daemon 404s forever on first-touch
+    /// chunks.
     #[cfg(target_os = "linux")]
     async fn try_spawn_nbd(
         &self,
+        uri: &str,
         cached: &CachedImage,
     ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
         let (pool, store, cache) = match (
@@ -407,7 +415,14 @@ impl PooledBackend {
             Some(b) => b,
             None => return Ok(None),
         };
-        let store_arc = Arc::new(store.clone());
+        let effective_store = self
+            .upgrade_chunk_store_for_chunked_oci(store, uri, cached)
+            .await
+            .map_err(|e| {
+                tracing::error!(uri = %uri, error = %e, "chunk-store upgrade for chunked-OCI (NBD) failed");
+                e
+            })?;
+        let store_arc = Arc::new(effective_store);
         let state = crate::disk_daemon::attach_manifest(
             bundle.disk_manifest,
             cache.clone(),
