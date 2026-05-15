@@ -165,6 +165,13 @@ build {
     script = "${path.root}/provisioners/install-firecracker.sh"
   }
 
+  # 2b. FC guest kernel at /usr/local/lib/engram/vmlinux. Host-agent
+  # boots every microVM with this kernel; without it `create()`
+  # rejects every sandbox spec.
+  provisioner "shell" {
+    script = "${path.root}/provisioners/install-fc-kernel.sh"
+  }
+
   # 3. engram-host-agent — pulled from the operator-provided GCS URL.
   provisioner "shell" {
     environment_vars = [
