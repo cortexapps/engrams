@@ -329,14 +329,14 @@ async fn handle_notify(
             tracing::debug!("server received unexpected HarnessEvent; ignoring");
         }
         NotifyKind::SessionEgressPolicy(policy) => {
-            // Coordinator → host: register the per-session egress
-            // policy on the local backend so the proxy's registry
-            // knows this guest IP's allow_hosts. Without dispatch
-            // here, the guest's DNS proxy denies every query with
-            // UnknownGuest and TCP/443 SNI peeks fall through to
-            // Reject — the entire egress path is dark.
-            if let Err(e) = backend.notify_session_policy(policy).await {
-                tracing::warn!(error = %e, "backend rejected SessionEgressPolicy");
+            // ADR 0013: only used now for the no-agent
+            // `apply_egress_policy` path (sessions without a
+            // harness still need their egress proxy entry). The
+            // start_agent bundle case carries policy inline via
+            // `RequestKind::StartAgent`, no notify involved. This
+            // variant deletes with the rest of the WS code.
+            if let Err(e) = backend.apply_egress_policy(policy).await {
+                tracing::warn!(error = %e, "backend rejected apply_egress_policy");
             }
         }
     }
@@ -438,12 +438,14 @@ async fn handle_request(
                 "host did not register a HostAdminHandler; ReapMaterializeDir unsupported".into(),
             )),
         },
-        RequestKind::StartAgent { sandbox_id, agent } => {
-            match backend.start_agent(sandbox_id, agent).await {
-                Ok(()) => Ok(ResponseKind::AgentStarted),
-                Err(e) => Err(RemoteError::from_sandbox(e)),
-            }
-        }
+        RequestKind::StartAgent {
+            sandbox_id,
+            agent,
+            policy,
+        } => match backend.start_agent(sandbox_id, agent, policy).await {
+            Ok(()) => Ok(ResponseKind::AgentStarted),
+            Err(e) => Err(RemoteError::from_sandbox(e)),
+        },
         RequestKind::BindHarnessSession {
             session_id,
             sandbox_id,
@@ -588,15 +590,16 @@ impl HostClient for RecordingBackend {
         &self,
         id: engram_core::SandboxId,
         agent: engram_core::types::sandbox::AgentSpec,
+        policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
-        self.inner.start_agent(id, agent).await
+        self.inner.start_agent(id, agent, policy).await
     }
 
-    async fn notify_session_policy(
+    async fn apply_egress_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
-        self.inner.notify_session_policy(policy).await
+        self.inner.apply_egress_policy(policy).await
     }
 
     async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {

@@ -98,11 +98,21 @@ impl HostClient for LocalHostClient {
         self.sandbox.restore(metadata).await
     }
 
-    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
+    async fn start_agent(
+        &self,
+        id: SandboxId,
+        agent: AgentSpec,
+        policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        // ADR 0013 atomicity: apply the policy *first* so the egress
+        // proxy registry is live before the agent process spawns and
+        // tries to dial out. Both ops touch the inner SandboxBackend
+        // in-proc; local memory ordering carries the invariant.
+        self.sandbox.notify_session_policy(policy).await?;
         self.sandbox.start_agent(id, agent).await
     }
 
-    async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+    async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
         self.sandbox.notify_session_policy(policy).await
     }
 

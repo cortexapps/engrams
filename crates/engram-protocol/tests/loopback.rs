@@ -25,6 +25,20 @@ use futures::stream::StreamExt;
 use tempfile::TempDir;
 use tokio_tungstenite::tungstenite::{Error as TungError, Message as TungMessage};
 
+fn test_policy(
+    sandbox_id: engram_core::SandboxId,
+) -> engram_core::types::egress::SessionEgressPolicy {
+    engram_core::types::egress::SessionEgressPolicy {
+        session_id: engram_core::SessionId::new(),
+        sandbox_id,
+        guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+        network_allow_hosts: vec![],
+        network_allow_host_patterns: vec![],
+        secrets: vec![],
+        secret_mode: engram_core::types::image::SecretMode::Broker,
+    }
+}
+
 fn live_spec() -> SandboxSpec {
     SandboxSpec {
         image: "loopback-test".into(),
@@ -226,7 +240,7 @@ async fn start_agent_round_trips_argv_and_env_through_the_wire() {
             .collect(),
     };
     remote
-        .start_agent(id, agent)
+        .start_agent(id, agent, test_policy(id))
         .await
         .expect("start_agent round-trips");
 
@@ -260,6 +274,7 @@ async fn start_agent_propagates_invalid_spec_error_through_the_wire() {
                 argv: Vec::new(),
                 env: Default::default(),
             },
+            test_policy(id),
         )
         .await
         .expect_err("empty argv must propagate as a backend error");

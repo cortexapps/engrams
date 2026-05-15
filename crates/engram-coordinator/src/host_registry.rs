@@ -368,21 +368,22 @@ impl HostClient for HostRegistry {
         result
     }
 
-    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
+    async fn start_agent(
+        &self,
+        id: SandboxId,
+        agent: AgentSpec,
+        policy: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
         let backend = self.lookup(id)?;
-        backend.start_agent(id, agent).await
+        backend.start_agent(id, agent, policy).await
     }
 
-    async fn notify_session_policy(
+    async fn apply_egress_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
-        // Route by `sandbox_id` — the policy targets the host that
-        // owns that sandbox. The looked-up `HostClient` dispatches:
-        // `RemoteHostClient` forwards over its WS; a `LocalHostClient`
-        // applies directly.
         let backend = self.lookup(policy.sandbox_id)?;
-        backend.notify_session_policy(policy).await
+        backend.apply_egress_policy(policy).await
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {

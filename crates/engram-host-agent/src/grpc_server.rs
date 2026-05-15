@@ -187,17 +187,9 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    /// ADR 0013: bundled policy + start. The host applies the
-    /// `SessionEgressPolicy` to its egress proxy registry BEFORE
-    /// spawning the agent process. Atomic by construction —
-    /// replaces the WS-era frame-ordering invariant.
-    ///
-    /// Today still routes through `LocalHostClient`'s split
-    /// `notify_session_policy` + `start_agent` methods (the trait
-    /// still has them separately during transition). The cutover
-    /// commit unifies them into one trait method;
-    /// `HostServiceImpl::start_agent` becomes a single delegate
-    /// then.
+    /// ADR 0013: bundled policy + start. One trait call applies the
+    /// `SessionEgressPolicy` to the host's egress proxy registry
+    /// BEFORE spawning the agent process. Atomic by construction.
     async fn start_agent(
         &self,
         req: Request<StartAgentRequest>,
@@ -206,18 +198,8 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
         let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
-
-        // Apply the policy to the host's egress registry first, via
-        // the existing standalone trait method. The host's local
-        // `notify_session_policy` is synchronous against the
-        // backend's egress proxy state, so this returns with the
-        // policy live by the time we kick `start_agent`.
         self.inner
-            .notify_session_policy(policy)
-            .await
-            .map_err(sandbox_to_status)?;
-        self.inner
-            .start_agent(sandbox_id, agent)
+            .start_agent(sandbox_id, agent, policy)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

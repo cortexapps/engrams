@@ -69,8 +69,27 @@ pub trait HostClient: Send + Sync {
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
 
-    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError>;
-    async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
+    /// ADR 0013: bundle the egress policy with the agent spawn so the
+    /// host applies the policy to its egress proxy registry BEFORE
+    /// starting the agent process. Atomic by construction —
+    /// eliminates the WS-era frame-ordering invariant that the
+    /// stateless transport can't honour. Local impl applies in-proc;
+    /// the gRPC impl ships both fields in a single `StartAgent` RPC.
+    async fn start_agent(
+        &self,
+        id: SandboxId,
+        agent: AgentSpec,
+        policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError>;
+
+    /// Apply an egress policy to the host's local proxy registry
+    /// without spawning an agent. The companion to `start_agent`'s
+    /// bundled form, for sessions that don't carry a harness but
+    /// can still emit outbound traffic via raw `/exec`. Idempotent:
+    /// the host's egress registry keys on
+    /// `(session_id, sandbox_id, guest_ip)` and upserts.
+    async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
+
     async fn guest_ip(&self, id: SandboxId) -> Option<String>;
 
     // ---- harness routing ----

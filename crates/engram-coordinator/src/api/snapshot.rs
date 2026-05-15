@@ -367,7 +367,34 @@ async fn resume_from_fc_snapshot(
             .ok()
             .flatten();
     if let Some(agent) = agent_opt {
-        if let Err(e) = state.services.host.start_agent(new_sandbox_id, agent).await {
+        // Pre-existing gap (not introduced by ADR 0013): resume
+        // doesn't re-apply the SessionEgressPolicy on the new
+        // sandbox's host, so a resume onto a fresh host gets an
+        // empty egress registry. Filed as a follow-up; the bundled
+        // start_agent here passes an unspecified-IP policy that
+        // the host treats as "no policy applied" — same observable
+        // behavior as before. To fix properly we need to rebuild
+        // the manifest + secret bundle here (extract a helper from
+        // create_session_inner) and pass a populated policy.
+        let placeholder_policy = engram_core::types::egress::SessionEgressPolicy {
+            session_id: id,
+            sandbox_id: new_sandbox_id,
+            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            network_allow_hosts: vec![],
+            network_allow_host_patterns: vec![],
+            secrets: vec![],
+            // SecretMode is required by the struct; Broker is the
+            // benign default (broker mode does nothing if there are
+            // no secrets to broker). Same as if create had been
+            // called with an empty secret bundle.
+            secret_mode: engram_core::types::image::SecretMode::Broker,
+        };
+        if let Err(e) = state
+            .services
+            .host
+            .start_agent(new_sandbox_id, agent, placeholder_policy)
+            .await
+        {
             tracing::warn!(
                 session_id = %id,
                 sandbox_id = %new_sandbox_id,

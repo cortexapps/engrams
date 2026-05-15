@@ -27,7 +27,15 @@ use crate::heartbeat::{Heartbeat, HeartbeatAck};
 /// schemaless, so a single mismatched int between coord and host
 /// silently misaligns every subsequent byte — version-gating the
 /// connection is the only safe way to roll mixed-version deploys.
-pub const WIRE_VERSION: u32 = 1;
+///
+/// v2 (ADR 0013): `RequestKind::StartAgent` gains an inline
+/// `policy: SessionEgressPolicy` field. The bundled-policy
+/// invariant means there's no separate `NotifyKind::SessionEgressPolicy`
+/// frame to race against. The notify variant remains on the wire
+/// for now (coord no longer sends it; host server logs+drops); it
+/// will delete along with the rest of the WS code in the cleanup
+/// commit.
+pub const WIRE_VERSION: u32 = 2;
 
 /// Top-level frame on the wire.
 ///
@@ -180,14 +188,14 @@ pub enum RequestKind {
         live_disk_manifest_ids: Vec<uuid::Uuid>,
     },
     /// Launch the long-running "agent" process inside an existing
-    /// sandbox. Mirrors `HostClient::start_agent`. Frame ordering on
-    /// a single WS connection guarantees this is processed after any
-    /// preceding `NotifyKind::SessionEgressPolicy` for the same
-    /// sandbox, so the host's egress proxy registry is live before
-    /// the harness can dial out.
+    /// sandbox. Mirrors `HostClient::start_agent`. ADR 0013 bundles
+    /// the egress policy inline so the host applies it to the
+    /// egress proxy registry BEFORE spawning the agent — atomic by
+    /// construction, no frame-ordering dependency.
     StartAgent {
         sandbox_id: SandboxId,
         agent: AgentSpec,
+        policy: SessionEgressPolicy,
     },
     /// Tell the host that an upcoming harness connection identifying
     /// itself with `session_id` should be routed to `sandbox_id`.
@@ -630,9 +638,19 @@ mod tests {
             env,
         };
         let sandbox_id = SandboxId::new();
+        let policy = SessionEgressPolicy {
+            session_id: engram_core::SessionId::new(),
+            sandbox_id,
+            guest_ip: "10.200.1.2".parse().unwrap(),
+            network_allow_hosts: vec!["api.github.com".into()],
+            network_allow_host_patterns: vec![],
+            secrets: vec![],
+            secret_mode: engram_core::types::image::SecretMode::Broker,
+        };
         let kind = RequestKind::StartAgent {
             sandbox_id,
             agent: agent.clone(),
+            policy: policy.clone(),
         };
         let frame = Frame::Request {
             req_id: 11,
@@ -647,12 +665,15 @@ mod tests {
                     RequestKind::StartAgent {
                         sandbox_id: got_id,
                         agent: got_agent,
+                        policy: got_policy,
                     },
                 ..
             } => {
                 assert_eq!(got_id, sandbox_id);
                 assert_eq!(got_agent.argv, agent.argv);
                 assert_eq!(got_agent.env, agent.env);
+                assert_eq!(got_policy.session_id, policy.session_id);
+                assert_eq!(got_policy.network_allow_hosts, policy.network_allow_hosts);
             }
             other => panic!("wrong shape: {other:?}"),
         }

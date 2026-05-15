@@ -590,10 +590,11 @@ async fn create_session_inner(
     // start_agent request are serialised on the same connection so
     // the policy is live before the harness can make egress calls.
     //
-    // Skipped only when the backend has no guest IP for this
-    // sandbox (process backend, VZ in some configs). Host-agents
-    // with no local proxy attached treat the frame as a no-op.
-    if let Some(guest_ip_str) = state.services.host.guest_ip(sandbox_id).await {
+    // Build the egress policy from the resolved guest IP. None when
+    // the backend has no guest IP for this sandbox (process backend,
+    // VZ in some configs) — fine; host-agents without a proxy
+    // ignore the policy field.
+    let egress_policy = if let Some(guest_ip_str) = state.services.host.guest_ip(sandbox_id).await {
         if let Ok(guest_ip) = guest_ip_str.parse::<std::net::Ipv4Addr>() {
             let mut secrets = Vec::new();
             for (name, resolved) in &secret_bundle.secrets {
@@ -607,7 +608,7 @@ async fn create_session_inner(
                     allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
                 });
             }
-            let policy = engram_core::types::egress::SessionEgressPolicy {
+            Some(engram_core::types::egress::SessionEgressPolicy {
                 session_id,
                 sandbox_id,
                 guest_ip,
@@ -615,21 +616,13 @@ async fn create_session_inner(
                 network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
                 secrets,
                 secret_mode: manifest.secret_mode,
-            };
-            if let Err(e) = state.services.host.notify_session_policy(policy).await {
-                // Don't fail session create — the policy frame is
-                // best-effort. Hosts without an attached proxy
-                // silently no-op; transient WS issues should retry
-                // through cold-resume re-issuance.
-                tracing::warn!(
-                    %session_id,
-                    %sandbox_id,
-                    error = %e,
-                    "notify_session_policy failed; proceeding without egress policy",
-                );
-            }
+            })
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     // Bind the routing on the host that owns this sandbox *before*
     // the agent has a chance to dial. `backend.create()` returns with
     // the sandbox ready to accept exec but the agent (if any) NOT
@@ -645,16 +638,77 @@ async fn create_session_inner(
     //
     // Workspace materialization is gone (ADR 0005): the bake image's
     // `/workspace` is the workspace; nothing for the platform to do
-    // here.
-    if let Some(agent) = agent_for_session {
-        if let Err(e) = state.services.host.start_agent(sandbox_id, agent).await {
-            let _ = state
+    // here. ADR 0013 bundles `policy` into the `start_agent` call so
+    // the host applies the policy atomically before spawning the
+    // agent — no more "notify then unary" race surface.
+    match (agent_for_session, egress_policy) {
+        (Some(agent), Some(policy)) => {
+            if let Err(e) = state
                 .services
-                .meta
-                .set_session_status(session_id, SessionStatus::Failed)
-                .await;
-            state.services.host.unbind_session(session_id).await;
-            return Err(e.into());
+                .host
+                .start_agent(sandbox_id, agent, policy)
+                .await
+            {
+                let _ = state
+                    .services
+                    .meta
+                    .set_session_status(session_id, SessionStatus::Failed)
+                    .await;
+                state.services.host.unbind_session(session_id).await;
+                return Err(e.into());
+            }
+        }
+        (Some(agent), None) => {
+            // No guest IP yet → no policy to bundle. Synthesize an
+            // empty SessionEgressPolicy with the unspecified IP;
+            // host-agents without a live proxy treat policy
+            // application as a no-op, so this is safe. The agent
+            // can still apply policy on a later
+            // `apply_egress_policy` call once the IP shows up.
+            let policy = engram_core::types::egress::SessionEgressPolicy {
+                session_id,
+                sandbox_id,
+                guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                network_allow_hosts: network_for_proxy.allow_hosts.clone(),
+                network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
+                secrets: Vec::new(),
+                secret_mode: manifest.secret_mode,
+            };
+            if let Err(e) = state
+                .services
+                .host
+                .start_agent(sandbox_id, agent, policy)
+                .await
+            {
+                let _ = state
+                    .services
+                    .meta
+                    .set_session_status(session_id, SessionStatus::Failed)
+                    .await;
+                state.services.host.unbind_session(session_id).await;
+                return Err(e.into());
+            }
+        }
+        (None, Some(policy)) => {
+            // No agent to spawn — just apply the egress policy so
+            // future `/exec` traffic flows through the proxy with
+            // the right allowlist.
+            if let Err(e) = state.services.host.apply_egress_policy(policy).await {
+                tracing::warn!(
+                    %session_id,
+                    %sandbox_id,
+                    error = %e,
+                    "apply_egress_policy failed; proceeding without egress policy",
+                );
+            }
+        }
+        (None, None) => {
+            // Sandbox without a harness and without a guest IP —
+            // nothing to apply, nothing to spawn. The session is
+            // already alive (row inserted, host bound); exec
+            // traffic will go through whatever default the host's
+            // proxy provides (typically allow-all in mode=all,
+            // deny-all in production with no policy registered).
         }
     }
     // Row was inserted as Active in Phase 5; no status update needed.

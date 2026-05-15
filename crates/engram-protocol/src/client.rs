@@ -617,19 +617,21 @@ impl engram_core::traits::HostClient for RemoteHostClient {
         }
     }
 
-    async fn notify_session_policy(
+    async fn apply_egress_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
-        // Notify (not unary) — fire-and-forget. WS-frame ordering
-        // guarantees the host processes this before any subsequent
-        // request on the same connection (e.g. start_agent), which is
-        // the sequencing invariant we rely on for ADR 0006.
+        // No-agent egress policy path: send the vestigial
+        // SessionEgressPolicy Notify so the host's WS server
+        // applies it via NotifyKind dispatch. The Notify variant
+        // deletes with the rest of the WS code; gRPC's
+        // `ApplyEgressPolicy` (future) will replace this with a
+        // dedicated unary that returns an actual ack.
         self.host
             .notify(crate::wire::NotifyKind::SessionEgressPolicy(policy))
             .await
             .map_err(|e| {
-                SandboxError::Vm(Box::new(StringError(format!("notify session policy: {e}"))))
+                SandboxError::Vm(Box::new(StringError(format!("apply_egress_policy: {e}"))))
             })
     }
 
@@ -637,12 +639,18 @@ impl engram_core::traits::HostClient for RemoteHostClient {
         &self,
         id: SandboxId,
         agent: engram_core::types::sandbox::AgentSpec,
+        policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
+        // ADR 0013: bundled. One unary RPC carries the policy + the
+        // agent spec; the host's `RequestKind::StartAgent` dispatch
+        // applies the policy to its egress proxy registry before
+        // spawning the agent. The old paired-Notify path is gone.
         match self
             .host
             .unary(RequestKind::StartAgent {
                 sandbox_id: id,
                 agent,
+                policy,
             })
             .await
         {
