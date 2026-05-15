@@ -380,29 +380,37 @@ pub async fn create_session(
     // `SecretMode::Literal`, so passing them through verbatim is
     // safe — the operator asserted the value, no proxy substitution
     // contract is implied.
-    if manifest.secret_mode == engram_core::types::image::SecretMode::Literal {
-        if let Some(overrides) = req.secrets.as_ref() {
-            for (name, value) in overrides {
-                spec_env.insert(name.clone(), value.clone());
-            }
-            // Persist the overrides sealed under the deployment KEK so
-            // resume can rebuild the post-resume harness's launch env.
-            // Without this, an idle-then-active transition (auto-
-            // resume on the next prompt) respawns the harness child
-            // with no secret env — Claude prompts the user to log in
-            // again. Skipped when overrides is empty so we don't
-            // create empty rows.
-            if !overrides.is_empty() {
-                if let Err(e) = persist_session_secrets(&state, session_id, overrides).await {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "session secrets persistence failed; resume will lose secrets",
-                    );
+    // Captured-but-deferred: the env injection is pure CPU and has to
+    // happen before vm_spec construction, but the DB persist depends
+    // on the session row existing (FK from session_secrets.session_id
+    // → sessions.id). Under the post-aa794b8 flow the row isn't
+    // written until *after* scheduling succeeds, so we defer the
+    // persist call to that point. See `deferred_session_secrets`
+    // below for where it actually fires.
+    let deferred_session_secrets: Option<HashMap<String, String>> =
+        if manifest.secret_mode == engram_core::types::image::SecretMode::Literal {
+            if let Some(overrides) = req.secrets.as_ref() {
+                for (name, value) in overrides {
+                    spec_env.insert(name.clone(), value.clone());
                 }
+                // Persist sealed under the deployment KEK so resume can
+                // rebuild the post-resume harness's launch env. Without
+                // this, an idle-then-active transition (auto-resume on
+                // the next prompt) respawns the harness child with no
+                // secret env — Claude prompts the user to log in again.
+                // Skipped when overrides is empty so we don't create
+                // empty rows.
+                if overrides.is_empty() {
+                    None
+                } else {
+                    Some(overrides.clone())
+                }
+            } else {
+                None
             }
-        }
-    }
+        } else {
+            None
+        };
 
     // The host-agent's `pooled_backend` reads this env hint to pick
     // the substrate's mount-root subdir name. Without it, it falls
@@ -531,6 +539,20 @@ pub async fn create_session(
             );
         }
         return Err(e.into());
+    }
+
+    // Now that the session row exists, the FK on session_secrets is
+    // satisfiable. Best-effort: a failure here just means resume
+    // re-prompts for credentials (the harness still gets them on the
+    // initial boot via vm_spec.env).
+    if let Some(overrides) = deferred_session_secrets {
+        if let Err(e) = persist_session_secrets(&state, session_id, &overrides).await {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "session secrets persistence failed; resume will lose secrets",
+            );
+        }
     }
 
     state.registry.bind(session_id, sandbox_id);
