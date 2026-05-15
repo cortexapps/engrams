@@ -1,8 +1,10 @@
 # ADR 0014: Portable snapshots — warm-pool session create + durable resume
 
 Status: accepted, 2026-05-15
-Phase: 1 (M1 in flight) — ADR doc landed; FC path canonicalization +
-portable-snapshot upload primitive + warm-pool driver to follow.
+Phase: 1 (M1 in flight) — ADR + `paths.rs` contract module landed
+(`ccde296`, `5188751`); portable-snapshot primitive (canonical path
+wiring + mount-namespace per FC + state.bin/sidecar upload + cross-
+host restore integration test) is the next coherent commit.
 
 ## Context
 
@@ -129,16 +131,49 @@ Cross-host restore on the receiver:
 FC has no API to rewrite state.bin after capture. The existing restore
 code already re-provisions TAP at the manifest-derived name
 (`reserve_restored_net`, `lib.rs:1280`) and re-creates the vsock UDS at
-the manifest-derived path. To make this work across hosts we tighten
-the contract:
+the manifest-derived path. The canonical scheme tightens the contract:
 
-- All hosts use identical jail layout:
-  `/var/lib/engram/sandboxes/{sandbox_id}/`.
-- `vsock_uds_path = <jail>/vsock.sock`; rootfs ext4 = `<jail>/rootfs.ext4`.
+- All hosts use identical `<work_dir>` (packer-installed:
+  `/var/lib/engram/sandboxes`).
+- Jail dir: `<work_dir>/<sandbox_id>/` — per-FC-process runtime
+  state (FC api socket, log, uffd uds). Removed on destroy.
+- vsock UDS: `<work_dir>/<sandbox_id>.vsock` — outside the jail, so
+  destroy's `remove_dir_all(jail_dir)` doesn't break a subsequent
+  restore.
+- **Rootfs canonical path: `<work_dir>/rootfs/<sandbox_id>.dev`** —
+  outside the jail, source-sandbox-id-keyed. Symlink to the actual
+  rootfs source (NBD device, materialized file, etc.). FC put_drive
+  receives this path; state.bin embeds this path. The path
+  survives destroy of the source sandbox so cross-host restore (or
+  same-host idle resume) can recreate the materialization.
+- **Harness canonical path: `<work_dir>/harness/<sandbox_id>.ext4`**
+  — same shape.
 - Snapshot capture refuses non-conformant paths (fail-fast at the
-  source rather than fail-mysteriously at restore time on a different
-  host).
-- Cross-host restore integration test gates either milestone shipping.
+  source rather than fail-mysteriously at restore time on a
+  different host).
+
+### Per-FC mount namespace for concurrent restores
+
+A snapshot may be restored multiple times concurrently (N warm
+slots from one template; a leased slot whose refill is in-flight).
+Every restored FC opens the same embedded `path_on_host` from
+state.bin. Sharing one file across N writable FCs corrupts the
+rootfs.
+
+The fix is `unshare(CLONE_NEWNS)` per FC process: each FC runs in
+its own mount namespace where the canonical path bind-mounts to a
+per-FC writable copy. The host's view keeps the canonical path
+unchanged; the FC's view sees its own private file at the same
+path.
+
+Implementation: `Command::pre_exec` in the FC child runs the
+namespace + bind-mount setup between fork and exec, before FC's
+`main()` ever runs. The host process is unaffected.
+
+This is the standard pattern in Lambda's microVM stack (NSDI '20),
+FC's own jailer, runc, and kubelet — adopted here because the
+"one canonical path, many private views" pattern is exactly what
+multi-restore needs.
 
 ### Bootstrap-after-restore: the unified rehydration path
 
@@ -182,6 +217,9 @@ reasons.
 Goals:
 
 - p50 warm-lease session create ≤ 150 ms; p99 ≤ 250 ms.
+- v1 warm-pool depth: N=1 per template per host (mount-namespace
+  isolation makes N>1 correctness-safe; the depth-cap is a memory-
+  cost decision, see warm_pool_memory bench result).
 - Templates with `session_kind ∈ {ephemeral, readonly}` warm-leased by
   default.
 - Templates with `session_kind=git` fall through to cold-create.
@@ -207,8 +245,12 @@ Components:
 - **`templates` table**: maps (image_repo, image_tag, harness_pack_uri)
   → snapshot_id + memory/cpu spec. Rebake flips prior row `active=false`.
 - **Per-host `WarmPool`** (new `crates/engram-host-agent/src/warm_pool.rs`):
-  free-list per template_ref; refill loop; 60 s grace on rebake;
-  N(T)=2 default; autoscale on lease-rate.
+  free-list per template_ref; refill loop; 60 s grace on rebake.
+  v1 N(T)=1 default per host (each warm slot is fully independent
+  via the per-FC mount namespace described above; bumping to N>1
+  is correctness-safe immediately but the read-only-template +
+  per-FC-overlay drive pattern is a later optimisation to reduce
+  the per-slot memory cost). Autoscale on lease-rate.
 - **gRPC additions**: `LeaseWarmSandbox`, `LaunchWarmSandbox`,
   `ListWarmSlots`. `LeaseWarmResponse` is a oneof of
   `{sandbox_id, StaleTemplate{current_ref}, no_capacity}` so the
