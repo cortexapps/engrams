@@ -1,31 +1,29 @@
 name: Bake container images
 
-# Builds the three engrams container images (coordinator, host-agent,
-# web) and pushes them to this repo's GHCR namespace:
+# Two concerns in one workflow:
 #
-#   ghcr.io/cortexapps/engrams/<image>:<sha>
-#   ghcr.io/cortexapps/engrams/<image>:<short-sha>
-#   ghcr.io/cortexapps/engrams/<image>:main          (on push to main only)
-#   ghcr.io/cortexapps/engrams/<image>:latest        (on push to main only)
+# 1. When an image-affecting path changes, build coord/web/host-agent
+#    container images at this SHA and push to GHCR under
+#    `ghcr.io/cortexapps/engrams/<image>:{<sha>,<short>,main,latest}`.
+#    Anyone forking the repo gets the same images under their own
+#    org's GHCR namespace automatically.
 #
-# Anyone forking the repo gets the same workflow producing images
-# under their own org's GHCR namespace automatically — no changes
-# needed.
+# 2. After every push to main (image-affecting OR not), fire a
+#    `repository_dispatch: engrams-changed` at cortexapps/engrams-
+#    internal carrying the SHA. The deploy repo's auto-pipeline
+#    decides what needs to happen from there (helm rollout, TF
+#    apply, FC host image rebake). Path-filtered bakes + an
+#    always-fires notify let chart-only or TF-only pushes propagate
+#    to a redeploy without forcing a no-op image rebuild.
+#
+# TEMPORARY: the dispatch to engrams-internal exists while engrams
+# is still private. Remove the `notify` job when engrams goes
+# public — at that point engrams-internal pulls in releases on its
+# own cadence.
 
 on:
   push:
     branches: [main]
-    # Only re-run when something that affects the images changes —
-    # Cargo source, the Dockerfiles themselves, the migrations the
-    # coord image bundles, or the web SPA.
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'docker/**'
-      - 'deploy/migrations/**'
-      - 'web/**'
-      - '.github/workflows/bake-images.yml'
   workflow_dispatch:
     inputs:
       ref:
@@ -41,7 +39,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            images:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'docker/**'
+              - 'deploy/migrations/**'
+              - 'web/**'
+              - '.github/workflows/bake-images.yml'
+
   bake:
+    needs: detect
+    if: needs.detect.outputs.images == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
 
@@ -97,29 +116,36 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
 
-  # TEMPORARY: while engrams is still private, fire the deploy
-  # workflow in cortexapps/engrams-internal as soon as fresh images
-  # land on main. Remove this whole job when engrams goes public —
-  # at that point the deploy repo dispatches its workflow on its own
-  # cadence (manual, on a release tag, etc.), not driven from here.
+  # Fires on EVERY push to main, whether `bake` ran or was skipped
+  # (chart/TF-only changes don't need new container images). The
+  # deploy repo's auto-pipeline picks up the SHA and converges:
+  # helm-deploy pins images to `bake_ref` (most-recent successful
+  # bake) or the dispatched SHA when fresh; tf-apply re-runs in
+  # case TF modules / values moved.
   #
-  # Auth uses the org-level `GH_TOKEN` PAT (also used for the
-  # cross-repo checkout from engrams-internal). The PAT needs
-  # `actions:write` on cortexapps/engrams-internal.
-  trigger-internal-deploy:
-    needs: bake
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  # `if: always() && ...` lets this fire when `bake` was skipped;
+  # the `bake.result != 'failure'` guard keeps it from firing if a
+  # bake actually failed.
+  notify:
+    needs: [detect, bake]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.bake.result != 'failure' &&
+      needs.bake.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - name: Fire repository_dispatch at engrams-internal
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           SHA: ${{ github.sha }}
+          BAKED: ${{ needs.bake.result == 'success' }}
         run: |
           curl --fail -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/cortexapps/engrams-internal/dispatches \
-            -d "{\"event_type\":\"engrams-bake-completed\",\"client_payload\":{\"engrams_ref\":\"$SHA\"}}"
-          echo "Dispatched engrams-bake-completed -> cortexapps/engrams-internal @ $SHA"
+            -d "{\"event_type\":\"engrams-changed\",\"client_payload\":{\"engrams_ref\":\"$SHA\",\"baked\":$BAKED}}"
+          echo "Dispatched engrams-changed -> cortexapps/engrams-internal @ $SHA (baked=$BAKED)"
