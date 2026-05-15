@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+// ADR 0013: coord ↔ host transport. Replaces the bincode-over-WS
+// wire defined in `src/wire.rs`. One gRPC method per existing
+// `HostClient` trait method (transport per-method dispatch is the
+// debug-grep win); structurally-simple payloads use native proto
+// fields; structurally-complex payloads (SandboxSpec,
+// SnapshotMetadata, SessionEgressPolicy, AgentSpec, ExecRequest)
+// stay bincode-encoded inside a `bytes` field. That carves a small
+// proto surface while keeping the existing Rust types
+// authoritative — coord+host always deploy at the same OSS tag so
+// bincode drift can't happen (same atomic-deploy property the WS
+// path relies on today).
+//
+// UUIDs ride as 16-byte `bytes` fields, not as strings. Strings
+// would double the wire size for no schema benefit.
+
+package engram.host.v1;
+
+service HostService {
+  // ---- sandbox lifecycle ----
+  rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+  rpc DestroySandbox(SandboxIdMessage) returns (Empty);
+  rpc ListSandboxes(Empty) returns (ListSandboxesResponse);
+  rpc Snapshot(SandboxIdMessage) returns (SnapshotResponse);
+  rpc Restore(RestoreRequest) returns (SandboxIdMessage);
+  rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
+
+  // ---- harness routing ----
+  rpc BindHarnessSession(BindHarnessSessionRequest) returns (Empty);
+  rpc UnbindHarnessSession(UnbindHarnessSessionRequest) returns (Empty);
+  rpc SendHarnessPrompt(SendHarnessPromptRequest) returns (Empty);
+
+  // StartAgent bundles SessionEgressPolicy inline so the host
+  // applies the policy to its egress proxy registry *before*
+  // spawning the agent. Eliminates the WS-era "policy notify must
+  // arrive first on the same connection" frame-ordering invariant.
+  rpc StartAgent(StartAgentRequest) returns (Empty);
+
+  // ADR 0011 follow-up #3.
+  rpc AcquireShell(SandboxIdMessage) returns (Empty);
+  rpc ReleaseShell(SandboxIdMessage) returns (Empty);
+
+  // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
+  rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
+
+  // ---- streaming ----
+  rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
+
+  // ---- pool warming ----
+  // Lightweight no-op that forces TCP+H2 handshake when called on a
+  // freshly built `Channel::connect_lazy`. Coord pods fire one of
+  // these on host register / first heartbeat to keep the warm-path
+  // RPC latency budget intact.
+  rpc Ping(Empty) returns (Empty);
+}
+
+message Empty {}
+
+// 16-byte UUID. Same shape as `engram_core::SandboxId`'s underlying
+// `uuid::Uuid::as_bytes()`. Validating that `len(uuid) == 16` is the
+// caller's responsibility.
+message SandboxIdMessage {
+  bytes uuid = 1;
+}
+
+// --- CreateSandbox ---
+
+message CreateSandboxRequest {
+  // bincode-encoded `engram_core::types::sandbox::SandboxSpec`.
+  bytes spec_bincode = 1;
+}
+
+message CreateSandboxResponse {
+  bytes sandbox_id = 1; // 16-byte UUID
+}
+
+// --- ListSandboxes ---
+
+message ListSandboxesResponse {
+  // Each entry is a 16-byte UUID.
+  repeated bytes sandbox_ids = 1;
+}
+
+// --- Snapshot ---
+
+message SnapshotResponse {
+  // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
+  bytes metadata_bincode = 1;
+}
+
+// --- Restore ---
+
+message RestoreRequest {
+  // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
+  bytes metadata_bincode = 1;
+}
+
+// --- GuestIp ---
+
+message GuestIpResponse {
+  // `None` ↔ ip field absent. v4 dotted-quad string when present.
+  optional string ip = 1;
+}
+
+// --- Harness routing ---
+
+message BindHarnessSessionRequest {
+  bytes session_id = 1; // 16-byte UUID
+  bytes sandbox_id = 2; // 16-byte UUID
+}
+
+message UnbindHarnessSessionRequest {
+  bytes session_id = 1; // 16-byte UUID
+}
+
+message SendHarnessPromptRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string text = 2;
+}
+
+message StartAgentRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  // bincode-encoded `engram_core::types::sandbox::AgentSpec`.
+  bytes agent_bincode = 2;
+  // bincode-encoded `engram_core::types::egress::SessionEgressPolicy`.
+  // Applied to the host's egress proxy registry before the agent
+  // spawns. Required (not optional) — even a "no policy" session
+  // serialises an `SessionEgressPolicy::empty()`-shaped struct so
+  // the host has uniform handling.
+  bytes policy_bincode = 3;
+}
+
+// --- ReapMaterializeDir ---
+
+message ReapMaterializeDirRequest {
+  uint64 min_age_secs = 1;
+  // Each entry is a 16-byte UUID. Coord ships this snapshot of
+  // `list_live_disk_manifest_ids` inline; hosts have no DB access.
+  // 1M IDs = 16 MiB — bump the per-method max_decoding_message_size
+  // on the host server.
+  repeated bytes live_disk_manifest_ids = 2;
+}
+
+message ReapMaterializeDirResponse {
+  // bincode-encoded `engram_protocol::wire::WireReapStats`.
+  bytes stats_bincode = 1;
+}
+
+// --- ExecStart (server-streaming) ---
+
+message ExecStartRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  // bincode-encoded `engram_protocol::wire::WireExecRequest`.
+  bytes request_bincode = 2;
+}
+
+message ExecFrame {
+  oneof frame {
+    // First frame on a fresh stream — carries the host-assigned
+    // `exec_id`. Mirrors today's `ResponseKind::ExecStarted`.
+    string started = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    // Terminal frame; the client closes its receiver after one of
+    // these. `status` is `None` when the process was killed by
+    // signal without an exit code.
+    ExecExit exit = 4;
+  }
+}
+
+message ExecExit {
+  optional int32 status = 1;
+}

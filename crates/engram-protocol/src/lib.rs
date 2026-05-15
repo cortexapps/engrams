@@ -13,6 +13,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod grpc;
 pub mod heartbeat;
 pub mod scheduling;
 pub mod server;
