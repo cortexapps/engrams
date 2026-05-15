@@ -25,6 +25,34 @@ pub trait MetadataStore: Send + Sync {
 
     // ---- sessions ----
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
+
+    /// Atomically insert a session in `Active` status with `host_id`
+    /// and `sandbox_id` already bound. Used by the create-session API
+    /// to only persist a row once scheduling has succeeded — so a
+    /// transient capacity blip or unrecoverable scheduling error
+    /// doesn't leave a `Pending` row that nothing will ever advance.
+    ///
+    /// The caller mints the `SessionId` ahead of scheduling (because
+    /// vm_spec env / harness arg construction needs it before the
+    /// sandbox exists). The impl persists with that exact id.
+    ///
+    /// TODO(self-healing reconciler): a future version of this API
+    /// reintroduces a "queue-and-retry" path — pending sessions
+    /// persist with the full vm_spec captured, and a background
+    /// reconciler retries scheduling against later-arriving capacity.
+    /// At that point this method might fall back to "insert Pending
+    /// if scheduling fails, the reconciler picks it up later". The
+    /// reason we don't do that today: SessionSpec doesn't carry
+    /// vm_spec / harness resolution context, and capturing it
+    /// requires schema work that's bigger than the v1 fix.
+    async fn create_session_active(
+        &self,
+        session_id: SessionId,
+        spec: SessionSpec,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+    ) -> Result<(), MetaError>;
+
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 

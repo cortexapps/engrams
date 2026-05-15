@@ -108,6 +108,15 @@ impl MetadataStore for ReconcileMeta {
     async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
         unimplemented!("test seeds sessions directly")
     }
+    async fn create_session_active(
+        &self,
+        _: SessionId,
+        _: SessionSpec,
+        _: engram_core::HostId,
+        _: engram_core::SandboxId,
+    ) -> Result<(), MetaError> {
+        unimplemented!("test seeds sessions directly")
+    }
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         self.sessions
             .lock()

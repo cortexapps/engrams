@@ -14,6 +14,13 @@ pub enum ApiError {
     /// invalidated (Dead): the only affordance is to fork.
     Gone(String),
     Unsupported(String),
+    /// 503 — request was rejected because the system is temporarily
+    /// unable to satisfy it. Used for capacity-fit failures at
+    /// session create: no host has free capacity, no row is written
+    /// to Postgres, retry can succeed. Distinguished from `Conflict`
+    /// (resource exists in a state that rejects the op) and
+    /// `Internal` (genuinely broken).
+    Unavailable(String),
     Internal(String),
 }
 
@@ -31,6 +38,7 @@ impl ApiError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -42,6 +50,7 @@ impl ApiError {
             Self::Conflict(_) => "conflict",
             Self::Gone(_) => "snapshot_invalidated",
             Self::Unsupported(_) => "unsupported",
+            Self::Unavailable(_) => "unavailable",
             Self::Internal(_) => "internal",
         }
     }
@@ -53,6 +62,7 @@ impl ApiError {
             | Self::Conflict(m)
             | Self::Gone(m)
             | Self::Unsupported(m)
+            | Self::Unavailable(m)
             | Self::Internal(m) => m,
         }
     }

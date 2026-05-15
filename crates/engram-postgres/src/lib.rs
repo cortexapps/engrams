@@ -93,6 +93,39 @@ impl MetadataStore for PostgresStore {
         Ok(SessionId(id))
     }
 
+    async fn create_session_active(
+        &self,
+        session_id: SessionId,
+        spec: SessionSpec,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+    ) -> Result<(), MetaError> {
+        let now = Utc::now();
+        let harness_json = serde_json::to_value(&spec.harness)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        sqlx::query(
+            r#"
+            INSERT INTO sessions
+                (id, user_id, status, host_id, sandbox_id,
+                 image_uri, harness,
+                 created_at, last_active_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(spec.user_id.as_deref())
+        .bind(SessionStatus::Active.as_str())
+        .bind(host_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(&spec.image)
+        .bind(harness_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         let row = sqlx::query(
             r#"

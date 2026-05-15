@@ -80,6 +80,28 @@ impl MetadataStore for MockMetadataStore {
         Ok(id)
     }
 
+    async fn create_session_active(
+        &self,
+        session_id: SessionId,
+        spec: SessionSpec,
+        host_id: engram_core::HostId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<(), MetaError> {
+        let session = Session {
+            id: session_id,
+            user_id: spec.user_id,
+            status: SessionStatus::Active,
+            host_id: Some(host_id),
+            sandbox_id: Some(sandbox_id),
+            created_at: Utc::now(),
+            image: spec.image,
+            harness: spec.harness,
+            last_active_at: Utc::now(),
+        };
+        self.sessions.lock().insert(session_id, session);
+        Ok(())
+    }
+
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         self.sessions
             .lock()
@@ -1919,7 +1941,7 @@ async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
 }
 
 #[tokio::test]
-async fn create_session_failure_marks_session_failed() {
+async fn create_session_failure_returns_503_with_no_row() {
     // Build an app whose sandbox backend always errors on create.
     struct AlwaysFailSandbox;
     #[async_trait]
@@ -2010,20 +2032,19 @@ async fn create_session_failure_marks_session_failed() {
         ))
         .await
         .unwrap();
-    // SandboxError::LimitExceeded → ApiError::Internal → 500.
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // New contract: scheduling failures bubble as 503, no row is
+    // ever written. Caller is expected to retry. (The previous shape
+    // marked an orphan Pending→Failed row to leave audit breadcrumbs;
+    // we now keep Postgres clean and lean on coord logs for forensics.)
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // The metadata row exists and is marked Failed so operators can
-    // see *which* sessions the backend rejected.
     let active = store.list_active_sessions().await.unwrap();
-    assert!(
-        active.is_empty(),
-        "failed sessions must not appear in the active list",
-    );
-    // Find the failed session by listing all sessions in the mock.
+    assert!(active.is_empty());
     let sessions = store.all_sessions();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].status, SessionStatus::Failed);
+    assert!(
+        sessions.is_empty(),
+        "no session row should be persisted when scheduling fails, got: {sessions:?}",
+    );
 }
 
 #[tokio::test]

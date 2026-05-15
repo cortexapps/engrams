@@ -207,6 +207,15 @@ mod tests {
         async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
             unreachable!()
         }
+        async fn create_session_active(
+            &self,
+            _: SessionId,
+            _: SessionSpec,
+            _: engram_core::HostId,
+            _: engram_core::SandboxId,
+        ) -> Result<(), MetaError> {
+            unreachable!()
+        }
         async fn get_session(&self, _: SessionId) -> Result<Session, MetaError> {
             unreachable!()
         }

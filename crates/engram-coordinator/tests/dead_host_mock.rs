@@ -44,6 +44,29 @@ impl MetadataStore for MiniMeta {
         );
         Ok(id)
     }
+    async fn create_session_active(
+        &self,
+        session_id: SessionId,
+        spec: SessionSpec,
+        host_id: engram_core::HostId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<(), MetaError> {
+        self.sessions.lock().insert(
+            session_id,
+            Session {
+                id: session_id,
+                user_id: spec.user_id,
+                status: SessionStatus::Active,
+                host_id: Some(host_id),
+                sandbox_id: Some(sandbox_id),
+                created_at: Utc::now(),
+                image: spec.image,
+                harness: spec.harness,
+                last_active_at: Utc::now(),
+            },
+        );
+        Ok(())
+    }
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         self.sessions
             .lock()

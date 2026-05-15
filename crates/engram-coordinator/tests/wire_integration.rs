@@ -62,6 +62,29 @@ impl MetadataStore for MiniMeta {
         );
         Ok(id)
     }
+    async fn create_session_active(
+        &self,
+        session_id: SessionId,
+        spec: SessionSpec,
+        host_id: engram_core::HostId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<(), MetaError> {
+        self.sessions.lock().insert(
+            session_id,
+            Session {
+                id: session_id,
+                user_id: spec.user_id,
+                status: SessionStatus::Active,
+                host_id: Some(host_id),
+                sandbox_id: Some(sandbox_id),
+                created_at: Utc::now(),
+                image: spec.image,
+                harness: spec.harness,
+                last_active_at: Utc::now(),
+            },
+        );
+        Ok(())
+    }
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         self.sessions
             .lock()
@@ -434,13 +457,13 @@ async fn create_then_exec_round_trips_via_wire() {
 }
 
 #[tokio::test]
-async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
-    // Build an AppState with an empty HostRegistry. The Phase 3a
-    // single-host scheduler's "no host" path must surface as a 500
-    // with a meaningful message rather than silently hanging. The
-    // image is seeded via `seed_enabled()` below so the create
-    // handler clears the image-resolution gate and we get to the
-    // no-host failure the test is exercising.
+async fn create_with_no_hosts_registered_returns_503_with_clear_message() {
+    // Build an AppState with an empty HostRegistry. The scheduler's
+    // "no host" path now surfaces as 503 Service Unavailable — the
+    // create handler returns without persisting a row so the caller
+    // can retry. The image is seeded via `seed_enabled()` below so
+    // the create handler clears the image-resolution gate and we get
+    // to the no-host failure the test is exercising.
     let host_registry = Arc::new(HostRegistry::new());
     let meta = Arc::new(MiniMeta::default());
     seed_enabled(&meta, "demo:warm-test", r#"name = "demo""#);
@@ -496,13 +519,13 @@ async fn create_with_no_hosts_registered_returns_500_with_clear_message() {
         .unwrap();
     assert_eq!(
         create.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "no-host path should not silently succeed",
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no-host path should return 503 (retryable)",
     );
     let body = body_json(create.into_body()).await;
     let msg = body["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("no hosts connected") || msg.contains("no host"),
+        msg.contains("no host"),
         "error message must explain why: got {msg:?}",
     );
 }

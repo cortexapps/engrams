@@ -333,11 +333,26 @@ pub async fn create_session(
         user_id: req.user_id,
     };
 
-    // -------- 3. Persist the row --------
-    // First so it has a stable SessionId even if sandbox creation
-    // fails — the failure is then observable as a row stuck in
-    // `failed`.
-    let session_id = state.services.meta.create_session(spec).await?;
+    // -------- 3. Mint a SessionId (no DB write yet) --------
+    //
+    // The row is persisted in Phase 5, AFTER scheduling succeeds —
+    // so a scheduling failure (no capacity, image-not-found, host
+    // crash mid-create) returns 503 with no zombie row. Phase 4
+    // builds vm_spec / harness args using this id, which has to
+    // exist before the sandbox does because those args ride INTO
+    // the sandbox's env at create time.
+    //
+    // TODO(self-healing reconciler): when transient-capacity blips
+    // become a real pattern (warm pools, multi-region cold-start),
+    // flip this around: persist a Pending row with the full
+    // vm_spec captured, and have a background reconciler retry
+    // scheduling against later-arriving capacity. Today the
+    // session row carries `image + harness + user_id` only —
+    // not enough to reconstruct a vm_spec — so the v1 fix is
+    // "fail loud, let the user retry" rather than "queue and
+    // retry in the background". Schema work to capture the
+    // full spec is the gating change.
+    let session_id = SessionId::new();
 
     // -------- 4. Build the anonymous SandboxSpec --------
     // What every sandbox in this image pool gets. Session-specific
@@ -461,68 +476,62 @@ pub async fn create_session(
     };
 
     // -------- 5. Schedule + create the sandbox --------
+    //
+    // No row exists yet. If scheduling fails the caller gets a 503
+    // and Postgres is untouched; a retry can succeed once capacity
+    // recovers. See TODO at the SessionId mint for the eventual
+    // self-healing reconciler design that would persist Pending and
+    // retry in the background instead.
     let ctx = ScheduleContext {
         repo: &image_repo,
         image_version: &image_tag,
         prefer_snapshot_id: None,
         memory_mib: Some(vm_spec.memory.max_mib),
     };
-    let sandbox_id = match state.host_registry.create_for_session(&ctx, vm_spec).await {
-        Ok((host_id, id)) => {
-            if let Err(e) = state
-                .services
-                .meta
-                .assign_session_host(session_id, Some(host_id))
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    host_id = %host_id,
-                    error = %e,
-                    "assign_session_host failed; routing still works via HostRegistry"
-                );
-            }
-            // Persist the sandbox_id so a coordinator restart can
-            // rebuild its in-memory routing maps from `sessions`.
-            if let Err(e) = state
-                .services
-                .meta
-                .assign_session_sandbox(session_id, Some(id))
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    sandbox_id = %id,
-                    error = %e,
-                    "assign_session_sandbox failed; live routing still works (in-memory only)"
-                );
-            }
-            id
-        }
+    let (host_id, sandbox_id) = match state.host_registry.create_for_session(&ctx, vm_spec).await {
+        Ok((host_id, id)) => (host_id, id),
         Err(e) => {
-            // Best-effort: mark the row failed and bubble the error.
-            // We don't tear down the row — Postgres remains the
-            // audit trail for the failure.
-            //
-            // Log loud at error level — sessions that go to
-            // `failed` status without context were silent failures
-            // historically. Include image_uri + session_id so
-            // operators can grep coord logs to find the cause from
-            // a dashboard / API observation of `status=failed`.
-            tracing::error!(
-                session_id = %session_id,
+            tracing::warn!(
                 image_uri = %req.image,
                 error = %e,
-                "session create failed: marking row failed; underlying SandboxError chained in error field",
+                "session create rejected at scheduling; returning 503, no row persisted",
             );
-            let _ = state
-                .services
-                .meta
-                .set_session_status(session_id, SessionStatus::Failed)
-                .await;
-            return Err(e.into());
+            return Err(ApiError::Unavailable(format!(
+                "no host has capacity for this session right now: {e}. \
+                 Retry shortly; capacity-fit recovers as hosts register or sessions drain."
+            )));
         }
     };
+
+    // Atomic insert: row exists only once we have host_id + sandbox_id
+    // bound. If THIS step fails, the sandbox is already running and
+    // would orphan — tear it down before bubbling. Note the
+    // `services.host.destroy` is best-effort; a failure here leaves
+    // a sandbox running on the host until its owning host-agent's
+    // reconcile pass flips it.
+    if let Err(e) = state
+        .services
+        .meta
+        .create_session_active(session_id, spec, host_id, sandbox_id)
+        .await
+    {
+        tracing::error!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            host_id = %host_id,
+            error = %e,
+            "session row insert failed after sandbox create; tearing sandbox down",
+        );
+        if let Err(de) = state.services.host.destroy(sandbox_id).await {
+            tracing::error!(
+                session_id = %session_id,
+                sandbox_id = %sandbox_id,
+                error = %de,
+                "sandbox teardown after insert failure also failed — host reconcile will GC",
+            );
+        }
+        return Err(e.into());
+    }
 
     state.registry.bind(session_id, sandbox_id);
     // ADR 0006: ship per-session egress policy to the host-agent
@@ -598,11 +607,11 @@ pub async fn create_session(
             return Err(e.into());
         }
     }
-    state
-        .services
-        .meta
-        .set_session_status(session_id, SessionStatus::Active)
-        .await?;
+    // Row was inserted as Active in Phase 5; no status update needed.
+    // Still emit a Pending→Active StatusChanged so SSE subscribers
+    // see the lifecycle event (`Pending` is the implicit pre-insert
+    // state from the API caller's point of view, even though we
+    // never persisted it).
     state
         .emit(
             session_id,
