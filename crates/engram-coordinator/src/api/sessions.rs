@@ -649,6 +649,13 @@ async fn create_session_inner(
                 .start_agent(sandbox_id, agent, policy)
                 .await
             {
+                tracing::error!(
+                    %session_id,
+                    %sandbox_id,
+                    %host_id,
+                    error = %e,
+                    "start_agent failed; marking session Failed",
+                );
                 let _ = state
                     .services
                     .meta
@@ -680,6 +687,13 @@ async fn create_session_inner(
                 .start_agent(sandbox_id, agent, policy)
                 .await
             {
+                tracing::error!(
+                    %session_id,
+                    %sandbox_id,
+                    %host_id,
+                    error = %e,
+                    "start_agent failed (no guest IP path); marking session Failed",
+                );
                 let _ = state
                     .services
                     .meta
