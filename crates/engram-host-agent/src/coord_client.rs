@@ -165,14 +165,58 @@ impl CoordClient {
 }
 
 fn trim_ws_suffix(coord_url: &str) -> String {
-    // Tolerate callers that pass the WS-flavored URL today
-    // (`http://coord:8080/api/hosts/connect`) so the cutover commit
-    // can swap dialer code without rewriting config.
+    // Tolerate callers that pass the WS-flavored URL inherited from
+    // the pre-0013 dialer config (`ws://coord:8080/api/hosts/connect`
+    // is what the Terraform startup script writes today). Strip the
+    // `/api/hosts/connect` suffix AND rewrite the `ws://` / `wss://`
+    // scheme to `http://` / `https://` — reqwest rejects WS schemes
+    // outright with "builder error for url" otherwise.
     let trimmed = coord_url.trim_end_matches('/');
-    if let Some(stripped) = trimmed.strip_suffix("/api/hosts/connect") {
-        stripped.to_string()
+    let trimmed = if let Some(stripped) = trimmed.strip_suffix("/api/hosts/connect") {
+        stripped
+    } else {
+        trimmed
+    };
+    if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{rest}")
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod trim_ws_suffix_tests {
+    use super::trim_ws_suffix;
+
+    #[test]
+    fn strips_connect_suffix_and_rewrites_ws_scheme() {
+        assert_eq!(
+            trim_ws_suffix("ws://coord:8080/api/hosts/connect"),
+            "http://coord:8080",
+        );
+        assert_eq!(
+            trim_ws_suffix("wss://coord:8080/api/hosts/connect"),
+            "https://coord:8080",
+        );
+    }
+
+    #[test]
+    fn passes_http_url_through_untouched_after_suffix_strip() {
+        assert_eq!(
+            trim_ws_suffix("http://coord:8080/api/hosts/connect"),
+            "http://coord:8080",
+        );
+        assert_eq!(trim_ws_suffix("http://coord:8080"), "http://coord:8080");
+    }
+
+    #[test]
+    fn handles_trailing_slash() {
+        assert_eq!(
+            trim_ws_suffix("ws://coord:8080/api/hosts/connect/"),
+            "http://coord:8080",
+        );
     }
 }
 

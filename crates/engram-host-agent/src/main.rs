@@ -58,6 +58,23 @@ struct Cli {
     #[arg(long, env = "ENGRAM_COORDINATOR_TOKEN")]
     coordinator_token: Option<String>,
 
+    /// ADR 0013: bind address for the gRPC `HostService` server. The
+    /// coord dials this from inside the VPC. `0.0.0.0:9101` by
+    /// default; set to an empty string or `disabled` to skip the
+    /// server entirely (`--mode=all`-style standalone dev where
+    /// nothing's dispatching to us).
+    #[arg(long, env = "ENGRAM_GRPC_LISTEN_ADDR", default_value = "0.0.0.0:9101")]
+    grpc_listen_addr: String,
+
+    /// ADR 0013: externally-routable URL the coord uses to dial the
+    /// gRPC server (sent to coord in `POST /api/hosts/register`).
+    /// When unset, host-agent auto-derives it: GCE metadata server
+    /// → `http://<internal-ip>:<grpc-port>`; falls back to
+    /// `http://127.0.0.1:<grpc-port>` for non-GCE dev runs.
+    /// Set to an empty string to opt out of registration entirely.
+    #[arg(long, env = "ENGRAM_GRPC_ADVERTISE_ADDR")]
+    grpc_advertise_addr: Option<String>,
+
     /// Which sandbox backend to wrap. `firecracker` (Linux+KVM) or
     /// `vz` (macOS Apple Silicon). The Process backend is a test
     /// fixture and is intentionally not selectable here.
@@ -170,10 +187,29 @@ async fn main() -> Result<(), HostAgentError> {
     // the autohealer fails every instance after the 180s grace
     // period and the MIG rolls in a tight loop.
     engram_host_agent::metrics::init(cli.metrics_addr);
+
+    // ADR 0013: resolve the gRPC listen + advertise addrs.
+    //
+    // listen_addr: parse the CLI/env-supplied socket addr. Empty
+    // string or "disabled" skips the gRPC server (mode=all-style
+    // standalone dev where the host-agent serves only its in-proc
+    // backend). Default 0.0.0.0:9101 is "always on" in production.
+    //
+    // advertise_addr: prefer ENGRAM_GRPC_ADVERTISE_ADDR; if unset,
+    // try the GCE metadata server for the host's internal IP; if
+    // neither yields a value, fall back to 127.0.0.1 with the
+    // resolved listen port (covers dev-vm split-mode where the
+    // coord and host-agent run on the same box).
+    let (grpc_listen_addr, grpc_port) = parse_grpc_listen(&cli.grpc_listen_addr);
+    let grpc_advertise_addr =
+        resolve_advertise_addr(cli.grpc_advertise_addr.clone(), grpc_port).await;
+
     let cfg = HostAgentConfig {
         work_dir: cli.work_dir.clone(),
         coordinator_endpoint: cli.coordinator.clone(),
         coordinator_token: cli.coordinator_token.clone(),
+        grpc_listen_addr,
+        grpc_advertise_addr,
         ..HostAgentConfig::default()
     };
 
@@ -400,6 +436,101 @@ async fn build_host_egress(cli: &Cli) -> Result<engram_host_agent::egress::HostE
     engram_host_agent::egress::HostEgress::spawn(source, bind)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Parse the gRPC listen address from `ENGRAM_GRPC_LISTEN_ADDR`.
+/// Returns `(Some(addr), port)` for a normal binding, `(None, 0)`
+/// when explicitly disabled by an empty string or `"disabled"`.
+/// On a malformed value, logs a warning and disables (same as
+/// explicit disable) rather than crashing — the host-agent's other
+/// surfaces (heartbeat, register, harness events) can still run.
+fn parse_grpc_listen(raw: &str) -> (Option<std::net::SocketAddr>, u16) {
+    let s = raw.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("disabled") {
+        return (None, 0);
+    }
+    match s.parse::<std::net::SocketAddr>() {
+        Ok(addr) => (Some(addr), addr.port()),
+        Err(e) => {
+            tracing::warn!(
+                value = %s,
+                error = %e,
+                "invalid ENGRAM_GRPC_LISTEN_ADDR; disabling gRPC server",
+            );
+            (None, 0)
+        }
+    }
+}
+
+/// Resolve the externally-routable URL the coord uses to dial us.
+/// ADR 0013. Precedence:
+///   1. The CLI/env `ENGRAM_GRPC_ADVERTISE_ADDR` value, if non-empty.
+///      An explicit empty string opts out of registration.
+///   2. The GCE metadata server's primary internal IP, with the
+///      resolved gRPC port. Times out fast (500 ms) so a non-GCE dev
+///      run doesn't pay the wait.
+///   3. `http://127.0.0.1:<grpc_port>` — appropriate for the dev-vm
+///      split-mode test where the coord runs on the same VM.
+///
+/// `grpc_port=0` (gRPC server disabled) returns `None` regardless of
+/// the env var, since there's nothing to advertise.
+async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Option<String> {
+    if grpc_port == 0 {
+        if cli_value.as_deref().is_some_and(|s| !s.is_empty()) {
+            tracing::warn!("ENGRAM_GRPC_ADVERTISE_ADDR set but gRPC listener disabled; ignoring",);
+        }
+        return None;
+    }
+    if let Some(v) = cli_value {
+        let v = v.trim().to_string();
+        // Explicit empty string = opt out of registration.
+        if v.is_empty() {
+            tracing::info!("ENGRAM_GRPC_ADVERTISE_ADDR is empty; skipping host registration");
+            return None;
+        }
+        return Some(v);
+    }
+    // Try GCE metadata server with a short timeout.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .ok()?;
+    let metadata_url =
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip";
+    match client
+        .get(metadata_url)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(ip) => {
+                let ip = ip.trim();
+                if ip.is_empty() {
+                    tracing::warn!("GCE metadata returned empty IP; falling back to 127.0.0.1");
+                    Some(format!("http://127.0.0.1:{grpc_port}"))
+                } else {
+                    let addr = format!("http://{ip}:{grpc_port}");
+                    tracing::info!(
+                        advertise_addr = %addr,
+                        "resolved gRPC advertise addr from GCE metadata",
+                    );
+                    Some(addr)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "GCE metadata body read failed; falling back");
+                Some(format!("http://127.0.0.1:{grpc_port}"))
+            }
+        },
+        _ => {
+            tracing::info!(
+                "GCE metadata server unreachable; advertising http://127.0.0.1:{grpc_port} \
+                 (set ENGRAM_GRPC_ADVERTISE_ADDR explicitly for non-GCE multi-host runs)",
+            );
+            Some(format!("http://127.0.0.1:{grpc_port}"))
+        }
+    }
 }
 
 /// Initialise the global tracing subscriber.
