@@ -93,6 +93,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
 pub mod net;
+pub mod paths;
 pub mod pidfd;
 pub mod sandbox_manifest;
 
