@@ -248,6 +248,11 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
         },
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
+        // The WS path doesn't know the host's gRPC addr — that's
+        // populated by the ADR 0013 `/api/hosts/register` endpoint.
+        // Leave NULL; once the host re-registers via HTTP, it'll get
+        // set without losing this row.
+        host_addr: None,
     };
     if let Err(e) = state.services.meta.upsert_host(initial_record).await {
         tracing::warn!(host_id = %host_id, error = %e, "host upsert failed; in-memory registration still active");

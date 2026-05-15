@@ -269,8 +269,8 @@ impl MetadataStore for PostgresStore {
                                capacity_total_gb, capacity_used_gb,
                                capacity_total_mib, capacity_used_mib,
                                running_sandboxes_count,
-                               last_heartbeat_at, status, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                               last_heartbeat_at, status, host_addr, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
             ON CONFLICT (hostname) DO UPDATE SET
                 cloud_metadata          = EXCLUDED.cloud_metadata,
                 capacity_total_gb       = EXCLUDED.capacity_total_gb,
@@ -280,6 +280,7 @@ impl MetadataStore for PostgresStore {
                 running_sandboxes_count = EXCLUDED.running_sandboxes_count,
                 last_heartbeat_at       = EXCLUDED.last_heartbeat_at,
                 status                  = EXCLUDED.status,
+                host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
                 updated_at              = NOW()
             "#,
         )
@@ -293,6 +294,7 @@ impl MetadataStore for PostgresStore {
         .bind(host.capacity.running_sandboxes as i32)
         .bind(host.last_heartbeat_at)
         .bind(host.status.as_str())
+        .bind(host.host_addr.as_deref())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -311,7 +313,7 @@ impl MetadataStore for PostgresStore {
                    capacity_total_gb, capacity_used_gb,
                    capacity_total_mib, capacity_used_mib,
                    running_sandboxes_count,
-                   last_heartbeat_at, status
+                   last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
             "#,
@@ -377,7 +379,7 @@ impl MetadataStore for PostgresStore {
                    capacity_total_gb, capacity_used_gb,
                    capacity_total_mib, capacity_used_mib,
                    running_sandboxes_count,
-                   last_heartbeat_at, status
+                   last_heartbeat_at, status, host_addr
               FROM hosts
              WHERE status IN ('ready','draining')
                AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint)

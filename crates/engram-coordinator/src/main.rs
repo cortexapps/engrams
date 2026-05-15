@@ -575,6 +575,7 @@ async fn main() -> Result<(), CoordinatorError> {
             },
             status: engram_core::types::host::HostStatus::Ready,
             last_heartbeat_at: chrono::Utc::now(),
+            host_addr: None,
         };
         if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await {
             return Err(CoordinatorError::Config(format!(
@@ -604,6 +605,7 @@ async fn main() -> Result<(), CoordinatorError> {
                     },
                     status: engram_core::types::host::HostStatus::Ready,
                     last_heartbeat_at: chrono::Utc::now(),
+                    host_addr: None,
                 };
                 if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
                 {

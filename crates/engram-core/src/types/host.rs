@@ -71,6 +71,12 @@ pub struct HostRecord {
     pub capacity: HostCapacity,
     pub status: HostStatus,
     pub last_heartbeat_at: DateTime<Utc>,
+    /// ADR 0013: gRPC dial address (e.g. `http://10.10.0.42:9101`)
+    /// reported via `POST /api/hosts/register`. `None` for pre-0013
+    /// rows or hosts that haven't re-registered since the migration —
+    /// the coord's `GrpcHostPool` treats those as unreachable.
+    #[serde(default)]
+    pub host_addr: Option<String>,
 }
 
 /// Specification for provisioning a new host (autoscaling).

@@ -39,6 +39,7 @@ mod tests {
             },
             status,
             last_heartbeat_at: Utc::now(),
+            host_addr: None,
         }
     }
 

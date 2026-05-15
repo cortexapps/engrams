@@ -52,6 +52,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let last_heartbeat_at: DateTime<Utc> = row.try_get("last_heartbeat_at").map_err(col_err)?;
     let cloud_metadata: HostMetadata =
         serde_json::from_value(cloud_meta).map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let host_addr: Option<String> = row.try_get("host_addr").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -65,6 +66,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         },
         status: parse_host_status(&status)?,
         last_heartbeat_at,
+        host_addr,
     })
 }
 
