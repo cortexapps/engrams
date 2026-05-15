@@ -14,6 +14,8 @@
 pub mod client;
 pub mod codec;
 pub mod grpc;
+pub mod grpc_client;
+pub mod grpc_pool;
 pub mod heartbeat;
 pub mod scheduling;
 pub mod server;

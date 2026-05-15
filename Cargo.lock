@@ -1168,6 +1168,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bincode",
+ "bytes",
  "chrono",
  "dashmap",
  "engram-core",
