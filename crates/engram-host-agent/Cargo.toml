@@ -39,6 +39,7 @@ engram-cloud-static.workspace = true
 engram-secrets-gcp.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
+bincode.workspace = true
 bytes.workspace = true
 # Linux-only: raw libc bindings for the NBD ioctl orchestration
 # in `disk_daemon::runtime`. Gated by `target_os = "linux"` on the
@@ -58,8 +59,11 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tokio-tungstenite.workspace = true
 tokio-util = { version = "0.7", features = ["io"] }
+tonic.workspace = true
+reqwest.workspace = true
 # For the disk-pressure detector's statvfs-based free-space probe.
 # Linux + macOS both expose statvfs; nix's `fs` feature wraps it.
 nix = { version = "0.31", default-features = false, features = ["fs"] }

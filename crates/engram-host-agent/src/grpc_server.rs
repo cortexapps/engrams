@@ -1,0 +1,414 @@
+//! Host-agent's gRPC `HostService` server (ADR 0013).
+//!
+//! Implements the proto-generated `HostService` trait by delegating
+//! to the existing `LocalHostClient`. The same `LocalHostClient`
+//! the WS server (`engram_protocol::server::serve_with_reader`)
+//! talks to today, so there is exactly one in-proc backend and both
+//! transports route through it.
+//!
+//! The server is bound by `boot(...)` to a TCP listener (typically
+//! `0.0.0.0:9101`) and runs until shutdown. Errors mid-RPC become
+//! `tonic::Status` codes mirroring the WS path's `RemoteError`
+//! mapping.
+//!
+//! `result_large_err` is allowed module-wide because `tonic::Status`
+//! is the only error shape for trait methods and helpers — boxing
+//! the Status doesn't compose with tonic's signatures.
+
+#![allow(clippy::result_large_err)]
+
+use std::sync::Arc;
+
+use engram_core::traits::HostClient;
+use engram_core::SandboxError;
+use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
+use engram_protocol::grpc::{
+    BindHarnessSessionRequest, CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit,
+    ExecFrame, ExecStartRequest, GuestIpResponse, ListSandboxesResponse, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+};
+use engram_protocol::server::HostAdminHandler;
+use engram_protocol::wire::{WireExecRequest, WireReapStats};
+use futures::Stream;
+use std::pin::Pin;
+use tokio::sync::mpsc;
+use tonic::{Request, Response, Status};
+
+/// Concrete `HostService` impl. Holds the same `Arc<dyn HostClient>`
+/// the WS server (`engram_protocol::server::serve_with_reader`)
+/// dispatches into, so both transports share one local backend.
+pub struct HostServiceImpl {
+    inner: Arc<dyn HostClient>,
+    admin: Option<Arc<dyn HostAdminHandler>>,
+}
+
+impl HostServiceImpl {
+    pub fn new(inner: Arc<dyn HostClient>) -> Self {
+        Self { inner, admin: None }
+    }
+
+    pub fn with_admin_handler(mut self, admin: Arc<dyn HostAdminHandler>) -> Self {
+        self.admin = Some(admin);
+        self
+    }
+}
+
+/// Boot a tonic `Server` bound to `listen_addr` and serve the
+/// `HostService` until the caller drops the returned future. The
+/// JoinHandle terminates with `Err` on bind failure or panic; a
+/// clean Ctrl-C just drops the future, which the runtime collects.
+pub async fn boot(
+    listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    admin: Option<Arc<dyn HostAdminHandler>>,
+) -> Result<(), tonic::transport::Error> {
+    let mut svc = HostServiceImpl::new(inner);
+    if let Some(a) = admin {
+        svc = svc.with_admin_handler(a);
+    }
+    tracing::info!(addr = %listen_addr, "gRPC HostService listening");
+    tonic::transport::Server::builder()
+        // ADR 0013: HTTP/2 multiplexes many concurrent streams over
+        // one TCP connection per coord pod. 256 is well above the
+        // running_sandboxes ceiling — we don't expect to hit it.
+        .concurrency_limit_per_connection(256)
+        .add_service(HostServiceServer::new(svc))
+        .serve(listen_addr)
+        .await
+}
+
+#[tonic::async_trait]
+impl HostService for HostServiceImpl {
+    type ExecStartStream = Pin<Box<dyn Stream<Item = Result<ExecFrame, Status>> + Send + 'static>>;
+
+    async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn create_sandbox(
+        &self,
+        req: Request<CreateSandboxRequest>,
+    ) -> Result<Response<CreateSandboxResponse>, Status> {
+        let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
+        let sandbox_id = self.inner.create(spec).await.map_err(sandbox_to_status)?;
+        Ok(Response::new(CreateSandboxResponse {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+        }))
+    }
+
+    async fn destroy_sandbox(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner.destroy(id).await.map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn list_sandboxes(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<ListSandboxesResponse>, Status> {
+        let ids = self.inner.list().await.map_err(sandbox_to_status)?;
+        Ok(Response::new(ListSandboxesResponse {
+            sandbox_ids: ids
+                .into_iter()
+                .map(|id| id.as_uuid().as_bytes().to_vec())
+                .collect(),
+        }))
+    }
+
+    async fn snapshot(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<SnapshotResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let metadata = self.inner.snapshot(id).await.map_err(sandbox_to_status)?;
+        Ok(Response::new(SnapshotResponse {
+            metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+        }))
+    }
+
+    async fn restore(
+        &self,
+        req: Request<RestoreRequest>,
+    ) -> Result<Response<SandboxIdMessage>, Status> {
+        let metadata = decode_bincode(&req.into_inner().metadata_bincode, "SnapshotMetadata")?;
+        let id = self
+            .inner
+            .restore(metadata)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        }))
+    }
+
+    async fn guest_ip(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<GuestIpResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let ip = self.inner.guest_ip(id).await;
+        Ok(Response::new(GuestIpResponse { ip }))
+    }
+
+    async fn bind_harness_session(
+        &self,
+        req: Request<BindHarnessSessionRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let session_id = decode_session_id(&r.session_id)?;
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner.bind_session(session_id, sandbox_id).await;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn unbind_harness_session(
+        &self,
+        req: Request<UnbindHarnessSessionRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let session_id = decode_session_id(&req.into_inner().session_id)?;
+        self.inner.unbind_session(session_id).await;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn send_harness_prompt(
+        &self,
+        req: Request<SendHarnessPromptRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .send_prompt(sandbox_id, r.text)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    /// ADR 0013: bundled policy + start. The host applies the
+    /// `SessionEgressPolicy` to its egress proxy registry BEFORE
+    /// spawning the agent process. Atomic by construction —
+    /// replaces the WS-era frame-ordering invariant.
+    ///
+    /// Today still routes through `LocalHostClient`'s split
+    /// `notify_session_policy` + `start_agent` methods (the trait
+    /// still has them separately during transition). The cutover
+    /// commit unifies them into one trait method;
+    /// `HostServiceImpl::start_agent` becomes a single delegate
+    /// then.
+    async fn start_agent(
+        &self,
+        req: Request<StartAgentRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
+        let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
+
+        // Apply the policy to the host's egress registry first, via
+        // the existing standalone trait method. The host's local
+        // `notify_session_policy` is synchronous against the
+        // backend's egress proxy state, so this returns with the
+        // policy live by the time we kick `start_agent`.
+        self.inner
+            .notify_session_policy(policy)
+            .await
+            .map_err(sandbox_to_status)?;
+        self.inner
+            .start_agent(sandbox_id, agent)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn acquire_shell(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner
+            .acquire_shell(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn release_shell(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner
+            .release_shell(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn reap_materialize_dir(
+        &self,
+        req: Request<ReapMaterializeDirRequest>,
+    ) -> Result<Response<ReapMaterializeDirResponse>, Status> {
+        let Some(admin) = self.admin.as_ref() else {
+            return Err(Status::unimplemented(
+                "host did not register a HostAdminHandler; ReapMaterializeDir unsupported",
+            ));
+        };
+        let r = req.into_inner();
+        let live: Vec<uuid::Uuid> = r
+            .live_disk_manifest_ids
+            .iter()
+            .map(|b| {
+                if b.len() != 16 {
+                    Err(Status::invalid_argument(format!(
+                        "live_disk_manifest_id must be 16 bytes, got {}",
+                        b.len()
+                    )))
+                } else {
+                    let mut buf = [0u8; 16];
+                    buf.copy_from_slice(b);
+                    Ok(uuid::Uuid::from_bytes(buf))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let stats: WireReapStats = admin
+            .reap_materialize_dir(r.min_age_secs, live)
+            .await
+            .map_err(|e| Status::internal(format!("reap_materialize_dir: {e}")))?;
+        Ok(Response::new(ReapMaterializeDirResponse {
+            stats_bincode: encode_bincode(&stats, "WireReapStats")?,
+        }))
+    }
+
+    /// Server-streaming exec. First frame is `started` (carries the
+    /// host-assigned `exec_id`); subsequent frames carry stdout /
+    /// stderr bytes; terminal frame is `exit` (always exactly one).
+    async fn exec_start(
+        &self,
+        req: Request<ExecStartRequest>,
+    ) -> Result<Response<Self::ExecStartStream>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        let wire: WireExecRequest = decode_bincode(&r.request_bincode, "WireExecRequest")?;
+        let request = wire.into_engine();
+
+        let mut stream = self
+            .inner
+            .exec_stream(sandbox_id, request)
+            .await
+            .map_err(sandbox_to_status)?;
+
+        // mpsc channel feeds the gRPC stream out. We pump the
+        // backend's `ExecStream` events into it; the stream ends
+        // when the backend sends `Exit` or its events channel
+        // closes (treat-as-Exit-None per the WS path's drain
+        // logic).
+        let (tx, rx) = mpsc::channel::<Result<ExecFrame, Status>>(64);
+
+        // First frame: `started` with the assigned exec_id.
+        let started = ExecFrame {
+            frame: Some(engram_protocol::grpc::exec_frame::Frame::Started(
+                stream.exec_id.clone(),
+            )),
+        };
+        if tx.send(Ok(started)).await.is_err() {
+            // Client already gave up; nothing to do.
+            return Err(Status::cancelled("client closed stream before Started"));
+        }
+
+        tokio::spawn(async move {
+            use engram_core::types::sandbox::ExecEvent;
+            use futures::StreamExt;
+            while let Some(ev) = stream.events.next().await {
+                let frame = match ev {
+                    ExecEvent::Stdout(b) => ExecFrame {
+                        frame: Some(engram_protocol::grpc::exec_frame::Frame::Stdout(b.to_vec())),
+                    },
+                    ExecEvent::Stderr(b) => ExecFrame {
+                        frame: Some(engram_protocol::grpc::exec_frame::Frame::Stderr(b.to_vec())),
+                    },
+                    ExecEvent::Exit(status) => {
+                        let frame = ExecFrame {
+                            frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
+                                status,
+                            })),
+                        };
+                        let _ = tx.send(Ok(frame)).await;
+                        return;
+                    }
+                };
+                if tx.send(Ok(frame)).await.is_err() {
+                    // Client dropped the stream — stop pumping.
+                    return;
+                }
+            }
+            // Backend events channel ended without an explicit Exit
+            // frame. Synthesize Exit(None) so the demuxer downstream
+            // terminates cleanly — matches the WS path's
+            // `drain_exec_stream` behavior.
+            let _ = tx
+                .send(Ok(ExecFrame {
+                    frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
+                        status: None,
+                    })),
+                }))
+                .await;
+        });
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
+    }
+}
+
+// ---- helpers ----
+
+fn encode_bincode<T: serde::Serialize>(value: &T, kind: &'static str) -> Result<Vec<u8>, Status> {
+    bincode::serialize(value).map_err(|e| Status::internal(format!("bincode encode {kind}: {e}")))
+}
+
+fn decode_bincode<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<T, Status> {
+    bincode::deserialize(bytes)
+        .map_err(|e| Status::invalid_argument(format!("bincode decode {kind}: {e}")))
+}
+
+fn decode_sandbox_id(bytes: &[u8]) -> Result<engram_core::SandboxId, Status> {
+    if bytes.len() != 16 {
+        return Err(Status::invalid_argument(format!(
+            "sandbox_id must be 16 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(bytes);
+    Ok(engram_core::SandboxId(uuid::Uuid::from_bytes(buf)))
+}
+
+fn decode_session_id(bytes: &[u8]) -> Result<engram_core::SessionId, Status> {
+    if bytes.len() != 16 {
+        return Err(Status::invalid_argument(format!(
+            "session_id must be 16 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(bytes);
+    Ok(engram_core::SessionId(uuid::Uuid::from_bytes(buf)))
+}
+
+fn sandbox_to_status(err: SandboxError) -> Status {
+    match err {
+        SandboxError::NotFound => Status::not_found(err.to_string()),
+        SandboxError::AlreadyExists => Status::already_exists(err.to_string()),
+        SandboxError::LimitExceeded(_) => Status::resource_exhausted(err.to_string()),
+        SandboxError::InvalidSpec(_) => Status::invalid_argument(err.to_string()),
+        SandboxError::Timeout => Status::deadline_exceeded(err.to_string()),
+        SandboxError::Snapshot(_) | SandboxError::Io(_) | SandboxError::Vm(_) => {
+            Status::internal(err.to_string())
+        }
+    }
+}

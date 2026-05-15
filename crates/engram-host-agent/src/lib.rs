@@ -21,9 +21,11 @@ use crate::image_cache::ImageCache;
 pub mod admin_handler;
 pub mod blob;
 pub mod config;
+pub mod coord_client;
 pub mod dialer;
 pub mod disk_daemon;
 pub mod egress;
+pub mod grpc_server;
 pub mod harness;
 pub mod host_client;
 pub use host_client::LocalHostClient;
@@ -369,21 +371,99 @@ impl HostAgent {
                     as std::sync::Arc<dyn engram_protocol::server::HostAdminHandler>
             });
             let dialer_cfg = dialer::DialerConfig {
-                coordinator_url: coord_url,
+                coordinator_url: coord_url.clone(),
                 auth_token: self.cfg.coordinator_token.clone(),
                 heartbeat_interval: self.cfg.heartbeat_interval,
                 heartbeat_provider: Some(provider),
                 auth_session_handle: self.auth_session_handle.clone(),
                 harness_session_handle: Some(harness_session_handle),
-                admin_handler,
+                admin_handler: admin_handler.clone(),
             };
             let dialer_task = tokio::spawn(async move {
                 if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, host_for_dialer).await {
                     tracing::error!(error = %e, "dialer terminated with error");
                 }
             });
+
+            // ADR 0013: register over HTTP so the coord persists
+            // our host_addr column. The pool can't dial us via gRPC
+            // until that row is populated. Best-effort with retry:
+            // if the coord is briefly unreachable, the WS dialer
+            // above keeps trying too and a future register can
+            // backfill the addr.
+            let coord_client = coord_client::CoordClient::new(
+                coord_url.clone(),
+                self.cfg.coordinator_token.clone(),
+            );
+            if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
+                // hostname: prefer the env-supplied value (set by
+                // the deployment / systemd unit on production
+                // hosts), fall back to a synthetic host-<id>
+                // string. The coord uses this for human display
+                // only; uniqueness comes from host_id.
+                let hostname = std::env::var("HOSTNAME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("host-{host_id}"));
+                let register_req = coord_client::RegisterRequest {
+                    host_id,
+                    hostname,
+                    host_addr: advertise_addr.clone(),
+                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                    wire_version: engram_protocol::WIRE_VERSION,
+                    cloud_metadata: None,
+                };
+                let cc = coord_client.clone();
+                tokio::spawn(async move {
+                    let mut backoff = std::time::Duration::from_millis(500);
+                    let cap = std::time::Duration::from_secs(30);
+                    loop {
+                        match cc.register(&register_req).await {
+                            Ok(_) => {
+                                tracing::info!(
+                                    host_id = %register_req.host_id,
+                                    host_addr = %register_req.host_addr,
+                                    "registered with coord via /api/hosts/register",
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    host_id = %register_req.host_id,
+                                    error = %e,
+                                    "host registration failed; will retry",
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(cap);
+                            }
+                        }
+                    }
+                });
+            }
+
+            // ADR 0013: boot the gRPC HostService server so the
+            // coord can dispatch over gRPC once the cutover commit
+            // wires the GrpcHostPool. Dark today — nothing on the
+            // coord side calls into us via gRPC yet. The server is
+            // still safe to expose: it sits behind the VPC
+            // firewall and the WS path is the active control plane.
+            let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
+                let local_for_grpc = local_host.clone();
+                let admin_for_grpc = admin_handler.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        grpc_server::boot(addr, local_for_grpc, admin_for_grpc).await
+                    {
+                        tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
+                    }
+                })
+            });
+
             shutdown_signal().await;
             dialer_task.abort();
+            if let Some(t) = grpc_task {
+                t.abort();
+            }
 
             // ADR 0009 Phase 7: SIGTERM-checkpoint pipeline. Runs
             // only when `ENGRAM_GRACEFUL_SHUTDOWN=1` (opt-in for
