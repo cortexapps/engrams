@@ -267,15 +267,20 @@ impl MetadataStore for PostgresStore {
             r#"
             INSERT INTO hosts (id, hostname, cloud_metadata,
                                capacity_total_gb, capacity_used_gb,
+                               capacity_total_mib, capacity_used_mib,
+                               running_sandboxes_count,
                                last_heartbeat_at, status, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
             ON CONFLICT (hostname) DO UPDATE SET
-                cloud_metadata    = EXCLUDED.cloud_metadata,
-                capacity_total_gb = EXCLUDED.capacity_total_gb,
-                capacity_used_gb  = EXCLUDED.capacity_used_gb,
-                last_heartbeat_at = EXCLUDED.last_heartbeat_at,
-                status            = EXCLUDED.status,
-                updated_at        = NOW()
+                cloud_metadata          = EXCLUDED.cloud_metadata,
+                capacity_total_gb       = EXCLUDED.capacity_total_gb,
+                capacity_used_gb        = EXCLUDED.capacity_used_gb,
+                capacity_total_mib      = EXCLUDED.capacity_total_mib,
+                capacity_used_mib       = EXCLUDED.capacity_used_mib,
+                running_sandboxes_count = EXCLUDED.running_sandboxes_count,
+                last_heartbeat_at       = EXCLUDED.last_heartbeat_at,
+                status                  = EXCLUDED.status,
+                updated_at              = NOW()
             "#,
         )
         .bind(host.id.as_uuid())
@@ -283,6 +288,9 @@ impl MetadataStore for PostgresStore {
         .bind(cloud_meta)
         .bind(host.capacity.total_gb as i32)
         .bind(host.capacity.used_gb as i32)
+        .bind(host.capacity.total_mib as i64)
+        .bind(host.capacity.used_mib as i64)
+        .bind(host.capacity.running_sandboxes as i32)
         .bind(host.last_heartbeat_at)
         .bind(host.status.as_str())
         .execute(&self.pool)
@@ -301,6 +309,8 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, hostname, cloud_metadata,
                    capacity_total_gb, capacity_used_gb,
+                   capacity_total_mib, capacity_used_mib,
+                   running_sandboxes_count,
                    last_heartbeat_at, status
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -365,6 +375,8 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, hostname, cloud_metadata,
                    capacity_total_gb, capacity_used_gb,
+                   capacity_total_mib, capacity_used_mib,
+                   running_sandboxes_count,
                    last_heartbeat_at, status
               FROM hosts
              WHERE status IN ('ready','draining')
