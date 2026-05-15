@@ -2165,7 +2165,16 @@ impl SandboxBackend for FirecrackerBackend {
         // listener takes seconds to come up after VM boot — same
         // race as `exec_stream`'s vsock CONNECT. Retry the
         // handshake-only error patterns with backoff.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        //
+        // Deadline is generous because cold chunked-NBD rootfs/
+        // workspace mounts can take 15-25s to page in their first
+        // blocks from GCS; engram-init blocks on those mounts
+        // before exec'ing the bootstrap binary, so the vsock
+        // listener doesn't appear until after the mounts complete.
+        // After the chunks land in the host's local cache,
+        // subsequent boots finish in well under a second; this
+        // ceiling only matters on the cold path.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut backoff = Duration::from_millis(100);
         let mut conn = loop {
             match Self::connect_fc_vsock(
@@ -2195,7 +2204,7 @@ impl SandboxBackend for FirecrackerBackend {
         // does immediately after `listener.accept()` returns.
         use tokio::io::AsyncReadExt;
         let mut marker = [0u8; 1];
-        match tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut marker)).await {
+        match tokio::time::timeout(Duration::from_secs(60), conn.read_exact(&mut marker)).await {
             Ok(Ok(_)) => {
                 if marker[0] != engram_harness_proto::BOOTSTRAP_READY_BYTE {
                     tracing::warn!(
@@ -2212,7 +2221,7 @@ impl SandboxBackend for FirecrackerBackend {
             }
             Err(_) => {
                 return Err(SandboxError::Vm(
-                    "timed out waiting for bootstrap ready marker (15s)".into(),
+                    "timed out waiting for bootstrap ready marker (60s)".into(),
                 ));
             }
         }
