@@ -11,6 +11,7 @@ mod events;
 mod exec;
 mod harnesses;
 mod health;
+mod host_http;
 mod hosts;
 mod prompt;
 mod registries;
@@ -44,6 +45,23 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/api/hosts/connect", get(hosts::connect))
+        // ADR 0013 host → coord HTTP endpoints. Live in this build
+        // but unused — host-agent still dials the WS at /connect.
+        // Wiring up the host side lands in the cutover commit.
+        .route("/api/hosts/register", post(host_http::register))
+        .route("/api/hosts/:id/heartbeat", post(host_http::heartbeat))
+        .route(
+            "/api/hosts/:id/auth/resolve-registry",
+            post(host_http::resolve_registry_auth),
+        )
+        .route(
+            "/api/hosts/:id/idle-eviction-candidates",
+            post(host_http::idle_eviction_candidates),
+        )
+        .route(
+            "/sessions/:id/harness-events",
+            post(host_http::harness_event_ingest),
+        )
         .route("/api/hosts", get(hosts::list))
         .route("/api/hosts/:id", get(hosts::get))
         .route("/api/hosts/:id/drain", post(hosts::drain))
