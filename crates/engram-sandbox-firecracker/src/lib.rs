@@ -1769,7 +1769,43 @@ impl SandboxBackend for FirecrackerBackend {
         let sandbox_id = SandboxId::new();
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
 
-        match self.create_in_jail(sandbox_id, &jail_dir, spec).await {
+        // Two-pipe observability: span for forensics (one
+        // log line per attempt, with sandbox_id), histogram for
+        // aggregates (p50/p99 boot latency across many attempts,
+        // partitioned by outcome). Phase-level breakdown (image
+        // pull / materialize / fc_boot / agent_handshake) is the
+        // next iteration — for now this gives us total-cycle
+        // numbers we don't have today.
+        let start = std::time::Instant::now();
+        let span = tracing::info_span!("fc.create", %sandbox_id);
+        let _guard = span.enter();
+
+        let result = self.create_in_jail(sandbox_id, &jail_dir, spec).await;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        let outcome = match &result {
+            Ok(()) => "success",
+            Err(SandboxError::InvalidSpec(_)) => "invalid_spec",
+            Err(_) => "fc_error",
+        };
+        metrics::histogram!(
+            "engram_sandbox_boot_seconds",
+            "phase" => "total",
+            "outcome" => outcome,
+        )
+        .record(elapsed);
+        metrics::counter!(
+            "engram_sandbox_create_total",
+            "outcome" => outcome,
+        )
+        .increment(1);
+        tracing::info!(
+            elapsed_ms = (elapsed * 1000.0) as u64,
+            outcome,
+            "fc create complete",
+        );
+
+        match result {
             Ok(()) => Ok(sandbox_id),
             Err(e) => {
                 // Best-effort cleanup so a failed create doesn't leave

@@ -45,6 +45,13 @@ struct Cli {
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
 
+    /// Address the Prometheus `/metrics` exporter listens on.
+    /// Doubles as the TCP target for the GCE MIG's autohealing
+    /// health check (see fc-host-mig TF — `google_compute_health_check.host_agent`
+    /// targets port 9100).
+    #[arg(long, env = "ENGRAM_HOST_METRICS_ADDR", default_value = "0.0.0.0:9100")]
+    metrics_addr: std::net::SocketAddr,
+
     /// Bearer token sent on the WS upgrade. Match the coordinator's
     /// `ENGRAM_AUTH_TOKENS`. Omit when the coordinator is in dev mode
     /// (auth disabled).
@@ -157,6 +164,12 @@ async fn main() -> Result<(), HostAgentError> {
     init_tracing();
 
     let cli = Cli::parse();
+
+    // Bind the metrics port first. It doubles as the GCE MIG
+    // autohealing health check's TCP target — without this listener
+    // the autohealer fails every instance after the 180s grace
+    // period and the MIG rolls in a tight loop.
+    engram_host_agent::metrics::init(cli.metrics_addr);
     let cfg = HostAgentConfig {
         work_dir: cli.work_dir.clone(),
         coordinator_endpoint: cli.coordinator.clone(),

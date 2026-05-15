@@ -30,6 +30,7 @@ pub use host_client::LocalHostClient;
 pub mod heartbeat;
 pub mod image_cache;
 pub mod live_attach;
+pub mod metrics;
 pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod resource;

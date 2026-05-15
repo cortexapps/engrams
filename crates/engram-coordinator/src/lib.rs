@@ -18,6 +18,7 @@ pub mod error;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_evictor;
+pub mod metrics;
 pub mod pg_listener;
 pub mod preemption_drain;
 pub mod reconcile;

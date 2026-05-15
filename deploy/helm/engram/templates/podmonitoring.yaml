@@ -1,0 +1,25 @@
+{{- if .Values.metrics.podMonitoring.enabled -}}
+# Google Managed Prometheus PodMonitoring — GKE-native scrape
+# config. GMP picks up this CRD and scrapes the named port on
+# every selector-matching pod without any standalone Prometheus
+# infra. Available on GKE clusters with `managed-prometheus`
+# enabled (cluster-level setting).
+#
+# Operators on self-hosted Prometheus should leave
+# `metrics.podMonitoring.enabled = false` and point their scraper
+# at the coord pods directly via the `metrics` named port.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ include "engram.coordinator.fullname" . }}
+  labels:
+    {{- include "engram.coordinator.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "engram.coordinator.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.podMonitoring.interval | quote }}
+      path: /metrics
+{{- end -}}

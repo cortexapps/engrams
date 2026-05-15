@@ -226,6 +226,34 @@ pub struct CreateSessionResponse {
 }
 
 pub async fn create_session(
+    state: State<SharedState>,
+    req: Json<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    let start = std::time::Instant::now();
+    let result = create_session_inner(state, req).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let outcome = match &result {
+        Ok(_) => "success",
+        Err(ApiError::BadRequest(_)) => "bad_request",
+        Err(ApiError::NotFound(_)) => "image_not_enabled",
+        Err(ApiError::Unavailable(_)) => "scheduling_rejected",
+        Err(_) => "internal",
+    };
+    metrics::histogram!(
+        crate::metrics::SESSION_BOOT_SECONDS,
+        "phase" => "total",
+        "outcome" => outcome,
+    )
+    .record(elapsed);
+    metrics::counter!(
+        crate::metrics::SESSION_CREATE_TOTAL,
+        "outcome" => outcome,
+    )
+    .increment(1);
+    result
+}
+
+async fn create_session_inner(
     State(state): State<SharedState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {

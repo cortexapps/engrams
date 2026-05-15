@@ -65,6 +65,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 uuid.workspace = true
 tempfile = "3"
 

@@ -98,6 +98,12 @@ struct Cli {
     )]
     harness_listen_addr: std::net::SocketAddr,
 
+    /// Address the Prometheus `/metrics` exporter listens on.
+    /// Separate port from the main API so scrapers reach a
+    /// bearer-free endpoint without going through nginx + IAP.
+    #[arg(long, env = "ENGRAM_METRICS_ADDR", default_value = "0.0.0.0:9090")]
+    metrics_addr: std::net::SocketAddr,
+
     /// Engram CIDR pool — every Firecracker sandbox gets a unique
     /// /30 carved from this. Defaults to 10.200.0.0/16 (16k slots).
     /// Override if you're already using 10.200.0.0/16 on this host.
@@ -208,6 +214,13 @@ async fn main() -> Result<(), CoordinatorError> {
     init_tracing();
 
     let cli = Cli::parse();
+
+    // Bring up the metrics exporter early so any later init step
+    // (postgres connect, KEK load, etc.) can record startup
+    // counters / timings. Bind failures are logged + swallowed
+    // inside `init`; we don't want a busy 9090 to keep the coord
+    // from coming up.
+    engram_coordinator::metrics::init(cli.metrics_addr);
 
     let cfg = CoordinatorConfig {
         bind_addr: cli.bind_addr.clone(),

@@ -119,6 +119,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 # cli
 clap = { version = "4", features = ["derive", "env"] }

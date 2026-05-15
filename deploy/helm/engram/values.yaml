@@ -140,6 +140,16 @@ pdb:
   enabled: true
   minAvailable: 1
 
+# Metrics scraping. On GKE the natural fit is Google Managed
+# Prometheus (GMP), which scrapes via a `PodMonitoring` CRD.
+# Operators on self-hosted Prometheus typically add scrape configs
+# directly; for those, leave `podMonitoring.enabled = false` and
+# point the scraper at the coord pod's `:9090` `metrics` port.
+metrics:
+  podMonitoring:
+    enabled: false
+    interval: "30s"
+
 # NetworkPolicy egress controls. The coord needs to reach Postgres,
 # the blob backend, and the OCI registry. Tighten per cloud.
 networkPolicy:
