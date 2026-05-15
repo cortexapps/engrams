@@ -43,11 +43,27 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       images: ${{ steps.filter.outputs.images }}
+      host_image: ${{ steps.filter.outputs.host_image }}
+      tf_or_helm: ${{ steps.filter.outputs.tf_or_helm }}
     steps:
       - uses: actions/checkout@v6
       - id: filter
         uses: dorny/paths-filter@v3
         with:
+          # Three filters drive the downstream fan-out into
+          # engrams-internal:
+          # - `images`: container rebake (coord / host-agent / web).
+          #   Gates this workflow's own bake job + the
+          #   `engrams-changed` dispatch that triggers helm-deploy.
+          # - `host_image`: FC host GCE image rebake. Gates the new
+          #   `engrams-host-changed` dispatch that triggers
+          #   bake-fc-host-image in engrams-internal.
+          # - `tf_or_helm`: TF / helm module changes that don't
+          #   need a container or host-image rebake. Gates the new
+          #   `engrams-tf-changed` dispatch that triggers
+          #   tf-apply directly. Without this filter, every OSS
+          #   push fanned tf-apply in parallel with bake-fc-host,
+          #   wasting a ~5min run against the stale image.
           filters: |
             images:
               - 'Cargo.toml'
@@ -57,6 +73,15 @@ jobs:
               - 'deploy/migrations/**'
               - 'web/**'
               - '.github/workflows/bake-images.yml'
+            host_image:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'deploy/packer/**'
+              - 'rust-toolchain.toml'
+            tf_or_helm:
+              - 'deploy/terraform/**'
+              - 'deploy/helm/**'
 
   bake:
     needs: detect
@@ -116,16 +141,25 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
 
-  # Fires on EVERY push to main, whether `bake` ran or was skipped
-  # (chart/TF-only changes don't need new container images). The
-  # deploy repo's auto-pipeline picks up the SHA and converges:
-  # helm-deploy pins images to `bake_ref` (most-recent successful
-  # bake) or the dispatched SHA when fresh; tf-apply re-runs in
-  # case TF modules / values moved.
+  # Fires on EVERY push to main where the `bake` job didn't fail.
+  # Fans path-aware repository_dispatches into engrams-internal so
+  # each downstream workflow only runs when its inputs actually
+  # moved:
   #
-  # `if: always() && ...` lets this fire when `bake` was skipped;
-  # the `bake.result != 'failure'` guard keeps it from firing if a
-  # bake actually failed.
+  #   - `engrams-changed` → helm-deploy. Fires when container
+  #     images got (or could have) rebaked.
+  #   - `engrams-host-changed` → bake-fc-host-image. Fires when
+  #     the FC host GCE image needs a rebake (host-agent code,
+  #     packer manifest, Cargo lock, etc.).
+  #   - `engrams-tf-changed` → tf-apply directly. Fires for
+  #     OSS-side TF/helm module changes that don't need a
+  #     container or host-image rebake. Without this dispatch,
+  #     such changes don't propagate at all under the path-aware
+  #     model.
+  #
+  # `if: always() && ...` lets this fire when `bake` was skipped
+  # for path reasons; the `bake.result != 'failure'` guard keeps
+  # it from firing if a bake actually broke.
   notify:
     needs: [detect, bake]
     if: |
@@ -136,16 +170,37 @@ jobs:
       needs.bake.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
-      - name: Fire repository_dispatch at engrams-internal
+      - name: Fire path-aware repository_dispatches at engrams-internal
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           SHA: ${{ github.sha }}
           BAKED: ${{ needs.bake.result == 'success' }}
+          CONTAINERS_CHANGED: ${{ needs.detect.outputs.images }}
+          HOST_IMAGE_CHANGED: ${{ needs.detect.outputs.host_image }}
+          TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
         run: |
-          curl --fail -sS -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/cortexapps/engrams-internal/dispatches \
-            -d "{\"event_type\":\"engrams-changed\",\"client_payload\":{\"engrams_ref\":\"$SHA\",\"baked\":$BAKED}}"
-          echo "Dispatched engrams-changed -> cortexapps/engrams-internal @ $SHA (baked=$BAKED)"
+          set -euo pipefail
+          fire() {
+            local event_type="$1"
+            curl --fail -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/cortexapps/engrams-internal/dispatches \
+              -d "{\"event_type\":\"$event_type\",\"client_payload\":{\"engrams_ref\":\"$SHA\",\"baked\":$BAKED}}"
+            echo "Dispatched $event_type -> cortexapps/engrams-internal @ $SHA (baked=$BAKED)"
+          }
+          if [[ "$CONTAINERS_CHANGED" == "true" ]]; then
+            fire engrams-changed
+          fi
+          if [[ "$HOST_IMAGE_CHANGED" == "true" ]]; then
+            fire engrams-host-changed
+          fi
+          if [[ "$TF_CHANGED" == "true" ]]; then
+            fire engrams-tf-changed
+          fi
+          if [[ "$CONTAINERS_CHANGED" != "true" \
+             && "$HOST_IMAGE_CHANGED" != "true" \
+             && "$TF_CHANGED" != "true" ]]; then
+            echo "No deploy-relevant paths changed in this push; skipping dispatches."
+          fi
