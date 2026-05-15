@@ -140,7 +140,7 @@ sha2 = "0.10"
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 rustls-pemfile = "2"
 tls-parser = "0.12"
 nom = "7"
