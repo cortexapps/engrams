@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.95-slim AS builder
 WORKDIR /src
+# protobuf-compiler: ADR 0013 added a build.rs in engram-protocol that
+# invokes `protoc` to compile `proto/host_service.proto`. The Debian
+# package version is compatible with `tonic-build` 0.12.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates \
+    pkg-config libssl-dev ca-certificates protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

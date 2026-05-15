@@ -69,6 +69,11 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      # ADR 0013: engram-protocol/build.rs needs protoc.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
@@ -133,6 +138,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
 

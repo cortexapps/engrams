@@ -51,6 +51,11 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      # ADR 0013: engram-protocol/build.rs needs protoc.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install musl-tools
