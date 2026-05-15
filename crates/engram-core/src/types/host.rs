@@ -32,10 +32,35 @@ pub struct HostMetadata {
 }
 
 /// Capacity and freshness reported via heartbeat.
+///
+/// Two precisions live here side by side. The `*_mib` + `running_sandboxes`
+/// trio are the source of truth — what the host-agent's heartbeat
+/// actually reports and what the API surfaces. The `*_gb` fields are
+/// legacy holdovers from the original row schema and are set to zero
+/// by current code paths; they'll be dropped in a follow-up once no
+/// downstream consumer reads them.
+///
+/// MiB precision is load-bearing for the SPA's "X.X / Y.Y GiB"
+/// display — at GB granularity the readout would visibly round (a
+/// 31.4 GiB host shows up as "31 GiB"). Persisting MiB on every
+/// heartbeat is also what makes `/api/hosts` consistent across coord
+/// replicas: the in-memory `host_registry` only knows about hosts
+/// whose WS connected to *this* pod, so a pod fielding the API
+/// request for a host owned by a sibling pod falls back to the row
+/// from Postgres. Without persisted MiB fields, that fallback gave
+/// zero capacity and the UI flashed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostCapacity {
+    #[serde(default)]
     pub total_gb: u32,
+    #[serde(default)]
     pub used_gb: u32,
+    #[serde(default)]
+    pub total_mib: u64,
+    #[serde(default)]
+    pub used_mib: u64,
+    #[serde(default)]
+    pub running_sandboxes: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

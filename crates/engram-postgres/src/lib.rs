@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    EnabledImage, HarnessPack, HostRecord, HostStatus, PersistedEvent, RegistryCredential, Session,
-    SessionSecrets, SessionSpec, SessionStatus, SnapshotRecord,
+    EnabledImage, HarnessPack, HostCapacity, HostRecord, HostStatus, PersistedEvent,
+    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionStatus, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -326,16 +326,27 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    async fn touch_host_heartbeat(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
+    async fn touch_host_heartbeat(
+        &self,
+        id: HostId,
+        status: HostStatus,
+        capacity: HostCapacity,
+    ) -> Result<(), MetaError> {
         let n = sqlx::query(
             r#"UPDATE hosts
                   SET status = $2,
+                      capacity_total_mib = $3,
+                      capacity_used_mib = $4,
+                      running_sandboxes_count = $5,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
         )
         .bind(id.as_uuid())
         .bind(status.as_str())
+        .bind(capacity.total_mib as i64)
+        .bind(capacity.used_mib as i64)
+        .bind(capacity.running_sandboxes as i32)
         .execute(&self.pool)
         .await
         .map_err(db_err)?

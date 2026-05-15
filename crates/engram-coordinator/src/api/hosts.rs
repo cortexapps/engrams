@@ -110,14 +110,39 @@ impl HostView {
         row: engram_core::types::HostRecord,
         live: Option<crate::host_registry::HostState>,
     ) -> Self {
+        // Capacity prefers the Postgres row (consistent across coord
+        // replicas — persisted on every heartbeat). If `live` is
+        // present *and* the row's MiB total is zero (pre-migration
+        // row, never had a fresh heartbeat write), fall back to the
+        // in-memory value so the operator isn't stuck staring at 0
+        // during a single-replica deploy or right after the
+        // migration runs.
+        //
+        // `local_snapshots` stays live-only — the count isn't
+        // persisted yet. It'll read as 0 on the WS-non-owning pod,
+        // which is the existing pre-MiB-fields behaviour.
         let live = live.unwrap_or_default();
+        let (capacity_total_mib, capacity_used_mib, running_sandboxes) =
+            if row.capacity.total_mib > 0 {
+                (
+                    row.capacity.total_mib,
+                    row.capacity.used_mib,
+                    row.capacity.running_sandboxes,
+                )
+            } else {
+                (
+                    live.capacity.total_mib,
+                    live.capacity.used_mib,
+                    live.capacity.running_sandboxes,
+                )
+            };
         Self {
             id: row.id,
             hostname: row.hostname,
             status: row.status.as_str(),
-            capacity_total_mib: live.capacity.total_mib,
-            capacity_used_mib: live.capacity.used_mib,
-            running_sandboxes: live.capacity.running_sandboxes,
+            capacity_total_mib,
+            capacity_used_mib,
+            running_sandboxes,
             local_snapshots: live.local_snapshots.len(),
             last_heartbeat_at: row.last_heartbeat_at,
         }
@@ -217,6 +242,9 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
         capacity: HostCapacity {
             total_gb: 0,
             used_gb: 0,
+            total_mib: 0,
+            used_mib: 0,
+            running_sandboxes: 0,
         },
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
@@ -275,10 +303,25 @@ async fn handle_connection(state: SharedState, socket: WebSocket) {
                 } else {
                     HostStatus::Ready
                 };
+                // Persist capacity alongside status/freshness so
+                // `/api/hosts` reads stay consistent across coord
+                // replicas — see HostCapacity's doc comment for the
+                // multi-pod motivation. Field translation: the wire
+                // protocol's `HostCapacityReport` is the MiB +
+                // running_sandboxes trio; we zero the legacy GB
+                // fields here since they're not in the heartbeat
+                // payload and current callers ignore them.
+                let row_capacity = engram_core::types::HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: hb.capacity.total_mib,
+                    used_mib: hb.capacity.used_mib,
+                    running_sandboxes: hb.capacity.running_sandboxes,
+                };
                 if let Err(e) = state
                     .services
                     .meta
-                    .touch_host_heartbeat(host_id, row_status)
+                    .touch_host_heartbeat(host_id, row_status, row_capacity)
                     .await
                 {
                     tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");

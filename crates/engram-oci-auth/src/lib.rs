@@ -260,6 +260,7 @@ mod tests {
             &self,
             _: HostId,
             _: engram_core::types::HostStatus,
+            _: engram_core::types::HostCapacity,
         ) -> Result<(), MetaError> {
             Ok(())
         }

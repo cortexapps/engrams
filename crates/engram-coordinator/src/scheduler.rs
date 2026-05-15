@@ -33,6 +33,9 @@ mod tests {
             capacity: HostCapacity {
                 total_gb: 100,
                 used_gb: 10,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
             },
             status,
             last_heartbeat_at: Utc::now(),

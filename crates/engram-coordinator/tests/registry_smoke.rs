@@ -115,7 +115,12 @@ impl MetadataStore for MockMetadataStore {
     async fn set_host_status(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn touch_host_heartbeat(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
+    async fn touch_host_heartbeat(
+        &self,
+        _: HostId,
+        _: HostStatus,
+        _: engram_core::types::HostCapacity,
+    ) -> Result<(), MetaError> {
         Ok(())
     }
     async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {

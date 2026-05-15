@@ -43,8 +43,11 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
 pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let cloud_meta: serde_json::Value = row.try_get("cloud_metadata").map_err(col_err)?;
-    let total: i32 = row.try_get("capacity_total_gb").map_err(col_err)?;
-    let used: i32 = row.try_get("capacity_used_gb").map_err(col_err)?;
+    let total_gb: i32 = row.try_get("capacity_total_gb").map_err(col_err)?;
+    let used_gb: i32 = row.try_get("capacity_used_gb").map_err(col_err)?;
+    let total_mib: i64 = row.try_get("capacity_total_mib").map_err(col_err)?;
+    let used_mib: i64 = row.try_get("capacity_used_mib").map_err(col_err)?;
+    let running_sandboxes: i32 = row.try_get("running_sandboxes_count").map_err(col_err)?;
     let status: String = row.try_get("status").map_err(col_err)?;
     let last_heartbeat_at: DateTime<Utc> = row.try_get("last_heartbeat_at").map_err(col_err)?;
     let cloud_metadata: HostMetadata =
@@ -54,8 +57,11 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         hostname: row.try_get("hostname").map_err(col_err)?,
         cloud_metadata,
         capacity: HostCapacity {
-            total_gb: total.max(0) as u32,
-            used_gb: used.max(0) as u32,
+            total_gb: total_gb.max(0) as u32,
+            used_gb: used_gb.max(0) as u32,
+            total_mib: total_mib.max(0) as u64,
+            used_mib: used_mib.max(0) as u64,
+            running_sandboxes: running_sandboxes.max(0) as u32,
         },
         status: parse_host_status(&status)?,
         last_heartbeat_at,

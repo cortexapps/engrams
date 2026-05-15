@@ -556,6 +556,9 @@ async fn main() -> Result<(), CoordinatorError> {
             capacity: engram_core::types::host::HostCapacity {
                 total_gb: 0,
                 used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
             },
             status: engram_core::types::host::HostStatus::Ready,
             last_heartbeat_at: chrono::Utc::now(),
@@ -582,6 +585,9 @@ async fn main() -> Result<(), CoordinatorError> {
                     capacity: engram_core::types::host::HostCapacity {
                         total_gb: 0,
                         used_gb: 0,
+                        total_mib: 0,
+                        used_mib: 0,
+                        running_sandboxes: 0,
                     },
                     status: engram_core::types::host::HostStatus::Ready,
                     last_heartbeat_at: chrono::Utc::now(),
