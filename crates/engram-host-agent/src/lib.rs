@@ -315,6 +315,19 @@ impl HostAgent {
             // §3). On `list()` error, ship an empty list — the
             // 3-strike grace window (15s) absorbs transient errors
             // without flipping live sessions.
+            // Seed capacity once at startup from /proc/meminfo. Used
+            // by the scheduler's fit check — without this the coord
+            // sees `total_mib=0` and rejects every session.
+            // TODO: `used_mib` accounting. Plumbing record_start /
+            // record_stop hooks into the SandboxBackend is a follow-up;
+            // until then the host always looks "fully available",
+            // which lets the scheduler place but doesn't prevent
+            // oversubscription.
+            let host_total_mib = crate::resource::read_total_memory_mib();
+            tracing::info!(
+                host_total_mib,
+                "capacity reporting seeded from /proc/meminfo"
+            );
             let pooled_for_provider = pooled.clone();
             let provider: dialer::HeartbeatProvider = std::sync::Arc::new(move || {
                 let backend = pooled_for_provider.clone();
@@ -326,8 +339,13 @@ impl HostAgent {
                             Vec::new()
                         }
                     };
+                    let running_count = running_sandboxes.len() as u32;
                     dialer::HeartbeatPayload {
-                        capacity: engram_protocol::HostCapacityReport::default(),
+                        capacity: engram_protocol::HostCapacityReport {
+                            total_mib: host_total_mib,
+                            used_mib: 0,
+                            running_sandboxes: running_count,
+                        },
                         local_snapshots: Vec::new(),
                         running_sandboxes,
                         draining: false,

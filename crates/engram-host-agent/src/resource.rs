@@ -7,6 +7,34 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+/// Read total system memory in MiB from `/proc/meminfo`. Used to seed
+/// `ResourceGovernor::new(...)` at host-agent startup so capacity
+/// heartbeats report the actual machine size — without this, the
+/// coord scheduler sees `total_mib=0` on every host and rejects every
+/// session whose `vm_spec.memory.max_mib` is non-zero (every session
+/// in practice). Returns 0 on non-Linux or unparseable input — the
+/// caller logs and continues; sessions just won't be scheduled to
+/// the host, which is the safe default.
+pub fn read_total_memory_mib() -> u64 {
+    let s = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // Format: "MemTotal:       32910156 kB"
+            if let Some(kb) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                return kb / 1024;
+            }
+        }
+    }
+    0
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CapacitySnapshot {
     pub total_mib: u64,
