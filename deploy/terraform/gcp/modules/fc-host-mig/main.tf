@@ -106,6 +106,24 @@ resource "google_compute_instance_template" "fc_host" {
   machine_type = var.machine_type
   region       = var.region
 
+  # Firecracker is a KVM-based VMM: it requires `/dev/kvm` on the
+  # host, which in turn requires the host CPU to expose `vmx`
+  # (Intel VT-x) or `svm` (AMD-V). GCE VMs don't expose those
+  # flags by default — the host shows up with `flags: ... hypervisor
+  # ...` but no `vmx`, and `/dev/kvm` is absent even though the
+  # `kvm` module is loaded. Nested virt is per-instance opt-in:
+  #   - `advanced_machine_features.enable_nested_virtualization`
+  #     turns on nested virt for the instance
+  #   - `min_cpu_platform` must be Haswell or later (the family
+  #     that introduced VT-x); GCE's default for n2 already meets
+  #     this but we pin it explicitly so we never get scheduled
+  #     onto an older Sandy/Ivy Bridge spot pool.
+  # See: https://cloud.google.com/compute/docs/instances/nested-virtualization/overview
+  min_cpu_platform = "Intel Haswell"
+  advanced_machine_features {
+    enable_nested_virtualization = true
+  }
+
   disk {
     # Pinned to the data source's resolved self_link (not the
     # `family/<name>` shortcut) so TF sees a diff when a new image
