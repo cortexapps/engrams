@@ -114,12 +114,14 @@ resource "google_compute_instance_template" "fc_host" {
   # `kvm` module is loaded. Nested virt is per-instance opt-in:
   #   - `advanced_machine_features.enable_nested_virtualization`
   #     turns on nested virt for the instance
-  #   - `min_cpu_platform` must be Haswell or later (the family
-  #     that introduced VT-x); GCE's default for n2 already meets
-  #     this but we pin it explicitly so we never get scheduled
-  #     onto an older Sandy/Ivy Bridge spot pool.
+  #   - `min_cpu_platform` must be at least the machine type's
+  #     required floor. For n2 the required floor is Cascade Lake
+  #     (GCE rejects creates with "required CPU platform of
+  #     cascadelake. The minimum CPU platform must match this..."
+  #     if you pin anything older, even though Haswell+ is what
+  #     nested virt itself requires).
   # See: https://cloud.google.com/compute/docs/instances/nested-virtualization/overview
-  min_cpu_platform = "Intel Haswell"
+  min_cpu_platform = "Intel Cascade Lake"
   advanced_machine_features {
     enable_nested_virtualization = true
   }
