@@ -711,4 +711,20 @@ impl engram_core::traits::HostClient for RemoteHostClient {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        // Transitional WS path: no wire variant exists yet for shell
+        // acquire/release. The shell-pin is purely advisory (it just
+        // suppresses idle eviction while a tab is open). In
+        // mode=coordinator with the WS path, the coord still falls
+        // back to touching `state.harness_hub` directly — the
+        // dispatched RPC would have nowhere to land. Once the gRPC
+        // transport ships, both sides get the dedicated `AcquireShell`
+        // method and this no-op deletes.
+        Ok(())
+    }
+
+    async fn release_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
 }

@@ -92,6 +92,21 @@ pub trait HostClient: Send + Sync {
     /// mid-send.
     async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError>;
 
+    /// ADR 0013 + ADR 0011 follow-up #3: pin a sandbox against idle
+    /// eviction while a shell WebSocket is open. The local hub is the
+    /// only source of truth for "is a shell attached to this sandbox?"
+    /// — the in-proc `LocalHostClient` reaches its hub directly;
+    /// remote impls route to the host that owns the harness session.
+    /// Reference-counted in the hub so a future second client doesn't
+    /// decrement to zero prematurely.
+    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
+
+    /// Release a `acquire_shell` reference. Called on shell bridge
+    /// exit (success or error). Symmetric with `acquire_shell`; the
+    /// hub silently swallows underflow rather than erroring so a buggy
+    /// caller can't poison the count.
+    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
+
     /// How a harness process inside this host's sandboxes dials back
     /// to the harness channel. Static per-host capability — drives
     /// the argv shape `resolve_harness` builds. Default `Vsock`

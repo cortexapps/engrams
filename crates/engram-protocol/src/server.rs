@@ -622,4 +622,12 @@ impl HostClient for RecordingBackend {
     ) -> Result<(), SandboxError> {
         self.inner.send_prompt(sandbox_id, text).await
     }
+
+    async fn acquire_shell(&self, sandbox_id: engram_core::SandboxId) -> Result<(), SandboxError> {
+        self.inner.acquire_shell(sandbox_id).await
+    }
+
+    async fn release_shell(&self, sandbox_id: engram_core::SandboxId) -> Result<(), SandboxError> {
+        self.inner.release_shell(sandbox_id).await
+    }
 }

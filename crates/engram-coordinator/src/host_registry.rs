@@ -422,6 +422,16 @@ impl HostClient for HostRegistry {
         backend.send_prompt(sandbox_id, text).await
     }
 
+    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let backend = self.lookup(sandbox_id)?;
+        backend.acquire_shell(sandbox_id).await
+    }
+
+    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let backend = self.lookup(sandbox_id)?;
+        backend.release_shell(sandbox_id).await
+    }
+
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         // Fan out to every registered host. `LocalHostClient` wires
         // it onto its inner VMM backend; `RemoteHostClient`'s default

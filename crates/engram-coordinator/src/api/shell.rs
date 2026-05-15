@@ -78,7 +78,7 @@ pub async fn shell(
     };
 
     let target = format!("ws://{guest_ip}:{GUEST_TTYD_PORT}/ws");
-    let hub = state.harness_hub.clone();
+    let host = state.services.host.clone();
     upgrade
         .protocols(["tty"]) // ttyd advertises the "tty" subprotocol
         .on_upgrade(move |socket| async move {
@@ -90,9 +90,28 @@ pub async fn shell(
             // keep-alive forever. Reference-counted in the hub so a
             // future second client doesn't decrement to zero
             // prematurely.
-            hub.acquire_shell(sandbox_id);
+            //
+            // Routes through `HostClient` (ADR 0013 + ADR 0011 #3)
+            // so the call reaches the host that owns the harness
+            // session, not whichever coord pod's local hub. In
+            // mode=all the LocalHostClient still updates the in-proc
+            // hub; in split mode the remote impl dispatches to the
+            // right host.
+            if let Err(e) = host.acquire_shell(sandbox_id).await {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "acquire_shell failed; shell still opens but idle eviction may race",
+                );
+            }
             let bridge_result = bridge(socket, target.clone()).await;
-            hub.release_shell(sandbox_id);
+            if let Err(e) = host.release_shell(sandbox_id).await {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "release_shell failed; the hub's pin count may drift",
+                );
+            }
             if let Err(e) = bridge_result {
                 tracing::warn!(
                     session_id = %id,

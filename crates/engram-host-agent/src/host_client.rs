@@ -125,6 +125,16 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.harness_hub.acquire_shell(sandbox_id);
+        Ok(())
+    }
+
+    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.harness_hub.release_shell(sandbox_id);
+        Ok(())
+    }
+
     fn harness_dial(&self) -> HarnessDial {
         self.sandbox.harness_dial()
     }
