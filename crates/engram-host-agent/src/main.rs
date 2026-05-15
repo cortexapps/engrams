@@ -290,15 +290,25 @@ async fn main() -> Result<(), HostAgentError> {
 
     // OCI auth resolver. The standalone host-agent doesn't have
     // direct DB/KEK access, so it asks the coord to resolve
-    // credentials via a `ResolveRegistryAuth` RPC over the existing
-    // dialer connection. The `SessionHandle` is shared mutable
-    // state — empty until the dialer connects, populated for the
-    // lifetime of each connection. ADR 0007.
-    let (ws_auth_resolver, auth_session_handle) = engram_host_agent::ws_auth::WsAuthResolver::new();
+    // credentials over HTTP (ADR 0013).
+    // `HttpAuthResolver` POSTs to
+    // `/api/hosts/:id/auth/resolve-registry`, the receiving coord
+    // pod calls its existing `PgAuthResolver` and returns creds
+    // (or `None` for anonymous registries). Plaintext creds
+    // traverse the per-request HTTPS hop only at pull time —
+    // never persisted on the host.
     let oci_cache_root = cli.work_dir.join("oci-cache");
-    let oci_client = std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
-        ws_auth_resolver,
-    )));
+    let coord_url_for_auth = cfg
+        .coordinator_endpoint
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let auth_coord_client = engram_host_agent::coord_client::CoordClient::new(
+        coord_url_for_auth,
+        cfg.coordinator_token.clone(),
+    );
+    let http_auth_resolver =
+        engram_host_agent::coord_client::HttpAuthResolver::new(auth_coord_client, host_id);
+    let oci_client = std::sync::Arc::new(engram_oci::OciClient::new(http_auth_resolver));
     let image_cache =
         engram_host_agent::image_cache::ImageCache::open(oci_cache_root, (*oci_client).clone())
             .await
@@ -308,7 +318,6 @@ async fn main() -> Result<(), HostAgentError> {
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
         .with_image_cache(image_cache)
-        .with_auth_session_handle(auth_session_handle)
         .with_host_id(host_id);
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);

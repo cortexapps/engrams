@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use engram_protocol::server::HostAdminHandler;
+use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::wire::WireReapStats;
 
 use crate::orphan_reap;

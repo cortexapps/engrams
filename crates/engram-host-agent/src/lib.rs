@@ -22,7 +22,6 @@ pub mod admin_handler;
 pub mod blob;
 pub mod config;
 pub mod coord_client;
-pub mod dialer;
 pub mod disk_daemon;
 pub mod egress;
 pub mod grpc_server;
@@ -30,6 +29,7 @@ pub mod harness;
 pub mod host_client;
 pub use host_client::LocalHostClient;
 pub mod heartbeat;
+pub mod idle_evictor;
 pub mod image_cache;
 pub mod live_attach;
 pub mod metrics;
@@ -38,7 +38,6 @@ pub mod pooled_backend;
 pub mod resource;
 pub mod shutdown;
 pub mod snapshot;
-pub mod ws_auth;
 
 pub use config::HostAgentConfig;
 
@@ -59,12 +58,6 @@ pub struct HostAgent {
     /// `spec.rootfs_source` set already (the dev-only path).
     /// Production multi-host topologies must set this.
     pub image_cache: Option<ImageCache>,
-    /// ADR 0007: shared handle the dialer writes the live
-    /// `HostSession` into when the WS comes up. The
-    /// [`ws_auth::WsAuthResolver`] reads it for each OCI auth
-    /// lookup so credentials can travel back over the existing
-    /// WS connection. `None` skips the wiring entirely.
-    pub auth_session_handle: Option<ws_auth::SessionHandle>,
     /// ADR 0007 #3a: NVMe-backed chunk cache. Optional; wired in
     /// production to amortise chunk reads across manifests.
     pub chunk_cache: Option<ChunkCache>,
@@ -101,7 +94,6 @@ impl HostAgent {
             egress: None,
             chunk_store: None,
             image_cache: None,
-            auth_session_handle: None,
             chunk_cache: None,
             nbd_pool: None,
             host_id: None,
@@ -145,15 +137,6 @@ impl HostAgent {
     /// materializing them to single files. Linux-only at runtime.
     pub fn with_nbd_pool(mut self, pool: Arc<disk_daemon::NbdSlotAllocator>) -> Self {
         self.nbd_pool = Some(pool);
-        self
-    }
-
-    /// Wire the session handle the dialer will populate so the
-    /// `WsAuthResolver` can issue OCI auth RPCs over the live WS.
-    /// Pair with the resolver returned by
-    /// [`ws_auth::WsAuthResolver::new`].
-    pub fn with_auth_session_handle(mut self, handle: ws_auth::SessionHandle) -> Self {
-        self.auth_session_handle = Some(handle);
         self
     }
 
@@ -262,37 +245,32 @@ impl HostAgent {
                 }
                 Arc::new(p)
             };
-            // Construct a local HarnessHub whose EventSink ships
-            // `NotifyKind::HarnessEvent` over the WS dialer. The
-            // dialer populates `harness_session_handle` on every
-            // connect and clears it on disconnect, so a brief gap
-            // during reconnect just drops a handful of events
-            // (the host's hub still drives idle eviction locally).
-            let harness_session_handle: crate::ws_auth::SessionHandle =
-                Arc::new(tokio::sync::RwLock::new(None));
-            let sink_handle = harness_session_handle.clone();
+            // ADR 0013: every harness event POSTs to the coord via
+            // HTTP. Any coord pod can serve the POST (the
+            // `state.emit` path on the receiving pod handles
+            // session_events persistence + SSE fan-out via
+            // pg_listener). Per-event POSTs are slightly chattier
+            // than the old WS-frame approach but eliminate the
+            // pod-pinning required for a long-lived stream and the
+            // back-to-back duplicate `harness_idle` de-dup at the
+            // coord side already protects against the few extra
+            // events that might land out-of-order across pods.
+            let coord_client_for_events = coord_client::CoordClient::new(
+                coord_url.clone(),
+                self.cfg.coordinator_token.clone(),
+            );
             let event_sink = crate::harness::event_sink_to(move |session_id, sandbox_id, ev| {
-                let handle = sink_handle.clone();
+                let cc = coord_client_for_events.clone();
                 async move {
-                    let guard = handle.read().await;
-                    let Some(session) = guard.clone() else {
-                        tracing::trace!(
-                            %session_id, %sandbox_id,
-                            "no live coord session; dropping harness event",
-                        );
-                        return;
-                    };
-                    drop(guard);
-                    let frame = engram_protocol::wire::NotifyKind::HarnessEvent {
-                        session_id,
+                    let req = coord_client::HarnessEventRequest {
                         sandbox_id,
                         event: ev,
                         at: chrono::Utc::now(),
                     };
-                    if let Err(e) = session.notify(frame).await {
+                    if let Err(e) = cc.harness_event(session_id, &req).await {
                         tracing::debug!(
                             %session_id, %sandbox_id, error = %e,
-                            "forward harness event over WS failed",
+                            "forward harness event to coord failed",
                         );
                     }
                 }
@@ -308,9 +286,8 @@ impl HostAgent {
                 std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
             pooled.set_harness_sink(sink);
             let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub),
+                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone()),
             );
-            let host_for_dialer = local_host.clone();
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
             // intersects this against expected-active sessions to
@@ -331,70 +308,31 @@ impl HostAgent {
                 host_total_mib,
                 "capacity reporting seeded from /proc/meminfo"
             );
-            let pooled_for_provider = pooled.clone();
-            let provider: dialer::HeartbeatProvider = std::sync::Arc::new(move || {
-                let backend = pooled_for_provider.clone();
-                Box::pin(async move {
-                    let running_sandboxes = match backend.list().await {
-                        Ok(ids) => ids,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "backend.list() failed; reporting empty running_sandboxes");
-                            Vec::new()
-                        }
-                    };
-                    let running_count = running_sandboxes.len() as u32;
-                    dialer::HeartbeatPayload {
-                        capacity: engram_protocol::HostCapacityReport {
-                            total_mib: host_total_mib,
-                            used_mib: 0,
-                            running_sandboxes: running_count,
-                        },
-                        local_snapshots: Vec::new(),
-                        running_sandboxes,
-                        draining: false,
-                    }
-                })
-            });
-            // ADR 0007: surface the reaper to the coord. The coord's
-            // POST /api/admin/reap-materialize-dir fans this out
-            // across every connected host in --mode=coordinator;
-            // without it, that admin endpoint can't reach this
-            // host. We hand it `materialize_dir` from
-            // chunk_store; hosts without a chunk_store wiring
-            // leave admin_handler = None (RPC then returns a clean
-            // "unsupported" error, the coord-side aggregator
-            // tolerates per-host failures).
+            // ADR 0007: surface the reaper to the coord. The host's
+            // gRPC server exposes ReapMaterializeDir; the coord's
+            // POST /api/admin/reap-materialize-dir fans it out
+            // across every connected host. Hosts without a
+            // chunk_store wiring leave admin_handler = None and
+            // the gRPC method returns Unimplemented.
             let admin_handler: Option<
-                std::sync::Arc<dyn engram_protocol::server::HostAdminHandler>,
+                std::sync::Arc<dyn engram_protocol::admin::HostAdminHandler>,
             > = self.chunk_store.as_ref().map(|(_, dir)| {
                 std::sync::Arc::new(admin_handler::MaterializeDirReaper::new(dir.clone()))
-                    as std::sync::Arc<dyn engram_protocol::server::HostAdminHandler>
-            });
-            let dialer_cfg = dialer::DialerConfig {
-                coordinator_url: coord_url.clone(),
-                auth_token: self.cfg.coordinator_token.clone(),
-                heartbeat_interval: self.cfg.heartbeat_interval,
-                heartbeat_provider: Some(provider),
-                auth_session_handle: self.auth_session_handle.clone(),
-                harness_session_handle: Some(harness_session_handle),
-                admin_handler: admin_handler.clone(),
-            };
-            let dialer_task = tokio::spawn(async move {
-                if let Err(e) = dialer::run_dialer(dialer_cfg, host_id, host_for_dialer).await {
-                    tracing::error!(error = %e, "dialer terminated with error");
-                }
+                    as std::sync::Arc<dyn engram_protocol::admin::HostAdminHandler>
             });
 
-            // ADR 0013: register over HTTP so the coord persists
-            // our host_addr column. The pool can't dial us via gRPC
-            // until that row is populated. Best-effort with retry:
-            // if the coord is briefly unreachable, the WS dialer
-            // above keeps trying too and a future register can
-            // backfill the addr.
+            // ADR 0013: per-process CoordClient for HTTP traffic
+            // (register, heartbeat, registry-auth, harness-events,
+            // idle-eviction).
             let coord_client = coord_client::CoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
+
+            // ADR 0013: register over HTTP so the coord persists
+            // our host_addr column. Mandatory — the coord-side
+            // GrpcHostPool can't dispatch to us until host_addr
+            // lands. Background loop with exponential backoff.
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
                 // the deployment / systemd unit on production
@@ -441,26 +379,110 @@ impl HostAgent {
                 });
             }
 
-            // ADR 0013: boot the gRPC HostService server so the
-            // coord can dispatch over gRPC once the cutover commit
-            // wires the GrpcHostPool. Dark today — nothing on the
-            // coord side calls into us via gRPC yet. The server is
-            // still safe to expose: it sits behind the VPC
-            // firewall and the WS path is the active control plane.
+            // ADR 0013: boot the gRPC HostService server. The
+            // coord's GrpcHostPool dials this address (populated
+            // via /api/hosts/register) to dispatch coord→host
+            // RPCs. Required in production; mode=all leaves
+            // `grpc_listen_addr=None`.
             let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
                 let local_for_grpc = local_host.clone();
                 let admin_for_grpc = admin_handler.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        grpc_server::boot(addr, local_for_grpc, admin_for_grpc).await
-                    {
+                    if let Err(e) = grpc_server::boot(addr, local_for_grpc, admin_for_grpc).await {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
                     }
                 })
             });
 
+            // ADR 0013: HTTP heartbeat loop. Posts
+            // {capacity, local_snapshots, running_sandboxes,
+            // draining} every `heartbeat_interval` to any coord
+            // pod via the L4-LB. Coord pod that receives it
+            // updates host_registry capacity, runs the ADR 0009
+            // reconcile, and persists to PG. Idempotent across
+            // pods — heartbeats can fan out without harm.
+            let heartbeat_interval = self.cfg.heartbeat_interval;
+            let coord_for_heartbeat = coord_client.clone();
+            let pooled_for_heartbeat = pooled.clone();
+            let heartbeat_task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(heartbeat_interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let running_sandboxes = match pooled_for_heartbeat.list().await {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "backend.list() failed; reporting empty running_sandboxes",
+                            );
+                            Vec::new()
+                        }
+                    };
+                    let running_count = running_sandboxes.len() as u32;
+                    let req = coord_client::HeartbeatRequest {
+                        capacity: engram_protocol::heartbeat::HostCapacityReport {
+                            total_mib: host_total_mib,
+                            used_mib: 0,
+                            running_sandboxes: running_count,
+                        },
+                        local_snapshots: Vec::new(),
+                        running_sandboxes,
+                        draining: false,
+                    };
+                    if let Err(e) = coord_for_heartbeat.heartbeat(host_id, &req).await {
+                        tracing::debug!(
+                            host_id = %host_id,
+                            error = %e,
+                            "heartbeat POST failed; retrying next tick",
+                        );
+                    }
+                }
+            });
+
+            // ADR 0011 follow-up #2: host owns idle-eviction
+            // detection (its HarnessHub is authoritative for "last
+            // harness activity"). Push candidates to coord via
+            // HTTP; coord-side pipeline (`evict_idle_session`)
+            // runs the snapshot+destroy+mark-Idle dance on whatever
+            // pod receives the POST. Idempotent across pods.
+            let eviction_hub = harness_hub.clone();
+            let eviction_coord = coord_client.clone();
+            let idle_soft_ttl = idle_evictor::idle_ttl_from_env();
+            let idle_hard_ttl = idle_evictor::idle_hard_ttl_from_env();
+            let eviction_task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(idle_evictor::DEFAULT_POLL_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
+                    if pairs.is_empty() {
+                        continue;
+                    }
+                    let candidates: Vec<coord_client::IdleCandidate> = pairs
+                        .into_iter()
+                        .map(|(session_id, sandbox_id)| coord_client::IdleCandidate {
+                            session_id,
+                            sandbox_id,
+                            idle_since: None,
+                        })
+                        .collect();
+                    if let Err(e) = eviction_coord
+                        .push_idle_eviction_candidates(host_id, candidates)
+                        .await
+                    {
+                        tracing::debug!(
+                            host_id = %host_id,
+                            error = %e,
+                            "idle-eviction POST failed; retrying next tick",
+                        );
+                    }
+                }
+            });
+
             shutdown_signal().await;
-            dialer_task.abort();
+            heartbeat_task.abort();
+            eviction_task.abort();
             if let Some(t) = grpc_task {
                 t.abort();
             }

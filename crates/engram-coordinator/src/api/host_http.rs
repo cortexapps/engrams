@@ -77,15 +77,11 @@ pub async fn register(
         ));
     }
     if req.wire_version != 0 && req.wire_version != engram_protocol::WIRE_VERSION {
-        // 0 means "unset" from a host that doesn't carry the field
-        // (older binaries during transition). Real mismatches are
-        // logged but don't reject — the gRPC layer carries its own
-        // schema discipline.
         tracing::warn!(
             host_id = %req.host_id,
             host_wire_version = req.wire_version,
             coord_wire_version = engram_protocol::WIRE_VERSION,
-            "wire_version mismatch on host register; tolerating",
+            "wire_version mismatch on host register; tolerating (gRPC carries its own schema)",
         );
     }
     let record = HostRecord {
@@ -105,16 +101,29 @@ pub async fn register(
     };
     state.services.meta.upsert_host(record).await?;
 
+    // ADR 0013: warm the gRPC pool entry + register the host's
+    // GrpcHostClient with `HostRegistry` so subsequent
+    // dispatch lands on the right gRPC channel. Pool.warm fires
+    // a Ping to force the TCP+H2 handshake; the channel is
+    // already inserted into the pool's DashMap regardless of
+    // ping outcome (lazy connect tolerates a brief unreachable
+    // window — first real RPC retries).
+    state
+        .services
+        .host_pool
+        .warm(req.host_id, req.host_addr.clone())
+        .await?;
+    let grpc_client = state.services.host_pool.get(req.host_id)?;
+    let backend: std::sync::Arc<dyn engram_core::traits::HostClient> =
+        std::sync::Arc::new(grpc_client);
+    state.host_registry.register(req.host_id, backend);
+
     tracing::info!(
         host_id = %req.host_id,
         host_addr = %req.host_addr,
         agent_version = %req.agent_version,
         "host registered via /api/hosts/register",
     );
-
-    // ADR 0013 follow-up: once `state.services.host_pool` exists,
-    // warm it here. Defer until the GrpcHostPool is plumbed onto
-    // AppState in the cutover commit.
 
     Ok(Json(RegisterResponse {
         server_time: Utc::now(),

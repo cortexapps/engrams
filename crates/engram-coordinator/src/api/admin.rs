@@ -238,15 +238,18 @@ pub async fn reap_materialize_dir(
     let mut total_skipped_too_young = 0u64;
 
     for host_id in host_ids {
-        let client = match state.host_registry.admin_client(host_id) {
-            Some(c) => c,
-            None => {
+        // ADR 0013: admin reap fanout goes through the gRPC pool.
+        // `get` returns the pool's `GrpcHostClient`; if the host
+        // hasn't registered yet (no host_addr persisted) we skip
+        // it with a clear per-host error so the aggregate isn't
+        // partially silent.
+        let client = match state.services.host_pool.get(host_id) {
+            Ok(c) => c,
+            Err(_) => {
                 per_host.push(PerHostReap {
                     host_id: host_id.to_string(),
                     stats: None,
-                    error: Some(
-                        "host registered without an admin_client (in-proc or test backend)".into(),
-                    ),
+                    error: Some("host not in gRPC pool (not yet registered)".into()),
                 });
                 continue;
             }

@@ -100,6 +100,7 @@ async fn gc_chunks_endpoint_reports_live_manifest_count_from_db() {
         auth_resolver: Arc::new(engram_oci::AnonymousResolver),
         blob,
         chunk_store,
+        host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
     };
     let cfg = CoordinatorConfig {

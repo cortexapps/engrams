@@ -220,6 +220,7 @@ mod tests {
             auth_resolver: Arc::new(engram_oci::AnonymousResolver),
             blob: blob.clone(),
             chunk_store: engram_chunk_store::ChunkStore::new(blob),
+            host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
         };
         let cfg = CoordinatorConfig {

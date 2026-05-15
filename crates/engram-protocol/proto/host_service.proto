@@ -37,6 +37,11 @@ service HostService {
   // arrive first on the same connection" frame-ordering invariant.
   rpc StartAgent(StartAgentRequest) returns (Empty);
 
+  // Apply an egress policy without spawning an agent (no-agent
+  // sessions still need their proxy allowlist populated). The
+  // standalone companion to StartAgent's bundled form.
+  rpc ApplyEgressPolicy(ApplyEgressPolicyRequest) returns (Empty);
+
   // ADR 0011 follow-up #3.
   rpc AcquireShell(SandboxIdMessage) returns (Empty);
   rpc ReleaseShell(SandboxIdMessage) returns (Empty);
@@ -129,6 +134,11 @@ message StartAgentRequest {
   // serialises an `SessionEgressPolicy::empty()`-shaped struct so
   // the host has uniform handling.
   bytes policy_bincode = 3;
+}
+
+message ApplyEgressPolicyRequest {
+  // bincode-encoded `engram_core::types::egress::SessionEgressPolicy`.
+  bytes policy_bincode = 1;
 }
 
 // --- ReapMaterializeDir ---

@@ -44,10 +44,11 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/prompt", post(prompt::prompt))
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
-        .route("/api/hosts/connect", get(hosts::connect))
-        // ADR 0013 host → coord HTTP endpoints. Live in this build
-        // but unused — host-agent still dials the WS at /connect.
-        // Wiring up the host side lands in the cutover commit.
+        // ADR 0013 host → coord HTTP endpoints. The old
+        // `/api/hosts/connect` WS handler has been retired —
+        // host-agents register over HTTP, heartbeat over HTTP,
+        // forward harness events over HTTP, and the coord
+        // dispatches back to them over gRPC.
         .route("/api/hosts/register", post(host_http::register))
         .route("/api/hosts/:id/heartbeat", post(host_http::heartbeat))
         .route(

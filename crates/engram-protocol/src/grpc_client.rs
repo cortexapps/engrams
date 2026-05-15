@@ -5,17 +5,16 @@
 //! SandboxSpec, etc.) and serializes through bincode where the
 //! proto layer carries opaque `bytes` payloads.
 //!
-//! This type does **not** implement `engram_core::traits::HostClient`
-//! yet — the trait surface still expects today's split
-//! `start_agent` / `notify_session_policy` shape (load-bearing for
-//! the WS transport). The trait change to bundle policy into
-//! `start_agent` lands atomically with the WS deletion in the
-//! cutover commit; at that point `GrpcHostClient` picks up the
-//! trait impl in one move. Until then this is dark infrastructure
-//! plus a set of free-standing async methods callers can use
-//! directly.
+//! Implements `engram_core::traits::HostClient` so the coord's
+//! existing dispatch path (HostRegistry → Arc<dyn HostClient>)
+//! drops a `GrpcHostClient` in where the WS RemoteHostClient used
+//! to live. ADR 0013's bundled `start_agent(id, agent, policy)`
+//! is one gRPC RPC; `apply_egress_policy` is the no-agent
+//! companion.
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use engram_core::traits::HostClient;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -26,9 +25,9 @@ use tonic::transport::Channel;
 
 use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::{
-    BindHarnessSessionRequest, CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse,
-    ReapMaterializeDirRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    StartAgentRequest, UnbindHarnessSessionRequest,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest, Empty,
+    ExecStartRequest, GuestIpResponse, ReapMaterializeDirRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use crate::wire::{WireExecRequest, WireReapStats};
 
@@ -221,6 +220,24 @@ impl GrpcHostClient {
         Ok(())
     }
 
+    /// Apply a SessionEgressPolicy without spawning an agent. The
+    /// companion to `start_agent`'s bundled form for no-agent
+    /// sessions.
+    pub async fn apply_egress_policy(
+        &self,
+        policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        let req = ApplyEgressPolicyRequest {
+            policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
+        };
+        self.inner
+            .clone()
+            .apply_egress_policy(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     pub async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let req = SandboxIdMessage {
             uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
@@ -388,6 +405,86 @@ fn decode_sandbox_id(bytes: &[u8]) -> Result<SandboxId, SandboxError> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(bytes);
     Ok(SandboxId(uuid::Uuid::from_bytes(buf)))
+}
+
+// ADR 0013: trait impl. The coord's `HostRegistry` stores
+// `Arc<dyn HostClient>` per host — wrapping a `GrpcHostClient` in
+// the trait object lets the existing dispatch machinery route to
+// it transparently. Inherent methods do the work; this is pure
+// delegation.
+#[async_trait]
+impl HostClient for GrpcHostClient {
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        self.create_sandbox(spec).await
+    }
+
+    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.destroy_sandbox(id).await
+    }
+
+    async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+        self.list_sandboxes().await
+    }
+
+    async fn exec_stream(
+        &self,
+        id: SandboxId,
+        cmd: ExecRequest,
+    ) -> Result<ExecStream, SandboxError> {
+        self.exec_start(id, cmd).await
+    }
+
+    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        // Disambiguates from the trait's `snapshot` method.
+        Self::snapshot(self, id).await
+    }
+
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        Self::restore(self, metadata).await
+    }
+
+    async fn start_agent(
+        &self,
+        id: SandboxId,
+        agent: AgentSpec,
+        policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        Self::start_agent(self, id, agent, policy).await
+    }
+
+    async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        Self::apply_egress_policy(self, policy).await
+    }
+
+    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+        Self::guest_ip(self, id).await
+    }
+
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+        if let Err(e) = self.bind_harness_session(session_id, sandbox_id).await {
+            tracing::warn!(%session_id, %sandbox_id, error = %e, "gRPC bind_harness_session failed");
+        }
+    }
+
+    async fn unbind_session(&self, session_id: SessionId) {
+        if let Err(e) = self.unbind_harness_session(session_id).await {
+            tracing::warn!(%session_id, error = %e, "gRPC unbind_harness_session failed");
+        }
+    }
+
+    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError> {
+        self.send_harness_prompt(sandbox_id, text).await
+    }
+
+    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Self::acquire_shell(self, sandbox_id).await
+    }
+
+    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Self::release_shell(self, sandbox_id).await
+    }
+    // harness_dial + set_harness_sink use the trait defaults — gRPC
+    // doesn't carry static capability or in-proc sink wiring.
 }
 
 /// Map a tonic Status into the same `SandboxError` shape today's WS

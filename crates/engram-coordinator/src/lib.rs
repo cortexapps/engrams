@@ -36,6 +36,12 @@ pub struct Services {
     pub meta: Arc<dyn MetadataStore>,
     pub cloud: Arc<dyn CloudBackend>,
     pub host: Arc<dyn HostClient>,
+    /// ADR 0013: coord-side gRPC channel pool keyed by `HostId`.
+    /// Populated on host registration (POST `/api/hosts/register`)
+    /// and pre-warmed at coord startup from `hosts.host_addr`.
+    /// Used by `HostRegistry`'s dispatch path to send unary +
+    /// streaming RPCs to host-agents over HTTP/2.
+    pub host_pool: Arc<engram_protocol::grpc_pool::GrpcHostPool>,
     pub secrets: Arc<dyn SecretStore>,
     /// Master key provider used to wrap/unwrap registry-credential
     /// DEKs. Initialised from `--kek-provider`. Phase 5+; envelope-
@@ -164,18 +170,12 @@ pub async fn run_with_registry_and_local(
         }
     };
 
-    // Phase 4 Track B: idle-session evictor. Polls the harness hub
-    // every ~10s for sandboxes whose last harness event is older
-    // than `ENGRAM_IDLE_TTL_SECS` (default 60s) and runs the suspend
-    // pipeline (checkpoint → FC snapshot → destroy → mark Idle).
-    // Auto-resume on next request lands on the existing /resume path.
-    // Drops the JoinHandle — task lives for coord's lifetime.
-    let _idle_evictor = idle_evictor::spawn(
-        state.clone(),
-        idle_evictor::idle_ttl_from_env(),
-        idle_evictor::idle_hard_ttl_from_env(),
-        idle_evictor::DEFAULT_POLL_INTERVAL,
-    );
+    // ADR 0013 + ADR 0011 #2: the idle-eviction *driver* runs on
+    // each host-agent (its local HarnessHub is authoritative for
+    // "is this sandbox idle?"). The host POSTs candidates to
+    // `/api/hosts/:id/idle-eviction-candidates`; the receiving
+    // coord pod runs the pipeline (`evict_idle_session` below).
+    // No background task lives here anymore.
 
     // Phase 4 Track D: preemption best-effort drain. Subscribes to
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE

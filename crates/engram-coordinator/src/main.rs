@@ -655,10 +655,15 @@ async fn main() -> Result<(), CoordinatorError> {
     // consume the same `blob` so chunks the bake writes land in
     // the same keyspace the GC sweeps.
     let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+    // ADR 0013: per-pod gRPC pool. Empty at construction; populated
+    // on `/api/hosts/register` POSTs and (in `run_with_registry`) at
+    // startup from already-registered `hosts` rows.
+    let host_pool = Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new());
     let services = Services {
         meta: meta_arc.clone(),
         cloud,
         host: host_registry.clone() as Arc<dyn HostClient>,
+        host_pool,
         secrets,
         kek,
         oci: oci_client,

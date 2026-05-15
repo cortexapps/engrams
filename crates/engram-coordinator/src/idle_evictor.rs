@@ -1,100 +1,29 @@
-//! Idle-session evictor — Track B's pack-hosts mechanism.
+//! Idle-session eviction *pipeline* — the snapshot+destroy+mark-Idle
+//! primitive that runs when a sandbox has been quiet past its TTL.
 //!
-//! Background task on the coordinator that polls the
-//! [`engram_host_agent::harness::HarnessHub`] for sandboxes whose
-//! last harness event is older than `idle_ttl_secs`, and runs the
-//! suspend pipeline on each:
-//!
-//!   1. **Take a Firecracker memory snapshot** to local NVMe so the
-//!      session can be hot-restored on the same host without paying
-//!      cold-clone-and-deps cost.
-//!   2. **Destroy the sandbox** to free host RAM.
-//!   3. **Mark the session `Idle`**, clear its `sandbox_id`, emit
-//!      `SnapshotTaken` + `Evicted` + `StatusChanged` events so SSE
-//!      subscribers see the suspension cleanly.
-//!
-//! ADR 0005 retired the workspace-checkpoint pre-step the original
-//! Track C.9 design ran here — every snapshot now ships the rootfs
-//! delta, and (Stage 5+) cold-tier blob durability covers the
-//! cross-host case the git push used to.
+//! ADR 0013 + ADR 0011 follow-up #2 retired the polling driver that
+//! lived here. In a stateless coord, no single pod's local
+//! `HarnessHub` is authoritative for "is this sandbox idle?" — the
+//! host owns that view. The host now scans its local hub on a tick
+//! and POSTs candidates to `/api/hosts/:id/idle-eviction-candidates`;
+//! the receiving coord pod runs `evict_idle_session` on each. The
+//! pipeline is idempotent (registry guard at the top short-circuits
+//! if another pod already evicted the sandbox), so the same
+//! candidate landing twice is safe.
 //!
 //! Auto-resume on next request is wired separately (`api/sessions.rs`
 //! exec/exec_stream/SSE handlers): if status is `Idle`, call the
 //! existing `resume` path before routing.
-//!
-//! `--mode=all` and dev-loop only for now: the task runs on the
-//! coordinator with direct in-process access to the HarnessHub. In
-//! multi-host production, the evictor's driver moves to each
-//! host-agent (with the same shared `evict_idle_session` pipeline
-//! function); this module's split into "the driver" and "the
-//! pipeline" is intentional to make that future move surgical.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SessionStatus;
 use engram_core::{SandboxId, SessionId};
-use tokio::task::JoinHandle;
 
 use crate::state::{SessionEvent, SharedState};
-
-/// **Soft** idle TTL — a session whose adapter emitted `Idle` and
-/// stayed quiet for this long is hot-suspended. Default 30s tracks
-/// "user is afk." Override via `ENGRAM_IDLE_TTL_SECS`.
-pub const DEFAULT_IDLE_TTL_SECS: u64 = 30;
-
-/// **Hard** idle TTL — backstop for adapters that go silent
-/// without ever emitting `Idle` (stuck in a tool call, infinite
-/// loop, etc.). Default 30 minutes; override via
-/// `ENGRAM_IDLE_HARD_TTL_SECS`.
-pub const DEFAULT_IDLE_HARD_TTL_SECS: u64 = 1800;
-
-/// How often the evictor scans for over-TTL sandboxes. 10s is loose
-/// enough that the scan itself is negligible load and tight enough
-/// that the actual suspend lag past TTL is bounded.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Spawn the idle evictor as a background task. Returns the
-/// JoinHandle so the caller can abort on shutdown (the run loop
-/// itself never exits voluntarily).
-pub fn spawn(
-    state: SharedState,
-    soft_ttl: Duration,
-    hard_ttl: Duration,
-    poll_interval: Duration,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(poll_interval);
-        // Skip the immediate first tick so a freshly-started coord
-        // doesn't insta-evict sandboxes whose harness just attached
-        // a few ms before we polled.
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            run_once(&state, soft_ttl, hard_ttl).await;
-        }
-    })
-}
-
-async fn run_once(state: &SharedState, soft_ttl: Duration, hard_ttl: Duration) {
-    let candidates = state.harness_hub.idle_sandboxes(soft_ttl, hard_ttl);
-    for (session_id, sandbox_id) in candidates {
-        if let Err(e) = evict_idle_session(state, session_id, sandbox_id).await {
-            // Per-eviction failure logs but doesn't kill the loop;
-            // a transient sandbox issue shouldn't pause the whole
-            // host's pack-hosts machinery.
-            tracing::warn!(
-                session_id = %session_id,
-                sandbox_id = %sandbox_id,
-                error = %e,
-                "idle eviction failed; will retry next tick if still idle",
-            );
-        }
-    }
-}
 
 /// Run the suspend pipeline for one sandbox. Pure function over
 /// `SharedState`; the loop above is just the driver. Multi-host
@@ -250,26 +179,10 @@ impl std::error::Error for EvictError {
     }
 }
 
-/// Helper: pull the soft TTL from the env, falling back to the
-/// default. Called at coord startup.
-pub fn idle_ttl_from_env() -> Duration {
-    std::env::var("ENGRAM_IDLE_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_IDLE_TTL_SECS))
-}
-
-/// Helper: pull the hard TTL from the env, falling back to the
-/// default. The hard TTL is the stuck-adapter backstop — far
-/// looser than the soft TTL so legit long tool calls don't trip it.
-pub fn idle_hard_ttl_from_env() -> Duration {
-    std::env::var("ENGRAM_IDLE_HARD_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_IDLE_HARD_TTL_SECS))
-}
+// The TTL env helpers + polling driver live on the host-agent now
+// (`engram_host_agent::idle_evictor`). The coord only owns the
+// `evict_idle_session` pipeline above, invoked by the
+// `/api/hosts/:id/idle-eviction-candidates` POST handler.
 
 /// Marker that this module exists so unused-arg checkers don't
 /// flag the `Arc<dyn SandboxBackend>` we explicitly take below.
@@ -291,6 +204,7 @@ mod tests {
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn build_state_with_session(session: Session, sandbox_root: &Path) -> SharedState {
@@ -325,6 +239,7 @@ mod tests {
                     std::env::temp_dir().join("engram-blobs-test"),
                 ),
             )),
+            host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
         };
         let cfg = CoordinatorConfig {

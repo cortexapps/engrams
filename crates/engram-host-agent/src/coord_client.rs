@@ -18,11 +18,14 @@
 //! `CoordClient`. HTTP/1.1 keep-alive is sufficient — these are
 //! low-frequency POSTs against the coord LB.
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
+use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
 use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Persistent HTTP client to the coord. One per host-agent process;
@@ -304,4 +307,35 @@ pub struct IdleEvictionCandidatesRequest {
 pub struct IdleEvictionCandidatesResponse {
     pub accepted: usize,
     pub failed: usize,
+}
+
+/// `RegistryAuthResolver` impl that asks the coord for OCI creds
+/// over HTTP. Replaces the WS-based `WsAuthResolver` — same
+/// semantics, different transport. ADR 0013.
+pub struct HttpAuthResolver {
+    coord: CoordClient,
+    host_id: HostId,
+}
+
+impl HttpAuthResolver {
+    pub fn new(coord: CoordClient, host_id: HostId) -> Arc<Self> {
+        Arc::new(Self { coord, host_id })
+    }
+}
+
+#[async_trait]
+impl RegistryAuthResolver for HttpAuthResolver {
+    async fn resolve(&self, registry_host: &str) -> Result<Option<BasicCreds>, OciError> {
+        match self
+            .coord
+            .resolve_registry_auth(self.host_id, registry_host)
+            .await
+        {
+            Ok(resp) => Ok(resp.creds.map(|c| BasicCreds {
+                username: c.username,
+                password: c.password,
+            })),
+            Err(e) => Err(OciError::Distribution(format!("HttpAuthResolver: {e}"))),
+        }
+    }
 }

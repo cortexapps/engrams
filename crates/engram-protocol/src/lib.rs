@@ -1,30 +1,26 @@
-//! Wire types for the coordinator <-> host channel.
+//! Wire types for the coordinator ↔ host channel (ADR 0013).
 //!
-//! Phase 3 transport: bincode-encoded [`Frame`]s carried inside binary
-//! WebSocket messages. The [`wire`] module defines the frame schema;
-//! [`codec`] handles encode/decode against `tokio_tungstenite::Message`;
-//! [`client`] holds the request-id demuxer and the [`RemoteSandboxBackend`]
-//! impl; [`server`] is the host-side accept loop.
+//! Transport is HTTP/2 + gRPC (coord → host) via [`grpc_client`] +
+//! [`grpc_pool`] on the coord side, served by the host-agent's
+//! gRPC server. The proto schema lives at `proto/host_service.proto`
+//! and generates into [`grpc`].
 //!
-//! Phase 1+2 also defined `Heartbeat` / `AssignSession` / `RevokeSession`
-//! shapes used in-process before any wire was needed; those still live
-//! in [`heartbeat`] / [`scheduling`] and are now embedded in the [`wire`]
-//! frame schema.
+//! Host → coord traffic (heartbeat, registry-auth, harness events,
+//! idle-eviction-candidates, register) is plain HTTP/JSON — the
+//! payload types ([`heartbeat::HostCapacityReport`] etc.) are
+//! defined here for sharing across both sides.
+//!
+//! Pre-ADR-0013 this crate held a full bincode-over-WebSocket
+//! frame protocol; that's been retired and only the shared
+//! payload shapes remain.
 
-pub mod client;
-pub mod codec;
+pub mod admin;
 pub mod grpc;
 pub mod grpc_client;
 pub mod grpc_pool;
 pub mod heartbeat;
-pub mod scheduling;
-pub mod server;
 pub mod wire;
 
-pub use client::HostRequestHandler;
+pub use admin::HostAdminHandler;
 pub use heartbeat::*;
-pub use scheduling::*;
-pub use wire::{
-    Frame, NotifyKind, RegistryCreds, RemoteError, RequestKind, ResponseKind, StreamItem,
-    TraceContext, WireExecRequest, WIRE_VERSION,
-};
+pub use wire::{WireExecRequest, WireReapStats, WIRE_VERSION};

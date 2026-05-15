@@ -293,6 +293,7 @@ mod tests {
                     std::env::temp_dir().join("engram-blobs-test"),
                 ),
             )),
+            host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
         };
         let cfg = CoordinatorConfig {

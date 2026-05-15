@@ -1,10 +1,8 @@
 //! Host-agent's gRPC `HostService` server (ADR 0013).
 //!
 //! Implements the proto-generated `HostService` trait by delegating
-//! to the existing `LocalHostClient`. The same `LocalHostClient`
-//! the WS server (`engram_protocol::server::serve_with_reader`)
-//! talks to today, so there is exactly one in-proc backend and both
-//! transports route through it.
+//! to the local `LocalHostClient`. One in-proc backend, dispatched
+//! into by coord pods over HTTP/2.
 //!
 //! The server is bound by `boot(...)` to a TCP listener (typically
 //! `0.0.0.0:9101`) and runs until shutdown. Errors mid-RPC become
@@ -21,23 +19,25 @@ use std::sync::Arc;
 
 use engram_core::traits::HostClient;
 use engram_core::SandboxError;
+use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
 use engram_protocol::grpc::{
-    BindHarnessSessionRequest, CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit,
-    ExecFrame, ExecStartRequest, GuestIpResponse, ListSandboxesResponse, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
+    CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
+    ListSandboxesResponse, ReapMaterializeDirRequest, ReapMaterializeDirResponse, RestoreRequest,
+    SandboxIdMessage, SendHarnessPromptRequest, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
-use engram_protocol::server::HostAdminHandler;
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
-/// Concrete `HostService` impl. Holds the same `Arc<dyn HostClient>`
-/// the WS server (`engram_protocol::server::serve_with_reader`)
-/// dispatches into, so both transports share one local backend.
+/// Concrete `HostService` impl. Holds the in-proc
+/// `Arc<dyn HostClient>` (typically a `LocalHostClient` wrapping
+/// the host's SandboxBackend + HarnessHub). Optional
+/// `HostAdminHandler` services ReapMaterializeDir.
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
     admin: Option<Arc<dyn HostAdminHandler>>,
@@ -200,6 +200,18 @@ impl HostService for HostServiceImpl {
         let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
         self.inner
             .start_agent(sandbox_id, agent, policy)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn apply_egress_policy(
+        &self,
+        req: Request<ApplyEgressPolicyRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let policy = decode_bincode(&req.into_inner().policy_bincode, "SessionEgressPolicy")?;
+        self.inner
+            .apply_egress_policy(policy)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

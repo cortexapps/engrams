@@ -390,6 +390,7 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
@@ -443,6 +444,7 @@ impl TestFixture {
                     std::env::temp_dir().join("engram-blobs-test"),
                 ),
             )),
+            host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
         };
         let cfg = CoordinatorConfig {
@@ -2013,6 +2015,7 @@ async fn create_session_failure_returns_503_with_no_row() {
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
     };
     let cfg = CoordinatorConfig {
@@ -2885,14 +2888,13 @@ async fn admin_gc_chunks_returns_zero_on_empty_store() {
 }
 
 #[tokio::test]
-async fn admin_reap_materialize_dir_reports_host_without_admin_client() {
-    // Default TestFixture has no local materialize_dir but DOES
-    // register an in-proc ProcessBackend via plain `register()`
-    // (test backends don't have a ConnectedHost). Per ADR 0007 the
-    // coordinator-mode path fans out, and hosts without an
-    // admin_client surface a per-host error explaining the skip
-    // — this exercises the "graceful skip" contract where one
-    // host's missing handler doesn't fail the whole sweep.
+async fn admin_reap_materialize_dir_reports_host_not_in_grpc_pool() {
+    // ADR 0013: the fanout dispatches through `state.services.host_pool`.
+    // The default TestFixture registers an in-proc ProcessBackend via
+    // `register()` but doesn't populate the pool (no HTTP /register
+    // call in tests). Hosts not in the pool surface a per-host error
+    // explaining the skip — same "graceful skip" contract as the
+    // old admin_client path, just keyed on the new pool.
     let store = MockMetadataStore::arc();
     let app = build_app(store);
 
@@ -2909,9 +2911,9 @@ async fn admin_reap_materialize_dir_reports_host_without_admin_client() {
     assert!(entry["stats"].is_null(), "no stats when host was skipped");
     let err = entry["error"]
         .as_str()
-        .expect("missing admin_client → per-host error string");
+        .expect("not in gRPC pool → per-host error string");
     assert!(
-        err.contains("admin_client"),
+        err.contains("not yet registered") || err.contains("gRPC pool"),
         "error must explain the skip reason, got: {err}",
     );
 }
@@ -2962,6 +2964,7 @@ async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
                 std::env::temp_dir().join("engram-blobs-test"),
             ),
         )),
+        host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: Some(materialize_dir.clone()),
     };
     let cfg = engram_coordinator::CoordinatorConfig::default();
