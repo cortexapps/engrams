@@ -177,6 +177,21 @@ variable "update_max_surge" {
   nullable    = true
 }
 
+variable "coord_grpc_source_ranges" {
+  type        = list(string)
+  default     = []
+  description = <<-DESC
+    ADR 0013: CIDRs allowed to reach the host-agent's gRPC
+    `HostService` on port 9101. In GKE-hosted production this is
+    the cluster's pod CIDR (alias IPs), since coord pods dial
+    hosts directly with their pod IPs (VPC-native networking
+    bypasses node-IP NAT). Leave empty to skip the rule; the
+    intra-VPC firewall in the network module still allows traffic
+    from the primary CIDR — but GKE pod IPs are typically in a
+    secondary range outside that.
+  DESC
+}
+
 variable "autoscale" {
   type = object({
     enabled      = bool

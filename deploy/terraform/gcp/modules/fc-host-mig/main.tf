@@ -264,6 +264,34 @@ resource "google_compute_firewall" "host_agent_healthcheck" {
   description = "Allow GCE health-check probes to reach the host-agent metrics port"
 }
 
+# ADR 0013: coord pods dial the host-agent's gRPC server on 9101
+# for `HostService` dispatch (CreateSandbox, ExecStart, Snapshot,
+# …). GKE in VPC-native mode gives pods alias IPs from a secondary
+# range outside the primary subnet CIDR — so the broad intra-VPC
+# firewall in the network module doesn't cover this traffic, and
+# without this rule every coord→host gRPC call errors with
+# `tcp connect error` at the channel-warm `Ping`.
+#
+# `count = ...` so callers that don't have a coord pod CIDR to
+# pass (single-VPC test fixtures, fresh bring-ups before the GKE
+# cluster exists) opt out cleanly.
+resource "google_compute_firewall" "host_agent_grpc" {
+  count   = length(var.coord_grpc_source_ranges) > 0 ? 1 : 0
+  name    = "${var.name}-grpc-allow"
+  network = var.network_name
+  project = var.project_id
+
+  source_ranges = var.coord_grpc_source_ranges
+  target_tags   = [var.network_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["9101"]
+  }
+
+  description = "Allow coord (GKE pod CIDR) to reach host-agent gRPC HostService"
+}
+
 resource "google_compute_region_autoscaler" "fc_host" {
   count  = var.autoscale.enabled ? 1 : 0
   name   = "${var.name}-as"
