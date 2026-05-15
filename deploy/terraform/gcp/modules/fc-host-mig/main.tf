@@ -238,6 +238,32 @@ resource "google_compute_health_check" "host_agent" {
   }
 }
 
+# Without this firewall rule, the GCE health check above never
+# reaches port 9100 — the VPC's default deny drops probes from the
+# GCE health-check IP ranges and the autohealer marks every
+# instance unhealthy after `initial_delay_sec`, rolling the MIG in
+# a tight loop indefinitely.
+#
+# The source ranges are the documented GCE health-check infrastructure
+# ranges: https://cloud.google.com/load-balancing/docs/health-check-concepts#ip-ranges
+# Targets the instances by `network_tag` (same tag the instance
+# template stamps on every VM in this MIG).
+resource "google_compute_firewall" "host_agent_healthcheck" {
+  name    = "${var.name}-hc-allow"
+  network = var.network_name
+  project = var.project_id
+
+  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
+  target_tags   = [var.network_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["9100"]
+  }
+
+  description = "Allow GCE health-check probes to reach the host-agent metrics port"
+}
+
 resource "google_compute_region_autoscaler" "fc_host" {
   count  = var.autoscale.enabled ? 1 : 0
   name   = "${var.name}-as"
