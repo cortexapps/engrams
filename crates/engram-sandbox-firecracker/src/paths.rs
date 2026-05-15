@@ -60,17 +60,42 @@ pub fn vsock_uds_path(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
     work_dir.join(format!("{sandbox_id}.vsock"))
 }
 
-/// `<jail>/rootfs.dev` — canonical rootfs symlink target. FC
-/// `put_drive` and the embedded path inside `state.bin` are both
-/// this.
-pub fn rootfs_link(jail_dir: &Path) -> PathBuf {
-    jail_dir.join("rootfs.dev")
+/// `<work_dir>/rootfs/<sandbox_id>.dev` — canonical rootfs symlink
+/// path. FC `put_drive`'s `path_on_host` and the embedded path
+/// inside `state.bin` are both this. Lives **outside** the jail by
+/// design: `destroy()`'s `remove_dir_all(jail_dir)` doesn't touch
+/// it, so a snapshot taken from this sandbox stays restorable
+/// after the sandbox is gone. The symlink itself is removed on
+/// destroy via [`canonical_dirs_for_destroy`]; on restore, the
+/// receiver re-creates it pointing at whatever it has materialized
+/// locally.
+pub fn rootfs_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
+    work_dir.join("rootfs").join(format!("{sandbox_id}.dev"))
 }
 
-/// `<jail>/harness.ext4` — canonical harness-substrate symlink
-/// target. Present only when the spec had a harness substrate.
-pub fn harness_link(jail_dir: &Path) -> PathBuf {
-    jail_dir.join("harness.ext4")
+/// `<work_dir>/harness/<sandbox_id>.ext4` — canonical harness-
+/// substrate symlink path. Same shape as [`rootfs_canonical`].
+/// Present only when the spec had a harness substrate.
+pub fn harness_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
+    work_dir.join("harness").join(format!("{sandbox_id}.ext4"))
+}
+
+/// Parent dirs that must exist before [`install_symlink`] can land
+/// the canonical-path entries. Idempotent — `create_dir_all` is
+/// the right primitive at the callsite.
+pub fn canonical_parent_dirs(work_dir: &Path) -> [PathBuf; 2] {
+    [work_dir.join("rootfs"), work_dir.join("harness")]
+}
+
+/// The canonical-path entries owned by this sandbox (rootfs +
+/// harness). `destroy()` should `remove_file` each one — they're
+/// symlinks, not directories, so a single `remove_file` is enough
+/// and a `NotFound` is benign (caller didn't have one of them).
+pub fn canonical_entries_for(work_dir: &Path, sandbox_id: SandboxId) -> [PathBuf; 2] {
+    [
+        rootfs_canonical(work_dir, sandbox_id),
+        harness_canonical(work_dir, sandbox_id),
+    ]
 }
 
 /// `<jail>/firecracker.sock`.
@@ -103,13 +128,17 @@ pub async fn install_symlink(canonical: &Path, target: &Path) -> std::io::Result
     tokio::fs::symlink(target, canonical).await
 }
 
-/// Verify the rootfs canonical symlink exists at `<jail>/rootfs.dev`
-/// and resolves to a host-visible path. Returns the link target.
-/// Snapshot creation calls this before producing the artifact —
-/// refusing to snapshot a non-canonical sandbox prevents shipping a
-/// blob that won't restore on a sibling host.
-pub async fn assert_rootfs_canonical(jail_dir: &Path) -> Result<PathBuf, String> {
-    let link = rootfs_link(jail_dir);
+/// Verify the rootfs canonical symlink exists at
+/// `<work_dir>/rootfs/<sandbox_id>.dev` and resolves to a host-
+/// visible path. Returns the link target. Snapshot creation calls
+/// this before producing the artifact — refusing to snapshot a
+/// non-canonical sandbox prevents shipping a blob that won't
+/// restore on a sibling host.
+pub async fn assert_rootfs_canonical(
+    work_dir: &Path,
+    sandbox_id: SandboxId,
+) -> Result<PathBuf, String> {
+    let link = rootfs_canonical(work_dir, sandbox_id);
     let target = tokio::fs::read_link(&link).await.map_err(|e| {
         format!(
             "rootfs canonical symlink missing at {}: {e}",
@@ -139,9 +168,42 @@ mod tests {
             jail,
             Path::new("/var/lib/engram/sandboxes").join(id.to_string())
         );
-        assert_eq!(rootfs_link(&jail), jail.join("rootfs.dev"));
-        assert_eq!(harness_link(&jail), jail.join("harness.ext4"));
+        // Per-jail entries (FC api socket, log, uffd uds) live
+        // INSIDE the jail and are removed on destroy.
+        assert_eq!(firecracker_socket(&jail), jail.join("firecracker.sock"));
+        assert_eq!(firecracker_log(&jail), jail.join("firecracker.log"));
         assert_eq!(uffd_uds(&jail), jail.join("uffd.sock"));
+    }
+
+    #[test]
+    fn canonical_rootfs_lives_outside_jail() {
+        let id = SandboxId::new();
+        let work = Path::new("/var/lib/engram/sandboxes");
+        let canonical = rootfs_canonical(work, id);
+        let jail = jail_dir(work, id);
+        // The canonical rootfs path is under <work_dir>/rootfs/, a
+        // sibling of the jail. Survives `remove_dir_all(jail)`.
+        assert_eq!(canonical, work.join("rootfs").join(format!("{id}.dev")));
+        assert!(!canonical.starts_with(&jail));
+    }
+
+    #[test]
+    fn canonical_harness_lives_outside_jail() {
+        let id = SandboxId::new();
+        let work = Path::new("/var/lib/engram/sandboxes");
+        let canonical = harness_canonical(work, id);
+        let jail = jail_dir(work, id);
+        assert_eq!(canonical, work.join("harness").join(format!("{id}.ext4")));
+        assert!(!canonical.starts_with(&jail));
+    }
+
+    #[test]
+    fn canonical_entries_for_lists_both_paths() {
+        let id = SandboxId::new();
+        let work = Path::new("/var/lib/engram/sandboxes");
+        let entries = canonical_entries_for(work, id);
+        assert_eq!(entries[0], rootfs_canonical(work, id));
+        assert_eq!(entries[1], harness_canonical(work, id));
     }
 
     #[test]
@@ -180,28 +242,39 @@ mod tests {
     #[tokio::test]
     async fn assert_rootfs_canonical_rejects_missing_link() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = assert_rootfs_canonical(tmp.path()).await.unwrap_err();
+        let id = SandboxId::new();
+        let err = assert_rootfs_canonical(tmp.path(), id).await.unwrap_err();
         assert!(err.contains("rootfs canonical symlink missing"));
     }
 
     #[tokio::test]
     async fn assert_rootfs_canonical_rejects_dangling_link() {
         let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        for parent in canonical_parent_dirs(tmp.path()) {
+            tokio::fs::create_dir_all(&parent).await.unwrap();
+        }
         let dangling = tmp.path().join("does-not-exist");
-        let link = rootfs_link(tmp.path());
-        install_symlink(&link, &dangling).await.unwrap();
-        let err = assert_rootfs_canonical(tmp.path()).await.unwrap_err();
+        install_symlink(&rootfs_canonical(tmp.path(), id), &dangling)
+            .await
+            .unwrap();
+        let err = assert_rootfs_canonical(tmp.path(), id).await.unwrap_err();
         assert!(err.contains("not present on host"));
     }
 
     #[tokio::test]
     async fn assert_rootfs_canonical_accepts_resolvable_link() {
         let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("rootfs.ext4");
+        let id = SandboxId::new();
+        for parent in canonical_parent_dirs(tmp.path()) {
+            tokio::fs::create_dir_all(&parent).await.unwrap();
+        }
+        let target = tmp.path().join("source.ext4");
         tokio::fs::write(&target, b"ext4").await.unwrap();
-        let link = rootfs_link(tmp.path());
-        install_symlink(&link, &target).await.unwrap();
-        let resolved = assert_rootfs_canonical(tmp.path()).await.unwrap();
+        install_symlink(&rootfs_canonical(tmp.path(), id), &target)
+            .await
+            .unwrap();
+        let resolved = assert_rootfs_canonical(tmp.path(), id).await.unwrap();
         assert_eq!(resolved, target);
     }
 }

@@ -1046,9 +1046,37 @@ impl FirecrackerBackend {
             initrd_path: None,
         })
         .await?;
+        // ADR 0014: install canonical symlinks for the rootfs (and
+        // harness, when present) at sandbox-id-keyed paths under
+        // `<work_dir>/{rootfs,harness}/`. FC's `state.bin` embeds
+        // `path_on_host` literally; the canonical layer makes that
+        // embedded path live OUTSIDE the jail so it survives
+        // `destroy()`'s `remove_dir_all(jail_dir)`. Any host with
+        // the same `<work_dir>` convention can re-materialize the
+        // target under the same canonical path on restore.
+        for parent in paths::canonical_parent_dirs(&self.work_dir) {
+            tokio::fs::create_dir_all(&parent).await.map_err(|e| {
+                SandboxError::Vm(
+                    format!("create canonical parent dir {}: {e}", parent.display()).into(),
+                )
+            })?;
+        }
+        let rootfs_canonical = paths::rootfs_canonical(&self.work_dir, sandbox_id);
+        paths::install_symlink(&rootfs_canonical, &rootfs)
+            .await
+            .map_err(|e| {
+                SandboxError::Vm(
+                    format!(
+                        "install rootfs canonical symlink {} -> {}: {e}",
+                        rootfs_canonical.display(),
+                        rootfs.display()
+                    )
+                    .into(),
+                )
+            })?;
         api.put_drive(&DriveConfig {
             drive_id: "rootfs".into(),
-            path_on_host: rootfs.to_string_lossy().into_owned(),
+            path_on_host: rootfs_canonical.to_string_lossy().into_owned(),
             is_root_device: true,
             // Read-write so a future in-guest agent can write workspace
             // state. Snapshots will pin this to read-only via overlay.
@@ -1063,9 +1091,22 @@ impl FirecrackerBackend {
         // `/run/engram/harnesses/<name>/harness`. None when the
         // host's harness registry is empty.
         if let Some(substrate_path) = spec.harness_substrate.as_ref() {
+            let harness_canonical = paths::harness_canonical(&self.work_dir, sandbox_id);
+            paths::install_symlink(&harness_canonical, substrate_path)
+                .await
+                .map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "install harness canonical symlink {} -> {}: {e}",
+                            harness_canonical.display(),
+                            substrate_path.display()
+                        )
+                        .into(),
+                    )
+                })?;
             api.put_drive(&DriveConfig {
                 drive_id: "harnesses".into(),
-                path_on_host: substrate_path.to_string_lossy().into_owned(),
+                path_on_host: harness_canonical.to_string_lossy().into_owned(),
                 is_root_device: false,
                 is_read_only: true,
             })
@@ -1267,6 +1308,22 @@ impl FirecrackerBackend {
         }
 
         let (socket, child) = self.spawn_firecracker(jail_dir).await?;
+
+        // ADR 0014: FC's `state.bin` embeds the canonical rootfs
+        // path keyed by the **source** sandbox_id, not this new
+        // restored sandbox_id. The receiver must materialize the
+        // rootfs at that exact host-visible path before
+        // `load_snapshot` opens it. Same `<work_dir>` contract +
+        // re-create the source-id-keyed symlink pointing at the
+        // host-local source (same OCI cache file for same-host
+        // restore; cross-host restore expects the caller to have
+        // materialized into `manifest.spec.rootfs_source` already).
+        // Errors here drop `child` explicitly so the spawned FC
+        // process gets SIGKILLed before we propagate.
+        if let Err(e) = restore_canonical_symlinks(&self.work_dir, manifest).await {
+            drop(child);
+            return Err(e);
+        }
 
         // Re-provision the host-side networking BEFORE load_snapshot.
         // FC's `state.bin` references the original TAP by name on the
@@ -1494,6 +1551,51 @@ impl FirecrackerBackend {
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// ADR 0014: re-install the canonical rootfs + harness symlinks for
+/// a restored sandbox. The symlinks live under
+/// `<work_dir>/{rootfs,harness}/<source_sandbox_id>.{dev,ext4}` —
+/// keyed by the **source** sandbox_id because that's what
+/// `state.bin` embedded as `path_on_host`, not the new restored
+/// sandbox_id. Idempotent.
+async fn restore_canonical_symlinks(
+    work_dir: &Path,
+    manifest: &FcSnapshotManifest,
+) -> Result<(), SandboxError> {
+    for parent in paths::canonical_parent_dirs(work_dir) {
+        tokio::fs::create_dir_all(&parent).await.map_err(|e| {
+            vm_err(format!(
+                "create canonical parent dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    if let Some(rootfs_target) = manifest.spec.rootfs_source.as_ref() {
+        let canonical = paths::rootfs_canonical(work_dir, manifest.sandbox_id);
+        paths::install_symlink(&canonical, rootfs_target)
+            .await
+            .map_err(|e| {
+                vm_err(format!(
+                    "restore rootfs canonical symlink {} -> {}: {e}",
+                    canonical.display(),
+                    rootfs_target.display()
+                ))
+            })?;
+    }
+    if let Some(harness_target) = manifest.spec.harness_substrate.as_ref() {
+        let canonical = paths::harness_canonical(work_dir, manifest.sandbox_id);
+        paths::install_symlink(&canonical, harness_target)
+            .await
+            .map_err(|e| {
+                vm_err(format!(
+                    "restore harness canonical symlink {} -> {}: {e}",
+                    canonical.display(),
+                    harness_target.display()
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 /// ADR 0009 §6: branch destroy's wait-for-exit on whether we own a
@@ -1875,6 +1977,15 @@ impl SandboxBackend for FirecrackerBackend {
             )
         };
 
+        // ADR 0014: refuse to snapshot a sandbox whose canonical
+        // rootfs symlink is missing or dangling. FC's `state.bin`
+        // embeds `<work_dir>/rootfs/<sandbox_id>.dev` as
+        // `path_on_host`; capture-time validation prevents shipping
+        // a blob that fails opaquely at restore on a sibling host.
+        paths::assert_rootfs_canonical(&self.work_dir, id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("non-canonical jail layout: {e}")))?;
+
         // ADR 0007 Phase 6: allocate the snapshot id first, derive
         // the staging dir from it. Coord no longer dictates layout.
         let snapshot_id = SnapshotId::new();
@@ -2078,6 +2189,19 @@ impl SandboxBackend for FirecrackerBackend {
         // Vsock UDS lives at work_dir root; remove explicitly since
         // it isn't inside the jail dir we wipe below.
         let _ = tokio::fs::remove_file(&live.state.vsock_uds_path).await;
+
+        // ADR 0014: canonical rootfs / harness symlinks at
+        // `<work_dir>/{rootfs,harness}/<sandbox_id>.{dev,ext4}`
+        // live outside the jail by design. Remove them explicitly;
+        // any restore that wants this sandbox_id back will re-create
+        // them pointing at whatever it has materialized locally.
+        for entry in paths::canonical_entries_for(&self.work_dir, id) {
+            // NotFound is benign — sandbox may have been created
+            // without a harness substrate, or pre-ADR-0014 (no entry
+            // at all). `remove_file` on a symlink unlinks the entry,
+            // not the target.
+            let _ = tokio::fs::remove_file(&entry).await;
+        }
 
         let jail_dir = self.work_dir.join(id.to_string());
         if let Err(e) = tokio::fs::remove_dir_all(&jail_dir).await {
