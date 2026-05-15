@@ -24,6 +24,26 @@ data "google_compute_zones" "region" {
   region = var.region
 }
 
+# Look up the latest image in the family at plan time. This is what
+# makes the auto-deploy pipeline work: when the bake-fc-host CI
+# workflow lands a new image, the family pointer moves, this data
+# source resolves to a new `self_link`, and the instance template
+# below sees `source_image` as changed — TF then create-before-
+# destroy's the template and the MIG rolls onto it. With the older
+# `family/<name>` URI form, GCE resolves the family at instance-
+# create time and TF never sees a diff, so the MIG would stay on
+# whatever image was current when the template was first created.
+#
+# Bring-up gotcha: this data source requires at least one image in
+# the family. On a fresh deploy, run the `bake-fc-host-image`
+# workflow ONCE before the first `terraform apply`, or apply the
+# rest of the stack first with the FC MIG opted-out (host_count=0)
+# and then bake + re-apply.
+data "google_compute_image" "fc_host" {
+  family  = var.image_family
+  project = var.project_id
+}
+
 locals {
   zone_count = length(data.google_compute_zones.region.names)
 
@@ -87,7 +107,10 @@ resource "google_compute_instance_template" "fc_host" {
   region       = var.region
 
   disk {
-    source_image = "projects/${var.project_id}/global/images/family/${var.image_family}"
+    # Pinned to the data source's resolved self_link (not the
+    # `family/<name>` shortcut) so TF sees a diff when a new image
+    # lands in the family. See the data block comment above.
+    source_image = data.google_compute_image.fc_host.self_link
     boot         = true
     auto_delete  = true
     disk_size_gb = var.boot_disk_size_gb
