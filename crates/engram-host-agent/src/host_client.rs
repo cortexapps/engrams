@@ -34,6 +34,12 @@ use crate::harness::{HarnessError, HarnessHub};
 pub struct LocalHostClient {
     sandbox: Arc<dyn SandboxBackend>,
     harness_hub: Arc<HarnessHub>,
+    /// ADR 0014 warm pool. `None` in dev (mode=all) and in tests
+    /// that don't exercise warm-lease. When `Some`, the
+    /// `lease_warm_sandbox` / `launch_warm_sandbox` /
+    /// `list_warm_slots` trait methods delegate here instead of
+    /// the no-op defaults.
+    warm_pool: Option<crate::warm_pool::WarmPool>,
 }
 
 impl LocalHostClient {
@@ -41,7 +47,22 @@ impl LocalHostClient {
         Self {
             sandbox,
             harness_hub,
+            warm_pool: None,
         }
+    }
+
+    /// Attach a warm pool (ADR 0014). The host-agent's boot path
+    /// constructs one with the same backend instance and calls this
+    /// before publishing the LocalHostClient to the gRPC server.
+    pub fn with_warm_pool(mut self, warm_pool: crate::warm_pool::WarmPool) -> Self {
+        self.warm_pool = Some(warm_pool);
+        self
+    }
+
+    /// Borrow the attached warm pool (for the heartbeat loop's
+    /// `list_slots` + `observe_templates` hooks in M1.7).
+    pub fn warm_pool(&self) -> Option<&crate::warm_pool::WarmPool> {
+        self.warm_pool.as_ref()
     }
 
     /// Convenience constructor for callers that don't need to route
@@ -143,6 +164,37 @@ impl HostClient for LocalHostClient {
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub.release_shell(sandbox_id);
         Ok(())
+    }
+
+    async fn lease_warm_sandbox(
+        &self,
+        template_ref: engram_core::types::ids::TemplateRef,
+    ) -> Result<engram_core::traits::host_client::WarmLeaseOutcome, SandboxError> {
+        match self.warm_pool.as_ref() {
+            Some(pool) => Ok(pool.lease(template_ref).await),
+            None => Ok(engram_core::traits::host_client::WarmLeaseOutcome::NoCapacity),
+        }
+    }
+
+    async fn launch_warm_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        agent: AgentSpec,
+        policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        match self.warm_pool.as_ref() {
+            Some(pool) => pool.launch(sandbox_id, agent, policy).await,
+            None => Err(SandboxError::NotFound),
+        }
+    }
+
+    async fn list_warm_slots(
+        &self,
+    ) -> Result<Vec<engram_core::traits::host_client::WarmSlotCount>, SandboxError> {
+        match self.warm_pool.as_ref() {
+            Some(pool) => Ok(pool.list_slots()),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn harness_dial(&self) -> HarnessDial {

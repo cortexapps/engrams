@@ -38,6 +38,7 @@ pub mod pooled_backend;
 pub mod resource;
 pub mod shutdown;
 pub mod snapshot;
+pub mod warm_pool;
 
 pub use config::HostAgentConfig;
 
