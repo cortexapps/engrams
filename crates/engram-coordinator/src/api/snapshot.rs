@@ -278,6 +278,15 @@ async fn resume_from_fc_snapshot(
         image_version: record.image_version.clone(),
         disk_manifest: record.disk_manifest,
         memory_manifest: record.memory_manifest,
+        // ADR 0014: portable-snapshot refs aren't yet plumbed onto
+        // SnapshotRecord — the existing idle-resume path stays
+        // same-host. Warm-pool restore will carry these via gRPC
+        // request fields (M1.5), bypassing the SnapshotRecord
+        // shape.
+        source_sandbox_id: None,
+        state_blob_key: None,
+        sidecar_blob_key: None,
+        rootfs_blob_key: None,
     };
     let (host_id, new_sandbox_id) = match state
         .host_registry

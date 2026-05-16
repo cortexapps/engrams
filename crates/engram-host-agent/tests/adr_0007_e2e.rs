@@ -147,6 +147,10 @@ impl SandboxBackend for FakeFcBackend {
             image_version: "e2e-test:1".into(),
             disk_manifest: None,
             memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
         })
     }
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {

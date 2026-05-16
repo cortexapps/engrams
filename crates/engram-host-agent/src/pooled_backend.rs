@@ -508,6 +508,56 @@ impl PooledBackend {
     }
 }
 
+/// ADR 0014 cross-host restore helper: download `state.bin` and the
+/// FC sidecar JSON from `BlobStorage` into the snapshot staging
+/// directory iff (a) the metadata carries portable blob keys and
+/// (b) the local files aren't already there. Idempotent — same-
+/// host restore is a pair of `fs::metadata` short-circuits.
+async fn materialize_state_if_missing(
+    blob: &dyn engram_core::traits::storage::BlobStorage,
+    src: &std::path::Path,
+    state_blob_key: Option<&str>,
+    sidecar_blob_key: Option<&str>,
+) -> Result<(), SandboxError> {
+    // The dest paths mirror the inner FC backend's snapshot layout
+    // (`<snapshot_dir>/{state.bin,manifest.json}`). Cross-host
+    // restore may hand us a path whose parent doesn't exist yet.
+    fs::create_dir_all(src).await.map_err(|e| {
+        SandboxError::Snapshot(format!("create snapshot dir {}: {e}", src.display()))
+    })?;
+    let state_path = src.join("state.bin");
+    if let Some(key) = state_blob_key {
+        if fs::metadata(&state_path).await.is_err() {
+            crate::snapshot_blob::download_file(blob, key, &state_path)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!("download state.bin from {key}: {e}"))
+                })?;
+            tracing::info!(
+                path = %state_path.display(),
+                key = key,
+                "materialised state.bin from BlobStorage",
+            );
+        }
+    }
+    let sidecar_path = src.join("manifest.json");
+    if let Some(key) = sidecar_blob_key {
+        if fs::metadata(&sidecar_path).await.is_err() {
+            crate::snapshot_blob::download_file(blob, key, &sidecar_path)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!("download sidecar.json from {key}: {e}"))
+                })?;
+            tracing::info!(
+                path = %sidecar_path.display(),
+                key = key,
+                "materialised sidecar.json from BlobStorage",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// ADR 0008 Phase 5 final piece: ensure the disk `Manifest`
 /// referenced by `cached.bundle.disk_manifest` is reachable in
 /// the host's `BlobStorage`. For chunked-OCI images, the bake-
@@ -963,6 +1013,37 @@ impl SandboxBackend for PooledBackend {
             manifest = %manifest_ref,
             "chunked FC memory.bin → chunk store",
         );
+
+        // ADR 0014: upload state.bin + sidecar to BlobStorage so a
+        // sibling host can restore from this snapshot. memory.bin
+        // is already chunk-stored above; state.bin and sidecar are
+        // small opaque blobs (state.bin is FC VMM+device state,
+        // sidecar is `manifest.json` carrying spec + memory_manifest
+        // + source sandbox_id). Skipped silently when state.bin is
+        // missing (defensive: should always exist after FC snapshot,
+        // but the chunked-memory path already gates on memory.bin
+        // existence for the same reason).
+        let blob = chunk_store.blob_storage();
+        let state_path = dest.join("state.bin");
+        let sidecar_path = dest.join("manifest.json");
+        if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok() {
+            let state_key = crate::snapshot_blob::state_blob_key(metadata.id);
+            let sidecar_key = crate::snapshot_blob::sidecar_blob_key(metadata.id);
+            crate::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
+            crate::snapshot_blob::upload_file(blob.as_ref(), &sidecar_key, &sidecar_path)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+            metadata.state_blob_key = Some(state_key);
+            metadata.sidecar_blob_key = Some(sidecar_key);
+            metadata.source_sandbox_id = Some(id);
+            tracing::info!(
+                source_sandbox = %id,
+                snapshot_id = %metadata.id,
+                "portable snapshot artifacts uploaded to BlobStorage",
+            );
+        }
         Ok(metadata)
     }
 
@@ -986,6 +1067,31 @@ impl SandboxBackend for PooledBackend {
                 "memory.bin materialization failed; inner.restore will see whatever's there",
             );
         }
+
+        // ADR 0014: cross-host state.bin + sidecar materialization.
+        // Symmetric to memory.bin — if the metadata carries portable
+        // blob keys and the local files aren't present, download
+        // them from BlobStorage. Same-host restore (idle resume on
+        // the host that produced the snapshot) hits the early-return
+        // because the files are already at `src`.
+        if let Some(chunk_store) = self.chunk_store.as_ref() {
+            let blob = chunk_store.blob_storage();
+            if let Err(e) = materialize_state_if_missing(
+                blob.as_ref(),
+                &src,
+                metadata.state_blob_key.as_deref(),
+                metadata.sidecar_blob_key.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    src = %src.display(),
+                    "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
+                );
+            }
+        }
+
         self.inner.restore(metadata).await
     }
 
@@ -1235,6 +1341,10 @@ mod tests {
                     image_version: "test:1".into(),
                     disk_manifest: None,
                     memory_manifest: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -1292,6 +1402,287 @@ mod tests {
         cs.materialize_to_file(&manifest, &recovered).await.unwrap();
         let recovered_bytes = tokio::fs::read(&recovered).await.unwrap();
         assert_eq!(recovered_bytes, bytes, "memory bytes round-trip");
+    }
+
+    /// ADR 0014: PooledBackend's snapshot wrap uploads state.bin +
+    /// sidecar.json to BlobStorage and stamps the metadata with the
+    /// portable blob keys. Mirrors the chunked-memory test pattern
+    /// above but verifies the new state/sidecar upload step rather
+    /// than the existing memory-chunk step.
+    #[tokio::test]
+    async fn snapshot_uploads_state_and_sidecar_to_blob_storage() {
+        use engram_chunk_store::ChunkStore;
+        use engram_storage_local::LocalBlobStorage;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // FakeFcBackend writes the three artifacts (memory.bin,
+        // state.bin, manifest.json) into its staging dir, mirroring
+        // what real FC `create_snapshot` produces.
+        #[derive(Clone)]
+        struct FakeFcBackend {
+            payload: Vec<u8>,
+            staging_root: PathBuf,
+        }
+        impl FakeFcBackend {
+            fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging_root.join(id.to_string())
+            }
+        }
+        #[async_trait]
+        impl SandboxBackend for FakeFcBackend {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.dir_for(snapshot_id);
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), &self.payload)
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"fake-state-bin-bytes")
+                    .await
+                    .unwrap();
+                let manifest = serde_json::json!({
+                    "sandbox_id": uuid::Uuid::new_v4(),
+                    "created_at": chrono::Utc::now(),
+                    "spec": {
+                        "image": "test:1", "rootfs_source": null, "image_uri": null,
+                        "harness_pack_uri": null, "cpu": {"vcpus": 1},
+                        "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+                        "ttl": null, "env": {}, "workdir": null,
+                        "harness_substrate": null, "network": {}
+                    },
+                    "format": "fc"
+                });
+                tokio::fs::write(
+                    dest.join("manifest.json"),
+                    serde_json::to_vec_pretty(&manifest).unwrap(),
+                )
+                .await
+                .unwrap();
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: self.payload.len() as u64,
+                    created_at: chrono::Utc::now(),
+                    image_version: "test:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.dir_for(id)
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let cs = ChunkStore::new(blob.clone());
+        let payload: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeFcBackend {
+            payload,
+            staging_root: tmp.path().join("fc-snaps"),
+        });
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("mat"));
+
+        let source_sandbox = SandboxId::new();
+        let metadata = pooled.snapshot(source_sandbox).await.unwrap();
+
+        // Portable fields populated.
+        assert_eq!(
+            metadata.source_sandbox_id,
+            Some(source_sandbox),
+            "PooledBackend must stamp source_sandbox_id",
+        );
+        let state_key = metadata
+            .state_blob_key
+            .as_ref()
+            .expect("state_blob_key must be set after upload");
+        let sidecar_key = metadata
+            .sidecar_blob_key
+            .as_ref()
+            .expect("sidecar_blob_key must be set after upload");
+        assert!(state_key.contains(&metadata.id.to_string()));
+        assert!(sidecar_key.contains(&metadata.id.to_string()));
+
+        // Blobs are actually in BlobStorage.
+        let downloaded_state: bytes::Bytes = blob.get(state_key).await.unwrap();
+        assert_eq!(&downloaded_state[..], b"fake-state-bin-bytes");
+        let downloaded_sidecar: bytes::Bytes = blob.get(sidecar_key).await.unwrap();
+        let sidecar: serde_json::Value = serde_json::from_slice(&downloaded_sidecar).unwrap();
+        assert_eq!(sidecar["format"], "fc");
+        assert_eq!(sidecar["spec"]["image"], "test:1");
+    }
+
+    /// ADR 0014: PooledBackend's restore wrap pulls state.bin +
+    /// sidecar from BlobStorage when the local files are missing
+    /// (cross-host restore case). Validated by deleting the local
+    /// staging files between snapshot and restore — restore must
+    /// rebuild them before delegating to inner.
+    #[tokio::test]
+    async fn restore_materializes_missing_state_and_sidecar_from_blob_storage() {
+        use engram_chunk_store::ChunkStore;
+        use engram_storage_local::LocalBlobStorage;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Inner backend that lets us drive snapshot then asserts on
+        // restore that state.bin + manifest.json are present on disk
+        // by the time it's invoked.
+        struct AssertingInner {
+            staging_root: PathBuf,
+            payload: Vec<u8>,
+            saw_state: parking_lot::Mutex<Option<Vec<u8>>>,
+            saw_sidecar: parking_lot::Mutex<Option<Vec<u8>>>,
+        }
+        impl AssertingInner {
+            fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging_root.join(id.to_string())
+            }
+        }
+        #[async_trait]
+        impl SandboxBackend for AssertingInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.dir_for(snapshot_id);
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), &self.payload)
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"upload-me-state")
+                    .await
+                    .unwrap();
+                let sidecar = serde_json::json!({
+                    "sandbox_id": uuid::Uuid::new_v4(),
+                    "created_at": chrono::Utc::now(),
+                    "spec": {
+                        "image": "t", "rootfs_source": null, "image_uri": null,
+                        "harness_pack_uri": null, "cpu": {"vcpus": 1},
+                        "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+                        "ttl": null, "env": {}, "workdir": null,
+                        "harness_substrate": null, "network": {}
+                    },
+                    "format": "fc"
+                });
+                tokio::fs::write(
+                    dest.join("manifest.json"),
+                    serde_json::to_vec_pretty(&sidecar).unwrap(),
+                )
+                .await
+                .unwrap();
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: self.payload.len() as u64,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.dir_for(id)
+            }
+            async fn restore(&self, meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                // Capture what was on disk at the moment inner.restore ran.
+                let dest = self.dir_for(meta.id);
+                let state = tokio::fs::read(dest.join("state.bin"))
+                    .await
+                    .expect("state.bin must be materialised before inner.restore");
+                let sidecar = tokio::fs::read(dest.join("manifest.json"))
+                    .await
+                    .expect("manifest.json must be materialised before inner.restore");
+                *self.saw_state.lock() = Some(state);
+                *self.saw_sidecar.lock() = Some(sidecar);
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let cs = ChunkStore::new(blob.clone());
+        let payload: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let inner = Arc::new(AssertingInner {
+            staging_root: tmp.path().join("fc-snaps"),
+            payload: payload.clone(),
+            saw_state: parking_lot::Mutex::new(None),
+            saw_sidecar: parking_lot::Mutex::new(None),
+        });
+        let inner_dyn: Arc<dyn SandboxBackend> = inner.clone();
+        let pooled = PooledBackend::new(inner_dyn).with_chunk_store(cs, tmp.path().join("mat"));
+
+        // Snapshot — uploads state + sidecar to BlobStorage.
+        let metadata = pooled.snapshot(SandboxId::new()).await.unwrap();
+        let staging = inner.dir_for(metadata.id);
+
+        // Simulate cross-host: delete the local staging files so
+        // restore has nothing to read from disk. Memory.bin is also
+        // deleted; it gets materialised from the chunked manifest.
+        tokio::fs::remove_file(staging.join("state.bin"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(staging.join("manifest.json"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(staging.join("memory.bin"))
+            .await
+            .unwrap();
+
+        // Restore — wrap must re-download state.bin + sidecar
+        // before delegating to inner.
+        pooled.restore(metadata).await.unwrap();
+
+        let seen_state = inner.saw_state.lock().clone().expect("inner.restore ran");
+        assert_eq!(&seen_state[..], b"upload-me-state");
+        let seen_sidecar = inner.saw_sidecar.lock().clone().expect("inner.restore ran");
+        let parsed: serde_json::Value = serde_json::from_slice(&seen_sidecar).unwrap();
+        assert_eq!(parsed["format"], "fc");
     }
 
     /// Snapshot wrap is a no-op when no chunk store is wired —
@@ -1448,6 +1839,10 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: Some(manifest_ref),
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -1569,6 +1964,10 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();

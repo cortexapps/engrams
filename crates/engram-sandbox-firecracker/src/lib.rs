@@ -2060,6 +2060,13 @@ impl SandboxBackend for FirecrackerBackend {
             // way the FC backend stays chunk-store-agnostic and
             // dev/test paths don't need a chunk-store wiring.
             memory_manifest: None,
+            // ADR 0014: portable-snapshot fields are populated by
+            // `PooledBackend::snapshot` after the inner backend
+            // returns. Bare FC stays BlobStorage-agnostic.
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
         })
     }
 
@@ -2507,6 +2514,10 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
@@ -2611,6 +2622,10 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {

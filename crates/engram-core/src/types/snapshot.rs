@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::ids::{HostId, SessionId, SnapshotId};
+use super::ids::{HostId, SandboxId, SessionId, SnapshotId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -26,6 +26,36 @@ pub struct SnapshotMetadata {
     /// stays FC-only.
     #[serde(default)]
     pub memory_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0014: source sandbox_id at snapshot time. Required for
+    /// receivers to re-create canonical rootfs/harness symlinks at
+    /// `<work_dir>/{rootfs,harness}/<source_sandbox_id>.{dev,ext4}`
+    /// before `load_snapshot` opens them. `None` for pre-ADR-0014
+    /// snapshots; restore falls back to whatever the FC backend's
+    /// `manifest.spec.rootfs_source` says.
+    #[serde(default)]
+    pub source_sandbox_id: Option<SandboxId>,
+    /// ADR 0014: BlobStorage key for the FC `state.bin` artifact
+    /// (`snapshots/<snapshot_id>/state.bin`). Receivers download
+    /// to `<snapshot_staging>/state.bin` before `load_snapshot`.
+    /// `None` when the snapshot stayed local-only (mode=all,
+    /// in-process tests).
+    #[serde(default)]
+    pub state_blob_key: Option<String>,
+    /// ADR 0014: BlobStorage key for the FC snapshot sidecar JSON
+    /// (`snapshots/<snapshot_id>/sidecar.json`). Sidecar carries
+    /// the spec, network config, memory_manifest ref, and source
+    /// sandbox_id. Receivers download to
+    /// `<snapshot_staging>/manifest.json`.
+    #[serde(default)]
+    pub sidecar_blob_key: Option<String>,
+    /// ADR 0014 M2 interim: BlobStorage key for the tar+zstd-
+    /// compressed writable rootfs blob
+    /// (`snapshots/<snapshot_id>/rootfs.tar.zst`). Receivers
+    /// download + unpack to `manifest.spec.rootfs_source` before
+    /// `load_snapshot`. `None` for snapshots whose rootfs is
+    /// represented via `disk_manifest` (chunked path) instead.
+    #[serde(default)]
+    pub rootfs_blob_key: Option<String>,
 }
 
 /// Persisted row in the `snapshots` table.

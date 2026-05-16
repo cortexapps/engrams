@@ -94,6 +94,13 @@ pub(crate) async fn build_metadata(
         // framework's memory snapshot is broken upstream for arm64
         // guests (ADR 0003), so chunked memory is FC-only.
         memory_manifest: None,
+        // ADR 0014: VZ stays portable-snapshot-agnostic. The wrap
+        // layer (PooledBackend) is FC-only on Linux; macOS dev paths
+        // don't go through BlobStorage upload yet.
+        source_sandbox_id: None,
+        state_blob_key: None,
+        sidecar_blob_key: None,
+        rootfs_blob_key: None,
     })
 }
 
