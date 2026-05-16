@@ -88,7 +88,6 @@ fn mem_available_kib() -> std::io::Result<u64> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
             let val: u64 = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|n| n.parse().ok())
