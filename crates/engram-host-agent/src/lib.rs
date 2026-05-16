@@ -490,6 +490,22 @@ impl HostAgent {
                 }
             });
 
+            // ADR 0014 M1.9: periodic warm-pool gc_tick. Drives the
+            // autoscaler (recompute target N(T) from lease rate),
+            // drains inactive templates past STALE_GRACE, and tops
+            // up free-lists toward the new targets. 5s cadence
+            // matches the heartbeat — fine-grained enough to react
+            // to bursts within one tick.
+            let warm_pool_for_gc = warm_pool.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    warm_pool_for_gc.gc_tick().await;
+                }
+            });
+
             // ADR 0011 follow-up #2: host owns idle-eviction
             // detection (its HarnessHub is authoritative for "last
             // harness activity"). Push candidates to coord via

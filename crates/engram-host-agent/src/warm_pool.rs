@@ -46,9 +46,37 @@ use engram_core::types::template::TemplateRecord;
 use engram_core::SandboxId;
 use parking_lot::Mutex;
 
-/// Default target slots per template until the autoscaler (M1.9)
-/// lights up.
-const DEFAULT_TARGET: u32 = 1;
+/// Floor target for any known template — the warm pool keeps at
+/// least this many slots ready when the autoscaler observes any
+/// recent lease activity. v1 floors at 1.
+const FLOOR_TARGET: u32 = 1;
+
+/// Ceiling on per-template target. Memory-cost guardrail until
+/// the cgroup-accounting bench (M1.10) validates canonical-mmap
+/// page-cache sharing at larger depths. v1 caps at 4.
+const CEILING_TARGET: u32 = 4;
+
+/// Window over which lease rate is computed for autoscaler input.
+/// 5 minutes keeps the signal stable across bursty session-create
+/// patterns while still reacting within one batch.
+const AUTOSCALE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Time to spawn one refill end-to-end (download blob + restore
+/// FC). Multiplied by lease-rate to compute the in-flight target
+/// the pool needs to keep up. Conservative; M1.10's bench will
+/// give us a measured value.
+const REFILL_TIME_SECS: f64 = 5.0;
+
+/// Headroom multiplier on the computed target (1.2 = 20% slack)
+/// so bursts past the steady rate don't immediately starve the
+/// pool.
+const AUTOSCALE_HEADROOM: f64 = 1.2;
+
+/// How long a template can go without a lease before the
+/// autoscaler floors it back to 0 (drained). 30 min matches the
+/// ADR 0014 plan; the pool's STALE_GRACE handles the eventual
+/// teardown.
+const COLD_TAIL: Duration = Duration::from_secs(30 * 60);
 
 /// How long an inactive template's free-list keeps existing
 /// sandboxes alive after the coord drops it from the active set.
@@ -70,9 +98,14 @@ struct WarmPoolInner {
     /// per template_ref. The refill loop reads SnapshotMetadata
     /// from here to drive `backend.restore`.
     known: DashMap<TemplateRef, KnownTemplate>,
-    /// Autoscaler target per template. Defaults to `DEFAULT_TARGET`;
-    /// M1.9 makes this lease-rate-driven.
+    /// Autoscaler target per template (M1.9). Bounded by
+    /// `FLOOR_TARGET`..`CEILING_TARGET`; recomputed from lease
+    /// history on every gc_tick.
     targets: DashMap<TemplateRef, u32>,
+    /// Per-template lease history — `Instant` of each successful
+    /// `lease()` over the `AUTOSCALE_WINDOW`. Older entries are
+    /// trimmed on gc_tick.
+    lease_history: DashMap<TemplateRef, Mutex<Vec<std::time::Instant>>>,
     /// Reference back to the host's SandboxBackend (typically a
     /// PooledBackend wrapping FirecrackerBackend). Used by the
     /// refill loop for `restore` and by `launch` for
@@ -97,6 +130,7 @@ impl WarmPool {
                 free_lists: DashMap::new(),
                 known: DashMap::new(),
                 targets: DashMap::new(),
+                lease_history: DashMap::new(),
                 backend,
             }),
         }
@@ -173,7 +207,7 @@ impl WarmPool {
         self.inner
             .targets
             .entry(template_ref)
-            .or_insert(DEFAULT_TARGET);
+            .or_insert(FLOOR_TARGET);
         for sandbox_id in stale_drain {
             let _ = self.inner.backend.destroy(sandbox_id).await;
         }
@@ -207,6 +241,12 @@ impl WarmPool {
             .free_lists
             .get(&template_ref)
             .and_then(|m| m.lock().pop());
+        // ADR 0014 M1.9: every lease attempt (success or empty)
+        // counts as demand for the autoscaler. Recording on both
+        // outcomes lets the pool scale UP under load even when
+        // it's being out-paced — empty leases are exactly the
+        // signal that target is too low.
+        self.record_lease_demand(template_ref);
         // Whether we leased one or not, refill toward the target
         // so the next lease finds a slot. Spawned to avoid blocking
         // the caller (coord's parallel-ask path).
@@ -215,6 +255,18 @@ impl WarmPool {
             Some(sandbox_id) => WarmLeaseOutcome::Granted(sandbox_id),
             None => WarmLeaseOutcome::NoCapacity,
         }
+    }
+
+    /// Append a demand timestamp to the per-template lease history
+    /// (M1.9 autoscaler input). Trimming happens on `gc_tick`.
+    fn record_lease_demand(&self, template_ref: TemplateRef) {
+        let now = std::time::Instant::now();
+        self.inner
+            .lease_history
+            .entry(template_ref)
+            .or_default()
+            .lock()
+            .push(now);
     }
 
     /// Activate a previously-leased warm sandbox: push
@@ -246,7 +298,7 @@ impl WarmPool {
                 .targets
                 .get(&template_ref)
                 .map(|t| *t)
-                .unwrap_or(DEFAULT_TARGET);
+                .unwrap_or(FLOOR_TARGET);
             out.push(WarmSlotCount {
                 template_ref,
                 available,
@@ -257,10 +309,24 @@ impl WarmPool {
     }
 
     /// Tick called by a periodic timer (every ~5s) to:
+    /// - Recompute per-template autoscaler targets from the
+    ///   recent lease history.
     /// - Garbage-collect inactive templates past their grace window.
     /// - Top up free-lists toward their target.
     pub async fn gc_tick(&self) {
         let now = std::time::Instant::now();
+        // ADR 0014 M1.9: trim per-template lease history to the
+        // autoscaler window and recompute each target.
+        for entry in self.inner.lease_history.iter() {
+            let cutoff = now - AUTOSCALE_WINDOW;
+            entry.value().lock().retain(|t| *t >= cutoff);
+        }
+        for entry in self.inner.known.iter() {
+            let template_ref = *entry.key();
+            let new_target = self.compute_target(template_ref, now);
+            self.inner.targets.insert(template_ref, new_target);
+        }
+        // GC inactive templates past their grace window.
         let mut to_remove = Vec::new();
         for entry in self.inner.known.iter() {
             if let Some(t) = entry.inactive_since {
@@ -278,16 +344,73 @@ impl WarmPool {
                 .unwrap_or_default();
             self.inner.known.remove(&template_ref);
             self.inner.targets.remove(&template_ref);
+            self.inner.lease_history.remove(&template_ref);
             for sandbox_id in to_destroy {
                 let _ = self.inner.backend.destroy(sandbox_id).await;
             }
         }
+        // Drain free-lists for templates whose target went to 0.
+        // (Cold tail: no leases observed in COLD_TAIL.)
+        for entry in self.inner.targets.iter() {
+            let template_ref = *entry.key();
+            let target = *entry.value();
+            if target > 0 {
+                continue;
+            }
+            let to_destroy = self
+                .inner
+                .free_lists
+                .get(&template_ref)
+                .map(|m| std::mem::take(&mut *m.lock()))
+                .unwrap_or_default();
+            for sandbox_id in to_destroy {
+                let _ = self.inner.backend.destroy(sandbox_id).await;
+            }
+        }
+        // Top up active templates toward their (possibly new) target.
         for entry in self.inner.known.iter() {
             if entry.inactive_since.is_some() {
                 continue;
             }
             self.maybe_refill(*entry.key()).await;
         }
+    }
+
+    /// ADR 0014 M1.9 autoscaler. Computes the target N(T) for
+    /// `template_ref` at `now`:
+    ///
+    /// - If no leases in COLD_TAIL → 0 (drain back to cold tail).
+    /// - Else compute lease_rate = leases_in_window / window_secs
+    ///   (per second), and N = max(FLOOR_TARGET, ceil(rate ×
+    ///   REFILL_TIME_SECS × AUTOSCALE_HEADROOM)). Clamp to
+    ///   CEILING_TARGET.
+    ///
+    /// The formula is "keep enough slots that the refill loop can
+    /// keep up with the observed lease rate × refill time, plus a
+    /// headroom multiplier for burst tolerance." Driven by the
+    /// observed lease rate, not heartbeat-reported slots, so it's
+    /// resilient to template-ref skew.
+    fn compute_target(&self, template_ref: TemplateRef, now: std::time::Instant) -> u32 {
+        let history = match self.inner.lease_history.get(&template_ref) {
+            Some(h) => h,
+            None => return FLOOR_TARGET,
+        };
+        let leases = history.lock();
+        if leases.is_empty() {
+            return FLOOR_TARGET;
+        }
+        // Cold tail: if newest lease is older than COLD_TAIL, drain.
+        if let Some(latest) = leases.iter().max() {
+            if now.duration_since(*latest) >= COLD_TAIL {
+                return 0;
+            }
+        }
+        let count = leases.len() as f64;
+        let window_secs = AUTOSCALE_WINDOW.as_secs_f64();
+        let lease_rate = count / window_secs;
+        let raw = lease_rate * REFILL_TIME_SECS * AUTOSCALE_HEADROOM;
+        let target = (raw.ceil() as u32).max(FLOOR_TARGET);
+        target.min(CEILING_TARGET)
     }
 
     /// If the free-list for `template_ref` is below target, spawn
@@ -302,7 +425,7 @@ impl WarmPool {
             .targets
             .get(&template_ref)
             .map(|t| *t)
-            .unwrap_or(DEFAULT_TARGET);
+            .unwrap_or(FLOOR_TARGET);
         let current = self
             .inner
             .free_lists
@@ -471,11 +594,11 @@ mod tests {
             .await;
         assert!(
             wait_for(
-                || *backend.restore_count.lock() >= DEFAULT_TARGET,
+                || *backend.restore_count.lock() >= FLOOR_TARGET,
                 Duration::from_secs(2)
             )
             .await,
-            "refill should run at least DEFAULT_TARGET times",
+            "refill should run at least FLOOR_TARGET times",
         );
         // The free-list should now have at least one entry.
         let slots = pool.list_slots();
@@ -484,7 +607,7 @@ mod tests {
             .find(|s| s.template_ref == rec.template_ref)
             .expect("free-list entry exists");
         assert!(entry.available >= 1);
-        assert_eq!(entry.target, DEFAULT_TARGET);
+        assert_eq!(entry.target, FLOOR_TARGET);
     }
 
     #[tokio::test]
@@ -554,6 +677,66 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].0, sandbox_id);
         assert_eq!(log[0].1.argv, agent.argv);
+    }
+
+    #[tokio::test]
+    async fn autoscaler_raises_target_under_lease_rate() {
+        // Many recent leases ⇒ target rises above FLOOR_TARGET
+        // (capped by CEILING_TARGET).
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let (rec, meta) = template(SnapshotId::new());
+        pool.observe_templates(vec![(rec.clone(), meta)]).await;
+        // Inject a synthetic burst: 100 lease timestamps in the
+        // last 60s. At 100 leases / 300s window × 5s refill × 1.2
+        // headroom = ceil(2.0) = 2, capped to CEILING_TARGET=4.
+        let now = std::time::Instant::now();
+        {
+            let entry = pool
+                .inner
+                .lease_history
+                .entry(rec.template_ref)
+                .or_default();
+            entry
+                .lock()
+                .extend((0..100).map(|i| now - Duration::from_secs(i as u64)));
+        }
+        pool.gc_tick().await;
+        let target = pool.compute_target(rec.template_ref, now);
+        assert!(
+            (2..=CEILING_TARGET).contains(&target),
+            "autoscaler should raise target above floor under load (got {target})",
+        );
+    }
+
+    #[tokio::test]
+    async fn autoscaler_holds_at_floor_with_no_leases() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let (rec, meta) = template(SnapshotId::new());
+        pool.observe_templates(vec![(rec.clone(), meta)]).await;
+        let now = std::time::Instant::now();
+        // No history → floor.
+        assert_eq!(pool.compute_target(rec.template_ref, now), FLOOR_TARGET);
+    }
+
+    #[tokio::test]
+    async fn autoscaler_drains_to_zero_after_cold_tail() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let (rec, meta) = template(SnapshotId::new());
+        pool.observe_templates(vec![(rec.clone(), meta)]).await;
+        // Inject a lease that's older than COLD_TAIL — autoscaler
+        // should target 0.
+        let now = std::time::Instant::now();
+        let stale = now - COLD_TAIL - Duration::from_secs(60);
+        pool.inner
+            .lease_history
+            .entry(rec.template_ref)
+            .or_default()
+            .lock()
+            .push(stale);
+        assert_eq!(pool.compute_target(rec.template_ref, now), 0);
     }
 
     #[tokio::test]
