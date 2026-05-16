@@ -116,6 +116,15 @@ struct WarmPoolInner {
     /// `lease()` over the `AUTOSCALE_WINDOW`. Older entries are
     /// trimmed on gc_tick.
     lease_history: DashMap<TemplateRef, Mutex<Vec<std::time::Instant>>>,
+    /// Per-template count of in-flight refill tasks. Set to 1
+    /// before a refill is spawned and decremented when it
+    /// completes. `maybe_refill` checks this BEFORE spawning to
+    /// prevent concurrent refills from racing each other — without
+    /// this, multiple `gc_tick` calls (or a `lease` + `gc_tick`
+    /// pair) would each spawn their own `backend.restore` task,
+    /// and both would try to bind the same vsock UDS path embedded
+    /// in `state.bin` → EADDRINUSE on the second.
+    inflight_refills: DashMap<TemplateRef, ()>,
     /// Reference back to the host's SandboxBackend (typically a
     /// PooledBackend wrapping FirecrackerBackend). Used by the
     /// refill loop for `restore` and by `launch` for
@@ -141,6 +150,7 @@ impl WarmPool {
                 known: DashMap::new(),
                 targets: DashMap::new(),
                 lease_history: DashMap::new(),
+                inflight_refills: DashMap::new(),
                 backend,
             }),
         }
@@ -449,13 +459,38 @@ impl WarmPool {
             Some(k) => k.metadata.clone(),
             None => return,
         };
+        // Race guard: only one in-flight refill per template_ref
+        // at a time. The DashMap `Entry` API gives us atomic
+        // test-and-set under a per-shard write lock — the match
+        // arm runs while the lock is held, so the Vacant→insert
+        // transition cannot race a parallel Vacant→insert on
+        // another task. The buggy alternative was `matches!` on
+        // `entry()` followed by a separate `.insert()`, which
+        // dropped the lock between the check and the write.
+        match self.inner.inflight_refills.entry(template_ref) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                tracing::trace!(
+                    %template_ref,
+                    "warm_pool refill already in flight; skipping spawn",
+                );
+                return;
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(());
+            }
+        }
         let pool = self.clone();
         tokio::spawn(async move {
             // SnapshotMetadata is Clone — capture it into the
             // spawned task. The backend's restore() handles
             // BlobStorage materialisation (state.bin + sidecar +
             // memory chunks) under the hood, then drives FC.
-            let sandbox_id = match pool.inner.backend.restore(metadata).await {
+            let outcome = pool.inner.backend.restore(metadata).await;
+            // Drop the in-flight flag before pushing to the
+            // free-list so the next gc_tick can spawn another
+            // refill if target hasn't been met yet.
+            pool.inner.inflight_refills.remove(&template_ref);
+            let sandbox_id = match outcome {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(
@@ -466,8 +501,6 @@ impl WarmPool {
                     return;
                 }
             };
-            // Push to the free-list. Use entry() to lazy-create on
-            // the first refill.
             pool.inner
                 .free_lists
                 .entry(template_ref)
