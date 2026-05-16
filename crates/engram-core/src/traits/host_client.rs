@@ -25,9 +25,44 @@ use async_trait::async_trait;
 use crate::error::SandboxError;
 use crate::traits::sandbox::{HarnessDial, HarnessSink};
 use crate::types::egress::SessionEgressPolicy;
+use crate::types::ids::TemplateRef;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
 use crate::types::snapshot::SnapshotMetadata;
 use crate::types::{SandboxId, SessionId};
+
+/// ADR 0014: outcome of [`HostClient::lease_warm_sandbox`].
+///
+/// Distinct from `Result<Option<SandboxId>>` because the scheduler
+/// treats "stale pool" differently from "no capacity" — stale
+/// prompts a cache invalidation + try-next-host, no-capacity
+/// passes silently.
+#[derive(Clone, Debug)]
+pub enum WarmLeaseOutcome {
+    /// Granted a warm slot — coord follows up with
+    /// [`HostClient::launch_warm_sandbox`] to push BootstrapLaunch.
+    Granted(SandboxId),
+    /// Host's warm pool is for an older template_ref than the
+    /// coord asked about. `current_ref` is the host's most-recently-
+    /// known active ref; coord uses it to lazily update its cache
+    /// and re-resolve.
+    Stale { current_ref: TemplateRef },
+    /// Pool is currently empty for this template (refill in flight,
+    /// or autoscaler target is 0). Scheduler falls through to
+    /// cold-create with one tracing::warn.
+    NoCapacity,
+}
+
+/// ADR 0014: one entry in the host's warm-pool inventory, returned
+/// by [`HostClient::list_warm_slots`] and (via heartbeat) by
+/// [`HostCapacityReport::warm_slots`].
+#[derive(Clone, Debug)]
+pub struct WarmSlotCount {
+    pub template_ref: TemplateRef,
+    /// Sandboxes currently in the free-list (ready to lease).
+    pub available: u32,
+    /// Target N that the autoscaler is keeping the pool at.
+    pub target: u32,
+}
 
 #[async_trait]
 pub trait HostClient: Send + Sync {
@@ -141,4 +176,45 @@ pub trait HostClient: Send + Sync {
     /// local sink internally, and the closure (capturing coord-side
     /// state) wouldn't serialize anyway.
     fn set_harness_sink(&self, _sink: HarnessSink) {}
+
+    // ---- ADR 0014 warm pool ----
+
+    /// Atomic take from this host's free-list of pre-restored
+    /// microVMs for `template_ref`. Default `NoCapacity` because
+    /// only the FC host-agent maintains a warm pool today;
+    /// LocalHostClient (mode=all) and ProcessBackend (dev) just
+    /// fall through to cold-create.
+    async fn lease_warm_sandbox(
+        &self,
+        template_ref: TemplateRef,
+    ) -> Result<WarmLeaseOutcome, SandboxError> {
+        let _ = template_ref;
+        Ok(WarmLeaseOutcome::NoCapacity)
+    }
+
+    /// Activate a previously-leased warm sandbox: push BootstrapLaunch
+    /// to in-guest engram-bootstrap and apply the SessionEgressPolicy.
+    /// The pre-restored substrate is already running by this point;
+    /// this RPC is the per-session activation, not the create.
+    ///
+    /// Default impl errors with `NotFound` since impls that don't
+    /// implement [`Self::lease_warm_sandbox`] can never have a
+    /// sandbox_id that corresponds to a leased warm slot.
+    async fn launch_warm_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        agent: AgentSpec,
+        policy: SessionEgressPolicy,
+    ) -> Result<(), SandboxError> {
+        let _ = (sandbox_id, agent, policy);
+        Err(SandboxError::NotFound)
+    }
+
+    /// Inspect this host's warm-pool inventory. Default empty; only
+    /// the warm-pool-equipped host-agent populates it. Ops tooling
+    /// (`engram-cli warm-pool`) and the coord scheduler's
+    /// "skip-zero-slot-host" hint both consume this.
+    async fn list_warm_slots(&self) -> Result<Vec<WarmSlotCount>, SandboxError> {
+        Ok(Vec::new())
+    }
 }
