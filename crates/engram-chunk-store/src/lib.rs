@@ -46,6 +46,7 @@ pub mod file;
 pub mod gc;
 pub mod manifest;
 pub mod resolver;
+pub mod snapshot_blob;
 pub mod store;
 pub mod working_set;
 

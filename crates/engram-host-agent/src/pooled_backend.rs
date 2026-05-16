@@ -528,7 +528,7 @@ async fn materialize_state_if_missing(
     let state_path = src.join("state.bin");
     if let Some(key) = state_blob_key {
         if fs::metadata(&state_path).await.is_err() {
-            crate::snapshot_blob::download_file(blob, key, &state_path)
+            engram_chunk_store::snapshot_blob::download_file(blob, key, &state_path)
                 .await
                 .map_err(|e| {
                     SandboxError::Snapshot(format!("download state.bin from {key}: {e}"))
@@ -543,7 +543,7 @@ async fn materialize_state_if_missing(
     let sidecar_path = src.join("manifest.json");
     if let Some(key) = sidecar_blob_key {
         if fs::metadata(&sidecar_path).await.is_err() {
-            crate::snapshot_blob::download_file(blob, key, &sidecar_path)
+            engram_chunk_store::snapshot_blob::download_file(blob, key, &sidecar_path)
                 .await
                 .map_err(|e| {
                     SandboxError::Snapshot(format!("download sidecar.json from {key}: {e}"))
@@ -1027,14 +1027,18 @@ impl SandboxBackend for PooledBackend {
         let state_path = dest.join("state.bin");
         let sidecar_path = dest.join("manifest.json");
         if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok() {
-            let state_key = crate::snapshot_blob::state_blob_key(metadata.id);
-            let sidecar_key = crate::snapshot_blob::sidecar_blob_key(metadata.id);
-            crate::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
+            let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+            let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+            engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-            crate::snapshot_blob::upload_file(blob.as_ref(), &sidecar_key, &sidecar_path)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+            engram_chunk_store::snapshot_blob::upload_file(
+                blob.as_ref(),
+                &sidecar_key,
+                &sidecar_path,
+            )
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
             metadata.state_blob_key = Some(state_key);
             metadata.sidecar_blob_key = Some(sidecar_key);
             metadata.source_sandbox_id = Some(id);

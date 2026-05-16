@@ -395,6 +395,14 @@ pub struct BuildOutcome {
     /// captured at bake time.
     pub memory_bootstrap_path: Option<PathBuf>,
     pub memory_chunks_blob_path: Option<PathBuf>,
+    /// ADR 0014: full portable template snapshot. `Some` iff the
+    /// bake captured canonical memory AND uploaded the FC
+    /// state.bin + sidecar to BlobStorage. Coord-side template
+    /// registration (M1.4) reads this to populate the `templates`
+    /// table; bundle.json's `canonical_snapshot` block carries
+    /// the same data for downstream consumers that read the
+    /// image artifact directly.
+    pub canonical_snapshot: Option<engram_core::types::snapshot::SnapshotMetadata>,
 }
 
 #[derive(Debug)]
@@ -686,16 +694,21 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             }
         };
 
-        // ADR 0007 Phase 5: bake-time canonical memory capture.
-        // Three branches:
-        //   1. Caller supplied a pre-computed ref → use it as is.
+        // ADR 0007 Phase 5 + ADR 0014: bake-time canonical memory
+        // capture. Three branches:
+        //   1. Caller supplied a pre-computed ref → use it as is
+        //      (no full snapshot, just the memory manifest).
         //   2. Caller enabled auto-capture AND we have an ext4
         //      rootfs (canonical only makes sense on FC) → boot
-        //      the rootfs once + chunk memory.bin.
+        //      the rootfs once, snapshot, chunk memory.bin,
+        //      upload state.bin + sidecar to BlobStorage. Returns
+        //      a full portable SnapshotMetadata.
         //   3. Otherwise → None (sessions pay session-private
         //      memory cost at restore, functionally correct).
-        let canonical_memory_manifest = if req.canonical_memory_manifest.is_some() {
+        let (canonical_memory_manifest, canonical_snapshot) = if let Some(mref) =
             req.canonical_memory_manifest
+        {
+            (Some(mref), None)
         } else if let (Some(capture_cfg), Some(_disk_ref)) =
             (req.capture_canonical_memory.as_ref(), disk_manifest)
         {
@@ -703,14 +716,15 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 .capture_canonical_memory(&rootfs_path, capture_cfg)
                 .await
             {
-                Ok(mref) => {
+                Ok(metadata) => {
                     tracing::info!(
                         repo = %req.repo,
                         tag = %req.tag,
-                        manifest = %mref,
-                        "captured canonical memory manifest at bake time"
+                        snapshot_id = %metadata.id,
+                        memory_manifest = ?metadata.memory_manifest,
+                        "captured canonical template snapshot at bake time"
                     );
-                    Some(mref)
+                    (metadata.memory_manifest, Some(metadata))
                 }
                 Err(e) => {
                     // Capture is best-effort: if FC + KVM aren't
@@ -722,13 +736,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                         repo = %req.repo,
                         tag = %req.tag,
                         error = %e,
-                        "canonical memory capture failed; bundle.json will omit canonical_memory_manifest"
+                        "canonical memory capture failed; bundle.json will omit canonical_snapshot"
                     );
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         // ADR 0008 Phase 3: produce Nydus-shaped artifacts
@@ -837,14 +851,38 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // when chunked-OCI artifacts were produced — v1 readers
         // see `disk_manifest` still and work; v2 readers
         // additionally consult `bootstrap_disk` /
-        // `bootstrap_memory` for Range-GET-on-fault.
+        // `bootstrap_memory` for Range-GET-on-fault. v3 (ADR 0014)
+        // adds `canonical_snapshot` for restorable template
+        // snapshots (state.bin + sidecar in BlobStorage).
         if let Some(disk_ref) = disk_manifest {
-            let schema_version = if disk_bootstrap_path.is_some() { 2 } else { 1 };
+            let schema_version = if canonical_snapshot.is_some() {
+                3
+            } else if disk_bootstrap_path.is_some() {
+                2
+            } else {
+                1
+            };
             let mut bundle = serde_json::json!({
                 "schema_version": schema_version,
                 "disk_manifest": disk_ref,
                 "canonical_memory_manifest": canonical_memory_manifest,
             });
+            if let Some(snap) = canonical_snapshot.as_ref() {
+                // The full portable snapshot descriptor — coord +
+                // host-agent consume this to register a `templates`
+                // row and lease a warm slot keyed by the snapshot
+                // id, with state.bin + sidecar fetchable from
+                // BlobStorage at the keys recorded here.
+                bundle["canonical_snapshot"] = serde_json::json!({
+                    "snapshot_id": snap.id,
+                    "source_sandbox_id": snap.source_sandbox_id,
+                    "memory_manifest": snap.memory_manifest,
+                    "state_blob_key": snap.state_blob_key,
+                    "sidecar_blob_key": snap.sidecar_blob_key,
+                    "size_bytes": snap.size_bytes,
+                    "created_at": snap.created_at,
+                });
+            }
             if disk_bootstrap_path.is_some() {
                 // We don't know the OCI layer digests yet (those
                 // are computed at push time when the registry
@@ -875,13 +913,19 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             disk_chunks_blob_path,
             memory_bootstrap_path,
             memory_chunks_blob_path,
+            canonical_snapshot,
         })
     }
 
     /// Boot the just-baked rootfs via FC, wait `boot_wait`, then
     /// snapshot `memory.bin` and chunk it into the chunk store.
-    /// Returns the [`ManifestRef`] suitable for stamping on
-    /// `bundle.json::canonical_memory_manifest`.
+    /// ADR 0014: also uploads `state.bin` + sidecar JSON to
+    /// `BlobStorage` so production hosts can restore this template
+    /// snapshot without re-running the bake. Returns a full
+    /// [`SnapshotMetadata`] with all portable fields stamped
+    /// (memory_manifest, state_blob_key, sidecar_blob_key,
+    /// source_sandbox_id) — bundle.json's `canonical_snapshot`
+    /// block serializes the same data.
     ///
     /// Requires:
     /// - `/dev/kvm` accessible to the bake user (the dev VM, the
@@ -899,7 +943,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         &self,
         rootfs_path: &Path,
         capture_cfg: &CanonicalCaptureConfig,
-    ) -> Result<engram_chunk_store::ManifestRef, BuildError> {
+    ) -> Result<engram_core::types::snapshot::SnapshotMetadata, BuildError> {
         use engram_chunk_store::ManifestKind;
         use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
         use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
@@ -954,7 +998,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // ADR 0007 Phase 6: backend owns the staging dir; we look it
         // up via snapshot_path_for after the snapshot completes so we
         // can chunk the memory.bin it wrote.
-        let metadata = engram_core::traits::SandboxBackend::snapshot(&backend, sandbox_id)
+        let mut metadata = engram_core::traits::SandboxBackend::snapshot(&backend, sandbox_id)
             .await
             .map_err(|e| BuildError::Config(format!("canonical bake snapshot: {e}")))?;
         let snap_dir =
@@ -974,6 +1018,39 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Config(format!("put canonical manifest: {e}")))?;
 
+        // ADR 0014: upload state.bin + sidecar JSON to BlobStorage
+        // so production hosts can restore this template snapshot
+        // without re-running the bake. The chunk store's
+        // BlobStorage is the same handle the host-agent's
+        // PooledBackend reads from at restore time.
+        let blob = self.chunk_store.blob_storage();
+        let state_path = snap_dir.join("state.bin");
+        let sidecar_path = snap_dir.join("manifest.json");
+        let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+        let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+        engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
+            .await
+            .map_err(|e| BuildError::Config(format!("upload canonical state.bin: {e}")))?;
+        engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &sidecar_key, &sidecar_path)
+            .await
+            .map_err(|e| BuildError::Config(format!("upload canonical sidecar.json: {e}")))?;
+
+        // Stamp the metadata with everything a sibling host needs
+        // to restore. memory_manifest is the chunked manifest of
+        // memory.bin; canonical_memory_manifest is the same value
+        // here (this IS the canonical for the template).
+        metadata.memory_manifest = Some(manifest_ref);
+        metadata.source_sandbox_id = Some(sandbox_id);
+        metadata.state_blob_key = Some(state_key);
+        metadata.sidecar_blob_key = Some(sidecar_key);
+
+        tracing::info!(
+            snapshot_id = %metadata.id,
+            source_sandbox = %sandbox_id,
+            memory_manifest = %manifest_ref,
+            "canonical bake snapshot uploaded; portable refs stamped",
+        );
+
         // Cleanup: destroy the bake VM. Errors are logged but
         // don't fail the capture — the manifest is already in
         // the store. A leaked VM gets reaped at process exit
@@ -982,7 +1059,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             tracing::warn!(error = %e, "canonical bake VM destroy failed; FC child cleanup is kill-on-drop");
         }
 
-        Ok(manifest_ref)
+        Ok(metadata)
     }
 
     /// Push a freshly-baked image (output of [`Self::build`]) to a

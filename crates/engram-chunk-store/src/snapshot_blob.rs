@@ -14,7 +14,11 @@
 //!
 //! All three are opaque blobs (not chunked). Keys are derived from
 //! the snapshot_id so the same scheme works for warm-pool template
-//! snapshots and durability snapshots alike.
+//! snapshots (image-builder bake-time) and durability snapshots
+//! (host-agent runtime) alike. Lives in `engram-chunk-store` rather
+//! than `engram-host-agent` so producers in either crate (image
+//! builder + host-agent + future migration tooling) reach the same
+//! key scheme without cross-dependency.
 
 use std::path::Path;
 
@@ -92,7 +96,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
 
-        // Write a source file and upload it.
         let src = tmp.path().join("source.bin");
         tokio::fs::write(&src, b"hello-state-bin").await.unwrap();
 
@@ -101,7 +104,6 @@ mod tests {
         let size = upload_file(blob.as_ref(), &key, &src).await.unwrap();
         assert_eq!(size, b"hello-state-bin".len() as u64);
 
-        // Download to a new location, content matches.
         let dest = tmp.path().join("downloaded.bin");
         download_file(blob.as_ref(), &key, &dest).await.unwrap();
         let body = tokio::fs::read(&dest).await.unwrap();
@@ -118,7 +120,6 @@ mod tests {
         upload_file(blob.as_ref(), &state_blob_key(id), &src)
             .await
             .unwrap();
-        // Destination's parent directory doesn't exist yet.
         let dest = tmp.path().join("nested/dir/state.bin");
         download_file(blob.as_ref(), &state_blob_key(id), &dest)
             .await
