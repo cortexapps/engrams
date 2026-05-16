@@ -539,11 +539,16 @@ async fn create_session_inner(
     //      already did both.
     //   4. On NoCapacity / all-Stale, fall through to cold-create
     //      with one tracing::debug.
-    let warm_lease_outcome = if let Some(harness_uri) = harness_pack_uri.as_deref() {
+    // No-harness sessions still resolve a template — image-builder
+    // bakes `harness_pack_uri = "none"` into the template row for
+    // that case (see seed_warm_template binary). Without this,
+    // `kind = none` sessions would never warm-lease.
+    let warm_lookup_uri = harness_pack_uri.as_deref().unwrap_or("none");
+    let warm_lease_outcome = {
         match state
             .services
             .meta
-            .resolve_template(&image_repo, &image_tag, harness_uri)
+            .resolve_template(&image_repo, &image_tag, warm_lookup_uri)
             .await
         {
             Ok(Some(template_ref)) => {
@@ -561,21 +566,29 @@ async fn create_session_inner(
                     secrets: Vec::new(),
                     secret_mode: manifest.secret_mode,
                 };
-                match (warm_agent, warm_policy) {
-                    (Some(agent), policy) => state
-                        .host_registry
-                        .try_warm_lease_for_session(&ctx, template_ref, agent, policy)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                %template_ref,
-                                error = %e,
-                                "warm-lease errored; falling back to cold-create",
-                            );
-                            None
-                        }),
-                    (None, _) => None, // no-agent session: cold-create
-                }
+                // For no-agent sessions we still want to warm-lease,
+                // synthesising a noop AgentSpec — the warm-launch
+                // path requires *some* AgentSpec because the in-VM
+                // bootstrap supervisor exec's whatever argv it
+                // receives. Passing argv=[] would crash bootstrap;
+                // pass a sleep-forever shim so the launch succeeds
+                // and the leased VM stays usable for direct exec.
+                let agent = warm_agent.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
+                    argv: vec!["/bin/sleep".into(), "infinity".into()],
+                    env: Default::default(),
+                });
+                state
+                    .host_registry
+                    .try_warm_lease_for_session(&ctx, template_ref, agent, warm_policy)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            %template_ref,
+                            error = %e,
+                            "warm-lease errored; falling back to cold-create",
+                        );
+                        None
+                    })
             }
             Ok(None) => None,
             Err(e) => {
@@ -583,8 +596,6 @@ async fn create_session_inner(
                 None
             }
         }
-    } else {
-        None
     };
 
     let (host_id, sandbox_id, warm_lease_taken) = match warm_lease_outcome {
