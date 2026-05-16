@@ -64,6 +64,7 @@ id_newtype!(SnapshotId);
 id_newtype!(MessageId);
 id_newtype!(ToolCallId);
 id_newtype!(AgentCommitId);
+id_newtype!(TemplateRef);
 
 #[cfg(test)]
 mod tests {

@@ -440,6 +440,124 @@ impl MetadataStore for PostgresStore {
         Ok(ids)
     }
 
+    async fn upsert_template(
+        &self,
+        template: engram_core::types::template::TemplateRecord,
+    ) -> Result<(), MetaError> {
+        // ADR 0014: atomic "swap active flag" — flip the prior
+        // active row for the same (repo, tag, harness) triple
+        // BEFORE inserting the new one, in a single tx. This way
+        // observers never see two active rows for the same triple,
+        // and a failed insert leaves no zombie inactive row.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query(
+            r#"
+            UPDATE templates
+               SET active = FALSE
+             WHERE image_repo = $1
+               AND image_tag = $2
+               AND harness_pack_uri = $3
+               AND active = TRUE
+            "#,
+        )
+        .bind(&template.image_repo)
+        .bind(&template.image_tag)
+        .bind(&template.harness_pack_uri)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            r#"
+            INSERT INTO templates (template_ref, image_repo, image_tag,
+                                   harness_pack_uri, snapshot_id,
+                                   vcpus, memory_mib, created_at, active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (image_repo, image_tag, harness_pack_uri, snapshot_id)
+              DO UPDATE SET active = EXCLUDED.active
+            "#,
+        )
+        .bind(template.template_ref.as_uuid())
+        .bind(&template.image_repo)
+        .bind(&template.image_tag)
+        .bind(&template.harness_pack_uri)
+        .bind(template.snapshot_id.as_uuid())
+        .bind(template.vcpus as i32)
+        .bind(template.memory_mib as i32)
+        .bind(template.created_at)
+        .bind(template.active)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_active_templates(
+        &self,
+    ) -> Result<Vec<engram_core::types::template::TemplateRecord>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT template_ref, image_repo, image_tag, harness_pack_uri,
+                   snapshot_id, vcpus, memory_mib, created_at, active
+              FROM templates
+             WHERE active = TRUE
+             ORDER BY template_ref
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(row::template_from_row).collect()
+    }
+
+    async fn resolve_template(
+        &self,
+        image_repo: &str,
+        image_tag: &str,
+        harness_pack_uri: &str,
+    ) -> Result<Option<engram_core::types::ids::TemplateRef>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT template_ref
+              FROM templates
+             WHERE image_repo = $1
+               AND image_tag = $2
+               AND harness_pack_uri = $3
+               AND active = TRUE
+             LIMIT 1
+            "#,
+        )
+        .bind(image_repo)
+        .bind(image_tag)
+        .bind(harness_pack_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| {
+            let id: uuid::Uuid = r.get("template_ref");
+            engram_core::types::ids::TemplateRef::from(id)
+        }))
+    }
+
+    async fn get_template(
+        &self,
+        template_ref: engram_core::types::ids::TemplateRef,
+    ) -> Result<Option<engram_core::types::template::TemplateRecord>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT template_ref, image_repo, image_tag, harness_pack_uri,
+                   snapshot_id, vcpus, memory_mib, created_at, active
+              FROM templates
+             WHERE template_ref = $1
+            "#,
+        )
+        .bind(template_ref.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(row::template_from_row).transpose()
+    }
+
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
         // ADR 0007: single-tier durability. Every snapshot row
         // references chunked manifests in `BlobStorage` via the

@@ -3,10 +3,12 @@ use async_trait::async_trait;
 use crate::error::MetaError;
 use crate::types::event::PersistedEvent;
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
+use crate::types::ids::TemplateRef;
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential, SessionSecrets};
 use crate::types::session::{Session, SessionSpec, SessionStatus};
 use crate::types::snapshot::SnapshotRecord;
+use crate::types::template::TemplateRecord;
 
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
@@ -145,6 +147,51 @@ pub trait MetadataStore: Send + Sync {
         &self,
         host_id: HostId,
     ) -> Result<Vec<SessionId>, MetaError>;
+
+    // ---- templates (ADR 0014 warm pool) ----
+    /// Register a freshly-baked template snapshot. Implementations
+    /// must (a) insert the new row and (b) atomically flip any
+    /// existing `active=true` row for the same
+    /// (image_repo, image_tag, harness_pack_uri) triple to
+    /// `active=false`. The image-builder's bake pipeline calls this
+    /// once per successful canonical capture.
+    async fn upsert_template(&self, template: TemplateRecord) -> Result<(), MetaError> {
+        // Default no-op so in-memory stores (and crates that don't
+        // care about the warm pool yet) don't have to implement it.
+        let _ = template;
+        Ok(())
+    }
+    /// List active templates — one row per (repo, tag, harness)
+    /// triple, the most recent bake. The host-agent's warm-pool
+    /// refill loop polls this on heartbeat boundaries to decide
+    /// which templates to keep N microVMs warm for. Order is
+    /// implementation-defined; callers that need stability sort.
+    async fn list_active_templates(&self) -> Result<Vec<TemplateRecord>, MetaError> {
+        Ok(Vec::new())
+    }
+    /// Resolve a session spec triple to its active template_ref,
+    /// or `None` when no warm-eligible template exists for the
+    /// tuple. The coord scheduler's warm-lease path calls this
+    /// before parallel-asking hosts.
+    async fn resolve_template(
+        &self,
+        image_repo: &str,
+        image_tag: &str,
+        harness_pack_uri: &str,
+    ) -> Result<Option<TemplateRef>, MetaError> {
+        let _ = (image_repo, image_tag, harness_pack_uri);
+        Ok(None)
+    }
+    /// Fetch a template by ref. Used by the warm-pool refill loop
+    /// once it has a ref from `list_active_templates`, and by
+    /// `LaunchWarmSandbox` callers that need the snapshot_id back.
+    async fn get_template(
+        &self,
+        template_ref: TemplateRef,
+    ) -> Result<Option<TemplateRecord>, MetaError> {
+        let _ = template_ref;
+        Ok(None)
+    }
 
     // ---- snapshots ----
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;
