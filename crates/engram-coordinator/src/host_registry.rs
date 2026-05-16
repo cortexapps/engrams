@@ -42,6 +42,9 @@ pub struct HostState {
     pub capacity: HostCapacityReport,
     pub local_snapshots: Vec<LocalSnapshotReport>,
     pub draining: bool,
+    /// ADR 0014: per-template warm-slot inventory from the host's
+    /// most recent heartbeat. Empty for hosts without a warm pool.
+    pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
 }
 
 /// Inputs the scheduler considers when picking a host. [`SandboxBackend`]
@@ -226,6 +229,122 @@ impl HostRegistry {
         let sandbox_id = backend.create(spec).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
+    }
+
+    /// ADR 0014: try the warm-pool lease path before falling through
+    /// to cold-create. Walks candidate hosts that report at least
+    /// one available slot for `template_ref` (via heartbeat
+    /// `warm_slots`), asks each in turn for a lease, then on the
+    /// first `Granted` outcome dispatches `LaunchWarmSandbox` with
+    /// the per-session agent + policy. Returns `Ok(Some(...))` on a
+    /// successful warm activation, `Ok(None)` when no host had a
+    /// slot (caller should fall back to cold-create), or `Err(_)`
+    /// only for genuinely fatal conditions.
+    ///
+    /// `Stale{current_ref}` outcomes are skipped silently — the
+    /// host's pool is on an older template_ref than coord knows.
+    /// Future M1.x: surface this back to the template-cache so the
+    /// coord lazily updates. v1 just tries the next host.
+    pub async fn try_warm_lease_for_session(
+        &self,
+        ctx: &ScheduleContext<'_>,
+        template_ref: engram_core::types::ids::TemplateRef,
+        agent: engram_core::types::sandbox::AgentSpec,
+        policy: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<Option<(HostId, SandboxId)>, SandboxError> {
+        use engram_core::traits::host_client::WarmLeaseOutcome;
+        let candidates = self.candidates_with_warm_slot(template_ref);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        // Sequential rather than parallel — v1 fleets are small
+        // (single-digit hosts) and the lease RPC is sub-ms when the
+        // pool has capacity. Parallel-ask becomes interesting at
+        // fleet sizes where the wait-for-first-yes wins; defer the
+        // tokio::select! variant until measured demand.
+        let _ = ctx; // ScheduleContext not consumed today; reserved for
+                     // memory-fit / repo affinity refinements in M1.9+.
+        for (host_id, backend) in candidates {
+            let outcome = match backend.lease_warm_sandbox(template_ref).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        %host_id,
+                        %template_ref,
+                        error = %e,
+                        "warm-lease RPC failed; trying next host",
+                    );
+                    continue;
+                }
+            };
+            match outcome {
+                WarmLeaseOutcome::Granted(sandbox_id) => {
+                    // Launch on the same host. If it fails after a
+                    // successful lease, the leased slot is effectively
+                    // orphaned — that's a tracked-but-non-blocking
+                    // issue for v1; the warm pool's refill loop will
+                    // reach target again on its own. Surface the error
+                    // so the caller can cold-fall-back.
+                    if let Err(e) = backend
+                        .launch_warm_sandbox(sandbox_id, agent.clone(), policy.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            %host_id,
+                            %sandbox_id,
+                            %template_ref,
+                            error = %e,
+                            "warm-launch failed after lease; falling back to cold-create",
+                        );
+                        // Best-effort: try to destroy the orphaned slot
+                        // so the autoscaler doesn't double-count it.
+                        let _ = backend.destroy(sandbox_id).await;
+                        continue;
+                    }
+                    self.sandbox_owner.insert(sandbox_id, host_id);
+                    return Ok(Some((host_id, sandbox_id)));
+                }
+                WarmLeaseOutcome::Stale { current_ref } => {
+                    tracing::debug!(
+                        %host_id,
+                        requested = %template_ref,
+                        host_current = %current_ref,
+                        "host reports stale template_ref; trying next",
+                    );
+                    continue;
+                }
+                WarmLeaseOutcome::NoCapacity => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Hosts whose most recent heartbeat reported at least one
+    /// available warm slot for `template_ref`. Ordered by available
+    /// count descending so the fullest pool gets asked first.
+    fn candidates_with_warm_slot(
+        &self,
+        template_ref: engram_core::types::ids::TemplateRef,
+    ) -> Vec<(HostId, Arc<dyn HostClient>)> {
+        let mut scored: Vec<(u32, HostId, Arc<dyn HostClient>)> = Vec::new();
+        for entry in self.hosts.iter() {
+            let st = entry.value().state.read();
+            if st.draining {
+                continue;
+            }
+            let available = st
+                .warm_slots
+                .iter()
+                .find(|s| s.template_ref == template_ref)
+                .map(|s| s.available)
+                .unwrap_or(0);
+            if available == 0 {
+                continue;
+            }
+            scored.push((available, *entry.key(), entry.value().backend.clone()));
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, h, b)| (h, b)).collect()
     }
 
     /// Same as `create_for_session` but for restoring from a snapshot.
@@ -534,6 +653,7 @@ mod tests {
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
+                warm_slots: Vec::new(),
             },
         );
         reg.update_state(
@@ -553,6 +673,7 @@ mod tests {
                     last_accessed_at: chrono::Utc::now(),
                 }],
                 draining: false,
+                warm_slots: Vec::new(),
             },
         );
 
@@ -590,6 +711,7 @@ mod tests {
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
+                warm_slots: Vec::new(),
             },
         );
         reg.update_state(
@@ -603,6 +725,7 @@ mod tests {
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
+                warm_slots: Vec::new(),
             },
         );
 
@@ -638,6 +761,7 @@ mod tests {
                 },
                 local_snapshots: Vec::new(),
                 draining: true,
+                warm_slots: Vec::new(),
             },
         );
         reg.update_state(
@@ -651,6 +775,7 @@ mod tests {
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
+                warm_slots: Vec::new(),
             },
         );
 

@@ -155,11 +155,10 @@ pub struct HeartbeatRequest {
     #[serde(default)]
     pub host_addr: Option<String>,
     /// ADR 0014: per-template warm-slot inventory reported by the
-    /// host. Empty when the host hasn't attached a warm pool. Held
-    /// here so it travels with the request body; the scheduler's
-    /// parallel-ask hint (M1.8) reads it via `HostState`.
+    /// host. Empty when the host hasn't attached a warm pool. The
+    /// heartbeat handler copies this into `HostState.warm_slots`,
+    /// where the scheduler reads it as a parallel-ask hint.
     #[serde(default)]
-    #[allow(dead_code)] // wired into HostState in M1.8
     pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
 }
 
@@ -236,6 +235,7 @@ pub async fn heartbeat(
             capacity: hb.capacity.clone(),
             local_snapshots: hb.local_snapshots.clone(),
             draining: hb.draining,
+            warm_slots: hb.warm_slots.clone(),
         },
     );
 

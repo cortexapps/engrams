@@ -483,7 +483,7 @@ async fn create_session_inner(
         image: image_uri.clone(),
         rootfs_source: None,
         image_uri: Some(image_uri.clone()),
-        harness_pack_uri,
+        harness_pack_uri: harness_pack_uri.clone(),
         cpu: CpuLimit {
             vcpus: manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS),
         },
@@ -524,19 +524,93 @@ async fn create_session_inner(
         prefer_snapshot_id: None,
         memory_mib: Some(vm_spec.memory.max_mib),
     };
-    let (host_id, sandbox_id) = match state.host_registry.create_for_session(&ctx, vm_spec).await {
-        Ok((host_id, id)) => (host_id, id),
-        Err(e) => {
-            tracing::warn!(
-                image_uri = %req.image,
-                error = %e,
-                "session create rejected at scheduling; returning 503, no row persisted",
-            );
-            return Err(ApiError::Unavailable(format!(
-                "no host has capacity for this session right now: {e}. \
-                 Retry shortly; capacity-fit recovers as hosts register or sessions drain."
-            )));
+
+    // ADR 0014 M1.8: try the warm-pool lease path before cold-create.
+    // Steps:
+    //   1. Resolve `(image_repo, image_tag, harness_pack_uri)` to a
+    //      template_ref via MetadataStore::resolve_template. None
+    //      → no warm-eligible template; fall through.
+    //   2. Build a placeholder AgentSpec + SessionEgressPolicy with
+    //      `guest_ip = UNSPECIFIED` (matching the no-guest-IP cold
+    //      path at L668-676 of this file). The host's warm-launch
+    //      applies the policy + sends BootstrapLaunch.
+    //   3. Ask the registry for a warm lease. On success, skip the
+    //      cold-create + start_agent path below — warm-launch
+    //      already did both.
+    //   4. On NoCapacity / all-Stale, fall through to cold-create
+    //      with one tracing::debug.
+    let warm_lease_outcome = if let Some(harness_uri) = harness_pack_uri.as_deref() {
+        match state
+            .services
+            .meta
+            .resolve_template(&image_repo, &image_tag, harness_uri)
+            .await
+        {
+            Ok(Some(template_ref)) => {
+                // Same UNSPECIFIED-IP policy shape as the no-guest-IP
+                // cold path. Per-IP egress rules are absent on the
+                // warm path until a M1.x follow-up adds a post-launch
+                // policy refresh keyed on the actual guest_ip.
+                let warm_agent = agent_for_session.clone();
+                let warm_policy = engram_core::types::egress::SessionEgressPolicy {
+                    session_id,
+                    sandbox_id: engram_core::SandboxId::new(), // overwritten by host on launch
+                    guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                    network_allow_hosts: network_for_proxy.allow_hosts.clone(),
+                    network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
+                    secrets: Vec::new(),
+                    secret_mode: manifest.secret_mode,
+                };
+                match (warm_agent, warm_policy) {
+                    (Some(agent), policy) => state
+                        .host_registry
+                        .try_warm_lease_for_session(&ctx, template_ref, agent, policy)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                %template_ref,
+                                error = %e,
+                                "warm-lease errored; falling back to cold-create",
+                            );
+                            None
+                        }),
+                    (None, _) => None, // no-agent session: cold-create
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(error = %e, "resolve_template failed; cold-create");
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    let (host_id, sandbox_id, warm_lease_taken) = match warm_lease_outcome {
+        Some((host_id, sandbox_id)) => {
+            tracing::info!(
+                %session_id,
+                %host_id,
+                %sandbox_id,
+                "warm-lease granted; skipping cold-create",
+            );
+            (host_id, sandbox_id, true)
+        }
+        None => match state.host_registry.create_for_session(&ctx, vm_spec).await {
+            Ok((host_id, id)) => (host_id, id, false),
+            Err(e) => {
+                tracing::warn!(
+                    image_uri = %req.image,
+                    error = %e,
+                    "session create rejected at scheduling; returning 503, no row persisted",
+                );
+                return Err(ApiError::Unavailable(format!(
+                    "no host has capacity for this session right now: {e}. \
+                     Retry shortly; capacity-fit recovers as hosts register or sessions drain."
+                )));
+            }
+        },
     };
 
     // Atomic insert: row exists only once we have host_id + sandbox_id
@@ -641,88 +715,102 @@ async fn create_session_inner(
     // here. ADR 0013 bundles `policy` into the `start_agent` call so
     // the host applies the policy atomically before spawning the
     // agent — no more "notify then unary" race surface.
-    match (agent_for_session, egress_policy) {
-        (Some(agent), Some(policy)) => {
-            if let Err(e) = state
-                .services
-                .host
-                .start_agent(sandbox_id, agent, policy)
-                .await
-            {
-                tracing::error!(
-                    %session_id,
-                    %sandbox_id,
-                    %host_id,
-                    error = %e,
-                    "start_agent failed; marking session Failed",
-                );
-                let _ = state
+    //
+    // ADR 0014: warm-lease already invoked LaunchWarmSandbox which
+    // applied the policy + sent BootstrapLaunch on the host side.
+    // Skip the start_agent call here to avoid double-spawning the
+    // agent. Per-IP egress refinement is a follow-up (see comment
+    // in the warm-lease block above).
+    if warm_lease_taken {
+        // M1.x follow-up: query guest_ip on the host and call
+        // apply_egress_policy with the full per-IP rules so the
+        // egress proxy gets the same treatment cold-create sessions
+        // get at L719. For v1 we accept the UNSPECIFIED-IP policy
+        // already applied by LaunchWarmSandbox.
+    } else {
+        match (agent_for_session, egress_policy) {
+            (Some(agent), Some(policy)) => {
+                if let Err(e) = state
                     .services
-                    .meta
-                    .set_session_status(session_id, SessionStatus::Failed)
-                    .await;
-                state.services.host.unbind_session(session_id).await;
-                return Err(e.into());
+                    .host
+                    .start_agent(sandbox_id, agent, policy)
+                    .await
+                {
+                    tracing::error!(
+                        %session_id,
+                        %sandbox_id,
+                        %host_id,
+                        error = %e,
+                        "start_agent failed; marking session Failed",
+                    );
+                    let _ = state
+                        .services
+                        .meta
+                        .set_session_status(session_id, SessionStatus::Failed)
+                        .await;
+                    state.services.host.unbind_session(session_id).await;
+                    return Err(e.into());
+                }
             }
-        }
-        (Some(agent), None) => {
-            // No guest IP yet → no policy to bundle. Synthesize an
-            // empty SessionEgressPolicy with the unspecified IP;
-            // host-agents without a live proxy treat policy
-            // application as a no-op, so this is safe. The agent
-            // can still apply policy on a later
-            // `apply_egress_policy` call once the IP shows up.
-            let policy = engram_core::types::egress::SessionEgressPolicy {
-                session_id,
-                sandbox_id,
-                guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                network_allow_hosts: network_for_proxy.allow_hosts.clone(),
-                network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-                secrets: Vec::new(),
-                secret_mode: manifest.secret_mode,
-            };
-            if let Err(e) = state
-                .services
-                .host
-                .start_agent(sandbox_id, agent, policy)
-                .await
-            {
-                tracing::error!(
-                    %session_id,
-                    %sandbox_id,
-                    %host_id,
-                    error = %e,
-                    "start_agent failed (no guest IP path); marking session Failed",
-                );
-                let _ = state
+            (Some(agent), None) => {
+                // No guest IP yet → no policy to bundle. Synthesize an
+                // empty SessionEgressPolicy with the unspecified IP;
+                // host-agents without a live proxy treat policy
+                // application as a no-op, so this is safe. The agent
+                // can still apply policy on a later
+                // `apply_egress_policy` call once the IP shows up.
+                let policy = engram_core::types::egress::SessionEgressPolicy {
+                    session_id,
+                    sandbox_id,
+                    guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                    network_allow_hosts: network_for_proxy.allow_hosts.clone(),
+                    network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
+                    secrets: Vec::new(),
+                    secret_mode: manifest.secret_mode,
+                };
+                if let Err(e) = state
                     .services
-                    .meta
-                    .set_session_status(session_id, SessionStatus::Failed)
-                    .await;
-                state.services.host.unbind_session(session_id).await;
-                return Err(e.into());
+                    .host
+                    .start_agent(sandbox_id, agent, policy)
+                    .await
+                {
+                    tracing::error!(
+                        %session_id,
+                        %sandbox_id,
+                        %host_id,
+                        error = %e,
+                        "start_agent failed (no guest IP path); marking session Failed",
+                    );
+                    let _ = state
+                        .services
+                        .meta
+                        .set_session_status(session_id, SessionStatus::Failed)
+                        .await;
+                    state.services.host.unbind_session(session_id).await;
+                    return Err(e.into());
+                }
             }
-        }
-        (None, Some(policy)) => {
-            // No agent to spawn — just apply the egress policy so
-            // future `/exec` traffic flows through the proxy with
-            // the right allowlist.
-            if let Err(e) = state.services.host.apply_egress_policy(policy).await {
-                tracing::warn!(
-                    %session_id,
-                    %sandbox_id,
-                    error = %e,
-                    "apply_egress_policy failed; proceeding without egress policy",
-                );
+            (None, Some(policy)) => {
+                // No agent to spawn — just apply the egress policy so
+                // future `/exec` traffic flows through the proxy with
+                // the right allowlist.
+                if let Err(e) = state.services.host.apply_egress_policy(policy).await {
+                    tracing::warn!(
+                        %session_id,
+                        %sandbox_id,
+                        error = %e,
+                        "apply_egress_policy failed; proceeding without egress policy",
+                    );
+                }
             }
-        }
-        (None, None) => {
-            // Sandbox without a harness and without a guest IP —
-            // nothing to apply, nothing to spawn. The session is
-            // already alive (row inserted, host bound); exec
-            // traffic will go through whatever default the host's
-            // proxy provides (typically allow-all in mode=all,
-            // deny-all in production with no policy registered).
+            (None, None) => {
+                // Sandbox without a harness and without a guest IP —
+                // nothing to apply, nothing to spawn. The session is
+                // already alive (row inserted, host bound); exec
+                // traffic will go through whatever default the host's
+                // proxy provides (typically allow-all in mode=all,
+                // deny-all in production with no policy registered).
+            }
         }
     }
     // Row was inserted as Active in Phase 5; no status update needed.
