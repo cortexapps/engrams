@@ -128,13 +128,20 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
         memory_mib: Some(128),
     };
 
-    let manifest_ref = match builder
+    let snapshot_metadata = match builder
         .capture_canonical_memory(&rootfs, &capture_cfg)
         .await
     {
         Ok(r) => r,
         Err(e) => panic!("capture_canonical_memory failed: {e}"),
     };
+
+    // ADR 0014 M1.3 changed the return type from `ManifestRef` to
+    // `SnapshotMetadata`. The chunked memory manifest is one field
+    // inside it; state.bin / sidecar live alongside.
+    let manifest_ref = snapshot_metadata
+        .memory_manifest
+        .expect("canonical capture must populate memory_manifest");
 
     // The manifest is in the store; size + chunk count are non-trivial.
     let manifest = store.get_manifest(manifest_ref).await.unwrap();
