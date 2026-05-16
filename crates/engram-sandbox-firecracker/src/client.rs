@@ -102,6 +102,34 @@ impl FirecrackerClient {
         self.put(&path, drive).await
     }
 
+    /// `PATCH /drives/{drive_id}` — swap the host file backing an
+    /// already-attached drive. Valid on a paused VM (including a
+    /// VM that was loaded from a snapshot but not yet resumed),
+    /// which is the ADR 0014 option-D restore path: load snapshot
+    /// paused → patch harness drive → resume → guest sees the new
+    /// file's bytes.
+    ///
+    /// On resume, FC re-notifies the virtio-blk queues for every
+    /// drive ("Artificially kick devices" in its logs); the guest
+    /// kernel responds by re-reading capacity and, on size change,
+    /// invalidates its buffer cache for the device. So even a
+    /// guest that read from the drive pre-snapshot will see the
+    /// new bytes on the next read post-resume — confirmed by
+    /// `tests/patch_drive_swap.rs`.
+    pub async fn patch_drive(
+        &self,
+        drive_id: &str,
+        path_on_host: &Path,
+    ) -> Result<(), SandboxError> {
+        let body = DrivePatchBody {
+            drive_id: drive_id.to_string(),
+            path_on_host: path_on_host.to_string_lossy().into_owned(),
+        };
+        let path = format!("/drives/{drive_id}");
+        self.request_with_body("PATCH", &path, Some(&body)).await?;
+        Ok(())
+    }
+
     /// `PUT /vsock` — attach a virtio-vsock device. The host-side `uds_path`
     /// is where `engram-agentd` will accept connections from inside the guest.
     pub async fn put_vsock(&self, vsock: &VsockConfig) -> Result<(), SandboxError> {
@@ -184,6 +212,22 @@ impl FirecrackerClient {
     /// eviction-resume. Use [`Self::load_snapshot_uffd`] in
     /// production-grade resume paths.
     pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
+        self.load_snapshot_inner(paths, /*resume_vm=*/ true).await
+    }
+
+    /// Load a snapshot into a paused VM. Caller is responsible for
+    /// the eventual `patch_vm_state(Resumed)`. Used by the ADR 0014
+    /// option-D restore path where a `patch_drive` happens between
+    /// load and resume.
+    pub async fn load_snapshot_paused(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
+        self.load_snapshot_inner(paths, /*resume_vm=*/ false).await
+    }
+
+    async fn load_snapshot_inner(
+        &self,
+        paths: &SnapshotPaths,
+        resume_vm: bool,
+    ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: paths.state_path.to_string_lossy().into_owned(),
             mem_backend: MemBackend {
@@ -191,7 +235,7 @@ impl FirecrackerClient {
                 backend_path: paths.mem_path.to_string_lossy().into_owned(),
             },
             enable_diff_snapshots: false,
-            resume_vm: true,
+            resume_vm,
         };
         self.put("/snapshot/load", &body).await
     }
@@ -452,6 +496,16 @@ pub struct DriveConfig {
     pub path_on_host: String,
     pub is_root_device: bool,
     pub is_read_only: bool,
+}
+
+/// `PATCH /drives/{drive_id}` body. Subset of `DriveConfig`:
+/// `drive_id` + `path_on_host` are the only fields FC accepts on
+/// patch (boot-time flags like `is_root_device` are immutable
+/// post-attach).
+#[derive(Debug, Clone, Serialize)]
+struct DrivePatchBody {
+    drive_id: String,
+    path_on_host: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
