@@ -223,6 +223,12 @@ pub struct CreateSessionResponse {
     pub session_id: SessionId,
     pub status: &'static str,
     pub image_version: String,
+    /// `"warm"` if the session was satisfied by a pre-restored
+    /// warm-pool slot, `"cold"` if it took the full create path.
+    /// Used both by the dashboard (badge in session detail) and by
+    /// the metrics wrapper to label `engram_session_boot_seconds`
+    /// without re-running the scheduling decision.
+    pub kind: &'static str,
 }
 
 pub async fn create_session(
@@ -239,10 +245,19 @@ pub async fn create_session(
         Err(ApiError::Unavailable(_)) => "scheduling_rejected",
         Err(_) => "internal",
     };
+    // Read kind off the success response; on error we don't know
+    // which path was attempted (warm-lease may have errored before
+    // we knew to fall through, or the spec failed validation
+    // pre-scheduling), so label as `unknown`.
+    let kind = match &result {
+        Ok((_, body)) => body.kind,
+        Err(_) => "unknown",
+    };
     metrics::histogram!(
         crate::metrics::SESSION_BOOT_SECONDS,
         "phase" => "total",
         "outcome" => outcome,
+        "kind" => kind,
     )
     .record(elapsed);
     metrics::counter!(
@@ -875,6 +890,7 @@ async fn create_session_inner(
             session_id,
             status: SessionStatus::Active.as_str(),
             image_version: image_tag,
+            kind: if warm_lease_taken { "warm" } else { "cold" },
         }),
     ))
 }

@@ -44,31 +44,46 @@ pub fn init(addr: SocketAddr) {
 
 // ─── metric name constants ────────────────────────────────────────
 
-/// Histogram. Wall-clock time the `SandboxBackend::create` call
-/// took on this host. Labels:
-/// - `phase`: cold-path sub-step name. Emitted today:
-///   - `image_resolve` (sum of `ensure_image` + `ensure_harness_ext4`
-///     — both are OCI/cache lookups)
-///   - `materialize` (`resolve_rootfs` — NBD daemon spawn or
-///     materialize-to-file for chunked rootfs)
+/// Histogram. Wall-clock time spent in each phase of the sandbox
+/// lifecycle on this host. Labels:
+/// - `phase`: which sub-step. Emitted today:
+///   - `image_resolve` (`pooled_backend::create` — sum of
+///     `ensure_image` + `ensure_harness_ext4`, both OCI/cache
+///     lookups)
+///   - `materialize` (`pooled_backend::create` — `resolve_rootfs`
+///     spawns the NBD daemon or materializes the rootfs to file)
 ///   - `fc_boot` (`FirecrackerBackend::create` — FC API
 ///     PUT-boot-source / PUT-drive / PUT-vsock / InstanceStart)
-///   - `agent_handshake` (host blocks on the in-guest bootstrap
-///     accept()'ing on vsock 1025; this is the in-VM-boot phase
-///     where kernel + engram-init + ext4 mount + bootstrap binary
-///     load happen before the host's CONNECT succeeds)
-///   - `create_total` (pooled_backend's full create — sum of the
-///     first three; `agent_handshake` is a separate gRPC call)
-/// - `outcome`: `success` / `invalid_spec` / `fc_error`.
-/// - `kind`: `cold` (the only value today; warm-path emissions
-///   come from `WarmPool::lease`/`launch` and will land in a
-///   follow-up).
+///   - `create_total` (`pooled_backend::create` — rollup of the
+///     three above; `agent_handshake` is a separate gRPC call)
+///   - `agent_handshake` (entry-point emits this; covers
+///     `notify_session_policy` + the vsock CONNECT + the
+///     BootstrapLaunch write):
+///     - on the **cold-create** path, emitted from
+///       `grpc_server::start_agent` (the coord's gRPC entry).
+///       Time is dominated by in-VM boot: kernel + engram-init +
+///       ext4 mount + bootstrap binary load before the host's
+///       CONNECT succeeds.
+///     - on the **warm-lease** path, emitted from
+///       `WarmPool::launch`. Same downstream code, but bootstrap
+///       is already accept()'ing on the pre-restored microVM, so
+///       this should run sub-100ms in the happy case.
+///   - `warm_lease` (`WarmPool::lease` — DashMap pop primitive;
+///     sub-millisecond in the granted case, slightly longer when
+///     the requested template_ref is stale or unknown).
+/// - `outcome`: `success` / `invalid_spec` / `fc_error` / for
+///   `warm_lease` also `no_capacity` / `stale`.
+/// - `kind`: `cold` (sessions that took the full create path) or
+///   `warm` (warm-pool-leased sessions). Use this label to compare
+///   the same `phase` across the two paths — the headline win of
+///   ADR 0014 lands as `agent_handshake{kind="warm"}` being ~25×
+///   shorter than `agent_handshake{kind="cold"}`.
 ///
 /// Pairs with the coord-side `engram_session_boot_seconds` — same
 /// operation, different vantage; comparing the two surfaces gRPC
 /// round-trip overhead. Drill-down dashboard query example:
-/// `histogram_quantile(0.95, sum by (phase, le) (rate(
-/// engram_sandbox_boot_seconds_bucket{kind="cold"}[5m])))`.
+/// `histogram_quantile(0.95, sum by (phase, kind, le) (rate(
+/// engram_sandbox_boot_seconds_bucket[5m])))`.
 pub const SANDBOX_BOOT_SECONDS: &str = "engram_sandbox_boot_seconds";
 
 /// Counter. Sandboxes the host has been asked to create, labelled

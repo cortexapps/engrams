@@ -192,6 +192,14 @@ impl HostService for HostServiceImpl {
     /// ADR 0013: bundled policy + start. One trait call applies the
     /// `SessionEgressPolicy` to the host's egress proxy registry
     /// BEFORE spawning the agent process. Atomic by construction.
+    ///
+    /// This entry-point serves the **cold-create** path: coord
+    /// calls `StartAgent` after `Create` returns, the in-guest
+    /// bootstrap may not be accept()'ing yet, and the dial blocks
+    /// until kernel + engram-init + ext4 mount complete. The
+    /// warm-lease path doesn't reach here — it goes through
+    /// `WarmPool::launch` (which has its own histogram emission
+    /// labelled `kind="warm"`).
     async fn start_agent(
         &self,
         req: Request<StartAgentRequest>,
@@ -200,10 +208,25 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
         let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
-        self.inner
+        let phase_start = std::time::Instant::now();
+        let result = self
+            .inner
             .start_agent(sandbox_id, agent, policy)
             .await
-            .map_err(sandbox_to_status)?;
+            .map_err(sandbox_to_status);
+        let outcome = if result.is_ok() {
+            "success"
+        } else {
+            "fc_error"
+        };
+        metrics::histogram!(
+            crate::metrics::SANDBOX_BOOT_SECONDS,
+            "phase" => "agent_handshake",
+            "outcome" => outcome,
+            "kind" => "cold",
+        )
+        .record(phase_start.elapsed().as_secs_f64());
+        result?;
         Ok(Response::new(Empty {}))
     }
 

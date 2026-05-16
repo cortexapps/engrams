@@ -2287,12 +2287,12 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         agent: engram_core::types::sandbox::AgentSpec,
     ) -> Result<(), SandboxError> {
-        // ADR 0014 follow-up: `agent_handshake` is the cold-path
-        // phase that dominates total cold-boot wall-clock — vsock
-        // CONNECT to in-guest bootstrap blocks on kernel + engram-
-        // init + ext4 mount + bootstrap binary load. Emitting it as
-        // a histogram lets us drill into the in-VM-boot tail
-        // without per-session forensics.
+        // `agent_handshake` wall-clock is recorded by the caller
+        // (`grpc_server::start_agent` for cold-create, `WarmPool::
+        // launch` for warm-lease) so the histogram can carry the
+        // `kind` label without this backend method knowing which
+        // path it's serving. The tracing log here is still useful
+        // for per-sandbox forensics.
         let phase_start = std::time::Instant::now();
         // Read sandbox state under the dashmap guard, drop it
         // before any await — the path/cid we need is `Clone`.
@@ -2383,13 +2383,6 @@ impl SandboxBackend for FirecrackerBackend {
         // Best-effort flush; bootstrap closes its end on exec.
         let _ = conn.shutdown().await;
         let elapsed = phase_start.elapsed().as_secs_f64();
-        metrics::histogram!(
-            "engram_sandbox_boot_seconds",
-            "phase" => "agent_handshake",
-            "outcome" => "success",
-            "kind" => "cold",
-        )
-        .record(elapsed);
         tracing::info!(
             sandbox_id = %id,
             elapsed_ms = (elapsed * 1000.0) as u64,

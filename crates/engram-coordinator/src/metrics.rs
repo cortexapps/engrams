@@ -75,13 +75,19 @@ pub fn init(addr: SocketAddr) {
 ///   scheduling, host gRPC, in-VM boot, and the harness
 ///   handshake). Per-sub-phase emissions live on the host-agent
 ///   under `engram_sandbox_boot_seconds` (matching `phase` taxonomy:
-///   `image_resolve` / `materialize` / `fc_boot` / `agent_handshake`)
-///   because the coord delegates each phase to the host over gRPC;
-///   the coord stack frame only has the rollup to time. Comparing
-///   coord-`total` against the sum of host-side phases surfaces
-///   network and scheduler overhead.
+///   `image_resolve` / `materialize` / `fc_boot` / `agent_handshake`
+///   / `warm_lease`) because the coord delegates each phase to the
+///   host over gRPC; the coord stack frame only has the rollup to
+///   time. Comparing coord-`total` against the sum of host-side
+///   phases surfaces network and scheduler overhead.
 /// - `outcome`: `success` / `bad_request` / `image_not_enabled` /
 ///   `scheduling_rejected` / `internal`.
+/// - `kind`: `cold` (session took the full create path) or `warm`
+///   (warm-pool-leased) or `unknown` (errored before the path was
+///   chosen). Sourced from `CreateSessionResponse.kind` on success.
+///   The headline ADR 0014 win shows up as
+///   `engram_session_boot_seconds_sum{phase="total",kind="warm"}`
+///   trending toward sub-1s while `kind="cold"` stays at ~20-25s.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
 
 /// Counter. Sessions that reached `Active`. Labels: `outcome`

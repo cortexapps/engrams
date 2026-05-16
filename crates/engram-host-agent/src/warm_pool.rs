@@ -240,6 +240,7 @@ impl WarmPool {
     /// a refill in the background on success or empty so the pool
     /// returns to target.
     pub async fn lease(&self, template_ref: TemplateRef) -> WarmLeaseOutcome {
+        let phase_start = std::time::Instant::now();
         // Stale template: coord asked about a ref we don't know
         // about. Return the most recent known ref so the coord can
         // refresh its cache. If no ref is known at all, NoCapacity.
@@ -253,10 +254,18 @@ impl WarmPool {
                 .iter()
                 .find(|e| e.inactive_since.is_none())
                 .map(|e| *e.key());
-            return match hint {
+            let outcome = match hint {
                 Some(current_ref) => WarmLeaseOutcome::Stale { current_ref },
                 None => WarmLeaseOutcome::NoCapacity,
             };
+            metrics::histogram!(
+                crate::metrics::SANDBOX_BOOT_SECONDS,
+                "phase" => "warm_lease",
+                "outcome" => "no_capacity",
+                "kind" => "warm",
+            )
+            .record(phase_start.elapsed().as_secs_f64());
+            return outcome;
         }
         let leased = self
             .inner
@@ -273,10 +282,23 @@ impl WarmPool {
         // so the next lease finds a slot. Spawned to avoid blocking
         // the caller (coord's parallel-ask path).
         self.maybe_refill(template_ref).await;
-        match leased {
+        let lease_outcome = match leased {
             Some(sandbox_id) => WarmLeaseOutcome::Granted(sandbox_id),
             None => WarmLeaseOutcome::NoCapacity,
-        }
+        };
+        let outcome_label = match &lease_outcome {
+            WarmLeaseOutcome::Granted(_) => "success",
+            WarmLeaseOutcome::NoCapacity => "no_capacity",
+            WarmLeaseOutcome::Stale { .. } => "stale",
+        };
+        metrics::histogram!(
+            crate::metrics::SANDBOX_BOOT_SECONDS,
+            "phase" => "warm_lease",
+            "outcome" => outcome_label,
+            "kind" => "warm",
+        )
+        .record(phase_start.elapsed().as_secs_f64());
+        lease_outcome
     }
 
     /// Append a demand timestamp to the per-template lease history
@@ -303,8 +325,30 @@ impl WarmPool {
         // ADR 0014 ordering: policy onto the proxy registry BEFORE
         // bootstrap exec's the agent. Same invariant ADR 0013
         // codified for cold-create's StartAgent.
-        self.inner.backend.notify_session_policy(policy).await?;
-        self.inner.backend.start_agent(sandbox_id, agent).await
+        let phase_start = std::time::Instant::now();
+        let result = async {
+            self.inner.backend.notify_session_policy(policy).await?;
+            self.inner.backend.start_agent(sandbox_id, agent).await
+        }
+        .await;
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(_) => "fc_error",
+        };
+        // `agent_handshake` on the warm path is sub-100ms in the
+        // happy case — bootstrap is already accept()'ing on the
+        // restored microVM, so the vsock CONNECT returns
+        // immediately. Compare against the cold-path emission at
+        // `grpc_server::start_agent` to see the snapshot-restore
+        // win.
+        metrics::histogram!(
+            crate::metrics::SANDBOX_BOOT_SECONDS,
+            "phase" => "agent_handshake",
+            "outcome" => outcome,
+            "kind" => "warm",
+        )
+        .record(phase_start.elapsed().as_secs_f64());
+        result
     }
 
     /// Snapshot of per-template inventory (free-list size + target).
