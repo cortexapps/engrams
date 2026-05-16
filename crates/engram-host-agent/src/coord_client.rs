@@ -303,6 +303,12 @@ pub struct HeartbeatRequest {
     pub running_sandboxes: Vec<SandboxId>,
     #[serde(default)]
     pub draining: bool,
+    /// ADR 0014: optional per-template warm-slot inventory so the
+    /// coord scheduler can skip parallel-asking zero-slot hosts
+    /// without an extra ListWarmSlots round-trip. Empty when the
+    /// host has no warm pool attached (mode=all, pre-M1.6).
+    #[serde(default)]
+    pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
     /// ADR 0013: gRPC advertise URL the host registered with. Sent on
     /// every heartbeat so any coord pod can self-heal its in-memory
     /// registry from heartbeat traffic alone (coord rolling restart
@@ -317,6 +323,11 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     pub server_time: DateTime<Utc>,
     pub revoked_sessions: Vec<SessionId>,
+    /// ADR 0014: coord's authoritative active-template set, each
+    /// entry carrying the full SnapshotMetadata so the host's
+    /// WarmPool can `restore` without a follow-up RPC.
+    #[serde(default)]
+    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
 }
 
 #[derive(Serialize)]

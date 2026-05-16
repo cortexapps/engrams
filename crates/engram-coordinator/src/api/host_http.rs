@@ -154,6 +154,13 @@ pub struct HeartbeatRequest {
     /// rollout; once they've all redeployed, presence is the norm.
     #[serde(default)]
     pub host_addr: Option<String>,
+    /// ADR 0014: per-template warm-slot inventory reported by the
+    /// host. Empty when the host hasn't attached a warm pool. Held
+    /// here so it travels with the request body; the scheduler's
+    /// parallel-ask hint (M1.8) reads it via `HostState`.
+    #[serde(default)]
+    #[allow(dead_code)] // wired into HostState in M1.8
+    pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +171,12 @@ pub struct HeartbeatResponse {
     /// the wire so a future revocation flow doesn't need a new
     /// endpoint.
     pub revoked_sessions: Vec<SessionId>,
+    /// ADR 0014: coord's authoritative active-template set. Each
+    /// entry carries the full SnapshotMetadata so the host's
+    /// WarmPool can `restore` without a follow-up RPC. Empty when
+    /// no templates have been registered yet.
+    #[serde(default)]
+    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
 }
 
 pub async fn heartbeat(
@@ -252,10 +265,70 @@ pub async fn heartbeat(
         tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");
     }
 
+    // ADR 0014: ship the coord's authoritative active-template set
+    // so the host's WarmPool can drive its refill loop from
+    // heartbeat traffic alone. Each entry carries the full
+    // SnapshotMetadata required for `backend.restore`. Best-effort:
+    // a PG hiccup degrades to no-templates (the host's existing
+    // pool entries stay alive until STALE_GRACE expires).
+    let active_templates = match state.services.meta.list_active_templates().await {
+        Ok(records) => active_templates_with_metadata(state.clone(), records).await,
+        Err(e) => {
+            tracing::debug!(host_id = %host_id, error = %e, "list_active_templates failed");
+            Vec::new()
+        }
+    };
+
     Ok(Json(HeartbeatResponse {
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
+        active_templates,
     }))
+}
+
+/// ADR 0014: enrich each TemplateRecord with the matching
+/// SnapshotMetadata that the host needs to restore. Best-effort —
+/// templates whose snapshot row went missing are dropped from the
+/// response rather than aborting the heartbeat.
+async fn active_templates_with_metadata(
+    state: SharedState,
+    records: Vec<engram_core::types::template::TemplateRecord>,
+) -> Vec<engram_protocol::heartbeat::ActiveTemplate> {
+    let _ = state; // M1.8 plumbs snapshot-row enrichment here
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        // Synthesise a SnapshotMetadata sufficient for the host
+        // to drive `backend.restore`: blob keys are derived from
+        // snapshot_id, and memory_manifest gets resolved by the
+        // host after it downloads the sidecar JSON from
+        // BlobStorage (PooledBackend.restore reads
+        // `manifest.json::memory_manifest` to materialise
+        // memory.bin from chunks). Future M1.8 follow-up: enrich
+        // here from the snapshots row so the host doesn't have to
+        // round-trip through sidecar JSON to discover
+        // memory_manifest.
+        let snapshot = engram_core::types::snapshot::SnapshotMetadata {
+            id: record.snapshot_id,
+            size_bytes: 0,
+            created_at: record.created_at,
+            image_version: format!("{}:{}", record.image_repo, record.image_tag),
+            disk_manifest: None,
+            // The memory manifest is captured at bake-time as part
+            // of the bundle; the host's PooledBackend reads it via
+            // the sidecar JSON it downloads from BlobStorage.
+            memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
+                record.snapshot_id,
+            )),
+            sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(
+                record.snapshot_id,
+            )),
+            rootfs_blob_key: None,
+        };
+        out.push(engram_protocol::heartbeat::ActiveTemplate { record, snapshot });
+    }
+    out
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----

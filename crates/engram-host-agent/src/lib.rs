@@ -286,8 +286,17 @@ impl HostAgent {
             let sink: engram_core::traits::HarnessSink =
                 std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
             pooled.set_harness_sink(sink);
+            // ADR 0014 M1.6: attach a warm pool to the host's
+            // LocalHostClient. The pool shares the same PooledBackend
+            // instance so refill restores land in the host's normal
+            // sandbox lifecycle. Coord-side warm-lease RPCs route
+            // here via the gRPC server.
+            let warm_pool = crate::warm_pool::WarmPool::new(
+                pooled.clone() as Arc<dyn engram_core::traits::SandboxBackend>
+            );
             let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone()),
+                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone())
+                    .with_warm_pool(warm_pool.clone()),
             );
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
@@ -410,6 +419,11 @@ impl HostAgent {
             // register this host without waiting for the next agent
             // restart.
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
+            // ADR 0014: shared warm-pool handle. Heartbeat producer
+            // reads its inventory into the request; the response
+            // carries the coord's active-template set, which the
+            // pool consumes via `observe_templates`.
+            let warm_pool_for_heartbeat = warm_pool.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -426,23 +440,52 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
+                    let warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport> =
+                        warm_pool_for_heartbeat
+                            .list_slots()
+                            .into_iter()
+                            .map(|s| engram_protocol::heartbeat::WarmSlotReport {
+                                template_ref: s.template_ref,
+                                available: s.available,
+                                target: s.target,
+                            })
+                            .collect();
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
                             used_mib: 0,
                             running_sandboxes: running_count,
+                            warm_slots: warm_slots.clone(),
                         },
                         local_snapshots: Vec::new(),
                         running_sandboxes,
                         draining: false,
                         host_addr: host_addr_for_heartbeat.clone(),
+                        warm_slots,
                     };
-                    if let Err(e) = coord_for_heartbeat.heartbeat(host_id, &req).await {
-                        tracing::debug!(
-                            host_id = %host_id,
-                            error = %e,
-                            "heartbeat POST failed; retrying next tick",
-                        );
+                    match coord_for_heartbeat.heartbeat(host_id, &req).await {
+                        Ok(resp) => {
+                            // ADR 0014: drive the warm pool's
+                            // observe_templates from coord's
+                            // authoritative active-template set.
+                            // No-op when coord hasn't enabled warm
+                            // pool yet (empty Vec).
+                            if !resp.active_templates.is_empty() {
+                                let templates = resp
+                                    .active_templates
+                                    .into_iter()
+                                    .map(|t| (t.record, t.snapshot))
+                                    .collect();
+                                warm_pool_for_heartbeat.observe_templates(templates).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                host_id = %host_id,
+                                error = %e,
+                                "heartbeat POST failed; retrying next tick",
+                            );
+                        }
                     }
                 }
             });

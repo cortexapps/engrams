@@ -1,4 +1,7 @@
 use chrono::{DateTime, Utc};
+use engram_core::types::ids::TemplateRef;
+use engram_core::types::snapshot::SnapshotMetadata;
+use engram_core::types::template::TemplateRecord;
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +43,24 @@ pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,
     pub running_sandboxes: u32,
+    /// ADR 0014: per-template warm slot inventory. The coord
+    /// scheduler uses this as a parallel-ask hint — hosts that
+    /// report zero (or no entry) for a template are skipped, no
+    /// gRPC round-trip needed. Empty `Vec` (the default) means
+    /// "no warm pool here", which is the mode=all / pre-warm-pool
+    /// state and matches what the coord scheduler treats as
+    /// "everyone is cold".
+    #[serde(default)]
+    pub warm_slots: Vec<WarmSlotReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WarmSlotReport {
+    pub template_ref: TemplateRef,
+    /// Sandboxes currently in the free-list (ready to lease).
+    pub available: u32,
+    /// Autoscaler target N this host is keeping the pool at.
+    pub target: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +78,21 @@ pub struct HeartbeatAck {
     /// Sessions the coordinator has reassigned away from this host.
     /// The host should drop them from local state on next reconciliation.
     pub revoked_sessions: Vec<SessionId>,
+    /// ADR 0014: coord's authoritative active-template set, with
+    /// each entry's full SnapshotMetadata inlined so the host's
+    /// WarmPool can `restore` without a second round-trip.
+    /// Empty `Vec` means the coord has no active templates (or
+    /// hasn't enabled warm-pool yet) — the host's WarmPool will
+    /// drain its existing slots after the STALE_GRACE window.
+    #[serde(default)]
+    pub active_templates: Vec<ActiveTemplate>,
+}
+
+/// One entry in [`HeartbeatAck::active_templates`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActiveTemplate {
+    pub record: TemplateRecord,
+    pub snapshot: SnapshotMetadata,
 }
 
 #[cfg(test)]
@@ -71,6 +107,7 @@ mod tests {
                 total_mib: 256_000,
                 used_mib: 64_000,
                 running_sandboxes: 7,
+                warm_slots: Vec::new(),
             },
             local_snapshots: vec![LocalSnapshotReport {
                 snapshot_id: SnapshotId::new(),
@@ -125,6 +162,7 @@ mod tests {
         let original = HeartbeatAck {
             server_time: Utc::now(),
             revoked_sessions: vec![SessionId::new(), SessionId::new()],
+            active_templates: Vec::new(),
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: HeartbeatAck = serde_json::from_str(&json).unwrap();
