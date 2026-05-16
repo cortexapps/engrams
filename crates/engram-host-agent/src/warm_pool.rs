@@ -51,10 +51,20 @@ use parking_lot::Mutex;
 /// recent lease activity. v1 floors at 1.
 const FLOOR_TARGET: u32 = 1;
 
-/// Ceiling on per-template target. Memory-cost guardrail until
-/// the cgroup-accounting bench (M1.10) validates canonical-mmap
-/// page-cache sharing at larger depths. v1 caps at 4.
-const CEILING_TARGET: u32 = 4;
+/// Ceiling on per-template target. v1 caps at 1 because N>1
+/// concurrent restores from one snapshot collide on the
+/// source-sandbox-id-keyed vsock UDS path (FC's state.bin embeds
+/// it; two FCs can't bind the same Unix socket). ADR 0014 calls
+/// out per-FC mount-namespace + bind-mount as the unblocker;
+/// when that lands, raise the ceiling to N=4 (or higher,
+/// depending on the warm_pool_memory bench result).
+///
+/// This means M1's warm pool today is effectively N=1 per
+/// template per host — a slot exists or it doesn't. The
+/// autoscaler tracks lease rate so it stays at FLOOR_TARGET=1
+/// when leases happen and drains to 0 in the cold tail. Raising
+/// this constant is the v2 unlock.
+const CEILING_TARGET: u32 = 1;
 
 /// Window over which lease rate is computed for autoscaler input.
 /// 5 minutes keeps the signal stable across bursty session-create
@@ -703,9 +713,14 @@ mod tests {
         }
         pool.gc_tick().await;
         let target = pool.compute_target(rec.template_ref, now);
-        assert!(
-            (2..=CEILING_TARGET).contains(&target),
-            "autoscaler should raise target above floor under load (got {target})",
+        // v1 caps at CEILING_TARGET=1 because concurrent restores
+        // from one snapshot collide on vsock UDS (ADR 0014 mount-
+        // namespace work). Once that lands and CEILING_TARGET
+        // rises, this assertion should change to
+        // `(2..=CEILING_TARGET).contains(&target)`.
+        assert_eq!(
+            target, CEILING_TARGET,
+            "autoscaler should clamp to CEILING_TARGET under load (got {target})",
         );
     }
 

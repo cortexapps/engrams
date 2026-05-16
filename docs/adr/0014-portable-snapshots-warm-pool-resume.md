@@ -246,11 +246,15 @@ Components:
   → snapshot_id + memory/cpu spec. Rebake flips prior row `active=false`.
 - **Per-host `WarmPool`** (new `crates/engram-host-agent/src/warm_pool.rs`):
   free-list per template_ref; refill loop; 60 s grace on rebake.
-  v1 N(T)=1 default per host (each warm slot is fully independent
-  via the per-FC mount namespace described above; bumping to N>1
-  is correctness-safe immediately but the read-only-template +
-  per-FC-overlay drive pattern is a later optimisation to reduce
-  the per-slot memory cost). Autoscale on lease-rate.
+  v1 effective N(T)=1 default per host. The autoscaler computes
+  a target from observed lease rate but **CEILING_TARGET=1** in
+  v1: N>1 concurrent restores from one snapshot collide on the
+  source-sandbox-id-keyed vsock UDS path (FC's state.bin embeds
+  it, two FCs can't bind the same Unix socket). The per-FC
+  mount-namespace + bind-mount approach above unblocks N>1; once
+  that lands, raise the ceiling. M1.10's `multi_restore` test is
+  serial (the warm-pool refill semantic) and passes today;
+  `warm_pool_memory` is scaffolded for the un-block PR.
 - **gRPC additions**: `LeaseWarmSandbox`, `LaunchWarmSandbox`,
   `ListWarmSlots`. `LeaseWarmResponse` is a oneof of
   `{sandbox_id, StaleTemplate{current_ref}, no_capacity}` so the
