@@ -69,10 +69,19 @@ pub fn init(addr: SocketAddr) {
 // emission site because the metric's contract is what scrapers
 // depend on, not the producer.
 
-/// Histogram. Time from `SandboxBackend::create` entry to the agent
-/// being ready to accept exec. Label `phase` partitions by
-/// sub-step: `image_resolve`, `materialize`, `fc_start`,
-/// `agent_handshake`, `total`.
+/// Histogram. Time from `POST /sessions` handler entry to the
+/// handler returning the SessionCreated response. Labels:
+/// - `phase`: emitted today only as `total` (end-to-end including
+///   scheduling, host gRPC, in-VM boot, and the harness
+///   handshake). Per-sub-phase emissions live on the host-agent
+///   under `engram_sandbox_boot_seconds` (matching `phase` taxonomy:
+///   `image_resolve` / `materialize` / `fc_boot` / `agent_handshake`)
+///   because the coord delegates each phase to the host over gRPC;
+///   the coord stack frame only has the rollup to time. Comparing
+///   coord-`total` against the sum of host-side phases surfaces
+///   network and scheduler overhead.
+/// - `outcome`: `success` / `bad_request` / `image_not_enabled` /
+///   `scheduling_rejected` / `internal`.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
 
 /// Counter. Sessions that reached `Active`. Labels: `outcome`

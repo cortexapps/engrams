@@ -866,70 +866,121 @@ impl SandboxBackend for PooledBackend {
         // resolve_rootfs always returns `()` for the second slot.
         #[cfg(target_os = "linux")]
         let mut pending_nbd_state: Option<crate::disk_daemon::NbdSandboxState> = None;
-        if let Some(cache) = &self.image_cache {
-            if let Some(uri) = spec.image_uri.clone() {
-                let cached = cache.ensure_image(&uri).await.map_err(|e| {
-                    SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
-                })?;
-                tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
-                let (path, _state) = self.resolve_rootfs(&uri, &cached).await?;
-                spec.rootfs_source = Some(path);
-                // ADR 0007 Phase 5: lift the bundle's canonical
-                // memory manifest onto the spec so FC backend's
-                // snapshot can stamp it on `FcSnapshotManifest.
-                // canonical_memory_manifest`. UFFD handler reads
-                // that on restore and serves shared-canonical
-                // reads from the per-image page cache.
-                if let Some(bundle) = cached.bundle.as_ref() {
-                    spec.canonical_memory_manifest = bundle.canonical_memory_manifest;
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    pending_nbd_state = _state;
-                }
-            }
-            if let Some(uri) = spec.harness_pack_uri.clone() {
-                // Backends that attach the substrate as a virtio-blk
-                // device (FC, VZ block-device mode) need a real ext4
-                // file at `harness_substrate`. ProcessBackend is
-                // fine with a directory but accepts an ext4 path
-                // too. We resolve the harness name from the spec's
-                // existing `engram_session_harness_name` env hint
-                // when present, falling back to the URI's last path
-                // segment. This keeps the in-VM `/run/engram/
-                // harnesses/<name>/harness` invariant intact.
-                let name = harness_name_for_substrate(&spec, &uri);
-                // ADR 0006: when a local egress proxy is attached,
-                // stamp its CA cert into the substrate so the guest
-                // trust store accepts MITM leaves.
-                let host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.as_str());
-                let cached = cache
-                    .ensure_harness_ext4(&uri, &name, host_ca_pem)
-                    .await
-                    .map_err(|e| {
-                        SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
+        // ADR 0014 follow-up: per-phase boot timing. Captured as
+        // sum-of-durations because the image + harness branches are
+        // independently optional (image-only specs skip the harness
+        // pull and vice-versa). The histogram labels follow the
+        // contract in `crate::metrics::SANDBOX_BOOT_SECONDS`.
+        let phase_total = std::time::Instant::now();
+        let mut image_resolve = std::time::Duration::ZERO;
+        let mut materialize = std::time::Duration::ZERO;
+        let result: Result<SandboxId, SandboxError> = async {
+            if let Some(cache) = &self.image_cache {
+                if let Some(uri) = spec.image_uri.clone() {
+                    let t = std::time::Instant::now();
+                    let cached = cache.ensure_image(&uri).await.map_err(|e| {
+                        SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
                     })?;
-                tracing::debug!(
-                    uri = %uri,
-                    name = %name,
-                    digest = %cached.digest,
-                    ext4 = %cached.ext4_path.display(),
-                    "harness substrate built"
-                );
-                spec.harness_substrate = Some(cached.ext4_path);
+                    image_resolve += t.elapsed();
+                    tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
+                    let t = std::time::Instant::now();
+                    let (path, _state) = self.resolve_rootfs(&uri, &cached).await?;
+                    materialize += t.elapsed();
+                    spec.rootfs_source = Some(path);
+                    // ADR 0007 Phase 5: lift the bundle's canonical
+                    // memory manifest onto the spec so FC backend's
+                    // snapshot can stamp it on `FcSnapshotManifest.
+                    // canonical_memory_manifest`. UFFD handler reads
+                    // that on restore and serves shared-canonical
+                    // reads from the per-image page cache.
+                    if let Some(bundle) = cached.bundle.as_ref() {
+                        spec.canonical_memory_manifest = bundle.canonical_memory_manifest;
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        pending_nbd_state = _state;
+                    }
+                }
+                if let Some(uri) = spec.harness_pack_uri.clone() {
+                    // Backends that attach the substrate as a virtio-blk
+                    // device (FC, VZ block-device mode) need a real ext4
+                    // file at `harness_substrate`. ProcessBackend is
+                    // fine with a directory but accepts an ext4 path
+                    // too. We resolve the harness name from the spec's
+                    // existing `engram_session_harness_name` env hint
+                    // when present, falling back to the URI's last path
+                    // segment. This keeps the in-VM `/run/engram/
+                    // harnesses/<name>/harness` invariant intact.
+                    let name = harness_name_for_substrate(&spec, &uri);
+                    // ADR 0006: when a local egress proxy is attached,
+                    // stamp its CA cert into the substrate so the guest
+                    // trust store accepts MITM leaves.
+                    let host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.as_str());
+                    let t = std::time::Instant::now();
+                    let cached = cache
+                        .ensure_harness_ext4(&uri, &name, host_ca_pem)
+                        .await
+                        .map_err(|e| {
+                            SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
+                        })?;
+                    image_resolve += t.elapsed();
+                    tracing::debug!(
+                        uri = %uri,
+                        name = %name,
+                        digest = %cached.digest,
+                        ext4 = %cached.ext4_path.display(),
+                        "harness substrate built"
+                    );
+                    spec.harness_substrate = Some(cached.ext4_path);
+                }
             }
-        }
 
-        let sandbox_id = self.inner.create(spec).await?;
-        // Stash any spawned NBD daemon under the freshly-assigned
-        // sandbox id. `destroy()` removes the entry (Drop tears
-        // down the daemon + returns the slot); `snapshot()` reads
-        // it back to call `backend.flush()`.
-        #[cfg(target_os = "linux")]
-        if let Some(state) = pending_nbd_state {
-            self.nbd_sandboxes.insert(sandbox_id, state);
+            // `fc_boot` is emitted by the inner FC backend itself
+            // (see `engram_sandbox_firecracker::create`), with the
+            // same metric name + label set. We don't double-record
+            // here because that backend has finer-grained insight
+            // into the sub-steps of the FC `PUT` calls if we want
+            // to drill in later.
+            let sandbox_id = self.inner.create(spec).await?;
+            // Stash any spawned NBD daemon under the freshly-assigned
+            // sandbox id. `destroy()` removes the entry (Drop tears
+            // down the daemon + returns the slot); `snapshot()` reads
+            // it back to call `backend.flush()`.
+            #[cfg(target_os = "linux")]
+            if let Some(state) = pending_nbd_state {
+                self.nbd_sandboxes.insert(sandbox_id, state);
+            }
+            Ok(sandbox_id)
         }
-        Ok(sandbox_id)
+        .await;
+
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(SandboxError::InvalidSpec(_)) => "invalid_spec",
+            Err(_) => "fc_error",
+        };
+        metrics::histogram!(
+            crate::metrics::SANDBOX_BOOT_SECONDS,
+            "phase" => "image_resolve",
+            "outcome" => outcome,
+            "kind" => "cold",
+        )
+        .record(image_resolve.as_secs_f64());
+        metrics::histogram!(
+            crate::metrics::SANDBOX_BOOT_SECONDS,
+            "phase" => "materialize",
+            "outcome" => outcome,
+            "kind" => "cold",
+        )
+        .record(materialize.as_secs_f64());
+        metrics::histogram!(
+            crate::metrics::SANDBOX_BOOT_SECONDS,
+            "phase" => "create_total",
+            "outcome" => outcome,
+            "kind" => "cold",
+        )
+        .record(phase_total.elapsed().as_secs_f64());
+        result
     }
 
     async fn exec_stream(

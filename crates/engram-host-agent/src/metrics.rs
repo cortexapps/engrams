@@ -45,11 +45,30 @@ pub fn init(addr: SocketAddr) {
 // ─── metric name constants ────────────────────────────────────────
 
 /// Histogram. Wall-clock time the `SandboxBackend::create` call
-/// took on this host. Label `phase` partitions sub-steps:
-/// `image_pull`, `materialize`, `fc_boot`, `agent_handshake`,
-/// `total`. Pairs with the coord-side `engram_session_boot_seconds`
-/// — same operation, different vantage; comparing the two surfaces
-/// network round-trip overhead.
+/// took on this host. Labels:
+/// - `phase`: cold-path sub-step name. Emitted today:
+///   - `image_resolve` (sum of `ensure_image` + `ensure_harness_ext4`
+///     — both are OCI/cache lookups)
+///   - `materialize` (`resolve_rootfs` — NBD daemon spawn or
+///     materialize-to-file for chunked rootfs)
+///   - `fc_boot` (`FirecrackerBackend::create` — FC API
+///     PUT-boot-source / PUT-drive / PUT-vsock / InstanceStart)
+///   - `agent_handshake` (host blocks on the in-guest bootstrap
+///     accept()'ing on vsock 1025; this is the in-VM-boot phase
+///     where kernel + engram-init + ext4 mount + bootstrap binary
+///     load happen before the host's CONNECT succeeds)
+///   - `create_total` (pooled_backend's full create — sum of the
+///     first three; `agent_handshake` is a separate gRPC call)
+/// - `outcome`: `success` / `invalid_spec` / `fc_error`.
+/// - `kind`: `cold` (the only value today; warm-path emissions
+///   come from `WarmPool::lease`/`launch` and will land in a
+///   follow-up).
+///
+/// Pairs with the coord-side `engram_session_boot_seconds` — same
+/// operation, different vantage; comparing the two surfaces gRPC
+/// round-trip overhead. Drill-down dashboard query example:
+/// `histogram_quantile(0.95, sum by (phase, le) (rate(
+/// engram_sandbox_boot_seconds_bucket{kind="cold"}[5m])))`.
 pub const SANDBOX_BOOT_SECONDS: &str = "engram_sandbox_boot_seconds";
 
 /// Counter. Sandboxes the host has been asked to create, labelled
