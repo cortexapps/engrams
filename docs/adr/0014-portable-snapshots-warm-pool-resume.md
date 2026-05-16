@@ -1,7 +1,13 @@
 # ADR 0014: Portable snapshots — warm-pool session create + durable resume
 
-Status: accepted, 2026-05-15
-Phase: 1 (M1 landed; e2e-validated on dev VM 2026-05-16). Commit chain:
+Status: accepted, 2026-05-15. Revised 2026-05-16 to make the warm-
+pool restore path harness-agnostic (option D) and to bolt on the
+prefetch + working-set machinery the chunked-memory primitive needs
+to actually hit sub-1 s TTFM on the warm path.
+
+Phase: 1 (M1 landed; option D + prefetch follow-ups in flight after
+prod metrics showed agent_handshake at p99 ~25 s dominating cold
+boot). Commit chain:
 
 - M1.0 `ccde296` — ADR
 - M1.1 `5188751` + `af93584` — `paths.rs` canonical-jail contract
@@ -21,7 +27,32 @@ Phase: 1 (M1 landed; e2e-validated on dev VM 2026-05-16). Commit chain:
 - Hotfix `e96842d` — no-harness sessions warm-lease via `"none"`
   sentinel uri instead of short-circuiting on `harness_pack_uri=None`
 - Dev tool `a803fda` — `seed_warm_template` bin: the missing bake →
-  `templates` row glue, see "Open questions" below
+  `templates` row glue, see M1.11 below
+- `8e219d8` — per-phase cold-boot histograms on the host-agent
+  (image_resolve / materialize / fc_boot / agent_handshake /
+  create_total). Cold-boot data from prod motivated the M1.11–M1.15
+  follow-up work below.
+- `9580e83` — warm-path histograms wired with `kind=warm/cold` split
+  (dormant until M1.11 lands and warm pool actually fires in prod)
+- `3c7cd8e` — `FirecrackerClient::patch_drive` +
+  `load_snapshot_paused` + `tests/patch_drive_swap.rs` integration
+  test, validating the option-D mechanism on the dev VM
+
+Queued (in dependency order):
+
+- **M1.11** — image enablement → templates row cascade. Hooks the
+  existing `POST /api/enabled-images` handler so warm-pool starts
+  firing in prod without operator-side scripting.
+- **M1.12** — option D itself. Bake at pre-mount + bootstrap
+  mounts /dev/vdb + warm-restore PATCHes the harness drive +
+  drop `harness_pack_uri` from `templates` unique key.
+- **M1.13** — eager-prefetch refill. Refill loop parallel-fetches
+  all memory chunks to NVMe before publishing the slot.
+- **M1.14** — working-set recording + replay (REAP-style) with
+  **synthetic profiling** to capture the kernel pages touched
+  during the post-resume mount(2) + execve path.
+- **M1.15** — first-class `snapshot_chunk_cache` with pinning
+  hints, LRU, metrics.
 
 M2 (durability) is still future work. Concurrent N>1 restores still
 require per-FC mount-namespacing (see "Per-FC mount namespace for
@@ -235,16 +266,220 @@ Both milestones use the same wire choreography after FC `restore`:
 1. Host re-creates TAP + vsock UDS at canonical paths.
 2. Bootstrap (alive in the restored guest) is on `accept()`.
 3. Host dials bootstrap on the UDS, reads `BOOTSTRAP_READY_BYTE` (0xEB).
-4. Host pushes `BootstrapLaunch{argv, env}`:
-   - M1 warm-launch: argv = harness, env = session token + initial
-     prompt + workspace hints.
-   - M2 resume: same shape; the agent itself reads on-disk transcript
-     and continues from there.
-5. Bootstrap reaps any prior agent child (none on warm-launch; the
-   cold-restarted agent on M2 resume), spawns the new one.
+4. Host pushes `BootstrapLaunch{argv, env, harness_dev,
+   harness_mount}` (the last two are new under M1.12 — bootstrap
+   mounts the harness device itself before exec; see "Harness
+   late-bind via PATCH /drives" below).
+5. Bootstrap mounts `<harness_dev>` at `<harness_mount>` (no-op on
+   the M2 resume path where the harness is already mounted in the
+   session-specific snapshot), reaps any prior agent child, and
+   spawns the agent process.
 
-Wire surface unchanged from `engram-harness-proto`. No new in-guest
-RPCs.
+Wire surface stays the same `engram-harness-proto` `BootstrapLaunch`
+frame; it grows two optional fields. No new in-guest RPCs.
+
+### Harness late-bind via PATCH /drives (M1.12, option D)
+
+The original M1 design implicitly assumed the bake-time canonical
+snapshot was captured *after* engram-init mounted the harness
+substrate. That coupled each `templates` row to a specific
+`(image, harness)` pair: N images × M harnesses = N×M bakes. With
+the demo image + claude/codex/none harnesses the matrix is small,
+but it scales with operator-added harnesses and forces a rebake on
+every harness bump.
+
+Option D decouples them. The bake-time capture point moves *earlier*
+— to the moment bootstrap returns from `accept()` *before* the
+harness device has been touched — and per-session harness selection
+is done at warm-restore time via Firecracker's `PATCH /drives`.
+
+Mechanics on the bake side:
+
+- A stub harness ext4 (16 MiB empty file at the canonical path
+  `<work_dir>/harness/stub.ext4`) is attached as the FC harness
+  drive. It exists on every host as a static asset shipped with the
+  host-agent binary; it never holds session data.
+- engram-init mounts the rootfs only. It does **not** mount the
+  harness substrate. (Same engram-init binary works on cold-create
+  too — bootstrap, not init, is now the mount call site.)
+- engram-init exec's bootstrap. Bootstrap accepts on vsock port
+  1025. The snapshot is taken here.
+- State.bin embeds the harness drive's `path_on_host` =
+  `<work_dir>/harness/stub.ext4`. Memory.bin chunks contain kernel
+  pages, bootstrap process pages, and the kernel page cache for
+  rootfs only — no harness-specific bytes.
+
+Mechanics on the warm-restore side:
+
+1. `load_snapshot_paused` — restore memory + state.bin. UFFD handler
+   set up. VM stays paused.
+2. `patch_drive("harness", <session_harness_path>)` — FC swaps the
+   stub for the session's chosen harness ext4. The kernel hasn't
+   run yet, so there's nothing in its page cache referencing the
+   stub.
+3. `patch_vm_state(Resumed)` — FC kicks all virtio queues
+   (`"Artificially kick devices"` in FC logs). The kernel virtio-
+   blk driver re-reads device capacity. If the new file is a
+   different size from the stub (it always is — real harness ext4s
+   are MiBs–hundreds-of-MiBs), the kernel emits a
+   `detected capacity change` uevent and **invalidates its buffer
+   cache** for that block device. Even if the bake's profiling pass
+   touched the stub (see M1.14 below), the resume path's cache is
+   clean.
+4. Bootstrap accept() returns when the host's vsock CONNECT lands.
+5. Host writes `BootstrapLaunch{argv, env, harness_dev=/dev/vdb,
+   harness_mount=/run/engram/harnesses/<name>}`.
+6. Bootstrap does `mount(2)` on `/dev/vdb` at the requested mount
+   point (bootstrap runs as PID 1, has CAP_SYS_ADMIN), then exec's
+   the harness binary.
+
+The mechanism is verified end-to-end on the dev VM by
+`crates/engram-sandbox-firecracker/tests/patch_drive_swap.rs`
+(commit `3c7cd8e`). Two variants pass: the production shape (no
+guest read of vdb pre-snapshot) and a staleness variant (3 reads
+pre-snapshot to pollute the page cache; cache is still correctly
+invalidated post-PATCH+resume).
+
+Implications:
+
+- `templates` unique key drops from `(image_repo, image_tag,
+  harness_pack_uri)` to `(image_repo, image_tag)`. Harness column
+  becomes nullable or removed. One bake per image, period.
+- Session-create's `resolve_template` no longer takes a
+  harness_pack_uri; warm-lease works for any (image, harness)
+  pair as long as the image's template exists.
+- The cold-create path also moves the harness mount from
+  engram-init to bootstrap. Cold path is unchanged otherwise.
+- M2 resume and idle-thaw do **not** use PATCH /drives. They
+  restore session-specific snapshots where the harness was
+  already mounted at snapshot time; PATCH would invalidate the
+  kernel's warm page cache for the harness, which would hurt M2
+  more than help. This is a clean architectural split: PATCH is a
+  warm-pool-only mechanism, session-specific snapshots restore
+  embedded paths as-is.
+
+### Working-set recording with synthetic profiling (M1.14)
+
+The chunked-memory primitive (ADR 0007) makes restore lazy: chunks
+are faulted in by UFFD on first kernel access. That's correct but
+slow when chunks are GCS-cold — each fault is one GCS RTT
+(~200-500 ms in-region), and 10-30 sequential faults during kernel
+resume + bootstrap wake-up serialize into multi-second restores.
+
+REAP (ASPLOS '21) showed that a one-time profiling pass that
+records the working-set chunk order, then bulk-loads that set on
+subsequent restores, gives 3.7× speedup on average. We adopt the
+same primitive, with a twist for option D.
+
+Bake-time profiling pass (after canonical capture, before
+finalizing the template):
+
+1. Restore the just-captured snapshot with the UFFD handler
+   instrumented to record `(chunk_hash, fault_order_index)` for
+   every page fault.
+2. Let the VM run idle for ~3 s — long enough for the kernel
+   scheduler to settle, bootstrap to re-enter accept(), virtio-blk
+   queue notifiers to stabilize.
+3. Then run a **synthetic post-restore profile**: from the host,
+   dial bootstrap, write a synthetic `BootstrapLaunch{argv=/bin/
+   true, env={}, harness_dev=/dev/vdb, harness_mount=/run/engram/
+   harnesses/_profile}`. Bootstrap mounts the stub harness and
+   exec's `/bin/true`. This forces the kernel to touch the pages
+   that option D's warm-lease *will* touch: ext4 mount path
+   (`ext4_fill_super`, `__ext4_iget`, etc.), execve path
+   (`do_execveat_common`, `load_elf_binary`), and the relevant
+   syscall trampolines.
+4. Stop the VM. Serialize the recorded chunks (in fault order,
+   deduplicated) into `working_set.json` with shape:
+
+   ```json
+   {
+     "version": 1,
+     "snapshot_id": "...",
+     "chunks": [
+       {"hash": "sha256:...", "first_fault_ms": 0},
+       {"hash": "sha256:...", "first_fault_ms": 4},
+       ...
+     ],
+     "total_pages": 2143,
+     "synthetic_mount_exec": true
+   }
+   ```
+
+5. Upload `working_set.json` alongside the sidecar JSON. Reference
+   it from `SnapshotMetadata.working_set_blob_key`.
+
+The synthetic-mount-exec step is the key adaptation to option D.
+Without it, the bake-time idle profile would miss the kernel pages
+that get touched only during the option-D warm-lease (mount + exec
+fire only after the host writes the launch frame). Those pages
+would be GCS-cold faults on every warm session, eroding the
+prefetch win. With the synthetic step, the recorded working set
+covers the full critical path from `patch_vm_state(Resumed)`
+through harness execve — which is exactly what we want to be
+NVMe-hot at warm-lease time.
+
+The synthetic mount uses the stub harness (it's still attached at
+bake time). The bytes it reads from the stub don't matter — only
+the kernel pages exercised in the mount + execve syscalls do. The
+stub's tiny ext4 keeps the profile fast and deterministic.
+
+Restore-time consumption (see M1.13 below).
+
+### Eager-prefetch refill + snapshot chunk cache (M1.13, M1.15)
+
+`WarmPool::maybe_refill`'s spawned task currently does:
+
+```
+backend.restore(metadata)
+  → spawn firecracker
+  → materialize stub harness
+  → load_snapshot_paused  // chunks loaded lazily by UFFD
+  → push to free_lists
+```
+
+Under M1.13, the task fetches working-set chunks to NVMe *before*
+the restore, then everything else *after* the slot is published:
+
+```
+backend.restore(metadata)
+  → spawn firecracker
+  → materialize stub harness
+  → read working_set.json (if present in metadata)
+  → parallel materialize working-set chunks to NVMe
+        (8-wide concurrency, content-addressed paths)
+  → load_snapshot_paused  // UFFD faults hit NVMe, not GCS
+  → push to free_lists    // slot advertised in next heartbeat
+  → tokio::spawn:
+      → parallel materialize ALL remaining chunks in memory_manifest
+        (background; doesn't block first lease)
+```
+
+Without `working_set.json` (e.g., older templates baked before
+M1.14), the prefetch falls back to "fetch all chunks before
+publish" — slower refill but correct. With it, refill drops from
+"fetch 32 chunks of 16 MiB" (~2 s parallel from GCS) to "fetch ~5
+chunks" (~300 ms parallel) before the slot is usable.
+
+The cache itself (M1.15) promotes today's ad-hoc per-chunk file
+writes into a `SnapshotChunkCache` component:
+
+- Content-addressed NVMe storage under
+  `<work_dir>/chunks/sha256/<aa>/<bbbb…>` (mirrors the existing
+  chunk-store layout).
+- Pinning hints: chunks named in any active template's
+  `working_set.json` are excluded from LRU eviction.
+- Bounded by a `--chunk-cache-budget-bytes` flag (default 50 GiB);
+  oldest non-pinned chunks evicted when budget exceeded.
+- Metrics: `engram_chunk_cache_size_bytes`,
+  `engram_chunk_cache_hits_total{cache_tier="nvme|blobstorage"}`,
+  `engram_chunk_cache_evictions_total{reason="lru|pinned_changed"}`.
+
+The cache is the L1 layer in the same architectural shape as AWS
+Lambda SnapStart's tiered cache (their L1=NVMe, L2=distributed,
+L3=S3). Our L2 is BlobStorage directly; we don't plan a
+distributed mid-tier in v1 — measured GCS in-region latency is
+acceptable as the miss path.
 
 ### Cost claim: canonical-mmap page-cache sharing
 
@@ -270,34 +505,53 @@ reasons.
 Goals:
 
 - p50 warm-lease session create ≤ 150 ms; p99 ≤ 250 ms.
+- p95 warm-pool refill ≤ 2 s on a chunk-cache-cold host (this is
+  the new measurable that M1.13+M1.14 produce; today's refill on
+  a fresh host pays multi-second GCS chunk-fault tax).
+- p95 first warm session on a freshly-deployed host ≤ 1 s (today
+  this is "1b: ~3 s NVMe-cold faults during resume"; with prefetch
+  it collapses to scenario 3).
 - v1 warm-pool depth: N=1 per template per host (mount-namespace
   isolation makes N>1 correctness-safe; the depth-cap is a memory-
   cost decision, see warm_pool_memory bench result).
-- Templates with `session_kind ∈ {ephemeral, readonly}` warm-leased by
-  default.
-- Templates with `session_kind=git` fall through to cold-create.
-  Workspace late-bind via virtio-fs is a future ADR.
+- One template row per `(image_repo, image_tag)` — harness is
+  late-bound per session via the option-D PATCH path. Eliminates
+  the N×M bake-matrix coupling.
 - Lease failure (stale template, host gone, capacity exhausted) falls
   through to cold-create with one tracing::warn.
-- Eager hydration on image upload: a new bake → new `templates` row →
-  hosts refill warm slots for it via the coord's active template set,
-  without waiting for the first user session. Memory chunks are
-  already in BlobStorage from the bake pipeline, so first-touch is a
-  GCS pull (intra-VPC, fast) not an OCI registry pull. Eliminates the
-  "first user pays the OCI pull cost on a freshly-uploaded image" UX
-  gap.
+- Eager hydration on image upload: enabling an image in the
+  dashboard's `Settings → Images` panel (POST /api/enabled-images)
+  cascades — when bundle.json carries a `canonical_snapshot`, coord
+  inserts `snapshots` + `templates` rows in one PG transaction. The
+  next heartbeat-ack ships the new template_ref, hosts begin filling
+  warm slots, and the first user session lands on the warm path.
+  Memory chunks are already in BlobStorage from the bake pipeline,
+  so first-touch is a GCS pull (intra-VPC, fast) not an OCI registry
+  pull. Eliminates the "first user pays the OCI pull cost on a
+  freshly-uploaded image" UX gap.
 
 Components:
 
 - **Image builder extension**: `CanonicalCaptureConfig` already
   snapshots memory at bake. Add state.bin + sidecar upload after the
-  capture; register a `templates` row pointing at the resulting
-  `PortableSnapshotRef`. Snapshot point: bootstrap on `accept()`, after
-  writing READY, before any BootstrapLaunch — capture script connects,
-  reads READY, immediately issues FC pause + `PUT /snapshot/create`.
-- **`templates` table**: maps (image_repo, image_tag, harness_pack_uri)
-  → snapshot_id + memory/cpu spec. Rebake flips prior row `active=false`.
-- **Per-host `WarmPool`** (new `crates/engram-host-agent/src/warm_pool.rs`):
+  capture. Under M1.12, snapshot point moves from "post-engram-init
+  full mount" to "bootstrap on `accept()` with stub harness attached
+  but unmounted." Under M1.14, the bake pipeline grows a synthetic
+  profiling pass that produces `working_set.json` alongside the
+  sidecar.
+- **`templates` table**: maps `(image_repo, image_tag) →
+  snapshot_id + vcpus + memory_mib`. Rebake flips prior row
+  `active=false`. (M1.12 drops `harness_pack_uri` from the unique
+  key; was redundant once harness binding is per-session.)
+- **Image-enablement cascade** (M1.11, in
+  `crates/engram-coordinator/src/api/enabled_images.rs`): after
+  validating the bundle, if `bundle.canonical_snapshot.is_some()`,
+  insert into `snapshots` (with `recoverable=true`) and
+  `upsert_template` in one PG transaction. Idempotent on re-
+  enable. Replaces the deferred admin endpoint discussed in earlier
+  drafts.
+- **Per-host `WarmPool`** (existing
+  `crates/engram-host-agent/src/warm_pool.rs`):
   free-list per template_ref; refill loop; 60 s grace on rebake.
   v1 effective N(T)=1 default per host. The autoscaler computes
   a target from observed lease rate but **CEILING_TARGET=1** in
@@ -308,6 +562,26 @@ Components:
   that lands, raise the ceiling. M1.10's `multi_restore` test is
   serial (the warm-pool refill semantic) and passes today;
   `warm_pool_memory` is scaffolded for the un-block PR.
+- **Working-set recorder** (M1.14, new in image-builder): bake-side
+  profiling pass that produces `working_set.json`. Synthetic
+  mount+exec step exercises the kernel pages option-D warm-lease
+  touches, not just the post-restore idle path. See "Working-set
+  recording with synthetic profiling" above.
+- **Refill prefetch** (M1.13, in `WarmPool::maybe_refill`'s spawn):
+  parallel-fetch working-set chunks before `load_snapshot_paused`;
+  background-fetch remaining chunks after `push to free_lists`.
+  Fallback to "fetch all before publish" when `working_set.json` is
+  absent (older templates).
+- **`SnapshotChunkCache`** (M1.15, new on the host-agent): first-
+  class NVMe cache for snapshot chunks. Pinning hints from active
+  templates' working sets; LRU eviction with a configurable budget;
+  exported metrics. The structural analog of AWS Lambda SnapStart's
+  L1 cache tier.
+- **Bootstrap mount + harness late-bind** (M1.12, in
+  `engram-bootstrap`): bootstrap learns to `mount(2)` the harness
+  device at the path the host requests in `BootstrapLaunch`, before
+  exec'ing the harness binary. engram-init stops mounting the
+  harness — bootstrap owns it on both warm and cold paths.
 - **gRPC additions**: `LeaseWarmSandbox`, `LaunchWarmSandbox`,
   `ListWarmSlots`. `LeaseWarmResponse` is a oneof of
   `{sandbox_id, StaleTemplate{current_ref}, no_capacity}` so the
@@ -376,25 +650,110 @@ Components:
 
 ## Files modified (overview)
 
-Full breakdown in `~/.claude/plans/cheeky-booping-castle.md`. High-level:
+M1.0–M1.10 (landed):
 
 - `crates/engram-sandbox-firecracker/`: path canonicalization in
-  snapshot/restore.
-- `crates/engram-host-agent/`: new `warm_pool.rs`, new
-  `snapshot_uploader.rs`, edits to `shutdown.rs` for upload pipeline +
-  extended drain deadline, edits to `idle_evictor.rs` for durability
-  path.
-- `crates/engram-coordinator/`: new `templates.rs`, new
-  `api/resume.rs`, edits to `host_registry.rs` for warm-lease, edits
-  to `dead_host.rs` for Paused transition.
+  snapshot/restore; new `client::patch_drive` +
+  `load_snapshot_paused` primitives (commit `3c7cd8e`).
+- `crates/engram-host-agent/`: new `warm_pool.rs`; metrics module
+  with `kind=cold/warm` split; gRPC server emits agent_handshake
+  histogram on cold path.
+- `crates/engram-coordinator/`: new templates resolver + scheduler
+  warm-lease path in `host_registry.rs`; metrics module;
+  `CreateSessionResponse.kind` field.
 - `crates/engram-image-builder/`: post-canonical-capture state.bin +
-  sidecar upload.
+  sidecar upload; bundle.json v3 carries canonical_snapshot.
 - `crates/engram-protocol/`: proto additions for warm-pool RPCs;
   HostCapacityReport.warm_slots.
-- `crates/engram-core/`: SessionStatus::Paused; trait surface for
-  LeaseWarm/LaunchWarm.
-- `deploy/migrations/`: 0025 (templates), 0026 (sessions.snapshot_ref),
-  0027 (snapshots portable columns).
+- `crates/engram-core/`: SessionStatus shape; trait surface for
+  LeaseWarm/LaunchWarm; SnapshotMetadata schema.
+- `deploy/migrations/`: 0025 (templates).
+
+M1.11–M1.15 (queued):
+
+- **M1.11** edits `crates/engram-coordinator/src/api/enabled_images.rs`
+  to cascade into snapshots + templates inserts when bundle.json
+  carries `canonical_snapshot`. Migration may drop `harness_pack_uri`
+  from `templates` unique key (or hold to M1.12 if we want to keep
+  the column for a release).
+- **M1.12** spans `engram-init` (drop harness mount), `engram-bootstrap`
+  (gain mount(2)), `crates/engram-image-builder/` (snapshot point
+  moves to bootstrap-on-accept with stub harness attached),
+  `crates/engram-sandbox-firecracker/src/lib.rs` (`restore_in_jail`
+  switches to `load_snapshot_paused` + `patch_drive` + explicit
+  resume; ship the stub harness ext4 as a static asset under
+  `<work_dir>/harness/stub.ext4`), `crates/engram-host-agent/src/
+  warm_pool.rs` (`launch` adds `patch_drive` call). Templates
+  schema migration drops `harness_pack_uri` from the unique key.
+- **M1.13** edits `crates/engram-host-agent/src/warm_pool.rs`
+  (refill spawn block grows pre-publish parallel fetch + post-
+  publish background fetch). Touches `crates/engram-host-agent/
+  src/pooled_backend.rs` for the materialize-to-NVMe helper.
+- **M1.14** adds a profiling pass to `crates/engram-image-builder/
+  src/lib.rs` (synthetic mount + execve via a temporary
+  BootstrapLaunch over vsock to the just-snapshotted VM). Adds
+  `working_set_blob_key` to `SnapshotMetadata`. M1.13's prefetch
+  starts consuming it.
+- **M1.15** adds `crates/engram-host-agent/src/snapshot_chunk_cache.rs`
+  (LRU + pinning + budget + metrics). Refactors `pooled_backend.rs`'s
+  ad-hoc chunk writes through it.
+
+M2 (still future):
+
+- `crates/engram-host-agent/`: new `snapshot_uploader.rs`, edits to
+  `shutdown.rs` for upload pipeline + extended drain deadline, edits
+  to `idle_evictor.rs` for durability path.
+- `crates/engram-coordinator/`: new `api/resume.rs`, edits to
+  `dead_host.rs` for Paused transition.
+- `crates/engram-core/`: SessionStatus::Paused.
+- `deploy/migrations/`: 0026 (sessions.snapshot_ref), 0027 (snapshots
+  portable columns).
+
+## Implementation order (M1.11 → M1.15)
+
+Each phase is intended to land as its own commit + measurable on
+the same prod dashboard. Ordering matters: M1.11 is the unblocker
+(without it the warm pool never fires in prod); M1.12 changes the
+critical-path mechanism; M1.13 + M1.14 are the latency wins that
+make warm-lease actually sub-1 s; M1.15 is the polish that turns
+the chunk cache into a tunable, observable component.
+
+1. **M1.11 — image enablement → templates cascade.** ~150 LoC in
+   `enabled_images.rs` + the existing PG transaction helpers. Lands
+   in this repo (engrams). Measurable: first
+   `engram_sandbox_boot_seconds{kind="warm"}` series with non-zero
+   counts on the prod dashboard.
+
+2. **M1.12 — option D.** ~500 LoC across engram-init,
+   engram-bootstrap, image-builder, host-agent, coord. The
+   `tests/patch_drive_swap.rs` integration test (commit `3c7cd8e`)
+   becomes the regression gate. Migration drops `harness_pack_uri`
+   from `templates`'s unique key. Measurable:
+   `engram_session_boot_seconds{kind="warm",phase="total"}` p50
+   drops to ~700 ms — sub-1 s achieved on warm-cache hosts.
+
+3. **M1.13 — eager prefetch refill.** ~50 LoC in `WarmPool::
+   maybe_refill`. Measurable: `engram_warm_pool_refill_seconds` p95
+   on a chunk-cache-cold host drops from ~5 s (UFFD-lazy GCS faults)
+   to ~2 s (parallel pre-publish GCS pulls).
+
+4. **M1.14 — working-set recording + replay with synthetic
+   profiling.** ~400 LoC across image-builder (profiling pass +
+   stub-harness mount + execve drive over vsock + working_set.json
+   writer) and host-agent (consume the manifest, narrow the pre-
+   publish fetch). New `working_set_blob_key` field on
+   `SnapshotMetadata`. Measurable: refill p95 drops from ~2 s
+   (eager-everything) to ~500 ms (working-set-only); first warm
+   session post-deploy is NVMe-hot from the first kernel fault.
+
+5. **M1.15 — `snapshot_chunk_cache`.** ~200 LoC. Pinning, LRU,
+   budget, metrics. Measurable: `engram_chunk_cache_hits_total`
+   ratio visible on the dashboard; operators can tune the budget.
+
+Implementation-order ADR change is purely additive — each phase is
+behind the existence of `working_set.json` / `kind=warm` / etc., so
+older deploys continue to function (cold-create everywhere, no
+warm-lease).
 
 ## Risks
 
@@ -438,8 +797,20 @@ M1 acceptance gates:
 - `cargo test -p engram-sandbox-firecracker --test multi_restore --
   --ignored --nocapture` (dev-vm) — N=5 restores from one canonical;
   independent guest_ip; no cross-talk.
+- `cargo test -p engram-sandbox-firecracker --test patch_drive_swap
+  -- --ignored --nocapture` (dev-vm, M1.12) — option-D mechanism
+  test: load_snapshot_paused + patch_drive + resume; guest sees new
+  bytes on next read. Both the production-shape and staleness
+  variants pass (commit `3c7cd8e` already in tree).
 - `cargo bench -p engram-host-agent --bench warm_pool_memory` (dev-vm)
   — N=20 sandboxes; MemAvailable within 10% of canonical-shared total.
+- New (M1.13/M1.14): refill-latency benchmark scraping
+  `engram_warm_pool_refill_seconds`. Target p95 ≤ 2 s on a chunk-
+  cache-cold host with `working_set.json` present. Compare against
+  no-prefetch baseline.
+- New (M1.12): `engram_session_boot_seconds{kind="warm",phase="total"}`
+  p95 ≤ 1 s on the dev VM after warm pool is hot. Today's
+  `kind="cold"` p95 ~25 s is the baseline this is measured against.
 - Manual rollout: engrams-internal with warm-pool depth N=1; 24 h soak;
   bump to N=2.
 
@@ -476,18 +847,44 @@ M2 acceptance gates:
 - Manual rollout: engrams-internal force-roll MIG; all active sessions
   → Paused (not Failed); Resume restores user workspace files.
 
+## Resolved design decisions (previously open)
+
+- **Bake → `templates` row glue.** Resolved as M1.11: cascade in
+  the existing `POST /api/enabled-images` handler. When the
+  bundle.json validated during image enablement carries a
+  `canonical_snapshot`, coord inserts `snapshots` + `templates`
+  rows in one PG transaction. Idempotent on re-enable. No new
+  admin endpoint, no image-builder-side network call, no GHA
+  changes needed. The `seed_warm_template` dev binary becomes a
+  legacy tool for dev VMs that don't run the full coord stack.
+- **Harness coupling: per-harness bakes vs. harness-agnostic
+  templates.** Resolved in favor of harness-agnostic (option D,
+  M1.12). One template per `(image_repo, image_tag)`; harness
+  binding happens at warm-restore via `PATCH /drives`. Rationale:
+  (a) eliminates N×M bake matrix, (b) snapshot point moves
+  earlier so the memory.bin chunks don't carry harness-specific
+  bytes — full chunked-memory dedup across sessions of different
+  harness, (c) the FC mechanism is verified by
+  `tests/patch_drive_swap.rs`. Cost: bootstrap learns one
+  `mount(2)` call; engram-init loses its harness-mount step.
+- **Working-set replay vs. eager-everything prefetch on refill.**
+  Resolved as both, layered. M1.13 ships eager-everything (no
+  bake-time profiling needed; loads all chunks before publish).
+  M1.14 layers working-set replay on top (smaller pre-publish
+  fetch + background load of the rest). Falls back to M1.13's
+  shape when a template predates M1.14's `working_set.json`.
+- **Synthetic profiling vs. static kernel-page nomination.**
+  Resolved in favor of synthetic profiling (M1.14): the bake-time
+  profiling pass exercises mount(2) + execve(2) on a stub harness
+  to capture the kernel pages that option-D's warm-lease will
+  touch. Static nomination (hand-listing kernel symbols whose
+  pages must be in the working set) is fragile and bound to kernel
+  versions; synthetic profiling generalizes to future "session-
+  side first actions" (chdir, workspace mount, etc.) without
+  manual maintenance.
+
 ## Open questions / deferred
 
-- **Bake → `templates` row glue (M1.x).** Image-builder produces
-  `BuildOutcome.canonical_snapshot: Option<SnapshotMetadata>` (M1.3)
-  but nothing yet inserts the matching `templates` row from that
-  outcome. Until that lands, `seed_warm_template` is the only way to
-  populate templates — a deliberate dev workaround documented in the
-  binary's header. Likely shape: an admin endpoint
-  (`POST /api/templates/register`) the image-builder calls at the end
-  of a bake, plus a CLI shim for manual seeds. Paired with the
-  "explicit admin trigger for testability" pattern (per the project's
-  feedback memory).
 - **Diff snapshots** if M2 background-upload bandwidth becomes a
   problem.
 - **Chunked writable disk** replaces M2's interim tar+zstd upload when
@@ -499,6 +896,11 @@ M2 acceptance gates:
 - **Egress policy re-bind on cross-host Resume** — confirm
   `engram-egress-proxy` re-attaches when a sandbox restores on a host
   with a fresh TAP. Trace in the cross-host restore test.
+- **Distributed L2 chunk cache.** AWS Lambda SnapStart runs an
+  intermediate distributed cache between local NVMe (L1) and S3
+  (L3). We skip this in M1 — measured GCS in-region latency is
+  acceptable as the miss path when working-set prefetch is doing
+  its job. Revisit if fleet-wide chunk-cache-miss rate climbs.
 
 ADR 0012 ("warm pool deferred") and ADR 0009 ("graceful preemption
 deferred") both move from `deferred` → `landed via 0014` after M2.
