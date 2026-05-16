@@ -10,12 +10,12 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.100.9",
+    "@tanstack/react-query": "^5.100.10",
     "framer-motion": "^12.38.0",
     "ghostty-web": "^0.4.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "react-router-dom": "^7.15.0"
+    "react-router-dom": "^7.15.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.0",
@@ -29,7 +29,7 @@
     "tailwindcss": "^4.3.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
-    "vitest": "^4.1.5",
-    "ws": "^8.20.0"
+    "vitest": "^4.1.6",
+    "ws": "^8.20.1"
   }
 }
