@@ -116,14 +116,16 @@ struct WarmPoolInner {
     /// `lease()` over the `AUTOSCALE_WINDOW`. Older entries are
     /// trimmed on gc_tick.
     lease_history: DashMap<TemplateRef, Mutex<Vec<std::time::Instant>>>,
-    /// Per-template count of in-flight refill tasks. Set to 1
-    /// before a refill is spawned and decremented when it
-    /// completes. `maybe_refill` checks this BEFORE spawning to
-    /// prevent concurrent refills from racing each other — without
-    /// this, multiple `gc_tick` calls (or a `lease` + `gc_tick`
-    /// pair) would each spawn their own `backend.restore` task,
-    /// and both would try to bind the same vsock UDS path embedded
-    /// in `state.bin` → EADDRINUSE on the second.
+    /// Per-template race guard against concurrent refills. Claimed
+    /// atomically in `maybe_refill` via the DashMap `Entry::Vacant`
+    /// → `slot.insert(())` pattern (the shard's write lock spans
+    /// the match arm, so the test-and-set is atomic). Without this,
+    /// multiple `gc_tick` calls or a `lease` + `gc_tick` pair would
+    /// each spawn their own `backend.restore` task, and both would
+    /// try to bind the same vsock UDS path embedded in `state.bin`
+    /// → EADDRINUSE on the second. Removed by the spawn callback
+    /// before pushing to the free-list, so the next gc_tick can
+    /// refill if the slot was consumed in the meantime.
     inflight_refills: DashMap<TemplateRef, ()>,
     /// Reference back to the host's SandboxBackend (typically a
     /// PooledBackend wrapping FirecrackerBackend). Used by the

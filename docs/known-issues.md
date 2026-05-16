@@ -5,19 +5,25 @@ deadline. Each item has the file/line of the offending code and a
 sketch of the proper fix so a future visitor (you, me, an agent) can
 land it without rediscovering the problem.
 
-## 1. ~~Warm-pool key ignores `repo`~~ (RETIRED with the warm pool)
+## 1. ~~Warm-pool key ignores `repo`~~ (RESOLVED — warm pool restored on a new substrate)
 
-**Resolved by deletion.** Warm pools shipped through Phase 3 had a
-series of correctness sharp edges (pool key ignored `repo`, then
-ignored `harness_substrate`, then needed `rootfs_source` to be the
-content-addressed digest) on top of an increasingly thin
-performance benefit: chunked-OCI rootfs + canonical-memory restore
-(ADR 0008) made cold start fast enough that pre-warming wasn't
-worth the lifecycle complexity. The entire `Pool` / `PoolKey` /
-warm-pool replenish path was deleted; sessions now always take the
-chunked-OCI cold path. See the deletion commit for the full
-rationale. WIRE_VERSION bumped to v5 (heartbeat no longer carries
-`warm_pools`).
+**The original warm pool (Phase 3–7) was retired in Phase 8** (ADR
+0008) because its pool key kept leaking abstractions: it ignored
+`repo`, then ignored `harness_substrate`, then needed `rootfs_source`
+to be a content-addressed digest. The lifecycle complexity stopped
+paying for itself once chunked-OCI cold start landed.
+
+**Phase 9 (ADR 0014) restored the warm pool on a different substrate.**
+The new key is `template_ref` — a UUID that points at a bake-time
+portable snapshot (state.bin + sidecar + memory chunks). Templates
+are content-addressed by `(image_repo, image_tag, harness_pack_uri,
+snapshot_id)` in the `templates` table; the pool keys on the
+template_ref UUID, not on user-visible bits like the spec. The prior
+sharp edges (key ignoring fields of the spec) don't apply because
+template_ref is opaque. The host's free-list is a flat
+`DashMap<TemplateRef, Vec<SandboxId>>`. WIRE shape: heartbeat carries
+`HostCapacityReport.warm_slots: Vec<WarmSlotReport>` again, but the
+report is keyed on template_ref rather than on the old `PoolKey`.
 
 ## 2. VZ disk-attach failures leak the cloned rootfs
 

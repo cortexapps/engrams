@@ -1,10 +1,32 @@
 # ADR 0014: Portable snapshots — warm-pool session create + durable resume
 
 Status: accepted, 2026-05-15
-Phase: 1 (M1 in flight) — ADR + `paths.rs` contract module landed
-(`ccde296`, `5188751`); portable-snapshot primitive (canonical path
-wiring + mount-namespace per FC + state.bin/sidecar upload + cross-
-host restore integration test) is the next coherent commit.
+Phase: 1 (M1 landed; e2e-validated on dev VM 2026-05-16). Commit chain:
+
+- M1.0 `ccde296` — ADR
+- M1.1 `5188751` + `af93584` — `paths.rs` canonical-jail contract
+- M1.2a `e325fe8` — canonical rootfs/harness paths outside the jail
+- M1.2b `0d7341f` — portable state.bin + sidecar upload
+- M1.3 `ef033cd` — bake-time template snapshots in image-builder
+- M1.4 `83dd40c` — `templates` table + resolver
+- M1.5 `5d66696` — gRPC LeaseWarm/LaunchWarm/ListWarmSlots
+- M1.6 `594225b` — `WarmPool` component + refill loop
+- M1.7 `b195878` — heartbeat warm-slot inventory + active-template push
+- M1.8 `4e61699` + `2e1a727` — scheduler warm-lease path + tests
+- M1.9 `e88737d` — lease-rate autoscaler
+- M1.10 `dc054d8` — serial multi-restore + warm-pool-memory scaffold
+- Hotfix `34b18aa` — atomic `Entry` race guard in `maybe_refill`
+  (concurrent refills collided on the source-keyed vsock UDS;
+  caught by dev-VM e2e, not unit tests)
+- Hotfix `e96842d` — no-harness sessions warm-lease via `"none"`
+  sentinel uri instead of short-circuiting on `harness_pack_uri=None`
+- Dev tool `a803fda` — `seed_warm_template` bin: the missing bake →
+  `templates` row glue, see "Open questions" below
+
+M2 (durability) is still future work. Concurrent N>1 restores still
+require per-FC mount-namespacing (see "Per-FC mount namespace for
+concurrent restores" below); v1 effective depth stays at 1/template
+/host.
 
 ## Context
 
@@ -174,6 +196,37 @@ This is the standard pattern in Lambda's microVM stack (NSDI '20),
 FC's own jailer, runc, and kubelet — adopted here because the
 "one canonical path, many private views" pattern is exactly what
 multi-restore needs.
+
+### Inflight-refill race guard (correctness invariant)
+
+`WarmPool::maybe_refill` is called from every heartbeat-response
+*and* from the 5s `gc_tick`. Without serialization per template,
+two concurrent calls each saw `current=0 < target=1`, each spawned
+its own `backend.restore` task, and the second collided with the
+first on the source-sandbox-id-keyed vsock UDS path embedded in
+`state.bin` → EADDRINUSE on every refill thereafter (caught by
+dev-VM e2e, 92 failures in 7 minutes; hotfix `34b18aa`).
+
+The guard is a per-template `DashMap<TemplateRef, ()>` claimed via
+the atomic `Entry` API:
+
+```rust
+match self.inner.inflight_refills.entry(template_ref) {
+    Entry::Occupied(_) => return,            // someone else is restoring
+    Entry::Vacant(slot) => { slot.insert(()); }
+}
+```
+
+The DashMap shard's write lock spans the entire match — the
+`Vacant → insert` transition cannot race a parallel call's
+`Vacant → insert`. The buggy alternative (`matches!(entry(), Vacant(_))`
+followed by a separate `.insert()`) dropped the lock between the
+check and the write and triggered the bug.
+
+The spawn callback removes the flag *before* pushing to the free-
+list so the next `gc_tick` can fire another refill if the slot was
+consumed in the meantime — same correctness shape, opposite
+direction.
 
 ### Bootstrap-after-restore: the unified rehydration path
 
@@ -390,6 +443,29 @@ M1 acceptance gates:
 - Manual rollout: engrams-internal with warm-pool depth N=1; 24 h soak;
   bump to N=2.
 
+**Dev-VM e2e validation (2026-05-16):**
+
+- Built `seed_warm_template` (commit `a803fda`) to register a real
+  template + snapshot artifacts via the production code path:
+  `FirecrackerBackend` → `PooledBackend` → `LocalBlobStorage`.
+- Ran `mode=coordinator` (separate coord + host-agent processes,
+  HTTP + gRPC between them) against docker-compose Postgres.
+- Confirmed: refill #1 succeeded in <60 ms; 35+ s of heartbeat +
+  gc_tick probes after that all observed `current=1 >= target=1`
+  and skipped the spawn; zero EADDRINUSE failures.
+- Confirmed: `POST /sessions` with `harness: {kind: "none"}`
+  resolved the template, picked the host (via heartbeat-reported
+  `warm_slots`), and fired `LaunchWarmSandbox` over gRPC.
+- Surfaced two e2e-only bugs not caught by unit tests:
+  - `34b18aa` — `matches!(entry, Vacant)` race in `maybe_refill`
+    (see "Inflight-refill race guard" above).
+  - `e96842d` — `harness_pack_uri: None` short-circuited the
+    warm-lease block instead of using the `"none"` sentinel.
+- Did *not* exercise the final agent-exec step: the seed binary
+  uses the public Ubuntu rootfs (no `engram-bootstrap` baked in),
+  so the warm-launch's vsock CONNECT to port 1025 returns EOF.
+  Production rootfs (image-builder output) bakes bootstrap.
+
 M2 acceptance gates:
 
 - `cargo test -p engram-coordinator --test resume_integration` — host
@@ -402,6 +478,16 @@ M2 acceptance gates:
 
 ## Open questions / deferred
 
+- **Bake → `templates` row glue (M1.x).** Image-builder produces
+  `BuildOutcome.canonical_snapshot: Option<SnapshotMetadata>` (M1.3)
+  but nothing yet inserts the matching `templates` row from that
+  outcome. Until that lands, `seed_warm_template` is the only way to
+  populate templates — a deliberate dev workaround documented in the
+  binary's header. Likely shape: an admin endpoint
+  (`POST /api/templates/register`) the image-builder calls at the end
+  of a bake, plus a CLI shim for manual seeds. Paired with the
+  "explicit admin trigger for testability" pattern (per the project's
+  feedback memory).
 - **Diff snapshots** if M2 background-upload bandwidth becomes a
   problem.
 - **Chunked writable disk** replaces M2's interim tar+zstd upload when

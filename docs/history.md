@@ -330,6 +330,56 @@ rationale lives in the heartbeat doc-comment + this entry.
 
 ---
 
+## Phase 9 — Portable snapshots + warm pool, take two (May 2026)
+
+**Goal**: sub-second session create on cold templates, and a
+durability story for in-flight sessions across host loss / MIG roll.
+The Phase-8 retirement of warm pool removed a *fanout* mechanism;
+chunked-OCI cold start is fast, but not 100 ms fast, and it can't
+help durability at all. Portable snapshots are the missing primitive
+for both.
+
+- **Portable-snapshot artifact (ADR 0014 M1.2)** — FC's `state.bin`
+  + sidecar JSON join the existing chunked memory + (future) chunked
+  disk in BlobStorage. State.bin embeds host paths verbatim, so the
+  receiver must materialize the same paths it embeds — enforced by
+  the canonical jail-layout contract (M1.1).
+- **Canonical path scheme (ADR 0014 M1.1, M1.2a)** — rootfs symlink
+  + harness symlink + vsock UDS all live outside the jail dir at
+  source-sandbox-id-keyed paths under `<work_dir>`. Survive
+  `destroy()`'s `remove_dir_all(jail_dir)`, so cross-host restore
+  (warm-pool or durable resume) finds them intact.
+- **`templates` table + resolver (ADR 0014 M1.4)** — maps
+  `(image_repo, image_tag, harness_pack_uri) → snapshot_id + vcpus
+  + memory_mib`. Rebake flips prior row to `active=false`; coord
+  ships the live active set in every heartbeat-response.
+- **Per-host `WarmPool` driver (ADR 0014 M1.6)** — free-list per
+  template_ref, refill loop bounded by an atomic-Entry inflight
+  guard (caught by dev-VM e2e, hotfix `34b18aa`). v1 ceiling at
+  N=1 per template per host because concurrent restores collide on
+  the source-keyed vsock UDS; mount-namespacing per FC unblocks
+  N>1.
+- **Warm-lease scheduler path (ADR 0014 M1.8)** — `pick_for_session`
+  resolves template_ref → `candidates_with_warm_slot` (heartbeat
+  warm_slots) → sequential `LeaseWarmSandbox` → `LaunchWarmSandbox`.
+  Lease failure (stale ref / no capacity / launch error) falls
+  through to cold-create with one tracing::warn.
+- **Lease-rate autoscaler (ADR 0014 M1.9)** — per-template lease
+  history over 5-min window; `target = clamp(ceil(rate × refill ×
+  1.2), FLOOR=1, CEILING=1)`. CEILING rises with N>1 work.
+
+E2e-validated on the dev VM 2026-05-16 (commits `34b18aa` +
+`e96842d` + `a803fda` were dev-VM-found, not unit-test-found —
+documented at length in the ADR's "Verification" section). M2
+(durability — `Paused` status, drain-time snapshot upload, Resume
+API) is queued but not yet started.
+
+ADR 0014 captures the full design + the explicit two-milestone
+shape; ADR 0012 ("warm pool deferred") flips from `deferred` →
+`landed via 0014`.
+
+---
+
 ## Cross-cutting
 
 These don't fit one phase but track across the timeline:

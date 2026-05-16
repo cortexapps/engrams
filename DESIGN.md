@@ -66,7 +66,7 @@ The architecture comes out of an extended design discussion that explored: Strip
 
 ## Goals
 
-1. **Sub-second sandbox spawn** without pre-warming — chunked-OCI rootfs + canonical-memory restore (ADR 0008) makes cold start fast enough that a warm pool isn't worth the complexity.
+1. **Sub-second sandbox spawn** — chunked-OCI rootfs + canonical-memory restore (ADR 0008) get cold start to a few seconds; the warm-pool tier on top (ADR 0014 M1, restored after the Phase-8 retirement) keeps the lease path on a pre-restored microVM at p99 ≤ 250 ms. The portable-snapshot primitive doubles as the substrate for cross-host durable resume (ADR 0014 M2).
 2. **Snapshot-evict mechanic** for time-sharing host RAM across more sessions than fit at once.
 3. **Pluggable cloud backend** so the project ports cleanly between GCP, AWS, Hetzner, and self-hosted bare metal.
 4. **Pluggable storage backend** (GCS, S3, MinIO, local) for snapshot durability.
@@ -171,7 +171,7 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 - Receive session requests (`POST /sessions`). Pick a host, return session id + persistent SSE event stream.
 - Maintain host registry. Heartbeats from each host every 5s: capacity (vCPU / memory / disk), local snapshots held, draining flag.
 - Track session ↔ host ↔ sandbox routing in Postgres so coordinator restart restores active sessions.
-- Drive scheduling decisions: prefer host with snapshot local → host with largest free capacity → fail. (Pre-v5 also had a "host with warm pool match" tier between the two; deleted with ADR 0008.)
+- Drive scheduling decisions: prefer host with a warm slot for the session's template (ADR 0014 M1) → host with snapshot local → host with largest free capacity → fail. (Phase 8 / ADR 0008 deleted the original warm pool because its key was leaking abstractions; ADR 0014 restores the tier on top of portable snapshots, keyed on `template_ref` — a content-addressed handle that side-steps the prior correctness sharp edges.)
 - Drive idle-eviction policy: per-session idle TTL → snapshot + destroy → `Idle` → auto-resume on next request.
 - Detect dead hosts via missed heartbeats; race other replicas via `pg_try_advisory_lock`; mark host's sessions `Dead` (ADR 0002 — no cross-host fallover).
 - Re-broadcast events between replicas via Postgres `LISTEN/NOTIFY` on `session_events` + `host_dead`.
