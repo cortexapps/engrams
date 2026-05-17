@@ -447,6 +447,51 @@ impl PooledBackend {
     /// already present). Failures bubble; callers can log + fall
     /// through to inner.restore which will surface a clearer
     /// "memory.bin missing" error.
+    /// ADR 0014 M1.13: parallel prefetch the memory manifest's
+    /// chunks into the local NVMe chunk cache. Idempotent (no-op
+    /// when the cache is already warm) and best-effort (errors
+    /// degrade to the serial fault path inside materialize_to_file_cached).
+    ///
+    /// Concurrency is bounded at 8 — well under the NIC's
+    /// saturation point on the prod n2-standard-8 hosts (single-
+    /// stream GCS hits ~80 MB/s; 8× parallel = ~640 MB/s, half the
+    /// 10 Gbps line rate) and well below GCS's per-object rate
+    /// limits.
+    async fn prefetch_memory_chunks(
+        &self,
+        metadata: &SnapshotMetadata,
+    ) -> Result<usize, SandboxError> {
+        let Some(mref) = metadata.memory_manifest else {
+            return Ok(0);
+        };
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return Ok(0);
+        };
+        let Some(cache) = self.chunk_cache.as_ref() else {
+            return Ok(0);
+        };
+        let manifest = chunk_store
+            .get_manifest(mref)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}")))?;
+        let hashes: Vec<_> = manifest.chunks.iter().map(|c| c.hash).collect();
+        let chunk_count = hashes.len();
+        let store_for_fetch = chunk_store.clone();
+        cache
+            .prefetch_chunks_parallel(hashes, 8, move |hash| {
+                let s = store_for_fetch.clone();
+                async move { s.get_chunk(hash).await }
+            })
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks_parallel: {e}")))?;
+        tracing::debug!(
+            manifest = %mref,
+            chunk_count,
+            "warm-pool refill: memory chunks prefetched into NVMe",
+        );
+        Ok(chunk_count)
+    }
+
     async fn materialize_memory_if_missing(
         &self,
         src: &std::path::Path,
@@ -1115,13 +1160,45 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        // ADR 0014 M1.13: eager parallel prefetch of memory chunks
+        // into local NVMe BEFORE we hand off to materialize +
+        // inner.restore. Without this, materialize_to_file_cached's
+        // serial chunk iteration pays N×GCS-RTT (~300 ms each) on
+        // a cold-cache host — a 512 MiB template's 32 chunks come
+        // out as ~10 s of serial fetch. Parallel prefetch with
+        // bounded concurrency reduces that to roughly ~2 s.
+        // Subsequent restores against the same template hit NVMe
+        // and the prefetch is a no-op.
+        let prefetch_start = std::time::Instant::now();
+        let prefetched_chunks = self.prefetch_memory_chunks(&metadata).await;
+        if let Err(e) = prefetched_chunks.as_ref() {
+            tracing::warn!(
+                error = %e,
+                snapshot_id = %metadata.id,
+                "warm-pool memory chunk prefetch failed; falling back to serial fault path",
+            );
+        }
+        let prefetch_outcome = if prefetched_chunks.is_ok() {
+            "success"
+        } else {
+            "failed"
+        };
+        metrics::histogram!(
+            crate::metrics::WARM_POOL_REFILL_SECONDS,
+            "phase" => "prefetch",
+            "outcome" => prefetch_outcome,
+        )
+        .record(prefetch_start.elapsed().as_secs_f64());
+
         // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
         // The backend owns its staging dir layout (Phase 6); we ask
         // it where this snapshot would live, then ensure the
         // memory.bin file is present before delegating to inner —
         // either because we're on the same host where it was
         // written, or because we need to rebuild it from chunks
-        // (cross-host migration).
+        // (cross-host migration). With M1.13's prefetch above, the
+        // serial materialize loop now hits the NVMe-warm cache for
+        // every chunk.
         let src = self.inner.snapshot_path_for(metadata.id);
         if let Err(e) = self.materialize_memory_if_missing(&src).await {
             tracing::warn!(
@@ -1155,7 +1232,15 @@ impl SandboxBackend for PooledBackend {
             }
         }
 
-        self.inner.restore(metadata).await
+        let restore_start = std::time::Instant::now();
+        let inner_result = self.inner.restore(metadata).await;
+        metrics::histogram!(
+            crate::metrics::WARM_POOL_REFILL_SECONDS,
+            "phase" => "restore",
+            "outcome" => if inner_result.is_ok() { "success" } else { "failed" },
+        )
+        .record(restore_start.elapsed().as_secs_f64());
+        inner_result
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {

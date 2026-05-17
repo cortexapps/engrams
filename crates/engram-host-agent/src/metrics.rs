@@ -86,6 +86,20 @@ pub fn init(addr: SocketAddr) {
 /// engram_sandbox_boot_seconds_bucket[5m])))`.
 pub const SANDBOX_BOOT_SECONDS: &str = "engram_sandbox_boot_seconds";
 
+/// Histogram. ADR 0014 M1.13: per-phase timing of a warm-pool
+/// refill on the host. Labels:
+/// - `phase`: `prefetch` (parallel chunk fetch into NVMe before
+///   load_snapshot) or `restore` (the inner FC restore, including
+///   materialize_to_file_cached + load_snapshot_uffd).
+/// - `outcome`: `success` / `failed`.
+///
+/// The dominant cost on a chunk-cache-cold host is `prefetch` —
+/// parallel-fetching the snapshot's memory chunks from BlobStorage.
+/// On a chunk-cache-warm host (host has served the template before)
+/// prefetch is a sub-millisecond no-op; the cost moves into
+/// `restore` (load_snapshot UFFD setup + on-disk reads).
+pub const WARM_POOL_REFILL_SECONDS: &str = "engram_warm_pool_refill_seconds";
+
 /// Counter. Sandboxes the host has been asked to create, labelled
 /// by `outcome` (`success` / `invalid_spec` / `image_pull_failed`
 /// / `fc_error`).

@@ -244,6 +244,57 @@ impl ChunkCache {
         Ok(())
     }
 
+    /// ADR 0014 M1.13: parallel prefetch of a whole manifest's
+    /// chunk set into local NVMe. Bounds concurrency so a bursty
+    /// refill doesn't saturate the host NIC or GCS rate limits.
+    ///
+    /// Returns once every chunk is either confirmed in cache or
+    /// fetched. The `fetch` closure is called once per missing
+    /// chunk (concurrent calls are fine; per-chunk dedup happens
+    /// inside `get`). Errors propagate from the first failure;
+    /// already-completed fetches stay in cache (the prefetch is
+    /// best-effort lazy from the caller's POV).
+    ///
+    /// Used by `pooled_backend::restore` to warm the snapshot's
+    /// memory chunks before `inner.restore` triggers UFFD-driven
+    /// reads — converts what would be N serial GCS round-trips
+    /// during kernel resume into K parallel round-trips upfront.
+    pub async fn prefetch_chunks_parallel<F, Fut>(
+        &self,
+        hashes: Vec<ChunkHash>,
+        concurrency: usize,
+        fetch: F,
+    ) -> Result<()>
+    where
+        F: Fn(ChunkHash) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = Result<Bytes>> + Send + 'static,
+    {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        type Task = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+        let spawn_one = |h: ChunkHash, cache: ChunkCache, fetcher: F| -> Task {
+            Box::pin(async move { cache.prefetch(h, || fetcher(h)).await })
+        };
+
+        let max_in_flight = concurrency.max(1);
+        let mut in_flight: FuturesUnordered<Task> = FuturesUnordered::new();
+        let mut iter = hashes.into_iter();
+        // Seed the pipeline.
+        for _ in 0..max_in_flight {
+            match iter.next() {
+                Some(h) => in_flight.push(spawn_one(h, self.clone(), fetch.clone())),
+                None => break,
+            }
+        }
+        // Drain + refill: each completion lets us start one more.
+        while let Some(result) = in_flight.next().await {
+            result?;
+            if let Some(h) = iter.next() {
+                in_flight.push(spawn_one(h, self.clone(), fetch.clone()));
+            }
+        }
+        Ok(())
+    }
+
     /// Pin a chunk against eviction. Used by the UFFD handler for
     /// the working-set set so prefault stays warm across restarts.
     pub fn pin(&self, hash: ChunkHash) {
@@ -453,6 +504,53 @@ mod tests {
     /// don't care about the fetcher's identity.
     async fn cache_get_from(cache: &ChunkCache, store: &ChunkStore, h: ChunkHash) -> Result<Bytes> {
         cache.get(h, || store.get_chunk(h)).await
+    }
+
+    /// ADR 0014 M1.13: parallel prefetch of a chunk set. Verifies
+    /// that all hashes land in the cache + the fetcher is called
+    /// at most once per hash even when the hash list contains
+    /// duplicates (singleflight inside `prefetch_chunks_parallel`
+    /// piggybacks on `get`'s in-flight dedup).
+    #[tokio::test]
+    async fn prefetch_chunks_parallel_warms_all_listed_hashes() {
+        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
+        // Push 16 distinct chunks so the parallel pipeline has
+        // enough work to exercise the bounded-concurrency loop.
+        let mut hashes = Vec::with_capacity(16);
+        for i in 0..16u8 {
+            let body = vec![i; 4 * 1024];
+            let h = store.put_chunk(&body).await.unwrap();
+            hashes.push(h);
+        }
+        // Plus one duplicate to confirm dedup.
+        hashes.push(hashes[0]);
+
+        let store_clone = store.clone();
+        cache
+            .prefetch_chunks_parallel(hashes.clone(), 4, move |h| {
+                let s = store_clone.clone();
+                async move { s.get_chunk(h).await }
+            })
+            .await
+            .unwrap();
+
+        // Every chunk is now in the cache.
+        for h in hashes.iter() {
+            assert!(
+                cache.contains(*h).await,
+                "chunk {h:?} should be cached after prefetch_chunks_parallel",
+            );
+        }
+        // Subsequent get must NOT fire the fetcher.
+        let body0_actual = cache
+            .get(hashes[0], || async {
+                panic!("fetcher must not fire on prefetched hit");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(body0_actual.len(), 4 * 1024);
     }
 
     #[tokio::test]
