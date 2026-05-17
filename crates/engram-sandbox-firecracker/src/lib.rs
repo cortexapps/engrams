@@ -2068,6 +2068,7 @@ impl SandboxBackend for FirecrackerBackend {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         })
     }
 
@@ -2587,6 +2588,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
@@ -2695,6 +2697,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {

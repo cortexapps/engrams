@@ -325,6 +325,7 @@ async fn active_templates_with_metadata(
                 record.snapshot_id,
             )),
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         out.push(engram_protocol::heartbeat::ActiveTemplate { record, snapshot });
     }

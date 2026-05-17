@@ -674,6 +674,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         (rec, meta)
     }
@@ -893,6 +894,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         pool.observe_templates(vec![(rec_v2, meta_v2)]).await;
         // Old sandboxes were destroyed.

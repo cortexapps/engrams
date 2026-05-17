@@ -151,6 +151,7 @@ impl SandboxBackend for FakeFcBackend {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         })
     }
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {

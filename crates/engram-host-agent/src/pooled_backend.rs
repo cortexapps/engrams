@@ -470,15 +470,56 @@ impl PooledBackend {
         let Some(cache) = self.chunk_cache.as_ref() else {
             return Ok(0);
         };
-        let manifest = chunk_store
-            .get_manifest(mref)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}")))?;
-        let hashes: Vec<_> = manifest.chunks.iter().map(|c| c.hash).collect();
-        let chunk_count = hashes.len();
+        // ADR 0014 M1.14: if the snapshot has a published working-
+        // set trace, narrow the prefetch to those chunks only —
+        // typically a small subset of the full manifest (~5-15
+        // chunks vs ~30+). Shrinks cold-cache refill from ~2 s to
+        // ~500 ms in the best case. Fallback to full-manifest
+        // prefetch (M1.13 behavior) when the trace isn't present,
+        // unreachable, or empty.
+        let hashes_to_prefetch: Vec<_> = match metadata.working_set_blob_key.as_deref() {
+            Some(ws_key) => match self.fetch_working_set_chunks(chunk_store, ws_key).await {
+                Ok(chunks) if !chunks.is_empty() => {
+                    tracing::debug!(
+                        ws_key,
+                        chunk_count = chunks.len(),
+                        "warm-pool refill: prefetch narrowed to working set",
+                    );
+                    chunks
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        ws_key,
+                        "warm-pool refill: working set empty, falling back to full manifest",
+                    );
+                    let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
+                        SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
+                    })?;
+                    manifest.chunks.iter().map(|c| c.hash).collect()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ws_key,
+                        error = %e,
+                        "warm-pool refill: working set fetch failed, falling back to full manifest",
+                    );
+                    let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
+                        SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
+                    })?;
+                    manifest.chunks.iter().map(|c| c.hash).collect()
+                }
+            },
+            None => {
+                let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
+                    SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
+                })?;
+                manifest.chunks.iter().map(|c| c.hash).collect()
+            }
+        };
+        let chunk_count = hashes_to_prefetch.len();
         let store_for_fetch = chunk_store.clone();
         cache
-            .prefetch_chunks_parallel(hashes, 8, move |hash| {
+            .prefetch_chunks_parallel(hashes_to_prefetch, 8, move |hash| {
                 let s = store_for_fetch.clone();
                 async move { s.get_chunk(hash).await }
             })
@@ -490,6 +531,34 @@ impl PooledBackend {
             "warm-pool refill: memory chunks prefetched into NVMe",
         );
         Ok(chunk_count)
+    }
+
+    /// ADR 0014 M1.14: load a working_set.json from BlobStorage and
+    /// return its chunk hashes. Used by `prefetch_memory_chunks`
+    /// to narrow the parallel prefetch to the chunks the kernel
+    /// actually touches on warm-restore. Returns `Ok(vec![])` when
+    /// the blob is missing (older bakes that pre-date M1.14) so
+    /// the caller falls back to full-manifest prefetch.
+    async fn fetch_working_set_chunks(
+        &self,
+        chunk_store: &ChunkStore,
+        ws_key: &str,
+    ) -> Result<Vec<engram_chunk_store::manifest::ChunkHash>, SandboxError> {
+        let blob = chunk_store.blob_storage();
+        let bytes = match blob.get(ws_key).await {
+            Ok(b) => b,
+            Err(engram_core::BlobError::NotFound) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(SandboxError::Snapshot(format!(
+                    "fetch working-set blob {ws_key}: {e}"
+                )))
+            }
+        };
+        let trace: engram_chunk_store::working_set::WorkingSetTrace =
+            serde_json::from_slice(&bytes).map_err(|e| {
+                SandboxError::Snapshot(format!("parse working-set trace {ws_key}: {e}"))
+            })?;
+        Ok(trace.chunks)
     }
 
     async fn materialize_memory_if_missing(
@@ -1493,6 +1562,7 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
+                    working_set_blob_key: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -1628,6 +1698,7 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
+                    working_set_blob_key: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -1763,6 +1834,7 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
+                    working_set_blob_key: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -1991,6 +2063,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -2116,6 +2189,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();

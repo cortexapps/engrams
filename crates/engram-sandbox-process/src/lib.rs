@@ -356,6 +356,7 @@ impl SandboxBackend for ProcessBackend {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         })
     }
 
@@ -938,6 +939,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
         };
         let res = b.restore(meta).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));

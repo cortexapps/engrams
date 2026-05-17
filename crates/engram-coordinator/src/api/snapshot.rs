@@ -287,6 +287,7 @@ async fn resume_from_fc_snapshot(
         state_blob_key: None,
         sidecar_blob_key: None,
         rootfs_blob_key: None,
+        working_set_blob_key: None,
     };
     let (host_id, new_sandbox_id) = match state
         .host_registry
