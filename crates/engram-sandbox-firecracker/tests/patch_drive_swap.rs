@@ -44,7 +44,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -359,7 +359,7 @@ async fn configure_boot(
     client: &FirecrackerClient,
     kernel: &Path,
     rootfs: &Path,
-    harness_a: &PathBuf,
+    harness_a: &Path,
 ) {
     client
         .put_machine_config(&MachineConfig {

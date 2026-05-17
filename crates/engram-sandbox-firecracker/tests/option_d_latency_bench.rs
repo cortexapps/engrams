@@ -104,7 +104,7 @@ async fn option_d_latency_within_budget() {
     // N cycles: restore → swap → destroy.
     let mut restore_samples = Vec::with_capacity(N_CYCLES);
     let mut swap_samples = Vec::with_capacity(N_CYCLES);
-    for i in 0..N_CYCLES {
+    for (i, session_harness) in session_harnesses.iter().enumerate() {
         let t_restore = Instant::now();
         let id = backend
             .restore(metadata.clone())
@@ -114,7 +114,7 @@ async fn option_d_latency_within_budget() {
 
         let t_swap = Instant::now();
         backend
-            .swap_harness_drive(id, session_harnesses[i].clone())
+            .swap_harness_drive(id, session_harness.clone())
             .await
             .unwrap_or_else(|e| panic!("swap iter {i}: {e}"));
         swap_samples.push(t_swap.elapsed());
