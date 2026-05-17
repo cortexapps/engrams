@@ -277,23 +277,45 @@ mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
-# ADR 0014 M1.12 (option D): engram-init no longer mounts the
-# harness substrate. The host's BootstrapLaunch frame nominates the
-# harness device + mount point (typically /dev/vdb +
-# /run/engram/harnesses), and engram-bootstrap mounts it itself
-# before exec'ing the harness binary. This lets warm-pool templates
-# be harness-agnostic — the bake snapshot captures bootstrap on
-# accept() before any harness mount has happened, then `PATCH
-# /drives` per-session swaps the device's backing file.
+# ADR 0014 M1.12 (option D): engram-init no longer leaves a
+# persistent mount of the harness substrate at
+# /run/engram/harnesses. The host's BootstrapLaunch frame
+# nominates the harness device + mount point and
+# engram-bootstrap does the mount itself; this lets warm-pool
+# templates be harness-agnostic — the bake snapshot captures
+# bootstrap on accept() before any harness mount has happened,
+# then `PATCH /drives` per-session swaps the device's backing
+# file (see crates/engram-sandbox-firecracker/tests/
+# patch_drive_swap.rs).
 #
-# Init still creates the mount point so bootstrap's mkdir is a
-# no-op; if a session has no harness (rare), the dir just stays
-# empty.
+# But cold-create sessions don't go through the bootstrap-launch
+# path: init exec's agentd directly, and the egress-proxy CA
+# lives in the substrate at /.engram-host/ca.pem. To support
+# both flows we tmp-mount /dev/vdb, copy the CA into a
+# rootfs-persistent location, and unmount immediately — the
+# block-device page cache is still invalidated post-PATCH so
+# the warm path's bootstrap mount sees the swapped contents.
 mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
-# ADR 0014 M1.12: egress-proxy CA setup moved to engram-bootstrap,
-# because the harness substrate (where the CA lives at
-# `/.engram-host/ca.pem`) isn't mounted yet — bootstrap does the
-# mount itself after receiving BootstrapLaunch.
+if [ -b /dev/vdb ]; then
+    mkdir -p /run/engram/.ca-stage 2>/dev/null || true
+    if mount -t ext4 -o ro /dev/vdb /run/engram/.ca-stage 2>/dev/null; then
+        if [ -f /run/engram/.ca-stage/.engram-host/ca.pem ]; then
+            mkdir -p /etc/engram /etc/ssl/certs 2>/dev/null || true
+            cp /run/engram/.ca-stage/.engram-host/ca.pem /etc/engram/ca.pem 2>/dev/null || true
+            if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+                cat /etc/engram/ca.pem >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+            else
+                cp /etc/engram/ca.pem /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+            fi
+            export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+            export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+            export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+            export NODE_EXTRA_CA_CERTS=/etc/engram/ca.pem
+        fi
+        umount /run/engram/.ca-stage 2>/dev/null || true
+    fi
+    rmdir /run/engram/.ca-stage 2>/dev/null || true
+fi
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
