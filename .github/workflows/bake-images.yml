@@ -64,11 +64,29 @@ jobs:
           #   tf-apply directly. Without this filter, every OSS
           #   push fanned tf-apply in parallel with bake-fc-host,
           #   wasting a ~5min run against the stale image.
+          # paths-filter supports `!` negation — host-side bake
+          # tools (engram-cli, engram-image-builder) ship in no
+          # deployed binary, so excluding them stops a CLI-only or
+          # image-builder-only commit from triggering the entire
+          # container-bake + FC-host-rebake + helm-deploy + TF-apply
+          # fan-out. engram-agentd / engram-bootstrap are baked
+          # *into the demo image* (which has its own manual bake
+          # workflow), so they don't affect coord/web/host-agent
+          # container images either. engram-harness-* belongs to
+          # bake-harness-claude's lane, which has its own narrow
+          # filters.
           filters: |
             images:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/**'
+              - '!crates/engram-cli/**'
+              - '!crates/engram-image-builder/**'
+              - '!crates/engram-agentd/**'
+              - '!crates/engram-bootstrap/**'
+              - '!crates/engram-harness-claude/**'
+              - '!crates/engram-harness-noop/**'
+              - '!crates/engram-harness-proto/**'
               - 'docker/**'
               - 'deploy/migrations/**'
               - 'web/**'
@@ -77,6 +95,13 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/**'
+              - '!crates/engram-cli/**'
+              - '!crates/engram-image-builder/**'
+              - '!crates/engram-agentd/**'
+              - '!crates/engram-bootstrap/**'
+              - '!crates/engram-harness-claude/**'
+              - '!crates/engram-harness-noop/**'
+              - '!crates/engram-harness-proto/**'
               - 'deploy/packer/**'
               - 'rust-toolchain.toml'
             tf_or_helm:
