@@ -955,6 +955,20 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
         use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
+        // FC's create flow installs `rootfs_source` as a symlink target
+        // at `<work_dir>/rootfs/<sandbox_id>.dev`, and the kernel
+        // resolves relative symlink targets against the symlink's
+        // parent directory — not the bake's CWD. CLI invocations
+        // typically pass `--images-dir var/engram/images` (relative),
+        // so without this canonicalize FC's PUT /drives lands on a
+        // "No such file or directory" error.
+        let rootfs_path = tokio::fs::canonicalize(rootfs_path).await.map_err(|e| {
+            BuildError::Config(format!(
+                "canonicalize rootfs path {}: {e}",
+                rootfs_path.display()
+            ))
+        })?;
+
         let work = tempfile::tempdir()
             .map_err(|e| BuildError::Config(format!("canonical bake tempdir: {e}")))?;
 
