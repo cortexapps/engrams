@@ -402,13 +402,22 @@ pub struct BuildOutcome {
     /// captured at bake time.
     pub memory_bootstrap_path: Option<PathBuf>,
     pub memory_chunks_blob_path: Option<PathBuf>,
+    /// ADR 0014: bake-time captured FC `state.bin`. `Some` iff
+    /// `capture_canonical_memory` ran. `push_to_registry` reads
+    /// this and ships it as an OCI layer; coord's `enable_image`
+    /// pulls the layer and writes the bytes to its BlobStorage
+    /// at `state_blob_key(snapshot_id)`.
+    pub snapshot_state_path: Option<PathBuf>,
+    /// ADR 0014: bake-time captured FC sidecar `manifest.json`.
+    /// Paired with `snapshot_state_path`.
+    pub snapshot_sidecar_path: Option<PathBuf>,
     /// ADR 0014: full portable template snapshot. `Some` iff the
-    /// bake captured canonical memory AND uploaded the FC
-    /// state.bin + sidecar to BlobStorage. Coord-side template
-    /// registration (M1.4) reads this to populate the `templates`
-    /// table; bundle.json's `canonical_snapshot` block carries
-    /// the same data for downstream consumers that read the
-    /// image artifact directly.
+    /// bake captured canonical memory. `state_blob_key` and
+    /// `sidecar_blob_key` are `None` here — coord assigns them on
+    /// enable-image after writing the OCI-shipped bytes to its
+    /// own BlobStorage. bundle.json's `canonical_snapshot` block
+    /// carries the same shape for downstream consumers reading
+    /// the artifact directly.
     pub canonical_snapshot: Option<engram_core::types::snapshot::SnapshotMetadata>,
 }
 
@@ -720,7 +729,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             (req.capture_canonical_memory.as_ref(), disk_manifest)
         {
             match self
-                .capture_canonical_memory(&rootfs_path, capture_cfg)
+                .capture_canonical_memory(&rootfs_path, image_dir, capture_cfg)
                 .await
             {
                 Ok(metadata) => {
@@ -915,6 +924,18 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await?;
         }
 
+        // ADR 0014: snapshot_state + sidecar are staged into
+        // image_dir by `capture_canonical_memory`. Surface their
+        // paths on BuildOutcome so `push_to_registry` can include
+        // them as OCI layers.
+        let (snapshot_state_path, snapshot_sidecar_path) = if canonical_snapshot.is_some() {
+            let s = image_dir.join("snapshot.state.bin");
+            let c = image_dir.join("snapshot.sidecar.json");
+            (s.exists().then_some(s), c.exists().then_some(c))
+        } else {
+            (None, None)
+        };
+
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
             manifest_path,
@@ -926,6 +947,8 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             disk_chunks_blob_path,
             memory_bootstrap_path,
             memory_chunks_blob_path,
+            snapshot_state_path,
+            snapshot_sidecar_path,
             canonical_snapshot,
         })
     }
@@ -955,6 +978,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     pub async fn capture_canonical_memory(
         &self,
         rootfs_path: &Path,
+        image_dir: &Path,
         capture_cfg: &CanonicalCaptureConfig,
     ) -> Result<engram_core::types::snapshot::SnapshotMetadata, BuildError> {
         use engram_chunk_store::ManifestKind;
@@ -1045,31 +1069,48 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Config(format!("put canonical manifest: {e}")))?;
 
-        // ADR 0014: upload state.bin + sidecar JSON to BlobStorage
-        // so production hosts can restore this template snapshot
-        // without re-running the bake. The chunk store's
-        // BlobStorage is the same handle the host-agent's
-        // PooledBackend reads from at restore time.
-        let blob = self.chunk_store.blob_storage();
+        // ADR 0014: copy state.bin + sidecar JSON into `image_dir`
+        // so `push_to_registry` can package them as OCI layers.
+        // Previously the bake uploaded these directly to its
+        // local BlobStorage — that coupled the bake's environment
+        // (LocalBlobStorage on a CI runner with no GCS creds) to
+        // the production deployment's blob backend, producing
+        // OCI artifacts prod hosts couldn't restore from. The
+        // current design: bake → OCI artifact → coord's
+        // `enable_image` materializes to BlobStorage at canonical
+        // keys derived from snapshot_id. blob keys are assigned
+        // app-side, not bake-side, so we leave them None here.
         let state_path = snap_dir.join("state.bin");
         let sidecar_path = snap_dir.join("manifest.json");
-        let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
-        let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
-        engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
+        let staged_state = image_dir.join("snapshot.state.bin");
+        let staged_sidecar = image_dir.join("snapshot.sidecar.json");
+        tokio::fs::copy(&state_path, &staged_state)
             .await
-            .map_err(|e| BuildError::Config(format!("upload canonical state.bin: {e}")))?;
-        engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &sidecar_key, &sidecar_path)
+            .map_err(|e| {
+                BuildError::Config(format!(
+                    "stage canonical state.bin into {}: {e}",
+                    staged_state.display()
+                ))
+            })?;
+        tokio::fs::copy(&sidecar_path, &staged_sidecar)
             .await
-            .map_err(|e| BuildError::Config(format!("upload canonical sidecar.json: {e}")))?;
+            .map_err(|e| {
+                BuildError::Config(format!(
+                    "stage canonical sidecar.json into {}: {e}",
+                    staged_sidecar.display()
+                ))
+            })?;
 
         // Stamp the metadata with everything a sibling host needs
         // to restore. memory_manifest is the chunked manifest of
         // memory.bin; canonical_memory_manifest is the same value
         // here (this IS the canonical for the template).
+        // state_blob_key + sidecar_blob_key stay None — coord
+        // assigns them on enable-image based on snapshot_id.
         metadata.memory_manifest = Some(manifest_ref);
         metadata.source_sandbox_id = Some(sandbox_id);
-        metadata.state_blob_key = Some(state_key);
-        metadata.sidecar_blob_key = Some(sidecar_key);
+        metadata.state_blob_key = None;
+        metadata.sidecar_blob_key = None;
 
         tracing::info!(
             snapshot_id = %metadata.id,
@@ -1184,6 +1225,20 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 ),
                 _ => (None, None),
             };
+            // ADR 0014: ship state.bin + sidecar as OCI layers so
+            // the deployment's coord can materialize them to its
+            // own BlobStorage on enable-image. Both-or-neither
+            // symmetry is enforced by `push_chunked_image`.
+            let (snapshot_state, snapshot_sidecar_json) = match (
+                outcome.snapshot_state_path.as_ref(),
+                outcome.snapshot_sidecar_path.as_ref(),
+            ) {
+                (Some(s), Some(c)) => (
+                    Some(tokio::fs::read(s).await.map_err(BuildError::Io)?),
+                    Some(tokio::fs::read(c).await.map_err(BuildError::Io)?),
+                ),
+                _ => (None, None),
+            };
 
             let payload = engram_oci::ChunkedPushPayload {
                 manifest_toml: manifest_bytes,
@@ -1193,6 +1248,8 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 disk_chunks_blob,
                 memory_bootstrap_json,
                 memory_chunks_blob,
+                snapshot_state,
+                snapshot_sidecar_json,
             };
 
             let digest = oci

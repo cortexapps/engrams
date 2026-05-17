@@ -66,7 +66,7 @@ pub async fn enable_image(
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    let (row, manifest, bundle_canonical_snapshot) =
+    let (row, manifest, bundle_canonical_snapshot, artifacts) =
         fetch_and_seal_manifest(&state, &req.image_uri).await?;
     state
         .services
@@ -74,22 +74,36 @@ pub async fn enable_image(
         .upsert_enabled_image(row.clone())
         .await?;
 
-    // ADR 0014 M1.11: if the OCI artifact's bundle.json carries a
-    // canonical_snapshot block, cascade into snapshots + templates so
-    // the host-agent's warm pool starts filling for this image on the
-    // next heartbeat. Older bakes that pre-date M1.3 don't carry a
-    // canonical_snapshot — we just enable the image (existing
-    // behavior) and the session falls through to cold-create.
+    // ADR 0014 M1.11: when the bundle carries a canonical_snapshot,
+    // materialize the bake's OCI artifact into the deployment's
+    // BlobStorage (state.bin, sidecar, memory + disk chunks +
+    // manifests at canonical keys), then cascade into snapshots +
+    // templates. Both have to succeed for the warm pool to actually
+    // refill — a templates row pointing at a snapshot whose chunks
+    // aren't in BlobStorage is the regression we just fixed.
     if let Some(snapshot) = bundle_canonical_snapshot {
-        if let Err(e) = cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await {
-            // Don't fail the whole enable on cascade failure — the
-            // image is still usable for cold-create. Surface the
-            // error in logs so an operator can investigate.
-            tracing::warn!(
-                image_uri = %req.image_uri,
-                error = %e,
-                "enabled image; templates cascade failed (warm pool will not fire for this image)",
-            );
+        let materialized = materialize_template_artifacts(&state, snapshot, &artifacts).await;
+        match materialized {
+            Ok(snapshot) => {
+                if let Err(e) =
+                    cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await
+                {
+                    tracing::warn!(
+                        image_uri = %req.image_uri,
+                        error = %e,
+                        "enabled image; templates cascade failed after materialization \
+                         (warm pool will not fire for this image)",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    image_uri = %req.image_uri,
+                    error = %e,
+                    "enabled image; OCI → BlobStorage materialization failed \
+                     (image is enabled but warm pool will not fire)",
+                );
+            }
         }
     }
 
@@ -128,11 +142,8 @@ pub async fn refresh_enabled_image(
             ))
         })?;
 
-    let (mut refreshed, manifest, bundle_canonical_snapshot) =
+    let (mut refreshed, manifest, bundle_canonical_snapshot, artifacts) =
         fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    // Preserve the original `id` + `created_at` so the row is
-    // recognisably "the same row, refreshed" — `last_refreshed_at`
-    // and `manifest_digest` are the ones that move.
     refreshed.id = existing.id;
     refreshed.created_at = existing.created_at;
     refreshed.updated_at = Some(Utc::now());
@@ -143,18 +154,35 @@ pub async fn refresh_enabled_image(
         .upsert_enabled_image(refreshed.clone())
         .await?;
 
-    // ADR 0014 M1.11: refresh also re-runs the templates cascade, so
-    // a registry image that was re-baked (same URI, new
-    // canonical_snapshot) gets a fresh templates row pointing at the
-    // new snapshot. upsert_template's internal transaction flips the
-    // prior active row to false.
+    // ADR 0014 M1.11: refresh re-runs the full pipeline —
+    // materialize the new artifact's chunks/state/sidecar into
+    // BlobStorage, then cascade. upsert_template's internal
+    // transaction flips the prior active row to false so warm-pool
+    // hosts pick up the new snapshot on the next heartbeat-ack.
+    // Content-addressed chunks dedup against the prior bake
+    // automatically — only genuinely new bytes hit the wire.
     if let Some(snapshot) = bundle_canonical_snapshot {
-        if let Err(e) = cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await {
-            tracing::warn!(
-                image_uri = %req.image_uri,
-                error = %e,
-                "refreshed image; templates cascade failed (warm pool will not refill new snapshot)",
-            );
+        let materialized = materialize_template_artifacts(&state, snapshot, &artifacts).await;
+        match materialized {
+            Ok(snapshot) => {
+                if let Err(e) =
+                    cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await
+                {
+                    tracing::warn!(
+                        image_uri = %req.image_uri,
+                        error = %e,
+                        "refreshed image; templates cascade failed (warm pool will not refill new snapshot)",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    image_uri = %req.image_uri,
+                    error = %e,
+                    "refreshed image; OCI → BlobStorage materialization failed \
+                     (warm pool will not refill new snapshot)",
+                );
+            }
         }
     }
 
@@ -180,26 +208,36 @@ pub async fn disable_enabled_image(
     }
 }
 
-/// Pull the manifest.toml + (optional) bundle.json layers of an
-/// engram image artifact, validate them, and return:
+/// Pull the full engram OCI artifact at `image_uri` and validate
+/// it. Returns:
 ///   - the `EnabledImage` row ready to upsert,
 ///   - the parsed `ImageManifest` (so the caller can read resource
 ///     hints for the templates cascade),
 ///   - the bundle's `canonical_snapshot` block if present (ADR
-///     0014 M1.11 cascade input).
+///     0014 M1.11 cascade input),
+///   - the full `TemplateArtifacts` (state.bin, sidecar, chunks
+///     blobs, bootstrap layers) — the materializer downstream
+///     re-shards these into the deployment's BlobStorage so prod
+///     host-agents can restore by canonical key.
 ///
 /// Bundle.json is optional: artifacts baked before ADR 0014 M1.3
 /// don't carry it. We still enable the image; the cascade is skipped.
-/// The caller preserves `id` + `created_at` on the EnabledImage if
-/// this is a refresh; the new row here always carries fresh values.
 async fn fetch_and_seal_manifest(
     state: &SharedState,
     image_uri: &str,
-) -> Result<(EnabledImage, ImageManifest, Option<SnapshotMetadata>), ApiError> {
-    let layers = state
+) -> Result<
+    (
+        EnabledImage,
+        ImageManifest,
+        Option<SnapshotMetadata>,
+        engram_oci::TemplateArtifacts,
+    ),
+    ApiError,
+> {
+    let artifacts = state
         .services
         .oci
-        .pull_engram_metadata(image_uri)
+        .pull_template_artifacts(image_uri)
         .await
         .map_err(|e| {
             ApiError::BadRequest(format!(
@@ -209,24 +247,19 @@ async fn fetch_and_seal_manifest(
             ))
         })?;
 
-    let manifest_toml = String::from_utf8(layers.manifest_toml).map_err(|e| {
+    let manifest_toml = String::from_utf8(artifacts.manifest_toml.clone()).map_err(|e| {
         ApiError::BadRequest(format!(
             "manifest layer for `{image_uri}` is not valid UTF-8: {e}"
         ))
     })?;
 
-    // Validate the TOML parses cleanly. `manifest_toml` is the source
-    // of truth; the parsed `ImageManifest` is consumed by the M1.11
-    // cascade to read suggested_{vcpus,memory_mib}.
     let manifest: ImageManifest = toml::from_str(&manifest_toml).map_err(|e| {
         ApiError::BadRequest(format!(
             "manifest.toml at `{image_uri}` failed to parse as engram ImageManifest: {e}"
         ))
     })?;
 
-    // Bundle.json parse is best-effort: if it's malformed or
-    // canonical_snapshot is absent, the cascade simply doesn't fire.
-    let canonical_snapshot = layers.bundle_json.as_deref().and_then(|bytes| {
+    let canonical_snapshot = artifacts.bundle_json.as_deref().and_then(|bytes| {
         serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
             .and_then(|root| root.get("canonical_snapshot").cloned())
@@ -238,12 +271,238 @@ async fn fetch_and_seal_manifest(
         id: Uuid::new_v4(),
         image_uri: image_uri.to_string(),
         manifest_toml,
-        manifest_digest: layers.manifest_digest.as_str().to_string(),
+        manifest_digest: artifacts.manifest_digest.as_str().to_string(),
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
     };
-    Ok((row, manifest, canonical_snapshot))
+    Ok((row, manifest, canonical_snapshot, artifacts))
+}
+
+/// ADR 0014: persist a chunk-blob into BlobStorage at the content-
+/// addressed key for each chunk in `bootstrap`, plus the recon-
+/// structed `Manifest` at `manifest_ref`. Content-addressing means
+/// chunks present from a prior bake are skipped — only genuinely
+/// new bytes hit the wire. Bounded-parallel exists+put fans out so
+/// the materialization isn't a thousand-deep sequential round-trip.
+///
+/// Returns the chunk counts so the caller can surface a "wrote
+/// 47 of 1024 chunks (rest deduplicated)" status line.
+async fn materialize_chunk_blob(
+    blob: &dyn engram_core::traits::BlobStorage,
+    chunk_store: &engram_chunk_store::ChunkStore,
+    manifest_ref: engram_core::types::manifest::ManifestRef,
+    bootstrap_json: &[u8],
+    chunks_blob: &[u8],
+) -> Result<(usize, usize), ApiError> {
+    let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(bootstrap_json)
+        .map_err(|e| ApiError::Internal(format!("parse bootstrap json: {e}")))?;
+    let manifest = bootstrap.to_manifest();
+
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut tasks = FuturesUnordered::new();
+    // GCS is comfortable with high concurrency on a single bucket
+    // (documented at 5k writes/sec/bucket once you spread keys).
+    // The materializer is the latency-critical path on enable —
+    // bump concurrency so a 1024-chunk memory.bin materializes in
+    // seconds rather than minutes. Coord's other workloads are
+    // not on this hot path.
+    let concurrency = 64;
+    let mut iter = bootstrap.entries.iter();
+    let mut written = 0usize;
+    let mut deduped = 0usize;
+
+    async fn process_one(
+        blob: &dyn engram_core::traits::BlobStorage,
+        entry: engram_chunk_store::BootstrapEntry,
+        chunks_blob_slice: bytes::Bytes,
+    ) -> Result<bool, ApiError> {
+        let key = entry.sha256.storage_key();
+        // exists-then-put is the dedup. A redundant put would still
+        // be semantically a no-op (same content at same key), but
+        // skipping the upload saves bandwidth + GCS write quota.
+        match blob.exists(&key).await {
+            Ok(true) => Ok(false),
+            Ok(false) => {
+                blob.put(&key, chunks_blob_slice)
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("put chunk {}: {e}", entry.sha256)))?;
+                Ok(true)
+            }
+            Err(e) => Err(ApiError::Internal(format!(
+                "exists probe {}: {e}",
+                entry.sha256
+            ))),
+        }
+    }
+
+    // Prime the pump.
+    for _ in 0..concurrency {
+        if let Some(entry) = iter.next() {
+            let start = entry.blob_offset as usize;
+            let end = start
+                .checked_add(entry.length as usize)
+                .ok_or_else(|| ApiError::Internal("chunk offset+length overflow".into()))?;
+            if end > chunks_blob.len() {
+                return Err(ApiError::Internal(format!(
+                    "chunks blob too short for entry {}: end={end}, blob_len={}",
+                    entry.sha256,
+                    chunks_blob.len()
+                )));
+            }
+            let slice = bytes::Bytes::copy_from_slice(&chunks_blob[start..end]);
+            tasks.push(process_one(blob, entry.clone(), slice));
+        }
+    }
+    while let Some(res) = tasks.next().await {
+        match res? {
+            true => written += 1,
+            false => deduped += 1,
+        }
+        if let Some(entry) = iter.next() {
+            let start = entry.blob_offset as usize;
+            let end = start + entry.length as usize;
+            let slice = bytes::Bytes::copy_from_slice(&chunks_blob[start..end]);
+            tasks.push(process_one(blob, entry.clone(), slice));
+        }
+    }
+
+    // After every chunk landed, the manifest JSON itself goes in
+    // BlobStorage. host-agent's `chunk_store.get_manifest(mref)`
+    // resolves through the same backend; a manifest with missing
+    // chunks would be a footgun (faults on first read).
+    //
+    // put_manifest refuses to overwrite — that's the right
+    // primitive for sessions (snapshot_id + version is supposed to
+    // be unique). For the materializer, re-enabling the same
+    // image is a real workflow (operator retry, idempotent
+    // refresh), so probe first and only write when absent. The
+    // chunks themselves are content-addressed so the same bytes
+    // land at the same keys regardless of how many times we run.
+    match chunk_store.get_manifest(manifest_ref).await {
+        Ok(_) => {
+            tracing::debug!(
+                manifest = %manifest_ref,
+                "manifest already present in BlobStorage; skipping put_manifest"
+            );
+        }
+        Err(_) => {
+            chunk_store
+                .put_manifest(manifest_ref, &manifest)
+                .await
+                .map_err(|e| ApiError::Internal(format!("put_manifest {manifest_ref}: {e}")))?;
+        }
+    }
+
+    Ok((written, deduped))
+}
+
+/// ADR 0014 M1.11: materialize the bake's OCI artifact into the
+/// deployment's BlobStorage so prod host-agents can restore the
+/// template by canonical key. Three pieces land in the store:
+///   1. memory chunks (via `materialize_chunk_blob` with the
+///      memory bootstrap + chunks layer)
+///   2. state.bin → BlobStorage at `state_blob_key(snapshot_id)`
+///   3. sidecar.json → BlobStorage at `sidecar_blob_key(snapshot_id)`
+///
+/// Returns the updated `SnapshotMetadata` with the canonical
+/// state/sidecar keys stamped on so the snapshots row reflects
+/// where the bytes actually live.
+async fn materialize_template_artifacts(
+    state: &SharedState,
+    mut snapshot: SnapshotMetadata,
+    artifacts: &engram_oci::TemplateArtifacts,
+) -> Result<SnapshotMetadata, ApiError> {
+    let blob = state.services.blob.clone();
+
+    // Memory chunks + manifest. Only fires when the bake actually
+    // captured canonical memory (both `memory_bootstrap_json` and
+    // `memory_chunks_blob` must be present, paired by push-side
+    // symmetry check). Without these, the snapshot is "metadata
+    // only" — restorable from rootfs but with no memory dedup.
+    if let (Some(boot), Some(blob_bytes), Some(mref)) = (
+        artifacts.memory_bootstrap_json.as_deref(),
+        artifacts.memory_chunks_blob.as_deref(),
+        snapshot.memory_manifest,
+    ) {
+        let (wrote, deduped) = materialize_chunk_blob(
+            blob.as_ref(),
+            &state.services.chunk_store,
+            mref,
+            boot,
+            blob_bytes,
+        )
+        .await?;
+        tracing::info!(
+            snapshot_id = %snapshot.id,
+            manifest = %mref,
+            wrote,
+            deduped,
+            "materialized memory chunks into BlobStorage",
+        );
+    }
+
+    // Disk chunks + manifest. Same shape as memory; `disk_manifest`
+    // is the ref the host's NBD daemon / materialize-to-file path
+    // queries. Without this, the cold-create path falls back to
+    // pulling the rootfs.ext4 layer (slow), or to on-fault Range-GET
+    // against the OCI artifact (works but reaches back to the
+    // registry every miss).
+    if let (Some(boot), Some(blob_bytes), Some(mref)) = (
+        artifacts.disk_bootstrap_json.as_deref(),
+        artifacts.disk_chunks_blob.as_deref(),
+        snapshot.disk_manifest,
+    ) {
+        let (wrote, deduped) = materialize_chunk_blob(
+            blob.as_ref(),
+            &state.services.chunk_store,
+            mref,
+            boot,
+            blob_bytes,
+        )
+        .await?;
+        tracing::info!(
+            snapshot_id = %snapshot.id,
+            manifest = %mref,
+            wrote,
+            deduped,
+            "materialized disk chunks into BlobStorage",
+        );
+    }
+
+    // state.bin
+    if let Some(bytes) = artifacts.snapshot_state.as_deref() {
+        let key = engram_chunk_store::snapshot_blob::state_blob_key(snapshot.id);
+        // dedup probe is cheap; same content at the same key from a
+        // prior enable would re-PUT for nothing.
+        if !blob
+            .exists(&key)
+            .await
+            .map_err(|e| ApiError::Internal(format!("exists probe state.bin: {e}")))?
+        {
+            blob.put(&key, bytes::Bytes::copy_from_slice(bytes))
+                .await
+                .map_err(|e| ApiError::Internal(format!("put state.bin at {key}: {e}")))?;
+        }
+        snapshot.state_blob_key = Some(key);
+    }
+
+    // sidecar.json
+    if let Some(bytes) = artifacts.snapshot_sidecar_json.as_deref() {
+        let key = engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot.id);
+        if !blob
+            .exists(&key)
+            .await
+            .map_err(|e| ApiError::Internal(format!("exists probe sidecar: {e}")))?
+        {
+            blob.put(&key, bytes::Bytes::copy_from_slice(bytes))
+                .await
+                .map_err(|e| ApiError::Internal(format!("put sidecar at {key}: {e}")))?;
+        }
+        snapshot.sidecar_blob_key = Some(key);
+    }
+
+    Ok(snapshot)
 }
 
 /// ADR 0014 M1.11: insert `snapshots` + `templates` rows from a
@@ -328,4 +587,112 @@ async fn cascade_into_templates(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_chunk_store::{Bootstrap, BootstrapEntry, ChunkSize, ManifestKind, ManifestRef};
+    use engram_core::traits::BlobStorage;
+    use engram_storage_local::LocalBlobStorage;
+    use std::sync::Arc;
+
+    /// Regression guard for the OCI → BlobStorage materializer.
+    /// Constructs a synthetic chunks-blob + bootstrap, runs the
+    /// slicing logic, and asserts:
+    ///   1. each chunk lands at its content-addressed key
+    ///   2. the manifest lands at the supplied ManifestRef
+    ///   3. a second call against the same BlobStorage dedups
+    ///      (no redundant puts on top of identical bytes)
+    #[tokio::test]
+    async fn materialize_chunk_blob_writes_chunks_and_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+
+        // Two chunks of distinct bytes. Hash → storage key derivation
+        // mirrors what the bake's chunk_file produces.
+        // Manifest validation requires per-chunk offsets to be
+        // multiples of chunk_size. Use a tiny chunk_size (64 B) +
+        // pad each chunk to that boundary so the test stays
+        // self-contained without a 512 KiB allocation.
+        let chunk_size_u32: u32 = 64;
+        let chunk_size = ChunkSize::bytes(chunk_size_u32 as u64);
+        let mut c0 = b"chunk-zero".to_vec();
+        c0.resize(chunk_size_u32 as usize, 0);
+        let mut c1 = b"chunk-one-different".to_vec();
+        c1.resize(chunk_size_u32 as usize, 0);
+        let h0 = engram_chunk_store::ChunkHash::of(&c0);
+        let h1 = engram_chunk_store::ChunkHash::of(&c1);
+        let mut chunks_blob = Vec::new();
+        chunks_blob.extend_from_slice(&c0);
+        chunks_blob.extend_from_slice(&c1);
+
+        let bootstrap = Bootstrap {
+            schema_version: engram_chunk_store::BOOTSTRAP_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            total_bytes: (c0.len() + c1.len()) as u64,
+            chunk_size,
+            entries: vec![
+                BootstrapEntry {
+                    file_offset: 0,
+                    blob_digest: None,
+                    blob_offset: 0,
+                    length: c0.len() as u32,
+                    sha256: h0,
+                },
+                BootstrapEntry {
+                    file_offset: c0.len() as u64,
+                    blob_digest: None,
+                    blob_offset: c0.len() as u64,
+                    length: c1.len() as u32,
+                    sha256: h1,
+                },
+            ],
+        };
+        let bootstrap_json = serde_json::to_vec(&bootstrap).unwrap();
+        let manifest_ref = ManifestRef::new();
+
+        let (wrote, deduped) = materialize_chunk_blob(
+            blob.as_ref(),
+            &chunk_store,
+            manifest_ref,
+            &bootstrap_json,
+            &chunks_blob,
+        )
+        .await
+        .expect("materialize");
+        assert_eq!(wrote, 2);
+        assert_eq!(deduped, 0);
+
+        // Chunks landed at their content-addressed keys.
+        for (h, body) in [(h0, &c0), (h1, &c1)] {
+            let got = blob.get(&h.storage_key()).await.expect("get chunk");
+            assert_eq!(got.as_ref(), body.as_slice());
+        }
+
+        // Manifest landed at the canonical ref.
+        let m = chunk_store
+            .get_manifest(manifest_ref)
+            .await
+            .expect("get_manifest");
+        assert_eq!(m.chunks.len(), 2);
+        assert_eq!(m.chunks[0].hash, h0);
+        assert_eq!(m.chunks[1].hash, h1);
+        assert_eq!(m.total_bytes, bootstrap.total_bytes);
+
+        // Second call dedups — same content, same keys, nothing
+        // re-written. This is the optimization the user asked about.
+        let (wrote2, deduped2) = materialize_chunk_blob(
+            blob.as_ref(),
+            &chunk_store,
+            manifest_ref,
+            &bootstrap_json,
+            &chunks_blob,
+        )
+        .await
+        .expect("materialize again");
+        assert_eq!(wrote2, 0, "second materialize should dedup all chunks");
+        assert_eq!(deduped2, 2);
+    }
 }

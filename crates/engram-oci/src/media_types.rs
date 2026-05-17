@@ -55,3 +55,37 @@ pub const ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE: &str =
 /// 512 KB chunks. Pulled via Range GET on UFFD fault when the
 /// chunk isn't in the local NVMe cache and isn't in BlobStorage.
 pub const ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE: &str = "application/vnd.engram.chunks.memory.v1";
+
+// ---- ADR 0014 M1.3 / M1.11: canonical-snapshot state + sidecar ----
+//
+// The bake's `capture_canonical_memory` produces a portable FC
+// snapshot. Three pieces are needed to restore on a sibling host:
+//
+//   1. memory.bin — chunked into the (memory bootstrap, chunks
+//      memory) layers above. Large.
+//   2. state.bin — opaque FC vCPU/device state. Small (few MiB).
+//   3. manifest.json — the FC sidecar describing the snapshot
+//      (memory layout, drives, etc.). Tiny.
+//
+// Before these media types existed, the bake uploaded #2 and #3
+// directly to `BlobStorage` at canonical keys derived from
+// snapshot_id. That coupled the bake's environment to the
+// production deployment's blob backend — a bake on a CI runner
+// with no GCS credentials produced an OCI artifact prod hosts
+// couldn't restore. With these layers in OCI, the bake is
+// self-contained: `engram-coordinator::enable_image` pulls them
+// and writes to its own `BlobStorage` at the canonical keys.
+
+/// Engram canonical-snapshot `state.bin` layer — opaque FC state
+/// bytes captured at bake time. Small (a few MiB). Coord
+/// materializes to BlobStorage at `state_blob_key(snapshot_id)`
+/// on enable-image so host-agents can restore without needing
+/// to re-fetch from OCI.
+pub const ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE: &str = "application/vnd.engram.snapshot.state.v1";
+
+/// Engram canonical-snapshot sidecar `manifest.json` layer — FC's
+/// own JSON manifest describing the snapshot's memory regions +
+/// device layout. Tiny. Coord materializes to BlobStorage at
+/// `sidecar_blob_key(snapshot_id)` on enable-image.
+pub const ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE: &str =
+    "application/vnd.engram.snapshot.sidecar.v1+json";

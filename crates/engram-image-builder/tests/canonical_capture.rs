@@ -128,8 +128,13 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
         memory_mib: Some(128),
     };
 
+    // ADR 0014 M1.11: `capture_canonical_memory` now stages
+    // state.bin + sidecar into `image_dir` (so push_to_registry
+    // can layer them into OCI). Tests don't push — just point at
+    // any writable tempdir and ignore the staged files.
+    let stage = tempfile::tempdir().expect("stage tempdir");
     let snapshot_metadata = match builder
-        .capture_canonical_memory(&rootfs, &capture_cfg)
+        .capture_canonical_memory(&rootfs, stage.path(), &capture_cfg)
         .await
     {
         Ok(r) => r,
@@ -150,6 +155,35 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
         manifest.total_bytes > 0,
         "canonical memory must have content"
     );
+
+    // ADR 0014 M1.11: state.bin + sidecar are now staged into
+    // image_dir for push_to_registry to layer into OCI. Verify
+    // both exist and are non-empty — the OCI roundtrip relies on
+    // them being readable from this exact path.
+    let staged_state = stage.path().join("snapshot.state.bin");
+    let staged_sidecar = stage.path().join("snapshot.sidecar.json");
+    assert!(
+        staged_state.exists(),
+        "state.bin must be staged at {}",
+        staged_state.display()
+    );
+    assert!(
+        staged_sidecar.exists(),
+        "sidecar must be staged at {}",
+        staged_sidecar.display()
+    );
+    assert!(
+        tokio::fs::metadata(&staged_state).await.unwrap().len() > 0,
+        "staged state.bin must be non-empty"
+    );
+    assert!(
+        tokio::fs::metadata(&staged_sidecar).await.unwrap().len() > 0,
+        "staged sidecar must be non-empty"
+    );
+    // Coord assigns the blob keys at enable-image; bake leaves
+    // them None now.
+    assert!(snapshot_metadata.state_blob_key.is_none());
+    assert!(snapshot_metadata.sidecar_blob_key.is_none());
 
     // Materialize it back to verify chunks are reachable.
     let recovered = tmp.path().join("recovered-canonical.bin");
