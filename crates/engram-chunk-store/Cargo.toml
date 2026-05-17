@@ -15,6 +15,11 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+# ADR 0014 M1.15: chunk-cache hit/miss/eviction metrics emit through
+# the global `metrics::*` recorder that the host-agent's Prometheus
+# exporter binds at boot. When no recorder is installed (unit tests
+# without the exporter) the macros are cheap no-ops.
+metrics.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

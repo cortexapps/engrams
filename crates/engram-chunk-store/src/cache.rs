@@ -183,6 +183,14 @@ impl ChunkCache {
             // (concurrent mutation, FS bit-rot, our own bugs).
             let actual = ChunkHash::of(&bytes);
             if actual == hash {
+                // ADR 0014 M1.15: local NVMe hit. Don't differentiate
+                // singleflight-piggyback from true cache hit here —
+                // the user-visible win is the same.
+                metrics::counter!(
+                    "engram_chunk_cache_hits_total",
+                    "tier" => "nvme",
+                )
+                .increment(1);
                 return Ok(bytes);
             }
             // Mismatch: drop the local copy and fall through to
@@ -221,6 +229,17 @@ impl ChunkCache {
             for waiter in waiters {
                 let _ = waiter.send(clone_result(&result));
             }
+            // ADR 0014 M1.15: counts the leader's fetch as a miss
+            // (we went to the underlying store). Singleflight
+            // followers are accounted as nvme hits when they
+            // re-enter `get` on a subsequent call — they're
+            // counted via the rx-await arm here only when the
+            // leader's fetch failed, which is rare.
+            metrics::counter!(
+                "engram_chunk_cache_hits_total",
+                "tier" => "blobstorage",
+            )
+            .increment(1);
             result
         } else {
             // We're not the first; the closure we were passed is
@@ -356,6 +375,10 @@ impl ChunkCache {
     async fn evict_to_budget(&self) -> Result<()> {
         let mut entries = self.list_entries().await?;
         let total: u64 = entries.iter().map(|e| e.size).sum();
+        // ADR 0014 M1.15: snapshot of current cache size at every
+        // budget check. Cheap; the metric is read by the dashboard,
+        // not the hot path.
+        metrics::gauge!("engram_chunk_cache_size_bytes").set(total as f64);
         let budget = self.inner.config.budget_bytes;
         if total <= budget {
             return Ok(());
@@ -373,6 +396,14 @@ impl ChunkCache {
             }
             let _ = fs::remove_file(&entry.path).await;
             over = over.saturating_sub(entry.size);
+            // ADR 0014 M1.15: per-chunk LRU eviction counter.
+            // Operators watch the rate to know if the budget is
+            // too small for the working set.
+            metrics::counter!(
+                "engram_chunk_cache_evictions_total",
+                "reason" => "lru",
+            )
+            .increment(1);
             tracing::trace!(
                 hash = %entry.hash,
                 bytes = entry.size,

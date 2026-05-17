@@ -816,6 +816,7 @@ dependencies = [
  "engram-storage-gcs",
  "engram-storage-local",
  "futures",
+ "metrics",
  "parking_lot",
  "serde",
  "serde_json",
