@@ -1,4 +1,5 @@
 /target
+/.nix
 **/*.rs.bk
 *.pdb
 

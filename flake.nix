@@ -59,7 +59,33 @@
           };
 
           shellHook = ''
-            echo "engram dev shell — rustc $(rustc --version | awk '{print $2}'), just $(just --version | awk '{print $2}'), fc=system"
+            # Insulate cargo from the host's rustup installation.
+            #
+            # cargo searches for external subcommands (cargo-clippy,
+            # cargo-fmt, …) in $CARGO_HOME/bin *before* PATH. If the
+            # host has rustup, ~/.cargo/bin holds host-built plugins
+            # that get preferred over the nix toolchain's, even
+            # inside `nix develop`. On systems where the host glibc
+            # is older than nix's (e.g. Ubuntu 22.04 host glibc 2.35
+            # vs. nix glibc 2.42), those host plugins fail to dlopen
+            # nix-built proc-macro .so files with `version GLIBC_2.X
+            # not found`.
+            #
+            # Fix: point CARGO_HOME at a project-local directory so
+            # bin/ is empty → cargo falls through to PATH and picks
+            # nix's plugins. Symlink registry/ + git/ to the host's
+            # ~/.cargo so we share the crates.io index and avoid a
+            # cold re-download on first entry.
+            export CARGO_HOME="$PWD/.nix/cargo"
+            mkdir -p "$CARGO_HOME"
+            if [ -d "$HOME/.cargo" ]; then
+              for d in registry git; do
+                if [ ! -e "$CARGO_HOME/$d" ] && [ -d "$HOME/.cargo/$d" ]; then
+                  ln -s "$HOME/.cargo/$d" "$CARGO_HOME/$d"
+                fi
+              done
+            fi
+            echo "engram dev shell — rustc $(rustc --version | awk '{print $2}'), just $(just --version | awk '{print $2}'), fc=system, CARGO_HOME=$CARGO_HOME"
           '';
         };
 
