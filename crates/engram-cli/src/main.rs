@@ -261,6 +261,13 @@ enum HarnessCmd {
     Rm { name: String },
 }
 
+// `Build` has many optional path fields (rootfs source, agent
+// injection, bootstrap injection, canonical-capture kernel + FC
+// binary, …). Boxing each one to silence `large_enum_variant`
+// would just move the bytes off the stack without gaining anything
+// — clap parses this enum exactly once at startup, so the size
+// doesn't matter on any hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum ImageCmd {
     /// List the operator-curated set of enabled images on the
@@ -365,6 +372,46 @@ enum ImageCmd {
         /// about the image when a session references its URI.
         #[arg(long)]
         push: Option<String>,
+
+        /// ADR 0014 M1.3 / M1.11: capture a canonical memory snapshot
+        /// at bake time by booting the just-built rootfs in a transient
+        /// FC microVM, snapshotting after `--canonical-boot-wait`, and
+        /// chunking memory.bin into the chunk store. The resulting
+        /// `SnapshotMetadata` is written into the OCI artifact's
+        /// `bundle.json` under `canonical_snapshot`; the coordinator's
+        /// `POST /api/enabled-images` cascade reads it and seeds the
+        /// `snapshots` + `templates` rows, which makes the host-agent
+        /// warm-pool refill the template's slot. Without this flag the
+        /// image still works but every session takes the cold path.
+        ///
+        /// Requires `--canonical-kernel` (FC vmlinux) on the build host;
+        /// firecracker binary is looked up on PATH unless
+        /// `--canonical-firecracker-bin` is set.
+        #[arg(long, requires = "canonical_kernel")]
+        capture_canonical_memory: bool,
+
+        /// FC kernel image (vmlinux) used for the canonical-capture
+        /// transient VM. Only consulted when `--capture-canonical-memory`
+        /// is set.
+        #[arg(long)]
+        canonical_kernel: Option<PathBuf>,
+
+        /// Firecracker binary for the canonical-capture VM. Defaults to
+        /// PATH lookup.
+        #[arg(long)]
+        canonical_firecracker_bin: Option<PathBuf>,
+
+        /// Wall-clock seconds to wait after InstanceStart before taking
+        /// the canonical snapshot. Default 8s — generous enough for
+        /// typical Python/Node images to reach steady state. Set higher
+        /// for heavier rootfses.
+        #[arg(long, default_value = "8")]
+        canonical_boot_wait_secs: u64,
+
+        /// Guest RAM (MiB) for the canonical-capture VM. Default 512.
+        /// memory.bin in the snapshot is dominated by this.
+        #[arg(long)]
+        canonical_memory_mib: Option<u32>,
     },
 }
 
@@ -469,7 +516,24 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 inject_bootstrap,
                 transport,
                 push,
+                capture_canonical_memory,
+                canonical_kernel,
+                canonical_firecracker_bin,
+                canonical_boot_wait_secs,
+                canonical_memory_mib,
             } => {
+                let canonical = if *capture_canonical_memory {
+                    Some(engram_image_builder::CanonicalCaptureConfig {
+                        kernel_image_path: canonical_kernel
+                            .clone()
+                            .expect("clap `requires` enforces --canonical-kernel with --capture-canonical-memory"),
+                        firecracker_bin: canonical_firecracker_bin.clone(),
+                        boot_wait: std::time::Duration::from_secs(*canonical_boot_wait_secs),
+                        memory_mib: *canonical_memory_mib,
+                    })
+                } else {
+                    None
+                };
                 image_build(
                     repo,
                     source,
@@ -481,6 +545,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     inject_bootstrap.as_deref(),
                     *transport,
                     push.as_deref(),
+                    canonical,
                 )
                 .await
             }
@@ -1091,6 +1156,7 @@ async fn image_build(
     inject_bootstrap: Option<&Path>,
     transport: engram_image_builder::Transport,
     push: Option<&str>,
+    capture_canonical_memory: Option<engram_image_builder::CanonicalCaptureConfig>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
@@ -1114,7 +1180,7 @@ async fn image_build(
         format,
         agent_injection,
         canonical_memory_manifest: None,
-        capture_canonical_memory: None,
+        capture_canonical_memory,
         parent_disk_bootstrap_path: None,
         parent_disk_chunks_blob_digest: None,
     };
