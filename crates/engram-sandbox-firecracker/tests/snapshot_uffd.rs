@@ -167,6 +167,7 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         state_blob_key: metadata.state_blob_key.clone(),
         sidecar_blob_key: metadata.sidecar_blob_key.clone(),
         rootfs_blob_key: metadata.rootfs_blob_key.clone(),
+        working_set_blob_key: metadata.working_set_blob_key.clone(),
     };
     let restored_id = match backend.restore(restore_metadata).await {
         Ok(id) => id,
