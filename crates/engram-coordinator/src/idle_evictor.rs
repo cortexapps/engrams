@@ -60,7 +60,7 @@ pub async fn evict_idle_session(
     let now = Utc::now();
     let record = SnapshotRecord {
         id: metadata.id,
-        session_id,
+        session_id: Some(session_id),
         host_id,
         image_version: metadata.image_version.clone(),
         size_bytes: metadata.size_bytes,

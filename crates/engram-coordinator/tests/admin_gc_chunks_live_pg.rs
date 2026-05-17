@@ -160,7 +160,7 @@ async fn create_session(meta: &Arc<dyn MetadataStore>, image: &str) -> SessionId
 fn snapshot_for(session_id: SessionId, disk_manifest: Option<ManifestRef>) -> SnapshotRecord {
     SnapshotRecord {
         id: SnapshotId::new(),
-        session_id,
+        session_id: Some(session_id),
         host_id: None,
         image_version: "warm-test".into(),
         size_bytes: 0,

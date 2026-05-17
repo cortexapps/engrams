@@ -78,7 +78,7 @@ pub async fn snapshot(
     .await;
     let record = SnapshotRecord {
         id: metadata.id,
-        session_id: id,
+        session_id: Some(id),
         host_id,
         image_version: metadata.image_version,
         size_bytes: metadata.size_bytes,

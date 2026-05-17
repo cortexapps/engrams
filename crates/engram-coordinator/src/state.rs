@@ -796,7 +796,7 @@ pub(crate) mod tests {
                 .snapshots
                 .lock()
                 .iter()
-                .filter(|s| s.session_id == sid)
+                .filter(|s| s.session_id == Some(sid))
                 .cloned()
                 .collect())
         }
@@ -808,7 +808,7 @@ pub(crate) mod tests {
                 .snapshots
                 .lock()
                 .iter()
-                .rfind(|s| s.session_id == sid)
+                .rfind(|s| s.session_id == Some(sid))
                 .cloned())
         }
         async fn append_session_event(

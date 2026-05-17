@@ -74,7 +74,11 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
 
 pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
-    let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
+    // Migration 0028 made session_id nullable so template snapshots
+    // produced by the M1.11 enabled_images cascade don't need a
+    // sentinel FK. Existing session-bound rows continue to populate
+    // it; template rows leave it NULL.
+    let session_id: Option<Uuid> = row.try_get("session_id").map_err(col_err)?;
     let host_id: Option<Uuid> = row.try_get("host_id").map_err(col_err)?;
     let size_bytes: i64 = row.try_get("size_bytes").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
@@ -105,7 +109,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     let recoverable: bool = row.try_get("recoverable").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
-        session_id: SessionId(session_id),
+        session_id: session_id.map(SessionId),
         host_id: host_id.map(HostId),
         image_version: row.try_get("image_version").map_err(col_err)?,
         size_bytes: size_bytes.max(0) as u64,

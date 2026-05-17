@@ -69,7 +69,14 @@ pub struct SnapshotMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
-    pub session_id: SessionId,
+    /// `None` for template snapshots produced by the image-builder
+    /// at bake time (ADR 0014 M1.11): the snapshot is a template
+    /// artifact, not a session capture, so the FK to `sessions` is
+    /// not meaningful. Session-bound snapshots (idle-eviction,
+    /// graceful-drain, M2 background uploader) still set it. The
+    /// underlying column was made nullable in migration 0028.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub host_id: Option<HostId>,
     pub image_version: String,
     pub size_bytes: u64,

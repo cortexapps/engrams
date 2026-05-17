@@ -304,25 +304,25 @@ impl OciClient {
         })
     }
 
-    /// Fetch only the engram manifest.toml layer of an engram image
-    /// artifact, plus its top-level manifest digest. Skips the
-    /// rootfs.ext4 layer entirely — the registry's `pull` returns the
-    /// full layer set, but we drop the rootfs blob without writing it.
-    /// Returns `(manifest_bytes, manifest_digest)`.
+    /// Fetch the engram manifest.toml layer and the optional
+    /// bundle.json layer of an engram image artifact, plus the
+    /// top-level manifest digest. Skips writing the rootfs.ext4
+    /// layer entirely.
     ///
     /// Used by the coordinator's `/api/enabled-images` POST handler:
     /// when an operator enables an image, we cache its parsed
     /// manifest on the row so session-create has zero registry I/O.
+    /// ADR 0014 M1.11 added the bundle.json extraction so the same
+    /// pull also drives the templates-cascade — when the bundle
+    /// carries a `canonical_snapshot` block, the handler inserts
+    /// `snapshots` + `templates` rows in one PG transaction.
+    ///
     /// `oci-distribution`'s `pull` is a single round-trip for the
     /// index + all layer blobs, so we still pay one fetch for the
-    /// rootfs bytes — but we don't write them anywhere, and on a
-    /// public registry that's a wash. The savings vs. a full
-    /// `pull_image()` are storage (no rootfs.ext4 file written) and
-    /// cleanup (no temp dir to manage).
-    pub async fn pull_engram_manifest_only(
-        &self,
-        uri: &str,
-    ) -> Result<(Vec<u8>, Digest256), OciError> {
+    /// rootfs bytes — but we don't write them anywhere. The
+    /// savings vs. a full `pull_image()` are storage (no rootfs.ext4
+    /// file written) and cleanup (no temp dir to manage).
+    pub async fn pull_engram_metadata(&self, uri: &str) -> Result<EngramMetadataLayers, OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
@@ -332,10 +332,8 @@ impl OciClient {
         // Must list every media type the artifact may carry —
         // oci-client validates each pulled layer against this set and
         // errors on the first mismatch (even though we only consume
-        // the manifest.toml layer here). Keep this in sync with
-        // [`Self::pull_image`]'s accepted list. ADR 0007 adds the
-        // bundle layer; ADR 0008 Phase 3 adds the chunked-OCI
-        // bootstrap + chunks blob layers.
+        // the manifest + bundle layers here). Keep this in sync with
+        // [`Self::pull_image`]'s accepted list.
         let accepted = vec![
             ENGRAM_MANIFEST_MEDIA_TYPE,
             ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
@@ -358,11 +356,17 @@ impl OciClient {
             .ok_or_else(|| {
                 OciError::Distribution("pulled artifact missing engram manifest layer".into())
             })?;
+        let bundle_bytes = data
+            .layers
+            .iter()
+            .find(|l| l.media_type == ENGRAM_BUNDLE_MEDIA_TYPE)
+            .map(|l| l.data.clone());
 
-        Ok((
-            manifest_layer.data.clone(),
-            Digest256(data.digest.unwrap_or_default()),
-        ))
+        Ok(EngramMetadataLayers {
+            manifest_toml: manifest_layer.data.clone(),
+            manifest_digest: Digest256(data.digest.unwrap_or_default()),
+            bundle_json: bundle_bytes,
+        })
     }
 
     /// Push a harness pack artifact. Tars + gzips `pack_dir` and pushes
@@ -628,6 +632,22 @@ impl Digest256 {
     pub fn hex(&self) -> &str {
         self.0.strip_prefix("sha256:").unwrap_or(&self.0)
     }
+}
+
+/// Result of `pull_engram_metadata`. Carries the manifest.toml
+/// layer bytes plus, when present, the bundle.json layer bytes —
+/// both layers are small (manifest is hundreds of bytes; bundle is
+/// tens of KiB). The caller (coord's `/api/enabled-images` handler)
+/// decodes each as needed.
+#[derive(Clone, Debug)]
+pub struct EngramMetadataLayers {
+    pub manifest_toml: Vec<u8>,
+    pub manifest_digest: Digest256,
+    /// `None` for artifacts that pre-date ADR 0014 M1.3 (no
+    /// `bundle.json` layer was attached at bake). Older bakes
+    /// still enable cleanly; they just don't cascade into a
+    /// templates row.
+    pub bundle_json: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]

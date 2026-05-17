@@ -207,11 +207,11 @@ impl MetadataStore for MockMetadataStore {
     }
 
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
-        self.snapshots
-            .lock()
-            .entry(snap.session_id)
-            .or_default()
-            .push(snap);
+        // Template snapshots (session_id=None) skip the per-session
+        // mock; the real PG store keys by snapshot_id directly.
+        if let Some(sid) = snap.session_id {
+            self.snapshots.lock().entry(sid).or_default().push(snap);
+        }
         Ok(())
     }
 

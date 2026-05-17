@@ -585,7 +585,7 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(snap.id.as_uuid())
-        .bind(snap.session_id.as_uuid())
+        .bind(snap.session_id.map(|s| s.as_uuid()))
         .bind(snap.host_id.map(|h| h.as_uuid()))
         .bind(&snap.image_version)
         .bind(snap.size_bytes as i64)

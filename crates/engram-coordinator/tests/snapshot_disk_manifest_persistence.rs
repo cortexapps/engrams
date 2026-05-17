@@ -59,7 +59,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
     };
     let snap_with = SnapshotRecord {
         id: SnapshotId::new(),
-        session_id,
+        session_id: Some(session_id),
         host_id: None,
         image_version: "warm-1".into(),
         size_bytes: 1024,
