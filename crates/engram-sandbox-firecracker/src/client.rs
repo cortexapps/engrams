@@ -253,6 +253,32 @@ impl FirecrackerClient {
         state_path: &Path,
         uffd_uds_path: &Path,
     ) -> Result<(), SandboxError> {
+        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ true)
+            .await
+    }
+
+    /// UFFD-backed load that leaves the VM paused. Caller must
+    /// follow up with `patch_vm_state(Resumed)`. Used by the ADR
+    /// 0014 option-D restore path so the host can `patch_drive` on
+    /// the harness substrate between load and resume — kernel
+    /// hasn't started executing yet, so the patch redirects the
+    /// next read of /dev/vdb to the session's harness ext4 instead
+    /// of the bake-time stub.
+    pub async fn load_snapshot_uffd_paused(
+        &self,
+        state_path: &Path,
+        uffd_uds_path: &Path,
+    ) -> Result<(), SandboxError> {
+        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ false)
+            .await
+    }
+
+    async fn load_snapshot_uffd_inner(
+        &self,
+        state_path: &Path,
+        uffd_uds_path: &Path,
+        resume_vm: bool,
+    ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
             mem_backend: MemBackend {
@@ -260,7 +286,7 @@ impl FirecrackerClient {
                 backend_path: uffd_uds_path.to_string_lossy().into_owned(),
             },
             enable_diff_snapshots: false,
-            resume_vm: true,
+            resume_vm,
         };
         self.put("/snapshot/load", &body).await
     }

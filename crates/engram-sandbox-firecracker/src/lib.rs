@@ -2282,6 +2282,41 @@ impl SandboxBackend for FirecrackerBackend {
         ip
     }
 
+    /// ADR 0014 M1.12: brief pause → `PATCH /drives` → resume on
+    /// the harness virtio-blk drive. Warm-pool lease path uses
+    /// this to swap the bake-time stub harness for the session's
+    /// chosen harness ext4 just before `start_agent` dials
+    /// bootstrap. ~30ms wall-clock on FC.
+    async fn swap_harness_drive(
+        &self,
+        id: SandboxId,
+        new_path: std::path::PathBuf,
+    ) -> Result<(), SandboxError> {
+        let api_sock = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.firecracker_socket.clone()
+        };
+        // Re-install the canonical symlink so state.bin's embedded
+        // path resolves on the next guest read. The session's
+        // harness ext4 lives in the host's image_cache; we point
+        // the canonical path at it.
+        let harness_canonical = paths::harness_canonical(&self.work_dir, id);
+        if let Err(e) = paths::install_symlink(&harness_canonical, &new_path).await {
+            return Err(SandboxError::Vm(
+                format!("install harness symlink for swap: {e}").into(),
+            ));
+        }
+        let api = FirecrackerClient::new(&api_sock);
+        api.patch_vm_state(VmState::Paused).await?;
+        let patch_result = api.patch_drive("harnesses", &harness_canonical).await;
+        // Always try to resume so a partial failure doesn't leave
+        // the VM paused. The patch error (if any) wins.
+        let resume_result = api.patch_vm_state(VmState::Resumed).await;
+        patch_result?;
+        resume_result?;
+        Ok(())
+    }
+
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -2373,9 +2408,29 @@ impl SandboxBackend for FirecrackerBackend {
         // launch frame). The connection drops on our end after the
         // write — bootstrap reads the frame and goes back to
         // accept().
+        // ADR 0014 M1.12 (option D): bootstrap mounts the harness
+        // device, not engram-init. Only sandboxes with an attached
+        // harness substrate get the mount instruction — sandboxes
+        // booted without a harness (rare, but supported for
+        // `kind = none` sessions) leave both fields None so bootstrap
+        // skips the mount step.
+        let has_harness = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.spec.harness_substrate.is_some()
+        };
+        let (harness_dev, harness_mount) = if has_harness {
+            (
+                Some("/dev/vdb".to_string()),
+                Some("/run/engram/harnesses".to_string()),
+            )
+        } else {
+            (None, None)
+        };
         let launch = engram_harness_proto::BootstrapLaunch {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
+            harness_dev,
+            harness_mount,
         };
         engram_harness_proto::write_msg(&mut conn, &launch)
             .await

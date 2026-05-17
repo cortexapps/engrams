@@ -294,10 +294,21 @@ impl HostAgent {
             let warm_pool = crate::warm_pool::WarmPool::new(
                 pooled.clone() as Arc<dyn engram_core::traits::SandboxBackend>
             );
-            let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            // ADR 0014 M1.12: option-D warm-lease needs the
+            // image_cache so it can resolve the session's
+            // harness_pack_uri to a host-local ext4 path before
+            // swap_harness_drive. Plumb it through the
+            // LocalHostClient builder.
+            let local_host_image_cache = self.image_cache.clone().map(Arc::new);
+            let local_host_egress_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
+            let mut local_host_builder =
                 crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone())
-                    .with_warm_pool(warm_pool.clone()),
-            );
+                    .with_warm_pool(warm_pool.clone());
+            if let Some(ic) = local_host_image_cache {
+                local_host_builder =
+                    local_host_builder.with_image_cache(ic, local_host_egress_ca_pem);
+            }
+            let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(local_host_builder);
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
             // intersects this against expected-active sessions to

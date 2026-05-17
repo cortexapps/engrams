@@ -416,12 +416,17 @@ impl GrpcHostClient {
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        harness_pack_uri: Option<String>,
     ) -> Result<(), SandboxError> {
         use crate::grpc::LaunchWarmRequest;
         let req = LaunchWarmRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             agent_bincode: encode_bincode(&agent, "AgentSpec")?,
             policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
+            // proto3 strings can't be Option; empty == None on the
+            // wire. Host's gRPC server maps "" → None before calling
+            // the HostClient trait method.
+            harness_pack_uri: harness_pack_uri.unwrap_or_default(),
         };
         self.inner
             .clone()
@@ -585,8 +590,9 @@ impl HostClient for GrpcHostClient {
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        harness_pack_uri: Option<String>,
     ) -> Result<(), SandboxError> {
-        Self::launch_warm_sandbox(self, sandbox_id, agent, policy).await
+        Self::launch_warm_sandbox(self, sandbox_id, agent, policy, harness_pack_uri).await
     }
 
     async fn list_warm_slots(

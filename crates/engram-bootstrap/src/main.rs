@@ -167,13 +167,66 @@ async fn main() -> ExitCode {
                 argv0 = %argv0,
                 argc = launch.argv.len(),
                 envc = launch.env.len(),
+                harness_dev = ?launch.harness_dev,
+                harness_mount = ?launch.harness_mount,
                 "spawning agent",
             );
+
+            // ADR 0014 M1.12 (option D): bootstrap mounts the harness
+            // device the host nominated. We do this here rather than
+            // in engram-init so warm-pool templates can be harness-
+            // agnostic — the template snapshot captures bootstrap on
+            // accept() before any harness mount has happened. The
+            // host PATCHes the harness drive per session, then sends
+            // a BootstrapLaunch frame pointing at the new device.
+            //
+            // engram-init left the mount point in place (idempotent
+            // mkdir), so we just need to call mount(2). Best-effort:
+            // a malformed harness ext4 surfaces a clear error in the
+            // serial console + we skip the exec so the session fails
+            // fast with no half-running agent.
+            let mut harness_mounted_at: Option<String> = None;
+            if let (Some(dev), Some(mount_point)) =
+                (launch.harness_dev.as_ref(), launch.harness_mount.as_ref())
+            {
+                if let Err(e) = mount_harness(dev, mount_point) {
+                    tracing::error!(
+                        error = %e,
+                        dev = %dev,
+                        mount = %mount_point,
+                        "harness mount failed; skipping spawn",
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    dev = %dev,
+                    mount = %mount_point,
+                    "harness mounted",
+                );
+                harness_mounted_at = Some(mount_point.clone());
+            }
 
             let mut cmd = Command::new(&argv0);
             cmd.args(&launch.argv[1..]);
             for (k, v) in &launch.env {
                 cmd.env(k, v);
+            }
+
+            // ADR 0014 M1.12: egress-proxy CA setup. Pre-M1.12 this
+            // ran in engram-init; moved here because the harness
+            // substrate (where the host stamps the CA at
+            // `.engram-host/ca.pem`) is mounted by bootstrap, not by
+            // init. Idempotent: each session gets a fresh CoW
+            // rootfs, so the append-to-ca-certificates.crt is
+            // per-session and can't accumulate.
+            if let Some(mount) = harness_mounted_at.as_ref() {
+                if let Err(e) = inject_egress_proxy_ca(mount, &mut cmd) {
+                    tracing::warn!(
+                        error = %e,
+                        mount = %mount,
+                        "egress-proxy CA setup failed; harness will not trust proxy-minted leaves",
+                    );
+                }
             }
             match cmd.spawn() {
                 Ok(child) => {
@@ -189,4 +242,80 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// ADR 0014 M1.12: mount(2) wrapper for the harness device. ext4 +
+/// read-only matches what engram-init used to do; the device is the
+/// session's harness substrate attached at FC bake time and (for
+/// warm leases) hot-swapped via FC `PATCH /drives`.
+///
+/// Idempotent: if the mount point is already a mount of the same
+/// device, returns Ok. The kernel handles "already mounted" via
+/// EBUSY; we treat it as success because re-entering bootstrap on
+/// the same warm slot (rare; only happens if the agent died and the
+/// host sent a fresh launch frame) shouldn't fail the mount.
+#[cfg(target_os = "linux")]
+fn mount_harness(dev: &str, mount_point: &str) -> std::io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+
+    // Mount point may not exist on the bake-time stub path. Create
+    // it idempotently.
+    if let Err(e) = std::fs::create_dir_all(mount_point) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+
+    // Same flags engram-init used pre-M1.12: ext4 + read-only. No
+    // mount data (ext4 has sensible defaults; option-D's stub
+    // harness ext4 is single-file and doesn't need a custom data
+    // arg).
+    match mount(
+        Some(dev),
+        mount_point,
+        Some("ext4"),
+        MsFlags::MS_RDONLY,
+        None::<&str>,
+    ) {
+        Ok(()) => Ok(()),
+        // EBUSY = already mounted there. Idempotent on re-entry,
+        // which can happen if the agent died and the host sent a
+        // fresh BootstrapLaunch on the same warm slot.
+        Err(nix::errno::Errno::EBUSY) => Ok(()),
+        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+    }
+}
+
+/// ADR 0014 M1.12: egress-proxy CA setup, moved here from engram-
+/// init because the harness substrate (where the host stamps the CA
+/// at `.engram-host/ca.pem`) is now mounted by bootstrap.
+///
+/// Appends the CA to the system bundle (`/etc/ssl/certs/ca-
+/// certificates.crt`) so glibc-based tools trust proxy leaves
+/// without per-tool env vars, and injects the env-var family that
+/// covers curl, requests, and Node's TLS stack. No-op when the CA
+/// file isn't present (egress proxy not deployed for this session).
+#[cfg(target_os = "linux")]
+fn inject_egress_proxy_ca(harness_mount: &str, cmd: &mut Command) -> std::io::Result<()> {
+    let ca_path = format!("{harness_mount}/.engram-host/ca.pem");
+    if !std::path::Path::new(&ca_path).exists() {
+        return Ok(());
+    }
+    let bundle = "/etc/ssl/certs/ca-certificates.crt";
+    let ca_bytes = std::fs::read(&ca_path)?;
+    // Append (or create) — matches the pre-M1.12 shell behavior.
+    let _ = std::fs::create_dir_all("/etc/ssl/certs");
+    let mut bundle_bytes = std::fs::read(bundle).unwrap_or_default();
+    if !bundle_bytes.ends_with(b"\n") && !bundle_bytes.is_empty() {
+        bundle_bytes.push(b'\n');
+    }
+    bundle_bytes.extend_from_slice(&ca_bytes);
+    std::fs::write(bundle, &bundle_bytes)?;
+
+    cmd.env("SSL_CERT_FILE", bundle);
+    cmd.env("CURL_CA_BUNDLE", bundle);
+    cmd.env("REQUESTS_CA_BUNDLE", bundle);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca_path);
+    tracing::info!(ca = %ca_path, bundle, "egress-proxy CA installed into trust store");
+    Ok(())
 }

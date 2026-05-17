@@ -837,7 +837,15 @@ fn harness_name_for_substrate(spec: &SandboxSpec, uri: &str) -> String {
     if let Some(name) = spec.env.get("ENGRAM_SESSION_HARNESS_NAME") {
         return name.clone();
     }
-    // last segment of `host/path/repo:tag` minus the `:tag`.
+    harness_name_from_uri(uri)
+}
+
+/// ADR 0014 M1.12: spec-less variant for the warm-lease path. The
+/// warm-pool slot doesn't carry an `ENGRAM_SESSION_HARNESS_NAME` env
+/// hint (it's per-session, not per-template), so the URI's last
+/// path segment is the only signal. Same fallback the cold path
+/// uses when the env hint is missing.
+pub fn harness_name_from_uri(uri: &str) -> String {
     let last = uri.rsplit('/').next().unwrap_or(uri);
     let no_tag = last.split(':').next().unwrap_or(last);
     no_tag.to_string()

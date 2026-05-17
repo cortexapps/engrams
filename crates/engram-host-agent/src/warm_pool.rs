@@ -313,21 +313,39 @@ impl WarmPool {
             .push(now);
     }
 
-    /// Activate a previously-leased warm sandbox: push
-    /// BootstrapLaunch + apply egress policy. Pre-restored substrate
+    /// Activate a previously-leased warm sandbox: optionally swap
+    /// the harness drive (ADR 0014 M1.12 option D), apply egress
+    /// policy, then push BootstrapLaunch. Pre-restored substrate
     /// is already running; this is the per-session activation step.
+    ///
+    /// `session_harness_path` is `Some` for sessions whose chosen
+    /// harness differs from the template's bake-time stub. The
+    /// host-agent's gRPC handler resolves the session's
+    /// harness_pack_uri via `image_cache.ensure_harness_ext4`
+    /// before calling here. `None` skips the swap (sessions with
+    /// no harness, or templates whose stub already matches what
+    /// the session wants).
     pub async fn launch(
         &self,
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        session_harness_path: Option<std::path::PathBuf>,
     ) -> Result<(), SandboxError> {
         // ADR 0014 ordering: policy onto the proxy registry BEFORE
         // bootstrap exec's the agent. Same invariant ADR 0013
-        // codified for cold-create's StartAgent.
+        // codified for cold-create's StartAgent. Harness swap goes
+        // BEFORE start_agent so bootstrap mounts the session's
+        // chosen ext4, not the bake-time stub.
         let phase_start = std::time::Instant::now();
         let result = async {
             self.inner.backend.notify_session_policy(policy).await?;
+            if let Some(path) = session_harness_path {
+                self.inner
+                    .backend
+                    .swap_harness_drive(sandbox_id, path)
+                    .await?;
+            }
             self.inner.backend.start_agent(sandbox_id, agent).await
         }
         .await;
@@ -638,7 +656,7 @@ mod tests {
             template_ref: ref_id,
             image_repo: "repo".into(),
             image_tag: "tag".into(),
-            harness_pack_uri: "pack".into(),
+            harness_pack_uri: None,
             snapshot_id,
             vcpus: 1,
             memory_mib: 64,
@@ -759,7 +777,12 @@ mod tests {
             secrets: Default::default(),
             secret_mode: Default::default(),
         };
-        pool.launch(sandbox_id, agent.clone(), policy)
+        // ADR 0014 M1.12: None for harness path — the FakeBackend
+        // doesn't implement swap_harness_drive (default trait impl
+        // returns InvalidSpec), so we skip the swap step here.
+        // Real warm-lease callers pass the session's harness ext4
+        // path resolved via image_cache.
+        pool.launch(sandbox_id, agent.clone(), policy, None)
             .await
             .unwrap();
         let log = backend.agent_log.lock().clone();

@@ -74,6 +74,33 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0014 M1.12 (option D): atomically swap the host file
+    /// backing the sandbox's harness virtio-blk drive. Used by
+    /// the warm-pool lease path so per-session harness selection
+    /// is decoupled from the bake-time template snapshot.
+    ///
+    /// Implementation contract: pause the VM, `PATCH /drives` on
+    /// the harness drive id to point at `new_path`, then resume.
+    /// The pause is brief (~30 ms on FC); the resume's
+    /// virtio-blk queue-kick invalidates the guest kernel's page
+    /// cache for the device, so the next read returns the new
+    /// file's bytes (verified by
+    /// `engram-sandbox-firecracker/tests/patch_drive_swap.rs`).
+    ///
+    /// Default: unimplemented. Backends that don't host the
+    /// warm pool (VZ, Process) inherit the default — only FC
+    /// implements the option-D path.
+    async fn swap_harness_drive(
+        &self,
+        _id: SandboxId,
+        _new_path: std::path::PathBuf,
+    ) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `swap_harness_drive` (option D is FC-only for now)"
+                .into(),
+        ))
+    }
+
     /// Register a sink that will receive inbound harness connections
     /// (one stream per guest dial). Backends that route the harness
     /// channel through their own transport (FC's vsock UDS, future

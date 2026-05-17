@@ -306,12 +306,10 @@ async fn cascade_into_templates(
         template_ref: TemplateRef::new(),
         image_repo: image_repo.clone(),
         image_tag: image_tag.clone(),
-        // ADR 0014 M1.11: pre-option-D, harness_pack_uri is still
-        // part of the unique key. We write the sentinel "*" so the
-        // template is shared across all harnesses the cold path may
-        // request. M1.12's migration 0029 drops this column from
-        // the unique key entirely.
-        harness_pack_uri: "*".to_string(),
+        // M1.12 (option D): templates are harness-agnostic. The
+        // column is nullable (migration 0029) and the unique key
+        // no longer references it; new cascade rows write None.
+        harness_pack_uri: None,
         snapshot_id: snapshot.id,
         vcpus,
         memory_mib,

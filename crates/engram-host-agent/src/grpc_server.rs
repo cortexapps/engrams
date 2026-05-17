@@ -306,8 +306,16 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
         let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
+        // ADR 0014 M1.12: proto3 string can't be `Option`; empty
+        // string on the wire means "no harness swap" (e.g.,
+        // `kind = none` sessions).
+        let harness_pack_uri = if r.harness_pack_uri.is_empty() {
+            None
+        } else {
+            Some(r.harness_pack_uri)
+        };
         self.inner
-            .launch_warm_sandbox(sandbox_id, agent, policy)
+            .launch_warm_sandbox(sandbox_id, agent, policy, harness_pack_uri)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

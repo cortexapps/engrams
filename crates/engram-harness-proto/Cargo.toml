@@ -20,3 +20,11 @@ engram-core.workspace = true
 serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Used by the ADR 0014 M1.12 backwards-compat test: a pre-M1.12
+# BootstrapLaunch frame (argv + env only) must still deserialize
+# into the new struct, with `harness_dev` + `harness_mount`
+# defaulting to None. JSON is the simplest format that exercises
+# `#[serde(default)]` independent of bincode's wire framing.
+serde_json = "1"

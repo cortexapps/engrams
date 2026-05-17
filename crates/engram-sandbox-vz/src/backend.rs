@@ -459,9 +459,17 @@ impl SandboxBackend for VzBackend {
             }
         }
 
+        // VZ backend doesn't use the option-D harness-late-bind path
+        // — its in-VM mount story is handled by engram-init via the
+        // VZ disk-attach config, not via bootstrap mount(2). Leave
+        // harness_{dev,mount} unset; bootstrap will skip the mount
+        // and exec directly. (If VZ ever joins the option-D path,
+        // populate these the same way the FC backend does.)
         let launch = engram_harness_proto::BootstrapLaunch {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
+            harness_dev: None,
+            harness_mount: None,
         };
         tracing::debug!(sandbox_id = %id, "vz start_agent: writing BootstrapLaunch frame");
         engram_harness_proto::write_msg(&mut conn, &launch)

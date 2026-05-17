@@ -251,6 +251,12 @@ impl HostRegistry {
         template_ref: engram_core::types::ids::TemplateRef,
         agent: engram_core::types::sandbox::AgentSpec,
         policy: engram_core::types::egress::SessionEgressPolicy,
+        // ADR 0014 M1.12 (option D): the session's chosen harness
+        // pack URI. The host swaps the warm slot's bake-time stub
+        // harness for this URI's ext4 before start_agent dials
+        // bootstrap. `None` for sessions without a harness
+        // (`kind = none`) — the bake-time stub stays attached.
+        harness_pack_uri: Option<String>,
     ) -> Result<Option<(HostId, SandboxId)>, SandboxError> {
         use engram_core::traits::host_client::WarmLeaseOutcome;
         let candidates = self.candidates_with_warm_slot(template_ref);
@@ -286,7 +292,12 @@ impl HostRegistry {
                     // reach target again on its own. Surface the error
                     // so the caller can cold-fall-back.
                     if let Err(e) = backend
-                        .launch_warm_sandbox(sandbox_id, agent.clone(), policy.clone())
+                        .launch_warm_sandbox(
+                            sandbox_id,
+                            agent.clone(),
+                            policy.clone(),
+                            harness_pack_uri.clone(),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -921,6 +932,7 @@ mod tests {
             sandbox_id: SandboxId,
             agent: engram_core::types::sandbox::AgentSpec,
             _policy: engram_core::types::egress::SessionEgressPolicy,
+            _harness_pack_uri: Option<String>,
         ) -> Result<(), SandboxError> {
             self.launch_log.lock().push((sandbox_id, agent));
             Ok(())
@@ -997,6 +1009,7 @@ mod tests {
                 template_ref,
                 agent(),
                 empty_policy(SessionId::new()),
+                None,
             )
             .await
             .expect("warm lease must not error");
@@ -1042,6 +1055,7 @@ mod tests {
                 template_ref,
                 agent(),
                 empty_policy(SessionId::new()),
+                None,
             )
             .await
             .expect("warm lease must not error");
@@ -1080,6 +1094,7 @@ mod tests {
                 template_ref,
                 agent(),
                 empty_policy(SessionId::new()),
+                None,
             )
             .await
             .expect("warm lease must not error");
@@ -1114,6 +1129,7 @@ mod tests {
                 template_ref,
                 agent(),
                 empty_policy(SessionId::new()),
+                None,
             )
             .await
             .expect("warm lease must not error");

@@ -200,13 +200,21 @@ pub trait HostClient: Send + Sync {
     /// Default impl errors with `NotFound` since impls that don't
     /// implement [`Self::lease_warm_sandbox`] can never have a
     /// sandbox_id that corresponds to a leased warm slot.
+    ///
+    /// ADR 0014 M1.12: `harness_pack_uri` lets the host swap the
+    /// warm slot's harness drive to the session's chosen ext4 via
+    /// `swap_harness_drive` before `start_agent` dials bootstrap.
+    /// `None` skips the swap (the slot's bake-time stub stays
+    /// attached — fine for sessions with no harness, or when the
+    /// stub already matches).
     async fn launch_warm_sandbox(
         &self,
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        harness_pack_uri: Option<String>,
     ) -> Result<(), SandboxError> {
-        let _ = (sandbox_id, agent, policy);
+        let _ = (sandbox_id, agent, policy, harness_pack_uri);
         Err(SandboxError::NotFound)
     }
 

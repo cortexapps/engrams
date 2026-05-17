@@ -40,6 +40,17 @@ pub struct LocalHostClient {
     /// `list_warm_slots` trait methods delegate here instead of
     /// the no-op defaults.
     warm_pool: Option<crate::warm_pool::WarmPool>,
+    /// ADR 0014 M1.12: needed by `launch_warm_sandbox` to resolve
+    /// the session's `harness_pack_uri` to a host-local ext4 path
+    /// before calling `WarmPool::launch` (which then does the FC
+    /// `swap_harness_drive`). `None` in tests / dev modes that
+    /// don't exercise the option-D path.
+    image_cache: Option<Arc<crate::image_cache::ImageCache>>,
+    /// ADR 0014 M1.12: needed for the egress-proxy CA stamping
+    /// step inside the harness ext4 (so the in-VM bootstrap can
+    /// inject it into the system trust store). `None` skips the
+    /// stamp; the harness ext4 is built without the CA.
+    egress_ca_pem: Option<String>,
 }
 
 impl LocalHostClient {
@@ -48,6 +59,8 @@ impl LocalHostClient {
             sandbox,
             harness_hub,
             warm_pool: None,
+            image_cache: None,
+            egress_ca_pem: None,
         }
     }
 
@@ -56,6 +69,19 @@ impl LocalHostClient {
     /// before publishing the LocalHostClient to the gRPC server.
     pub fn with_warm_pool(mut self, warm_pool: crate::warm_pool::WarmPool) -> Self {
         self.warm_pool = Some(warm_pool);
+        self
+    }
+
+    /// Attach the host's image cache so `launch_warm_sandbox` can
+    /// resolve the session's `harness_pack_uri` to a local ext4
+    /// path (ADR 0014 M1.12 option D).
+    pub fn with_image_cache(
+        mut self,
+        image_cache: Arc<crate::image_cache::ImageCache>,
+        egress_ca_pem: Option<String>,
+    ) -> Self {
+        self.image_cache = Some(image_cache);
+        self.egress_ca_pem = egress_ca_pem;
         self
     }
 
@@ -181,9 +207,43 @@ impl HostClient for LocalHostClient {
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        harness_pack_uri: Option<String>,
     ) -> Result<(), SandboxError> {
         match self.warm_pool.as_ref() {
-            Some(pool) => pool.launch(sandbox_id, agent, policy).await,
+            Some(pool) => {
+                // ADR 0014 M1.12: resolve the session's harness URI
+                // to a host-local ext4 path so the warm slot's
+                // bake-time stub harness drive can be swapped in
+                // for it. Sessions with no harness (`kind = none`)
+                // pass `None` and skip the swap entirely.
+                let session_harness_path = match (harness_pack_uri, self.image_cache.as_ref()) {
+                    (Some(uri), Some(cache)) => {
+                        // The harness name follows the same
+                        // convention the cold-create path uses
+                        // (`harness_name_for_substrate` →
+                        // `engram_session_harness_name` env or the
+                        // URI's last path segment).
+                        let name = crate::pooled_backend::harness_name_from_uri(&uri);
+                        let cached = cache
+                            .ensure_harness_ext4(&uri, &name, self.egress_ca_pem.as_deref())
+                            .await
+                            .map_err(|e| {
+                                SandboxError::InvalidSpec(format!(
+                                    "warm-lease: harness cache pull {uri}: {e}"
+                                ))
+                            })?;
+                        Some(cached.ext4_path)
+                    }
+                    (Some(_), None) => {
+                        return Err(SandboxError::InvalidSpec(
+                            "warm-lease: harness_pack_uri set but no image_cache attached to LocalHostClient".into(),
+                        ));
+                    }
+                    (None, _) => None,
+                };
+                pool.launch(sandbox_id, agent, policy, session_harness_path)
+                    .await
+            }
             None => Err(SandboxError::NotFound),
         }
     }

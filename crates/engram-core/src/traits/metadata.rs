@@ -169,17 +169,20 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_templates(&self) -> Result<Vec<TemplateRecord>, MetaError> {
         Ok(Vec::new())
     }
-    /// Resolve a session spec triple to its active template_ref,
-    /// or `None` when no warm-eligible template exists for the
-    /// tuple. The coord scheduler's warm-lease path calls this
+    /// Resolve an (image_repo, image_tag) pair to its active
+    /// template_ref, or `None` when no warm-eligible template
+    /// exists. The coord scheduler's warm-lease path calls this
     /// before parallel-asking hosts.
+    ///
+    /// ADR 0014 M1.12: harness_pack_uri dropped from the lookup —
+    /// templates are now harness-agnostic; harness binding is
+    /// per-session via `swap_harness_drive`.
     async fn resolve_template(
         &self,
         image_repo: &str,
         image_tag: &str,
-        harness_pack_uri: &str,
     ) -> Result<Option<TemplateRef>, MetaError> {
-        let _ = (image_repo, image_tag, harness_pack_uri);
+        let _ = (image_repo, image_tag);
         Ok(None)
     }
     /// Fetch a template by ref. Used by the warm-pool refill loop

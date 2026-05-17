@@ -220,6 +220,7 @@ pub(crate) fn template_from_row(row: PgRow) -> Result<TemplateRecord, MetaError>
         template_ref: TemplateRef::from(template_ref),
         image_repo: row.try_get("image_repo").map_err(col_err)?,
         image_tag: row.try_get("image_tag").map_err(col_err)?,
+        // Migration 0029 made harness_pack_uri nullable.
         harness_pack_uri: row.try_get("harness_pack_uri").map_err(col_err)?,
         snapshot_id: SnapshotId::from(snapshot_id),
         vcpus: u32::try_from(vcpus.max(0)).unwrap_or(0),

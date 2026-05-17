@@ -445,10 +445,13 @@ impl MetadataStore for PostgresStore {
         template: engram_core::types::template::TemplateRecord,
     ) -> Result<(), MetaError> {
         // ADR 0014: atomic "swap active flag" — flip the prior
-        // active row for the same (repo, tag, harness) triple
-        // BEFORE inserting the new one, in a single tx. This way
-        // observers never see two active rows for the same triple,
-        // and a failed insert leaves no zombie inactive row.
+        // active row for the same (repo, tag) pair BEFORE inserting
+        // the new one, in a single tx. This way observers never see
+        // two active rows for the same pair, and a failed insert
+        // leaves no zombie inactive row.
+        //
+        // M1.12 (option D): harness_pack_uri dropped from the unique
+        // key; we don't filter on it when flipping the prior row.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         sqlx::query(
             r#"
@@ -456,13 +459,11 @@ impl MetadataStore for PostgresStore {
                SET active = FALSE
              WHERE image_repo = $1
                AND image_tag = $2
-               AND harness_pack_uri = $3
                AND active = TRUE
             "#,
         )
         .bind(&template.image_repo)
         .bind(&template.image_tag)
-        .bind(&template.harness_pack_uri)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -472,14 +473,14 @@ impl MetadataStore for PostgresStore {
                                    harness_pack_uri, snapshot_id,
                                    vcpus, memory_mib, created_at, active)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (image_repo, image_tag, harness_pack_uri, snapshot_id)
+            ON CONFLICT (image_repo, image_tag, snapshot_id)
               DO UPDATE SET active = EXCLUDED.active
             "#,
         )
         .bind(template.template_ref.as_uuid())
         .bind(&template.image_repo)
         .bind(&template.image_tag)
-        .bind(&template.harness_pack_uri)
+        .bind(template.harness_pack_uri.as_deref())
         .bind(template.snapshot_id.as_uuid())
         .bind(template.vcpus as i32)
         .bind(template.memory_mib as i32)
@@ -514,22 +515,22 @@ impl MetadataStore for PostgresStore {
         &self,
         image_repo: &str,
         image_tag: &str,
-        harness_pack_uri: &str,
     ) -> Result<Option<engram_core::types::ids::TemplateRef>, MetaError> {
+        // M1.12 (option D): harness_pack_uri no longer part of the
+        // lookup. Templates are harness-agnostic — the warm-pool
+        // lease path swaps the harness drive per session.
         let row = sqlx::query(
             r#"
             SELECT template_ref
               FROM templates
              WHERE image_repo = $1
                AND image_tag = $2
-               AND harness_pack_uri = $3
                AND active = TRUE
              LIMIT 1
             "#,
         )
         .bind(image_repo)
         .bind(image_tag)
-        .bind(harness_pack_uri)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;

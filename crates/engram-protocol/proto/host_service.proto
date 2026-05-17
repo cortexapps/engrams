@@ -247,6 +247,15 @@ message LaunchWarmRequest {
   // frame goes onto vsock (same atomic-policy-first invariant as
   // StartAgent in ADR 0013).
   bytes policy_bincode = 3;
+  // ADR 0014 M1.12 (option D): the session's chosen harness pack
+  // URI. Host resolves it locally via `image_cache.ensure_harness_ext4`
+  // and calls `swap_harness_drive` to swap the warm slot's bake-time
+  // stub harness for this session's ext4 before `start_agent` dials
+  // bootstrap. Empty / absent string means "no harness swap" — used
+  // by `kind = none` sessions and by older coords that don't know
+  // about option D yet (warm slot keeps its bake-time stub harness,
+  // which is fine for the no-agent case).
+  string harness_pack_uri = 4;
 }
 
 message WarmSlotsResponse {

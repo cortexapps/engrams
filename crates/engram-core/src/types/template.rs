@@ -23,14 +23,16 @@ use super::ids::{SnapshotId, TemplateRef};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemplateRecord {
     pub template_ref: TemplateRef,
-    /// Image registry tuple. `harness_pack_uri` is the resolved
-    /// OCI ref of the harness substrate baked into the snapshot
-    /// (Claude/Codex/Gemini/etc); the warm slot is *bound to a
-    /// harness* because the snapshot captured the bootstrap+harness
-    /// substrate at-rest.
+    /// Image registry tuple. ADR 0014 M1.12 (option D) made
+    /// templates harness-agnostic: one bake per
+    /// `(image_repo, image_tag)` regardless of harness.
+    /// `harness_pack_uri` is now `Option<String>` carried for
+    /// backwards-compat with pre-M1.12 rows; new rows write `None`.
+    /// The unique key dropped this column too — see migration 0029.
     pub image_repo: String,
     pub image_tag: String,
-    pub harness_pack_uri: String,
+    #[serde(default)]
+    pub harness_pack_uri: Option<String>,
     /// Points at the `snapshots` row holding the full portable
     /// metadata (memory_manifest + state_blob_key + sidecar_blob_key
     /// + source_sandbox_id).
@@ -42,8 +44,8 @@ pub struct TemplateRecord {
     pub memory_mib: u32,
     pub created_at: DateTime<Utc>,
     /// TRUE iff this is the latest bake for its
-    /// (repo, tag, harness) triple. Updated to FALSE atomically
-    /// when a new template_ref lands for the same triple.
+    /// `(image_repo, image_tag)` pair. Updated to FALSE atomically
+    /// when a new template_ref lands for the same pair.
     pub active: bool,
 }
 
@@ -57,7 +59,7 @@ mod tests {
             template_ref: TemplateRef::new(),
             image_repo: "cortexapps/engrams-internal/demo".into(),
             image_tag: "warm-734a0b5".into(),
-            harness_pack_uri: "ghcr.io/cortexapps/engrams/harness-claude:b9dd2d1".into(),
+            harness_pack_uri: Some("ghcr.io/cortexapps/engrams/harness-claude:b9dd2d1".into()),
             snapshot_id: SnapshotId::new(),
             vcpus: 4,
             memory_mib: 2048,

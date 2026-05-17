@@ -277,38 +277,23 @@ mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
-# Harness substrate: read-only ext4 image attached as the second
-# virtio-blk drive on every sandbox (`/dev/vdb`). Same wire on FC
-# and VZ. The image is built once on the host from `cfg.harnesses_dir`;
-# `engram-bootstrap` exec's `/run/engram/harnesses/<name>/harness`
-# from here. If `/dev/vdb` isn't present (sandbox booted without a
-# substrate), the mkdir leaves an empty dir and the bootstrap
-# harness lookup will fail with a clear message.
+# ADR 0014 M1.12 (option D): engram-init no longer mounts the
+# harness substrate. The host's BootstrapLaunch frame nominates the
+# harness device + mount point (typically /dev/vdb +
+# /run/engram/harnesses), and engram-bootstrap mounts it itself
+# before exec'ing the harness binary. This lets warm-pool templates
+# be harness-agnostic — the bake snapshot captures bootstrap on
+# accept() before any harness mount has happened, then `PATCH
+# /drives` per-session swaps the device's backing file.
+#
+# Init still creates the mount point so bootstrap's mkdir is a
+# no-op; if a session has no harness (rare), the dir just stays
+# empty.
 mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
-if [ -b /dev/vdb ]; then
-    mount -t ext4 -o ro /dev/vdb /run/engram/harnesses 2>/dev/null || true
-fi
-# Engram egress-proxy CA. The host stamps it into the substrate at
-# `/.engram-host/ca.pem`; we append it to the system trust store
-# and export the relevant env vars so glibc, curl, requests, and
-# Node all validate proxy-minted leaves. This must run BEFORE any
-# user code (ttyd / bootstrap / agentd) so the first HTTPS request
-# the harness makes already trusts the proxy. No-op when the proxy
-# isn't deployed (CA file just isn't there).
-if [ -f /run/engram/harnesses/.engram-host/ca.pem ]; then
-    mkdir -p /etc/ssl/certs 2>/dev/null || true
-    if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-        cat /run/engram/harnesses/.engram-host/ca.pem \
-            >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
-    else
-        cp /run/engram/harnesses/.engram-host/ca.pem \
-            /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
-    fi
-    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-    export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-    export NODE_EXTRA_CA_CERTS=/run/engram/harnesses/.engram-host/ca.pem
-fi
+# ADR 0014 M1.12: egress-proxy CA setup moved to engram-bootstrap,
+# because the harness substrate (where the CA lives at
+# `/.engram-host/ca.pem`) isn't mounted yet — bootstrap does the
+# mount itself after receiving BootstrapLaunch.
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).

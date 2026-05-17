@@ -540,30 +540,27 @@ async fn create_session_inner(
         memory_mib: Some(vm_spec.memory.max_mib),
     };
 
-    // ADR 0014 M1.8: try the warm-pool lease path before cold-create.
-    // Steps:
-    //   1. Resolve `(image_repo, image_tag, harness_pack_uri)` to a
-    //      template_ref via MetadataStore::resolve_template. None
-    //      → no warm-eligible template; fall through.
+    // ADR 0014 M1.8 + M1.12: try the warm-pool lease path before
+    // cold-create.
+    //   1. Resolve `(image_repo, image_tag)` to a template_ref via
+    //      MetadataStore::resolve_template. M1.12 (option D) dropped
+    //      harness_pack_uri from the lookup — templates are harness-
+    //      agnostic; the host swaps the harness drive per session.
+    //      None → no warm-eligible template; fall through.
     //   2. Build a placeholder AgentSpec + SessionEgressPolicy with
     //      `guest_ip = UNSPECIFIED` (matching the no-guest-IP cold
-    //      path at L668-676 of this file). The host's warm-launch
-    //      applies the policy + sends BootstrapLaunch.
-    //   3. Ask the registry for a warm lease. On success, skip the
-    //      cold-create + start_agent path below — warm-launch
-    //      already did both.
+    //      path). The host's warm-launch applies the policy +
+    //      sends BootstrapLaunch (with harness_dev=/dev/vdb so
+    //      bootstrap mounts the swapped harness).
+    //   3. Ask the registry for a warm lease + harness_pack_uri.
+    //      Lease success → skip cold-create.
     //   4. On NoCapacity / all-Stale, fall through to cold-create
     //      with one tracing::debug.
-    // No-harness sessions still resolve a template — image-builder
-    // bakes `harness_pack_uri = "none"` into the template row for
-    // that case (see seed_warm_template binary). Without this,
-    // `kind = none` sessions would never warm-lease.
-    let warm_lookup_uri = harness_pack_uri.as_deref().unwrap_or("none");
     let warm_lease_outcome = {
         match state
             .services
             .meta
-            .resolve_template(&image_repo, &image_tag, warm_lookup_uri)
+            .resolve_template(&image_repo, &image_tag)
             .await
         {
             Ok(Some(template_ref)) => {
@@ -592,9 +589,21 @@ async fn create_session_inner(
                     argv: vec!["/bin/sleep".into(), "infinity".into()],
                     env: Default::default(),
                 });
+                // ADR 0014 M1.12 (option D): thread the session's
+                // harness URI through so the host can swap the warm
+                // slot's bake-time stub to the session's harness ext4
+                // before start_agent. Same URI cold-create would
+                // resolve to a host-local ext4 path.
+                let warm_harness_uri = harness_pack_uri.clone();
                 state
                     .host_registry
-                    .try_warm_lease_for_session(&ctx, template_ref, agent, warm_policy)
+                    .try_warm_lease_for_session(
+                        &ctx,
+                        template_ref,
+                        agent,
+                        warm_policy,
+                        warm_harness_uri,
+                    )
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(
