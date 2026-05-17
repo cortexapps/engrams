@@ -712,17 +712,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         //      a full portable SnapshotMetadata.
         //   3. Otherwise → None (sessions pay session-private
         //      memory cost at restore, functionally correct).
-        // Probe at WARN so the line shows under the default
-        // `RUST_LOG=warn` filter — lets the bake log tell us at a
-        // glance whether the capture branch is being entered.
-        tracing::warn!(
-            repo = %req.repo,
-            tag = %req.tag,
-            canonical_memory_manifest_set = req.canonical_memory_manifest.is_some(),
-            capture_canonical_memory_set = req.capture_canonical_memory.is_some(),
-            disk_manifest_set = disk_manifest.is_some(),
-            "canonical-capture decision probe (debug; will revert)",
-        );
         let (canonical_memory_manifest, canonical_snapshot) = if let Some(mref) =
             req.canonical_memory_manifest
         {
@@ -891,15 +880,21 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 // row and lease a warm slot keyed by the snapshot
                 // id, with state.bin + sidecar fetchable from
                 // BlobStorage at the keys recorded here.
-                bundle["canonical_snapshot"] = serde_json::json!({
-                    "snapshot_id": snap.id,
-                    "source_sandbox_id": snap.source_sandbox_id,
-                    "memory_manifest": snap.memory_manifest,
-                    "state_blob_key": snap.state_blob_key,
-                    "sidecar_blob_key": snap.sidecar_blob_key,
-                    "size_bytes": snap.size_bytes,
-                    "created_at": snap.created_at,
-                });
+                //
+                // Serialize via `serde_json::to_value(snap)` rather
+                // than hand-rolling a JSON object: the cascade in
+                // engram-coordinator reads this block with
+                // `serde_json::from_value::<SnapshotMetadata>` and
+                // any field-name drift between the struct's serde
+                // shape and the hand-roll silently returns None →
+                // cascade skipped → templates row never written →
+                // warm pool never fires for this image. The prior
+                // hand-roll used "snapshot_id" but the struct's
+                // field is "id", and omitted required fields like
+                // `image_version` entirely.
+                bundle["canonical_snapshot"] = serde_json::to_value(snap).map_err(|e| {
+                    BuildError::Config(format!("serialize canonical_snapshot: {e}"))
+                })?;
             }
             if disk_bootstrap_path.is_some() {
                 // We don't know the OCI layer digests yet (those
@@ -1345,4 +1340,47 @@ async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use engram_core::types::snapshot::SnapshotMetadata;
+
+    /// Regression guard for the bake → cascade contract: bundle.json's
+    /// `canonical_snapshot` block must round-trip cleanly through
+    /// `SnapshotMetadata`'s serde shape. A previous hand-rolled
+    /// `serde_json::json!({...})` in the bake used the wrong field
+    /// names ("snapshot_id" instead of "id", missing required
+    /// `image_version`); the coord's
+    /// `serde_json::from_value::<SnapshotMetadata>(snap).ok()` silently
+    /// returned None and the templates cascade never fired in prod.
+    #[test]
+    fn bundle_canonical_snapshot_round_trips_through_snapshot_metadata() {
+        let original = SnapshotMetadata {
+            id: engram_core::SnapshotId::new(),
+            size_bytes: 4096,
+            created_at: chrono::Utc::now(),
+            image_version: "warm-test".into(),
+            disk_manifest: None,
+            memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: Some("state".into()),
+            sidecar_blob_key: Some("sidecar".into()),
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+        };
+
+        // Same serialization the bake uses to populate
+        // bundle["canonical_snapshot"].
+        let value = serde_json::to_value(&original).expect("serialize");
+
+        // Same deserialization the cascade uses to read it back.
+        let parsed: SnapshotMetadata =
+            serde_json::from_value(value).expect("cascade-side deserialize");
+
+        assert_eq!(parsed.id, original.id);
+        assert_eq!(parsed.image_version, original.image_version);
+        assert_eq!(parsed.state_blob_key, original.state_blob_key);
+        assert_eq!(parsed.sidecar_blob_key, original.sidecar_blob_key);
+    }
 }
