@@ -712,6 +712,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         //      a full portable SnapshotMetadata.
         //   3. Otherwise → None (sessions pay session-private
         //      memory cost at restore, functionally correct).
+        // Probe at WARN so the line shows under the default
+        // `RUST_LOG=warn` filter — lets the bake log tell us at a
+        // glance whether the capture branch is being entered.
+        tracing::warn!(
+            repo = %req.repo,
+            tag = %req.tag,
+            canonical_memory_manifest_set = req.canonical_memory_manifest.is_some(),
+            capture_canonical_memory_set = req.capture_canonical_memory.is_some(),
+            disk_manifest_set = disk_manifest.is_some(),
+            "canonical-capture decision probe (debug; will revert)",
+        );
         let (canonical_memory_manifest, canonical_snapshot) = if let Some(mref) =
             req.canonical_memory_manifest
         {
