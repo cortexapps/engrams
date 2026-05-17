@@ -19,11 +19,14 @@ name: CI
 #   - test-firecracker: every `#[ignore]`'d FC integration test under
 #                       nested virt. Unprivileged set: boot, lifecycle,
 #                       snapshot, snapshot_uffd, exec_real_vm,
-#                       harness_loopback. ADR 0007 set:
+#                       harness_loopback, multi_restore,
+#                       option_d_latency_bench. ADR 0007 set:
 #                       canonical_capture (bake-time memory capture)
 #                       and nbd_chunked_disk (Linux + nbd, gated — see
 #                       the step). Root set under sudo for iptables +
-#                       TAP: host_startup, proxy_e2e, snapshot_net.
+#                       TAP + loop mounts: host_startup, proxy_e2e,
+#                       snapshot_net, patch_drive_swap,
+#                       option_d_warm_lease.
 #   - web:              pnpm install + tsc + vite build + vitest
 #
 # All jobs run on Blacksmith Linux runners
@@ -405,6 +408,8 @@ jobs:
             --test snapshot_uffd \
             --test exec_real_vm \
             --test harness_loopback \
+            --test multi_restore \
+            --test option_d_latency_bench \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -482,13 +487,15 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e, snapshot_net)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e, snapshot_net, patch_drive_swap, option_d_warm_lease)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
             --test proxy_e2e \
             --test snapshot_net \
+            --test patch_drive_swap \
+            --test option_d_warm_lease \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
