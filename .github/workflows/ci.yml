@@ -20,7 +20,8 @@ name: CI
 #                       nested virt. Unprivileged set: boot, lifecycle,
 #                       snapshot, snapshot_uffd, exec_real_vm,
 #                       harness_loopback, multi_restore,
-#                       option_d_latency_bench. ADR 0007 set:
+#                       option_d_latency_bench, cross_host_restore.
+#                       ADR 0007 set:
 #                       canonical_capture (bake-time memory capture)
 #                       and nbd_chunked_disk (Linux + nbd, gated — see
 #                       the step). Root set under sudo for iptables +
@@ -410,6 +411,7 @@ jobs:
             --test harness_loopback \
             --test multi_restore \
             --test option_d_latency_bench \
+            --test cross_host_restore \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
