@@ -1269,20 +1269,16 @@ impl SandboxBackend for PooledBackend {
         // serial materialize loop now hits the NVMe-warm cache for
         // every chunk.
         let src = self.inner.snapshot_path_for(metadata.id);
-        if let Err(e) = self.materialize_memory_if_missing(&src).await {
-            tracing::warn!(
-                error = %e,
-                src = %src.display(),
-                "memory.bin materialization failed; inner.restore will see whatever's there",
-            );
-        }
 
-        // ADR 0014: cross-host state.bin + sidecar materialization.
-        // Symmetric to memory.bin — if the metadata carries portable
-        // blob keys and the local files aren't present, download
-        // them from BlobStorage. Same-host restore (idle resume on
-        // the host that produced the snapshot) hits the early-return
-        // because the files are already at `src`.
+        // ADR 0014: cross-host materialization is order-sensitive.
+        // `materialize_memory_if_missing` reads the local FC sidecar
+        // (`manifest.json`) to find the memory_manifest ref before
+        // it can rebuild memory.bin from chunks. On a cross-host
+        // restore that sidecar is in BlobStorage, not on disk, so
+        // the sidecar download (`materialize_state_if_missing`)
+        // MUST run first — otherwise memory.bin materialization
+        // silently no-ops and FC restore then errors with
+        // "snapshot memory.bin missing".
         if let Some(chunk_store) = self.chunk_store.as_ref() {
             let blob = chunk_store.blob_storage();
             if let Err(e) = materialize_state_if_missing(
@@ -1299,6 +1295,14 @@ impl SandboxBackend for PooledBackend {
                     "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
                 );
             }
+        }
+
+        if let Err(e) = self.materialize_memory_if_missing(&src).await {
+            tracing::warn!(
+                error = %e,
+                src = %src.display(),
+                "memory.bin materialization failed; inner.restore will see whatever's there",
+            );
         }
 
         let restore_start = std::time::Instant::now();
