@@ -84,6 +84,12 @@ pub struct HostView {
     pub capacity_used_mib: u64,
     pub running_sandboxes: u32,
     pub local_snapshots: usize,
+    /// ADR 0014: sum of `available` warm slots across every
+    /// template this host is keeping warm. Live-only — not
+    /// persisted in the hosts row, so reads as 0 on a coord
+    /// replica that hasn't received a heartbeat from this host
+    /// yet (same caveat as `local_snapshots`).
+    pub warm_pool_available: u32,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
@@ -118,6 +124,7 @@ impl HostView {
                     live.capacity.running_sandboxes,
                 )
             };
+        let warm_pool_available: u32 = live.warm_slots.iter().map(|w| w.available).sum();
         Self {
             id: row.id,
             hostname: row.hostname,
@@ -126,6 +133,7 @@ impl HostView {
             capacity_used_mib,
             running_sandboxes,
             local_snapshots: live.local_snapshots.len(),
+            warm_pool_available,
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }

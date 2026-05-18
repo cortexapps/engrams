@@ -373,17 +373,33 @@ impl HostAgent {
                     cloud_metadata: None,
                 };
                 let cc = coord_client.clone();
+                let warm_pool_for_register = warm_pool.clone();
                 tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
                     loop {
                         match cc.register(&register_req).await {
-                            Ok(_) => {
+                            Ok(resp) => {
                                 tracing::info!(
                                     host_id = %register_req.host_id,
                                     host_addr = %register_req.host_addr,
+                                    active_templates = resp.active_templates.len(),
                                     "registered with coord via /api/hosts/register",
                                 );
+                                // ADR 0014 M1.11: kick off warm-pool
+                                // refill immediately from the coord's
+                                // register-response payload instead of
+                                // waiting for the first heartbeat
+                                // ack (~5 s). Cuts the post-MIG-roll
+                                // "no warm slots" window meaningfully.
+                                if !resp.active_templates.is_empty() {
+                                    let templates = resp
+                                        .active_templates
+                                        .into_iter()
+                                        .map(|t| (t.record, t.snapshot))
+                                        .collect();
+                                    warm_pool_for_register.observe_templates(templates).await;
+                                }
                                 break;
                             }
                             Err(e) => {

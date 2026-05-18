@@ -6,6 +6,7 @@ import {
   useEnabledImages,
   useRefreshEnabledImage,
 } from '../../hooks/useEnabledImages';
+import { useEnableProgress } from '../../hooks/useEnableProgress';
 import type { EnabledImageSummary } from '../../types';
 import { Field, FormError, PressButton, SubHead } from './_form';
 
@@ -277,6 +278,7 @@ function EnableImageForm({
   const [imageUri, setImageUri] = useState('');
   const enable = useEnableImage();
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const progress = useEnableProgress(enable.isPending);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -326,11 +328,72 @@ function EnableImageForm({
 
       <div className="flex items-baseline gap-6 pt-2">
         <PressButton type="submit" tone="primary" disabled={enable.isPending}>
-          {enable.isPending ? 'fetching manifest…' : 'enable'}
+          {enable.isPending ? 'enabling…' : 'enable'}
         </PressButton>
-        <PressButton onClick={onCancel}>cancel</PressButton>
+        <PressButton onClick={onCancel} disabled={enable.isPending}>
+          cancel
+        </PressButton>
+        <EnableProgress progress={progress} />
       </div>
     </form>
+  );
+}
+
+// Multi-stage progress copy that cycles based on elapsed wall-clock
+// while `POST /api/enabled-images` is in flight. The backend doesn't
+// stream events — we just shape time-into-text so the operator sees
+// movement instead of a frozen button. Stages are calibrated against
+// the observed 7-30s window of materialize + warm-pool fill.
+function EnableProgress({
+  progress,
+}: {
+  progress: ReturnType<typeof useEnableProgress>;
+}) {
+  if (!progress) return null;
+  return (
+    <span
+      className="font-mono text-xs smallcaps inline-flex items-baseline gap-2"
+      style={{ color: 'var(--color-ink-quiet)' }}
+    >
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.span
+          key={progress.label}
+          initial={{ opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -4 }}
+          transition={{ duration: 0.25, ease: 'easeOut' }}
+        >
+          {progress.label}
+          <DotPulse />
+        </motion.span>
+      </AnimatePresence>
+    </span>
+  );
+}
+
+// Three dots that fade-pulse in sequence. Cheap, lightweight,
+// matches the ledger aesthetic — no spinning gradients or
+// material wheels.
+function DotPulse() {
+  return (
+    <span className="inline-flex items-baseline" aria-hidden>
+      {[0, 1, 2].map((i) => (
+        <motion.span
+          key={i}
+          initial={{ opacity: 0.2 }}
+          animate={{ opacity: [0.2, 1, 0.2] }}
+          transition={{
+            duration: 1.2,
+            repeat: Infinity,
+            delay: i * 0.18,
+            ease: 'easeInOut',
+          }}
+          style={{ display: 'inline-block', marginLeft: '0.15ch' }}
+        >
+          .
+        </motion.span>
+      ))}
+    </span>
   );
 }
 

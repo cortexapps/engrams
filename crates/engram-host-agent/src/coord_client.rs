@@ -292,6 +292,11 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub server_time: DateTime<Utc>,
     pub coord_wire_version: u32,
+    /// ADR 0014 M1.11: bootstrap the host's warm-pool refill loop
+    /// without waiting for the first heartbeat ack. Default empty
+    /// for older coord deployments that don't emit the field.
+    #[serde(default)]
+    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
 }
 
 #[derive(Serialize)]

@@ -85,15 +85,35 @@ pub async fn enable_image(
         let materialized = materialize_template_artifacts(&state, snapshot, &artifacts).await;
         match materialized {
             Ok(snapshot) => {
-                if let Err(e) =
-                    cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await
-                {
-                    tracing::warn!(
+                match cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await {
+                    Ok(template_ref) => {
+                        // ADR 0014 M1.11: block until at least one
+                        // host has a warm slot for this template, so
+                        // the operator's next session-create lands
+                        // sub-second instead of falling through to
+                        // cold-create. Budget capped at 25 s; on
+                        // timeout the image is still enabled and the
+                        // pool will fill on subsequent heartbeats.
+                        match wait_for_first_warm_slot(&state, template_ref).await {
+                            Ok(elapsed) => tracing::info!(
+                                image_uri = %req.image_uri,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "warm pool ready on at least one host; enable returning",
+                            ),
+                            Err(elapsed) => tracing::warn!(
+                                image_uri = %req.image_uri,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "timed out waiting for first warm slot; \
+                                 image is enabled but next session may go cold",
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
                         image_uri = %req.image_uri,
                         error = %e,
                         "enabled image; templates cascade failed after materialization \
                          (warm pool will not fire for this image)",
-                    );
+                    ),
                 }
             }
             Err(e) => {
@@ -165,14 +185,26 @@ pub async fn refresh_enabled_image(
         let materialized = materialize_template_artifacts(&state, snapshot, &artifacts).await;
         match materialized {
             Ok(snapshot) => {
-                if let Err(e) =
-                    cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await
-                {
-                    tracing::warn!(
+                match cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await {
+                    Ok(template_ref) => {
+                        match wait_for_first_warm_slot(&state, template_ref).await {
+                            Ok(elapsed) => tracing::info!(
+                                image_uri = %req.image_uri,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "warm pool ready on at least one host; refresh returning",
+                            ),
+                            Err(elapsed) => tracing::warn!(
+                                image_uri = %req.image_uri,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "timed out waiting for first warm slot on refresh",
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
                         image_uri = %req.image_uri,
                         error = %e,
                         "refreshed image; templates cascade failed (warm pool will not refill new snapshot)",
-                    );
+                    ),
                 }
             }
             Err(e) => {
@@ -521,7 +553,7 @@ async fn cascade_into_templates(
     image_uri: &str,
     manifest: &ImageManifest,
     snapshot: SnapshotMetadata,
-) -> Result<(), ApiError> {
+) -> Result<TemplateRef, ApiError> {
     let (image_repo, image_tag) = {
         let (repo, tag) = split_image_ref(image_uri);
         (repo.to_string(), tag.to_string())
@@ -561,8 +593,9 @@ async fn cascade_into_templates(
     };
     state.services.meta.record_snapshot(snapshot_record).await?;
 
+    let template_ref = TemplateRef::new();
     let template = TemplateRecord {
-        template_ref: TemplateRef::new(),
+        template_ref,
         image_repo: image_repo.clone(),
         image_tag: image_tag.clone(),
         // M1.12 (option D): templates are harness-agnostic. The
@@ -586,7 +619,49 @@ async fn cascade_into_templates(
         "templates cascade complete; warm pool will refill on next host heartbeat",
     );
 
-    Ok(())
+    Ok(template_ref)
+}
+
+/// ADR 0014 M1.11: poll the host registry until at least one host
+/// reports an `available >= 1` warm slot for `template_ref`, or
+/// the budget elapses. Used by `POST /api/enabled-images` to
+/// make the "click enable → click create" UX always-warm: when
+/// this returns Ok the next session create against the enabled
+/// image will lease a warm slot.
+///
+/// Polls rather than RPC-pushes because the heartbeat supervisor
+/// already updates `HostState.warm_slots` on every inbound
+/// heartbeat (~every few seconds); a poll loop is simpler than
+/// adding a new bidirectional event and gives the same wall-clock
+/// outcome under healthy heartbeat cadence.
+///
+/// Budget: 25 s. Memory-side materialization + chunked-rootfs
+/// materialize + FC `load_snapshot` is observed at 3-15 s on
+/// chunk-cache-warm hosts and 10-25 s on cold-cache hosts. Past
+/// 25 s we return Err and the caller logs a WARN — the image
+/// stays enabled and warm pool fills on the next heartbeat tick.
+async fn wait_for_first_warm_slot(
+    state: &SharedState,
+    template_ref: TemplateRef,
+) -> Result<std::time::Duration, std::time::Duration> {
+    let start = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(25);
+    let tick = std::time::Duration::from_millis(500);
+    loop {
+        for (_host_id, hs) in state.host_registry.snapshot_all_states() {
+            if hs
+                .warm_slots
+                .iter()
+                .any(|w| w.template_ref == template_ref && w.available >= 1)
+            {
+                return Ok(start.elapsed());
+            }
+        }
+        if start.elapsed() >= budget {
+            return Err(start.elapsed());
+        }
+        tokio::time::sleep(tick).await;
+    }
 }
 
 #[cfg(test)]

@@ -52,6 +52,12 @@ export interface HostView {
   capacity_used_mib: number;
   running_sandboxes: number;
   local_snapshots: number;
+  /** ADR 0014: sum of `available` warm slots across every template
+   * this host keeps warm. Live-only, not persisted — reads 0 on a
+   * coord replica that hasn't received a heartbeat from this host
+   * yet. Surfaced in `VitalSigns` so operators can see the warm
+   * pool's depth at a glance. */
+  warm_pool_available: number;
   last_heartbeat_at: string;
 }
 

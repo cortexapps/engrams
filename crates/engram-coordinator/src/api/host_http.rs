@@ -65,6 +65,17 @@ pub struct RegisterResponse {
     /// invariant that existed on the WS path didn't survive into
     /// gRPC, since gRPC carries its own schema.
     pub coord_wire_version: u32,
+    /// ADR 0014 M1.11: the current active-templates set, same shape
+    /// the heartbeat-ack carries. Bootstrapping a fresh host through
+    /// the first heartbeat tick (~few seconds) leaves the warm pool
+    /// empty during that window; piggy-backing the template list on
+    /// `register` lets the host start its refill loop *immediately*
+    /// after registering, shrinking the post-MIG-roll "no warm
+    /// slots" window from `heartbeat_interval + refill_time` to just
+    /// `refill_time`. Default empty for old hosts that ignore the
+    /// field (forward-compat).
+    #[serde(default)]
+    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
 }
 
 pub async fn register(
@@ -118,16 +129,37 @@ pub async fn register(
         std::sync::Arc::new(grpc_client);
     state.host_registry.register(req.host_id, backend);
 
+    // ADR 0014 M1.11: hand the host the current active-templates
+    // set so it can start its refill loop without waiting for the
+    // first heartbeat tick (~few seconds). On MIG roll this cuts
+    // the "no warm slots after deploy" window by roughly that
+    // interval. Failure here is non-fatal — the heartbeat path
+    // re-delivers the list on the next tick, same behavior as
+    // pre-this-change.
+    let active_templates = match state.services.meta.list_active_templates().await {
+        Ok(records) => active_templates_with_metadata(state.clone(), records).await,
+        Err(e) => {
+            tracing::debug!(
+                host_id = %req.host_id,
+                error = %e,
+                "list_active_templates failed at register; host will pick them up on next heartbeat",
+            );
+            Vec::new()
+        }
+    };
+
     tracing::info!(
         host_id = %req.host_id,
         host_addr = %req.host_addr,
         agent_version = %req.agent_version,
+        active_templates = active_templates.len(),
         "host registered via /api/hosts/register",
     );
 
     Ok(Json(RegisterResponse {
         server_time: Utc::now(),
         coord_wire_version: engram_protocol::WIRE_VERSION,
+        active_templates,
     }))
 }
 

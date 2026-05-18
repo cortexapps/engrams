@@ -120,6 +120,20 @@ impl HostRegistry {
             .map(|e| e.value().state.read().clone())
     }
 
+    /// ADR 0014 M1.11: snapshot every host's state at once. Used by
+    /// the `POST /api/enabled-images` synchronous-fill path to poll
+    /// for warm-slot availability without per-host individual reads.
+    /// Returned vec ordered by `HostId` for determinism in tests.
+    pub fn snapshot_all_states(&self) -> Vec<(HostId, HostState)> {
+        let mut out: Vec<(HostId, HostState)> = self
+            .hosts
+            .iter()
+            .map(|e| (*e.key(), e.value().state.read().clone()))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
     /// Drop a host. Sandbox ownership rows for sandboxes created by
     /// this host stay around — they're meaningless without their host
     /// but cheap to leave; they get cleaned up the next time the

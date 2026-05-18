@@ -85,13 +85,19 @@ function computeStats(
   const snapshots = h.reduce((acc, host) => acc + host.local_snapshots, 0);
   const active = s.filter((x) => x.status === 'active').length;
   const idle = s.filter((x) => x.status === 'idle').length;
-  const dead = s.filter((x) => x.status === 'dead').length;
+  // ADR 0014: WARM replaces DEAD. Dead sessions are terminal and
+  // out of operator interest once they roll past the recent-list
+  // (still queryable via `engram session log`); the warm pool's
+  // depth, on the other hand, is the load-bearing signal for
+  // "next session will be sub-second" and worth a permanent
+  // header slot.
+  const warm = h.reduce((acc, host) => acc + host.warm_pool_available, 0);
 
   return [
     { label: 'HOSTS', value: h.length },
     { label: 'SNAPSHOTS', value: snapshots },
     { label: 'ACTIVE', value: active },
     { label: 'IDLE', value: idle },
-    { label: 'DEAD', value: dead },
+    { label: 'WARM', value: warm },
   ];
 }
