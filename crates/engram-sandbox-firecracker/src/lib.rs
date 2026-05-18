@@ -438,6 +438,15 @@ struct FcSnapshotManifest {
     /// source sandbox booted without a harness substrate.
     #[serde(default)]
     source_harness_canonical: Option<PathBuf>,
+    /// The exact `vsock.uds_path` the bake's FC `PUT /vsock`'d, baked
+    /// into state.bin. FC `load_snapshot` recreates the vsock UDS at
+    /// this path; the host-agent must then dial that same path to
+    /// reach the guest. Without this the host-agent dials
+    /// `<host_work_dir>/<source_id>.vsock` which doesn't exist on a
+    /// cross-host restore (the file FC actually opened lives at the
+    /// bake-side path).
+    #[serde(default)]
+    source_vsock_canonical: Option<PathBuf>,
 }
 
 const MANIFEST_FORMAT_FC: &str = "fc";
@@ -1462,13 +1471,19 @@ impl FirecrackerBackend {
         // the original VM had attached — Firecracker reopens that
         // path on load, so it must still be valid on disk.
         let rootfs_path = manifest.spec.rootfs_source.clone().unwrap_or_default();
-        // FC restored the vsock device at the same UDS path stored in
-        // state.bin (under work_dir, by design). We don't have the
-        // pre-snapshot CID in the manifest — that was a Firecracker
-        // internal — so we surface the original sandbox_id-derived
-        // path and a freshly-allocated CID for our SandboxState. The
-        // CID we record is informational on the restored side.
-        let vsock_uds_path = self.work_dir.join(format!("{}.vsock", manifest.sandbox_id));
+        // FC `load_snapshot` reads vsock config from state.bin and
+        // binds the host-side UDS at the bake-side path. FC's vsock
+        // state machine refuses any reconfiguration after load (PUT
+        // /vsock returns 400 both pre-load — "configuring boot
+        // resources before load" — and post-load — "not supported
+        // after starting the microVM"), so we MUST dial the bake's
+        // path. `source_vsock_canonical` carries that path. Fall back
+        // to the host-derived layout for legacy snapshots / same-host
+        // idle resume.
+        let vsock_uds_path = manifest
+            .source_vsock_canonical
+            .clone()
+            .unwrap_or_else(|| self.work_dir.join(format!("{}.vsock", manifest.sandbox_id)));
         let vsock_cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
         // Re-spawn the harness accept loop for the restored VM. FC
         // restored its vsock device pointing at the snapshot-time UDS
@@ -1635,6 +1650,25 @@ async fn restore_canonical_symlinks(
                     })?;
             }
         }
+    }
+    // FC `load_snapshot` re-creates the vsock UDS at the path embedded
+    // in state.bin (the bake's `<work_dir>/<id>.vsock`). The bake's
+    // tempdir is long gone on a cross-host restore, so the bind would
+    // fail silently — FC reports load success, then our CONNECT
+    // returns "early eof" because there's no listener. Pre-create the
+    // parent directory so FC can bind.
+    if let Some(source_vsock) = manifest.source_vsock_canonical.as_ref() {
+        if let Some(parent) = source_vsock.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                vm_err(format!(
+                    "create source vsock canonical parent {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        // Stale UDS file from a prior restore on this host blocks the
+        // bind. Best-effort remove; missing file is fine.
+        let _ = tokio::fs::remove_file(source_vsock).await;
     }
     if let Some(harness_target) = manifest.spec.harness_substrate.as_ref() {
         let canonical = paths::harness_canonical(work_dir, manifest.sandbox_id);
@@ -2090,6 +2124,12 @@ impl SandboxBackend for FirecrackerBackend {
         } else {
             None
         };
+        // The bake's vsock UDS lived at `<work_dir>/<sandbox_id>.vsock`
+        // (set in create_in_jail). FC's state.bin embeds that path; on
+        // restore FC recreates the UDS there. Stamp it so the receiver
+        // can dial the right path instead of guessing from its own
+        // work_dir.
+        let source_vsock_canonical = Some(self.work_dir.join(format!("{id}.vsock")));
         let manifest = FcSnapshotManifest {
             sandbox_id: id,
             created_at,
@@ -2119,6 +2159,7 @@ impl SandboxBackend for FirecrackerBackend {
             // location and wouldn't satisfy FC).
             source_rootfs_canonical,
             source_harness_canonical,
+            source_vsock_canonical,
         };
         let manifest_path = dest.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -2735,6 +2776,7 @@ mod tests {
             trace_host_hint: None,
             source_rootfs_canonical: None,
             source_harness_canonical: None,
+            source_vsock_canonical: None,
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: FcSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
