@@ -43,6 +43,13 @@ kill_by_pidfile() {
 
 # host-agent first so it gets a chance to deregister with the coord.
 kill_by_pidfile "$INTEG_DIR/host-agent.pid" "host-agent"
+# integration-up.sh runs host-agent under sudo for CAP_NET_ADMIN; the
+# pidfile points at the sudo wrapper, and SIGTERM-on-sudo forwards to
+# the child. As a backstop (sudo may not forward SIGKILL) we
+# pkill the binary by name. Best-effort.
+sudo -n pkill -TERM engram-host-agent 2>/dev/null || true
+sleep 0.5
+sudo -n pkill -KILL engram-host-agent 2>/dev/null || true
 kill_by_pidfile "$INTEG_DIR/coord.pid" "coordinator"
 
 echo "==> docker compose down (volumes preserved)"

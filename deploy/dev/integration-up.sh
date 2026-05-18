@@ -66,6 +66,22 @@ bash deploy/dev/seed-buckets.sh
 echo "==> build coordinator + host-agent"
 cargo build -p engram-coordinator -p engram-host-agent
 
+# ADR 0014: host-agent provisions per-VM TAPs (via the `ip` shell-out)
+# and writes iptables rules. CAP_NET_ADMIN on the host-agent binary
+# alone isn't enough — `ip` is a subprocess and the cap doesn't
+# propagate without ambient bits. Run host-agent under `sudo -E` on
+# the dev rig (prod uses systemd's AmbientCapabilities). User must
+# have NOPASSWD sudo, or this will block.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY"
+    if ! sudo -n true 2>/dev/null; then
+        echo "ERROR: passwordless sudo required for host-agent TAP creation." >&2
+        echo "       Add an entry to /etc/sudoers.d/ allowing this user NOPASSWD." >&2
+        exit 1
+    fi
+fi
+
 # Source .env so KEK + any operator overrides land in the
 # coord/host-agent's process env. `just bootstrap` writes a fresh
 # `ENGRAM_KEK_MASTER_KEY=...` line into .env on first run.
@@ -108,7 +124,7 @@ ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
 STORAGE_EMULATOR_HOST="http://localhost:4443" \
 ENGRAM_EGRESS_PROXY_PORT="0" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_host_agent::warm_pool=debug,engram_host_agent::pooled_backend=debug}" \
-nohup ./target/debug/engram-host-agent >"$INTEG_DIR/host-agent.log" 2>&1 &
+nohup $SUDO ./target/debug/engram-host-agent >"$INTEG_DIR/host-agent.log" 2>&1 &
 echo $! > "$INTEG_DIR/host-agent.pid"
 
 echo "==> wait for host registration"
