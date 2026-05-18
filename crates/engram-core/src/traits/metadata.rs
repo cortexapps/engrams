@@ -206,6 +206,22 @@ pub trait MetadataStore: Send + Sync {
         &self,
         sid: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError>;
+    /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
+    /// the heartbeat-ack template enrichment path to surface the
+    /// snapshot's persisted `disk_manifest` + `memory_manifest`
+    /// to host-agents — without those, warm-pool refill on a
+    /// fresh host has no way to materialize the rootfs file FC
+    /// `load_snapshot` needs.
+    ///
+    /// Default returns `None` so backends that don't have a real
+    /// DB (mocks, tests) opt out cleanly; callers that depend on
+    /// the persisted shape (heartbeat enrichment) override.
+    async fn get_snapshot(
+        &self,
+        _id: crate::types::SnapshotId,
+    ) -> Result<Option<SnapshotRecord>, MetaError> {
+        Ok(None)
+    }
 
     /// ADR 0007 chunk-store GC: enumerate every `manifest_id`
     /// referenced by a live snapshot row. The chunk store's

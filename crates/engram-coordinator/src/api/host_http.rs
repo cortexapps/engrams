@@ -294,29 +294,34 @@ async fn active_templates_with_metadata(
     state: SharedState,
     records: Vec<engram_core::types::template::TemplateRecord>,
 ) -> Vec<engram_protocol::heartbeat::ActiveTemplate> {
-    let _ = state; // M1.8 plumbs snapshot-row enrichment here
     let mut out = Vec::with_capacity(records.len());
     for record in records {
-        // Synthesise a SnapshotMetadata sufficient for the host
-        // to drive `backend.restore`: blob keys are derived from
-        // snapshot_id, and memory_manifest gets resolved by the
-        // host after it downloads the sidecar JSON from
-        // BlobStorage (PooledBackend.restore reads
-        // `manifest.json::memory_manifest` to materialise
-        // memory.bin from chunks). Future M1.8 follow-up: enrich
-        // here from the snapshots row so the host doesn't have to
-        // round-trip through sidecar JSON to discover
-        // memory_manifest.
+        // ADR 0014 M1.11: enrich from the snapshots row so the
+        // host doesn't have to round-trip through the sidecar JSON
+        // to discover memory_manifest, and (more importantly) gets
+        // disk_manifest so warm-pool refill can materialize the
+        // rootfs from BlobStorage chunks without an OCI pull.
+        // Without disk_manifest here, the host has no way to
+        // produce the rootfs file FC's `load_snapshot` requires
+        // and refills error out until `image_cache.ensure_image`
+        // primes the rootfs via a cold session create.
+        let snapshot_row = state
+            .services
+            .meta
+            .get_snapshot(record.snapshot_id)
+            .await
+            .ok()
+            .flatten();
+        let (disk_manifest, memory_manifest) = snapshot_row
+            .map(|r| (r.disk_manifest, r.memory_manifest))
+            .unwrap_or((None, None));
         let snapshot = engram_core::types::snapshot::SnapshotMetadata {
             id: record.snapshot_id,
             size_bytes: 0,
             created_at: record.created_at,
             image_version: format!("{}:{}", record.image_repo, record.image_tag),
-            disk_manifest: None,
-            // The memory manifest is captured at bake-time as part
-            // of the bundle; the host's PooledBackend reads it via
-            // the sidecar JSON it downloads from BlobStorage.
-            memory_manifest: None,
+            disk_manifest,
+            memory_manifest,
             source_sandbox_id: None,
             state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
                 record.snapshot_id,

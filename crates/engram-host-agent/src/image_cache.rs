@@ -634,7 +634,7 @@ pub struct CachedImage {
 /// Parsed contents of the `bundle.json` sidecar shipped with an OCI
 /// image artifact.
 ///
-/// Two on-disk shapes, deserialized into one struct:
+/// Three on-disk shapes, deserialized into one struct:
 ///
 /// - **v1** (ADR 0007): `schema_version: 1`, carries
 ///   `disk_manifest` + `canonical_memory_manifest`. Disk bytes
@@ -645,6 +645,13 @@ pub struct CachedImage {
 ///   OCI artifact. The actual bootstrap file paths and chunk-blob
 ///   digests live on `CachedImage` (populated by the image_cache at
 ///   pull time from `PulledImage`).
+/// - **v3** (ADR 0014 M1.11): `schema_version: 3`, all v2 fields plus
+///   a top-level `canonical_snapshot` block carrying a portable
+///   `SnapshotMetadata` (snapshot_id, memory_manifest, blob keys).
+///   Coord's `enable_image` cascade reads this block to populate
+///   the templates + snapshots tables; the host's image_cache
+///   doesn't consume it directly, so v3 deserializes cleanly into
+///   the v2 struct shape via `#[serde(default)]` ignores.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ImageBundle {
     pub schema_version: u32,

@@ -725,19 +725,30 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             req.canonical_memory_manifest
         {
             (Some(mref), None)
-        } else if let (Some(capture_cfg), Some(_disk_ref)) =
+        } else if let (Some(capture_cfg), Some(disk_ref)) =
             (req.capture_canonical_memory.as_ref(), disk_manifest)
         {
             match self
                 .capture_canonical_memory(&rootfs_path, image_dir, capture_cfg)
                 .await
             {
-                Ok(metadata) => {
+                Ok(mut metadata) => {
+                    // ADR 0014 M1.11: the bundle's `canonical_snapshot`
+                    // block needs `disk_manifest` so the coord-side
+                    // materializer + heartbeat-ack carry it through to
+                    // hosts. Without this, warm-pool refill on a fresh
+                    // host has the memory side reachable in BlobStorage
+                    // but no way to materialize the rootfs file FC
+                    // needs at `load_snapshot` time → "Block: Virtio
+                    // backend error" on every refill until a cold
+                    // session create primes image_cache.
+                    metadata.disk_manifest = Some(disk_ref);
                     tracing::info!(
                         repo = %req.repo,
                         tag = %req.tag,
                         snapshot_id = %metadata.id,
                         memory_manifest = ?metadata.memory_manifest,
+                        disk_manifest = ?metadata.disk_manifest,
                         "captured canonical template snapshot at bake time"
                     );
                     (metadata.memory_manifest, Some(metadata))

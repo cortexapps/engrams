@@ -648,6 +648,28 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::snapshot_from_row(&r)).transpose()
     }
 
+    async fn get_snapshot(
+        &self,
+        id: engram_core::types::SnapshotId,
+    ) -> Result<Option<SnapshotRecord>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, session_id, host_id,
+                   image_version, size_bytes,
+                   created_at, last_accessed_at,
+                   disk_manifest_id, disk_manifest_version,
+                   memory_manifest_id, memory_manifest_version,
+                   recoverable
+            FROM snapshots WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::snapshot_from_row(&r)).transpose()
+    }
+
     async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
         // The `idx_snapshots_disk_manifest` partial index (migration
         // 0018) makes this a fast scan over rows that actually have

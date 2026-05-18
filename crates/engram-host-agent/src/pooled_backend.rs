@@ -672,6 +672,127 @@ async fn materialize_state_if_missing(
     Ok(())
 }
 
+/// ADR 0014 cross-host warm-pool refill: materialize `rootfs.ext4`
+/// from chunks if it isn't already on disk, then patch the FC
+/// sidecar's `spec.rootfs_source` to the local file path. Without
+/// this, `restore_in_jail` installs the canonical-rootfs symlink
+/// pointing at the bake-time path (`/tmp/.tmpXXX/...`) which
+/// doesn't exist on the receiver, and FC `load_snapshot` errors
+/// with "Block: Virtio backend error: No such file or directory".
+///
+/// Called from `PooledBackend::restore` after `materialize_state_if_missing`
+/// (which downloads the sidecar that this function then patches).
+/// No-op when `metadata.disk_manifest` is None (legacy snapshots)
+/// or when the local rootfs file already exists at the canonical
+/// location (idempotent same-host resume).
+async fn materialize_disk_if_missing(
+    chunk_store: &ChunkStore,
+    chunk_cache: Option<&ChunkCache>,
+    src: &std::path::Path,
+    disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    materialize_lock: &Mutex<()>,
+) -> Result<(), SandboxError> {
+    let Some(disk_ref) = disk_manifest else {
+        return Ok(());
+    };
+    // Use the same content-addressed file name the cold-create path
+    // uses, in the same per-snapshot scratch dir, so a future
+    // `image_cache.ensure_image` materialization shares the file
+    // (and same-host resume short-circuits).
+    let local_rootfs = src.join(format!(
+        "{}-v{}.ext4",
+        disk_ref.manifest_id, disk_ref.version
+    ));
+    fs::create_dir_all(src).await.map_err(|e| {
+        SandboxError::Snapshot(format!("create snapshot dir {}: {e}", src.display()))
+    })?;
+    let _guard = materialize_lock.lock().await;
+    let manifest = chunk_store
+        .get_manifest(disk_ref)
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("get rootfs manifest {disk_ref}: {e}")))?;
+    if let Ok(meta) = fs::metadata(&local_rootfs).await {
+        if meta.len() == manifest.total_bytes {
+            tracing::debug!(
+                path = %local_rootfs.display(),
+                manifest = %disk_ref,
+                "rootfs already materialised; skipping rebuild",
+            );
+        }
+    }
+    if fs::metadata(&local_rootfs)
+        .await
+        .map(|m| m.len() != manifest.total_bytes)
+        .unwrap_or(true)
+    {
+        match chunk_cache {
+            Some(cache) => chunk_store
+                .materialize_to_file_cached(&manifest, &local_rootfs, cache)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!(
+                        "materialize rootfs (cached) {}: {e}",
+                        local_rootfs.display()
+                    ))
+                })?,
+            None => chunk_store
+                .materialize_to_file(&manifest, &local_rootfs)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!(
+                        "materialize rootfs {}: {e}",
+                        local_rootfs.display()
+                    ))
+                })?,
+        }
+        tracing::info!(
+            path = %local_rootfs.display(),
+            manifest = %disk_ref,
+            size_bytes = manifest.total_bytes,
+            "materialised rootfs.ext4 from chunked disk manifest",
+        );
+    }
+
+    // Patch the FC sidecar's `spec.rootfs_source` to point at the
+    // just-materialized file. `restore_in_jail` reads this field
+    // to install the canonical-rootfs symlink that FC `load_snapshot`
+    // dereferences; the bake-time path (`/tmp/.tmpXXX/.../rootfs.ext4`)
+    // doesn't exist on the receiver, so without this patch FC errors
+    // out. Same pattern as the in-prod `patch_fc_manifest_memory_ref`,
+    // just for the disk field instead of memory.
+    let sidecar_path = src.join("manifest.json");
+    let bytes = fs::read(&sidecar_path).await.map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "read fc manifest.json {}: {e}",
+            sidecar_path.display()
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "parse fc manifest.json {}: {e}",
+            sidecar_path.display()
+        ))
+    })?;
+    let spec = value
+        .get_mut("spec")
+        .and_then(|s| s.as_object_mut())
+        .ok_or_else(|| SandboxError::Snapshot("fc sidecar spec is not an object".into()))?;
+    spec.insert(
+        "rootfs_source".into(),
+        serde_json::Value::String(local_rootfs.to_string_lossy().into_owned()),
+    );
+    let patched = serde_json::to_vec_pretty(&value)
+        .map_err(|e| SandboxError::Snapshot(format!("serialize patched sidecar: {e}")))?;
+    fs::write(&sidecar_path, patched).await.map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "write patched sidecar to {}: {e}",
+            sidecar_path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// ADR 0008 Phase 5 final piece: ensure the disk `Manifest`
 /// referenced by `cached.bundle.disk_manifest` is reachable in
 /// the host's `BlobStorage`. For chunked-OCI images, the bake-
@@ -1293,6 +1414,26 @@ impl SandboxBackend for PooledBackend {
                     error = %e,
                     src = %src.display(),
                     "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
+                );
+            }
+            // ADR 0014: materialize rootfs from chunks (if disk_manifest
+            // is set) and patch the sidecar's spec.rootfs_source so
+            // restore_in_jail's canonical-rootfs symlink points at the
+            // local file. Without this, FC load_snapshot fails because
+            // the bake-time rootfs path doesn't exist on the receiver.
+            if let Err(e) = materialize_disk_if_missing(
+                chunk_store,
+                self.chunk_cache.as_ref(),
+                &src,
+                metadata.disk_manifest,
+                &self.materialize_lock,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    src = %src.display(),
+                    "rootfs materialization failed; inner.restore will see whatever's there",
                 );
             }
         }
