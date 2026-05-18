@@ -246,6 +246,21 @@ async fn main() -> Result<(), HostAgentError> {
             if cli.egress_proxy_port > 0 {
                 fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
             }
+            // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
+            // ext4 stub harness that warm-pool restore points the
+            // harness symlink at. Content-identical to the one the
+            // bake produces, so no transfer needed — every host
+            // mke2fs's its own at startup. `swap_harness_drive`
+            // re-points the symlink at the session's real harness
+            // ext4 at warm-lease.
+            let stub_path = cli.work_dir.join(".stub-harness.ext4");
+            let stub_abs = ensure_stub_harness(&stub_path).await.map_err(|e| {
+                HostAgentError::Config(format!(
+                    "materialize stub harness at {}: {e}",
+                    stub_path.display()
+                ))
+            })?;
+            fc_cfg.stub_harness_path = Some(stub_abs);
             let fc = Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
                 fc_cfg,
@@ -401,6 +416,39 @@ async fn main() -> Result<(), HostAgentError> {
         );
     }
     agent.run().await
+}
+
+/// ADR 0014 M1.12: produce / verify the 16 MiB stub harness ext4 at
+/// `<work_dir>/.stub-harness.ext4`. Warm-pool restore points the
+/// harness symlink at this file so `load_snapshot` can open it as a
+/// virtio-blk device; `swap_harness_drive` repoints to the session's
+/// real harness at warm-lease. Idempotent — skips when the file is
+/// already the expected size. Returns the **absolute** path; the
+/// receiver's harness symlinks resolve relative to their own parent
+/// directory (the bake's `/tmp/.tmpXXX/harness/`), so a relative
+/// `./var/...` target would dangle there.
+async fn ensure_stub_harness(path: &std::path::Path) -> Result<PathBuf, String> {
+    const STUB_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("mkdir stub parent {}: {e}", parent.display()))?;
+    }
+    let needs_build = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len() != STUB_SIZE_BYTES,
+        Err(_) => true,
+    };
+    if needs_build {
+        let scratch = tempfile::tempdir().map_err(|e| format!("stub tempdir: {e}"))?;
+        use engram_image_builder::{Ext4Packer, Mke2fsPacker};
+        Mke2fsPacker::default()
+            .pack(scratch.path(), path, STUB_SIZE_BYTES)
+            .await
+            .map_err(|e| format!("mke2fs stub harness: {e}"))?;
+    }
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| format!("canonicalize stub harness {}: {e}", path.display()))
 }
 
 async fn build_host_egress(cli: &Cli) -> Result<engram_host_agent::egress::HostEgress, String> {

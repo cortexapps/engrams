@@ -1013,6 +1013,35 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let work = tempfile::tempdir()
             .map_err(|e| BuildError::Config(format!("canonical bake tempdir: {e}")))?;
 
+        // ADR 0014 M1.12 (option D): produce a 16 MiB empty ext4 the
+        // bake attaches as the harness substrate (/dev/vdb). The init
+        // shim doesn't mount /dev/vdb; engram-bootstrap mounts it
+        // *after* receiving BootstrapLaunch at warm-lease time. The
+        // stub being attached at bake time is what lets us snapshot
+        // a bootstrap-on-accept state with the correct device-tree —
+        // FC's `swap_harness_drive` later swaps to the session's
+        // real harness, but the snapshot needs *something* openable
+        // at the embedded path.
+        let stub_dir = work.path().join("stub");
+        tokio::fs::create_dir_all(&stub_dir).await.map_err(|e| {
+            BuildError::Config(format!(
+                "create stub harness staging dir {}: {e}",
+                stub_dir.display()
+            ))
+        })?;
+        let stub_src = stub_dir.join("src");
+        tokio::fs::create_dir_all(&stub_src).await.map_err(|e| {
+            BuildError::Config(format!(
+                "create stub harness src dir {}: {e}",
+                stub_src.display()
+            ))
+        })?;
+        let stub_path = work.path().join(".stub-harness.ext4");
+        Mke2fsPacker::default()
+            .pack(&stub_src, &stub_path, 16 * 1024 * 1024)
+            .await
+            .map_err(|e| BuildError::Config(format!("pack stub harness ext4: {e}")))?;
+
         let mut fc_cfg = FirecrackerConfig::with_kernel(&capture_cfg.kernel_image_path);
         if let Some(bin) = &capture_cfg.firecracker_bin {
             fc_cfg.firecracker_bin = bin.clone();
@@ -1022,10 +1051,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // resources only.
         fc_cfg.net_pool = None;
         fc_cfg.egress_proxy_port = None;
-        // Boot to a shell — init shim isn't required for the
-        // memory snapshot, just enough kernel + userspace to
-        // reach steady state.
-        fc_cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+        // ADR 0014 M1.12: boot through `engram-init` so the init
+        // shim spawns engram-bootstrap (BOOTSTRAP_VSOCK_PORT
+        // listener) before snapshot. Without this the bake captures
+        // a kernel-only state and warm-launch's CONNECT gets RST.
+        fc_cfg.default_boot_args =
+            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
+        // Hand the FC backend the bake-time stub so its restore
+        // path can resolve the harness symlink — only meaningful
+        // here when we run a profiling-restore later (M1.14).
+        fc_cfg.stub_harness_path = Some(stub_path.clone());
 
         let backend = FirecrackerBackend::new(work.path(), fc_cfg);
 
@@ -1042,7 +1077,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: None,
+            harness_substrate: Some(stub_path.clone()),
             network: Default::default(),
             canonical_memory_manifest: None,
         };

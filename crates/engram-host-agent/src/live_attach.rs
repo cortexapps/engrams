@@ -273,6 +273,7 @@ mod tests {
             egress_dns_port: None,
             host_id: None,
             uffd_cache_root: None,
+            stub_harness_path: None,
         };
         Arc::new(FirecrackerBackend::new(work_dir, cfg))
     }

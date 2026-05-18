@@ -212,6 +212,17 @@ pub struct FirecrackerConfig {
     /// (`<work_dir>/uffd-chunk-cache/`) when the backend is built
     /// via `FirecrackerBackend::new`.
     pub uffd_cache_root: Option<PathBuf>,
+    /// ADR 0014 M1.12 (option D): host-local stub harness ext4 used
+    /// as the symlink target for warm-pool restores. State.bin
+    /// embeds the bake's harness substrate path, which doesn't exist
+    /// on the receiver; `restore_canonical_symlinks` redirects both
+    /// host-canonical and source-canonical harness paths at this
+    /// local file instead. Required to be present + a real ext4 so
+    /// FC `load_snapshot` can open it as a virtio-blk device. Caller
+    /// (host-agent on startup, image-builder during bake) is
+    /// responsible for materializing the file. The session's real
+    /// harness is patched in via `swap_harness_drive` at warm-lease.
+    pub stub_harness_path: Option<PathBuf>,
 }
 
 /// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
@@ -317,6 +328,7 @@ impl FirecrackerConfig {
             restore_mode: RestoreMode::File,
             host_id: None,
             uffd_cache_root: None,
+            stub_harness_path: None,
         }
     }
 }
@@ -1350,7 +1362,13 @@ impl FirecrackerBackend {
         // materialized into `manifest.spec.rootfs_source` already).
         // Errors here drop `child` explicitly so the spawned FC
         // process gets SIGKILLed before we propagate.
-        if let Err(e) = restore_canonical_symlinks(&self.work_dir, manifest).await {
+        if let Err(e) = restore_canonical_symlinks(
+            &self.work_dir,
+            manifest,
+            self.config.stub_harness_path.as_deref(),
+        )
+        .await
+        {
             drop(child);
             return Err(e);
         }
@@ -1595,9 +1613,18 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 /// keyed by the **source** sandbox_id because that's what
 /// `state.bin` embedded as `path_on_host`, not the new restored
 /// sandbox_id. Idempotent.
+///
+/// `stub_harness_override`, when `Some`, replaces `manifest.spec.
+/// harness_substrate` as the symlink target — used by warm-pool
+/// restore where the bake's stub.ext4 path doesn't exist on the
+/// receiver, but a content-identical host-local stub does. M1.12's
+/// `swap_harness_drive` re-points the symlink at the session's real
+/// harness ext4 at warm-lease time, so the stub only needs to be
+/// openable as a block device by `load_snapshot`.
 async fn restore_canonical_symlinks(
     work_dir: &Path,
     manifest: &FcSnapshotManifest,
+    stub_harness_override: Option<&Path>,
 ) -> Result<(), SandboxError> {
     for parent in paths::canonical_parent_dirs(work_dir) {
         tokio::fs::create_dir_all(&parent).await.map_err(|e| {
@@ -1670,7 +1697,16 @@ async fn restore_canonical_symlinks(
         // bind. Best-effort remove; missing file is fine.
         let _ = tokio::fs::remove_file(source_vsock).await;
     }
-    if let Some(harness_target) = manifest.spec.harness_substrate.as_ref() {
+    if manifest.spec.harness_substrate.is_some() {
+        // Pick the symlink target: a host-local stub when supplied
+        // (the cross-host warm-pool case), otherwise fall back to
+        // whatever the manifest names (legacy / same-host resume).
+        // If neither is available we'd dangle the symlink, so bail
+        // explicitly with a diagnostic.
+        let manifest_target = manifest.spec.harness_substrate.as_deref();
+        let harness_target: &Path = stub_harness_override
+            .or(manifest_target)
+            .ok_or_else(|| vm_err("no harness target available for symlink"))?;
         let canonical = paths::harness_canonical(work_dir, manifest.sandbox_id);
         paths::install_symlink(&canonical, harness_target)
             .await
@@ -2607,6 +2643,7 @@ mod tests {
             egress_dns_port: None,
             host_id: None,
             uffd_cache_root: None,
+            stub_harness_path: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }
