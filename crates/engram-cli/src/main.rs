@@ -542,6 +542,9 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                             .and_then(|p| p.parent().map(|d| d.join("engram-uffd-handler")))
                             .filter(|p| p.exists()),
                         blob_root: Some(images_dir.join("store")),
+                        // Production bakes inject engram-init +
+                        // bootstrap; warm-pool prep is the point.
+                        skip_warm_pool_prep: false,
                     })
                 } else {
                     None

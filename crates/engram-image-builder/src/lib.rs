@@ -148,6 +148,14 @@ pub struct CanonicalCaptureConfig {
     /// proceeds without a working-set trace and refill falls back
     /// to full-manifest prefetch.
     pub blob_root: Option<PathBuf>,
+    /// ADR 0014 M1.12: bypass the engram-init + stub-harness
+    /// scaffolding when `true`. Default `false` (production bakes
+    /// capture a bootstrap-on-accept snapshot). Set to `true` only
+    /// by the canonical-capture integration test fixture, which
+    /// boots a stock Ubuntu rootfs that has neither engram-init
+    /// nor engram-bootstrap baked in — without this opt-out the
+    /// kernel panics with `init=/sbin/engram-init` missing.
+    pub skip_warm_pool_prep: bool,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -1045,26 +1053,32 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // a bootstrap-on-accept state with the correct device-tree —
         // FC's `swap_harness_drive` later swaps to the session's
         // real harness, but the snapshot needs *something* openable
-        // at the embedded path.
-        let stub_dir = work.path().join("stub");
-        tokio::fs::create_dir_all(&stub_dir).await.map_err(|e| {
-            BuildError::Config(format!(
-                "create stub harness staging dir {}: {e}",
-                stub_dir.display()
-            ))
-        })?;
-        let stub_src = stub_dir.join("src");
-        tokio::fs::create_dir_all(&stub_src).await.map_err(|e| {
-            BuildError::Config(format!(
-                "create stub harness src dir {}: {e}",
-                stub_src.display()
-            ))
-        })?;
-        let stub_path = work.path().join(".stub-harness.ext4");
-        Mke2fsPacker::default()
-            .pack(&stub_src, &stub_path, 16 * 1024 * 1024)
-            .await
-            .map_err(|e| BuildError::Config(format!("pack stub harness ext4: {e}")))?;
+        // at the embedded path. Skipped in test fixtures that boot a
+        // stock rootfs without engram-init (kernel panic otherwise).
+        let stub_path = if capture_cfg.skip_warm_pool_prep {
+            None
+        } else {
+            let stub_dir = work.path().join("stub");
+            tokio::fs::create_dir_all(&stub_dir).await.map_err(|e| {
+                BuildError::Config(format!(
+                    "create stub harness staging dir {}: {e}",
+                    stub_dir.display()
+                ))
+            })?;
+            let stub_src = stub_dir.join("src");
+            tokio::fs::create_dir_all(&stub_src).await.map_err(|e| {
+                BuildError::Config(format!(
+                    "create stub harness src dir {}: {e}",
+                    stub_src.display()
+                ))
+            })?;
+            let p = work.path().join(".stub-harness.ext4");
+            Mke2fsPacker::default()
+                .pack(&stub_src, &p, 16 * 1024 * 1024)
+                .await
+                .map_err(|e| BuildError::Config(format!("pack stub harness ext4: {e}")))?;
+            Some(p)
+        };
 
         let mut fc_cfg = FirecrackerConfig::with_kernel(&capture_cfg.kernel_image_path);
         if let Some(bin) = &capture_cfg.firecracker_bin {
@@ -1079,12 +1093,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // shim spawns engram-bootstrap (BOOTSTRAP_VSOCK_PORT
         // listener) before snapshot. Without this the bake captures
         // a kernel-only state and warm-launch's CONNECT gets RST.
-        fc_cfg.default_boot_args =
-            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
+        // Test fixtures that boot a stock rootfs (no engram-init)
+        // override to a plain shell so the kernel doesn't panic.
+        fc_cfg.default_boot_args = if capture_cfg.skip_warm_pool_prep {
+            "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into()
+        } else {
+            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into()
+        };
         // Hand the FC backend the bake-time stub so its restore
         // path can resolve the harness symlink — only meaningful
         // here when we run a profiling-restore later (M1.14).
-        fc_cfg.stub_harness_path = Some(stub_path.clone());
+        fc_cfg.stub_harness_path = stub_path.clone();
 
         let backend = FirecrackerBackend::new(work.path(), fc_cfg);
 
@@ -1101,7 +1120,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: Some(stub_path.clone()),
+            harness_substrate: stub_path.clone(),
             network: Default::default(),
             canonical_memory_manifest: None,
         };
@@ -1234,17 +1253,23 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         if let Err(e) = engram_core::traits::SandboxBackend::destroy(&backend, sandbox_id).await {
             tracing::warn!(error = %e, "canonical bake VM destroy failed; FC child cleanup is kill-on-drop");
         }
-        match self
-            .run_working_set_profile_pass(
-                image_dir,
-                capture_cfg,
-                metadata.clone(),
-                &stub_path,
-                manifest_ref,
-                work.path(),
-            )
-            .await
-        {
+        // Skip the M1.14 profile pass when there's no stub harness
+        // — the pass relies on bootstrap mounting /dev/vdb.
+        let profile_outcome = match stub_path.as_ref() {
+            Some(stub) => {
+                self.run_working_set_profile_pass(
+                    image_dir,
+                    capture_cfg,
+                    metadata.clone(),
+                    stub,
+                    manifest_ref,
+                    work.path(),
+                )
+                .await
+            }
+            None => Ok(None),
+        };
+        match profile_outcome {
             Ok(Some(ws_path)) => {
                 tracing::info!(
                     path = %ws_path.display(),
