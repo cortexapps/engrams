@@ -120,10 +120,64 @@ db-reset:
 dev:
     tilt up
 
+# Same as `just dev` but in prod-shape split mode: coordinator runs
+# `mode=coordinator` (no in-process sandbox backend), a separate
+# `engram-host-agent` process registers + heartbeats over HTTP and
+# answers gRPC HostService calls — exactly what production runs.
+# Blob backend is forced to `gcs` (against fake-gcs-server) so
+# the OCI → BlobStorage materialization on enable-image is
+# exercised end-to-end.
+#
+# Use this when validating cross-host behavior locally: warm-pool
+# refill, register-time template delivery, the canonical-path
+# symlink contract, blob-backend coupling bugs.
+dev-split:
+    ENGRAM_DEV_SPLIT=1 tilt up
+
 # Bring everything down: kill the coordinator + web processes,
 # stop the docker-compose services, leave volumes intact.
 dev-down:
     tilt down
+
+# ------------------------------------------------------------------
+# `just integration-up` — prod-shape stack without Tilt.
+#
+# Designed for the dev VM, which has docker + just but not Tilt.
+# Brings up:
+#   • postgres (compose)
+#   • fake-gcs-server (compose)
+#   • local OCI registry (compose)
+#   • KEK + GCS bucket seed (one-shot)
+#   • coordinator in `mode=coordinator` (background, logs in
+#     ./var/integration/coord.log)
+#   • engram-host-agent dialing the coordinator (background,
+#     logs in ./var/integration/host-agent.log)
+#
+# Once everything is up, run `just integration-test` to exercise
+# the bake → enable → warm-pool → session-create loop end-to-end
+# against the local stack. `just integration-down` stops the
+# processes and the compose services.
+#
+# Linux-only (Firecracker requires KVM); the rig assumes a kernel
+# artifact in $HOME/.cache/engram-fc-test/. Run the fetch script
+# (crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)
+# if you don't have one.
+# ------------------------------------------------------------------
+integration-up:
+    bash deploy/dev/integration-up.sh
+
+# Stop the integration stack. Kills the background coord +
+# host-agent processes, stops docker compose services. Volumes
+# stay (db, gcs bucket) so re-running picks up state.
+integration-down:
+    bash deploy/dev/integration-down.sh
+
+# Smoke-test the full bake → enable → warm-pool → session flow
+# against the local integration stack. Times each step and
+# asserts the warm path actually triggers. Run after
+# `just integration-up`.
+integration-test:
+    bash deploy/dev/integration-test.sh
 
 # Bake an image from a directory containing Dockerfile + engram.toml,
 # then push it to the local OCI registry. Auto-selects cross-compile

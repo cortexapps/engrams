@@ -65,8 +65,20 @@ services:
   fake-gcs-server:
     image: fsouza/fake-gcs-server:1.54.0
     restart: unless-stopped
-    ports:
-      - "4443:4443"
+    # `network_mode: host` skips docker's bridge + iptables port-
+    # forwarding path entirely. Necessary when running this stack
+    # on a host that's been used for engram-host-agent
+    # development: `host_startup` writes iptables rules into the
+    # FORWARD / PREROUTING / POSTROUTING chains, and if the
+    # host-agent crashes or gets killed without running its
+    # teardown path, docker's later port-mapping DNAT writes
+    # collide ("iptables: No chain/target/match by that name").
+    # Postgres + registry don't hit this because their port
+    # bindings were realized before the host-agent ran; new
+    # bridge-mode containers do. Host networking sidesteps the
+    # whole problem — the container binds 4443 directly on the
+    # host, no DNAT involved.
+    network_mode: host
     volumes:
       - engram-fake-gcs-data:/data
     command: >

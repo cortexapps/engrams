@@ -156,10 +156,23 @@ local_resource('seed-buckets',
 # the chain tight.
 # ----------------------------------------------------------------
 
+# ADR 0014: when `ENGRAM_DEV_SPLIT=1` (or set in .env), wire the
+# stack the same way prod is: coord in `mode=coordinator`, a
+# separate host-agent process dialing it over HTTP+gRPC. Default
+# (unset) keeps `mode=all` for the fast inner-loop experience —
+# the same binary serves coord HTTP + a local in-process backend,
+# and there's no host-agent process to manage.
+#
+# Use `ENGRAM_DEV_SPLIT=1 tilt up` (or `ENGRAM_DEV_SPLIT=1` in
+# `.env`) when validating cross-host behavior locally — warm-pool
+# refill driven by the heartbeat-ack, register-time template
+# delivery, and the OCI → BlobStorage materialization end-to-end.
+dev_split = env_or('ENGRAM_DEV_SPLIT', '') in ('1', 'true', 'yes')
+
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
-    'ENGRAM_MODE': 'all',
+    'ENGRAM_MODE': 'coordinator' if dev_split else 'all',
     'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
     'ENGRAM_SANDBOX_WORK_DIR': './var/sandboxes',
     'ENGRAM_LOCAL_PATH': './var/engram',
@@ -169,8 +182,10 @@ coord_env = {
     # ADR 0005 / Stage 4: cold-tier blob durability. Default to the
     # local fs backend; flip to `gcs` against the fake-gcs-server
     # emulator by setting ENGRAM_BLOB_BACKEND=gcs in .env (the seed
-    # script provisions the `engram-snapshots-test` bucket).
-    'ENGRAM_BLOB_BACKEND': env_or('ENGRAM_BLOB_BACKEND', 'local'),
+    # script provisions the `engram-snapshots-test` bucket). Split
+    # mode forces gcs to match prod's topology — the whole point of
+    # the rig is to catch backend-config-coupling bugs.
+    'ENGRAM_BLOB_BACKEND': 'gcs' if dev_split else env_or('ENGRAM_BLOB_BACKEND', 'local'),
     'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
     'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
     'RUST_LOG': 'info,engram=debug',
@@ -222,6 +237,70 @@ local_resource('coordinator',
     labels=['app'],
     trigger_mode=TRIGGER_MODE_MANUAL,
     auto_init=True)
+
+# ----------------------------------------------------------------
+# Host-agent (split-mode only).
+#
+# In `mode=all` the coordinator binary serves both the HTTP API
+# and a local in-process backend. In `mode=coordinator` it serves
+# only the API, and a separate `engram-host-agent` process owns
+# the sandbox backend (FC/VZ), heartbeats over HTTP, and answers
+# gRPC HostService calls. Production runs this split shape; the
+# `ENGRAM_DEV_SPLIT=1` flag flips dev to match.
+# ----------------------------------------------------------------
+
+if dev_split:
+    host_agent_env = {
+        # Same per-image kernel as the coord-side mode=all path uses.
+        kernel_key: kernel_path,
+        'ENGRAM_SANDBOX_WORK_DIR': './var/host-sandboxes',
+        'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
+        # gRPC plumbing — coord dials this address (advertise) and
+        # the host-agent listens on the bind addr. Same machine in
+        # dev, so loopback works for both.
+        'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:9101',
+        'ENGRAM_GRPC_ADVERTISE_ADDR': 'http://127.0.0.1:9101',
+        # Coord HTTP — host-agent register/heartbeat target.
+        'ENGRAM_COORDINATOR_ENDPOINT': 'http://127.0.0.1:8090',
+        # Same GCS backend the coord uses, so chunks materialized
+        # coord-side are reachable from the host-agent's
+        # PooledBackend at runtime.
+        'ENGRAM_BLOB_BACKEND': 'gcs',
+        'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
+        'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
+        # Egress proxy off in dev — set non-zero to enable.
+        'ENGRAM_EGRESS_PROXY_PORT': '0',
+        'RUST_LOG': 'info,engram=debug',
+    }
+    if 'Darwin' in uname_str:
+        host_agent_env['PATH'] = (
+            '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
+        )
+
+    if needs_codesign:
+        host_agent_serve_cmd = (
+            'cargo build -p engram-host-agent && ' +
+            'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
+            'exec ./target/debug/engram-host-agent'
+        )
+    else:
+        host_agent_serve_cmd = 'cargo run -p engram-host-agent'
+
+    local_resource('host-agent',
+        serve_cmd=host_agent_serve_cmd,
+        serve_env=host_agent_env,
+        resource_deps=['coordinator'],
+        readiness_probe=probe(
+            period_secs=30,
+            timeout_secs=2,
+            tcp_socket=tcp_socket_action(port=9101),
+        ),
+        links=[
+            link('http://127.0.0.1:9100/metrics', 'metrics'),
+        ],
+        labels=['app'],
+        trigger_mode=TRIGGER_MODE_MANUAL,
+        auto_init=True)
 
 # ----------------------------------------------------------------
 # Web SPA (vite dev server).
