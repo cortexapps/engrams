@@ -1495,6 +1495,18 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_agent(id, agent).await
     }
 
+    async fn swap_harness_drive(
+        &self,
+        id: SandboxId,
+        new_path: std::path::PathBuf,
+    ) -> Result<(), SandboxError> {
+        // ADR 0014 M1.12: PooledBackend is a thin wrapper — forward to
+        // the inner backend (FC implements; VZ/Process default to
+        // unimplemented). Without this override the trait default
+        // returns "option D is FC-only" even when we *are* FC.
+        self.inner.swap_harness_drive(id, new_path).await
+    }
+
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         self.inner.set_harness_sink(sink);
     }

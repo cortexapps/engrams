@@ -2469,9 +2469,21 @@ impl SandboxBackend for FirecrackerBackend {
         // Re-install the canonical symlink so state.bin's embedded
         // path resolves on the next guest read. The session's
         // harness ext4 lives in the host's image_cache; we point
-        // the canonical path at it.
+        // the canonical path at it. Canonicalize first — `new_path`
+        // is constructed from work_dir which is typically relative
+        // (`./var/...`), and the symlink itself lives elsewhere, so
+        // a relative target would dangle when FC follows it.
+        let abs_new_path = tokio::fs::canonicalize(&new_path).await.map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "canonicalize session harness {} for swap: {e}",
+                    new_path.display()
+                )
+                .into(),
+            )
+        })?;
         let harness_canonical = paths::harness_canonical(&self.work_dir, id);
-        if let Err(e) = paths::install_symlink(&harness_canonical, &new_path).await {
+        if let Err(e) = paths::install_symlink(&harness_canonical, &abs_new_path).await {
             return Err(SandboxError::Vm(
                 format!("install harness symlink for swap: {e}").into(),
             ));
