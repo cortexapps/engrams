@@ -288,6 +288,19 @@ impl ChunkedMemoryBackend {
         })
     }
 
+    /// ADR 0014 M1.14: return the canonical chunk hash at a given
+    /// chunk-aligned byte offset. The working-set recorder uses this
+    /// to observe canonical-resolved faults too — without it, the
+    /// bake-time profile pass produces an empty trace because a
+    /// freshly-canonical snapshot has zero divergence chunks.
+    pub fn canonical_chunk_hash(&self, byte_offset: u64) -> Option<ChunkHash> {
+        if byte_offset >= self.canonical.total_bytes {
+            return None;
+        }
+        let chunk_idx = (byte_offset / self.canonical.chunk_size) as usize;
+        self.canonical.chunks.get(chunk_idx).copied().flatten()
+    }
+
     /// Bytes for a session-divergent chunk. Routes through the
     /// `ChunkCache`'s singleflight + local-NVMe layer so multiple
     /// faults on the same chunk in flight share one fetch.

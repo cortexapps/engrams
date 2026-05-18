@@ -217,6 +217,7 @@ impl OciClient {
             ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
             ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE,
             ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE,
+            ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -360,6 +361,7 @@ impl OciClient {
             ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
             ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE,
             ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE,
+            ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -418,6 +420,7 @@ impl OciClient {
             ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
             ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE,
             ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE,
+            ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -435,6 +438,7 @@ impl OciClient {
             memory_chunks_blob: None,
             snapshot_state: None,
             snapshot_sidecar_json: None,
+            snapshot_working_set_json: None,
         };
         for layer in data.layers {
             match layer.media_type.as_str() {
@@ -446,6 +450,9 @@ impl OciClient {
                 ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE => out.memory_chunks_blob = Some(layer.data),
                 ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE => out.snapshot_state = Some(layer.data),
                 ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE => out.snapshot_sidecar_json = Some(layer.data),
+                ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE => {
+                    out.snapshot_working_set_json = Some(layer.data)
+                }
                 _ => {}
             }
         }
@@ -646,6 +653,13 @@ impl OciClient {
                 None,
             ));
         }
+        if let Some(ws) = payload.snapshot_working_set_json {
+            layers.push(ImageLayer::new(
+                ws,
+                ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE.to_string(),
+                None,
+            ));
+        }
 
         let config = Config::new(
             payload.config_json,
@@ -785,6 +799,9 @@ pub struct TemplateArtifacts {
     pub memory_chunks_blob: Option<Vec<u8>>,
     pub snapshot_state: Option<Vec<u8>>,
     pub snapshot_sidecar_json: Option<Vec<u8>>,
+    /// ADR 0014 M1.14: bake-time working-set trace. Coord
+    /// materializes to BlobStorage at `working_set_blob_key(snapshot_id)`.
+    pub snapshot_working_set_json: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -854,6 +871,10 @@ pub struct ChunkedPushPayload {
     /// is useless without the sidecar.
     pub snapshot_state: Option<Vec<u8>>,
     pub snapshot_sidecar_json: Option<Vec<u8>>,
+    /// ADR 0014 M1.14: working-set trace produced by the bake's
+    /// synthetic profile pass. Optional — falls back to full-manifest
+    /// prefetch when absent.
+    pub snapshot_working_set_json: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1047,6 +1068,7 @@ mod tests {
             memory_chunks_blob: None,
             snapshot_state: None,
             snapshot_sidecar_json: None,
+            snapshot_working_set_json: None,
         };
 
         // Bootstrap but no blob → reject.
@@ -1090,6 +1112,7 @@ mod tests {
             memory_chunks_blob: None,
             snapshot_state: None,
             snapshot_sidecar_json: None,
+            snapshot_working_set_json: None,
         };
 
         let p = ChunkedPushPayload {

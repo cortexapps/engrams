@@ -84,6 +84,22 @@ impl WorkingSetRecorder {
         self.chunks_in_order.len()
     }
 
+    /// ADR 0014 M1.14: snapshot accessors used by the periodic
+    /// trace-output dumper. The dumper can't consume `self`
+    /// (the fault loop owns it) so we expose copies for read-only
+    /// use.
+    pub fn chunks_snapshot(&self) -> Vec<ChunkHash> {
+        self.chunks_in_order.clone()
+    }
+
+    pub fn vcpu_count_snapshot(&self) -> u32 {
+        self.vcpu_count
+    }
+
+    pub fn window_ms_snapshot(&self) -> u32 {
+        u32::try_from(self.window.as_millis()).unwrap_or(u32::MAX)
+    }
+
     /// Freeze the accumulator into a publishable `WorkingSetTrace`.
     /// `capture_window_ms` is taken from the constructor's
     /// `window`, not from wall-clock — the trace describes the

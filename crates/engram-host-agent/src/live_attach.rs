@@ -274,6 +274,8 @@ mod tests {
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
+            working_set_trace_output: None,
+            uffd_blob_root: None,
         };
         Arc::new(FirecrackerBackend::new(work_dir, cfg))
     }

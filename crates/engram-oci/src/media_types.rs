@@ -89,3 +89,15 @@ pub const ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE: &str = "application/vnd.engram.snaps
 /// `sidecar_blob_key(snapshot_id)` on enable-image.
 pub const ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE: &str =
     "application/vnd.engram.snapshot.sidecar.v1+json";
+
+/// ADR 0014 M1.14: bake-time working-set trace. JSON encoding of the
+/// `WorkingSetTrace` recorded by a synthetic profiling pass: bake
+/// restores the just-taken snapshot, exercises mount(2)+execve(2)
+/// on the stub harness, lets the UFFD recorder accumulate ~3s of
+/// chunk faults, then dumps. Tiny (~1 KiB). Coord materializes to
+/// BlobStorage at `working_set_blob_key(snapshot_id)` so warm-pool
+/// refill can narrow M1.13's parallel prefetch to just the working
+/// set. Absent layer = no canonical trace; refill falls back to
+/// full-manifest prefetch.
+pub const ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE: &str =
+    "application/vnd.engram.snapshot.working-set.v1+json";

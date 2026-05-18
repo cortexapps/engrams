@@ -226,6 +226,12 @@ pub struct Runtime {
     /// a trace (`EEXIST` would otherwise force a retry).
     installed: Mutex<Vec<bool>>,
     page_size: u64,
+    /// ADR 0014 M1.14: when set, the fault loop periodically writes
+    /// the current recorder snapshot to this path. Belt-and-
+    /// suspenders: the bake's profile pass can read the trace
+    /// even if the run loop hangs on a stale userfaultfd that the
+    /// kernel never closes after FC dies.
+    trace_output: Option<PathBuf>,
 }
 
 // SAFETY: canonical_ptr is owned by this struct and only read; no
@@ -315,7 +321,45 @@ impl Runtime {
             recorder,
             installed: Mutex::new(vec![false; chunk_count]),
             page_size,
+            trace_output: None,
         })
+    }
+
+    /// ADR 0014 M1.14: configure periodic trace_output dumping. The
+    /// fault loop snapshots the recorder into the path every N
+    /// faults (and once after the recorder window closes) so the
+    /// trace lands on disk even if the loop doesn't unwind cleanly.
+    pub fn set_trace_output(&mut self, path: PathBuf) {
+        self.trace_output = Some(path);
+    }
+
+    /// Snapshot the current recorder state and write it to
+    /// `trace_output` if configured. Best-effort; failures are
+    /// logged but don't propagate (the path matters more than
+    /// our error reporting).
+    fn dump_trace_output(&self) {
+        let Some(path) = self.trace_output.as_ref() else {
+            return;
+        };
+        let r = self.recorder.lock().expect("recorder poisoned");
+        let mut trace = WorkingSetTrace::new(r.vcpu_count_snapshot(), r.window_ms_snapshot());
+        trace.chunks = r.chunks_snapshot();
+        drop(r);
+        match serde_json::to_vec(&trace) {
+            Ok(bytes) => {
+                let tmp = path.with_extension("json.tmp");
+                if let Err(e) = std::fs::write(&tmp, &bytes) {
+                    tracing::warn!(error = %e, path = %tmp.display(), "trace_output tmp write");
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    tracing::warn!(error = %e, path = %path.display(), "trace_output rename");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "trace_output serialize");
+            }
+        }
     }
 
     /// Pre-install every chunk listed in `trace` into the guest
@@ -476,6 +520,11 @@ impl Runtime {
                     faults_served += 1;
                     if faults_served.is_power_of_two() {
                         tracing::info!(faults_served, "served page fault");
+                        // ADR 0014 M1.14: dump trace_output on the
+                        // same log-cadence so a hung run loop still
+                        // produces a usable file. Cheap (~1 KiB
+                        // serialize + fs::write).
+                        self.dump_trace_output();
                     }
                 }
                 Ok(Some(other)) => {
@@ -520,6 +569,17 @@ impl Runtime {
             .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?
         {
             ResolvedPage::Canonical { canonical_offset } => {
+                // ADR 0014 M1.14: also record the canonical chunk
+                // hash. Without this, a fully-canonical snapshot
+                // (bake time, pre-divergence) produces an empty
+                // working-set trace and the warm-pool refill prefetch
+                // can't narrow at all.
+                if let Some(hash) = self.backend.canonical_chunk_hash(canonical_offset) {
+                    let mut r = self.recorder.lock().expect("recorder poisoned");
+                    if r.is_open() {
+                        r.observe(hash);
+                    }
+                }
                 let installed =
                     self.install_canonical_at(canonical_offset, chunk_byte_offset, true)?;
                 if !installed {
@@ -607,6 +667,7 @@ pub fn run_listener(
     handle: TokioHandle,
     prefault_trace: Option<WorkingSetTrace>,
     recorder_window: Duration,
+    trace_output: Option<PathBuf>,
 ) -> Result<WorkingSetTrace, HandlerError> {
     let pid = std::process::id();
     let _ = std::fs::remove_file(&listen);
@@ -625,7 +686,7 @@ pub fn run_listener(
         total_bytes = total,
         "handshake complete",
     );
-    let rt = Runtime::new(
+    let mut rt = Runtime::new(
         &canonical_memory,
         mappings,
         uffd,
@@ -633,6 +694,9 @@ pub fn run_listener(
         handle,
         recorder_window,
     )?;
+    if let Some(path) = trace_output {
+        rt.set_trace_output(path);
+    }
     if let Some(trace) = prefault_trace {
         rt.prefault_from_trace(&trace)?;
     }

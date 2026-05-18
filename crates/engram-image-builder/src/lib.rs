@@ -136,6 +136,18 @@ pub struct CanonicalCaptureConfig {
     /// means it's fine to grant generously. Defaults to 512 MiB
     /// when caller passes `None`.
     pub memory_mib: Option<u32>,
+    /// ADR 0014 M1.14: path to `engram-uffd-handler` for the
+    /// synthetic profile pass. When `None`, falls back to PATH
+    /// lookup ("engram-uffd-handler"). CI bakes that don't ship
+    /// the UFFD handler in PATH should pin this explicitly; we
+    /// skip the profile pass cleanly when the binary is missing.
+    pub uffd_handler_bin: Option<PathBuf>,
+    /// ADR 0014 M1.14: chunk-store root the bake's chunks land in
+    /// (the `--blob-root` the UFFD handler should read from on the
+    /// profile-pass). `None` skips the profile pass: the bake
+    /// proceeds without a working-set trace and refill falls back
+    /// to full-manifest prefetch.
+    pub blob_root: Option<PathBuf>,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -411,6 +423,11 @@ pub struct BuildOutcome {
     /// ADR 0014: bake-time captured FC sidecar `manifest.json`.
     /// Paired with `snapshot_state_path`.
     pub snapshot_sidecar_path: Option<PathBuf>,
+    /// ADR 0014 M1.14: working-set trace JSON produced by the
+    /// synthetic profile pass. `Some` iff the bake ran the profile
+    /// successfully. Coord materializes to BlobStorage at
+    /// `working_set_blob_key(snapshot_id)` on enable-image.
+    pub snapshot_working_set_path: Option<PathBuf>,
     /// ADR 0014: full portable template snapshot. `Some` iff the
     /// bake captured canonical memory. `state_blob_key` and
     /// `sidecar_blob_key` are `None` here — coord assigns them on
@@ -939,13 +956,19 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // image_dir by `capture_canonical_memory`. Surface their
         // paths on BuildOutcome so `push_to_registry` can include
         // them as OCI layers.
-        let (snapshot_state_path, snapshot_sidecar_path) = if canonical_snapshot.is_some() {
-            let s = image_dir.join("snapshot.state.bin");
-            let c = image_dir.join("snapshot.sidecar.json");
-            (s.exists().then_some(s), c.exists().then_some(c))
-        } else {
-            (None, None)
-        };
+        let (snapshot_state_path, snapshot_sidecar_path, snapshot_working_set_path) =
+            if canonical_snapshot.is_some() {
+                let s = image_dir.join("snapshot.state.bin");
+                let c = image_dir.join("snapshot.sidecar.json");
+                let w = image_dir.join("snapshot.working_set.json");
+                (
+                    s.exists().then_some(s),
+                    c.exists().then_some(c),
+                    w.exists().then_some(w),
+                )
+            } else {
+                (None, None, None)
+            };
 
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
@@ -960,6 +983,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             memory_chunks_blob_path,
             snapshot_state_path,
             snapshot_sidecar_path,
+            snapshot_working_set_path,
             canonical_snapshot,
         })
     }
@@ -1199,15 +1223,284 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             "canonical bake snapshot uploaded; portable refs stamped",
         );
 
-        // Cleanup: destroy the bake VM. Errors are logged but
-        // don't fail the capture — the manifest is already in
-        // the store. A leaked VM gets reaped at process exit
-        // via FC's kill_on_drop on the spawned firecracker child.
+        // ADR 0014 M1.14: synthetic working-set profile pass. Restore
+        // the just-taken snapshot in UFFD mode, drive bootstrap
+        // through a synthetic mount+exec on the stub harness, dump
+        // the recorded trace to disk for OCI shipment. Best-effort:
+        // any failure here is logged at WARN and we proceed without
+        // a trace — refill falls back to full-manifest prefetch.
+        // Bake must be done with the primary backend BEFORE the
+        // profile pass: same kernel, same chunk store.
         if let Err(e) = engram_core::traits::SandboxBackend::destroy(&backend, sandbox_id).await {
             tracing::warn!(error = %e, "canonical bake VM destroy failed; FC child cleanup is kill-on-drop");
         }
+        match self
+            .run_working_set_profile_pass(
+                image_dir,
+                capture_cfg,
+                metadata.clone(),
+                &stub_path,
+                manifest_ref,
+                work.path(),
+            )
+            .await
+        {
+            Ok(Some(ws_path)) => {
+                tracing::info!(
+                    path = %ws_path.display(),
+                    "M1.14 profile pass produced working-set trace",
+                );
+            }
+            Ok(None) => {
+                tracing::info!("M1.14 profile pass skipped (uffd_handler_bin / blob_root not set)",);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "M1.14 profile pass failed; warm-pool refill will fall back to full-manifest prefetch",
+                );
+            }
+        }
+
+        // Primary bake VM already destroyed above (before the
+        // profile pass) — the profile pass uses a separate FC
+        // backend on a fresh work_dir.
 
         Ok(metadata)
+    }
+
+    /// ADR 0014 M1.14: synthetic profile pass. Restores the
+    /// just-baked snapshot in a SECOND FC backend (UFFD mode) wired
+    /// to dump the working-set trace to a file, dials vsock to drive
+    /// activity, then tears down. Returns the staged trace path on
+    /// success (also stages it as `image_dir/snapshot.working_set.json`),
+    /// `Ok(None)` when skipped (caller didn't supply uffd handler /
+    /// blob root), or `Err(...)` on a real failure (caller logs +
+    /// proceeds without a trace).
+    async fn run_working_set_profile_pass(
+        &self,
+        image_dir: &Path,
+        capture_cfg: &CanonicalCaptureConfig,
+        metadata: engram_core::types::snapshot::SnapshotMetadata,
+        stub_path: &Path,
+        memory_manifest_ref: engram_chunk_store::ManifestRef,
+        primary_work_dir: &Path,
+    ) -> Result<Option<PathBuf>, BuildError> {
+        use engram_harness_proto::{BootstrapLaunch, BOOTSTRAP_READY_BYTE, BOOTSTRAP_VSOCK_PORT};
+        use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let _ = memory_manifest_ref; // reserved for future telemetry
+        let Some(uffd_bin) = capture_cfg.uffd_handler_bin.as_ref() else {
+            return Ok(None);
+        };
+        let Some(blob_root) = capture_cfg.blob_root.as_ref() else {
+            return Ok(None);
+        };
+        if !uffd_bin.exists() {
+            return Err(BuildError::Config(format!(
+                "uffd_handler_bin {} does not exist",
+                uffd_bin.display()
+            )));
+        }
+
+        // Reuse the bake's primary work_dir for the profile FC: the
+        // snapshot files (state.bin, memory.bin, manifest.json) live
+        // there. The primary sandbox was already destroyed, so the
+        // jail dir is gone but the snapshots/ subtree survives.
+        // Trace output lives in a separate scratch tempdir so we
+        // can read it back regardless of what FC does to its jail.
+        let trace_scratch = tempfile::tempdir()
+            .map_err(|e| BuildError::Config(format!("profile-pass tempdir: {e}")))?;
+        let trace_out = trace_scratch.path().join("working_set.json");
+
+        // The bake patched the FC sidecar (manifest.json) in image_dir
+        // with memory_manifest before staging. The primary's sidecar
+        // is unpatched, so PooledBackend's `materialize_memory_if_missing`
+        // path can't infer the manifest from it. Copy the patched one
+        // back into the primary work_dir's snapshot dir before
+        // restoring — that's what the runtime path reads.
+        let primary_snap_dir = primary_work_dir
+            .join("snapshots")
+            .join(metadata.id.to_string());
+        let patched_sidecar = image_dir.join("snapshot.sidecar.json");
+        if patched_sidecar.exists() {
+            tokio::fs::copy(&patched_sidecar, primary_snap_dir.join("manifest.json"))
+                .await
+                .map_err(|e| {
+                    BuildError::Config(format!("profile-pass overlay patched sidecar: {e}"))
+                })?;
+        }
+
+        let mut fc_cfg = FirecrackerConfig::with_kernel(&capture_cfg.kernel_image_path);
+        if let Some(bin) = &capture_cfg.firecracker_bin {
+            fc_cfg.firecracker_bin = bin.clone();
+        }
+        fc_cfg.uffd_handler_bin = uffd_bin.clone();
+        fc_cfg.restore_mode = RestoreMode::Uffd;
+        fc_cfg.net_pool = None;
+        fc_cfg.egress_proxy_port = None;
+        fc_cfg.uffd_blob_root = Some(blob_root.clone());
+        fc_cfg.stub_harness_path = Some(stub_path.to_path_buf());
+        // host_id is required for UFFD restore (spawn_uffd_handler
+        // passes --publish-trace-host when set, but the publish target
+        // is the same BlobStorage as --blob-root — in dev that's the
+        // bake's local store, which is fine).
+        fc_cfg.host_id = Some(engram_core::HostId::new());
+        fc_cfg.working_set_trace_output = Some(trace_out.clone());
+
+        let profile_backend = FirecrackerBackend::new(primary_work_dir, fc_cfg);
+
+        // Restore the just-baked snapshot. The FC backend's restore
+        // path materializes the canonical-symlink + vsock-parent-dir
+        // fixups; UFFD handler spawns and starts recording.
+        let restored_id =
+            engram_core::traits::SandboxBackend::restore(&profile_backend, metadata.clone())
+                .await
+                .map_err(|e| BuildError::Config(format!("profile-pass restore: {e}")))?;
+
+        // Read the sidecar manifest from `image_dir` to discover
+        // the bake-side vsock UDS path. FC re-bound the host-side
+        // UDS at that exact path during load_snapshot (we ensured
+        // the parent dir exists via restore_canonical_symlinks).
+        let staged_sidecar = image_dir.join("snapshot.sidecar.json");
+        let sidecar_bytes = tokio::fs::read(&staged_sidecar).await.map_err(|e| {
+            BuildError::Config(format!(
+                "profile-pass read staged sidecar {}: {e}",
+                staged_sidecar.display()
+            ))
+        })?;
+        let sidecar_value: serde_json::Value = serde_json::from_slice(&sidecar_bytes)
+            .map_err(|e| BuildError::Config(format!("profile-pass parse sidecar: {e}")))?;
+        let vsock_path: PathBuf = sidecar_value
+            .get("source_vsock_canonical")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                BuildError::Config("profile-pass sidecar missing source_vsock_canonical".into())
+            })?;
+
+        // Dial bootstrap, read FC's OK + the 1-byte READY signal,
+        // then push a synthetic BootstrapLaunch that mounts the
+        // stub harness and exec's /bin/true. The exact argv doesn't
+        // matter — what we want is for the kernel to walk through
+        // mount(2) + execve(2) so the UFFD handler observes the
+        // chunks underlying those code paths.
+        let profile_result: Result<(), BuildError> = async {
+            let mut stream = UnixStream::connect(&vsock_path).await.map_err(|e| {
+                BuildError::Config(format!(
+                    "profile-pass connect vsock {}: {e}",
+                    vsock_path.display()
+                ))
+            })?;
+            stream
+                .write_all(format!("CONNECT {BOOTSTRAP_VSOCK_PORT}\n").as_bytes())
+                .await
+                .map_err(|e| BuildError::Config(format!("profile-pass write CONNECT: {e}")))?;
+            // Read FC's "OK <cid>\n" line.
+            let mut header = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream
+                    .read_exact(&mut byte)
+                    .await
+                    .map_err(|e| BuildError::Config(format!("profile-pass read OK: {e}")))?;
+                header.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if header.len() > 64 {
+                    return Err(BuildError::Config(
+                        "profile-pass FC vsock OK header too long".into(),
+                    ));
+                }
+            }
+            if !header.starts_with(b"OK ") {
+                return Err(BuildError::Config(format!(
+                    "profile-pass FC vsock unexpected header: {:?}",
+                    String::from_utf8_lossy(&header),
+                )));
+            }
+            // Bootstrap writes 0xEB once we're connected through.
+            let mut ready = [0u8; 1];
+            stream
+                .read_exact(&mut ready)
+                .await
+                .map_err(|e| BuildError::Config(format!("profile-pass read READY_BYTE: {e}")))?;
+            if ready[0] != BOOTSTRAP_READY_BYTE {
+                return Err(BuildError::Config(format!(
+                    "profile-pass expected READY_BYTE 0x{:02x}, got 0x{:02x}",
+                    BOOTSTRAP_READY_BYTE, ready[0]
+                )));
+            }
+            // Send a BootstrapLaunch with /bin/true as the harness.
+            // /dev/vdb is the stub ext4 attached at bake time; mount
+            // it read-only at /run/engram/harnesses/_profile so the
+            // ext4 mount(2) code path runs.
+            let launch = BootstrapLaunch {
+                argv: vec!["/bin/true".into()],
+                env: Default::default(),
+                harness_dev: Some("/dev/vdb".into()),
+                harness_mount: Some("/run/engram/harnesses/_profile".into()),
+            };
+            engram_harness_proto::write_msg(&mut stream, &launch)
+                .await
+                .map_err(|e| BuildError::Config(format!("profile-pass write launch: {e}")))?;
+            stream
+                .shutdown()
+                .await
+                .map_err(|e| BuildError::Config(format!("profile-pass shutdown: {e}")))?;
+            // Let the kernel fault its way through mount(2) + execve(2).
+            // The UFFD handler's recorder window defaults to 5s; sleep
+            // a hair longer than the synthetic activity so we capture
+            // the tail faults too.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(())
+        }
+        .await;
+
+        // Always destroy. The UFFD handler will exit and dump the
+        // trace to `trace_out` on clean shutdown.
+        let _ = engram_core::traits::SandboxBackend::destroy(&profile_backend, restored_id).await;
+        profile_result?;
+
+        // Give the UFFD handler a generous beat to land its stdout
+        // / file write — destroy returns when FC is gone but the
+        // handler exits asynchronously.
+        for _ in 0..20 {
+            if tokio::fs::metadata(&trace_out).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !trace_out.exists() {
+            // Dump the UFFD handler's log (parked next to trace_out by
+            // spawn_uffd_handler) so the caller sees *why* the handler
+            // bailed without producing a trace.
+            let log_path = trace_out
+                .parent()
+                .map(|d| d.join("uffd-handler.log"))
+                .unwrap_or_else(|| trace_out.with_extension("log"));
+            let log_tail = tokio::fs::read_to_string(&log_path)
+                .await
+                .unwrap_or_else(|_| "<uffd-handler log not found>".into());
+            return Err(BuildError::Config(format!(
+                "profile-pass UFFD handler exited but no trace file produced\n--- uffd-handler.log ---\n{log_tail}"
+            )));
+        }
+
+        // Stage the trace into image_dir alongside state.bin + sidecar
+        // so `push_to_registry` includes it as an OCI layer.
+        let staged = image_dir.join("snapshot.working_set.json");
+        tokio::fs::copy(&trace_out, &staged).await.map_err(|e| {
+            BuildError::Config(format!(
+                "profile-pass stage trace to {}: {e}",
+                staged.display()
+            ))
+        })?;
+        Ok(Some(staged))
     }
 
     /// Push a freshly-baked image (output of [`Self::build`]) to a
@@ -1319,6 +1612,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 ),
                 _ => (None, None),
             };
+            // ADR 0014 M1.14: optional working-set trace from the
+            // synthetic profile pass. May be absent on older bakes
+            // or when the profile pass was skipped/failed.
+            let snapshot_working_set_json = match outcome.snapshot_working_set_path.as_ref() {
+                Some(p) if p.exists() => Some(tokio::fs::read(p).await.map_err(BuildError::Io)?),
+                _ => None,
+            };
 
             let payload = engram_oci::ChunkedPushPayload {
                 manifest_toml: manifest_bytes,
@@ -1330,6 +1630,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 memory_chunks_blob,
                 snapshot_state,
                 snapshot_sidecar_json,
+                snapshot_working_set_json,
             };
 
             let digest = oci

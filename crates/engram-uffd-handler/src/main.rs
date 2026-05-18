@@ -120,6 +120,22 @@ mod linux {
         /// clean shutdown. Omit on bake / unit-test runs where no
         /// publishing is wanted.
         pub publish_trace_host: Option<Uuid>,
+        /// ADR 0014 M1.14: write the recorded trace JSON to this
+        /// local path on clean shutdown (in addition to / instead of
+        /// `--publish-trace-host`'s BlobStorage publish). Used by the
+        /// image-builder's synthetic profile pass: the bake spawns
+        /// FC+UFFD, dials vsock to drive activity, then reads the
+        /// trace file back to stage it as an OCI layer. Omit when
+        /// the receiver doesn't care.
+        pub trace_output: Option<PathBuf>,
+        /// ADR 0014 M1.14: when set, bypass `pick_blob_backend`'s
+        /// env-var lookup and `LocalBlobStorage::new(this)` directly.
+        /// Used by the image-builder's profile pass, where the bake
+        /// already knows its chunk-store root and the UFFD handler
+        /// needs to read from the same place — env-var-driven
+        /// resolution would mis-locate it because the bake uses a
+        /// `<images_dir>/store/` layout (not `<root>/blobs/`).
+        pub blob_root: Option<PathBuf>,
         pub cache_root: PathBuf,
         pub cache_budget_bytes: u64,
         pub recorder_window: Duration,
@@ -132,6 +148,8 @@ mod linux {
         let mut session_manifest: Option<ManifestRef> = None;
         let mut prefault_trace: Option<PrefaultTraceSpec> = None;
         let mut publish_trace_host: Option<Uuid> = None;
+        let mut trace_output: Option<PathBuf> = None;
+        let mut blob_root: Option<PathBuf> = None;
         let mut cache_root: Option<PathBuf> = None;
         let mut cache_budget_bytes: u64 = DEFAULT_CACHE_BUDGET_BYTES;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
@@ -177,6 +195,18 @@ mod linux {
                         Uuid::parse_str(&v)
                             .map_err(|e| format!("--publish-trace-host {v:?}: {e}"))?,
                     );
+                }
+                "--trace-output" => {
+                    trace_output =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--trace-output requires a value".to_string()
+                        })?));
+                }
+                "--blob-root" => {
+                    blob_root = Some(PathBuf::from(
+                        argv.next()
+                            .ok_or_else(|| "--blob-root requires a value".to_string())?,
+                    ));
                 }
                 "--cache-root" => {
                     cache_root =
@@ -224,6 +254,8 @@ mod linux {
             session_manifest,
             prefault_trace,
             publish_trace_host,
+            trace_output,
+            blob_root,
             cache_root,
             cache_budget_bytes,
             recorder_window: Duration::from_millis(recorder_window_ms),
@@ -264,7 +296,18 @@ mod linux {
     }
 
     pub async fn run(args: Args, handle: TokioHandle) -> Result<(), String> {
-        let blob = pick_blob_backend(&args.cache_root).await?;
+        let blob = match args.blob_root.as_ref() {
+            Some(root) => {
+                tokio::fs::create_dir_all(root)
+                    .await
+                    .map_err(|e| format!("create --blob-root {}: {e}", root.display()))?;
+                tracing::info!(path = %root.display(), "blob backend: local (overridden via --blob-root)");
+                let s: Arc<dyn BlobStorage> =
+                    Arc::new(engram_storage_local::LocalBlobStorage::new(root.clone()));
+                s
+            }
+            None => pick_blob_backend(&args.cache_root).await?,
+        };
         tokio::fs::create_dir_all(&args.cache_root)
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
@@ -313,9 +356,10 @@ mod linux {
             let canonical = args.canonical_memory.clone();
             let backend = backend.clone();
             let window = args.recorder_window;
+            let trace_out = args.trace_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
-                    listen, canonical, backend, handle, prefault, window,
+                    listen, canonical, backend, handle, prefault, window, trace_out,
                 )
             }
         })
@@ -323,12 +367,37 @@ mod linux {
         .map_err(|e| format!("fault-loop join: {e}"))?;
         let trace = result.map_err(|e| format!("fault loop: {e}"))?;
 
-        if let Some(host) = args.publish_trace_host {
-            publish_trace(blob, args.session_manifest.manifest_id, host, &trace).await?;
-        } else {
+        // ADR 0014 M1.14: dump the trace to a local file first, so a
+        // later publish_trace failure (e.g., the bake's blob root
+        // has a different layout than runtime's) doesn't lose the
+        // recorded data. The image-builder's profile pass reads
+        // this file back to stage the trace as an OCI layer.
+        if let Some(path) = args.trace_output.as_ref() {
+            let bytes = serde_json::to_vec(&trace)
+                .map_err(|e| format!("serialize trace for --trace-output: {e}"))?;
+            tokio::fs::write(path, &bytes)
+                .await
+                .map_err(|e| format!("write trace to {}: {e}", path.display()))?;
             tracing::info!(
                 chunks = trace.chunks.len(),
-                "fault loop exited; trace recorded but no --publish-trace-host set, dropping"
+                path = %path.display(),
+                "trace written to --trace-output"
+            );
+        }
+
+        if let Some(host) = args.publish_trace_host {
+            // Best-effort publish — log and continue rather than
+            // propagating, so the --trace-output side effect above
+            // sticks even when BlobStorage isn't reachable.
+            if let Err(e) =
+                publish_trace(blob, args.session_manifest.manifest_id, host, &trace).await
+            {
+                tracing::warn!(error = %e, "publish_trace failed; trace_output still written");
+            }
+        } else if args.trace_output.is_none() {
+            tracing::info!(
+                chunks = trace.chunks.len(),
+                "fault loop exited; trace recorded but no publish target set, dropping"
             );
         }
 

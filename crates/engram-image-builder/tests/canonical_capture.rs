@@ -126,6 +126,10 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
         // wait + readiness detection.
         boot_wait: Duration::from_secs(3),
         memory_mib: Some(128),
+        // Skip the M1.14 profile pass in this fixture; the
+        // chunked-restore plumbing needs prod-shaped wiring.
+        uffd_handler_bin: None,
+        blob_root: None,
     };
 
     // ADR 0014 M1.11: `capture_canonical_memory` now stages

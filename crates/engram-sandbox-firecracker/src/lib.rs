@@ -223,6 +223,22 @@ pub struct FirecrackerConfig {
     /// responsible for materializing the file. The session's real
     /// harness is patched in via `swap_harness_drive` at warm-lease.
     pub stub_harness_path: Option<PathBuf>,
+    /// ADR 0014 M1.14: when set, the UFFD handler dumps its recorded
+    /// `WorkingSetTrace` to this file on clean shutdown. Used by the
+    /// image-builder's synthetic profile pass: after bake's primary
+    /// snapshot is taken, a second FC restore runs with this set so
+    /// the bake driver can read the trace back from disk + stage it
+    /// as an OCI layer. `None` in production (warm-pool refill
+    /// doesn't need to dump; the publish-trace-host path is
+    /// sufficient for runtime).
+    pub working_set_trace_output: Option<PathBuf>,
+    /// ADR 0014 M1.14: bake-side override for the UFFD handler's
+    /// blob root. The bake's chunk store lives at
+    /// `<images_dir>/store/` rather than the runtime convention
+    /// `<root>/blobs/`; without this the handler's env-var-driven
+    /// resolution can't find the freshly-chunked memory bytes.
+    /// `None` in production — runtime resolution is correct there.
+    pub uffd_blob_root: Option<PathBuf>,
 }
 
 /// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
@@ -329,6 +345,8 @@ impl FirecrackerConfig {
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
+            working_set_trace_output: None,
+            uffd_blob_root: None,
         }
     }
 }
@@ -921,7 +939,18 @@ impl FirecrackerBackend {
         publish_trace_host: Option<uuid::Uuid>,
         jail_dir: &Path,
     ) -> Result<Child, SandboxError> {
-        let log_path = jail_dir.join("uffd-handler.log");
+        // ADR 0014 M1.14: when the caller wires `working_set_trace_output`,
+        // it's the bake's profile pass — destroy removes jail_dir
+        // immediately after, sweeping the handler's log with it. Park
+        // the log next to the trace output (in the bake's scratch
+        // tempdir) so post-mortem diagnostics survive.
+        let log_path = match self.config.working_set_trace_output.as_ref() {
+            Some(p) => p
+                .parent()
+                .map(|d| d.join("uffd-handler.log"))
+                .unwrap_or_else(|| jail_dir.join("uffd-handler.log")),
+            None => jail_dir.join("uffd-handler.log"),
+        };
         let log = std::fs::File::create(&log_path)
             .map_err(|e| vm_err(format!("open uffd handler log {}: {e}", log_path.display())))?;
         let log_clone = log
@@ -950,6 +979,16 @@ impl FirecrackerBackend {
         }
         if let Some(host) = publish_trace_host {
             cmd.arg("--publish-trace-host").arg(host.to_string());
+        }
+        // ADR 0014 M1.14: bake's profile pass sets this so the
+        // image-builder can read the trace file back without going
+        // through BlobStorage. Production warm-restore leaves it
+        // None — the publish-trace-host path is the runtime channel.
+        if let Some(path) = self.config.working_set_trace_output.as_ref() {
+            cmd.arg("--trace-output").arg(path);
+        }
+        if let Some(path) = self.config.uffd_blob_root.as_ref() {
+            cmd.arg("--blob-root").arg(path);
         }
 
         let mut child = cmd
@@ -2348,12 +2387,29 @@ impl SandboxBackend for FirecrackerBackend {
             }
         }
 
-        // UFFD handler (only set on Uffd-mode restore) follows
-        // firecracker into oblivion. Its UDS + log live inside
-        // jail_dir, which the remove_dir_all below sweeps.
+        // UFFD handler (only set on Uffd-mode restore). When FC dies
+        // the kernel reaps FC's mm but the userfaultfd this handler
+        // holds via SCM_RIGHTS doesn't auto-close — `read_event()`
+        // blocks indefinitely. Send SIGTERM so the kernel-default
+        // handler kills the process; if that doesn't take effect
+        // within a short window, escalate to SIGKILL. ADR 0014 M1.14
+        // relies on the handler having already flushed `--trace-output`
+        // by the time we get here, so the write must happen earlier
+        // (the runtime dumps after the recorder window closes).
         if let Some(mut handler) = live.uffd_handler {
-            let _ = handler.kill().await;
-            let _ = handler.wait().await;
+            if let Some(pid) = handler.id() {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+            match tokio::time::timeout(Duration::from_secs(2), handler.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = handler.kill().await;
+                    let _ = handler.wait().await;
+                }
+            }
         }
 
         // Tear down per-VM networking: yank iptables rules tagged
@@ -2656,6 +2712,8 @@ mod tests {
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
+            working_set_trace_output: None,
+            uffd_blob_root: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }

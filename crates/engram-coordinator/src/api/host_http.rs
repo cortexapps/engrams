@@ -362,7 +362,15 @@ async fn active_templates_with_metadata(
                 record.snapshot_id,
             )),
             rootfs_blob_key: None,
-            working_set_blob_key: None,
+            // ADR 0014 M1.14: stamp the working-set blob key
+            // unconditionally — pooled_backend's prefetch will fall
+            // back to full-manifest when the blob doesn't exist
+            // (older bakes that pre-date the profile pass, or pass
+            // failed/skipped). Cheap probe, no read cost when
+            // absent.
+            working_set_blob_key: Some(engram_chunk_store::snapshot_blob::working_set_blob_key(
+                record.snapshot_id,
+            )),
         };
         out.push(engram_protocol::heartbeat::ActiveTemplate { record, snapshot });
     }

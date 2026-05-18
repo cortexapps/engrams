@@ -530,6 +530,18 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                         firecracker_bin: canonical_firecracker_bin.clone(),
                         boot_wait: std::time::Duration::from_secs(*canonical_boot_wait_secs),
                         memory_mib: *canonical_memory_mib,
+                        // ADR 0014 M1.14: when these are present, the
+                        // image-builder runs a second restore in UFFD
+                        // mode to record the canonical working set.
+                        // Resolve the UFFD handler from the current
+                        // exe's directory (matches the cargo-built
+                        // target/release layout) and the bake's
+                        // chunk-store root from `images_dir/store`.
+                        uffd_handler_bin: std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.join("engram-uffd-handler")))
+                            .filter(|p| p.exists()),
+                        blob_root: Some(images_dir.join("store")),
                     })
                 } else {
                     None

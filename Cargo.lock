@@ -1099,6 +1099,7 @@ dependencies = [
  "clap",
  "engram-chunk-store",
  "engram-core",
+ "engram-harness-proto",
  "engram-oci",
  "engram-postgres",
  "engram-sandbox-firecracker",

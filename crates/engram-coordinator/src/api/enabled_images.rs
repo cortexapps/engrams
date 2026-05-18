@@ -534,6 +534,24 @@ async fn materialize_template_artifacts(
         snapshot.sidecar_blob_key = Some(key);
     }
 
+    // ADR 0014 M1.14: working_set.json — same shape as state.bin
+    // and sidecar. Pooled_backend reads `metadata.working_set_blob_key`
+    // and prefetches just the listed chunks instead of the full
+    // manifest; absent layer → fall back to full-manifest prefetch.
+    if let Some(bytes) = artifacts.snapshot_working_set_json.as_deref() {
+        let key = engram_chunk_store::snapshot_blob::working_set_blob_key(snapshot.id);
+        if !blob
+            .exists(&key)
+            .await
+            .map_err(|e| ApiError::Internal(format!("exists probe working_set: {e}")))?
+        {
+            blob.put(&key, bytes::Bytes::copy_from_slice(bytes))
+                .await
+                .map_err(|e| ApiError::Internal(format!("put working_set at {key}: {e}")))?;
+        }
+        snapshot.working_set_blob_key = Some(key);
+    }
+
     Ok(snapshot)
 }
 
