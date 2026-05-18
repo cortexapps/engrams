@@ -760,6 +760,16 @@ async fn materialize_disk_if_missing(
     // doesn't exist on the receiver, so without this patch FC errors
     // out. Same pattern as the in-prod `patch_fc_manifest_memory_ref`,
     // just for the disk field instead of memory.
+    //
+    // Must be absolute: the canonical-rootfs symlink lives at the
+    // bake's `/tmp/.tmpXXX/rootfs/<src>.dev`, so a relative target
+    // resolves against `/tmp/.tmpXXX/rootfs/` and points at nothing.
+    let local_rootfs = fs::canonicalize(&local_rootfs).await.map_err(|e| {
+        SandboxError::Snapshot(format!(
+            "canonicalize materialised rootfs {}: {e}",
+            local_rootfs.display()
+        ))
+    })?;
     let sidecar_path = src.join("manifest.json");
     let bytes = fs::read(&sidecar_path).await.map_err(|e| {
         SandboxError::Snapshot(format!(
