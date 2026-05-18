@@ -1092,11 +1092,45 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                     staged_state.display()
                 ))
             })?;
-        tokio::fs::copy(&sidecar_path, &staged_sidecar)
+
+        // ADR 0014: patch `memory_manifest` into the FC sidecar
+        // before staging it. The production session-snapshot path
+        // does this in `PooledBackend::snapshot` (the host that
+        // wrote the snapshot also chunks memory.bin and updates
+        // the sidecar in place), but the bake side never did —
+        // FC writes the sidecar without that field. On a
+        // cross-host warm-pool restore, `materialize_memory_if_missing`
+        // reads the sidecar to discover the memory_manifest ref;
+        // if the field is absent the function silently no-ops and
+        // FC restore later errors with "snapshot memory.bin missing".
+        let sidecar_bytes = tokio::fs::read(&sidecar_path).await.map_err(|e| {
+            BuildError::Config(format!(
+                "read fc manifest.json {}: {e}",
+                sidecar_path.display()
+            ))
+        })?;
+        let mut sidecar_value: serde_json::Value =
+            serde_json::from_slice(&sidecar_bytes).map_err(|e| {
+                BuildError::Config(format!(
+                    "parse fc manifest.json {}: {e}",
+                    sidecar_path.display()
+                ))
+            })?;
+        sidecar_value
+            .as_object_mut()
+            .ok_or_else(|| BuildError::Config("fc manifest.json root is not an object".into()))?
+            .insert(
+                "memory_manifest".into(),
+                serde_json::to_value(manifest_ref)
+                    .map_err(|e| BuildError::Config(format!("serialize memory_manifest: {e}")))?,
+            );
+        let patched = serde_json::to_vec_pretty(&sidecar_value)
+            .map_err(|e| BuildError::Config(format!("serialize patched sidecar: {e}")))?;
+        tokio::fs::write(&staged_sidecar, &patched)
             .await
             .map_err(|e| {
                 BuildError::Config(format!(
-                    "stage canonical sidecar.json into {}: {e}",
+                    "write patched sidecar to {}: {e}",
                     staged_sidecar.display()
                 ))
             })?;
