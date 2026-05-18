@@ -740,10 +740,15 @@ async fn read_bundle(path: &Path) -> Result<Option<ImageBundle>, CacheError> {
     let bytes = fs::read(path).await.map_err(CacheError::Io)?;
     let bundle: ImageBundle = serde_json::from_slice(&bytes)
         .map_err(|e| CacheError::Bundle(format!("{}: {e}", path.display())))?;
-    // ADR 0007: schema v1. ADR 0008 Phase 3: schema v2. v2's extra
-    // fields default-deserialize cleanly into v1 readers (#[serde
-    // (default)] on the optional fields).
-    if bundle.schema_version > 2 {
+    // ADR 0007: schema v1. ADR 0008 Phase 3: schema v2. ADR 0014
+    // M1.11: schema v3 adds a top-level `canonical_snapshot` block
+    // — the bake emits it whenever `capture_canonical_memory` ran.
+    // Host-side image_cache doesn't consume that block directly
+    // (coord's `enable_image` cascade does), so the extra field
+    // deserializes cleanly into `ImageBundle` via the existing
+    // `#[serde(default)]` ignore semantics; the schema_version
+    // check just needs to allow it through.
+    if bundle.schema_version > 3 {
         return Err(CacheError::Bundle(format!(
             "{}: unsupported schema_version {}",
             path.display(),
@@ -1045,7 +1050,7 @@ mod tests {
     async fn read_bundle_rejects_unsupported_schema_version() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bundle.json");
-        // schema_version 99 — we only know v1/v2.
+        // schema_version 99 — we only know v1/v2/v3.
         fs::write(
             &path,
             br#"{"schema_version":99,"disk_manifest":{"manifest_id":"00000000-0000-0000-0000-000000000000","version":1}}"#,
@@ -1057,6 +1062,60 @@ mod tests {
             CacheError::Bundle(msg) => assert!(msg.contains("schema_version")),
             other => panic!("expected Bundle error, got {other:?}"),
         }
+    }
+
+    /// ADR 0014 M1.11 regression guard: schema v3 bundles carry the
+    /// `canonical_snapshot` block. The host's image_cache doesn't
+    /// consume that field directly (coord's `enable_image` cascade
+    /// does), but it must still accept the bundle and produce a
+    /// valid `ImageBundle` for the cold-create path.
+    ///
+    /// This test would have caught the prod regression where the
+    /// host's bundle parser stayed at `> 2` after the bake started
+    /// emitting v3 — session-create then errored "image bundle parse:
+    /// unsupported schema_version 3" on every cold session, even
+    /// though materialization + warm-pool refill had succeeded.
+    #[tokio::test]
+    async fn read_bundle_accepts_v3_with_canonical_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.json");
+        let disk_ref = engram_chunk_store::ManifestRef::new();
+        let mem_ref = engram_chunk_store::ManifestRef::new();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 3,
+                "disk_manifest": disk_ref,
+                "canonical_memory_manifest": mem_ref,
+                "bootstrap_disk_available": true,
+                "bootstrap_memory_available": true,
+                // The shape the bake actually emits — host-side
+                // image_cache ignores this block (coord materializes
+                // it), but the deserialize must still pass.
+                "canonical_snapshot": {
+                    "id": uuid::Uuid::new_v4(),
+                    "size_bytes": 4096,
+                    "created_at": chrono::Utc::now(),
+                    "image_version": "warm-test",
+                    "disk_manifest": disk_ref,
+                    "memory_manifest": mem_ref,
+                    "source_sandbox_id": uuid::Uuid::new_v4(),
+                    "state_blob_key": null,
+                    "sidecar_blob_key": null,
+                    "rootfs_blob_key": null,
+                    "working_set_blob_key": null,
+                },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let got = read_bundle(&path).await.unwrap().expect("bundle present");
+        assert_eq!(got.schema_version, 3);
+        assert_eq!(got.disk_manifest, disk_ref);
+        assert_eq!(got.canonical_memory_manifest, Some(mem_ref));
+        assert!(got.bootstrap_disk_available);
+        assert!(got.bootstrap_memory_available);
     }
 
     #[tokio::test]
