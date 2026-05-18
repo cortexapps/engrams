@@ -417,6 +417,27 @@ struct FcSnapshotManifest {
     /// this host use the local recording.
     #[serde(default)]
     trace_host_hint: Option<engram_core::HostId>,
+    /// ADR 0014 M1.11: the exact `path_on_host` the bake's FC
+    /// instance PUT /drives'd with as the rootfs. FC's `state.bin`
+    /// embeds this path; on cross-host restore the receiver must
+    /// recreate a file (or symlink) at that exact path before
+    /// `load_snapshot`, otherwise FC errors out with "Block: Virtio
+    /// backend error: No such file or directory". The receiver's
+    /// own work_dir is generally `/var/lib/engram/sandboxes`, but
+    /// the bake ran in a `tempfile::tempdir()` (`/tmp/.tmpXXX/`)
+    /// so the bake-time and receiver-time work_dirs are different
+    /// — without this field, the receiver has no way to know what
+    /// state.bin actually embeds.
+    ///
+    /// `None` for snapshots written before this field landed. The
+    /// receiver falls back to its own work_dir, which only works
+    /// for same-host (idle resume) restores.
+    #[serde(default)]
+    source_rootfs_canonical: Option<PathBuf>,
+    /// Same shape, for the harness substrate drive. `None` if the
+    /// source sandbox booted without a harness substrate.
+    #[serde(default)]
+    source_harness_canonical: Option<PathBuf>,
 }
 
 const MANIFEST_FORMAT_FC: &str = "fc";
@@ -1572,6 +1593,10 @@ async fn restore_canonical_symlinks(
         })?;
     }
     if let Some(rootfs_target) = manifest.spec.rootfs_source.as_ref() {
+        // Always create the host's own canonical-path symlink — it
+        // keeps the same-host idle-resume path identical to a
+        // freshly-snapshotted sandbox, and stays correct under our
+        // own naming convention.
         let canonical = paths::rootfs_canonical(work_dir, manifest.sandbox_id);
         paths::install_symlink(&canonical, rootfs_target)
             .await
@@ -1582,6 +1607,34 @@ async fn restore_canonical_symlinks(
                     rootfs_target.display()
                 ))
             })?;
+        // ADR 0014 M1.11: cross-host restore. FC's state.bin embeds
+        // whatever path the bake's PUT /drives used as `path_on_host`
+        // — that's the bake's `tempfile::tempdir()/rootfs/<src>.dev`,
+        // which doesn't exist on the receiver. If the bake recorded
+        // its canonical path on the manifest, recreate the file there
+        // too (mkdir parent + symlink) so FC `load_snapshot` finds
+        // the drive at the absolute path it expects.
+        if let Some(source_canonical) = manifest.source_rootfs_canonical.as_ref() {
+            if source_canonical != &canonical {
+                if let Some(parent) = source_canonical.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        vm_err(format!(
+                            "create source rootfs canonical parent {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                paths::install_symlink(source_canonical, rootfs_target)
+                    .await
+                    .map_err(|e| {
+                        vm_err(format!(
+                            "restore source rootfs canonical symlink {} -> {}: {e}",
+                            source_canonical.display(),
+                            rootfs_target.display()
+                        ))
+                    })?;
+            }
+        }
     }
     if let Some(harness_target) = manifest.spec.harness_substrate.as_ref() {
         let canonical = paths::harness_canonical(work_dir, manifest.sandbox_id);
@@ -1594,6 +1647,27 @@ async fn restore_canonical_symlinks(
                     harness_target.display()
                 ))
             })?;
+        if let Some(source_canonical) = manifest.source_harness_canonical.as_ref() {
+            if source_canonical != &canonical {
+                if let Some(parent) = source_canonical.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        vm_err(format!(
+                            "create source harness canonical parent {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                paths::install_symlink(source_canonical, harness_target)
+                    .await
+                    .map_err(|e| {
+                        vm_err(format!(
+                            "restore source harness canonical symlink {} -> {}: {e}",
+                            source_canonical.display(),
+                            harness_target.display()
+                        ))
+                    })?;
+            }
+        }
     }
     Ok(())
 }
@@ -2006,6 +2080,16 @@ impl SandboxBackend for FirecrackerBackend {
         let paths = api.create_snapshot(&dest).await?;
 
         let created_at = Utc::now();
+        let source_rootfs_canonical = if spec.rootfs_source.is_some() {
+            Some(paths::rootfs_canonical(&self.work_dir, id))
+        } else {
+            None
+        };
+        let source_harness_canonical = if spec.harness_substrate.is_some() {
+            Some(paths::harness_canonical(&self.work_dir, id))
+        } else {
+            None
+        };
         let manifest = FcSnapshotManifest {
             sandbox_id: id,
             created_at,
@@ -2027,6 +2111,14 @@ impl SandboxBackend for FirecrackerBackend {
             // trace via `--prefault-trace <hint>`. Set from FC
             // config; falls back to None when not wired.
             trace_host_hint: self.config.host_id,
+            // ADR 0014 M1.11: canonical paths embedded in FC's
+            // state.bin. Cross-host restore reads these to recreate
+            // the EXACT path FC tries to open at load_snapshot
+            // time (state.bin has the bake's absolute path baked
+            // in; the receiver's own work_dir is a different
+            // location and wouldn't satisfy FC).
+            source_rootfs_canonical,
+            source_harness_canonical,
         };
         let manifest_path = dest.join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -2641,6 +2733,8 @@ mod tests {
             memory_manifest: None,
             canonical_memory_manifest: None,
             trace_host_hint: None,
+            source_rootfs_canonical: None,
+            source_harness_canonical: None,
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: FcSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
