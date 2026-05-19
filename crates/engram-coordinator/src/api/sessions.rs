@@ -595,6 +595,16 @@ async fn create_session_inner(
                 // before start_agent. Same URI cold-create would
                 // resolve to a host-local ext4 path.
                 let warm_harness_uri = harness_pack_uri.clone();
+                // Canonical harness name (e.g. "claude") for the
+                // in-VM dir layout `/run/engram/harnesses/<name>/`.
+                // Cold-create threads this via the
+                // `ENGRAM_SESSION_HARNESS_NAME` env hint; warm-launch
+                // needs it explicitly on the gRPC since the
+                // bake-time stub was attached without one.
+                let warm_harness_name = match &req.harness {
+                    HarnessSpec::Builtin { name } => Some(name.clone()),
+                    HarnessSpec::None => None,
+                };
                 state
                     .host_registry
                     .try_warm_lease_for_session(
@@ -603,6 +613,7 @@ async fn create_session_inner(
                         agent,
                         warm_policy,
                         warm_harness_uri,
+                        warm_harness_name,
                     )
                     .await
                     .unwrap_or_else(|e| {

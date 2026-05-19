@@ -417,6 +417,7 @@ impl GrpcHostClient {
         agent: AgentSpec,
         policy: SessionEgressPolicy,
         harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
     ) -> Result<(), SandboxError> {
         use crate::grpc::LaunchWarmRequest;
         let req = LaunchWarmRequest {
@@ -427,6 +428,7 @@ impl GrpcHostClient {
             // wire. Host's gRPC server maps "" → None before calling
             // the HostClient trait method.
             harness_pack_uri: harness_pack_uri.unwrap_or_default(),
+            harness_name: harness_name.unwrap_or_default(),
         };
         self.inner
             .clone()
@@ -591,8 +593,17 @@ impl HostClient for GrpcHostClient {
         agent: AgentSpec,
         policy: SessionEgressPolicy,
         harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
     ) -> Result<(), SandboxError> {
-        Self::launch_warm_sandbox(self, sandbox_id, agent, policy, harness_pack_uri).await
+        Self::launch_warm_sandbox(
+            self,
+            sandbox_id,
+            agent,
+            policy,
+            harness_pack_uri,
+            harness_name,
+        )
+        .await
     }
 
     async fn list_warm_slots(

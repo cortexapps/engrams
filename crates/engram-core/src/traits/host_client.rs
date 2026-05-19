@@ -207,14 +207,22 @@ pub trait HostClient: Send + Sync {
     /// `None` skips the swap (the slot's bake-time stub stays
     /// attached — fine for sessions with no harness, or when the
     /// stub already matches).
+    ///
+    /// `harness_name` is the canonical name (e.g. `"claude"`) the
+    /// session selected — the directory bootstrap inside the VM
+    /// expects under `/run/engram/harnesses/<name>/`. Required when
+    /// `harness_pack_uri` is `Some`, since the URI's last path
+    /// segment (e.g. `harness-claude`) won't generally match the
+    /// session's canonical name. `None` when the URI is also `None`.
     async fn launch_warm_sandbox(
         &self,
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
         harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
     ) -> Result<(), SandboxError> {
-        let _ = (sandbox_id, agent, policy, harness_pack_uri);
+        let _ = (sandbox_id, agent, policy, harness_pack_uri, harness_name);
         Err(SandboxError::NotFound)
     }
 

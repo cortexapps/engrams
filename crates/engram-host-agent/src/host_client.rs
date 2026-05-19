@@ -208,6 +208,7 @@ impl HostClient for LocalHostClient {
         agent: AgentSpec,
         policy: SessionEgressPolicy,
         harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
     ) -> Result<(), SandboxError> {
         match self.warm_pool.as_ref() {
             Some(pool) => {
@@ -218,12 +219,18 @@ impl HostClient for LocalHostClient {
                 // pass `None` and skip the swap entirely.
                 let session_harness_path = match (harness_pack_uri, self.image_cache.as_ref()) {
                     (Some(uri), Some(cache)) => {
-                        // The harness name follows the same
-                        // convention the cold-create path uses
-                        // (`harness_name_for_substrate` →
-                        // `engram_session_harness_name` env or the
-                        // URI's last path segment).
-                        let name = crate::pooled_backend::harness_name_from_uri(&uri);
+                        // Coord ships the canonical session harness
+                        // name explicitly (e.g. "claude"); fall back
+                        // to URI-derived naming only for legacy
+                        // callers that didn't set the new proto
+                        // field. The cold-create path uses the same
+                        // canonical name via the
+                        // `ENGRAM_SESSION_HARNESS_NAME` env hint, so
+                        // both paths agree on the directory layout
+                        // bootstrap exec's
+                        // (`/run/engram/harnesses/<name>/harness`).
+                        let name = harness_name
+                            .unwrap_or_else(|| crate::pooled_backend::harness_name_from_uri(&uri));
                         let cached = cache
                             .ensure_harness_ext4(&uri, &name, self.egress_ca_pem.as_deref())
                             .await

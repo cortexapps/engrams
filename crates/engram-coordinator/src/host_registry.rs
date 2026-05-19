@@ -271,6 +271,14 @@ impl HostRegistry {
         // bootstrap. `None` for sessions without a harness
         // (`kind = none`) — the bake-time stub stays attached.
         harness_pack_uri: Option<String>,
+        // The session's canonical harness name (e.g. `"claude"`).
+        // Bootstrap exec's `/run/engram/harnesses/<name>/harness`
+        // inside the VM, so the host must build the harness ext4
+        // with this directory name — not whatever the URI's last
+        // path segment happens to be (which would yield
+        // `harness-claude` for the `harness-claude` repo URI).
+        // `None` iff `harness_pack_uri` is `None`.
+        harness_name: Option<String>,
     ) -> Result<Option<(HostId, SandboxId)>, SandboxError> {
         use engram_core::traits::host_client::WarmLeaseOutcome;
         let candidates = self.candidates_with_warm_slot(template_ref);
@@ -311,6 +319,7 @@ impl HostRegistry {
                             agent.clone(),
                             policy.clone(),
                             harness_pack_uri.clone(),
+                            harness_name.clone(),
                         )
                         .await
                     {
@@ -947,6 +956,7 @@ mod tests {
             agent: engram_core::types::sandbox::AgentSpec,
             _policy: engram_core::types::egress::SessionEgressPolicy,
             _harness_pack_uri: Option<String>,
+            _harness_name: Option<String>,
         ) -> Result<(), SandboxError> {
             self.launch_log.lock().push((sandbox_id, agent));
             Ok(())
@@ -1024,6 +1034,7 @@ mod tests {
                 agent(),
                 empty_policy(SessionId::new()),
                 None,
+                None,
             )
             .await
             .expect("warm lease must not error");
@@ -1070,6 +1081,7 @@ mod tests {
                 agent(),
                 empty_policy(SessionId::new()),
                 None,
+                None,
             )
             .await
             .expect("warm lease must not error");
@@ -1109,6 +1121,7 @@ mod tests {
                 agent(),
                 empty_policy(SessionId::new()),
                 None,
+                None,
             )
             .await
             .expect("warm lease must not error");
@@ -1143,6 +1156,7 @@ mod tests {
                 template_ref,
                 agent(),
                 empty_policy(SessionId::new()),
+                None,
                 None,
             )
             .await

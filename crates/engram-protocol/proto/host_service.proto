@@ -256,6 +256,16 @@ message LaunchWarmRequest {
   // about option D yet (warm slot keeps its bake-time stub harness,
   // which is fine for the no-agent case).
   string harness_pack_uri = 4;
+  // ADR 0014 M1.12: the canonical harness name (e.g. "claude") the
+  // session selected. Bootstrap exec's `/run/engram/harnesses/<name>/
+  // harness` inside the VM, so the host must build the harness ext4
+  // with a `<name>/` directory inside — not whatever the URI's last
+  // path segment happens to be. Cold-create path threaded this via
+  // `spec.env.ENGRAM_SESSION_HARNESS_NAME`; warm-launch needs it
+  // explicitly here. Empty / absent string falls back to parsing the
+  // URI (legacy behaviour) — works only when the registry repo name
+  // matches the harness name exactly.
+  string harness_name = 5;
 }
 
 message WarmSlotsResponse {

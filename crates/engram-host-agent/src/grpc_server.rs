@@ -314,8 +314,13 @@ impl HostService for HostServiceImpl {
         } else {
             Some(r.harness_pack_uri)
         };
+        let harness_name = if r.harness_name.is_empty() {
+            None
+        } else {
+            Some(r.harness_name)
+        };
         self.inner
-            .launch_warm_sandbox(sandbox_id, agent, policy, harness_pack_uri)
+            .launch_warm_sandbox(sandbox_id, agent, policy, harness_pack_uri, harness_name)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
