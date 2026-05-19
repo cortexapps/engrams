@@ -904,7 +904,20 @@ warm-lease).
    same `NetworkAllocator` (both paths draw from `10.200.0.0/24`,
    so a slot leased by either is invisible to the other) and the
    same egress-proxy registry keyed on the host-visible IP.
-   Future ADR unifies the two when there's a real reason to.
+   Future ADR unifies the two when there's a real reason to. See
+   "Cold-path → netns unification" under Open questions.
+9. **(M1.16) Concurrent warm restores still collide on FC's
+   string state.** `state.bin` embeds the vsock UDS path as a
+   filesystem string; two concurrent restores from one snapshot
+   both `bind()` that path and the second loses with `EADDRINUSE`.
+   That's why `CEILING_TARGET=1` in `warm_pool.rs` and why
+   `multi_restore` is a serial test. M1.16's network namespace
+   only solves the network-side collision; mount namespaces are
+   needed to also isolate filesystem paths. Same kernel-namespace
+   pattern, same shape of host-agent change. Deferred as long as
+   `target=1` per template per host satisfies measured demand —
+   see "Per-FC mount namespace for concurrent restores" under
+   Open questions.
 
 ## Verification
 
@@ -1028,6 +1041,33 @@ M2 acceptance gates:
   (L3). We skip this in M1 — measured GCS in-region latency is
   acceptable as the miss path when working-set prefetch is doing
   its job. Revisit if fleet-wide chunk-cache-miss rate climbs.
+- **Per-FC mount namespace for concurrent restores (post-M1.16).**
+  M1.16 puts each warm-restored VM in its own network namespace,
+  which isolates the TAP name + per-VM IP. The remaining
+  collision is FC's vsock UDS path: `state.bin` embeds it as a
+  filesystem string keyed on the bake's sandbox_id, so two
+  concurrent restores from one snapshot both `bind()` the same
+  Unix socket on the host filesystem and the second fails with
+  `EADDRINUSE`. Fix is the same kernel-namespace trick applied to
+  a different namespace: `unshare(CLONE_NEWNS)` before
+  `spawn_firecracker`, `mount --bind /per-vm-dir/<id>.vsock
+  /var/lib/engram/<bake-id>.vsock` inside the namespace so FC's
+  embedded path resolves to a per-VM inode. Same overall LOC
+  budget as M1.16 (~200-300). Blocked behind raising
+  `CEILING_TARGET` past 1 — until measured demand asks for
+  N concurrent slots per template per host, sequential refill
+  with N=1 covers it (a session destroying its slot releases the
+  UDS before refill's next restore takes it).
+- **Cold-path → netns unification (post-M1.16).** M1.16 left
+  cold-create using the direct-TAP-on-host-root model and only
+  put warm-restored VMs in netns'es. Two networking shapes on
+  one host is the cost. Unifying — putting cold creates in netns
+  too — would shrink `net.rs` to one provisioning path, simplify
+  the test surface, and pre-stage cold for any future mount-ns
+  work. Deferred as plumbing rather than design: same primitives
+  (`provision_netns`/`teardown_netns`) already exist; main work
+  is rewriting `create_in_jail` to thread the netns through and
+  updating cold-path tests. ~300 LOC.
 
 ADR 0012 ("warm pool deferred") and ADR 0009 ("graceful preemption
 deferred") both move from `deferred` → `landed via 0014` after M2.
