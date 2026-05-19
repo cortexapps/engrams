@@ -379,6 +379,13 @@ struct LiveSandbox {
     /// `LiveSandbox` is constructed, but the field is `Option` for
     /// the symmetry with the `state` rebuild path.
     net: Option<net::NetSetup>,
+    /// ADR 0014 M1.16: warm-restore-only. When `Some`, the VM
+    /// lives inside a per-VM netns; `net` is `None` and the
+    /// host-visible IP is `netns.host_reachable_ip()` instead of
+    /// `net.vm_cidr.guest()`. `destroy()` calls
+    /// `net::teardown_netns` on this. Mutually exclusive with
+    /// `net`: at most one is `Some` per `LiveSandbox`.
+    netns: Option<net::NetnsSetup>,
     /// Cached IPv4 address discovered by querying agentd on first
     /// `guest_ip` call (mirrors VZ's pattern). Populated lazily
     /// because the agent's eth0 needs IP_PNP DHCP+kernel boot before
@@ -736,6 +743,10 @@ impl FirecrackerBackend {
                 fc_pid: Some(fc.process.pid),
                 uffd_handler: None,
                 net: net_setup,
+                // pidfd-reattach is for pre-M1.16 sandboxes that
+                // never used a per-VM netns; the field is always
+                // None on this path.
+                netns: None,
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
@@ -1338,6 +1349,8 @@ impl FirecrackerBackend {
                 fc_pid,
                 uffd_handler: None,
                 net: net_setup.cloned(),
+                // Cold create path: VM is in host root netns.
+                netns: None,
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
@@ -1421,17 +1434,38 @@ impl FirecrackerBackend {
             }
         }
 
-        // Warm restore enters its per-VM netns BEFORE spawning FC so
-        // FC's load_snapshot finds the bake-time TAP name inside this
-        // netns instead of (failing to find) it in host root. The
-        // netns is allocated below from `reserve_restored_net`'s
-        // M1.16 path; passing `None` here means a legacy snapshot
-        // with no net record (or a test backend with `net_pool=None`)
-        // restores in host root, same as today.
-        let restored_netns = None::<String>;
-        let (socket, child) = self
-            .spawn_firecracker(jail_dir, restored_netns.as_deref())
-            .await?;
+        // ADR 0014 M1.16: warm-restore networking provisions a
+        // per-VM netns BEFORE spawning FC. The netns has the bake's
+        // TAP recreated inside it (collision-free vs other warm VMs
+        // on the same host) plus SNAT remapping the VM's bake-time
+        // source IP to a unique-per-VM pool slot. FC enters the
+        // netns via `ip netns exec` so `load_snapshot`'s TAP open
+        // resolves inside it.
+        //
+        // Legacy/test snapshots with `manifest.net = None` keep the
+        // historical host-root flow: TAP lives directly on host
+        // root, FC stays in host root, no netns at all.
+        let netns_setup = match self
+            .reserve_restored_netns(sandbox_id, manifest.net.as_ref())
+            .await
+        {
+            Ok(setup) => setup,
+            Err(e) => return Err(e),
+        };
+
+        let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
+        let (socket, child) = match self
+            .spawn_firecracker(jail_dir, netns_name.as_deref())
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(setup) = netns_setup.as_ref() {
+                    net::teardown_netns(setup, &self.net_allocator).await;
+                }
+                return Err(e);
+            }
+        };
 
         // ADR 0014: FC's `state.bin` embeds the canonical rootfs
         // path keyed by the **source** sandbox_id, not this new
@@ -1452,27 +1486,19 @@ impl FirecrackerBackend {
         .await
         {
             drop(child);
+            if let Some(setup) = netns_setup.as_ref() {
+                net::teardown_netns(setup, &self.net_allocator).await;
+            }
             return Err(e);
         }
 
-        // Re-provision the host-side networking BEFORE load_snapshot.
-        // FC's `state.bin` references the original TAP by name on the
-        // virtio-net frontend, and the snapshot load will fail when
-        // FC tries to open a TAP that doesn't exist on the receiving
-        // host. Same-host hot-resume: the original TAP/CIDR were freed
-        // on `destroy()`, so the slot is back in the allocator.
-        // Cross-host cold-resume: the slot may already be taken on
-        // this host, in which case we fail-soft (no egress) rather
-        // than rejecting the restore — the snapshot is still valid,
-        // the VM still boots, the user can re-create to recover egress.
-        let net_setup = match self.reserve_restored_net(manifest.net.as_ref()).await {
-            Ok(setup) => setup,
-            Err(e) => {
-                // We've spawned FC; clean up before bailing.
-                drop(child);
-                return Err(e);
-            }
-        };
+        // Legacy/test path: no netns means we still might need the
+        // old host-root TAP setup (when `manifest.net.is_some` but
+        // the host is configured without a netns-style pool — e.g.
+        // a fixture that wants a direct TAP). For now we only take
+        // the netns path; legacy snapshots without `manifest.net`
+        // get `None` here and keep restoring netless.
+        let net_setup: Option<net::NetSetup> = None;
 
         let api = FirecrackerClient::new(&socket);
 
@@ -1501,6 +1527,9 @@ impl FirecrackerBackend {
                         drop(child);
                         if let Some(setup) = net_setup.as_ref() {
                             net::teardown(setup, &self.net_allocator).await;
+                        }
+                        if let Some(setup) = netns_setup.as_ref() {
+                            net::teardown_netns(setup, &self.net_allocator).await;
                         }
                         return Err(SandboxError::Snapshot(
                             "RestoreMode::Uffd requires manifest.memory_manifest \
@@ -1561,6 +1590,9 @@ impl FirecrackerBackend {
                 if let Some(setup) = net_setup.as_ref() {
                     net::teardown(setup, &self.net_allocator).await;
                 }
+                if let Some(setup) = netns_setup.as_ref() {
+                    net::teardown_netns(setup, &self.net_allocator).await;
+                }
                 drop(child);
                 return Err(e);
             }
@@ -1614,6 +1646,7 @@ impl FirecrackerBackend {
                 fc_pid,
                 uffd_handler,
                 net: net_setup,
+                netns: netns_setup,
                 guest_ip: parking_lot::Mutex::new(None),
             },
         );
@@ -1633,55 +1666,59 @@ impl FirecrackerBackend {
         Ok(())
     }
 
-    /// Re-allocate the manifest's /30 slot and recreate the TAP under
-    /// the original name. Falls back to `Ok(None)` (no egress) when
-    /// the slot is already in use on this host — that's the cross-host
-    /// cold-resume case where the receiving host's allocator may have
-    /// handed the slot to another VM. `Ok(None)` is also returned when
-    /// the manifest predates the net field (older snapshots) or when
-    /// the source VM was created with networking disabled.
-    async fn reserve_restored_net(
+    /// ADR 0014 M1.16: per-VM netns provisioning at restore time.
+    /// Used by the warm-restore path so every restored slot gets its
+    /// own netns where the bake's TAP name is reused collision-free.
+    /// Replaces the prior `reserve_restored_net` host-root variant —
+    /// the host-root approach can't support N>1 warm slots from one
+    /// snapshot because every restore would collide on the bake's
+    /// `host_dev_name`, and FC v1.10.1's PATCH /network-interfaces
+    /// doesn't permit rebinding it post-load.
+    ///
+    /// Returns `Ok(None)` when the host has networking disabled
+    /// (`config.net_pool = None`, tests) or when the manifest carries
+    /// no `net` record (legacy / pre-M1.16 bakes). Returns
+    /// `Ok(Some(setup))` on success; the caller threads `setup` into
+    /// `LiveSandbox.netns` and `destroy()` reverses the provisioning.
+    ///
+    /// Unlike `reserve_restored_net`, this path doesn't reserve the
+    /// snapshot's exact `/30` (the netns hides it) — it allocates a
+    /// fresh slot from the host pool for the SNAT'd source IP, so
+    /// multiple warm slots from one template never collide on the
+    /// host-visible side.
+    #[cfg(target_os = "linux")]
+    async fn reserve_restored_netns(
         &self,
+        sandbox_id: SandboxId,
         snap: Option<&FcNetSnapshot>,
-    ) -> Result<Option<net::NetSetup>, SandboxError> {
+    ) -> Result<Option<net::NetnsSetup>, SandboxError> {
         let Some(snap) = snap else {
             return Ok(None);
         };
         if self.config.net_pool.is_none() {
-            // Receiving host has networking disabled (test mode).
-            // Nothing to reserve, nothing to provision.
             return Ok(None);
         }
-        let cidr = net::VmCidr::new(snap.cidr_network);
-        match self.net_allocator.lock().reserve(cidr) {
-            Ok(_) => {}
-            Err(net::AllocError::SlotTaken) => {
-                tracing::warn!(
-                    cidr = %cidr.cidr_str(),
-                    tap = %snap.tap_name,
-                    "restore: original /30 already in use on this host; \
-                     restored sandbox will have no egress until re-created",
-                );
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(SandboxError::Vm(
-                    format!("reserve restored /30 {}: {e}", cidr.cidr_str()).into(),
-                ));
-            }
-        }
-        // Slot reserved. If TAP creation fails, return the slot to the
-        // allocator so the next restore attempt can try again rather
-        // than perpetually failing with SlotTaken.
-        match net::provision_with_named_tap(cidr, &snap.tap_name).await {
+        let bake_cidr = net::VmCidr::new(snap.cidr_network);
+        match net::provision_netns(sandbox_id, bake_cidr, &snap.tap_name, &self.net_allocator).await
+        {
             Ok(setup) => Ok(Some(setup)),
-            Err(e) => {
-                self.net_allocator.lock().free(cidr);
-                Err(SandboxError::Vm(
-                    format!("recreate TAP {}: {e}", snap.tap_name).into(),
-                ))
-            }
+            Err(e) => Err(SandboxError::Vm(
+                format!(
+                    "provision netns for restored sandbox (tap {}): {e}",
+                    snap.tap_name
+                )
+                .into(),
+            )),
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn reserve_restored_netns(
+        &self,
+        _sandbox_id: SandboxId,
+        _snap: Option<&FcNetSnapshot>,
+    ) -> Result<Option<net::NetnsSetup>, SandboxError> {
+        Ok(None)
     }
 }
 
@@ -2474,6 +2511,13 @@ impl SandboxBackend for FirecrackerBackend {
         if let Some(net_setup) = live.net.as_ref() {
             net::teardown(net_setup, &self.net_allocator).await;
         }
+        // ADR 0014 M1.16: warm-restored VMs ran in their own netns
+        // — delete it (and the TAP + veth-B inside, the SNAT iptables
+        // rule, etc.), unlink the host-side veth-A, free the SNAT
+        // pool slot. Best-effort like cold teardown.
+        if let Some(netns_setup) = live.netns.as_ref() {
+            net::teardown_netns(netns_setup, &self.net_allocator).await;
+        }
 
         // Vsock UDS lives at work_dir root; remove explicitly since
         // it isn't inside the jail dir we wipe below.
@@ -2519,6 +2563,18 @@ impl SandboxBackend for FirecrackerBackend {
     async fn guest_ip(&self, id: SandboxId) -> Option<String> {
         if let Some(live) = self.sandboxes.get(&id) {
             if let Some(ip) = live.guest_ip.lock().clone() {
+                return Some(ip);
+            }
+            // ADR 0014 M1.16: warm-restored VMs all share the
+            // bake-time eth0 IP `10.200.0.2` inside the guest, but
+            // each netns SNATs to a unique-per-VM pool slot on the
+            // host-visible side. Egress proxy registry indexes
+            // against that SNAT'd IP and the dashboard SHELL tab
+            // dials it for ttyd — so this is the value
+            // host-side callers want.
+            if let Some(ns) = live.netns.as_ref() {
+                let ip = ns.host_reachable_ip().to_string();
+                *live.guest_ip.lock() = Some(ip.clone());
                 return Some(ip);
             }
             // Fast path: the /30 allocator assigned the guest a
