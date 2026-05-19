@@ -869,7 +869,18 @@ impl FirecrackerBackend {
     /// `restore_in_jail`. Returns the socket path and the live `Child`.
     /// On any error after this call, the caller drops the Child —
     /// `kill_on_drop=true` cleans up.
-    async fn spawn_firecracker(&self, jail_dir: &Path) -> Result<(PathBuf, Child), SandboxError> {
+    ///
+    /// `netns_name`: when `Some`, FC is spawned via
+    /// `ip netns exec <name> firecracker …` so the process (and
+    /// any TAP it opens via `host_dev_name`) lives inside that
+    /// netns. ADR 0014 M1.16 warm-restore path passes the
+    /// per-VM netns here; cold path passes `None` and FC stays
+    /// in host root, as today.
+    async fn spawn_firecracker(
+        &self,
+        jail_dir: &Path,
+        netns_name: Option<&str>,
+    ) -> Result<(PathBuf, Child), SandboxError> {
         tokio::fs::create_dir_all(jail_dir)
             .await
             .map_err(|e| vm_err(format!("create jail dir {}: {e}", jail_dir.display())))?;
@@ -888,8 +899,25 @@ impl FirecrackerBackend {
             .try_clone()
             .map_err(|e| vm_err(format!("dup log fd: {e}")))?;
 
-        let mut child = Command::new(&self.config.firecracker_bin)
-            .args(["--api-sock", socket.to_string_lossy().as_ref()])
+        let fc_bin = self.config.firecracker_bin.to_string_lossy().into_owned();
+        let socket_arg = socket.to_string_lossy().into_owned();
+        let mut cmd = match netns_name {
+            Some(ns) => {
+                // `ip netns exec` forks + setns(CLONE_NEWNET) + exec
+                // the given command — the FC child (and its eventual
+                // PUT /network-interfaces host_dev_name lookup) all
+                // resolve TAP names inside this netns.
+                let mut c = Command::new("ip");
+                c.args(["netns", "exec", ns, &fc_bin, "--api-sock", &socket_arg]);
+                c
+            }
+            None => {
+                let mut c = Command::new(&self.config.firecracker_bin);
+                c.args(["--api-sock", &socket_arg]);
+                c
+            }
+        };
+        let mut child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
             .stdin(Stdio::null())
@@ -897,8 +925,9 @@ impl FirecrackerBackend {
             .spawn()
             .map_err(|e| {
                 vm_err(format!(
-                    "spawn {}: {e}",
-                    self.config.firecracker_bin.display()
+                    "spawn {} (netns={:?}): {e}",
+                    self.config.firecracker_bin.display(),
+                    netns_name,
                 ))
             })?;
 
@@ -1095,7 +1124,11 @@ impl FirecrackerBackend {
             .rootfs_source
             .clone()
             .ok_or_else(|| SandboxError::InvalidSpec("rootfs_source missing".into()))?;
-        let (socket, child) = self.spawn_firecracker(jail_dir).await?;
+        // Cold create: FC in the host root netns, TAP lives directly
+        // on root (per-VM /30 via `net::provision`). ADR 0014 M1.16
+        // only puts warm restores in their own netns; cold path
+        // stays simpler.
+        let (socket, child) = self.spawn_firecracker(jail_dir, None).await?;
 
         // Configure + start. Any failure here means the Child gets
         // dropped (and SIGKILL'd via kill_on_drop) by the outer
@@ -1388,7 +1421,17 @@ impl FirecrackerBackend {
             }
         }
 
-        let (socket, child) = self.spawn_firecracker(jail_dir).await?;
+        // Warm restore enters its per-VM netns BEFORE spawning FC so
+        // FC's load_snapshot finds the bake-time TAP name inside this
+        // netns instead of (failing to find) it in host root. The
+        // netns is allocated below from `reserve_restored_net`'s
+        // M1.16 path; passing `None` here means a legacy snapshot
+        // with no net record (or a test backend with `net_pool=None`)
+        // restores in host root, same as today.
+        let restored_netns = None::<String>;
+        let (socket, child) = self
+            .spawn_firecracker(jail_dir, restored_netns.as_deref())
+            .await?;
 
         // ADR 0014: FC's `state.bin` embeds the canonical rootfs
         // path keyed by the **source** sandbox_id, not this new
