@@ -2205,10 +2205,22 @@ impl SandboxBackend for FirecrackerBackend {
         // can dial the right path instead of guessing from its own
         // work_dir.
         let source_vsock_canonical = Some(self.work_dir.join(format!("{id}.vsock")));
+        // ADR 0014 sec-hardening: `spec.env` carries session secrets
+        // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, etc.) verbatim
+        // — keeping them in the on-disk sidecar would leak them to
+        // any operator with read access to /var/lib/engram. Restore
+        // doesn't replay env (the running VM's process state already
+        // baked it in), so we clear values before serialize. Keys
+        // stay for diagnostic value (operators can see "this snapshot
+        // had ANTHROPIC_API_KEY set" without the secret itself).
+        let mut redacted_spec = spec.clone();
+        for (_k, v) in redacted_spec.env.iter_mut() {
+            *v = "<redacted>".into();
+        }
         let manifest = FcSnapshotManifest {
             sandbox_id: id,
             created_at,
-            spec: spec.clone(),
+            spec: redacted_spec,
             net: net_snapshot,
             format: MANIFEST_FORMAT_FC.into(),
             // PooledBackend::snapshot patches `memory_manifest`
