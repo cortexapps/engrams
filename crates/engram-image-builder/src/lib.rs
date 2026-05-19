@@ -156,6 +156,22 @@ pub struct CanonicalCaptureConfig {
     /// nor engram-bootstrap baked in — without this opt-out the
     /// kernel panics with `init=/sbin/engram-init` missing.
     pub skip_warm_pool_prep: bool,
+    /// ADR 0014 M1.16: bake-time network pool. `Some(addr)`
+    /// allocates a /30 + creates a host TAP + bakes
+    /// `ip=…:eth0:off` into the kernel cmdline, so the snapshot
+    /// captures a virtio-net device + an up eth0 inside the VM.
+    /// Required for the dashboard SHELL tab + egress to work
+    /// post-warm-restore: FC can't hot-add virtio-net after
+    /// `load_snapshot`, and the prod host's per-VM netns
+    /// re-creates the TAP inside the netns + SNATs the bake's
+    /// `10.200.0.2` to a unique-per-VM host slot.
+    ///
+    /// Production bakes pass `Some("10.200.0.0".parse().unwrap())`
+    /// (matching `FirecrackerConfig::default`); bake host needs
+    /// `CAP_NET_ADMIN` for `ip tuntap add`. `None` keeps the bake
+    /// netless — only useful for test fixtures without
+    /// `CAP_NET_ADMIN` that don't need post-restore networking.
+    pub net_pool: Option<std::net::Ipv4Addr>,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -1084,10 +1100,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         if let Some(bin) = &capture_cfg.firecracker_bin {
             fc_cfg.firecracker_bin = bin.clone();
         }
-        // Bake-time isolation: no networking, no egress proxy.
-        // The image is supposed to reach steady state on local
-        // resources only.
-        fc_cfg.net_pool = None;
+        // Bake-time isolation: egress proxy stays off (the image
+        // is supposed to reach steady state on local resources).
+        // Networking IS configured when `capture_cfg.net_pool` is
+        // `Some` — ADR 0014 M1.16 needs the snapshot to capture a
+        // virtio-net device + an `ip=…`-up eth0 because FC can't
+        // hot-add network interfaces after `load_snapshot`.
+        // Production prod-host's warm-restore path recreates the
+        // bake's TAP inside a per-VM netns + SNATs the bake-time
+        // source IP to a unique-per-VM host slot.
+        fc_cfg.net_pool = capture_cfg.net_pool;
         fc_cfg.egress_proxy_port = None;
         // ADR 0014 M1.12: boot through `engram-init` so the init
         // shim spawns engram-bootstrap (BOOTSTRAP_VSOCK_PORT
@@ -1365,7 +1387,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         }
         fc_cfg.uffd_handler_bin = uffd_bin.clone();
         fc_cfg.restore_mode = RestoreMode::Uffd;
-        fc_cfg.net_pool = None;
+        // Mirror the primary bake's net config so this profile FC's
+        // `load_snapshot` can re-allocate the manifest's /30 + TAP.
+        // Without this, restoring a snapshot baked with `net_pool =
+        // Some(…)` here would fail trying to open the bake-time TAP
+        // that doesn't exist on this allocator.
+        fc_cfg.net_pool = capture_cfg.net_pool;
         fc_cfg.egress_proxy_port = None;
         fc_cfg.uffd_blob_root = Some(blob_root.clone());
         fc_cfg.stub_harness_path = Some(stub_path.to_path_buf());

@@ -134,6 +134,10 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
         // no engram-bootstrap; opt out of the M1.12 stub-harness +
         // engram-init scaffolding so the kernel can reach a shell.
         skip_warm_pool_prep: true,
+        // CI nextest runs as the `runner` user, which lacks
+        // `CAP_NET_ADMIN` — `ip tuntap add` would EPERM. Keep this
+        // fixture netless; production bakes opt in via the CLI flag.
+        net_pool: None,
     };
 
     // ADR 0014 M1.11: `capture_canonical_memory` now stages

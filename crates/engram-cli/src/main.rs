@@ -412,6 +412,17 @@ enum ImageCmd {
         /// memory.bin in the snapshot is dominated by this.
         #[arg(long)]
         canonical_memory_mib: Option<u32>,
+
+        /// ADR 0014 M1.16: bake-time network pool. When set, the
+        /// bake VM gets a TAP + virtio-net + `ip=…` kernel cmdline
+        /// so the snapshot captures a fully configured eth0.
+        /// Required for the dashboard SHELL tab and warm-restore
+        /// egress, because FC can't hot-add virtio-net post-snapshot.
+        /// Prod bakes pass `10.200.0.0` to match the FC host pool;
+        /// bake host needs `CAP_NET_ADMIN`. Omit to keep the bake
+        /// netless.
+        #[arg(long)]
+        canonical_net_pool: Option<std::net::Ipv4Addr>,
     },
 }
 
@@ -521,6 +532,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 canonical_firecracker_bin,
                 canonical_boot_wait_secs,
                 canonical_memory_mib,
+                canonical_net_pool,
             } => {
                 let canonical = if *capture_canonical_memory {
                     Some(engram_image_builder::CanonicalCaptureConfig {
@@ -545,6 +557,10 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                         // Production bakes inject engram-init +
                         // bootstrap; warm-pool prep is the point.
                         skip_warm_pool_prep: false,
+                        // ADR 0014 M1.16: when set, the bake captures
+                        // a virtio-net + up eth0. Required for the
+                        // dashboard SHELL tab + warm-restore egress.
+                        net_pool: *canonical_net_pool,
                     })
                 } else {
                     None
