@@ -489,7 +489,7 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e, snapshot_net, patch_drive_swap, option_d_warm_lease)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e, snapshot_net, patch_drive_swap, option_d_warm_lease, netns_isolation)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
@@ -498,6 +498,7 @@ jobs:
             --test snapshot_net \
             --test patch_drive_swap \
             --test option_d_warm_lease \
+            --test netns_isolation \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

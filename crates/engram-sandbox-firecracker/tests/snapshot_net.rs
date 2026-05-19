@@ -88,6 +88,23 @@ fn tap_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `ip -n <ns> link show <name>` — same probe, but inside a netns.
+/// Used by M1.16 assertions that the bake's TAP is recreated inside
+/// the per-VM netns instead of host root.
+fn tap_exists_in_netns(ns: &str, name: &str) -> bool {
+    std::process::Command::new("ip")
+        .args(["-n", ns, "link", "show", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `ip netns add` publishes a bind-mount at `/var/run/netns/<name>`.
+/// Probing the path is the cheapest existence check.
+fn netns_exists(name: &str) -> bool {
+    std::path::Path::new("/var/run/netns").join(name).exists()
+}
+
 /// Read `ip -4 addr show dev <name>` and check the gateway IP appears
 /// (it should — provision adds `<gateway>/30` to the TAP).
 fn tap_has_addr(name: &str, ip: Ipv4Addr) -> bool {
@@ -217,18 +234,27 @@ async fn snapshot_restore_round_trips_per_vm_network() {
         "restore allocates fresh sandbox id"
     );
 
-    // 6. host-side networking is back under the original TAP name +
-    //    same gateway IP. This is the load-bearing assertion: prior
-    //    to Gap 1 the restored sandbox carried `net: None` and the
-    //    TAP wouldn't have been recreated.
+    // 6. ADR 0014 M1.16: post-restore the TAP lives INSIDE a per-VM
+    //    netns, not host root. Recreating it under the bake's name in
+    //    the host-root namespace would collide with concurrent warm
+    //    restores from the same template, so M1.16 moved the entire
+    //    networking surface for restored sandboxes into a fresh netns.
+    let restored_ns = engram_sandbox_firecracker::net::netns_name_for(restored_id);
     assert!(
-        tap_exists(&orig_tap),
-        "TAP {orig_tap} should be recreated post-restore (restore-time \
-         net re-provisioning is broken if this fails)",
+        netns_exists(&restored_ns),
+        "netns {restored_ns} should exist post-restore (M1.16 puts the \
+         restored VM's networking inside its own netns)",
     );
     assert!(
-        tap_has_addr(&orig_tap, gateway),
-        "restored TAP {orig_tap} should hold gateway IP {gateway}",
+        tap_exists_in_netns(&restored_ns, &orig_tap),
+        "TAP {orig_tap} should be recreated INSIDE netns {restored_ns} \
+         post-restore (the bake's TAP name is reused, but it's now a \
+         netns-local interface so multiple warm slots can coexist)",
+    );
+    assert!(
+        !tap_exists(&orig_tap),
+        "Post-M1.16 the bake's TAP name only exists inside the per-VM \
+         netns; host root should not have it",
     );
 
     // cleanup
@@ -237,7 +263,8 @@ async fn snapshot_restore_round_trips_per_vm_network() {
         .await
         .expect("destroy restored");
     assert!(
-        !tap_exists(&orig_tap),
-        "TAP {orig_tap} should be deleted after second destroy"
+        !netns_exists(&restored_ns),
+        "netns {restored_ns} should be deleted after destroy"
     );
+    let _ = gateway; // kept above for the cold-create assertions
 }

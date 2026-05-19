@@ -2230,10 +2230,25 @@ impl SandboxBackend for FirecrackerBackend {
         // any await so we don't hold the read lock across an HTTP call.
         let (socket, spec, net_snapshot) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            let net_snapshot = live.net.as_ref().map(|setup| FcNetSnapshot {
-                tap_name: setup.tap_name.clone(),
-                cidr_network: setup.vm_cidr.network(),
-            });
+            // Cold-path sandboxes carry `net`; M1.16 warm-restored
+            // sandboxes carry `netns` with the same TAP name + CIDR
+            // recreated inside the netns. Either way, the manifest's
+            // `net` field must echo what `state.bin` references — a
+            // future restore (warm or cross-host) re-creates a TAP
+            // with this exact name inside its own per-VM netns.
+            let net_snapshot = live
+                .net
+                .as_ref()
+                .map(|setup| FcNetSnapshot {
+                    tap_name: setup.tap_name.clone(),
+                    cidr_network: setup.vm_cidr.network(),
+                })
+                .or_else(|| {
+                    live.netns.as_ref().map(|ns| FcNetSnapshot {
+                        tap_name: ns.tap_name.clone(),
+                        cidr_network: ns.vm_cidr.network(),
+                    })
+                });
             (
                 live.state.firecracker_socket.clone(),
                 live.state.spec.clone(),
