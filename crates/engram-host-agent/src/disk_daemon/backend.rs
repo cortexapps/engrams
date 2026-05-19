@@ -398,8 +398,52 @@ impl ChunkedDiskBackend {
             working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
-        let new_ref = state.manifest_ref.next_version();
-        self.store.put_manifest(new_ref, &new_manifest).await?;
+        // ADR 0014 NBD-version race: multiple sandboxes restored from
+        // the same template share the same `manifest_ref`. When sandbox
+        // A flushes v2, sandbox B's local `state.manifest_ref` is
+        // still v1 and its first flush attempts v2 → conflict. Each
+        // failed flush would leak a 4-GiB FC snapshot dir (see
+        // PooledBackend::snapshot's cleanup), filling host disk inside
+        // an hour. Retry on conflict: re-target the latest store
+        // version + bump, up to a small cap (a genuine sustained race
+        // would loop forever otherwise — bound it).
+        let mut attempt_ref = state.manifest_ref.next_version();
+        let new_ref = loop {
+            match self.store.put_manifest(attempt_ref, &new_manifest).await {
+                Ok(()) => break attempt_ref,
+                Err(engram_chunk_store::ChunkStoreError::VersionConflict {
+                    latest,
+                    attempted,
+                    manifest_id,
+                }) => {
+                    if attempted - latest > 32 {
+                        // Sanity guard: we're somehow ahead of the
+                        // store. Stop retrying and surface the
+                        // original error.
+                        return Err(engram_chunk_store::ChunkStoreError::VersionConflict {
+                            latest,
+                            attempted,
+                            manifest_id,
+                        }
+                        .into());
+                    }
+                    let next = ManifestRef {
+                        manifest_id,
+                        version: latest + 1,
+                    };
+                    tracing::debug!(
+                        manifest_id = %manifest_id,
+                        attempted = attempted,
+                        latest_in_store = latest,
+                        retry_with = next.version,
+                        "flush: NBD manifest version conflict; retrying with store's latest+1",
+                    );
+                    attempt_ref = next;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
 
         // Rebase: future reads of any chunk_idx we just rewrote
         // resolve to the NEW hash via the cache + store. Without
