@@ -481,6 +481,106 @@ L3=S3). Our L2 is BlobStorage directly; we don't plan a
 distributed mid-tier in v1 — measured GCS in-region latency is
 acceptable as the miss path.
 
+### Per-VM network namespaces for warm slots (M1.16)
+
+M1.0–M1.15 leave warm-restored VMs **netless**: the bake-time FC
+config sets `net_pool = None`, so the snapshot has no virtio-net
+device and the kernel cmdline has no `ip=…`. The cold path stays
+correct (per-session TAP + `/30` + `ip=…` baked into cmdline at
+create time), but warm sessions can't reach the egress proxy and
+the dashboard SHELL tab can't dial `ttyd` over TCP. The fix can't
+be "bake an `ip=…` into the snapshot then restore" because FC's
+`PATCH /network-interfaces/{iface_id}` doesn't permit changing
+`host_dev_name` post-load (verified against the v1.10.1 swagger),
+so every restore would be forced to recreate the *same* TAP name
+on the host — N>1 warm slots on one host would collide. Even with
+N=1 per template, every template's bake picks `10.200.0.0/30`
+(allocator starts at zero), so two templates on one host would
+collide too.
+
+M1.16 puts every warm-restored VM in its own network namespace.
+
+```
+┌──────────────────────────────── host root netns ───────────────────────────┐
+│                                                                            │
+│         ┌─ engr-br0 (bridge, no IP) ────────────────────────────┐          │
+│         │      ▲                ▲                ▲              │          │
+│   veth-A-vm1   veth-A-vm2  veth-A-vmN          (uplink)         │          │
+│         │      │                │                ▲              │          │
+│         ▼      ▼                ▼            iptables           │          │
+│   ┌─ vm1 ns ─┐ ┌─ vm2 ns ─┐ ┌─ vmN ns ─┐    REDIRECT→9443       │          │
+│   │ veth-B  │ │ veth-B  │ │ veth-B  │      MASQUERADE          │          │
+│   │ + TAP   │ │ + TAP   │ │ + TAP   │      egress-proxy:9443   │          │
+│   │   ↕     │ │   ↕     │ │   ↕     │      DNS-proxy:5353      │          │
+│   │  eth0=  │ │  eth0=  │ │  eth0=  │                          │          │
+│   │ 10.200. │ │ 10.200. │ │ 10.200. │                          │          │
+│   │ 0.2     │ │ 0.2     │ │ 0.2     │                          │          │
+│   └─────────┘ └─────────┘ └─────────┘                          │          │
+│       FC          FC          FC                                           │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+Per-VM layout (`engr-vm-<sandbox_id_prefix>`):
+
+- `ip netns add engr-vm-<id>`
+- `ip link add veth-A-<id> type veth peer name veth-B-<id>`
+- `ip link set veth-B-<id> netns engr-vm-<id>`
+- `ip link set veth-A-<id> master engr-br0 ; ip link set veth-A-<id> up`
+- Inside the netns:
+  - bring up `lo`
+  - `ip tuntap add tap-engr-<bake_id> mode tap` — the bake's TAP
+    name; reusing it inside this netns avoids the global-namespace
+    collision FC's `host_dev_name` invariant would otherwise force
+  - assign `10.200.0.1/30` to the TAP (matches the VM's baked-in
+    default gateway from the bake-time `ip=…` cmdline)
+  - default route via `veth-B-<id>`'s peer endpoint
+
+The egress proxy + DNS proxy keep listening on host-root
+`127.0.0.1:9443` / `:5353`. iptables PREROUTING REDIRECT runs on
+the bridge ingress (`-i engr-br0`), which captures every netns's
+egress traffic in one ruleset. Because every VM's `eth0` is
+`10.200.0.2`, the proxy registry would collide on `guest_ip` —
+we SNAT each netns's outbound source from `10.200.0.2` to a
+**unique-per-VM host-pool IP** allocated by the existing
+`NetworkAllocator`. The proxy registry stays keyed on that
+unique IP; conntrack reverses the SNAT on return packets.
+
+In effect: from inside the VM, networking looks the same on cold
+and warm paths (`eth0 = 10.200.0.2`, gateway `10.200.0.1`). From
+the host's view, every VM has a unique routable IP — same model
+the egress proxy already enforces against. The only new mechanism
+is the per-netns indirection and the SNAT mapping table.
+
+**Bake side**: enable `net_pool` at bake time so the snapshot has
+a virtio-net device + `ip=…` cmdline. Pre-M1.16 bakes (no
+virtio-net in the snapshot) stay restorable; they boot netless
+just like today — no regression. Bake host needs `CAP_NET_ADMIN`
+(workflow grants it via `setcap` on `engram-cli`).
+
+**FC spawn**: the host-agent enters the netns via
+`setns(CLONE_NEWNET)` immediately before exec'ing firecracker;
+the FC process and any UFFD/uffd-handler children inherit it.
+`spawn_firecracker` grows a `netns_path: Option<&Path>`
+argument. Cold path passes `None` (legacy direct-TAP-on-root
+shape) until a future ADR unifies the two; warm path always
+passes `Some(/var/run/netns/engr-vm-<id>)`.
+
+**Latency**: per-VM netns provisioning adds ~30–60 ms wall-clock
+to refill (kernel `ip netns add` + veth pair + bridge attach +
+`ip tuntap`); refill is async to the user. Steady-state per-packet
+overhead is one extra L2 hop (veth → bridge), ~10–50 µs, dwarfed
+by the existing FC virtio-net path.
+
+**Teardown**: `destroy()` deletes the netns (auto-cleans veth +
+TAP inside), removes veth-A from the bridge, releases the SNAT
+slot. Host-side rules are static (one ruleset on the bridge);
+no per-VM iptables to GC.
+
+**Lifecycle of the bridge**: host-agent startup brings up
+`engr-br0` once (idempotent, like `host_startup`'s iptables
+ruleset); it's the single host-wide L2 fabric all warm-VM netns
+veth-pairs plug into.
+
 ### Cost claim: canonical-mmap page-cache sharing
 
 The UFFD handler mmaps the canonical memory.bin with `MAP_PRIVATE`
@@ -598,6 +698,18 @@ Components:
 - **Autoscaler**: per-template lease/min over a 5-min window;
   N(T) = max(2, ceil(lease_rate × refill_time × 1.2)); floor=0 if 0
   leases in 30 min AND template inactive.
+- **Per-VM network namespaces** (M1.16, new in
+  `crates/engram-sandbox-firecracker/src/net.rs`): warm-restored
+  VMs run inside `engr-vm-<id>` netns'es, plugged into a
+  host-wide `engr-br0` bridge via veth pair, with SNAT to a
+  unique-per-VM host-pool IP. Lets every warm slot have working
+  egress (through the existing proxy) and a routable
+  `guest_ip` for the dashboard SHELL tab — without the FC
+  `host_dev_name` PATCH that the API doesn't support. Bake
+  enables `net_pool` so the snapshot carries a virtio-net device
+  + `ip=…` cmdline. Cold path stays direct-TAP-on-root in v1;
+  unification deferred to a follow-up. See "Per-VM network
+  namespaces for warm slots (M1.16)" above.
 
 ## Milestone 2 — Durability
 
@@ -786,6 +898,13 @@ warm-lease).
 7. **MIG drain deadline tightness.** Existing 90 s budget + new
    per-sandbox upload (~6 s memory + ~3-5 s rootfs at 4× concurrency)
    → ~75 s p99 for a 10-sandbox host. 180 s deadline gives 2× headroom.
+8. **(M1.16) Two parallel networking models on one host.** Cold
+   path stays direct-TAP-on-root (per-VM /30 from the host pool);
+   warm path uses netns + bridge + SNAT. Mitigated by sharing the
+   same `NetworkAllocator` (both paths draw from `10.200.0.0/24`,
+   so a slot leased by either is invisible to the other) and the
+   same egress-proxy registry keyed on the host-visible IP.
+   Future ADR unifies the two when there's a real reason to.
 
 ## Verification
 
@@ -811,6 +930,14 @@ M1 acceptance gates:
 - New (M1.12): `engram_session_boot_seconds{kind="warm",phase="total"}`
   p95 ≤ 1 s on the dev VM after warm pool is hot. Today's
   `kind="cold"` p95 ~25 s is the baseline this is measured against.
+- New (M1.16): `cargo test -p engram-sandbox-firecracker --test
+  netns_warm_multi_slot -- --ignored --nocapture` (CI Linux+KVM
+  job, runs as root). Provisions two warm slots from one
+  canonical snapshot; asserts each has a distinct host-side
+  reachable IP, each VM's eth0 boots to `10.200.0.2`, both can
+  reach a host-loopback fake-upstream concurrently, and traffic
+  doesn't cross between netns'es. Same test exercises teardown:
+  every netns + veth + bridge port gone after `destroy()`.
 - Manual rollout: engrams-internal with warm-pool depth N=1; 24 h soak;
   bump to N=2.
 
