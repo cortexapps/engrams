@@ -1280,79 +1280,120 @@ impl SandboxBackend for PooledBackend {
         let mut metadata = self.inner.snapshot(id).await?;
         let dest = self.inner.snapshot_path_for(metadata.id);
 
-        // Plumb the new disk manifest onto SnapshotMetadata so
-        // the coord-side snapshot recorder persists it on the
-        // `snapshots` row's `disk_manifest_*` columns.
-        #[cfg(target_os = "linux")]
-        if let Some(mref) = nbd_disk_manifest {
-            metadata.disk_manifest = Some(mref);
-        }
-        // ADR 0007 / Phase 5: when a chunk store is wired AND the
-        // underlying backend left a memory.bin in `dest` (FC does;
-        // VZ + Process don't), chunk it into the store + patch the
-        // FC snapshot manifest so the UFFD handler can resolve
-        // session-divergent pages on restore. Skipped silently when
-        // either condition isn't met — VZ + Process paths still
-        // produce valid snapshots without a memory_manifest, and
-        // FC without a chunk_store falls back to RestoreMode::File.
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return Ok(metadata);
-        };
-        let mem_path = dest.join("memory.bin");
-        if fs::metadata(&mem_path).await.is_err() {
-            return Ok(metadata);
-        }
-        let manifest_ref = chunk_memory_to_store(chunk_store, &mem_path).await?;
-        // Patch the FC sidecar JSON (`manifest.json`) so its
-        // `memory_manifest` field carries the ref the UFFD handler
-        // needs at restore time. The FC backend deserializes via
-        // serde with `#[serde(default)]`, so a JSON patch over the
-        // wire-shape stays compatible without us depending on its
-        // private struct.
-        let manifest_json = dest.join("manifest.json");
-        patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
-        metadata.memory_manifest = Some(manifest_ref);
-        tracing::info!(
-            session_sandbox = %id,
-            manifest = %manifest_ref,
-            "chunked FC memory.bin → chunk store",
-        );
+        // ADR 0014 cleanup hygiene: from here on, FC has materialised
+        // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
+        // the post-inner steps below (chunking, sidecar patch, BlobStorage
+        // upload, NBD version conflict surfaced via the caller's
+        // earlier flush) MUST rm -rf `dest` before propagating, or
+        // we leak 4 GiB per failure — idle-evict retries every ~30s
+        // and fills the host disk inside an hour.
+        let post = async {
+            // Plumb the new disk manifest onto SnapshotMetadata so
+            // the coord-side snapshot recorder persists it on the
+            // `snapshots` row's `disk_manifest_*` columns.
+            #[cfg(target_os = "linux")]
+            if let Some(mref) = nbd_disk_manifest {
+                metadata.disk_manifest = Some(mref);
+            }
+            // ADR 0007 / Phase 5: when a chunk store is wired AND the
+            // underlying backend left a memory.bin in `dest` (FC does;
+            // VZ + Process don't), chunk it into the store + patch the
+            // FC snapshot manifest so the UFFD handler can resolve
+            // session-divergent pages on restore. Skipped silently when
+            // either condition isn't met — VZ + Process paths still
+            // produce valid snapshots without a memory_manifest, and
+            // FC without a chunk_store falls back to RestoreMode::File.
+            let Some(chunk_store) = self.chunk_store.as_ref() else {
+                return Ok(metadata);
+            };
+            let mem_path = dest.join("memory.bin");
+            if fs::metadata(&mem_path).await.is_err() {
+                return Ok(metadata);
+            }
+            let manifest_ref = chunk_memory_to_store(chunk_store, &mem_path).await?;
+            // Patch the FC sidecar JSON (`manifest.json`) so its
+            // `memory_manifest` field carries the ref the UFFD handler
+            // needs at restore time. The FC backend deserializes via
+            // serde with `#[serde(default)]`, so a JSON patch over the
+            // wire-shape stays compatible without us depending on its
+            // private struct.
+            let manifest_json = dest.join("manifest.json");
+            patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
+            metadata.memory_manifest = Some(manifest_ref);
+            tracing::info!(
+                session_sandbox = %id,
+                manifest = %manifest_ref,
+                "chunked FC memory.bin → chunk store",
+            );
 
-        // ADR 0014: upload state.bin + sidecar to BlobStorage so a
-        // sibling host can restore from this snapshot. memory.bin
-        // is already chunk-stored above; state.bin and sidecar are
-        // small opaque blobs (state.bin is FC VMM+device state,
-        // sidecar is `manifest.json` carrying spec + memory_manifest
-        // + source sandbox_id). Skipped silently when state.bin is
-        // missing (defensive: should always exist after FC snapshot,
-        // but the chunked-memory path already gates on memory.bin
-        // existence for the same reason).
-        let blob = chunk_store.blob_storage();
-        let state_path = dest.join("state.bin");
-        let sidecar_path = dest.join("manifest.json");
-        if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok() {
-            let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
-            let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
-            engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
+            // ADR 0014: upload state.bin + sidecar to BlobStorage so a
+            // sibling host can restore from this snapshot. memory.bin
+            // is already chunk-stored above; state.bin and sidecar are
+            // small opaque blobs (state.bin is FC VMM+device state,
+            // sidecar is `manifest.json` carrying spec + memory_manifest
+            // + source sandbox_id). Skipped silently when state.bin is
+            // missing (defensive: should always exist after FC snapshot,
+            // but the chunked-memory path already gates on memory.bin
+            // existence for the same reason).
+            let blob = chunk_store.blob_storage();
+            let state_path = dest.join("state.bin");
+            let sidecar_path = dest.join("manifest.json");
+            if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok()
+            {
+                let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+                let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &state_key,
+                    &state_path,
+                )
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-            engram_chunk_store::snapshot_blob::upload_file(
-                blob.as_ref(),
-                &sidecar_key,
-                &sidecar_path,
-            )
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
-            metadata.state_blob_key = Some(state_key);
-            metadata.sidecar_blob_key = Some(sidecar_key);
-            metadata.source_sandbox_id = Some(id);
-            tracing::info!(
-                source_sandbox = %id,
-                snapshot_id = %metadata.id,
-                "portable snapshot artifacts uploaded to BlobStorage",
-            );
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &sidecar_key,
+                    &sidecar_path,
+                )
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+                metadata.state_blob_key = Some(state_key);
+                metadata.sidecar_blob_key = Some(sidecar_key);
+                metadata.source_sandbox_id = Some(id);
+                tracing::info!(
+                    source_sandbox = %id,
+                    snapshot_id = %metadata.id,
+                    "portable snapshot artifacts uploaded to BlobStorage",
+                );
+            }
+            Ok::<_, SandboxError>(metadata)
         }
-        Ok(metadata)
+        .await;
+
+        match post {
+            Ok(m) => Ok(m),
+            Err(e) => {
+                // ADR 0014 cleanup hygiene: rm -rf the FC-written
+                // snapshot dir before propagating. Idle-evict retry
+                // (every ~30s) without this leaks 4 GiB per try and
+                // fills the host disk inside an hour.
+                match tokio::fs::remove_dir_all(&dest).await {
+                    Ok(_) => tracing::warn!(
+                        sandbox_id = %id,
+                        dest = %dest.display(),
+                        error = %e,
+                        "PooledBackend::snapshot post-inner failed; orphan dir cleaned",
+                    ),
+                    Err(rm_err) => tracing::warn!(
+                        sandbox_id = %id,
+                        dest = %dest.display(),
+                        snapshot_error = %e,
+                        rm_error = %rm_err,
+                        "PooledBackend::snapshot post-inner failed; rm -rf of orphan dir also failed",
+                    ),
+                }
+                Err(e)
+            }
+        }
     }
 
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
