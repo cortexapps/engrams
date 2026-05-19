@@ -553,6 +553,266 @@ pub async fn teardown(setup: &NetSetup, allocator: &parking_lot::Mutex<NetworkAl
     allocator.lock().free(setup.vm_cidr);
 }
 
+// ============================================================================
+// ADR 0014 M1.16 — per-VM network namespaces for warm slots
+// ============================================================================
+//
+// Cold path: each VM owns a TAP in the host root netns with a /30
+// from the host pool; the bake's `ip=…` kernel cmdline encodes that
+// VM's specific guest IP.
+//
+// Warm path can't do that — the snapshot's `ip=…` is baked once at
+// bake time, so every restore inherits the same guest IP
+// (10.200.0.2). FC v1.10.1 forbids changing `host_dev_name` via
+// PATCH, so we can't even rebind the TAP per restore. To get N
+// concurrent warm slots, each VM runs in its own netns where the
+// bake's TAP name + guest IP are reused collision-free. A veth
+// pair plugs the netns into the host root; netns-local
+// POSTROUTING SNAT rewrites the VM's source IP (10.200.0.2) to a
+// unique-per-VM `snat_cidr.guest()` drawn from the same host-pool
+// allocator the cold path uses. The egress proxy registry indexes
+// against that unique IP, just like for cold sessions.
+
+/// Naming for the netns hosting one warm-restored VM. Resolves
+/// under `/var/run/netns/<name>` for both `ip netns exec` and a
+/// future direct `setns(2)` path.
+pub fn netns_name_for(sandbox_id: SandboxId) -> String {
+    let s = sandbox_id.to_string();
+    let prefix: String = s
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(6)
+        .collect();
+    format!("engr-vm-{prefix}")
+}
+
+/// Bind-mount path the kernel publishes per-netns. `ip netns add`
+/// creates this; opening + `setns(CLONE_NEWNET)` is how the FC
+/// child enters the namespace.
+pub fn netns_path_for(sandbox_id: SandboxId) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/var/run/netns/{}", netns_name_for(sandbox_id)))
+}
+
+/// veth pair names. Host side `vh-engr-XXXXXX`, netns side
+/// `vg-engr-XXXXXX` — both 14 chars, IFNAMSIZ-safe.
+pub fn veth_names_for(sandbox_id: SandboxId) -> (String, String) {
+    let s = sandbox_id.to_string();
+    let prefix: String = s
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(6)
+        .collect();
+    (format!("vh-engr-{prefix}"), format!("vg-engr-{prefix}"))
+}
+
+/// Per-VM netns bookkeeping. Persisted on `LiveSandbox` so
+/// `destroy()` can reverse provisioning. `host_reachable_ip()`
+/// is the value the egress proxy registry and `guest_ip()` both
+/// expose.
+#[derive(Clone, Debug)]
+pub struct NetnsSetup {
+    /// `engr-vm-<id>` — also resolves to `/var/run/netns/engr-vm-<id>`.
+    pub netns_name: String,
+    /// Host-root-side veth.
+    pub veth_host: String,
+    /// Netns-side veth.
+    pub veth_ns: String,
+    /// TAP name FC opens via `host_dev_name` in state.bin. Created
+    /// inside the netns so the bake's name doesn't collide globally.
+    pub tap_name: String,
+    /// The bake's /30 — `10.200.0.0/30` today, same in every snapshot.
+    /// `vm_cidr.guest()` is the kernel-cmdline-assigned VM IP that
+    /// every warm restore inherits. The netns's TAP terminates at
+    /// `vm_cidr.host()` so the VM's gateway ARP succeeds.
+    pub vm_cidr: VmCidr,
+    /// Per-VM SNAT slot from the host-pool allocator.
+    /// `snat_cidr.guest()` is the SNAT'd source the egress proxy
+    /// and dashboard SHELL tab both see.
+    pub snat_cidr: VmCidr,
+}
+
+impl NetnsSetup {
+    /// The host-routable IP identifying this VM from outside the
+    /// netns. Egress proxy registry indexes against this; the
+    /// shell-tab proxy dials `ws://<this>:7681/ws`.
+    pub fn host_reachable_ip(&self) -> Ipv4Addr {
+        self.snat_cidr.guest()
+    }
+}
+
+/// Provision a per-VM netns for a warm restore.
+///
+/// - Allocates a host-pool /30 for the SNAT source (released by
+///   `teardown_netns`).
+/// - `ip netns add` + veth pair + bring up `lo`, both veth sides.
+/// - Inside the netns: create the bake's TAP, terminate at
+///   `bake_cidr.host()` (the VM's expected gateway), default route
+///   via the veth-A peer endpoint.
+/// - Netns-local `iptables -t nat POSTROUTING SNAT` rewrites
+///   source `bake_cidr.guest()` → `snat_cidr.guest()` on egress.
+/// - On error, releases the SNAT slot AND best-effort deletes any
+///   partially-created netns + veth so a subsequent retry doesn't
+///   trip over a leftover.
+#[cfg(target_os = "linux")]
+pub async fn provision_netns(
+    sandbox_id: SandboxId,
+    bake_cidr: VmCidr,
+    tap_name: &str,
+    allocator: &parking_lot::Mutex<NetworkAllocator>,
+) -> Result<NetnsSetup, NetError> {
+    let snat_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
+    let res = provision_netns_inner(sandbox_id, bake_cidr, snat_cidr, tap_name).await;
+    if let Err(ref e) = res {
+        tracing::debug!(error = %e, "provision_netns failed; releasing snat slot");
+        let (veth_host, _) = veth_names_for(sandbox_id);
+        let netns = netns_name_for(sandbox_id);
+        let _ = run_cmd("ip", &["netns", "delete", &netns]).await;
+        let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
+        allocator.lock().free(snat_cidr);
+    }
+    res
+}
+
+#[cfg(target_os = "linux")]
+async fn provision_netns_inner(
+    sandbox_id: SandboxId,
+    bake_cidr: VmCidr,
+    snat_cidr: VmCidr,
+    tap_name: &str,
+) -> Result<NetnsSetup, NetError> {
+    let netns_name = netns_name_for(sandbox_id);
+    let (veth_host, veth_ns) = veth_names_for(sandbox_id);
+
+    // Idempotency: a leftover netns or veth from a prior failed
+    // provision would block the additive commands below. Best-
+    // effort cleanup first; both `delete` calls are no-ops when
+    // nothing's there.
+    let _ = run_cmd("ip", &["netns", "delete", &netns_name]).await;
+    let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
+
+    run_cmd("ip", &["netns", "add", &netns_name]).await?;
+
+    // veth pair: A in host root (gets the SNAT-slot host octet),
+    // B moved into the netns.
+    run_cmd(
+        "ip",
+        &[
+            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_ns,
+        ],
+    )
+    .await?;
+    run_cmd("ip", &["link", "set", &veth_ns, "netns", &netns_name]).await?;
+    let veth_host_addr = format!("{}/30", snat_cidr.host());
+    run_cmd("ip", &["addr", "add", &veth_host_addr, "dev", &veth_host]).await?;
+    run_cmd("ip", &["link", "set", "dev", &veth_host, "up"]).await?;
+
+    // Inside the netns: loopback up, veth-B up + addressed at
+    // snat_cidr.guest, TAP created + addressed at bake_cidr.host
+    // (the VM's gateway), default route via veth-A peer.
+    let veth_ns_addr = format!("{}/30", snat_cidr.guest());
+    run_ip_in_netns(&netns_name, &["link", "set", "lo", "up"]).await?;
+    run_ip_in_netns(
+        &netns_name,
+        &["addr", "add", &veth_ns_addr, "dev", &veth_ns],
+    )
+    .await?;
+    run_ip_in_netns(&netns_name, &["link", "set", "dev", &veth_ns, "up"]).await?;
+    run_ip_in_netns(&netns_name, &["tuntap", "add", tap_name, "mode", "tap"]).await?;
+    let tap_addr = format!("{}/30", bake_cidr.host());
+    run_ip_in_netns(&netns_name, &["addr", "add", &tap_addr, "dev", tap_name]).await?;
+    run_ip_in_netns(&netns_name, &["link", "set", "dev", tap_name, "up"]).await?;
+    let snat_host = snat_cidr.host().to_string();
+    run_ip_in_netns(&netns_name, &["route", "add", "default", "via", &snat_host]).await?;
+
+    // Netns-local SNAT. Rewrites every outbound packet's source
+    // from `bake_cidr.guest()` (the VM's baked-in eth0 IP) to
+    // `snat_cidr.guest()` (this netns's unique pool slot). After
+    // SNAT the packet reaches host-root iptables (PREROUTING
+    // REDIRECT, MASQUERADE, etc.) carrying the unique source —
+    // the egress proxy registry can then map it back to this
+    // specific session.
+    let snat_guest = snat_cidr.guest().to_string();
+    run_iptables_in_netns(
+        &netns_name,
+        &[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-o",
+            &veth_ns,
+            "-j",
+            "SNAT",
+            "--to-source",
+            &snat_guest,
+        ],
+    )
+    .await?;
+
+    Ok(NetnsSetup {
+        netns_name,
+        veth_host,
+        veth_ns,
+        tap_name: tap_name.to_string(),
+        vm_cidr: bake_cidr,
+        snat_cidr,
+    })
+}
+
+/// Reverse `provision_netns`. Best-effort — log + continue on each
+/// step's failure so a partially-broken state doesn't strand the
+/// snat slot.
+#[cfg(target_os = "linux")]
+pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<NetworkAllocator>) {
+    // `ip netns delete` cascades: it removes the TAP, veth-B, and
+    // the netns's iptables tables in one shot. veth-A in host root
+    // is auto-cleaned by the kernel when its peer disappears.
+    if let Err(e) = run_cmd("ip", &["netns", "delete", &setup.netns_name]).await {
+        tracing::debug!(netns = %setup.netns_name, error = %e, "netns delete failed");
+        // Fall through; veth-A may still need explicit cleanup.
+    }
+    let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
+    allocator.lock().free(setup.snat_cidr);
+}
+
+#[cfg(target_os = "linux")]
+async fn run_ip_in_netns(netns: &str, args: &[&str]) -> Result<(), NetError> {
+    let mut full = vec!["-n", netns];
+    full.extend_from_slice(args);
+    run_cmd("ip", &full).await
+}
+
+#[cfg(target_os = "linux")]
+async fn run_iptables_in_netns(netns: &str, args: &[&str]) -> Result<(), NetError> {
+    let mut full = vec!["netns", "exec", netns, "iptables"];
+    full.extend_from_slice(args);
+    run_cmd("ip", &full).await
+}
+
+// Non-Linux stubs.
+#[cfg(not(target_os = "linux"))]
+pub async fn provision_netns(
+    _sandbox_id: SandboxId,
+    _bake_cidr: VmCidr,
+    _tap_name: &str,
+    _allocator: &parking_lot::Mutex<NetworkAllocator>,
+) -> Result<NetnsSetup, NetError> {
+    Err(NetError::Spawn(
+        "provision_netns".into(),
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "FC networking is Linux-only",
+        ),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn teardown_netns(
+    _setup: &NetnsSetup,
+    _allocator: &parking_lot::Mutex<NetworkAllocator>,
+) {
+}
+
 // Non-Linux stubs.
 #[cfg(not(target_os = "linux"))]
 pub async fn host_startup(
@@ -689,6 +949,57 @@ mod tests {
         let n = tap_name_for(id());
         assert!(n.len() <= 15, "tap name {n} too long for IFNAMSIZ");
         assert!(n.starts_with("tap-engr-"));
+    }
+
+    #[test]
+    fn netns_and_veth_names_are_well_formed() {
+        let sid = id();
+        let ns = netns_name_for(sid);
+        let (vh, vg) = veth_names_for(sid);
+        assert!(ns.starts_with("engr-vm-"));
+        // netns path is what `ip netns add` publishes under.
+        assert_eq!(
+            netns_path_for(sid),
+            std::path::PathBuf::from(format!("/var/run/netns/{ns}")),
+        );
+        // Both veth names must fit IFNAMSIZ-1 (15) so the kernel
+        // accepts them; verified empirically when veth-pair create
+        // calls return EINVAL on too-long names.
+        assert!(vh.len() <= 15, "veth host {vh} too long for IFNAMSIZ");
+        assert!(vg.len() <= 15, "veth ns {vg} too long for IFNAMSIZ");
+        assert!(vh.starts_with("vh-engr-"));
+        assert!(vg.starts_with("vg-engr-"));
+        // Same sandbox_id must yield the same six-hex-char suffix on
+        // all three names so destroy can derive netns/veth names from
+        // sandbox_id alone (mirrors `tap_name_for`'s contract).
+        let tap = tap_name_for(sid);
+        let tap_suffix = &tap["tap-engr-".len()..];
+        let vh_suffix = &vh["vh-engr-".len()..];
+        let vg_suffix = &vg["vg-engr-".len()..];
+        let ns_suffix = &ns["engr-vm-".len()..];
+        assert_eq!(tap_suffix, vh_suffix);
+        assert_eq!(tap_suffix, vg_suffix);
+        assert_eq!(tap_suffix, ns_suffix);
+    }
+
+    #[test]
+    fn netns_setup_host_reachable_ip_is_snat_guest() {
+        let setup = NetnsSetup {
+            netns_name: "engr-vm-abc123".into(),
+            veth_host: "vh-engr-abc123".into(),
+            veth_ns: "vg-engr-abc123".into(),
+            tap_name: "tap-engr-abc123".into(),
+            vm_cidr: VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap()),
+            snat_cidr: VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap()),
+        };
+        // Egress proxy registry indexes here; the dashboard SHELL
+        // tab dials `ws://<this>:7681/ws`. Every warm VM has the
+        // same `vm_cidr.guest()` (10.200.0.2) inside, but a
+        // unique `snat_cidr.guest()` on the host-visible side.
+        assert_eq!(
+            setup.host_reachable_ip(),
+            Ipv4Addr::from_str("10.200.0.6").unwrap()
+        );
     }
 
     #[test]
