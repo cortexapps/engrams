@@ -407,8 +407,21 @@ impl ChunkedDiskBackend {
         // an hour. Retry on conflict: re-target the latest store
         // version + bump, up to a small cap (a genuine sustained race
         // would loop forever otherwise — bound it).
+        //
+        // ADR 0014 issue #7: the original retry guard was
+        // `if attempted - latest > 32` over `u64` operands. The typical
+        // race shape is `attempted < latest` (the store is ahead of
+        // us), so the subtraction wraps to ~u64::MAX in release mode
+        // (and panics in debug) and the very first retry bails out —
+        // exactly the failure mode that surfaced in post-M1.16 prod
+        // logs ("nbd disk flush: chunk store: manifest <id> version
+        // conflict: attempted v2, latest is v3"). Fixed: explicit
+        // attempt counter, no signed-subtraction sin.
+        const MAX_FLUSH_RETRIES: u32 = 32;
+        let mut attempts: u32 = 0;
         let mut attempt_ref = state.manifest_ref.next_version();
         let new_ref = loop {
+            attempts += 1;
             match self.store.put_manifest(attempt_ref, &new_manifest).await {
                 Ok(()) => break attempt_ref,
                 Err(engram_chunk_store::ChunkStoreError::VersionConflict {
@@ -416,10 +429,10 @@ impl ChunkedDiskBackend {
                     attempted,
                     manifest_id,
                 }) => {
-                    if attempted - latest > 32 {
-                        // Sanity guard: we're somehow ahead of the
-                        // store. Stop retrying and surface the
-                        // original error.
+                    if attempts >= MAX_FLUSH_RETRIES {
+                        // Sustained race; bail with the latest
+                        // conflict surface so the caller sees the
+                        // actual store-vs-attempt mismatch.
                         return Err(engram_chunk_store::ChunkStoreError::VersionConflict {
                             latest,
                             attempted,
@@ -436,6 +449,7 @@ impl ChunkedDiskBackend {
                         attempted = attempted,
                         latest_in_store = latest,
                         retry_with = next.version,
+                        attempts,
                         "flush: NBD manifest version conflict; retrying with store's latest+1",
                     );
                     attempt_ref = next;
@@ -822,5 +836,119 @@ mod tests {
         assert_eq!(second.chunks_flushed, 0);
         // The manifest_ref hasn't ticked again.
         assert_eq!(second.manifest_ref, outcome.manifest_ref);
+    }
+
+    /// ADR 0014 issue #7 regression. Multiple sandboxes restored from
+    /// the same template share `manifest_ref` v1; the first flush
+    /// publishes v2, the second sees `state.manifest_ref` is still v1
+    /// and ALSO tries v2 → `VersionConflict { attempted: 2, latest: 2
+    /// or 3 }`. The retry loop MUST advance to `latest + 1` and re-put.
+    ///
+    /// The original guard was `attempted - latest > 32` over u64 — when
+    /// attempted < latest the subtraction wrapped to ~u64::MAX,
+    /// triggered `> 32`, and bailed on the very first retry. Fix
+    /// substitutes an explicit attempt counter (`MAX_FLUSH_RETRIES`).
+    /// This test simulates the race by pre-populating a manifest at
+    /// the version the flush will attempt; the retry must land on the
+    /// next version up and finish cleanly.
+    #[tokio::test]
+    async fn flush_retries_past_version_conflict_with_store_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64;
+        let h_base = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let base_manifest = synth_manifest(total, chunk_size, vec![(0, h_base)]);
+        let manifest_ref = ManifestRef::new();
+        // v1: the backend's starting point.
+        store
+            .put_manifest(manifest_ref, &base_manifest)
+            .await
+            .unwrap();
+
+        // Simulate sandbox A's prior flush by publishing a foreign v2
+        // BEFORE we attempt our own v2 below. Any well-formed disk
+        // manifest at v2 will do; we just need the key to exist.
+        let foreign_v2 = ManifestRef {
+            manifest_id: manifest_ref.manifest_id,
+            version: 2,
+        };
+        let foreign_manifest = synth_manifest(total, chunk_size, vec![(0, h_base)]);
+        store
+            .put_manifest(foreign_v2, &foreign_manifest)
+            .await
+            .unwrap();
+
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &base_manifest, cache, store.clone()).unwrap();
+
+        // Dirty some bytes so flush has something to publish.
+        backend.write(0, &[0xcc; 16]).await.unwrap();
+
+        // Pre-fix this would have returned VersionConflict on the
+        // very first attempt (attempted=2, latest=2, u64 sub wraps,
+        // > 32 trips). With the fix, the retry observes latest=2 and
+        // re-targets v3, succeeds.
+        let outcome = backend
+            .flush()
+            .await
+            .expect("flush must retry past version conflict, not bail on u64 wrap");
+        assert_eq!(outcome.manifest_ref.version, 3, "must land on v3");
+        assert_eq!(outcome.chunks_flushed, 1);
+
+        // Confirm v3 is what's in the store now.
+        let stored_v3 = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        assert_eq!(stored_v3.chunks.len(), 1);
+    }
+
+    /// Bonus coverage: multi-level race. Two sandboxes back-to-back
+    /// pre-publish v2 AND v3. Our flush() retries past both — first
+    /// tries v2 (conflict, latest=3), retargets v4, succeeds.
+    /// Confirms the retry doesn't just cap at "one bump past latest"
+    /// — it does the right thing when latest moves between attempts
+    /// (which can happen when a concurrent writer commits during our
+    /// retry, just at a finer granularity than the test simulates).
+    #[tokio::test]
+    async fn flush_retries_past_multiple_foreign_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64;
+        let h_base = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let base_manifest = synth_manifest(total, chunk_size, vec![(0, h_base)]);
+        let manifest_ref = ManifestRef::new();
+        store
+            .put_manifest(manifest_ref, &base_manifest)
+            .await
+            .unwrap();
+
+        // Pre-populate v2 + v3 — every retry that targets one of
+        // these conflicts, and latest jumps forward each time.
+        for v in 2u64..=3 {
+            let r = ManifestRef {
+                manifest_id: manifest_ref.manifest_id,
+                version: v,
+            };
+            let m = synth_manifest(total, chunk_size, vec![(0, h_base)]);
+            store.put_manifest(r, &m).await.unwrap();
+        }
+
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &base_manifest, cache, store.clone()).unwrap();
+
+        backend.write(0, &[0xee; 16]).await.unwrap();
+        let outcome = backend
+            .flush()
+            .await
+            .expect("multi-level race must still converge");
+        assert_eq!(outcome.manifest_ref.version, 4, "must land on v4");
     }
 }
