@@ -105,3 +105,11 @@ pub const SESSIONS_ACTIVE: &str = "engram_sessions_active";
 /// `host_registry`). Should equal the count of `ready` rows in
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
+
+/// Counter. ADR 0014 issue #5: per-template refill failures
+/// reported by hosts via heartbeat. Each heartbeat carries the
+/// delta since the last drain (`WarmPool::list_slots`), so this
+/// counter sums to total failures observed since coord boot.
+/// Labels: `host_id`, `template_ref`, `error_class`
+/// (`blob_not_found` / `manifest_load` / `fc_spawn` / `other`).
+pub const WARM_POOL_REFILL_FAILURES_TOTAL: &str = "engram_warm_pool_refill_failures_total";

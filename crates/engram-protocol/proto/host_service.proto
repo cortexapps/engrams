@@ -330,4 +330,16 @@ message WarmSlotCount {
   bytes template_ref = 1; // 16-byte UUID
   uint32 available = 2;   // sandboxes currently in the free-list
   uint32 target = 3;      // current target N (autoscaler output)
+  // ADR 0014 issue #5: refill failures observed since the last
+  // heartbeat. Drained-on-read so each heartbeat reports the delta,
+  // not a cumulative count. Lets coord page on chronic failure
+  // (separate from the templates sweeper, which catches missing
+  // blob keys but not transient host-side problems like FC spawn
+  // failures or kernel resource exhaustion).
+  uint32 refill_failures_since_last = 4;
+  // Short classifier of the most recent failure: "blob_not_found",
+  // "manifest_load", "fc_spawn", or "other". Empty when
+  // refill_failures_since_last is 0. Coord scrapes both fields into
+  // `engram_warm_pool_refill_failures_total{error_class}`.
+  string last_error_class = 5;
 }

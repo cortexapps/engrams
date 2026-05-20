@@ -476,6 +476,8 @@ impl HostAgent {
                                 template_ref: s.template_ref,
                                 available: s.available,
                                 target: s.target,
+                                refill_failures_since_last: s.refill_failures_since_last,
+                                last_error_class: s.last_error_class,
                             })
                             .collect();
                     let req = coord_client::HeartbeatRequest {

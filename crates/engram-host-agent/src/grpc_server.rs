@@ -369,6 +369,8 @@ impl HostService for HostServiceImpl {
                 template_ref: s.template_ref.as_uuid().as_bytes().to_vec(),
                 available: s.available,
                 target: s.target,
+                refill_failures_since_last: s.refill_failures_since_last,
+                last_error_class: s.last_error_class,
             })
             .collect();
         Ok(Response::new(WarmSlotsResponse { slots: pb_slots }))

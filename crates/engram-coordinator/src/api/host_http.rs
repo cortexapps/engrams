@@ -257,6 +257,35 @@ pub async fn heartbeat(
         );
     }
 
+    // ADR 0014 issue #5: emit refill-failure metrics from the slot
+    // surface BEFORE the state replaces. Drain-on-host means each
+    // heartbeat carries the delta since the last drain, so the
+    // counter increments cleanly per failure.
+    for slot in &hb.warm_slots {
+        if slot.refill_failures_since_last == 0 {
+            continue;
+        }
+        let class = if slot.last_error_class.is_empty() {
+            "other"
+        } else {
+            slot.last_error_class.as_str()
+        };
+        metrics::counter!(
+            crate::metrics::WARM_POOL_REFILL_FAILURES_TOTAL,
+            "host_id" => host_id.to_string(),
+            "template_ref" => slot.template_ref.to_string(),
+            "error_class" => class.to_string(),
+        )
+        .increment(u64::from(slot.refill_failures_since_last));
+        tracing::warn!(
+            host_id = %host_id,
+            template_ref = %slot.template_ref,
+            error_class = class,
+            count = slot.refill_failures_since_last,
+            "warm-pool refill failures observed by host",
+        );
+    }
+
     // Refresh in-memory scheduler view so the next session-create
     // on this pod sees fresh capacity. NB: in the stateless-coord
     // world the in-memory host_registry is still load-bearing for

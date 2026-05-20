@@ -995,6 +995,8 @@ mod tests {
                 template_ref,
                 available,
                 target: available.max(1),
+                refill_failures_since_last: 0,
+                last_error_class: String::new(),
             }],
         }
     }

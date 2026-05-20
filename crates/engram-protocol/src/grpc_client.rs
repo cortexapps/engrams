@@ -592,6 +592,8 @@ impl GrpcHostClient {
                     ),
                     available: slot.available,
                     target: slot.target,
+                    refill_failures_since_last: slot.refill_failures_since_last,
+                    last_error_class: slot.last_error_class,
                 })
             })
             .collect()

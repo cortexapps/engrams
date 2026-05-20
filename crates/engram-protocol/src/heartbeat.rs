@@ -61,6 +61,16 @@ pub struct WarmSlotReport {
     pub available: u32,
     /// Autoscaler target N this host is keeping the pool at.
     pub target: u32,
+    /// ADR 0014 issue #5: refill failures observed since the last
+    /// heartbeat. Drained on read by `WarmPool::list_slots` so
+    /// each heartbeat reports the delta, not a cumulative count.
+    #[serde(default)]
+    pub refill_failures_since_last: u32,
+    /// Short classifier of the most recent failure
+    /// (`"blob_not_found"`, `"manifest_load"`, `"fc_spawn"`,
+    /// `"other"`). Empty when no failures since last heartbeat.
+    #[serde(default)]
+    pub last_error_class: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

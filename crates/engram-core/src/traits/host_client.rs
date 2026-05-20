@@ -63,6 +63,15 @@ pub struct WarmSlotCount {
     pub available: u32,
     /// Target N that the autoscaler is keeping the pool at.
     pub target: u32,
+    /// ADR 0014 issue #5: refill failures observed since the last
+    /// time this slot was reported. Drained on read on the host
+    /// side (`WarmPool::list_slots`) — coord emits a
+    /// `engram_warm_pool_refill_failures_total{error_class}` counter
+    /// from the drained surface.
+    pub refill_failures_since_last: u32,
+    /// Short classifier of the most recent refill failure.
+    /// Empty when no failures since last list_slots.
+    pub last_error_class: String,
 }
 
 #[async_trait]

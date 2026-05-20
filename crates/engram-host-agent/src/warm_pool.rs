@@ -132,6 +132,45 @@ struct WarmPoolInner {
     /// refill loop for `restore` and by `launch` for
     /// `start_agent` / `destroy`.
     backend: Arc<dyn SandboxBackend>,
+    /// ADR 0014 issue #5: per-template refill failure tracker. The
+    /// refill spawn increments the counter (and remembers the most
+    /// recent error class) on `backend.restore` failure;
+    /// `list_slots` drains it on each heartbeat so coord receives
+    /// the delta, not a cumulative count. Coord emits
+    /// `engram_warm_pool_refill_failures_total{host_id,template_ref,
+    /// error_class}` from the drained surface.
+    refill_failures: DashMap<TemplateRef, parking_lot::Mutex<FailureRollup>>,
+}
+
+/// In-memory rollup of refill failures since the last heartbeat
+/// drain. Captures the count and the most recent classifier.
+#[derive(Clone, Debug, Default)]
+struct FailureRollup {
+    count: u32,
+    last_class: String,
+}
+
+/// Map a `SandboxError` from `backend.restore` into a short
+/// classifier the coord-side metric labels with. Stable strings —
+/// dashboards key on these.
+///
+/// String-match on the message rather than a typed downcast because
+/// the error chains from `BlobStorage`/`ChunkStore` get flattened
+/// through `SandboxError::Vm/Snapshot(_)` and we'd lose the typed
+/// surface anyway. The labels match the strings the templates
+/// sweeper writes for the same root causes.
+fn classify_refill_error(err: &engram_core::SandboxError) -> &'static str {
+    let msg = err.to_string();
+    let m = msg.to_lowercase();
+    if m.contains("blob not found") || m.contains("no such file or directory") {
+        "blob_not_found"
+    } else if m.contains("manifest") {
+        "manifest_load"
+    } else if m.contains("firecracker") || m.contains("fc_spawn") || m.contains("spawn") {
+        "fc_spawn"
+    } else {
+        "other"
+    }
 }
 
 struct KnownTemplate {
@@ -154,6 +193,7 @@ impl WarmPool {
                 lease_history: DashMap::new(),
                 inflight_refills: DashMap::new(),
                 backend,
+                refill_failures: DashMap::new(),
             }),
         }
     }
@@ -372,6 +412,13 @@ impl WarmPool {
     /// Snapshot of per-template inventory (free-list size + target).
     /// Heartbeat (M1.7) ships this to coord; ops queries it via
     /// `ListWarmSlots`.
+    ///
+    /// ADR 0014 issue #5: also drains the per-template
+    /// `refill_failures` rollup so each heartbeat reports the delta
+    /// since the last call. Drain-on-read is the cleanest "rate over
+    /// a window" surface without per-tick math on the host — the
+    /// host accumulates between heartbeats, coord receives + zeroes
+    /// each tick.
     pub fn list_slots(&self) -> Vec<WarmSlotCount> {
         let mut out = Vec::with_capacity(self.inner.free_lists.len());
         for entry in self.inner.free_lists.iter() {
@@ -383,13 +430,60 @@ impl WarmPool {
                 .get(&template_ref)
                 .map(|t| *t)
                 .unwrap_or(FLOOR_TARGET);
+            let (refill_failures_since_last, last_error_class) =
+                self.drain_refill_failures(template_ref);
             out.push(WarmSlotCount {
                 template_ref,
                 available,
                 target,
+                refill_failures_since_last,
+                last_error_class,
+            });
+        }
+        // Templates that have ONLY produced failures and zero
+        // free-list entries deserve a heartbeat row too — otherwise
+        // a permanently-broken template's signal vanishes the moment
+        // its free-list empties.
+        for entry in self.inner.refill_failures.iter() {
+            let template_ref = *entry.key();
+            if out.iter().any(|s| s.template_ref == template_ref) {
+                continue;
+            }
+            let (refill_failures_since_last, last_error_class) =
+                self.drain_refill_failures(template_ref);
+            if refill_failures_since_last == 0 {
+                continue;
+            }
+            let target = self
+                .inner
+                .targets
+                .get(&template_ref)
+                .map(|t| *t)
+                .unwrap_or(FLOOR_TARGET);
+            out.push(WarmSlotCount {
+                template_ref,
+                available: 0,
+                target,
+                refill_failures_since_last,
+                last_error_class,
             });
         }
         out
+    }
+
+    /// Drain the per-template failure rollup and return the snapshot
+    /// fields the heartbeat ships. Resets the rollup to zero.
+    fn drain_refill_failures(&self, template_ref: TemplateRef) -> (u32, String) {
+        match self.inner.refill_failures.get(&template_ref) {
+            None => (0, String::new()),
+            Some(mu) => {
+                let mut g = mu.lock();
+                let count = g.count;
+                let class = std::mem::take(&mut g.last_class);
+                g.count = 0;
+                (count, class)
+            }
+        }
     }
 
     /// Tick called by a periodic timer (every ~5s) to:
@@ -557,9 +651,18 @@ impl WarmPool {
             let sandbox_id = match outcome {
                 Ok(id) => id,
                 Err(e) => {
+                    // ADR 0014 issue #5: classify and rollup so the
+                    // next heartbeat ships the failure delta.
+                    let class = classify_refill_error(&e);
+                    let mut entry = pool.inner.refill_failures.entry(template_ref).or_default();
+                    let mut g = entry.value_mut().lock();
+                    g.count = g.count.saturating_add(1);
+                    g.last_class = class.to_string();
+                    drop(g);
                     tracing::warn!(
                         %template_ref,
                         error = %e,
+                        error_class = class,
                         "warm_pool refill failed",
                     );
                     return;
@@ -907,5 +1010,152 @@ mod tests {
         for sid in v1_sandboxes {
             assert!(destroyed.contains(&sid), "old sandbox should be destroyed");
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ADR 0014 issue #5: refill-failure heartbeat tests.
+    // ──────────────────────────────────────────────────────────────
+
+    /// FakeBackend variant whose `restore()` always fails. The error
+    /// message lets us assert the classifier produces the expected
+    /// `error_class` label.
+    struct FailingBackend {
+        error: String,
+        restore_attempts: PMutex<u32>,
+    }
+
+    impl FailingBackend {
+        fn new(error: &str) -> Self {
+            Self {
+                error: error.into(),
+                restore_attempts: PMutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for FailingBackend {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        fn snapshot_path_for(&self, _: SnapshotId) -> std::path::PathBuf {
+            std::path::PathBuf::new()
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            *self.restore_attempts.lock() += 1;
+            Err(SandboxError::Vm(self.error.clone().into()))
+        }
+        async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    /// classify_refill_error pulls the right label out of common
+    /// error messages. Dashboards key on these strings.
+    #[test]
+    fn classify_refill_error_labels() {
+        let blob = SandboxError::Vm("blob storage: blob not found at snapshots/x".into());
+        let manifest = SandboxError::Vm("read manifest sha256:xxx version 1: ...".into());
+        let fc = SandboxError::Vm("firecracker spawn failed: ENOENT".into());
+        let other = SandboxError::Vm("something exotic".into());
+        assert_eq!(classify_refill_error(&blob), "blob_not_found");
+        assert_eq!(classify_refill_error(&manifest), "manifest_load");
+        assert_eq!(classify_refill_error(&fc), "fc_spawn");
+        assert_eq!(classify_refill_error(&other), "other");
+    }
+
+    /// Refill failures accumulate per template and surface on the
+    /// next `list_slots`. Drain-on-read: a second list_slots without
+    /// new failures returns count=0.
+    #[tokio::test]
+    async fn refill_failures_accumulate_and_drain_on_list_slots() {
+        let backend = Arc::new(FailingBackend::new(
+            "blob storage: blob not found at snapshots/abc/state.bin",
+        ));
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let (rec, meta) = template(SnapshotId::new());
+        pool.observe_templates(vec![(rec.clone(), meta.clone())])
+            .await;
+
+        // Wait for at least one refill attempt (the FLOOR_TARGET=1
+        // path fires immediately on observe).
+        assert!(
+            wait_for(
+                || *backend.restore_attempts.lock() >= 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "at least one refill attempt must occur",
+        );
+
+        // First list_slots: count >= 1, class = blob_not_found.
+        let slots = pool.list_slots();
+        let entry = slots
+            .iter()
+            .find(|s| s.template_ref == rec.template_ref)
+            .expect("refill_failures must surface even with empty free-list");
+        assert!(
+            entry.refill_failures_since_last >= 1,
+            "expected >= 1 failure, got {}",
+            entry.refill_failures_since_last
+        );
+        assert_eq!(entry.last_error_class, "blob_not_found");
+
+        // Second list_slots without any new failure happening: the
+        // counter must have been drained.
+        let slots = pool.list_slots();
+        let entry = slots
+            .iter()
+            .find(|s| s.template_ref == rec.template_ref)
+            // The template may or may not still surface depending on
+            // gc_tick + refill timing; only assert if it does that
+            // the count is 0.
+            .map(|s| (s.refill_failures_since_last, s.last_error_class.clone()));
+        if let Some((count, class)) = entry {
+            assert_eq!(count, 0, "second list_slots must drain to zero");
+            assert!(class.is_empty(), "class drained to empty");
+        }
+    }
+
+    /// Successful refill does NOT increment the failure counter
+    /// (regression guard against accidentally counting every spawn).
+    #[tokio::test]
+    async fn successful_refill_does_not_increment_failure_counter() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let (rec, meta) = template(SnapshotId::new());
+        pool.observe_templates(vec![(rec.clone(), meta.clone())])
+            .await;
+        assert!(
+            wait_for(
+                || *backend.restore_count.lock() >= FLOOR_TARGET,
+                Duration::from_secs(2),
+            )
+            .await,
+            "refill must run",
+        );
+        let slots = pool.list_slots();
+        let entry = slots
+            .iter()
+            .find(|s| s.template_ref == rec.template_ref)
+            .expect("free-list entry exists");
+        assert_eq!(entry.refill_failures_since_last, 0);
+        assert!(entry.last_error_class.is_empty());
     }
 }
