@@ -82,52 +82,52 @@ pub async fn enable_image(
     // refill — a templates row pointing at a snapshot whose chunks
     // aren't in BlobStorage is the regression we just fixed.
     if let Some(snapshot) = bundle_canonical_snapshot {
-        let materialized = materialize_template_artifacts(&state, snapshot, &artifacts).await;
-        match materialized {
-            Ok(snapshot) => {
-                match cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await {
-                    Ok(template_ref) => {
-                        // ADR 0014 M1.11: block until at least one
-                        // host has a warm slot for this template, so
-                        // the operator's next session-create lands
-                        // sub-second instead of falling through to
-                        // cold-create. Budget capped at 25 s; on
-                        // timeout the image is still enabled and the
-                        // pool will fill on subsequent heartbeats.
-                        match wait_for_first_warm_slot(&state, template_ref).await {
-                            Ok(elapsed) => tracing::info!(
-                                image_uri = %req.image_uri,
-                                elapsed_ms = elapsed.as_millis() as u64,
-                                "warm pool ready on at least one host; enable returning",
-                            ),
-                            Err(elapsed) => tracing::warn!(
-                                image_uri = %req.image_uri,
-                                elapsed_ms = elapsed.as_millis() as u64,
-                                "timed out waiting for first warm slot; \
-                                 image is enabled but next session may go cold",
-                            ),
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        image_uri = %req.image_uri,
-                        error = %e,
-                        "enabled image; templates cascade failed after materialization \
-                         (warm pool will not fire for this image)",
-                    ),
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
+        match materialize_and_cascade(&state, &req.image_uri, &manifest, snapshot, &artifacts).await
+        {
+            Ok(template_ref) => match wait_for_first_warm_slot(&state, template_ref).await {
+                Ok(elapsed) => tracing::info!(
                     image_uri = %req.image_uri,
-                    error = %e,
-                    "enabled image; OCI → BlobStorage materialization failed \
-                     (image is enabled but warm pool will not fire)",
-                );
-            }
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "warm pool ready on at least one host; enable returning",
+                ),
+                Err(elapsed) => tracing::warn!(
+                    image_uri = %req.image_uri,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "timed out waiting for first warm slot; \
+                     image is enabled but next session may go cold",
+                ),
+            },
+            Err(e) => tracing::warn!(
+                image_uri = %req.image_uri,
+                error = %e,
+                "enabled image; warm-pool cascade aborted \
+                 (image is enabled but warm pool will not fire for this image)",
+            ),
         }
     }
 
     Ok((StatusCode::CREATED, Json(EnabledImageSummary::from(row))))
+}
+
+/// ADR 0014 issue #3: enforce the cascade pipeline as a single
+/// fail-fast pipeline — materialize (strict), verify, cascade. Any
+/// failure aborts before writing PG rows so we can't end up with a
+/// templates row pointing at blob keys that never landed.
+async fn materialize_and_cascade(
+    state: &SharedState,
+    image_uri: &str,
+    manifest: &ImageManifest,
+    snapshot: SnapshotMetadata,
+    artifacts: &engram_oci::TemplateArtifacts,
+) -> Result<TemplateRef, ApiError> {
+    let snapshot = materialize_template_artifacts(state, snapshot, artifacts).await?;
+    verify_snapshot_blobs(
+        state.services.blob.as_ref(),
+        &state.services.chunk_store,
+        &snapshot,
+    )
+    .await?;
+    cascade_into_templates(state, image_uri, manifest, snapshot).await
 }
 
 pub async fn list_enabled_images(
@@ -182,39 +182,26 @@ pub async fn refresh_enabled_image(
     // Content-addressed chunks dedup against the prior bake
     // automatically — only genuinely new bytes hit the wire.
     if let Some(snapshot) = bundle_canonical_snapshot {
-        let materialized = materialize_template_artifacts(&state, snapshot, &artifacts).await;
-        match materialized {
-            Ok(snapshot) => {
-                match cascade_into_templates(&state, &req.image_uri, &manifest, snapshot).await {
-                    Ok(template_ref) => {
-                        match wait_for_first_warm_slot(&state, template_ref).await {
-                            Ok(elapsed) => tracing::info!(
-                                image_uri = %req.image_uri,
-                                elapsed_ms = elapsed.as_millis() as u64,
-                                "warm pool ready on at least one host; refresh returning",
-                            ),
-                            Err(elapsed) => tracing::warn!(
-                                image_uri = %req.image_uri,
-                                elapsed_ms = elapsed.as_millis() as u64,
-                                "timed out waiting for first warm slot on refresh",
-                            ),
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        image_uri = %req.image_uri,
-                        error = %e,
-                        "refreshed image; templates cascade failed (warm pool will not refill new snapshot)",
-                    ),
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
+        match materialize_and_cascade(&state, &req.image_uri, &manifest, snapshot, &artifacts).await
+        {
+            Ok(template_ref) => match wait_for_first_warm_slot(&state, template_ref).await {
+                Ok(elapsed) => tracing::info!(
                     image_uri = %req.image_uri,
-                    error = %e,
-                    "refreshed image; OCI → BlobStorage materialization failed \
-                     (warm pool will not refill new snapshot)",
-                );
-            }
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "warm pool ready on at least one host; refresh returning",
+                ),
+                Err(elapsed) => tracing::warn!(
+                    image_uri = %req.image_uri,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "timed out waiting for first warm slot on refresh",
+                ),
+            },
+            Err(e) => tracing::warn!(
+                image_uri = %req.image_uri,
+                error = %e,
+                "refreshed image; warm-pool cascade aborted (warm pool \
+                 will not refill new snapshot)",
+            ),
         }
     }
 
@@ -429,17 +416,92 @@ async fn materialize_chunk_blob(
     Ok((written, deduped))
 }
 
+/// ADR 0014 issue #3 layer 1: pure preflight that decides whether
+/// the OCI artifact is rich enough to support the snapshot it
+/// declares. Pure (no I/O) so it can be unit-tested directly.
+///
+/// Required when the bundle declares a `canonical_snapshot`:
+/// - `snapshot_state` (state.bin) and `snapshot_sidecar_json`
+///   (sidecar.json) are always required for M1.11+ artifacts.
+/// - If `snapshot.memory_manifest.is_some()` → both the memory
+///   bootstrap json and the memory chunks blob must be present.
+/// - If `snapshot.disk_manifest.is_some()` → same for disk.
+///
+/// `working_set.json` stays optional (M1.13-and-older predate it).
+fn check_required_template_layers(
+    snapshot: &SnapshotMetadata,
+    artifacts: &engram_oci::TemplateArtifacts,
+) -> Result<(), ApiError> {
+    if artifacts.snapshot_state.is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "bundle declares canonical_snapshot for snapshot_id={} \
+             but OCI artifact is missing the state.bin layer; \
+             rebake the image so the snapshot is portable",
+            snapshot.id
+        )));
+    }
+    if artifacts.snapshot_sidecar_json.is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "bundle declares canonical_snapshot for snapshot_id={} \
+             but OCI artifact is missing the sidecar.json layer; \
+             rebake the image so the snapshot is portable",
+            snapshot.id
+        )));
+    }
+    if snapshot.memory_manifest.is_some()
+        && (artifacts.memory_bootstrap_json.is_none() || artifacts.memory_chunks_blob.is_none())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "snapshot {} declares memory_manifest but OCI artifact is \
+             missing the memory bootstrap/chunks layers; rebake the image \
+             so memory chunks materialize cleanly",
+            snapshot.id
+        )));
+    }
+    if snapshot.disk_manifest.is_some()
+        && (artifacts.disk_bootstrap_json.is_none() || artifacts.disk_chunks_blob.is_none())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "snapshot {} declares disk_manifest but OCI artifact is \
+             missing the disk bootstrap/chunks layers; rebake the image \
+             so disk chunks materialize cleanly",
+            snapshot.id
+        )));
+    }
+    Ok(())
+}
+
 /// ADR 0014 M1.11: materialize the bake's OCI artifact into the
 /// deployment's BlobStorage so prod host-agents can restore the
-/// template by canonical key. Three pieces land in the store:
+/// template by canonical key. Four pieces land in the store:
 ///   1. memory chunks (via `materialize_chunk_blob` with the
 ///      memory bootstrap + chunks layer)
-///   2. state.bin → BlobStorage at `state_blob_key(snapshot_id)`
-///   3. sidecar.json → BlobStorage at `sidecar_blob_key(snapshot_id)`
+///   2. disk chunks (same shape, when the bake captured them)
+///   3. state.bin → BlobStorage at `state_blob_key(snapshot_id)`
+///   4. sidecar.json → BlobStorage at `sidecar_blob_key(snapshot_id)`
+///   5. (optional) working_set.json — only present on M1.14+ bakes
 ///
 /// Returns the updated `SnapshotMetadata` with the canonical
 /// state/sidecar keys stamped on so the snapshots row reflects
 /// where the bytes actually live.
+///
+/// **Strict mode (ADR 0014 issue #3 root cause).** When the bundle
+/// declares a `canonical_snapshot` we *require* the artifact to carry
+/// every layer the snapshot metadata references — silently skipping
+/// a missing layer used to leave the templates row pointing at
+/// non-existent blob keys (the host derives keys deterministically
+/// from snapshot_id and 404s on lookup). Required layers:
+///
+/// - Always: `snapshot_state` + `snapshot_sidecar_json`. Their absence
+///   is a bake bug for any M1.11+ artifact.
+/// - If `snapshot.memory_manifest.is_some()`: both
+///   `memory_bootstrap_json` and `memory_chunks_blob`.
+/// - If `snapshot.disk_manifest.is_some()`: both `disk_bootstrap_json`
+///   and `disk_chunks_blob`.
+///
+/// `working_set.json` stays optional — M1.13-or-older templates
+/// predate it and the warm-pool prefetch falls back to
+/// eager-everything in its absence (per M1.13/M1.14 in the ADR).
 async fn materialize_template_artifacts(
     state: &SharedState,
     mut snapshot: SnapshotMetadata,
@@ -447,11 +509,14 @@ async fn materialize_template_artifacts(
 ) -> Result<SnapshotMetadata, ApiError> {
     let blob = state.services.blob.clone();
 
-    // Memory chunks + manifest. Only fires when the bake actually
-    // captured canonical memory (both `memory_bootstrap_json` and
-    // `memory_chunks_blob` must be present, paired by push-side
-    // symmetry check). Without these, the snapshot is "metadata
-    // only" — restorable from rootfs but with no memory dedup.
+    // Pre-flight strictness: refuse to materialize when the artifact
+    // is missing a required layer for the snapshot it claims to
+    // describe (ADR 0014 issue #3 root cause).
+    check_required_template_layers(&snapshot, artifacts)?;
+
+    // Memory chunks + manifest. Strict-mode gate above already
+    // verified the layers are present when memory_manifest is set;
+    // the destructure here just unwraps in lockstep.
     if let (Some(boot), Some(blob_bytes), Some(mref)) = (
         artifacts.memory_bootstrap_json.as_deref(),
         artifacts.memory_chunks_blob.as_deref(),
@@ -474,12 +539,7 @@ async fn materialize_template_artifacts(
         );
     }
 
-    // Disk chunks + manifest. Same shape as memory; `disk_manifest`
-    // is the ref the host's NBD daemon / materialize-to-file path
-    // queries. Without this, the cold-create path falls back to
-    // pulling the rootfs.ext4 layer (slow), or to on-fault Range-GET
-    // against the OCI artifact (works but reaches back to the
-    // registry every miss).
+    // Disk chunks + manifest. Same shape as memory.
     if let (Some(boot), Some(blob_bytes), Some(mref)) = (
         artifacts.disk_bootstrap_json.as_deref(),
         artifacts.disk_chunks_blob.as_deref(),
@@ -502,7 +562,7 @@ async fn materialize_template_artifacts(
         );
     }
 
-    // state.bin
+    // state.bin (required; strict-mode gate above ensures Some).
     if let Some(bytes) = artifacts.snapshot_state.as_deref() {
         let key = engram_chunk_store::snapshot_blob::state_blob_key(snapshot.id);
         // dedup probe is cheap; same content at the same key from a
@@ -519,7 +579,7 @@ async fn materialize_template_artifacts(
         snapshot.state_blob_key = Some(key);
     }
 
-    // sidecar.json
+    // sidecar.json (required; strict-mode gate above ensures Some).
     if let Some(bytes) = artifacts.snapshot_sidecar_json.as_deref() {
         let key = engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot.id);
         if !blob
@@ -534,10 +594,9 @@ async fn materialize_template_artifacts(
         snapshot.sidecar_blob_key = Some(key);
     }
 
-    // ADR 0014 M1.14: working_set.json — same shape as state.bin
-    // and sidecar. Pooled_backend reads `metadata.working_set_blob_key`
-    // and prefetches just the listed chunks instead of the full
-    // manifest; absent layer → fall back to full-manifest prefetch.
+    // ADR 0014 M1.14: working_set.json — optional; older bakes
+    // (pre-M1.14) don't include it and the host's prefetch falls
+    // back to eager-everything when the key is absent.
     if let Some(bytes) = artifacts.snapshot_working_set_json.as_deref() {
         let key = engram_chunk_store::snapshot_blob::working_set_blob_key(snapshot.id);
         if !blob
@@ -553,6 +612,74 @@ async fn materialize_template_artifacts(
     }
 
     Ok(snapshot)
+}
+
+/// ADR 0014 issue #3 layer 2: after materialize, HEAD-verify every
+/// blob key the host will dereference at warm-pool refill time.
+/// Belt-and-suspenders against (a) any future regression of
+/// [`materialize_template_artifacts`]'s strictness contract, and
+/// (b) blobs being evicted between materialize and cascade by an
+/// unrelated GC / operator action.
+///
+/// The host derives blob keys deterministically from `snapshot_id`
+/// (via [`engram_chunk_store::snapshot_blob`]); the snapshot record
+/// in PG doesn't persist `state_blob_key` etc., so the source of
+/// truth for "do these blobs exist" is BlobStorage itself.
+async fn verify_snapshot_blobs(
+    blob: &dyn engram_core::traits::BlobStorage,
+    chunk_store: &engram_chunk_store::ChunkStore,
+    snapshot: &SnapshotMetadata,
+) -> Result<(), ApiError> {
+    let must_exist = |scope: &'static str, key: String| async move {
+        let key_for_err = key.clone();
+        match blob.exists(&key).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ApiError::Internal(format!(
+                "verify_snapshot_blobs: {scope} missing at {key_for_err}; \
+                 cascade refusing to write templates row that would \
+                 break warm-pool refill"
+            ))),
+            Err(e) => Err(ApiError::Internal(format!(
+                "verify_snapshot_blobs: {scope} probe failed at {key_for_err}: {e}"
+            ))),
+        }
+    };
+
+    must_exist(
+        "state.bin",
+        engram_chunk_store::snapshot_blob::state_blob_key(snapshot.id),
+    )
+    .await?;
+    must_exist(
+        "sidecar.json",
+        engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot.id),
+    )
+    .await?;
+
+    if snapshot.working_set_blob_key.is_some() {
+        must_exist(
+            "working_set.json",
+            engram_chunk_store::snapshot_blob::working_set_blob_key(snapshot.id),
+        )
+        .await?;
+    }
+
+    if let Some(mref) = snapshot.memory_manifest {
+        chunk_store.get_manifest(mref).await.map_err(|e| {
+            ApiError::Internal(format!(
+                "verify_snapshot_blobs: memory manifest {mref} unreadable: {e}"
+            ))
+        })?;
+    }
+    if let Some(mref) = snapshot.disk_manifest {
+        chunk_store.get_manifest(mref).await.map_err(|e| {
+            ApiError::Internal(format!(
+                "verify_snapshot_blobs: disk manifest {mref} unreadable: {e}"
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 /// ADR 0014 M1.11: insert `snapshots` + `templates` rows from a
@@ -787,5 +914,303 @@ mod tests {
         .expect("materialize again");
         assert_eq!(wrote2, 0, "second materialize should dedup all chunks");
         assert_eq!(deduped2, 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ADR 0014 issue #3: strict materialize + HEAD verify tests.
+    // ──────────────────────────────────────────────────────────────
+
+    use engram_core::types::ids::SnapshotId;
+    use engram_oci::{Digest256, TemplateArtifacts};
+
+    fn empty_artifacts() -> TemplateArtifacts {
+        TemplateArtifacts {
+            manifest_toml: Vec::new(),
+            manifest_digest: Digest256(String::new()),
+            bundle_json: None,
+            disk_bootstrap_json: None,
+            disk_chunks_blob: None,
+            memory_bootstrap_json: None,
+            memory_chunks_blob: None,
+            snapshot_state: None,
+            snapshot_sidecar_json: None,
+            snapshot_working_set_json: None,
+        }
+    }
+
+    fn minimal_snapshot_metadata() -> SnapshotMetadata {
+        SnapshotMetadata {
+            id: SnapshotId::new(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            image_version: "test".into(),
+            disk_manifest: None,
+            memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+        }
+    }
+
+    #[test]
+    fn check_required_layers_errors_when_state_bin_missing() {
+        let snap = minimal_snapshot_metadata();
+        let mut art = empty_artifacts();
+        // sidecar present but state.bin absent
+        art.snapshot_sidecar_json = Some(b"{}".to_vec());
+        let err =
+            check_required_template_layers(&snap, &art).expect_err("missing state.bin must error");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("state.bin"),
+                "error should mention state.bin: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_required_layers_errors_when_sidecar_missing() {
+        let snap = minimal_snapshot_metadata();
+        let mut art = empty_artifacts();
+        art.snapshot_state = Some(b"state.bin bytes".to_vec());
+        let err =
+            check_required_template_layers(&snap, &art).expect_err("missing sidecar must error");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("sidecar.json"),
+                "error should mention sidecar.json: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_required_layers_errors_when_memory_manifest_set_but_memory_layer_missing() {
+        let mut snap = minimal_snapshot_metadata();
+        snap.memory_manifest = Some(ManifestRef::new());
+        let mut art = empty_artifacts();
+        art.snapshot_state = Some(b"state.bin bytes".to_vec());
+        art.snapshot_sidecar_json = Some(b"{}".to_vec());
+        // Memory bootstrap present but chunks blob missing —
+        // still an asymmetric/incomplete artifact, must reject.
+        art.memory_bootstrap_json = Some(b"{}".to_vec());
+        let err = check_required_template_layers(&snap, &art)
+            .expect_err("memory_manifest declared but memory layers missing must error");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("memory"),
+                "error should mention memory layer: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_required_layers_errors_when_disk_manifest_set_but_disk_layer_missing() {
+        let mut snap = minimal_snapshot_metadata();
+        snap.disk_manifest = Some(ManifestRef::new());
+        let mut art = empty_artifacts();
+        art.snapshot_state = Some(b"state.bin bytes".to_vec());
+        art.snapshot_sidecar_json = Some(b"{}".to_vec());
+        // Disk chunks blob present but bootstrap missing — asymmetric.
+        art.disk_chunks_blob = Some(b"chunks bytes".to_vec());
+        let err = check_required_template_layers(&snap, &art)
+            .expect_err("disk_manifest declared but disk layers missing must error");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("disk"),
+                "error should mention disk layer: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_required_layers_ok_when_minimum_present() {
+        // Snapshot declares no manifests → only state.bin + sidecar
+        // are required. working_set.json stays optional.
+        let snap = minimal_snapshot_metadata();
+        let mut art = empty_artifacts();
+        art.snapshot_state = Some(b"state.bin bytes".to_vec());
+        art.snapshot_sidecar_json = Some(b"{}".to_vec());
+        check_required_template_layers(&snap, &art).expect("baseline must pass");
+    }
+
+    #[test]
+    fn check_required_layers_ok_with_full_payload() {
+        let mut snap = minimal_snapshot_metadata();
+        snap.memory_manifest = Some(ManifestRef::new());
+        snap.disk_manifest = Some(ManifestRef::new());
+        let mut art = empty_artifacts();
+        art.snapshot_state = Some(b"state.bin bytes".to_vec());
+        art.snapshot_sidecar_json = Some(b"{}".to_vec());
+        art.memory_bootstrap_json = Some(b"{}".to_vec());
+        art.memory_chunks_blob = Some(b"chunks".to_vec());
+        art.disk_bootstrap_json = Some(b"{}".to_vec());
+        art.disk_chunks_blob = Some(b"chunks".to_vec());
+        art.snapshot_working_set_json = Some(b"{}".to_vec());
+        check_required_template_layers(&snap, &art).expect("full payload must pass");
+    }
+
+    // ───── verify_snapshot_blobs HEAD-check tests ─────
+
+    #[tokio::test]
+    async fn verify_snapshot_blobs_errors_on_missing_state_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let snap = minimal_snapshot_metadata();
+        let err = verify_snapshot_blobs(blob.as_ref(), &chunk_store, &snap)
+            .await
+            .expect_err("missing state blob must surface");
+        match err {
+            ApiError::Internal(msg) => assert!(
+                msg.contains("state.bin"),
+                "error should name state.bin: {msg}"
+            ),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_snapshot_blobs_ok_when_state_and_sidecar_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let snap = minimal_snapshot_metadata();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(snap.id),
+            bytes::Bytes::from_static(b"state"),
+        )
+        .await
+        .unwrap();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::sidecar_blob_key(snap.id),
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .await
+        .unwrap();
+        verify_snapshot_blobs(blob.as_ref(), &chunk_store, &snap)
+            .await
+            .expect("verify must pass when both blobs exist");
+    }
+
+    #[tokio::test]
+    async fn verify_snapshot_blobs_errors_on_missing_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let snap = minimal_snapshot_metadata();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(snap.id),
+            bytes::Bytes::from_static(b"state"),
+        )
+        .await
+        .unwrap();
+        let err = verify_snapshot_blobs(blob.as_ref(), &chunk_store, &snap)
+            .await
+            .expect_err("missing sidecar blob must surface");
+        match err {
+            ApiError::Internal(msg) => assert!(
+                msg.contains("sidecar"),
+                "error should name sidecar.json: {msg}"
+            ),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_snapshot_blobs_ok_when_working_set_key_unset() {
+        // M1.13-and-older templates have no working_set_blob_key; the
+        // verify path must not probe a key that was never declared.
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let snap = minimal_snapshot_metadata();
+        // working_set_blob_key stays None
+        assert!(snap.working_set_blob_key.is_none());
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(snap.id),
+            bytes::Bytes::from_static(b"state"),
+        )
+        .await
+        .unwrap();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::sidecar_blob_key(snap.id),
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .await
+        .unwrap();
+        verify_snapshot_blobs(blob.as_ref(), &chunk_store, &snap)
+            .await
+            .expect("verify must pass when working_set is intentionally absent");
+    }
+
+    #[tokio::test]
+    async fn verify_snapshot_blobs_errors_when_declared_working_set_missing() {
+        // If the snapshot record carries a working_set_blob_key (M1.14+),
+        // the verify path must HEAD-probe it. A missing key fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let mut snap = minimal_snapshot_metadata();
+        snap.working_set_blob_key = Some(format!("snapshots/{}/working_set.json", snap.id));
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(snap.id),
+            bytes::Bytes::from_static(b"state"),
+        )
+        .await
+        .unwrap();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::sidecar_blob_key(snap.id),
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .await
+        .unwrap();
+        let err = verify_snapshot_blobs(blob.as_ref(), &chunk_store, &snap)
+            .await
+            .expect_err("declared but absent working_set must surface");
+        match err {
+            ApiError::Internal(msg) => assert!(
+                msg.contains("working_set"),
+                "error should name working_set.json: {msg}"
+            ),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_snapshot_blobs_errors_when_memory_manifest_absent_in_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let mut snap = minimal_snapshot_metadata();
+        snap.memory_manifest = Some(ManifestRef::new());
+        // state + sidecar present so we reach the manifest check.
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(snap.id),
+            bytes::Bytes::from_static(b"state"),
+        )
+        .await
+        .unwrap();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::sidecar_blob_key(snap.id),
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .await
+        .unwrap();
+        let err = verify_snapshot_blobs(blob.as_ref(), &chunk_store, &snap)
+            .await
+            .expect_err("missing manifest in chunk store must surface");
+        match err {
+            ApiError::Internal(msg) => assert!(
+                msg.contains("memory manifest"),
+                "error should name memory manifest: {msg}"
+            ),
+            other => panic!("expected Internal, got {other:?}"),
+        }
     }
 }
