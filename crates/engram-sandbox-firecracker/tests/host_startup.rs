@@ -130,3 +130,65 @@ async fn host_startup_with_proxy_adds_redirect_and_default_deny() {
 
     cleanup();
 }
+
+/// ADR 0014 issue #6 follow-up. The new ESTABLISHED,RELATED ACCEPT
+/// must land in iptables-save with the conntrack module loaded,
+/// matching the pool source, and ordered before the engram-host-input
+/// DROP. Without ordering, host-initiated TCP flows (proxy_shell ↔
+/// ttyd) lose their return SYN+ACK to the blanket DROP and time out
+/// — exactly the prod failure observed on session 379abfec.
+///
+/// This is the live-iptables counterpart to the
+/// `host_startup_accepts_established_input_before_drop` unit test in
+/// src/net.rs — that one asserts the rule string is generated; this
+/// one asserts the kernel actually installed it.
+#[tokio::test]
+#[ignore = "requires Linux + root (CAP_NET_ADMIN); run with sudo on the dev VM"]
+async fn host_startup_installs_established_accept_before_host_input_drop() {
+    if !require_root() {
+        return;
+    }
+    cleanup();
+
+    host_startup(Some(9443), Some(5353))
+        .await
+        .expect("host_startup");
+
+    let dump = iptables_save();
+    // The new rule lands with its comment tag and the conntrack match.
+    let est_line = dump
+        .lines()
+        .find(|l| l.contains("engram-host-input-established"))
+        .expect("ESTABLISHED ACCEPT rule must be present after host_startup");
+    assert!(
+        est_line.contains("ESTABLISHED,RELATED") || est_line.contains("RELATED,ESTABLISHED"),
+        "rule must use conntrack ESTABLISHED,RELATED state match; got: {est_line}"
+    );
+    assert!(
+        est_line.contains("ACCEPT"),
+        "rule must ACCEPT (not DROP); got: {est_line}"
+    );
+
+    // Ordering: ESTABLISHED ACCEPT before the blanket
+    // engram-host-input DROP in the filter table. iptables-save emits
+    // rules in chain order, so find the indices of the two lines and
+    // assert the ACCEPT precedes the DROP.
+    let est_idx = dump
+        .lines()
+        .position(|l| l.contains("engram-host-input-established"))
+        .expect("established line position");
+    let drop_idx = dump
+        .lines()
+        .position(|l| {
+            (l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input"))
+                && l.contains("DROP")
+        })
+        .expect("host-input DROP line position");
+    assert!(
+        est_idx < drop_idx,
+        "ESTABLISHED,RELATED ACCEPT must precede engram-host-input DROP \
+         in iptables-save; ACCEPT idx={est_idx}, DROP idx={drop_idx}",
+    );
+
+    cleanup();
+}
