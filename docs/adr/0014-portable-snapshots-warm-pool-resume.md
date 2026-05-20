@@ -1176,6 +1176,108 @@ follow-up; ordering reflects rough priority (highest first).
    to prefer Cloud Logging over SSH+`journalctl`, killing
    the sudo dependency for host-side log access.
 
+### Pointers for the next session
+
+Where to start in code, ordered by issue:
+
+- **#1 + #2 (idle-evict orphan dirs / `SnapshotId::new()`).**
+  - Host's idle-evict caller: `crates/engram-host-agent/src/idle_evictor.rs` (the timer + push-candidate-to-coord loop) and the gRPC handler that coord invokes for the actual eviction (search `IdleEvictSandbox` or `evict_idle_sandbox` in `engram-host-agent/src/grpc_server.rs`).
+  - Coord's "host-pushed idle eviction" handler: `crates/engram-coordinator/src/api/host_http.rs`, search `host-pushed idle eviction failed`.
+  - Snapshot ID minting + path layout: `crates/engram-host-agent/src/pooled_backend.rs::snapshot`, ~line 1280 (the `metadata.id = SnapshotId::new()` line, plus the post-snapshot async block that fix #1 in commit `752aea3` wrapped). The right place to introduce the sandbox-keyed scratch path.
+  - The scratch-then-promote pattern needs to thread through `inner.snapshot_path_for(metadata.id)` callers — including FC restore (which expects the dir at `<work_dir>/sandboxes/snapshots/<snapshot_id>/`) and `BlobStorage` chunk upload (consumes the local memory.bin during streaming).
+
+- **#3 (stale `templates` rows).**
+  - Cascade entry point: `crates/engram-coordinator/src/api/enabled_images.rs::enable_image` (the `if let Some(canonical) = bundle.canonical_snapshot { … }` branch added in M1.11). Add a `state.services.blob.head(blob_key)` pre-check before `record_snapshot` + `upsert_template` fire.
+  - `record_snapshot` schema: `crates/engram-postgres/src/lib.rs`, search `record_snapshot` (~line 561) and `upsert_template` (~line 443) for the actual SQL.
+  - Coord-side sweeper: new module under `crates/engram-coordinator/src/` (similar shape to `chunk_gc.rs`); runs periodically, walks `templates WHERE active=true`, calls `blob.head()` on each row's snapshot blob keys, marks `active=false` (or deletes) rows whose blobs are missing.
+  - Current stale templates query (run from prod-ops):
+    ```sql
+    select template_ref, image_repo, image_tag, snapshot_id, active
+    from templates where active = true;
+    -- then per snapshot_id, join `snapshots` and read `state_blob_key`,
+    -- `sidecar_blob_key`, `memory_manifest_id`. Verify each exists in
+    -- GCS via `gsutil ls gs://<bucket>/<key>`.
+    ```
+
+- **#4 (disk-pressure floor).**
+  - Host-agent's idle-evict timer is the right place to gate.
+    `statvfs(work_dir)` is one syscall; gate the next iteration
+    on free bytes > N × max-expected-memory.bin-size.
+  - Metric: add `engram_host_disk_free_bytes` gauge alongside
+    the existing host-agent Prometheus registry.
+
+- **#5 (refill-failure heartbeat field).**
+  - Heartbeat proto: `crates/engram-protocol/proto/host_service.proto` `HostCapacityReport`. Add
+    a `repeated TemplateRefillFailure refill_failures` field
+    (template_ref + recent failure count + last error class).
+  - Coord-side consumer: where `host_registry::update_state`
+    processes the heartbeat — log + emit `engram_warm_pool_refill_failures_total{template_ref,host_id}`.
+
+- **#6 follow-up (`logs-host.sh`).**
+  - Skill script: `~/.claude/skills/engrams-prod-ops/scripts/logs-host.sh`. Swap the
+    `gcloud compute ssh ... sudo journalctl -u engram-host-agent` body for a `gcloud logging read` query with
+    `resource.type="gce_instance" AND jsonPayload._SYSTEMD_UNIT="engram-host-agent.service"`. Keep the SSH path as
+    `--fallback` for cases where Ops Agent hasn't shipped yet
+    (e.g., a freshly-booted VM in the first ~30 seconds).
+
+Suggested order of attack:
+
+1. **#3 first.** Until stale templates stop nudging the warm
+   pool into futile refill loops, the warm path is broken
+   end-to-end and there's nothing to verify #1/#2 against
+   (every session falls to cold-create, where the leak
+   doesn't trigger because cold-create destroys cleanly).
+   Cleanup is also a one-shot: a coord-side admin endpoint
+   that prunes templates whose blobs are missing, run once
+   against prod.
+2. **#1 + #2 together.** The scratch-by-sandbox-id pattern
+   (#2) subsumes #1; do them as one commit. After this lands,
+   re-test session-create + idle-evict cycle on prod and
+   confirm no orphan dirs accumulate in
+   `/var/lib/engram/sandboxes/snapshots/`.
+3. **#5 second-to-last.** Heartbeat surface change deserves
+   its own commit + integration test; not blocking the warm
+   path's correctness, but valuable for ops visibility.
+4. **#4 last.** Defense-in-depth backstop. Cheap to add but
+   not load-bearing if #1–#3 land cleanly.
+
+Useful Cloud Logging queries while testing:
+
+```sh
+# host-agent's warm-pool refill failure rate
+gcloud logging read 'resource.type="gce_instance" AND \
+    jsonPayload._SYSTEMD_UNIT="engram-host-agent.service" AND \
+    "warm_pool refill failed"' \
+    --project=cortex-internal-tooling --freshness=1h --order=desc
+
+# idle-evict snapshot creation events (post-fix should be near-zero)
+gcloud logging read 'resource.type="gce_instance" AND \
+    jsonPayload._SYSTEMD_UNIT="engram-host-agent.service" AND \
+    "snapshot dir" AND ("create" OR "remove")' \
+    --project=cortex-internal-tooling --freshness=1h
+
+# coord-side eviction failure rate
+gcloud logging read 'resource.labels.container_name="coordinator" AND \
+    "host-pushed idle eviction failed"' \
+    --project=cortex-internal-tooling --freshness=1h
+```
+
+Production state snapshot at the time of writing (2026-05-20 02:35 UTC):
+
+- **FC hosts**: 2 instances (`engrams-fc-pgs9`, `engrams-fc-tf4j`), both on the post-M1.16 + post-Ops-Agent image (commit `3b6aec3`), MIG converged (`isStable=True`).
+- **Coord image**: `75babf7` (the M1.16 SHA — netns work).
+- **Demo image enabled**: `ghcr.io/cortexapps/engrams-internal/demo:warm-75babf7`.
+- **Claude harness registered**: `ghcr.io/cortexapps/engrams/harness-claude:b9dd2d1` (older, pre-M1.12 wire format — works due to `#[serde(default)]` compat).
+- **Stale `templates` rows in PG**: at least 5 reference snapshot IDs `9c615e34`, `36277885`, `99ea12c7`, `1e133a3d`, `cf798a54` whose blobs are not in BlobStorage. Verify via `bash ~/.claude/skills/engrams-prod-ops/scripts/psql.sh "select template_ref, image_repo, image_tag, snapshot_id from templates where active=true"`.
+- **Last session investigated**: `b511cf9b-7356-44fc-b6b4-be859bf864d4`. Created at 2026-05-19 19:40 UTC, took 29.5 s to activate (cold-create masquerading as warm — see #3), triggered the disk-fill on the (now-gone) `engrams-fc-xngk` host via #1.
+
+Prod-ops skill scripts to lean on (all under `~/.claude/skills/engrams-prod-ops/scripts/`):
+`psql.sh`, `curl.sh`, `metrics-coord.sh`, `metrics-hosts.sh`,
+`logs-coord.sh`, `logs-host.sh`, `logs-search.sh`. See the skill's
+`SKILL.md` for usage notes — secret-hygiene rules apply
+(never `TOKEN=$(...)` into the shell; always inline at point of
+use).
+
 ## Related
 
 - ADR 0007: chunked immutable storage — provides the chunked-memory
