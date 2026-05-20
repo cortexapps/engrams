@@ -276,15 +276,14 @@ async fn connect_tcp_in_netns_linux(
         // nix 0.31 takes anything that implements AsFd — passing
         // `&File` works (File implements AsFd) and keeps both fds
         // alive across the restore call.
-        setns(&target, CloneFlags::CLONE_NEWNET)
-            .map_err(|e| format!("setns(target): {e}"))?;
+        setns(&target, CloneFlags::CLONE_NEWNET).map_err(|e| format!("setns(target): {e}"))?;
         let stream_result = std::net::TcpStream::connect(&guest_addr_clone)
             .map_err(|e| format!("connect {guest_addr_clone}: {e}"));
         // Always restore root netns, even on connect failure — the
         // blocking worker thread is reused and we mustn't leave it
         // pinned to a guest netns.
-        let restore = setns(&root, CloneFlags::CLONE_NEWNET)
-            .map_err(|e| format!("setns(root): {e}"));
+        let restore =
+            setns(&root, CloneFlags::CLONE_NEWNET).map_err(|e| format!("setns(root): {e}"));
         let stream = stream_result?;
         restore?;
         stream.set_nonblocking(true).map_err(|e| e.to_string())?;
