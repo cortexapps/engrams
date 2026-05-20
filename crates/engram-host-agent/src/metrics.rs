@@ -113,3 +113,18 @@ pub const SANDBOXES_RUNNING: &str = "engram_sandboxes_running";
 /// labelled by `cache` (`hit` / `miss`). Hit-rate gives us a read
 /// on whether chunk caching is paying off.
 pub const OCI_PULL_BYTES: &str = "engram_oci_pull_bytes";
+
+/// ADR 0014 issue #4: gauge of free disk on the host's work_dir
+/// (where snapshot dirs land). Sampled on each idle-evict tick.
+/// Drops below `ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES` → idle-evict
+/// pauses pushing candidates, the
+/// `engram_host_idle_evict_disk_pressure_holds_total` counter
+/// increments, and ops can page on the cross-over before disk fills.
+pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
+
+/// ADR 0014 issue #4: counter incremented each time the idle-evict
+/// tick observes free disk below the floor and skips pushing
+/// candidates. Sustained increments mean a snowballing snapshot
+/// writer (or some other on-disk leak) is winning the race.
+pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
+    "engram_host_idle_evict_disk_pressure_holds_total";

@@ -546,11 +546,37 @@ impl HostAgent {
             let eviction_coord = coord_client.clone();
             let idle_soft_ttl = idle_evictor::idle_ttl_from_env();
             let idle_hard_ttl = idle_evictor::idle_hard_ttl_from_env();
+            // ADR 0014 issue #4: disk-pressure floor. When free disk
+            // on the work_dir falls below this, we pause pushing
+            // idle-evict candidates — coord-side retry storms (every
+            // one of which writes ~4 GiB of FC memory dump pre-fix)
+            // can't fill the disk if we never push them. The
+            // companion fixes from #1/#2 also stop the per-retry
+            // leak; this is the defense-in-depth backstop for any
+            // future leak class we haven't anticipated.
+            let eviction_work_dir = self.cfg.work_dir.clone();
+            let eviction_floor_bytes = idle_evictor::disk_floor_bytes_from_env();
             let eviction_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(idle_evictor::DEFAULT_POLL_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
+                    let (allow, free) =
+                        idle_evictor::disk_pressure_check(&eviction_work_dir, eviction_floor_bytes);
+                    if let Some(b) = free {
+                        ::metrics::gauge!(crate::metrics::HOST_DISK_FREE_BYTES).set(b as f64);
+                    }
+                    if !allow {
+                        ::metrics::counter!(crate::metrics::IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL)
+                            .increment(1);
+                        tracing::warn!(
+                            host_id = %host_id,
+                            free_bytes = ?free,
+                            floor_bytes = eviction_floor_bytes,
+                            "idle-evict paused: disk pressure (free < floor)",
+                        );
+                        continue;
+                    }
                     let pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
                     if pairs.is_empty() {
                         continue;
