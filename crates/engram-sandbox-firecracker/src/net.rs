@@ -117,15 +117,37 @@ impl NetworkAllocator {
     /// Build an allocator over `pool/16`. Lower octets must be 0
     /// (we carve exactly one /16 — `10.200.0.0/16` is the canonical
     /// default).
+    ///
+    /// ADR 0014 M1.16: slot 0 (the `10.200.0.0/30` at the base of
+    /// the pool) is **reserved**. That slot is the bake-time CIDR
+    /// every warm-restored sandbox's snapshot embeds — the host
+    /// recreates a TAP at `10.200.0.1` inside the per-VM netns
+    /// to match the VM's baked-in default gateway. If `alloc()`
+    /// also handed slot 0 out as a SNAT slot, the veth-B inside
+    /// the netns would get assigned `10.200.0.2`, colliding with
+    /// the VM's eth0. Kernel sees `10.200.0.2` as locally hosted
+    /// and short-circuits host-agent dials to ttyd through
+    /// loopback → SHELL tab fails with EHOSTUNREACH/ECONNREFUSED.
+    /// Observed in prod on session d20c4715 (2026-05-20).
+    ///
+    /// Reserving slot 0 at construction sidesteps the collision —
+    /// SNAT slots start at slot 1 (`10.200.0.4/30`), guaranteed
+    /// disjoint from `bake_cidr`. Cold-path sandboxes also avoid
+    /// it for free (their /30 comes from the same allocator).
     pub fn new(pool: Ipv4Addr) -> Self {
         let octets = pool.octets();
         let base = u32::from_be_bytes([octets[0], octets[1], 0, 0]);
+        let mut in_use = HashSet::new();
+        // Reserve slot 0 (the bake CIDR). See ADR 0014 M1.16 above.
+        in_use.insert(0);
         Self {
             pool_base: base,
             // 16384 /30s in a /16.
             pool_size: 1 << 14,
-            next: 0,
-            in_use: HashSet::new(),
+            // Start at slot 1; slot 0 is the bake CIDR and stays
+            // permanently in `in_use`.
+            next: 1,
+            in_use,
             free: Vec::new(),
         }
     }
@@ -148,6 +170,14 @@ impl NetworkAllocator {
         let Some(slot) = self.try_slot_for_cidr(cidr) else {
             return;
         };
+        // ADR 0014 M1.16: slot 0 (the bake CIDR) is permanently
+        // reserved — silently refuse to free it so a stray
+        // `allocator.free(bake_cidr)` doesn't accidentally release
+        // the slot back into the alloc pool and reintroduce the
+        // SNAT/eth0 collision.
+        if slot == 0 {
+            return;
+        }
         if self.in_use.remove(&slot) {
             self.free.push(slot);
         }
@@ -906,14 +936,19 @@ mod tests {
 
     #[test]
     fn allocator_carves_unique_30s_in_order() {
+        // ADR 0014 M1.16: slot 0 (10.200.0.0/30) is permanently
+        // reserved as the bake CIDR, so the first alloc returns
+        // slot 1 (10.200.0.4/30). See `NetworkAllocator::new`.
         let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
         let c0 = a.alloc().unwrap();
         let c1 = a.alloc().unwrap();
         let c2 = a.alloc().unwrap();
-        assert_eq!(c0.cidr_str(), "10.200.0.0/30");
-        assert_eq!(c1.cidr_str(), "10.200.0.4/30");
-        assert_eq!(c2.cidr_str(), "10.200.0.8/30");
-        assert_eq!(a.live_count(), 3);
+        assert_eq!(c0.cidr_str(), "10.200.0.4/30");
+        assert_eq!(c1.cidr_str(), "10.200.0.8/30");
+        assert_eq!(c2.cidr_str(), "10.200.0.12/30");
+        // live_count includes the permanently-reserved bake slot
+        // plus the 3 just-allocated slots.
+        assert_eq!(a.live_count(), 4);
     }
 
     #[test]
@@ -923,33 +958,67 @@ mod tests {
         let _c1 = a.alloc().unwrap();
         a.free(c0);
         let reused = a.alloc().unwrap();
-        assert_eq!(reused.cidr_str(), "10.200.0.0/30");
+        // First non-bake slot is 10.200.0.4/30; freeing then
+        // re-allocating returns it.
+        assert_eq!(reused.cidr_str(), "10.200.0.4/30");
     }
 
     #[test]
     fn reserve_holds_specific_slot_then_rejects_dupes() {
         let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
-        let target = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
+        let target = VmCidr::new(Ipv4Addr::from_str("10.200.0.8").unwrap());
         a.reserve(target).unwrap();
         // Same slot is now taken.
         assert!(matches!(a.reserve(target), Err(AllocError::SlotTaken)));
-        // Subsequent alloc skips past the reserved slot via `next`.
+        // Subsequent alloc returns the lowest available non-reserved
+        // slot. Slot 0 is the bake CIDR (perma-reserved); slot 1
+        // (10.200.0.4/30) is free; slot 2 (10.200.0.8/30) is our
+        // explicit reservation.
         let c0 = a.alloc().unwrap();
-        assert_eq!(c0.cidr_str(), "10.200.0.0/30");
+        assert_eq!(c0.cidr_str(), "10.200.0.4/30");
         let c2 = a.alloc().unwrap();
-        // 10.200.0.4 is reserved; next alloc should be the next slot
-        // beyond `next` (which we bumped past .4).
-        assert_eq!(c2.cidr_str(), "10.200.0.8/30");
+        // 10.200.0.8 is reserved; next alloc should skip past it.
+        assert_eq!(c2.cidr_str(), "10.200.0.12/30");
     }
 
     #[test]
     fn reserve_round_trips_through_free() {
         let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
-        let target = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        // The bake CIDR (slot 0) is permanently reserved and not
+        // reservable; use slot 1 instead for the recycle round-trip.
+        let target = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
         a.reserve(target).unwrap();
         a.free(target);
         // After free, the slot is reservable again.
         a.reserve(target).unwrap();
+    }
+
+    /// ADR 0014 M1.16: the bake CIDR (slot 0, `10.200.0.0/30`)
+    /// is permanently reserved by [`NetworkAllocator::new`]. Both
+    /// `alloc` and `reserve` must refuse to hand it out — otherwise
+    /// a netns SNAT slot collides with the bake's eth0 IP and the
+    /// SHELL tab fails (observed in prod on session d20c4715).
+    #[test]
+    fn bake_cidr_slot_0_is_permanently_reserved() {
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        let bake = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        // `reserve(bake)` must fail — slot 0 is already in_use.
+        assert!(matches!(a.reserve(bake), Err(AllocError::SlotTaken)));
+        // 1000 sequential allocs never produce slot 0.
+        for _ in 0..1000 {
+            let c = a.alloc().unwrap();
+            assert_ne!(
+                c.cidr_str(),
+                "10.200.0.0/30",
+                "alloc must never hand out the bake CIDR"
+            );
+        }
+        // Even after recycling: `free(bake)` is a no-op (slot 0
+        // doesn't go onto the free list because it was never
+        // alloc()'d in the first place), and a subsequent reserve
+        // still fails.
+        a.free(bake);
+        assert!(matches!(a.reserve(bake), Err(AllocError::SlotTaken)));
     }
 
     #[test]
