@@ -207,3 +207,29 @@ variable "autoscale" {
     cpu_target   = 0.6
   }
 }
+
+variable "distribution_policy_target_shape" {
+  type        = string
+  default     = "ANY"
+  description = <<-DESC
+    Regional MIG zonal placement strategy. One of:
+      - EVEN: strict even spread across zones. Best fault isolation,
+        but a single zone running out of capacity for `machine_type`
+        deadlocks rolling updates — the MIG will keep retrying in
+        the stocked-out zone (observed in prod 2026-05-20: us-west2-b
+        out of n2-standard-8 for 30+ min, MIG retry loop visible in
+        `gcloud compute operations list`).
+      - BALANCED: prefers EVEN but tolerates capacity issues by
+        landing in any zone with availability. Good middle ground.
+      - ANY: opportunistic — picks any zone with capacity, no
+        balance constraint. Best capacity availability, weakest
+        zonal fault tolerance.
+      - ANY_SINGLE_ZONE: pin all instances to one zone (no HA).
+
+    Default ANY because today's fleet is small (2 hosts) and we
+    care more about capacity availability during rolling updates
+    than about zonal spread. Bump to EVEN once the fleet is large
+    enough that one zone losing capacity is a smaller percentage
+    of total fleet capacity.
+  DESC
+}

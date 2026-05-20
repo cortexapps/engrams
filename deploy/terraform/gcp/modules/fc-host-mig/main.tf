@@ -202,6 +202,14 @@ resource "google_compute_region_instance_group_manager" "fc_host" {
   base_instance_name = var.name
   target_size        = var.target_size
 
+  # See `variables.tf::distribution_policy_target_shape` for why
+  # the default is ANY rather than EVEN. ANY trades zonal balance
+  # for capacity availability — the right call for a small fleet
+  # in a region where a single zone occasionally runs out of
+  # n2-standard-8 capacity (us-west2-b stockouts observed
+  # 2026-05-20 deadlocked rolling updates under EVEN).
+  distribution_policy_target_shape = var.distribution_policy_target_shape
+
   version {
     instance_template = google_compute_instance_template.fc_host.id
   }
