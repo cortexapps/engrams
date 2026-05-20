@@ -36,14 +36,28 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# `RuntimeDirectory=engram` creates `/run/engram` (cleared on stop);
-# `StateDirectory=engram` creates `/var/lib/engram` (persistent across
-# restarts — sandbox work-dir lives under it). Both directives
-# implicitly add their path to the unit's writable namespace, so
-# no `ReadWritePaths=` is needed. The earlier explicit form 226-NAMESPACE'd
-# on first boot because the paths didn't exist yet — nothing else
-# in the image creates them.
-RuntimeDirectory=engram
+# `RuntimeDirectory=engram netns` creates `/run/engram` (cleared on
+# stop) and `/run/netns` (writable bind in this unit's namespace).
+# `/run/netns` is what iproute2's `ip netns add` uses as the tree
+# for per-VM network namespaces (ADR 0014 M1.16 per-VM netns for
+# warm-restored sandboxes). Without it in the unit's writable set,
+# `ProtectSystem=strict` makes `/run` read-only in our mount
+# namespace and `ip netns add` fails with EROFS — the symptom was
+# `warm_pool refill failed ... ip netns add ...: mkdir /run/netns
+# failed: Read-only file system` after a healthy template enable
+# made it past the BlobStorage path on a fresh post-M1.16 host
+# (2026-05-20 prod).
+#
+# `RuntimeDirectoryPreserve=yes` keeps both dirs alive across unit
+# restarts so an `engram-host-agent` crash + restart doesn't take
+# down every per-VM netns the host already provisioned (they'd
+# otherwise vanish when systemd cleans `/run/netns` on stop, and
+# every live FC's eth0 would lose its peer veth).
+#
+# `StateDirectory=engram` creates `/var/lib/engram` (persistent
+# across restarts — sandbox work-dir lives under it).
+RuntimeDirectory=engram netns
+RuntimeDirectoryPreserve=yes
 StateDirectory=engram
 # We intentionally do NOT use ProtectKernelTunables / ProtectKernelModules
 # because the host-agent's iptables work needs them, and PrivateDevices
