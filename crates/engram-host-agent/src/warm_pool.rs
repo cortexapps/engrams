@@ -369,9 +369,24 @@ impl WarmPool {
         &self,
         sandbox_id: SandboxId,
         agent: AgentSpec,
-        policy: SessionEgressPolicy,
+        mut policy: SessionEgressPolicy,
         session_harness_path: Option<std::path::PathBuf>,
     ) -> Result<(), SandboxError> {
+        // ADR 0014: coord builds the egress policy with a placeholder
+        // `sandbox_id` because it doesn't know which warm slot will
+        // be leased until LeaseWarmSandbox returns; the comment in
+        // sessions.rs:574 reads "overwritten by host on launch."
+        // That overwrite has to actually happen — `notify_session_policy`
+        // takes `policy.sandbox_id` at face value and inserts the
+        // placeholder into the egress-proxy registry. Without this
+        // line, the registry has no entry for the actual warm
+        // sandbox's source IP, so every outbound from the in-VM
+        // harness (e.g. claude → api.anthropic.com) misses the
+        // policy lookup and gets dropped. Observed on session
+        // 9d9fef3e (2026-05-20): warm-lease worked, vsock handshake
+        // worked, but the harness produced no response because its
+        // first egress call failed.
+        policy.sandbox_id = sandbox_id;
         // ADR 0014 ordering: policy onto the proxy registry BEFORE
         // bootstrap exec's the agent. Same invariant ADR 0013
         // codified for cold-create's StartAgent. Harness swap goes
@@ -704,6 +719,10 @@ mod tests {
         last_metadata: PMutex<Option<SnapshotMetadata>>,
         destroy_log: PMutex<Vec<SandboxId>>,
         agent_log: PMutex<Vec<(SandboxId, AgentSpec)>>,
+        // ADR 0014: capture the policy that `launch` forwards to
+        // `notify_session_policy` so tests can assert the
+        // sandbox_id overwrite actually happens.
+        policy_log: PMutex<Vec<SessionEgressPolicy>>,
     }
 
     impl FakeBackend {
@@ -713,6 +732,7 @@ mod tests {
                 last_metadata: PMutex::new(None),
                 destroy_log: PMutex::new(Vec::new()),
                 agent_log: PMutex::new(Vec::new()),
+                policy_log: PMutex::new(Vec::new()),
             }
         }
     }
@@ -749,6 +769,13 @@ mod tests {
         }
         async fn start_agent(&self, id: SandboxId, spec: AgentSpec) -> Result<(), SandboxError> {
             self.agent_log.lock().push((id, spec));
+            Ok(())
+        }
+        async fn notify_session_policy(
+            &self,
+            policy: SessionEgressPolicy,
+        ) -> Result<(), SandboxError> {
+            self.policy_log.lock().push(policy);
             Ok(())
         }
     }
@@ -893,6 +920,53 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].0, sandbox_id);
         assert_eq!(log[0].1.argv, agent.argv);
+    }
+
+    /// ADR 0014 regression guard. The coord builds `SessionEgressPolicy`
+    /// with a placeholder `sandbox_id` (it doesn't know which warm
+    /// slot will be leased until LeaseWarmSandbox returns). The
+    /// host-side `launch` MUST overwrite `policy.sandbox_id` with the
+    /// real warm-slot id before forwarding to `notify_session_policy`
+    /// — without it the egress proxy registry keys on the placeholder
+    /// id, the actual warm slot's source IP misses the lookup, and
+    /// the in-VM harness's first egress call (e.g. claude →
+    /// api.anthropic.com) gets dropped. Observed on session 9d9fef3e
+    /// (2026-05-20): warm-lease worked, vsock handshake worked, but
+    /// the harness produced no response.
+    #[tokio::test]
+    async fn launch_overwrites_policy_sandbox_id_with_real_warm_id() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let real_sandbox = SandboxId::new();
+        let placeholder = SandboxId::new();
+        assert_ne!(real_sandbox, placeholder);
+        let agent = AgentSpec {
+            argv: vec!["/bin/true".into()],
+            env: Default::default(),
+        };
+        let policy = SessionEgressPolicy {
+            session_id: engram_core::SessionId::new(),
+            sandbox_id: placeholder, // what coord ships
+            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            network_allow_hosts: Default::default(),
+            network_allow_host_patterns: Default::default(),
+            secrets: Default::default(),
+            secret_mode: Default::default(),
+        };
+        pool.launch(real_sandbox, agent, policy, None)
+            .await
+            .unwrap();
+        let log = backend.policy_log.lock().clone();
+        assert_eq!(log.len(), 1, "notify_session_policy must fire exactly once");
+        assert_eq!(
+            log[0].sandbox_id, real_sandbox,
+            "launch must overwrite policy.sandbox_id with the warm-slot id, \
+             not pass the coord-side placeholder through"
+        );
+        assert_ne!(
+            log[0].sandbox_id, placeholder,
+            "the placeholder id must not survive into the egress registry",
+        );
     }
 
     #[tokio::test]
