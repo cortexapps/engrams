@@ -387,6 +387,39 @@ impl WarmPool {
         // worked, but the harness produced no response because its
         // first egress call failed.
         policy.sandbox_id = sandbox_id;
+        // Same overwrite story for guest_ip: coord builds the policy
+        // with `Ipv4Addr::UNSPECIFIED` (sessions.rs:575 leaves the
+        // M1.x "policy refresh keyed on the actual guest_ip" TODO
+        // unresolved on the warm path). Until the host fills in the
+        // real value, the egress-proxy registry is indexed against
+        // 0.0.0.0; when a VM packet arrives with peer-IP = the
+        // netns SNAT slot (e.g. 10.200.0.6), `Registry::lookup`
+        // misses entirely, the proxy drops the connection, and the
+        // in-VM harness's first outbound (claude → api.anthropic.com)
+        // hangs without logs. Observed in prod 2026-05-20 on session
+        // accb3924: the iptables REDIRECT fix put packets at the
+        // proxy's door but registry lookup found nothing, so
+        // egress was still effectively blackholed — just one layer
+        // deeper than the FORWARD DROP that preceded the REDIRECT
+        // fix.
+        if let Some(ip_str) = self.inner.backend.guest_ip(sandbox_id).await {
+            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                policy.guest_ip = ip;
+            } else {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    ip_str = %ip_str,
+                    "guest_ip parse failed; policy will register against UNSPECIFIED \
+                     and egress lookup will miss",
+                );
+            }
+        } else {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                "backend returned no guest_ip; policy will register against UNSPECIFIED \
+                 and egress lookup will miss",
+            );
+        }
         // ADR 0014 ordering: policy onto the proxy registry BEFORE
         // bootstrap exec's the agent. Same invariant ADR 0013
         // codified for cold-create's StartAgent. Harness swap goes
@@ -723,6 +756,12 @@ mod tests {
         // `notify_session_policy` so tests can assert the
         // sandbox_id overwrite actually happens.
         policy_log: PMutex<Vec<SessionEgressPolicy>>,
+        // ADR 0014: configurable guest_ip return value so tests can
+        // verify `launch`'s overwrite of `policy.guest_ip` with the
+        // backend's real SNAT'd IP. `None` (default) makes
+        // `guest_ip()` return None and exercises the leave-as-
+        // UNSPECIFIED branch.
+        guest_ip_value: PMutex<Option<String>>,
     }
 
     impl FakeBackend {
@@ -733,7 +772,13 @@ mod tests {
                 destroy_log: PMutex::new(Vec::new()),
                 agent_log: PMutex::new(Vec::new()),
                 policy_log: PMutex::new(Vec::new()),
+                guest_ip_value: PMutex::new(None),
             }
+        }
+
+        fn with_guest_ip(self, ip: &str) -> Self {
+            *self.guest_ip_value.lock() = Some(ip.to_string());
+            self
         }
     }
 
@@ -777,6 +822,9 @@ mod tests {
         ) -> Result<(), SandboxError> {
             self.policy_log.lock().push(policy);
             Ok(())
+        }
+        async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+            self.guest_ip_value.lock().clone()
         }
     }
 
@@ -967,6 +1015,89 @@ mod tests {
             log[0].sandbox_id, placeholder,
             "the placeholder id must not survive into the egress registry",
         );
+    }
+
+    /// ADR 0014 regression guard, second axis. The coord ALSO ships
+    /// the policy with `guest_ip = Ipv4Addr::UNSPECIFIED` because at
+    /// session-create time it doesn't know which netns slot the warm
+    /// lease will land on. The host MUST overwrite this with the
+    /// backend's actual `guest_ip` (the netns's SNAT'd source IP)
+    /// before forwarding to `notify_session_policy` — without it
+    /// the egress proxy registry is indexed against 0.0.0.0, every
+    /// real VM packet's peer-IP (e.g. 10.200.0.6) misses lookup,
+    /// and the proxy drops the connection. Observed on session
+    /// accb3924 (2026-05-20): the iptables REDIRECT fix had landed,
+    /// packets reached the proxy, but registry.lookup(10.200.0.6)
+    /// found nothing and egress was still blackholed — just one
+    /// layer deeper than before.
+    #[tokio::test]
+    async fn launch_overwrites_policy_guest_ip_with_real_snat_ip() {
+        let backend = Arc::new(FakeBackend::new().with_guest_ip("10.200.0.6"));
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let sandbox_id = SandboxId::new();
+        let agent = AgentSpec {
+            argv: vec!["/bin/true".into()],
+            env: Default::default(),
+        };
+        let policy = SessionEgressPolicy {
+            session_id: engram_core::SessionId::new(),
+            sandbox_id,
+            // The coord ships UNSPECIFIED — see sessions.rs:575.
+            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            network_allow_hosts: Default::default(),
+            network_allow_host_patterns: Default::default(),
+            secrets: Default::default(),
+            secret_mode: Default::default(),
+        };
+        pool.launch(sandbox_id, agent, policy, None).await.unwrap();
+        let log = backend.policy_log.lock().clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0].guest_ip,
+            "10.200.0.6".parse::<std::net::Ipv4Addr>().unwrap(),
+            "launch must overwrite policy.guest_ip with the backend's SNAT'd IP, \
+             not pass the UNSPECIFIED placeholder through to the registry",
+        );
+        assert_ne!(
+            log[0].guest_ip,
+            std::net::Ipv4Addr::UNSPECIFIED,
+            "the UNSPECIFIED placeholder must not survive into the egress registry",
+        );
+    }
+
+    /// Belt-and-suspenders for the UNSPECIFIED path: when the
+    /// backend can't determine a guest_ip (no netns yet, agentd not
+    /// up, etc.) the policy.guest_ip stays UNSPECIFIED and `launch`
+    /// emits a warn — but does NOT silently substitute a different
+    /// value. The proxy will drop traffic in that case, which is
+    /// the correct fail-closed behaviour.
+    #[tokio::test]
+    async fn launch_leaves_guest_ip_unspecified_when_backend_has_none() {
+        let backend = Arc::new(FakeBackend::new()); // no .with_guest_ip
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let sandbox_id = SandboxId::new();
+        let policy = SessionEgressPolicy {
+            session_id: engram_core::SessionId::new(),
+            sandbox_id,
+            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            network_allow_hosts: Default::default(),
+            network_allow_host_patterns: Default::default(),
+            secrets: Default::default(),
+            secret_mode: Default::default(),
+        };
+        pool.launch(
+            sandbox_id,
+            AgentSpec {
+                argv: vec!["/bin/true".into()],
+                env: Default::default(),
+            },
+            policy,
+            None,
+        )
+        .await
+        .unwrap();
+        let log = backend.policy_log.lock().clone();
+        assert_eq!(log[0].guest_ip, std::net::Ipv4Addr::UNSPECIFIED);
     }
 
     #[tokio::test]
