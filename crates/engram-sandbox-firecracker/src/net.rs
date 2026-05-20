@@ -268,6 +268,25 @@ pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec
     //    proxy's TCP/443 port AND its DNS port (53, both udp + tcp)
     //    before the blanket DROP. Order matters: ACCEPT first,
     //    DROP after.
+    //
+    //    ADR 0014 issue #6 follow-up: the host-agent's ProxyShell
+    //    tunnel dials the in-guest ttyd from host root (cold path)
+    //    or from the per-VM netns (warm path). Either way, the
+    //    guest's SYN+ACK reply comes back to host root with
+    //    src=10.200.0.x dst=10.200.0.1, hits the INPUT chain, and
+    //    the blanket DROP below catches it (no specific dport ACCEPT
+    //    matches the host's ephemeral source port). Result: every
+    //    host→VM TCP dial hangs until ETIMEDOUT and the SHELL tab
+    //    fails. Fix: accept ESTABLISHED + RELATED return traffic
+    //    from the pool BEFORE the DROP. This only permits return
+    //    traffic for flows the host initiated — it does NOT widen
+    //    the VM→host attack surface (new VM-initiated flows still
+    //    hit the DROP). Required for ProxyShell to actually reach
+    //    ttyd; observed in prod (session 379abfec) post-M1.16.
+    out.push(format!(
+        "-A INPUT -s {pool} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT \
+         -m comment --comment engram-host-input-established",
+    ));
     if let Some(port) = proxy_port {
         out.push(format!(
             "-A INPUT -s {pool} -p tcp --dport {port} -j ACCEPT \
@@ -1056,7 +1075,8 @@ mod tests {
         // engram-host-input DROP.
         let drop_idx = lines
             .iter()
-            .position(|l| l.contains("engram-host-input"))
+            .position(|l| l.contains("comment engram-host-input ")
+            || l.ends_with("comment engram-host-input"))
             .expect("host-input drop present");
         let dns_input_idx = lines
             .iter()
@@ -1097,9 +1117,53 @@ mod tests {
         // assert ACCEPT line index < DROP line index.
         let lines = host_startup_lines(Some(9443), None);
         let accept_idx = lines.iter().position(|l| l.contains("engram-proxy-input"));
-        let drop_idx = lines.iter().position(|l| l.contains("engram-host-input"));
+        let drop_idx = lines.iter().position(|l| l.contains("comment engram-host-input ")
+            || l.ends_with("comment engram-host-input"));
         assert!(accept_idx.is_some() && drop_idx.is_some());
         assert!(accept_idx < drop_idx);
+    }
+
+    /// ADR 0014 issue #6 follow-up: regression guard. The host-agent
+    /// ProxyShell dials the in-guest ttyd from host root (cold path)
+    /// and the guest's SYN+ACK return packet hits the INPUT chain.
+    /// Without an ESTABLISHED,RELATED ACCEPT *before* the blanket
+    /// engram-host-input DROP, every host→VM TCP dial times out
+    /// (observed in prod against session 379abfec on 2026-05-20).
+    /// This test pins the rule's presence and ordering.
+    #[test]
+    fn host_startup_accepts_established_input_before_drop() {
+        let lines = host_startup_lines(Some(9443), Some(5353));
+        let est_idx = lines
+            .iter()
+            .position(|l| l.contains("engram-host-input-established"))
+            .expect("host-input ESTABLISHED ACCEPT must be present");
+        let drop_idx = lines
+            .iter()
+            .position(|l| l.contains("comment engram-host-input ")
+            || l.ends_with("comment engram-host-input"))
+            .filter(|i| *i != est_idx)
+            .expect("host-input DROP must be present and distinct from the ESTABLISHED rule");
+        assert!(
+            est_idx < drop_idx,
+            "ESTABLISHED,RELATED ACCEPT must precede the engram-host-input DROP \
+             so host-initiated TCP flows (proxy_shell ↔ ttyd) see their SYN+ACK \
+             return packets",
+        );
+        let est_line = &lines[est_idx];
+        assert!(
+            est_line.contains("--ctstate ESTABLISHED,RELATED"),
+            "rule must match by conntrack state, not by port/protocol — \
+             keeps the VM→host attack surface narrow"
+        );
+        // Also assert the rule is present in no-proxy mode (which
+        // operators use when egress filtering is disabled).
+        let nolines = host_startup_lines(None, None);
+        assert!(
+            nolines
+                .iter()
+                .any(|l| l.contains("engram-host-input-established")),
+            "ESTABLISHED ACCEPT must be present in both proxy and no-proxy modes"
+        );
     }
 
     #[test]
