@@ -337,10 +337,33 @@ pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec
 
     if let Some(port) = proxy_port {
         // 4a. PROXY mode: REDIRECT VM→tcp/443 to the local proxy
-        //     port. -t nat -A PREROUTING with -i tap-engr-+ matches
-        //     any of our TAPs (the `+` is iptables' wildcard).
+        //     port. We install the rule TWICE, once for each input
+        //     interface that VM traffic can arrive on:
+        //
+        //     - `tap-engr-+`: cold-create path. The TAP sits in host
+        //       root netns (the pre-M1.16 layout we still take for
+        //       fresh sandboxes), so VM packets enter root netns
+        //       directly via the TAP.
+        //     - `vh-engr-+`: warm-restore path. The TAP lives inside
+        //       a per-VM netns; in root netns the VM's packets
+        //       arrive via the host-side veth (vh-engr-XXXXXX), not
+        //       the TAP. The TAP-only rule never fired for warm
+        //       restores (observed in prod 2026-05-20: packet
+        //       counters stuck at 0, the default-deny FORWARD
+        //       downstream was silently blackholing every outbound
+        //       API call from the harness).
+        //
+        //     Eventually the cold-create path should also use a per-
+        //     VM netns (ADR 0014 "Open questions"), at which point
+        //     the tap-engr-+ rule becomes dead code. Keep both for
+        //     now so neither path silently bypasses the proxy.
         out.push(format!(
             "-t nat -A PREROUTING -i tap-engr-+ -p tcp --dport 443 \
+             -j REDIRECT --to-port {port} \
+             -m comment --comment engram-proxy-redirect",
+        ));
+        out.push(format!(
+            "-t nat -A PREROUTING -i vh-engr-+ -p tcp --dport 443 \
              -j REDIRECT --to-port {port} \
              -m comment --comment engram-proxy-redirect",
         ));
@@ -352,13 +375,26 @@ pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec
         //     QNAME, closing the DNS-exfiltration channel. Without
         //     these rules, the guest could resolve arbitrary names
         //     even when every TCP connection downstream was blocked.
+        //
+        //     Same dual-interface story as 4a (tap-engr-+ for cold-
+        //     create, vh-engr-+ for warm-restore).
         out.push(format!(
             "-t nat -A PREROUTING -i tap-engr-+ -p udp --dport 53 \
              -j REDIRECT --to-port {dns_port} \
              -m comment --comment engram-dns-redirect",
         ));
         out.push(format!(
+            "-t nat -A PREROUTING -i vh-engr-+ -p udp --dport 53 \
+             -j REDIRECT --to-port {dns_port} \
+             -m comment --comment engram-dns-redirect",
+        ));
+        out.push(format!(
             "-t nat -A PREROUTING -i tap-engr-+ -p tcp --dport 53 \
+             -j REDIRECT --to-port {dns_port} \
+             -m comment --comment engram-dns-redirect",
+        ));
+        out.push(format!(
+            "-t nat -A PREROUTING -i vh-engr-+ -p tcp --dport 53 \
              -j REDIRECT --to-port {dns_port} \
              -m comment --comment engram-dns-redirect",
         ));
@@ -1111,7 +1147,12 @@ mod tests {
     #[test]
     fn host_startup_with_proxy_redirects_443_and_default_denies() {
         let lines = host_startup_lines(Some(9443), None).join("\n");
+        // Both cold-path (tap-engr-+, TAP in root netns) and warm-
+        // path (vh-engr-+, host-side veth into per-VM netns) need a
+        // REDIRECT rule. Pre-fix only the cold-path rule existed and
+        // every warm restore silently bypassed the proxy.
         assert!(lines.contains("-i tap-engr-+ -p tcp --dport 443"));
+        assert!(lines.contains("-i vh-engr-+ -p tcp --dport 443"));
         assert!(lines.contains("--to-port 9443"));
         assert!(lines.contains("engram-default-deny"));
         assert!(lines.contains("--dport 9443 -j ACCEPT"));
@@ -1133,8 +1174,12 @@ mod tests {
              that's exactly the DNS-exfil channel this change closes",
         );
         // REDIRECT for both transports, targeting the proxy's DNS port.
+        // Both interface families: tap-engr-+ for cold-create, vh-engr-+
+        // for warm-restore (post-M1.16 per-VM netns).
         assert!(joined.contains("-i tap-engr-+ -p udp --dport 53"));
+        assert!(joined.contains("-i vh-engr-+ -p udp --dport 53"));
         assert!(joined.contains("-i tap-engr-+ -p tcp --dport 53"));
+        assert!(joined.contains("-i vh-engr-+ -p tcp --dport 53"));
         assert!(joined.contains("--to-port 5353"));
         // INPUT accept for the proxy's DNS port (so REDIRECTed
         // packets aren't caught by the blanket VM-INPUT drop).

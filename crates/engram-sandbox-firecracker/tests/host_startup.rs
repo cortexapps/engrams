@@ -18,7 +18,12 @@
 
 #![cfg(target_os = "linux")]
 
-use engram_sandbox_firecracker::net::host_startup;
+use engram_core::SandboxId;
+use engram_sandbox_firecracker::net::{
+    host_startup, netns_name_for, provision_netns, tap_name_for, teardown_netns, NetworkAllocator,
+    VmCidr,
+};
+use parking_lot::Mutex;
 
 fn require_root() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
@@ -127,6 +132,20 @@ async fn host_startup_with_proxy_adds_redirect_and_default_deny() {
     assert!(dump.contains("engram-proxy-redirect"));
     assert!(dump.contains("--to-ports 9443"));
     assert!(dump.contains("engram-default-deny"));
+    // Both interface families must be present: tap-engr-+ for
+    // the cold-create path (TAP in root netns) and vh-engr-+ for
+    // the warm-restore path (TAP in per-VM netns, packet arrives
+    // at root via the host-side veth). Pre-fix only tap-engr-+
+    // existed and every warm restore silently bypassed the proxy
+    // (prod 2026-05-20).
+    assert!(
+        dump.contains("-i tap-engr-+"),
+        "cold-create REDIRECT must match the TAP; dump=\n{dump}",
+    );
+    assert!(
+        dump.contains("-i vh-engr-+"),
+        "warm-restore REDIRECT must match the host-side veth; dump=\n{dump}",
+    );
 
     cleanup();
 }
@@ -189,6 +208,123 @@ async fn host_startup_installs_established_accept_before_host_input_drop() {
         "ESTABLISHED,RELATED ACCEPT must precede engram-host-input DROP \
          in iptables-save; ACCEPT idx={est_idx}, DROP idx={drop_idx}",
     );
+
+    cleanup();
+}
+
+/// Regression for the prod 2026-05-20 blackhole: post-M1.16 the per-VM
+/// netns moves the TAP off host root, so REDIRECT must match
+/// `vh-engr-+` (the host-side veth end) to catch warm-restored VM
+/// traffic. Pre-fix only `tap-engr-+` was matched and the warm-path
+/// REDIRECT never fired — packets fell through to the default-deny
+/// FORWARD DROP and harness API calls hung silently.
+///
+/// What this test actually exercises:
+///   1. host_startup installs the proxy rules (both interface families).
+///   2. Provision a per-VM netns the same way warm-restore does
+///      (provision_netns → TAP in netns + veth pair + SNAT POSTROUTING).
+///   3. Bind a TCP listener on the proxy port in host root.
+///   4. From inside the netns, attempt to connect to a random
+///      "internet" IP on tcp/443. The packet must arrive at the
+///      listener via REDIRECT — if it doesn't, the test times out
+///      (which is exactly the prod failure mode).
+#[tokio::test]
+#[ignore = "requires Linux + root (CAP_NET_ADMIN + netns); run with sudo on the dev VM"]
+async fn host_startup_redirects_warm_path_via_vh_engr() {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    if !require_root() {
+        return;
+    }
+    cleanup();
+
+    // Use an unusual proxy port so we can be sure any accept on it
+    // came from our REDIRECT, not some other process.
+    let proxy_port: u16 = 28443;
+
+    host_startup(Some(proxy_port), Some(5353))
+        .await
+        .expect("host_startup");
+
+    // Listener in host root, accepts the redirected SYN.
+    let listener = TcpListener::bind(("0.0.0.0", proxy_port))
+        .await
+        .expect("bind proxy listener");
+
+    // Provision the netns + veth pair + SNAT (warm-restore shape).
+    let sandbox_id = SandboxId::new();
+    let bake_cidr = VmCidr::new("10.200.0.0".parse().unwrap());
+    let tap_name = tap_name_for(sandbox_id);
+    // The allocator's first usable slot is /30 #1 (slot 0 is reserved
+    // for the bake CIDR, see net.rs::NetworkAllocator::new).
+    let allocator = Mutex::new(NetworkAllocator::new("10.200.0.0".parse().unwrap()));
+    let setup = provision_netns(sandbox_id, bake_cidr, &tap_name, &allocator)
+        .await
+        .expect("provision_netns");
+
+    // From inside the netns, attempt to dial a non-existent
+    // "internet" target on tcp/443. The IP doesn't matter — the
+    // REDIRECT catches every dport=443. We use a TEST-NET range
+    // (RFC 5737) so no real host owns the address.
+    //
+    // bash's /dev/tcp/<ip>/<port> is the smallest dependency for a
+    // TCP SYN we have in nix's coreutils set; busybox-nc isn't
+    // guaranteed and tools/nc bring extra footprint.
+    let netns = netns_name_for(sandbox_id);
+    let dialer = tokio::process::Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &netns,
+            "bash",
+            "-c",
+            "exec 3<>/dev/tcp/192.0.2.42/443 && head -c 0 <&3",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ip netns exec");
+
+    // Wait up to 5s for the listener to accept (REDIRECT is
+    // instantaneous; the dial inside the netns races us by tens of
+    // ms). Pre-fix this hangs forever.
+    let accept_res = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+
+    // Clean up first so the kernel state doesn't leak into other
+    // tests, then assert on the result.
+    let _ = dialer.id().map(|pid| {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
+    });
+    teardown_netns(&setup, &allocator).await;
+
+    let (mut stream, peer) = accept_res
+        .expect(
+            "REDIRECT did not deliver the netns dial to the proxy port within 5s \
+             — this is the prod 2026-05-20 blackhole. Check that host_startup_lines \
+             emits a `-i vh-engr-+` rule and that provision_netns puts the host \
+             side of the veth in root.",
+        )
+        .expect("listener accept");
+
+    // The peer's source IP should be in our SNAT pool (the netns
+    // POSTROUTING SNAT rewrote it from 10.200.0.2 → snat_cidr.guest()).
+    let peer_ip = match peer {
+        std::net::SocketAddr::V4(v4) => *v4.ip(),
+        std::net::SocketAddr::V6(_) => panic!("expected IPv4 peer"),
+    };
+    assert_eq!(
+        peer_ip,
+        setup.snat_cidr.guest(),
+        "REDIRECTed connection's source IP must be the netns SNAT slot, \
+         confirming the packet traversed the netns→veth→REDIRECT path",
+    );
+
+    // Drain whatever the dialer wrote (probably nothing — bash's
+    // `head -c 0` exits immediately after the SYN/ACK handshake).
+    let mut _buf = [0u8; 64];
+    let _ = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut _buf)).await;
 
     cleanup();
 }
