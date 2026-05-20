@@ -180,6 +180,18 @@ build {
     script = "${path.root}/provisioners/install-host-agent.sh"
   }
 
+  # 4a. Google Cloud Ops Agent. Ships engram-host-agent's systemd
+  #     journal (plus the rest of the system journal: kernel, OOM,
+  #     iptables) to Cloud Logging so post-mortems don't require
+  #     `sudo journalctl` on every FC host VM. GCP-specific — the
+  #     installer + config live under `provisioners/gcp/`. Other
+  #     clouds will need their own per-cloud equivalent (e.g.
+  #     CloudWatch agent on AWS) when those Packer manifests land.
+  provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
+    script         = "${path.root}/provisioners/gcp/install-ops-agent.sh"
+  }
+
   # 4. systemd unit + drain hook.
   provisioner "file" {
     source      = "${path.root}/provisioners/systemd/engram-host-agent.service"
