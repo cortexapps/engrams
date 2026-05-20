@@ -1072,6 +1072,110 @@ M2 acceptance gates:
 ADR 0012 ("warm pool deferred") and ADR 0009 ("graceful preemption
 deferred") both move from `deferred` → `landed via 0014` after M2.
 
+## Known issues observed in prod (post-M1.16)
+
+Captured during the 2026-05-19/20 M1.16 rollout investigation
+(session `b511cf9b-7356-44fc-b6b4-be859bf864d4`, disk-fill on
+`engrams-fc-xngk`, Ops Agent enablement). Each item is a concrete
+follow-up; ordering reflects rough priority (highest first).
+
+1. **Idle-evict orphan snapshot dirs (caller-layer leak).**
+   Commit `752aea3` (fix #1) wraps `PooledBackend::snapshot`'s
+   post-FC chunk/upload work in cleanup hygiene — if chunking or
+   upload fails, the FC dir gets `rm -rf`'d. But the *caller*
+   layer (the idle-evictor's "snapshot → register → destroy"
+   sequence) has no equivalent. If a step after the snapshot
+   succeeds (PG insert / mark-idle / destroy / coord ack)
+   fails, the snapshot dir stays on disk. Each retry mints a
+   fresh `SnapshotId` and lays down another 4 GiB at
+   `/var/lib/engram/sandboxes/snapshots/<new-uuid>/`. On session
+   b511cf9b this leaked ~25 dirs × 4 GiB in 13 min, filling the
+   99 GB disk on `engrams-fc-xngk`. Minimum fix: extend the
+   cleanup hygiene to the idle-evict caller's failure path.
+   Cleaner fix: see #2.
+
+2. **`SnapshotId::new()` per idle-evict retry is the wrong
+   default.** A `SnapshotId` represents an immutable artifact's
+   identity — right for explicit "save this session" semantics,
+   wrong for idle-evict's retry-until-success shape. Each retry
+   creating a fresh ID means no two attempts share a path, so a
+   prior attempt's leftovers can't be naturally overwritten —
+   they orphan. Proper fix: idle-evict writes to a
+   sandbox-keyed scratch path
+   (`<work_dir>/sandboxes/snapshots/idle-scratch/<sandbox_id>/`);
+   each retry overwrites in place; atomic-rename to the
+   `SnapshotId::new()` final path only on full eviction
+   success. Same shape as tempfile crates' "write tmp/, rename
+   on success" pattern. Closes the orphan class entirely
+   instead of papering over with cleanup hygiene. Subsumes #1.
+
+3. **Stale `templates` rows pointing at missing snapshot
+   blobs.** Surfaced immediately after the M1.16 Ops Agent
+   commit made host-agent logs queryable in Cloud Logging:
+   ```
+   warm_pool refill failed ... read manifest: No such file or directory
+   prefetch get_manifest <id>@v1: blob storage: blob not found
+   download state.bin from snapshots/<id>/state.bin: blob not found
+   ```
+   Multiple `templates` rows in PG reference snapshot IDs whose
+   bytes are absent from BlobStorage. Likely origin: earlier
+   bake-cascade work (M1.11) where the demo image was enabled
+   but `canonical_snapshot` block in `bundle.json` referenced
+   blob keys that weren't actually populated, or where the
+   blob upload failed silently. Hosts dutifully try to refill
+   warm slots for each, hit blob-not-found, retry forever.
+   Net effect: warm pool stays empty → every session falls
+   through to cold-create (the 29.5 s "warm" activation on
+   b511cf9b was actually cold). Two fixes needed:
+   (a) `POST /api/enabled-images` cascade must verify
+   `canonical_snapshot`'s blob keys are resolvable in
+   BlobStorage **before** inserting the `templates` row.
+   (b) A coord-side sweeper that prunes `templates` rows
+   whose snapshot blobs go missing (or marks them inactive),
+   so a one-time blob-store hiccup doesn't permanently brick
+   warm pool for that template.
+
+4. **No disk-pressure floor on idle-evict.** Even with #1 + #2
+   fixed, a snowball scenario remains: a runaway eviction
+   retry loop (e.g., from coord-side bookkeeping flakiness)
+   can fill a 99 GB disk in ~12 minutes at 4 GiB per attempt.
+   Add a host-side disk-pressure detector that pauses idle-
+   eviction when free disk < N × `memory_mib` × 2 (worst-case
+   peak during a 4 GiB FC dump). Surface as a Prometheus
+   gauge so dashboards alert before fill. Lower urgency than
+   #1–#3 but the right backstop — defense in depth.
+
+5. **Warm-pool refill failures don't surface to coord.**
+   The 12-minute window when `xngk` was filling disk had no
+   coord-side WARN logs at all. Coord only started logging
+   eviction failure once disk was full and `create_dir_all`
+   ENOSPC'd. The refill-failure path is host-internal; coord
+   doesn't get a heartbeat-level signal for "I'm failing to
+   refill template X." Add a heartbeat field for per-template
+   refill failure count/rate so coord can: (a) page on
+   chronic refill failures, (b) drain hosts that can't
+   refill anything (or restrict them to existing-session-only
+   mode). Naturally pairs with #3's coord-side sweeper.
+
+6. **(Closed by `3b6aec3`) host-agent logs missing from Cloud
+   Logging.** Cloud Logging ingested coord/web pod logs but
+   not the host-agent's systemd journal. Investigations
+   required `sudo journalctl` per FC host VM, gated on
+   org-level IAM and only useful in real-time. Closed by the
+   Ops Agent install in
+   `deploy/packer/provisioners/gcp/install-ops-agent.sh`.
+   Journal now queryable via:
+   ```
+   resource.type="gce_instance" AND
+   jsonPayload._SYSTEMD_UNIT="engram-host-agent.service"
+   ```
+   Documented as a closed item so a future reader knows the
+   diagnostic capability was added in response to this
+   investigation, not as a planned feature. Follow-up:
+   update `~/.claude/skills/engrams-prod-ops/scripts/logs-host.sh`
+   to prefer Cloud Logging over SSH+`journalctl`, killing
+   the sudo dependency for host-side log access.
+
 ## Related
 
 - ADR 0007: chunked immutable storage — provides the chunked-memory
