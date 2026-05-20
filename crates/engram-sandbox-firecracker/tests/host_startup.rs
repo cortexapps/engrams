@@ -295,7 +295,9 @@ async fn host_startup_redirects_warm_path_via_vh_engr() {
     // Clean up first so the kernel state doesn't leak into other
     // tests, then assert on the result.
     let _ = dialer.id().map(|pid| {
-        let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
     });
     teardown_netns(&setup, &allocator).await;
 

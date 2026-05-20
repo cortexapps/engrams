@@ -2654,10 +2654,9 @@ impl SandboxBackend for FirecrackerBackend {
     /// been warm-running for 14 minutes).
     async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
         let vsock_uds_path = {
-            let live = self
-                .sandboxes
-                .get(&id)
-                .ok_or_else(|| SandboxError::Vm(format!("start_shell: no live sandbox {id}").into()))?;
+            let live = self.sandboxes.get(&id).ok_or_else(|| {
+                SandboxError::Vm(format!("start_shell: no live sandbox {id}").into())
+            })?;
             live.state.vsock_uds_path.clone()
         };
 
@@ -2670,12 +2669,9 @@ impl SandboxBackend for FirecrackerBackend {
             let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
-            engram_agentd::write_msg(
-                &mut conn,
-                &WireRequest::StartShell { port: None },
-            )
-            .await
-            .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
             let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: recv: {e}").into()))?;

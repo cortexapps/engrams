@@ -827,7 +827,10 @@ mod tests {
                 spawned,
             } => {
                 assert_eq!(got_port, port);
-                assert!(spawned, "first StartShell call should report `spawned = true`");
+                assert!(
+                    spawned,
+                    "first StartShell call should report `spawned = true`"
+                );
             }
             WireResponse::Error { kind, message } => {
                 panic!("StartShell returned Error: kind={kind} message={message}");

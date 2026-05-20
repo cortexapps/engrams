@@ -67,9 +67,7 @@ struct ShellHandle {
 }
 
 async fn state() -> &'static Mutex<Option<ShellHandle>> {
-    SHELL
-        .get_or_init(|| async { Mutex::new(None) })
-        .await
+    SHELL.get_or_init(|| async { Mutex::new(None) }).await
 }
 
 /// Outcome of a `start_shell` call. `spawned` distinguishes "the
@@ -152,12 +150,7 @@ pub async fn start_shell(port: u16) -> io::Result<ShellOutcome> {
         // SIGKILL.
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("spawn ttyd ({bin}): {e}"),
-            )
-        })?;
+        .map_err(|e| io::Error::new(e.kind(), format!("spawn ttyd ({bin}): {e}")))?;
 
     *guard = Some(ShellHandle { child, port });
 
