@@ -102,6 +102,23 @@ jobs:
               - '!crates/engram-harness-claude/**'
               - '!crates/engram-harness-noop/**'
               - '!crates/engram-harness-proto/**'
+              # Coord-only crates: not in engram-host-agent's dep
+              # tree. Changes here don't alter the host-agent
+              # binary that bakes into the FC host GCE image, so
+              # there's no point in firing the ~15 min FC-host
+              # bake + ~3 min MIG roll on a coord-only commit.
+              # Verified via `Cargo.toml` of engram-host-agent and
+              # its transitive deps: none of these crates are
+              # reachable from engram-host-agent. (Coord IS itself
+              # a consumer of engram-host-agent's LocalHostClient
+              # in mode=all, but the dependency edge is one-way.)
+              # Observed bloat: each commit to engram-coordinator
+              # was forcing the FC roll cycle on 2026-05-20.
+              - '!crates/engram-coordinator/**'
+              - '!crates/engram-postgres/**'
+              - '!crates/engram-cloud-gcp/**'
+              - '!crates/engram-cloud-mock/**'
+              - '!crates/engram-secrets-dev/**'
               - 'deploy/packer/**'
               - 'rust-toolchain.toml'
             tf_or_helm:
