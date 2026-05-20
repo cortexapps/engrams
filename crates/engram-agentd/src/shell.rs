@@ -84,8 +84,29 @@ pub struct ShellOutcome {
 /// `/usr/local/bin/ttyd` by default); on subsequent calls it checks
 /// the prior handle is still alive and the port still accepts —
 /// restarting only on failure.
+///
+/// Important: the legacy bake's init script also starts ttyd in
+/// the background at VM boot, so on a freshly-restored warm VM the
+/// port is likely ALREADY accepting before agentd ever sees a
+/// StartShell. In that case we must NOT try to spawn — `ttyd -p
+/// 7681 ...` would fail with `EADDRINUSE`. So before falling into
+/// the spawn path we probe the port; an existing listener (whether
+/// from init or from a previous StartShell on this same agentd) is
+/// reported as `spawned = false`.
 pub async fn start_shell(port: u16) -> io::Result<ShellOutcome> {
     let mut guard = state().await.lock().await;
+
+    // Path 0: somebody already bound the port — typically the bake's
+    // init script's `ttyd -W -p 7681 bash &`. Acknowledge it and
+    // return without touching anything. We don't take ownership of
+    // a child we didn't spawn; the bake's ttyd has its lifetime tied
+    // to PID 1.
+    if probe_ready(port).await.is_ok() {
+        return Ok(ShellOutcome {
+            port,
+            spawned: false,
+        });
+    }
 
     // Path 1: we already have a child. Verify it's still running AND
     // the port still accepts. Either failure → drop the handle and

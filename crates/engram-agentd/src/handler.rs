@@ -776,6 +776,74 @@ mod tests {
     ///
     /// Skipped when `python3` isn't on PATH (CI runners without
     /// python). The dev-vm and macOS dev hosts both have it.
+    /// Path 0 of start_shell: the port is ALREADY bound by something
+    /// else (the bake's init script's pre-started ttyd in prod). We
+    /// must NOT try to spawn — that'd fail with EADDRINUSE and the
+    /// host's proxy_shell would surface a bogus error. Instead we
+    /// recognise the existing listener and return ShellReady with
+    /// spawned=false. Validates the fix for the prod failure mode I
+    /// observed 2026-05-20 (session accb3924).
+    #[tokio::test]
+    async fn start_shell_recognises_a_preexisting_listener_without_spawning() {
+        // Pick an unused port, then bind our own listener on it
+        // BEFORE calling StartShell. agentd should probe, see the
+        // listener, and return spawned=false without touching the
+        // ENGRAM_TTYD_BIN spawn path.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Keep `listener` alive for the duration of the test. (If we
+        // dropped it, the port would close before the probe runs.)
+        // Bind blocking accepts in a thread so the kernel actually
+        // delivers SYN/ACK during probe_ready.
+        let _accept_thread = std::thread::spawn(move || {
+            // Accept exactly one connection (the probe). After that
+            // we let the listener drop on thread exit.
+            if let Ok((_stream, _)) = listener.accept() {
+                // probe_ready closes immediately after connecting;
+                // we just hold the stream long enough for that to
+                // happen, then exit.
+            }
+        });
+
+        // Make sure ENGRAM_TTYD_BIN points at a nonexistent path so
+        // we can confidently assert "no spawn happened" — if the
+        // probe path is broken and we fell through to spawn, the
+        // test would fail with a spawn-time error.
+        let prev = std::env::var("ENGRAM_TTYD_BIN").ok();
+        std::env::set_var("ENGRAM_TTYD_BIN", "/nonexistent/ttyd");
+
+        // Ensure no stale handle from a sibling test leaks in.
+        let _ = crate::shell::shutdown_for_tests().await;
+
+        let resp = round_trip(WireRequest::StartShell { port: Some(port) }).await;
+
+        if let Some(p) = prev {
+            std::env::set_var("ENGRAM_TTYD_BIN", p);
+        } else {
+            std::env::remove_var("ENGRAM_TTYD_BIN");
+        }
+
+        match resp {
+            WireResponse::ShellReady {
+                port: got_port,
+                spawned,
+            } => {
+                assert_eq!(got_port, port);
+                assert!(
+                    !spawned,
+                    "must NOT spawn when a listener already owns the port (bake's init-script ttyd case)",
+                );
+            }
+            WireResponse::Error { kind, message } => {
+                panic!(
+                    "should have detected the existing listener instead of erroring: \
+                     kind={kind} message={message}",
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn start_shell_spawns_and_probes_a_real_tcp_listener() {
         use std::io::Write;
