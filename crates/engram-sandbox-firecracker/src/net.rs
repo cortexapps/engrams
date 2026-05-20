@@ -1075,8 +1075,9 @@ mod tests {
         // engram-host-input DROP.
         let drop_idx = lines
             .iter()
-            .position(|l| l.contains("comment engram-host-input ")
-            || l.ends_with("comment engram-host-input"))
+            .position(|l| {
+                l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input")
+            })
             .expect("host-input drop present");
         let dns_input_idx = lines
             .iter()
@@ -1117,8 +1118,9 @@ mod tests {
         // assert ACCEPT line index < DROP line index.
         let lines = host_startup_lines(Some(9443), None);
         let accept_idx = lines.iter().position(|l| l.contains("engram-proxy-input"));
-        let drop_idx = lines.iter().position(|l| l.contains("comment engram-host-input ")
-            || l.ends_with("comment engram-host-input"));
+        let drop_idx = lines.iter().position(|l| {
+            l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input")
+        });
         assert!(accept_idx.is_some() && drop_idx.is_some());
         assert!(accept_idx < drop_idx);
     }
@@ -1139,8 +1141,9 @@ mod tests {
             .expect("host-input ESTABLISHED ACCEPT must be present");
         let drop_idx = lines
             .iter()
-            .position(|l| l.contains("comment engram-host-input ")
-            || l.ends_with("comment engram-host-input"))
+            .position(|l| {
+                l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input")
+            })
             .filter(|i| *i != est_idx)
             .expect("host-input DROP must be present and distinct from the ESTABLISHED rule");
         assert!(
