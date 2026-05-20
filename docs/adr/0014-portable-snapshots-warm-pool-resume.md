@@ -1157,7 +1157,58 @@ follow-up; ordering reflects rough priority (highest first).
    refill anything (or restrict them to existing-session-only
    mode). Naturally pairs with #3's coord-side sweeper.
 
-6. **(Closed by `3b6aec3`) host-agent logs missing from Cloud
+6. **Shell tab is architecturally broken from k8s coord.**
+   Coord's `/sessions/:id/shell` proxy opens a direct WebSocket
+   to `ws://<guest_ip>:7681/ws` — but `guest_ip` is the VM's
+   per-/30 address (e.g., `10.200.0.2`) which lives behind a
+   TAP on the FC host VM. **The coord pod is in GKE and has no
+   route to `10.200.0.0/24`** — no VPC route, no bridge.
+   Egress (VM→world) works because of the FC host's
+   iptables MASQUERADE; shell (world→VM) has no equivalent.
+   Failure mode in Cloud Logging:
+   ```
+   shell proxy ended with error
+     target=ws://10.200.0.2:7681/ws
+     error=connect to ttyd: IO error: Connection timed out
+   ```
+   Worked in dev (coord + host-agent on one VM, so coord's
+   network namespace can reach the TAPs); never worked from
+   k8s. Confirmed on session `bb3dd147-83c7-4f8b-a2cc-84034ae2a8e7`
+   (2026-05-20). M1.16's per-VM netns + bake-time networking
+   helped the *VM side* (the VM has eth0 now) but doesn't
+   address the *cluster-side reachability* gap.
+   Proper fix: **tunnel the shell through the host-agent's
+   gRPC channel.** Coord ↔ host-agent already has working
+   connectivity (it's how every other op flows). Host-agent ↔
+   ttyd works locally via the host's TAP. Add a `ProxyShell`
+   bidi-streaming RPC; coord opens it, host-agent dials
+   `<guest_ip>:7681` from its own host root netns, both sides
+   shuttle bytes. Same Option B shape from the M1.16 design
+   conversation. Alternatively, use vsock end-to-end (in-VM
+   bridge to ttyd or a fresh PTY), but the gRPC tunnel reuses
+   more existing plumbing.
+
+7. **NBD manifest version conflict surfaces despite fix #2.**
+   Fix #2 in commit `de0abcb` added a retry loop on
+   `VersionConflict` in the NBD manifest flush path. After
+   M1.16 rollout we observed this error still propagating to
+   coord:
+   ```
+   nbd disk flush: chunk store: manifest <id> version conflict:
+     attempted v2, latest is v3
+   ```
+   Either (a) fix #2's retry exhausts (up to 32 attempts;
+   unlikely under normal load), (b) the retry isn't on the
+   right code path (some other NBD flush callsite skipped),
+   or (c) the retry has a bug — e.g., reading `attempted` and
+   `latest` from a stale `state.manifest_ref` after the retry
+   bumps `attempt_ref`. Lower priority than #1–#3 because it's
+   self-recovering on the next eviction cycle, but worth a
+   reread of `crates/engram-host-agent/src/disk_daemon/backend.rs`
+   `flush()` (~line 401) to confirm fix #2's retry actually
+   covers this surface.
+
+8. **(Closed by `3b6aec3`) host-agent logs missing from Cloud
    Logging.** Cloud Logging ingested coord/web pod logs but
    not the host-agent's systemd journal. Investigations
    required `sudo journalctl` per FC host VM, gated on
@@ -1213,7 +1264,19 @@ Where to start in code, ordered by issue:
   - Coord-side consumer: where `host_registry::update_state`
     processes the heartbeat — log + emit `engram_warm_pool_refill_failures_total{template_ref,host_id}`.
 
-- **#6 follow-up (`logs-host.sh`).**
+- **#6 (shell-tab tunnel via host-agent gRPC).**
+  - Today's path: `crates/engram-coordinator/src/api/shell.rs` opens `ws://<guest_ip>:7681/ws` directly — broken from k8s. Replace with a `host.proxy_shell(sandbox_id, ws_from_dashboard)` call that returns a bidi-streaming RPC.
+  - New gRPC method: add `ProxyShell` to `crates/engram-protocol/proto/host_service.proto` — `stream bytes` both ways.
+  - Host-agent side: implement the handler in `crates/engram-host-agent/src/grpc_server.rs::proxy_shell`. Open a TCP connection to `<guest_ip>:7681` in its own netns (root for cold, per-VM netns for warm via `setns`), then byte-pump in both directions.
+  - Coord-side shell.rs becomes a thin shim: open the bidi stream, WebSocket-frame the bytes for the dashboard, no direct TCP. Drops `GUEST_TTYD_PORT` const and the URL formatter.
+  - Cold path needs the netns_path to be `None` (current host root). Warm path passes the per-VM netns path so host-agent enters it before dialing `10.200.0.2:7681`. NetnsSetup is already on LiveSandbox from M1.16 — surface it via a host-agent-side accessor.
+
+- **#7 (NBD retry verify).**
+  - Code: `crates/engram-host-agent/src/disk_daemon/backend.rs::flush` ~line 401 — the retry loop fix #2 added.
+  - Check: does the retry actually re-read `state.manifest_ref` from disk-daemon state each iteration, or is it using a stale local? The error message format includes `attempted=v2, latest=v3` — if `attempted` doesn't increment per retry, the retry isn't actually advancing.
+  - Repro: not easy to force in test (the race requires a concurrent writer to bump the manifest version), but a unit test with a `ChunkStore` mock that returns `VersionConflict` once then succeeds, asserting `attempted_ref.version` advanced, would lock the contract.
+
+- **#8 follow-up (`logs-host.sh`).**
   - Skill script: `~/.claude/skills/engrams-prod-ops/scripts/logs-host.sh`. Swap the
     `gcloud compute ssh ... sudo journalctl -u engram-host-agent` body for a `gcloud logging read` query with
     `resource.type="gce_instance" AND jsonPayload._SYSTEMD_UNIT="engram-host-agent.service"`. Keep the SSH path as
@@ -1235,11 +1298,17 @@ Suggested order of attack:
    re-test session-create + idle-evict cycle on prod and
    confirm no orphan dirs accumulate in
    `/var/lib/engram/sandboxes/snapshots/`.
-3. **#5 second-to-last.** Heartbeat surface change deserves
-   its own commit + integration test; not blocking the warm
-   path's correctness, but valuable for ops visibility.
-4. **#4 last.** Defense-in-depth backstop. Cheap to add but
-   not load-bearing if #1–#3 land cleanly.
+3. **#6 (shell-tab gRPC tunnel).** Independent of #1–#5;
+   self-contained ~150-200 LOC change. Easy to verify
+   end-to-end once landed (open the shell tab from the
+   dashboard, type a few chars). Could ship in parallel
+   with #1/#2 by a different worker.
+4. **#5.** Heartbeat surface change deserves its own commit
+   + integration test; not blocking warm-path correctness
+   but pairs naturally with #3's coord-side sweeper.
+5. **#4 + #7.** Defense-in-depth backstop and verification
+   that fix #2's retry actually works. Both cheap to add
+   but not load-bearing.
 
 Useful Cloud Logging queries while testing:
 
@@ -1269,7 +1338,9 @@ Production state snapshot at the time of writing (2026-05-20 02:35 UTC):
 - **Demo image enabled**: `ghcr.io/cortexapps/engrams-internal/demo:warm-75babf7`.
 - **Claude harness registered**: `ghcr.io/cortexapps/engrams/harness-claude:b9dd2d1` (older, pre-M1.12 wire format — works due to `#[serde(default)]` compat).
 - **Stale `templates` rows in PG**: at least 5 reference snapshot IDs `9c615e34`, `36277885`, `99ea12c7`, `1e133a3d`, `cf798a54` whose blobs are not in BlobStorage. Verify via `bash ~/.claude/skills/engrams-prod-ops/scripts/psql.sh "select template_ref, image_repo, image_tag, snapshot_id from templates where active=true"`.
-- **Last session investigated**: `b511cf9b-7356-44fc-b6b4-be859bf864d4`. Created at 2026-05-19 19:40 UTC, took 29.5 s to activate (cold-create masquerading as warm — see #3), triggered the disk-fill on the (now-gone) `engrams-fc-xngk` host via #1.
+- **Sessions investigated** (both confirm #3: cold-create masquerading as warm):
+  - `b511cf9b-7356-44fc-b6b4-be859bf864d4` — 2026-05-19 19:40 UTC, 29.5 s activation, triggered the disk-fill on the (now-gone) `engrams-fc-xngk` host via #1.
+  - `bb3dd147-83c7-4f8b-a2cc-84034ae2a8e7` — 2026-05-20 02:40 UTC, 26.4 s activation, on the new (post-Ops-Agent) hosts. Confirmed #6 (shell tab times out from coord pod) and #7 (NBD version conflict surfaces despite fix #2 retry).
 
 Prod-ops skill scripts to lean on (all under `~/.claude/skills/engrams-prod-ops/scripts/`):
 `psql.sh`, `curl.sh`, `metrics-coord.sh`, `metrics-hosts.sh`,
