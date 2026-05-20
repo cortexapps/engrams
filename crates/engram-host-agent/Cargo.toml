@@ -66,7 +66,10 @@ tonic.workspace = true
 reqwest.workspace = true
 # For the disk-pressure detector's statvfs-based free-space probe.
 # Linux + macOS both expose statvfs; nix's `fs` feature wraps it.
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+# `sched` is needed on Linux for ADR 0014 issue #6's ProxyShell
+# netns-dial (setns + CloneFlags). The `sched` module compiles to
+# a no-op on non-Linux so adding the feature here is portable.
+nix = { version = "0.31", default-features = false, features = ["fs", "sched"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true

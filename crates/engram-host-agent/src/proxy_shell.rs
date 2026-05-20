@@ -35,6 +35,8 @@ use bytes::Bytes;
 use engram_core::error::SandboxError;
 use engram_core::types::shell::{ShellClose, ShellFrame, ShellTunnelEnds};
 use futures::{SinkExt, StreamExt};
+#[cfg(target_os = "linux")]
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{protocol::CloseFrame, Message};
 
@@ -248,8 +250,6 @@ async fn connect_tcp_in_netns_linux(
     netns_name: &str,
     guest_ip: &str,
 ) -> Result<TcpStream, SandboxError> {
-    use std::os::fd::AsRawFd;
-
     let netns_path = format!("/var/run/netns/{netns_name}");
     let guest_addr = format!("{guest_ip}:{TTYD_PORT}");
 
@@ -273,14 +273,17 @@ async fn connect_tcp_in_netns_linux(
             .map_err(|e| format!("open /proc/self/ns/net: {e}"))?;
         let target = std::fs::File::open(&netns_path_clone)
             .map_err(|e| format!("open {netns_path_clone}: {e}"))?;
-        setns(target.as_raw_fd(), CloneFlags::CLONE_NEWNET)
+        // nix 0.31 takes anything that implements AsFd — passing
+        // `&File` works (File implements AsFd) and keeps both fds
+        // alive across the restore call.
+        setns(&target, CloneFlags::CLONE_NEWNET)
             .map_err(|e| format!("setns(target): {e}"))?;
         let stream_result = std::net::TcpStream::connect(&guest_addr_clone)
             .map_err(|e| format!("connect {guest_addr_clone}: {e}"));
         // Always restore root netns, even on connect failure — the
         // blocking worker thread is reused and we mustn't leave it
         // pinned to a guest netns.
-        let restore = setns(root.as_raw_fd(), CloneFlags::CLONE_NEWNET)
+        let restore = setns(&root, CloneFlags::CLONE_NEWNET)
             .map_err(|e| format!("setns(root): {e}"));
         let stream = stream_result?;
         restore?;
