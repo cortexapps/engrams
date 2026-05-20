@@ -2645,6 +2645,63 @@ impl SandboxBackend for FirecrackerBackend {
         live.netns.as_ref().map(|ns| ns.netns_name.clone())
     }
 
+    /// Ask agentd to ensure `ttyd` is running and accepting on its
+    /// port. Returns the bound port. ADR 0014 follow-up: replaces
+    /// the prior assumption that the snapshot's in-VM init script
+    /// would have ttyd bound by the time the host dialed — that
+    /// raced under warm restore (prod session 73fe33a3 saw
+    /// "Connection refused" 48s post-lease even though the VM had
+    /// been warm-running for 14 minutes).
+    async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        let vsock_uds_path = {
+            let live = self
+                .sandboxes
+                .get(&id)
+                .ok_or_else(|| SandboxError::Vm(format!("start_shell: no live sandbox {id}").into()))?;
+            live.state.vsock_uds_path.clone()
+        };
+
+        // Conservative deadline: ttyd binds in ~100ms under normal
+        // load; agentd's own ready-probe in-VM is bounded at 10s. Add
+        // headroom for the vsock RTT under load. If we hit this, the
+        // VM is severely degraded — surface loud rather than silently
+        // retrying like the old proxy_shell deadline.
+        let fut = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
+            engram_agentd::write_msg(
+                &mut conn,
+                &WireRequest::StartShell { port: None },
+            )
+            .await
+            .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
+            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_shell: recv: {e}").into()))?;
+            match resp {
+                engram_agentd::WireResponse::ShellReady { port, spawned } => {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        port,
+                        spawned,
+                        "agentd reports ttyd ready",
+                    );
+                    Ok(port)
+                }
+                engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                    format!("start_shell: agentd error ({kind}): {message}").into(),
+                )),
+                other => Err(SandboxError::Vm(
+                    format!("start_shell: unexpected response: {other:?}").into(),
+                )),
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(15), fut)
+            .await
+            .map_err(|_| SandboxError::Vm("start_shell: timed out waiting for agentd".into()))?
+    }
+
     /// ADR 0014 M1.12: brief pause → `PATCH /drives` → resume on
     /// the harness virtio-blk drive. Warm-pool lease path uses
     /// this to swap the bake-time stub harness for the session's

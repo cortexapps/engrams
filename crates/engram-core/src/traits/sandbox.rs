@@ -272,6 +272,21 @@ pub trait SandboxBackend: Send + Sync {
     fn harness_dial(&self) -> HarnessDial {
         HarnessDial::Vsock
     }
+
+    /// Ensure the in-guest `ttyd` is running and bound, returning the
+    /// port it accepted on. Called by host-agent's `proxy_shell` flow
+    /// just before dialing ttyd — guarantees the host's TCP connect
+    /// will find a listener (no more racing the warm-restore against
+    /// the in-VM init script that backgrounds ttyd).
+    ///
+    /// Default implementation assumes ttyd is part of the snapshot
+    /// and always listening — returns `Ok(7681)` so non-FC backends
+    /// (process, VZ-dev) inherit the legacy behaviour. The FC backend
+    /// overrides to send a vsock `StartShell` request to agentd,
+    /// which lazily spawns ttyd and only replies once a probe succeeds.
+    async fn start_shell(&self, _id: SandboxId) -> Result<u16, SandboxError> {
+        Ok(7681)
+    }
 }
 
 /// How a harness process inside a sandbox reaches the host-side

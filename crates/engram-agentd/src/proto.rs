@@ -165,6 +165,27 @@ pub enum WireRequest {
     /// Replies [`WireResponse::GuestIp`] with `None` if no eligible
     /// non-loopback address could be determined.
     GuestIp,
+    /// Ensure `ttyd` is running and bound to `port` (defaults to
+    /// 7681). On first call after VM boot the agent spawns ttyd; on
+    /// subsequent calls it checks the existing handle is still
+    /// alive and the port is accepting, restarting only if not.
+    /// Either way the agent only replies once a fresh TCP connect
+    /// to the loopback succeeds — so the host can dial ttyd with
+    /// confidence right after this returns.
+    ///
+    /// This decouples the in-browser shell from any timing
+    /// assumption about the warm snapshot: ttyd no longer needs to
+    /// be in the snapshot, and even if it is, the agent re-probes
+    /// before declaring it ready.
+    ///
+    /// Replies [`WireResponse::ShellReady`] on success, or
+    /// [`WireResponse::Error`] if the spawn or the port probe
+    /// fails (no ttyd binary, kernel refused, port held by
+    /// something else, etc.).
+    StartShell {
+        /// Optional port override. `None` → 7681.
+        port: Option<u16>,
+    },
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.
@@ -183,6 +204,16 @@ pub enum WireResponse {
     /// could not determine a non-loopback address (e.g. networking
     /// not configured, all interfaces down).
     GuestIp(Option<String>),
+    /// Reply to [`WireRequest::StartShell`]. ttyd is alive AND a
+    /// TCP probe to `127.0.0.1:port` from inside the VM completed
+    /// successfully — when the host dials the guest IP on this
+    /// same port immediately afterward, it should find a listener.
+    /// `spawned` is true if this call started ttyd, false if it
+    /// was already running and only re-probed.
+    ShellReady {
+        port: u16,
+        spawned: bool,
+    },
     /// Anything the agent couldn't fulfil. `message` is a short
     /// human-readable reason; `kind` mirrors the std `io::ErrorKind`
     /// stringly so the host can map back to a typed error

@@ -121,6 +121,21 @@ where
             write_msg(&mut writer, &WireResponse::GuestIp(ip)).await?;
             return Ok(());
         }
+        WireRequest::StartShell { port } => {
+            let port = port.unwrap_or(crate::shell::DEFAULT_TTYD_PORT);
+            let resp = match crate::shell::start_shell(port).await {
+                Ok(outcome) => WireResponse::ShellReady {
+                    port: outcome.port,
+                    spawned: outcome.spawned,
+                },
+                Err(e) => WireResponse::Error {
+                    kind: format!("{:?}", e.kind()),
+                    message: format!("start_shell: {e}"),
+                },
+            };
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
     };
 
     let req = exec_req;
@@ -748,6 +763,93 @@ mod tests {
     async fn ping_returns_pong() {
         let resp = round_trip(WireRequest::Ping).await;
         assert!(matches!(resp, WireResponse::Pong));
+    }
+
+    /// StartShell with a fake `ttyd` binary (a tiny shell script that
+    /// `exec`s `python3 -m http.server $3` — args from `start_shell`
+    /// are `["-W", "-p", "<port>", "<shell>"]`, so $3 is the port).
+    /// We pick a random unused port up-front, point ENGRAM_TTYD_BIN
+    /// at the script, fire StartShell, and assert the response says
+    /// the port is ready. The probe inside agentd does a real TCP
+    /// connect to 127.0.0.1:<port> so this confirms the full
+    /// "spawn → bind → ready" sequence works.
+    ///
+    /// Skipped when `python3` isn't on PATH (CI runners without
+    /// python). The dev-vm and macOS dev hosts both have it.
+    #[tokio::test]
+    async fn start_shell_spawns_and_probes_a_real_tcp_listener() {
+        use std::io::Write;
+        use std::time::Duration;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIP: python3 not available; start_shell test relies on it for a fake ttyd");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-ttyd.sh");
+        // `$3` is the port (matching start_shell's argv shape).
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nexec python3 -m http.server \"$3\" --bind 127.0.0.1 > /dev/null 2>&1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        // Pick an unused localhost port by binding briefly then dropping.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        // Scope the env var so we don't pollute sibling tests.
+        let prev = std::env::var("ENGRAM_TTYD_BIN").ok();
+        std::env::set_var("ENGRAM_TTYD_BIN", &script);
+
+        let resp = round_trip(WireRequest::StartShell { port: Some(port) }).await;
+
+        if let Some(p) = prev {
+            std::env::set_var("ENGRAM_TTYD_BIN", p);
+        } else {
+            std::env::remove_var("ENGRAM_TTYD_BIN");
+        }
+
+        match resp {
+            WireResponse::ShellReady {
+                port: got_port,
+                spawned,
+            } => {
+                assert_eq!(got_port, port);
+                assert!(spawned, "first StartShell call should report `spawned = true`");
+            }
+            WireResponse::Error { kind, message } => {
+                panic!("StartShell returned Error: kind={kind} message={message}");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Probe directly — agentd already did this internally, but
+        // we double-check the listener is genuinely alive after the
+        // RPC returned. (Catches any cleanup-on-drop issue if the
+        // handler unintentionally drops the Child.)
+        std::io::stdout().flush().unwrap();
+        let dial = tokio::net::TcpStream::connect(("127.0.0.1", port));
+        let dialed = tokio::time::timeout(Duration::from_secs(2), dial).await;
+        assert!(
+            dialed.is_ok() && dialed.unwrap().is_ok(),
+            "post-StartShell TCP connect should succeed",
+        );
+
+        // Tear down the fake ttyd so a sibling test running with the
+        // same OnceCell starts clean.
+        let _ = crate::shell::shutdown_for_tests().await;
     }
 
     #[tokio::test]

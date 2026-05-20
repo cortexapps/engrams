@@ -16,6 +16,7 @@
 
 pub mod handler;
 pub mod proto;
+pub mod shell;
 
 pub use handler::serve_connection;
 pub use proto::{

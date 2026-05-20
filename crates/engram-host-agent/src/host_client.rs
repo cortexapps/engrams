@@ -209,6 +209,15 @@ impl HostClient for LocalHostClient {
         // SandboxBackend knows whether this sandbox is warm-restored
         // (`netns_name_for == Some`) or cold (`None`); the proxy_shell
         // module handles both cases.
+        //
+        // start_shell() asks the in-VM agentd to ensure ttyd is up
+        // and accepting on its port before we attempt the dial. The
+        // agentd probes a local TCP connect before replying, so
+        // when we get here we're guaranteed a listener exists — no
+        // more racing the warm-restore against the snapshot's init
+        // script (prod session 73fe33a3 on 2026-05-20 saw the host
+        // dial 48s after lease and still hit Connection refused).
+        let port = self.sandbox.start_shell(sandbox_id).await?;
         let guest_ip = self
             .sandbox
             .guest_ip(sandbox_id)
@@ -216,7 +225,7 @@ impl HostClient for LocalHostClient {
             .ok_or_else(|| SandboxError::Vm("proxy_shell: guest_ip unavailable".into()))?;
         let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
-        crate::proxy_shell::open_shell_tunnel(guest_ip, netns_name, ends).await?;
+        crate::proxy_shell::open_shell_tunnel_at(guest_ip, port, netns_name, ends).await?;
         Ok(tunnel)
     }
 
