@@ -469,6 +469,15 @@ pub enum BuildError {
     Docker(String),
     Ext4(Ext4Error),
     InvalidPath(String),
+    /// ADR 0014: caller requested `--capture-canonical-memory` but
+    /// the bake-time FC capture step failed (TAP provisioning,
+    /// /dev/kvm permissions, snapshot/restore plumbing, etc.).
+    /// Returned instead of silently producing an artifact whose
+    /// bundle.json lacks the canonical_snapshot block — that's the
+    /// failure mode that produced `demo:warm-75babf7` (TAP EPERM
+    /// in CI) and caused warm pool to silently never fire for
+    /// the image in prod.
+    CanonicalCapture(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -479,6 +488,7 @@ impl std::fmt::Display for BuildError {
             Self::Docker(m) => write!(f, "docker: {m}"),
             Self::Ext4(e) => write!(f, "ext4: {e}"),
             Self::InvalidPath(p) => write!(f, "invalid path: {p}"),
+            Self::CanonicalCapture(m) => write!(f, "canonical memory capture: {m}"),
         }
     }
 }
@@ -762,56 +772,66 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         //      a full portable SnapshotMetadata.
         //   3. Otherwise → None (sessions pay session-private
         //      memory cost at restore, functionally correct).
-        let (canonical_memory_manifest, canonical_snapshot) = if let Some(mref) =
-            req.canonical_memory_manifest
-        {
-            (Some(mref), None)
-        } else if let (Some(capture_cfg), Some(disk_ref)) =
-            (req.capture_canonical_memory.as_ref(), disk_manifest)
-        {
-            match self
-                .capture_canonical_memory(&rootfs_path, image_dir, capture_cfg)
-                .await
+        let (canonical_memory_manifest, canonical_snapshot) =
+            if let Some(mref) = req.canonical_memory_manifest {
+                (Some(mref), None)
+            } else if let (Some(capture_cfg), Some(disk_ref)) =
+                (req.capture_canonical_memory.as_ref(), disk_manifest)
             {
-                Ok(mut metadata) => {
-                    // ADR 0014 M1.11: the bundle's `canonical_snapshot`
-                    // block needs `disk_manifest` so the coord-side
-                    // materializer + heartbeat-ack carry it through to
-                    // hosts. Without this, warm-pool refill on a fresh
-                    // host has the memory side reachable in BlobStorage
-                    // but no way to materialize the rootfs file FC
-                    // needs at `load_snapshot` time → "Block: Virtio
-                    // backend error" on every refill until a cold
-                    // session create primes image_cache.
-                    metadata.disk_manifest = Some(disk_ref);
-                    tracing::info!(
-                        repo = %req.repo,
-                        tag = %req.tag,
-                        snapshot_id = %metadata.id,
-                        memory_manifest = ?metadata.memory_manifest,
-                        disk_manifest = ?metadata.disk_manifest,
-                        "captured canonical template snapshot at bake time"
-                    );
-                    (metadata.memory_manifest, Some(metadata))
+                match self
+                    .capture_canonical_memory(&rootfs_path, image_dir, capture_cfg)
+                    .await
+                {
+                    Ok(mut metadata) => {
+                        // ADR 0014 M1.11: the bundle's `canonical_snapshot`
+                        // block needs `disk_manifest` so the coord-side
+                        // materializer + heartbeat-ack carry it through to
+                        // hosts. Without this, warm-pool refill on a fresh
+                        // host has the memory side reachable in BlobStorage
+                        // but no way to materialize the rootfs file FC
+                        // needs at `load_snapshot` time → "Block: Virtio
+                        // backend error" on every refill until a cold
+                        // session create primes image_cache.
+                        metadata.disk_manifest = Some(disk_ref);
+                        tracing::info!(
+                            repo = %req.repo,
+                            tag = %req.tag,
+                            snapshot_id = %metadata.id,
+                            memory_manifest = ?metadata.memory_manifest,
+                            disk_manifest = ?metadata.disk_manifest,
+                            "captured canonical template snapshot at bake time"
+                        );
+                        (metadata.memory_manifest, Some(metadata))
+                    }
+                    Err(e) => {
+                        // Fail loud. Previously this was best-effort
+                        // with a WARN log, but a "successful" bake that
+                        // shipped without canonical_snapshot was the
+                        // exact mechanism behind `demo:warm-75babf7`
+                        // (TAP ioctl EPERM in CI; warn logged but exit
+                        // code 0; image pushed; coord cascade silently
+                        // skipped templates write; warm pool never
+                        // fired for the image; every session
+                        // cold-created in ~27s in prod).
+                        //
+                        // The caller explicitly asked for canonical
+                        // capture via `--capture-canonical-memory`.
+                        // Honor that — if capture can't happen, refuse
+                        // to ship a half-broken artifact. CI lanes that
+                        // genuinely don't have KVM should simply omit
+                        // the flag.
+                        tracing::error!(
+                            repo = %req.repo,
+                            tag = %req.tag,
+                            error = %e,
+                            "canonical memory capture failed; aborting bake",
+                        );
+                        return Err(BuildError::CanonicalCapture(format!("{e}")));
+                    }
                 }
-                Err(e) => {
-                    // Capture is best-effort: if FC + KVM aren't
-                    // available, the bake still ships with a valid
-                    // disk_manifest. Operators on KVM-capable
-                    // runners get the canonical perf boost; CI
-                    // lanes without it ship anyway.
-                    tracing::warn!(
-                        repo = %req.repo,
-                        tag = %req.tag,
-                        error = %e,
-                        "canonical memory capture failed; bundle.json will omit canonical_snapshot"
-                    );
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
 
         // ADR 0008 Phase 3: produce Nydus-shaped artifacts
         // alongside the existing bundle.json. For each kind that
@@ -1872,5 +1892,38 @@ mod tests {
         assert_eq!(parsed.image_version, original.image_version);
         assert_eq!(parsed.state_blob_key, original.state_blob_key);
         assert_eq!(parsed.sidecar_blob_key, original.sidecar_blob_key);
+    }
+
+    /// Regression guard for the silent best-effort behavior that
+    /// produced `demo:warm-75babf7` in prod. Prior to this commit,
+    /// `Err(_)` from the bake-time `capture_canonical_memory` call
+    /// degraded to `(None, None)` + a tracing::warn, the bake's
+    /// exit code stayed zero, and the pushed artifact had
+    /// `bundle.json` schema_version=2 with no canonical_snapshot —
+    /// coord's enable-image cascade silently skipped the templates
+    /// write, warm pool never fired, every session cold-created
+    /// (~27s).
+    ///
+    /// This test pins the new shape: BuildError::CanonicalCapture
+    /// exists and displays with a clear prefix. The actual
+    /// "capture-fails-aborts-bake" semantic is exercised in
+    /// integration tests under `tests/builder.rs` (gated behind
+    /// docker availability); this is the compile-time guarantee
+    /// that the variant and its Display impl are wired.
+    #[test]
+    fn canonical_capture_error_variant_exists_and_displays_clearly() {
+        let err = super::BuildError::CanonicalCapture(
+            "ip tuntap add tap-engr-9f5afd mode tap: Operation not permitted".into(),
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("canonical memory capture:"),
+            "must surface the failure mode loudly in the prefix; got: {msg}"
+        );
+        assert!(
+            msg.contains("tuntap"),
+            "must thread the original error through so operators \
+             can diagnose without chasing log files; got: {msg}"
+        );
     }
 }
