@@ -215,18 +215,35 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         .expect("provision_netns");
 
     // ---- 4. Register the session in the proxy registry under the
-    //         REAL SNAT'd guest_ip (Fix 3). Use a wildcard network
-    //         allow so any SNI matches Decision::Intercept(secrets)
-    //         falling through to Bypass-on-empty-secrets.
+    //         REAL SNAT'd guest_ip (Fix 3). Include a dummy
+    //         SecretEntry whose `allow` list contains TEST_HOST —
+    //         that makes `SessionState::decide(TEST_HOST)` return
+    //         `Decision::Intercept(secrets)` instead of `Bypass`,
+    //         so the proxy TERMINATES TLS at its own listener and
+    //         mints a leaf signed by the engram CA. The leaf chains
+    //         cleanly to `ca.pem` and openssl's `-CAfile` then
+    //         verifies the chain. (Bypass mode would relay bytes
+    //         transparently and the netns client would see the
+    //         upstream's self-signed cert, breaking verification —
+    //         even though everything would still be functionally
+    //         correct.) The secret's `real_value` never gets
+    //         substituted in this test because openssl s_client
+    //         doesn't send the placeholder; we just need
+    //         Decision::Intercept.
     let session_id = engram_core::SessionId::new();
     let snat_ip = setup.snat_cidr.guest();
     let network_allow =
         engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap();
+    let dummy_secret = engram_egress_proxy::SecretEntry {
+        placeholder: "warm_proxy_chain_placeholder".into(),
+        real_value: "unused-in-this-test".into(),
+        allow: engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap(),
+    };
     registry.register(engram_egress_proxy::SessionState {
         session_id,
         guest_ip: snat_ip,
         network_allow,
-        secrets: Vec::new(),
+        secrets: vec![dummy_secret],
     });
 
     // ---- 5. From inside the netns, dial TEST_DEST_IP:443 with a
@@ -253,22 +270,28 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
     }
 
     let netns = netns_name_for(sandbox_id);
-    // We deliberately do NOT pass `-CAfile`. Wiring openssl to the
-    // proxy's CA would only validate that the test's path-handling
-    // is right; what we actually want to assert is "the proxy
-    // received the connection, looked up the source IP, peeked
-    // SNI, and minted a cert with the SNI as the CN." A
-    // self-signed-cert verify error from openssl IS the success
-    // path here — it proves the proxy got the connection through
-    // and replied with a mint-on-demand cert. Without REDIRECT or
-    // without the registry lookup matching, openssl wouldn't
-    // receive ANY cert (the connection would never reach the
-    // proxy's TLS code path).
+    // Point openssl at the engram CA so verification actually
+    // succeeds. The proxy's CertMint signs every leaf with this CA,
+    // so a successful `Verify return code: 0 (ok)` from openssl is
+    // the strongest signal we can ask for: REDIRECT delivered the
+    // connection, the proxy looked up the source IP, peeked SNI,
+    // minted a leaf, and the leaf chains cleanly to the CA we just
+    // generated. The netns shares the host filesystem (only the
+    // net namespace is isolated), so the host path resolves
+    // unchanged from inside `ip netns exec`.
+    let ca_pem = proxy_dir.path().join("ca.pem");
+    assert!(
+        ca_pem.exists(),
+        "engram CA didn't write to the expected path; got: {}",
+        ca_pem.display(),
+    );
     let openssl_cmd = format!(
         "echo | openssl s_client \
          -connect {TEST_DEST_IP}:443 \
          -servername {TEST_HOST} \
-         2>&1 | head -c 1024",
+         -CAfile {ca_path} \
+         2>&1 | head -c 2048",
+        ca_path = ca_pem.display(),
     );
     let dial = tokio::process::Command::new("ip")
         .args(["netns", "exec", &netns, "bash", "-c", &openssl_cmd])
@@ -316,21 +339,24 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
     //         registry lookup matched → SNI peek matched →
     //         cert mint → cert presented.
     eprintln!("--- openssl s_client output ---\n{combined}\n--- end ---");
+    // Strongest signal: openssl successfully verified the leaf cert
+    // against the engram CA. This means: (a) REDIRECT delivered
+    // the SYN, (b) the proxy's `Registry::lookup(snat_ip)` matched
+    // post-Fix-3, (c) SNI peek extracted TEST_HOST from the
+    // ClientHello, (d) CertMint minted a leaf with TEST_HOST as
+    // the CN and signed by the engram CA, (e) TLS handshake
+    // completed end-to-end, (f) chain verification passed against
+    // -CAfile. Any failure mode (REDIRECT, registry, mint, etc.)
+    // would surface as a non-zero verify return code or a connect
+    // error before getting here.
     assert!(
-        combined.contains(&format!("CN={TEST_HOST}")),
-        "proxy did not present a cert with the expected SNI as the CN — \
+        combined.contains("Verify return code: 0 (ok)"),
+        "openssl did not get `Verify return code: 0 (ok)` — \
          the warm-egress chain is broken somewhere. Combined output:\n{combined}",
     );
     assert!(
         !combined.contains("connect:errno"),
         "openssl reported a connect error — REDIRECT likely didn't fire \
          or the proxy isn't bound. Output:\n{combined}",
-    );
-    assert!(
-        !combined.contains("no peer certificate"),
-        "TLS handshake failed at cert exchange — the proxy's mint may be \
-         broken, or the connection was closed before cert was sent (which \
-         would mean the registry lookup missed and the proxy dropped). \
-         Output:\n{combined}",
     );
 }
