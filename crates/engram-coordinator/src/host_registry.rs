@@ -574,6 +574,14 @@ impl HostClient for HostRegistry {
         backend.release_shell(sandbox_id).await
     }
 
+    async fn proxy_shell(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        let backend = self.lookup(sandbox_id)?;
+        backend.proxy_shell(sandbox_id).await
+    }
+
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         // Fan out to every registered host. `LocalHostClient` wires
         // it onto its inner VMM backend; `RemoteHostClient`'s default

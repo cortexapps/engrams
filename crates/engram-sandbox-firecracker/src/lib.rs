@@ -2634,6 +2634,17 @@ impl SandboxBackend for FirecrackerBackend {
         ip
     }
 
+    /// ADR 0014 issue #6: the per-VM netns this sandbox runs inside,
+    /// when warm-restored under the M1.16 netns model. Cold sandboxes
+    /// run with TAPs on host root (`Some(net)`, `None`-netns); warm
+    /// sandboxes run inside `engr-vm-<id>` (`None`-net, `Some(netns)`).
+    /// Returned for ProxyShell so the host-agent can dial ttyd from
+    /// inside the right namespace.
+    async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
+        let live = self.sandboxes.get(&id)?;
+        live.netns.as_ref().map(|ns| ns.netns_name.clone())
+    }
+
     /// ADR 0014 M1.12: brief pause → `PATCH /drives` → resume on
     /// the harness virtio-blk drive. Warm-pool lease path uses
     /// this to swap the bake-time stub harness for the session's

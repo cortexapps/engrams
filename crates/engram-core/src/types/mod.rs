@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod registry;
 pub mod sandbox;
 pub mod session;
+pub mod shell;
 pub mod snapshot;
 pub mod template;
 
@@ -22,5 +23,6 @@ pub use manifest::*;
 pub use registry::*;
 pub use sandbox::*;
 pub use session::*;
+pub use shell::*;
 pub use snapshot::*;
 pub use template::*;

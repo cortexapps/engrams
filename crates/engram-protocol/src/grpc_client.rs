@@ -26,8 +26,9 @@ use tonic::transport::Channel;
 use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest, Empty,
-    ExecStartRequest, GuestIpResponse, ReapMaterializeDirRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
+    ExecStartRequest, GuestIpResponse, ProxyShellFrame, ProxyShellKind, ReapMaterializeDirRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use crate::wire::{WireExecRequest, WireReapStats};
 
@@ -394,6 +395,112 @@ impl GrpcHostClient {
         })
     }
 
+    /// ADR 0014 issue #6: open a bidi ProxyShell stream to the host.
+    /// Sends the initial frame carrying `sandbox_id`, then returns a
+    /// `ShellTunnel` whose channels the caller bridges to the
+    /// browser-side Axum WebSocket.
+    pub async fn proxy_shell(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        use engram_core::types::shell::{ShellFrame, ShellTunnel};
+        use futures::StreamExt;
+
+        let (tunnel, ends) = ShellTunnel::pair();
+        let engram_core::types::shell::ShellTunnelEnds {
+            mut outbound_rx,
+            inbound_tx,
+        } = ends;
+
+        // Build the initial frame carrying sandbox_id. After that,
+        // each ShellFrame from `outbound_rx` becomes a ProxyShellFrame
+        // with empty `sandbox_id`. tonic wants a Stream<ProxyShellFrame>;
+        // we build one via async_stream wrapping the mpsc Receiver.
+        let sandbox_bytes = sandbox_id.as_uuid().as_bytes().to_vec();
+
+        let out_stream = async_stream::stream! {
+            // First frame: only sandbox_id matters; payload empty.
+            yield ProxyShellFrame {
+                sandbox_id: sandbox_bytes.clone(),
+                kind: ProxyShellKind::Binary as i32,
+                data: Vec::new(),
+                close_code: 0,
+                close_reason: String::new(),
+            };
+            while let Some(frame) = outbound_rx.recv().await {
+                let (kind, data, close_code, close_reason) = match frame {
+                    ShellFrame::Text(t) => (ProxyShellKind::Text, t.into_bytes(), 0, String::new()),
+                    ShellFrame::Binary(b) => (ProxyShellKind::Binary, b.to_vec(), 0, String::new()),
+                    ShellFrame::Ping(b) => (ProxyShellKind::Ping, b.to_vec(), 0, String::new()),
+                    ShellFrame::Pong(b) => (ProxyShellKind::Pong, b.to_vec(), 0, String::new()),
+                    ShellFrame::Close(None) => (ProxyShellKind::Close, Vec::new(), 0, String::new()),
+                    ShellFrame::Close(Some(c)) => (
+                        ProxyShellKind::Close,
+                        Vec::new(),
+                        c.code as u32,
+                        c.reason,
+                    ),
+                };
+                yield ProxyShellFrame {
+                    sandbox_id: Vec::new(),
+                    kind: kind as i32,
+                    data,
+                    close_code,
+                    close_reason,
+                };
+            }
+        };
+
+        let mut inbound_stream = self
+            .inner
+            .clone()
+            .proxy_shell(out_stream)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+
+        // Pump inbound (host → us) into the tunnel's inbound channel.
+        tokio::spawn(async move {
+            use engram_core::types::shell::{ShellClose, ShellFrame};
+            while let Some(next) = inbound_stream.next().await {
+                let frame = match next {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_shell client recv error");
+                        break;
+                    }
+                };
+                let kind = match ProxyShellKind::try_from(frame.kind) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                let sf = match kind {
+                    ProxyShellKind::Text => {
+                        ShellFrame::Text(String::from_utf8_lossy(&frame.data).into_owned())
+                    }
+                    ProxyShellKind::Binary => ShellFrame::Binary(frame.data.into()),
+                    ProxyShellKind::Ping => ShellFrame::Ping(frame.data.into()),
+                    ProxyShellKind::Pong => ShellFrame::Pong(frame.data.into()),
+                    ProxyShellKind::Close => {
+                        if frame.close_code == 0 && frame.close_reason.is_empty() {
+                            ShellFrame::Close(None)
+                        } else {
+                            ShellFrame::Close(Some(ShellClose {
+                                code: frame.close_code as u16,
+                                reason: frame.close_reason,
+                            }))
+                        }
+                    }
+                };
+                if inbound_tx.send(sf).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(tunnel)
+    }
+
     // ---- ADR 0014 warm pool ----
 
     pub async fn lease_warm_sandbox(
@@ -610,6 +717,13 @@ impl HostClient for GrpcHostClient {
 
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::release_shell(self, sandbox_id).await
+    }
+
+    async fn proxy_shell(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        Self::proxy_shell(self, sandbox_id).await
     }
 
     async fn lease_warm_sandbox(

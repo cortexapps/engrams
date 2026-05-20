@@ -63,6 +63,20 @@ service HostService {
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
 
+  // ADR 0014 issue #6: bidi shell tunnel. Coord pods in GKE can't
+  // reach the per-VM `guest_ip` (10.200.0.x; lives behind a TAP on
+  // the FC host VM, or behind a netns for warm-restored VMs), so the
+  // pre-M1.16 `ws://<guest_ip>:7681/ws` direct-WebSocket from
+  // coord/api/shell.rs always times out from prod. The fix is to
+  // tunnel WS frames through this bidi gRPC: host-agent opens the
+  // upstream WebSocket to ttyd inside the right network namespace
+  // and shuttles frames between the gRPC stream and ttyd.
+  //
+  // First client frame MUST carry `sandbox_id` (other fields ignored
+  // server-side). Subsequent frames carry only `kind` + `data`
+  // (and `close_code`/`close_reason` when `kind == CLOSE`).
+  rpc ProxyShell(stream ProxyShellFrame) returns (stream ProxyShellFrame);
+
   // ---- pool warming ----
   // Lightweight no-op that forces TCP+H2 handshake when called on a
   // freshly built `Channel::connect_lazy`. Coord pods fire one of
@@ -218,6 +232,33 @@ message ExecFrame {
 
 message ExecExit {
   optional int32 status = 1;
+}
+
+// --- ADR 0014 issue #6: ProxyShell ---
+
+message ProxyShellFrame {
+  // Required on the first frame from client (coord) → server (host).
+  // 16-byte UUID. Ignored on every frame after the first, and on
+  // every frame from server → client.
+  bytes sandbox_id = 1;
+  // WebSocket message kind. Mirrors tokio_tungstenite::Message
+  // variants 1:1 — `kind=CLOSE` ends the stream.
+  ProxyShellKind kind = 2;
+  // The WS frame payload (binary or text). Empty for PING / PONG
+  // with no payload, and ignored for CLOSE.
+  bytes data = 3;
+  // Populated only when kind == CLOSE. close_code mirrors RFC 6455
+  // close codes.
+  uint32 close_code = 4;
+  string close_reason = 5;
+}
+
+enum ProxyShellKind {
+  TEXT = 0;
+  BINARY = 1;
+  PING = 2;
+  PONG = 3;
+  CLOSE = 4;
 }
 
 // --- ADR 0014 warm pool ---

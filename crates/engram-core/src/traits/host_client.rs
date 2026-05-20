@@ -27,6 +27,7 @@ use crate::traits::sandbox::{HarnessDial, HarnessSink};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::ids::TemplateRef;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
+use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
 use crate::types::{SandboxId, SessionId};
 
@@ -173,6 +174,34 @@ pub trait HostClient: Send + Sync {
     /// hub silently swallows underflow rather than erroring so a buggy
     /// caller can't poison the count.
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
+
+    /// ADR 0014 issue #6: open a bidi shell tunnel to the in-guest
+    /// `ttyd` for `sandbox_id`. The returned [`ShellTunnel`] is a
+    /// pair of mpsc channels:
+    /// - `outbound`: caller (coord) sends WS frames here; the
+    ///   implementation forwards each frame to ttyd inside the guest.
+    /// - `inbound`: implementation pushes WS frames received from
+    ///   ttyd here; caller drains and forwards to the browser.
+    ///
+    /// On either channel closing (browser disconnect, ttyd exit,
+    /// transport error) the implementation drops both halves and
+    /// frees its proxy task; idempotent. The first-frame `sandbox_id`
+    /// convention on the wire (gRPC ProxyShellFrame) lives in the
+    /// gRPC client/server only — this trait surface takes the
+    /// `sandbox_id` directly so trait callers don't have to embed it
+    /// in the frame stream.
+    ///
+    /// Default impl errors with `NotFound`: only host-agent
+    /// implementations actually proxy shells. The Local impl in the
+    /// host-agent opens a WebSocket to `ws://<guest_ip>:7681/ws`
+    /// inside the right network namespace (per
+    /// [`SandboxBackend::netns_name_for`]) and bridges; the gRPC
+    /// client impl opens a gRPC bidi stream and bridges the channels
+    /// with the wire frames.
+    async fn proxy_shell(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
+        let _ = sandbox_id;
+        Err(SandboxError::NotFound)
+    }
 
     /// How a harness process inside this host's sandboxes dials back
     /// to the harness channel. Static per-host capability — drives

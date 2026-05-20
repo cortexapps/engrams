@@ -200,6 +200,26 @@ impl HostClient for LocalHostClient {
         Ok(())
     }
 
+    async fn proxy_shell(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        // ADR 0014 issue #6: dial ttyd in the right netns and bridge
+        // WS frames through a ShellTunnel pair. The host's own
+        // SandboxBackend knows whether this sandbox is warm-restored
+        // (`netns_name_for == Some`) or cold (`None`); the proxy_shell
+        // module handles both cases.
+        let guest_ip = self
+            .sandbox
+            .guest_ip(sandbox_id)
+            .await
+            .ok_or_else(|| SandboxError::Vm("proxy_shell: guest_ip unavailable".into()))?;
+        let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
+        let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
+        crate::proxy_shell::open_shell_tunnel(guest_ip, netns_name, ends).await?;
+        Ok(tunnel)
+    }
+
     async fn lease_warm_sandbox(
         &self,
         template_ref: engram_core::types::ids::TemplateRef,

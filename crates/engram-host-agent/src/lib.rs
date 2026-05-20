@@ -35,6 +35,7 @@ pub mod live_attach;
 pub mod metrics;
 pub mod orphan_reap;
 pub mod pooled_backend;
+pub mod proxy_shell;
 pub mod resource;
 pub mod shutdown;
 pub mod snapshot;

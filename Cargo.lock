@@ -1083,6 +1083,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.21.0",
  "tokio-util",
  "tonic",
  "tracing",

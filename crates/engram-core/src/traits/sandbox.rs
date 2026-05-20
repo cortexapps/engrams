@@ -248,6 +248,19 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0014 issue #6: name of the Linux network namespace the
+    /// sandbox's TCP services live behind, if any. Returned for
+    /// warm-restored Firecracker sandboxes that run inside a per-VM
+    /// `engr-vm-<id>` netns (ADR 0014 M1.16); the host-agent's
+    /// ProxyShell handler enters this namespace before dialing
+    /// ttyd. `None` for sandboxes whose network is on the host root
+    /// (cold FC path before unification, plus all backends without
+    /// a netns model: VZ, Process). Default returns None so other
+    /// backends inherit the "dial on host root" semantics unchanged.
+    async fn netns_name_for(&self, _id: SandboxId) -> Option<String> {
+        None
+    }
+
     /// How a harness process inside this backend's sandbox dials
     /// back to the host's harness channel. Drives the `argv` shape
     /// `resolve_harness` builds for the agent. Default is `Vsock`

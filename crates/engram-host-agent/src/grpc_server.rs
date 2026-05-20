@@ -25,10 +25,11 @@ use engram_protocol::grpc::{
     lease_warm_response::Outcome as PbLeaseOutcome, ApplyEgressPolicyRequest,
     BindHarnessSessionRequest, CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit,
     ExecFrame, ExecStartRequest, GuestIpResponse, LaunchWarmRequest, LeaseWarmRequest,
-    LeaseWarmResponse, ListSandboxesResponse, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotResponse, StaleTemplate as PbStaleTemplate, StartAgentRequest,
-    UnbindHarnessSessionRequest, WarmSlotCount as PbWarmSlotCount, WarmSlotsResponse,
+    LeaseWarmResponse, ListSandboxesResponse, ProxyShellFrame, ProxyShellKind,
+    ReapMaterializeDirRequest, ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotResponse, StaleTemplate as PbStaleTemplate,
+    StartAgentRequest, UnbindHarnessSessionRequest, WarmSlotCount as PbWarmSlotCount,
+    WarmSlotsResponse,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -83,6 +84,8 @@ pub async fn boot(
 #[tonic::async_trait]
 impl HostService for HostServiceImpl {
     type ExecStartStream = Pin<Box<dyn Stream<Item = Result<ExecFrame, Status>> + Send + 'static>>;
+    type ProxyShellStream =
+        Pin<Box<dyn Stream<Item = Result<ProxyShellFrame, Status>> + Send + 'static>>;
 
     async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
         Ok(Response::new(Empty {}))
@@ -483,6 +486,136 @@ impl HostService for HostServiceImpl {
 
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
+    }
+
+    /// ADR 0014 issue #6: bidi WS-frame tunnel. First inbound frame
+    /// MUST carry `sandbox_id`; subsequent frames carry only the
+    /// `kind` + `data` (and close_code/close_reason when CLOSE).
+    /// The server opens a ShellTunnel via `HostClient::proxy_shell`
+    /// (which dials ttyd in the right netns), then bridges the gRPC
+    /// stream's frames to/from the tunnel's channels.
+    async fn proxy_shell(
+        &self,
+        req: Request<tonic::Streaming<ProxyShellFrame>>,
+    ) -> Result<Response<Self::ProxyShellStream>, Status> {
+        let mut inbound = req.into_inner();
+
+        // First frame carries sandbox_id. Wait for it (with a small
+        // budget so a misbehaving client doesn't pin a handler) and
+        // open the tunnel.
+        use futures::StreamExt;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next())
+            .await
+            .map_err(|_| Status::deadline_exceeded("proxy_shell: no first frame within 5s"))?
+            .ok_or_else(|| Status::cancelled("proxy_shell: client closed before first frame"))?
+            .map_err(|e| Status::internal(format!("proxy_shell: recv first frame: {e}")))?;
+        let sandbox_id = decode_sandbox_id(&first.sandbox_id)?;
+
+        let tunnel = self
+            .inner
+            .proxy_shell(sandbox_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        let engram_core::types::shell::ShellTunnel {
+            outbound: tunnel_outbound,
+            inbound: mut tunnel_inbound,
+        } = tunnel;
+
+        // mpsc carrying frames out to the gRPC client (browser side).
+        let (out_tx, out_rx) = mpsc::channel::<Result<ProxyShellFrame, Status>>(64);
+
+        // gRPC inbound (client → us) drains `inbound`; we forward
+        // each frame into the ShellTunnel's outbound channel (which
+        // the tunnel pump then writes to ttyd). The first frame
+        // we already consumed above — if it carried data (it
+        // shouldn't, but defensively forward it).
+        let first_payload = grpc_frame_to_shell_frame(first);
+        if let Some(sf) = first_payload {
+            let _ = tunnel_outbound.send(sf).await;
+        }
+        let tunnel_outbound_for_pump = tunnel_outbound.clone();
+        tokio::spawn(async move {
+            while let Some(next) = inbound.next().await {
+                let frame = match next {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_shell: client recv error");
+                        break;
+                    }
+                };
+                let Some(sf) = grpc_frame_to_shell_frame(frame) else {
+                    continue;
+                };
+                if tunnel_outbound_for_pump.send(sf).await.is_err() {
+                    break;
+                }
+            }
+            // Client closed; drop the tunnel outbound so the
+            // tunnel's pump tears down.
+            drop(tunnel_outbound_for_pump);
+        });
+
+        // Tunnel inbound (ttyd → us) drains here; we forward each
+        // frame to the gRPC client out_tx.
+        tokio::spawn(async move {
+            while let Some(sf) = tunnel_inbound.recv().await {
+                let frame = shell_frame_to_grpc_frame(sf);
+                if out_tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
+        Ok(Response::new(Box::pin(out_stream) as Self::ProxyShellStream))
+    }
+}
+
+/// Translate a proto `ProxyShellFrame` into the trait-level
+/// [`engram_core::types::shell::ShellFrame`]. `None` for frames that
+/// carry no payload (e.g. control frames the server should ignore).
+fn grpc_frame_to_shell_frame(
+    frame: ProxyShellFrame,
+) -> Option<engram_core::types::shell::ShellFrame> {
+    use engram_core::types::shell::{ShellClose, ShellFrame};
+    let kind = ProxyShellKind::try_from(frame.kind).ok()?;
+    Some(match kind {
+        ProxyShellKind::Text => ShellFrame::Text(String::from_utf8_lossy(&frame.data).into_owned()),
+        ProxyShellKind::Binary => ShellFrame::Binary(frame.data.into()),
+        ProxyShellKind::Ping => ShellFrame::Ping(frame.data.into()),
+        ProxyShellKind::Pong => ShellFrame::Pong(frame.data.into()),
+        ProxyShellKind::Close => {
+            if frame.close_code == 0 && frame.close_reason.is_empty() {
+                ShellFrame::Close(None)
+            } else {
+                ShellFrame::Close(Some(ShellClose {
+                    code: frame.close_code as u16,
+                    reason: frame.close_reason,
+                }))
+            }
+        }
+    })
+}
+
+/// Translate a [`engram_core::types::shell::ShellFrame`] into a proto
+/// `ProxyShellFrame`. Used by both the host-agent server (ttyd →
+/// client) and the gRPC client (client → ttyd).
+fn shell_frame_to_grpc_frame(frame: engram_core::types::shell::ShellFrame) -> ProxyShellFrame {
+    use engram_core::types::shell::ShellFrame;
+    let (kind, data, close_code, close_reason) = match frame {
+        ShellFrame::Text(t) => (ProxyShellKind::Text, t.into_bytes(), 0, String::new()),
+        ShellFrame::Binary(b) => (ProxyShellKind::Binary, b.to_vec(), 0, String::new()),
+        ShellFrame::Ping(b) => (ProxyShellKind::Ping, b.to_vec(), 0, String::new()),
+        ShellFrame::Pong(b) => (ProxyShellKind::Pong, b.to_vec(), 0, String::new()),
+        ShellFrame::Close(None) => (ProxyShellKind::Close, Vec::new(), 0, String::new()),
+        ShellFrame::Close(Some(c)) => (ProxyShellKind::Close, Vec::new(), c.code as u32, c.reason),
+    };
+    ProxyShellFrame {
+        sandbox_id: Vec::new(),
+        kind: kind as i32,
+        data,
+        close_code,
+        close_reason,
     }
 }
 
