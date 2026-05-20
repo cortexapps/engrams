@@ -232,16 +232,44 @@ async fn connect_ttyd_in_netns(
     }
     #[cfg(target_os = "linux")]
     {
-        let stream = connect_tcp_in_netns_linux(netns_name, guest_ip).await?;
-        // Wrap as MaybeTlsStream::Plain so the WS handshake produces
-        // a `WebSocketStream<MaybeTlsStream<TcpStream>>` that matches
-        // the cold path's return type exactly.
-        let wrapped = tokio_tungstenite::MaybeTlsStream::Plain(stream);
-        let request = build_request()?;
-        let (ws, _resp) = tokio_tungstenite::client_async(request, wrapped)
-            .await
-            .map_err(|e| SandboxError::Vm(format!("ttyd ws handshake: {e}").into()))?;
-        Ok(ws)
+        // ADR 0014 issue #6 follow-up: retry connection-refused for
+        // up to TTYD_DIAL_DEADLINE, same shape as the cold path. ttyd
+        // inside the warm-restored guest takes a few seconds to bind
+        // :7681 — the same boot-race the cold path retries against.
+        // Without this, the dashboard's first SHELL-tab click after
+        // a fresh warm-lease races ttyd's bind and the user sees
+        // "abnormal close" (observed on session 9d9fef3e, 2026-05-20).
+        let deadline = std::time::Instant::now() + TTYD_DIAL_DEADLINE;
+        let mut backoff = TTYD_BACKOFF_START;
+        loop {
+            let stream = match connect_tcp_in_netns_linux(netns_name, guest_ip).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let refused = msg.contains("Connection refused");
+                    if !refused || std::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(TTYD_BACKOFF_MAX);
+                    continue;
+                }
+            };
+            // TCP connect succeeded — now do the WS handshake. If the
+            // handshake itself fails it's a different problem (ttyd
+            // emitted a non-WS reply, etc.) and retrying connect-refused
+            // wouldn't help, so we just surface the error.
+            //
+            // Wrap as MaybeTlsStream::Plain so the WS handshake
+            // produces a `WebSocketStream<MaybeTlsStream<TcpStream>>`
+            // matching the cold path's return type exactly.
+            let wrapped = tokio_tungstenite::MaybeTlsStream::Plain(stream);
+            let request = build_request()?;
+            let (ws, _resp) = tokio_tungstenite::client_async(request, wrapped)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("ttyd ws handshake: {e}").into()))?;
+            return Ok(ws);
+        }
     }
 }
 
