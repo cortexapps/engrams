@@ -49,6 +49,15 @@ pub async fn evict_idle_session(
     // Step 1: take a snapshot. ADR 0007 Phase 6: backend owns its
     // staging dir; coord no longer pre-allocates one. Durability
     // flows through the chunked manifests on `SnapshotMetadata`.
+    //
+    // ADR 0014 issue #1/#2: the host tracks this as an in-flight
+    // snapshot. Every exit path after this point MUST end with either
+    // `commit_snapshot` (full pipeline succeeded) or `abort_snapshot`
+    // (anything else). Without this, a coord-side flake leaves the
+    // 4 GiB local snapshot dir + per-snapshot blob keys orphaned —
+    // host-side `idle_evictor` re-POSTs the candidate on the next tick,
+    // a fresh SnapshotId is minted, and we leak ~4 GiB per retry. That
+    // was the failure on `engrams-fc-xngk` (25 dirs × 4 GiB in 13 min).
     let metadata = state
         .services
         .host
@@ -79,12 +88,10 @@ pub async fn evict_idle_session(
         )
         .await,
     };
-    state
-        .services
-        .meta
-        .record_snapshot(record.clone())
-        .await
-        .map_err(|e| EvictError::Meta(e.to_string()))?;
+    if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
+        abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;
+        return Err(EvictError::Meta(e.to_string()));
+    }
 
     // Step 3: destroy the sandbox. Best-effort — even on failure we
     // still want to mark the session Idle so a future resume doesn't
@@ -114,14 +121,17 @@ pub async fn evict_idle_session(
             "idle eviction: assign_session_sandbox(None) failed",
         );
     }
-    state
+    if let Err(e) = state
         .services
         .meta
         .set_session_status(session_id, SessionStatus::Idle)
         .await
-        .map_err(|e| EvictError::Meta(e.to_string()))?;
+    {
+        abort_inflight_snapshot(state, session_id, sandbox_id, "set_session_status").await;
+        return Err(EvictError::Meta(e.to_string()));
+    }
 
-    state
+    if let Err(e) = state
         .emit(
             session_id,
             SessionEvent::SnapshotTaken {
@@ -131,12 +141,18 @@ pub async fn evict_idle_session(
             },
         )
         .await
-        .map_err(|e| EvictError::Emit(e.to_string()))?;
-    state
+    {
+        abort_inflight_snapshot(state, session_id, sandbox_id, "emit SnapshotTaken").await;
+        return Err(EvictError::Emit(e.to_string()));
+    }
+    if let Err(e) = state
         .emit(session_id, SessionEvent::Evicted { at: now })
         .await
-        .map_err(|e| EvictError::Emit(e.to_string()))?;
-    state
+    {
+        abort_inflight_snapshot(state, session_id, sandbox_id, "emit Evicted").await;
+        return Err(EvictError::Emit(e.to_string()));
+    }
+    if let Err(e) = state
         .emit(
             session_id,
             SessionEvent::StatusChanged {
@@ -146,9 +162,50 @@ pub async fn evict_idle_session(
             },
         )
         .await
-        .map_err(|e| EvictError::Emit(e.to_string()))?;
+    {
+        abort_inflight_snapshot(state, session_id, sandbox_id, "emit StatusChanged").await;
+        return Err(EvictError::Emit(e.to_string()));
+    }
+
+    // Full pipeline succeeded — commit the snapshot. Failure here is
+    // unusual (host RPC error) and means the host's in-flight tracking
+    // wasn't cleared, but the artifacts are still consistent. Log and
+    // let it ride; the next snapshot() for this sandbox will overwrite
+    // anyway, and the PG row still references the durable artifacts.
+    if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            error = %e,
+            "idle eviction: commit_snapshot failed after full pipeline success \
+             (host-side in-flight tracking may be stale until next retry overwrites)",
+        );
+    }
 
     Ok(())
+}
+
+/// ADR 0014 issue #1/#2: best-effort `abort_snapshot` after a
+/// downstream pipeline failure in [`evict_idle_session`]. Logs but
+/// never propagates — the caller's pipeline error is what surfaces.
+/// Hosts implement abort idempotently so spurious double-calls are
+/// safe.
+async fn abort_inflight_snapshot(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+    scope: &'static str,
+) {
+    if let Err(e) = state.services.host.abort_snapshot(sandbox_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            scope,
+            error = %e,
+            "idle eviction: abort_snapshot failed after pipeline failure \
+             (orphan local dir + blobs may persist until next retry)",
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -344,6 +401,427 @@ mod tests {
         assert!(
             !kinds.iter().any(|k| k == "checkpoint_pushed"),
             "ADR 0005: checkpoint_pushed must no longer be emitted (got {kinds:?})"
+        );
+    }
+
+    /// ADR 0014 issue #1/#2 regression guard. When `record_snapshot`
+    /// fails post-snapshot, the pipeline MUST call
+    /// `host.abort_snapshot(sandbox_id)` before bubbling — without
+    /// this, the host leaks the per-snapshot dir (4 GiB on FC), which
+    /// is exactly the failure mode that filled `engrams-fc-xngk` in
+    /// 13 minutes.
+    #[tokio::test]
+    async fn evict_idle_session_aborts_snapshot_when_record_snapshot_fails() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Spy that wraps the real HostRegistry and counts
+        // commit_snapshot + abort_snapshot calls.
+        struct SpyHost {
+            inner: StdArc<dyn engram_core::traits::HostClient>,
+            aborts: StdArc<AtomicU32>,
+            commits: StdArc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for SpyHost {
+            // Pass through all required methods to inner.
+            async fn create(
+                &self,
+                spec: SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.destroy(id).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.inner.snapshot(id).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.commits.fetch_add(1, Ordering::SeqCst);
+                self.inner.commit_snapshot(id).await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+                self.inner.abort_snapshot(id).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+            ) {
+                self.inner.bind_session(session_id, sandbox_id).await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, text).await
+            }
+            async fn acquire_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.acquire_shell(sandbox_id).await
+            }
+            async fn release_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.release_shell(sandbox_id).await
+            }
+        }
+
+        // Wire up state with the spy wrapping the standard
+        // HostRegistry → LocalHostClient → ProcessBackend stack, then
+        // toggle MiniMeta to fail the next record_snapshot.
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionStatus::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:evict-test".into(),
+            harness: HarnessSpec::None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let host_registry = Arc::new(HostRegistry::new());
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+
+        let aborts = StdArc::new(AtomicU32::new(0));
+        let commits = StdArc::new(AtomicU32::new(0));
+        let spy: Arc<dyn engram_core::traits::HostClient> = Arc::new(SpyHost {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            aborts: aborts.clone(),
+            commits: commits.clone(),
+        });
+
+        let meta = Arc::new(MiniMeta::new(session));
+        *meta.fail_next_record_snapshot.lock() = true;
+
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: spy,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-evict-abort-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-evict-abort-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+
+        let err = evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect_err("record_snapshot failure must bubble out of evict_idle_session");
+        match err {
+            EvictError::Meta(_) => {}
+            other => panic!("expected EvictError::Meta, got {other:?}"),
+        }
+
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            1,
+            "host.abort_snapshot must fire exactly once after record_snapshot failure",
+        );
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            0,
+            "host.commit_snapshot must NOT fire when pipeline failed",
+        );
+    }
+
+    /// Sanity inverse: full pipeline success → commit fires, no abort.
+    #[tokio::test]
+    async fn evict_idle_session_commits_snapshot_on_full_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Tiny duplicate of the spy from the abort test — keeps the
+        // tests independently readable.
+        struct SpyHost {
+            inner: StdArc<dyn engram_core::traits::HostClient>,
+            aborts: StdArc<AtomicU32>,
+            commits: StdArc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for SpyHost {
+            async fn create(
+                &self,
+                spec: SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.destroy(id).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.inner.snapshot(id).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.commits.fetch_add(1, Ordering::SeqCst);
+                self.inner.commit_snapshot(id).await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+                self.inner.abort_snapshot(id).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+            ) {
+                self.inner.bind_session(session_id, sandbox_id).await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, text).await
+            }
+            async fn acquire_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.acquire_shell(sandbox_id).await
+            }
+            async fn release_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.release_shell(sandbox_id).await
+            }
+        }
+
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionStatus::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:evict-test".into(),
+            harness: HarnessSpec::None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let host_registry = Arc::new(HostRegistry::new());
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+
+        let aborts = StdArc::new(AtomicU32::new(0));
+        let commits = StdArc::new(AtomicU32::new(0));
+        let spy: Arc<dyn engram_core::traits::HostClient> = Arc::new(SpyHost {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            aborts: aborts.clone(),
+            commits: commits.clone(),
+        });
+
+        let services = Services {
+            meta: Arc::new(MiniMeta::new(session)),
+            cloud: Arc::new(MockCloud::new()),
+            host: spy,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-evict-commit-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-evict-commit-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("full pipeline must succeed");
+
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "commit_snapshot must fire exactly once on full pipeline success",
+        );
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            0,
+            "abort_snapshot must NOT fire on full pipeline success",
         );
     }
 

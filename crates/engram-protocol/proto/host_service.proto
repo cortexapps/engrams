@@ -23,6 +23,17 @@ service HostService {
   rpc DestroySandbox(SandboxIdMessage) returns (Empty);
   rpc ListSandboxes(Empty) returns (ListSandboxesResponse);
   rpc Snapshot(SandboxIdMessage) returns (SnapshotResponse);
+  // ADR 0014 issue #1/#2: signal that a just-produced snapshot's
+  // downstream pipeline (record_snapshot → destroy → mark Idle)
+  // fully succeeded; the host clears its in-flight tracking and the
+  // snapshot artifacts are now PG-owned. Idempotent.
+  rpc CommitSnapshot(SandboxIdMessage) returns (Empty);
+  // ADR 0014 issue #1/#2: signal that a just-produced snapshot's
+  // downstream pipeline failed; the host removes the local
+  // snapshot dir + the per-snapshot opaque blobs (state.bin,
+  // sidecar.json, working_set.json) so they don't accumulate as
+  // 4 GiB-per-attempt leaks during retry storms. Idempotent.
+  rpc AbortSnapshot(SandboxIdMessage) returns (Empty);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
 

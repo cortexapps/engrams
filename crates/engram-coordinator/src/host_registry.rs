@@ -481,6 +481,16 @@ impl HostClient for HostRegistry {
         backend.snapshot(id).await
     }
 
+    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let backend = self.lookup(id)?;
+        backend.commit_snapshot(id).await
+    }
+
+    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let backend = self.lookup(id)?;
+        backend.abort_snapshot(id).await
+    }
+
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         let (host_id, backend) = self.pick_any().ok_or_else(Self::no_host_error)?;
         let sandbox_id = backend.restore(metadata).await?;

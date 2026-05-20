@@ -200,6 +200,36 @@ pub trait SandboxBackend: Send + Sync {
     /// files before reading.
     fn snapshot_path_for(&self, snapshot_id: crate::types::SnapshotId) -> PathBuf;
 
+    /// ADR 0014 issue #1/#2: commit a snapshot that was just produced
+    /// by [`Self::snapshot`]. Signals to the backend that the caller's
+    /// downstream pipeline (`record_snapshot` → `destroy` → mark Idle)
+    /// has fully succeeded and the snapshot artifacts are now owned by
+    /// the `snapshots` row.
+    ///
+    /// Idempotent: calling commit twice (or commit after abort) is a
+    /// no-op. Default impl returns Ok so backends without portable
+    /// snapshot artifacts (the in-process and VZ-dev backends) inherit
+    /// the trait shape unchanged. The Firecracker pooled backend
+    /// overrides to clear its in-flight tracking.
+    async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// ADR 0014 issue #1/#2: abort a snapshot previously produced by
+    /// [`Self::snapshot`] but whose downstream caller pipeline failed.
+    /// Backends with on-disk + BlobStorage artifacts (FC pooled) remove
+    /// the per-snapshot directory and the small per-snapshot opaque
+    /// blobs (state.bin, sidecar.json, working_set.json). Chunks
+    /// stay (content-addressed, dedup-safe, GC'd later).
+    ///
+    /// Idempotent: aborting twice, or aborting a sandbox with no
+    /// in-flight snapshot, is a no-op. The minimal contract is "best
+    /// effort cleanup, never panic, never error if there's nothing to
+    /// clean." Default impl returns Ok.
+    async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
 

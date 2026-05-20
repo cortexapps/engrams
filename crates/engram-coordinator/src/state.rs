@@ -681,6 +681,10 @@ pub(crate) mod tests {
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
+        /// ADR 0014 issue #1/#2 idle-evictor abort-on-failure tests:
+        /// when true, the next `record_snapshot` call returns an error.
+        /// Reset to false on use.
+        pub(crate) fail_next_record_snapshot: PlMutex<bool>,
     }
 
     impl MiniMeta {
@@ -690,6 +694,7 @@ pub(crate) mod tests {
                 events: PlMutex::new(Vec::new()),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
+                fail_next_record_snapshot: PlMutex::new(false),
             }
         }
     }
@@ -785,6 +790,14 @@ pub(crate) mod tests {
             Ok(Vec::new())
         }
         async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
+            let mut should_fail = self.fail_next_record_snapshot.lock();
+            if *should_fail {
+                *should_fail = false;
+                return Err(MetaError::Conflict(
+                    "MiniMeta fail_next_record_snapshot: injected failure".into(),
+                ));
+            }
+            drop(should_fail);
             self.snapshots.lock().push(snap);
             Ok(())
         }

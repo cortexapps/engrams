@@ -102,6 +102,19 @@ pub trait HostClient: Send + Sync {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+    /// ADR 0014 issue #1/#2: commit a snapshot whose post-snapshot
+    /// pipeline has fully succeeded. See `SandboxBackend::commit_snapshot`
+    /// for the contract. Default impl returns Ok so HostClients backed by
+    /// backends that don't need a commit phase (Process, VZ-dev) work
+    /// unchanged.
+    async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+    /// ADR 0014 issue #1/#2: abort a snapshot whose downstream pipeline
+    /// failed. Idempotent. See `SandboxBackend::abort_snapshot`.
+    async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
 
     /// ADR 0013: bundle the egress policy with the agent spawn so the

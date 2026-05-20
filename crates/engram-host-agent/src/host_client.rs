@@ -141,6 +141,14 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot(id).await
     }
 
+    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.sandbox.commit_snapshot(id).await
+    }
+
+    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.sandbox.abort_snapshot(id).await
+    }
+
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         self.sandbox.restore(metadata).await
     }

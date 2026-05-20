@@ -146,6 +146,17 @@ pub struct PooledBackend {
     /// chunked disks.
     #[cfg(target_os = "linux")]
     nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
+    /// ADR 0014 issue #1/#2: per-sandbox in-flight snapshot tracking.
+    /// `snapshot(sandbox_id)` records the produced snapshot_id here so
+    /// (a) a retry from the same sandbox first aborts the prior attempt
+    /// (overwrite-in-place semantics — prevents the 4-GiB-per-retry
+    /// leak the prod incident on `engrams-fc-xngk` exhibited) and
+    /// (b) the caller can `commit`/`abort` by sandbox_id without
+    /// passing the snapshot_id back. Cleared by `commit_snapshot` and
+    /// `abort_snapshot`; not persisted across host-agent restarts (a
+    /// restart between snapshot and commit/abort leaves an orphan dir
+    /// — small bounded leak we accept until a host-side janitor lands).
+    inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
 }
 
 impl PooledBackend {
@@ -163,6 +174,7 @@ impl PooledBackend {
             nbd_pool: None,
             #[cfg(target_os = "linux")]
             nbd_sandboxes: Arc::new(DashMap::new()),
+            inflight_snapshots: Arc::new(DashMap::new()),
         }
     }
 
@@ -618,6 +630,71 @@ impl PooledBackend {
             path = %mem_path.display(),
             "materialised memory.bin from chunked memory manifest",
         );
+        Ok(())
+    }
+
+    /// ADR 0014 issue #1/#2: tear down a snapshot whose downstream
+    /// pipeline failed (or whose successor snapshot() call is about
+    /// to overwrite it). Removes:
+    ///
+    /// - the per-snapshot local dir at
+    ///   `<work_dir>/sandboxes/snapshots/<snapshot_id>/` (4+ GiB on FC;
+    ///   the 99 GB `engrams-fc-xngk` host filled in ~12 min by leaking
+    ///   25 of these in 13 min).
+    /// - the per-snapshot opaque blobs in BlobStorage (state.bin,
+    ///   sidecar.json, working_set.json). Each is small (KiB-MiB) but
+    ///   leaving them around per failed attempt accumulates.
+    ///
+    /// Chunks (memory + disk content-addressed manifests) are NOT
+    /// deleted here: they're shared across snapshots by content hash
+    /// and the existing `chunk_gc` sweep is the right tool. Same
+    /// reason we don't bother deleting from the chunk-cache LRU.
+    ///
+    /// Best-effort: every step's error is logged but never propagated
+    /// beyond the WARN level. The caller (snapshot retry or
+    /// `abort_snapshot` RPC) can't act on partial failure usefully —
+    /// the only useful retry is calling this function again, which is
+    /// idempotent. Clears the inflight tracking entry on entry so a
+    /// double-call doesn't try to clean twice.
+    async fn abort_prior_inflight_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let Some((_, snapshot_id)) = self.inflight_snapshots.remove(&id) else {
+            return Ok(());
+        };
+        let dest = self.inner.snapshot_path_for(snapshot_id);
+        match fs::remove_dir_all(&dest).await {
+            Ok(()) => tracing::info!(
+                sandbox_id = %id,
+                snapshot_id = %snapshot_id,
+                dest = %dest.display(),
+                "abort_snapshot: removed local snapshot dir",
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                sandbox_id = %id,
+                snapshot_id = %snapshot_id,
+                dest = %dest.display(),
+                error = %e,
+                "abort_snapshot: rm -rf of snapshot dir failed (best-effort)",
+            ),
+        }
+        if let Some(chunk_store) = self.chunk_store.as_ref() {
+            let blob = chunk_store.blob_storage();
+            for key in [
+                engram_chunk_store::snapshot_blob::state_blob_key(snapshot_id),
+                engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot_id),
+                engram_chunk_store::snapshot_blob::working_set_blob_key(snapshot_id),
+            ] {
+                if let Err(e) = blob.delete(&key).await {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        snapshot_id = %snapshot_id,
+                        key = %key,
+                        error = %e,
+                        "abort_snapshot: blob delete failed (best-effort)",
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1245,6 +1322,26 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
+        // was produced but never committed (caller's downstream
+        // pipeline failed or the coord pod crashed between snapshot
+        // and commit), tear down its artifacts BEFORE we mint a fresh
+        // SnapshotId. This is the overwrite-in-place semantic that
+        // keeps the host-side disk bounded under coord-side retry
+        // storms — the prod incident on `engrams-fc-xngk` leaked
+        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
+        // id and left the prior dir on disk.
+        if self.inflight_snapshots.contains_key(&id) {
+            if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "snapshot retry: best-effort abort of prior in-flight snapshot failed; \
+                     proceeding with fresh attempt anyway",
+                );
+            }
+        }
+
         // ADR 0007 Phase 4: if this sandbox is NBD-backed, flush
         // its dirty disk chunks BEFORE we ask the inner FC backend
         // to take its memory snapshot. The flush produces a new
@@ -1370,7 +1467,15 @@ impl SandboxBackend for PooledBackend {
         .await;
 
         match post {
-            Ok(m) => Ok(m),
+            Ok(m) => {
+                // ADR 0014 issue #1/#2: record the snapshot_id so a
+                // future commit/abort RPC can clean up the per-snapshot
+                // artifacts even though the caller only knows the
+                // sandbox_id. Also lets a retry of this same sandbox's
+                // snapshot() find and tear down the prior attempt.
+                self.inflight_snapshots.insert(id, m.id);
+                Ok(m)
+            }
             Err(e) => {
                 // ADR 0014 cleanup hygiene: rm -rf the FC-written
                 // snapshot dir before propagating. Idle-evict retry
@@ -1394,6 +1499,35 @@ impl SandboxBackend for PooledBackend {
                 Err(e)
             }
         }
+    }
+
+    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // ADR 0014 issue #1/#2: caller's downstream pipeline
+        // (record_snapshot → destroy → mark Idle) succeeded; the
+        // snapshot is now owned by the `snapshots` row. Clear our
+        // tracking so a subsequent snapshot() for this sandbox treats
+        // the prior artifacts as no-longer-our-responsibility (the
+        // committed snapshot stays on disk and in BlobStorage; PG holds
+        // the durable reference).
+        if self.inflight_snapshots.remove(&id).is_none() {
+            tracing::debug!(
+                sandbox_id = %id,
+                "commit_snapshot called with no in-flight snapshot tracked; no-op",
+            );
+        }
+        Ok(())
+    }
+
+    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // ADR 0014 issue #1/#2: caller's downstream pipeline failed;
+        // tear down the snapshot artifacts we just produced before
+        // returning. Idempotent: if there's no in-flight snapshot for
+        // this sandbox (commit already ran, or abort already ran, or
+        // we never produced one), this is a clean no-op.
+        if !self.inflight_snapshots.contains_key(&id) {
+            return Ok(());
+        }
+        self.abort_prior_inflight_snapshot(id).await
     }
 
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
@@ -2645,5 +2779,230 @@ mod tests {
         // 8. The materialized file exists and is byte-equal.
         let materialized = tokio::fs::read(&expected).await.unwrap();
         assert_eq!(materialized, bytes, "materialized file bytes mismatch");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ADR 0014 issue #1/#2: commit + abort snapshot lifecycle tests.
+    // ──────────────────────────────────────────────────────────────
+
+    mod snapshot_lifecycle_tests {
+        use super::*;
+        use engram_chunk_store::ChunkStore;
+        use engram_storage_local::LocalBlobStorage;
+
+        /// Stripped-down FC-shaped inner that writes the three
+        /// canonical files (memory.bin, state.bin, manifest.json) into
+        /// a sandbox-id-keyed (NOT snapshot-id-keyed — we want to see
+        /// PooledBackend driving the snapshot_id path) staging root.
+        struct LifecycleInner {
+            staging_root: PathBuf,
+        }
+        impl LifecycleInner {
+            fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging_root.join(id.to_string())
+            }
+        }
+        #[async_trait]
+        impl SandboxBackend for LifecycleInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.dir_for(snapshot_id);
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![0u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"fake-state-bin")
+                    .await
+                    .unwrap();
+                // Minimal but parseable sidecar (the post-snapshot
+                // path validates JSON; we don't care about content).
+                let manifest = serde_json::json!({
+                    "sandbox_id": uuid::Uuid::new_v4(),
+                    "created_at": chrono::Utc::now(),
+                    "spec": {
+                        "image": "test:1", "rootfs_source": null, "image_uri": null,
+                        "harness_pack_uri": null, "cpu": {"vcpus": 1},
+                        "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+                        "ttl": null, "env": {}, "workdir": null,
+                        "harness_substrate": null, "network": {}
+                    },
+                    "format": "fc"
+                });
+                tokio::fs::write(
+                    dest.join("manifest.json"),
+                    serde_json::to_vec_pretty(&manifest).unwrap(),
+                )
+                .await
+                .unwrap();
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "test:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.dir_for(id)
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        fn build_pooled(
+            tmp: &tempfile::TempDir,
+        ) -> (PooledBackend, Arc<dyn engram_core::traits::BlobStorage>) {
+            let blob: Arc<dyn engram_core::traits::BlobStorage> =
+                Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+            let cs = ChunkStore::new(blob.clone());
+            let inner: Arc<dyn SandboxBackend> = Arc::new(LifecycleInner {
+                staging_root: tmp.path().join("fc-snaps"),
+            });
+            let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("mat"));
+            (pooled, blob)
+        }
+
+        /// Sanity: snapshot() leaves the local dir on disk and the
+        /// per-snapshot opaque blobs in BlobStorage. commit_snapshot
+        /// clears the in-flight tracking *without* deleting them — they
+        /// belong to the PG row now.
+        #[tokio::test]
+        async fn commit_snapshot_keeps_artifacts() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pooled, blob) = build_pooled(&tmp);
+
+            let sandbox_id = SandboxId::new();
+            let metadata = pooled.snapshot(sandbox_id).await.unwrap();
+            let dir = pooled.inner.snapshot_path_for(metadata.id);
+            let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+            let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+
+            assert!(dir.exists(), "snapshot dir must exist after snapshot()");
+            assert!(blob.exists(&state_key).await.unwrap());
+            assert!(blob.exists(&sidecar_key).await.unwrap());
+
+            pooled.commit_snapshot(sandbox_id).await.unwrap();
+
+            // After commit: dir + blobs stay (PG-owned now); tracking
+            // cleared.
+            assert!(dir.exists(), "commit must NOT delete the snapshot dir");
+            assert!(blob.exists(&state_key).await.unwrap());
+            assert!(blob.exists(&sidecar_key).await.unwrap());
+            assert!(!pooled.inflight_snapshots.contains_key(&sandbox_id));
+        }
+
+        /// abort_snapshot tears down the local dir and the per-snapshot
+        /// opaque blobs. This is the bandage on coord-side pipeline
+        /// failures — the prod incident leaked 4 GiB per failed retry
+        /// because we lacked this RPC.
+        #[tokio::test]
+        async fn abort_snapshot_removes_dir_and_blobs() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pooled, blob) = build_pooled(&tmp);
+
+            let sandbox_id = SandboxId::new();
+            let metadata = pooled.snapshot(sandbox_id).await.unwrap();
+            let dir = pooled.inner.snapshot_path_for(metadata.id);
+            let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+            let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+
+            pooled.abort_snapshot(sandbox_id).await.unwrap();
+
+            assert!(!dir.exists(), "abort must rm -rf the snapshot dir");
+            assert!(
+                !blob.exists(&state_key).await.unwrap(),
+                "abort must delete the state.bin blob",
+            );
+            assert!(
+                !blob.exists(&sidecar_key).await.unwrap(),
+                "abort must delete the sidecar.json blob",
+            );
+            assert!(!pooled.inflight_snapshots.contains_key(&sandbox_id));
+        }
+
+        /// abort_snapshot must be idempotent — double-call after the
+        /// in-flight tracking is gone is a no-op, not an error.
+        #[tokio::test]
+        async fn abort_snapshot_is_idempotent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pooled, _) = build_pooled(&tmp);
+
+            let sandbox_id = SandboxId::new();
+            // No snapshot taken yet → abort is a clean no-op.
+            pooled.abort_snapshot(sandbox_id).await.unwrap();
+
+            // Snapshot, abort, then abort again.
+            pooled.snapshot(sandbox_id).await.unwrap();
+            pooled.abort_snapshot(sandbox_id).await.unwrap();
+            pooled
+                .abort_snapshot(sandbox_id)
+                .await
+                .expect("double-abort must be a no-op");
+        }
+
+        /// The retry case: a second snapshot() for the same sandbox
+        /// tears down the first attempt's artifacts BEFORE producing
+        /// the new one. Closes the prod incident's leak class entirely
+        /// — even if the coord pod crashes between snapshot and
+        /// commit/abort, the next retry self-cleans.
+        #[tokio::test]
+        async fn retry_snapshot_overwrites_prior_attempt() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pooled, blob) = build_pooled(&tmp);
+
+            let sandbox_id = SandboxId::new();
+            let first = pooled.snapshot(sandbox_id).await.unwrap();
+            let first_dir = pooled.inner.snapshot_path_for(first.id);
+            let first_state_key = engram_chunk_store::snapshot_blob::state_blob_key(first.id);
+            assert!(first_dir.exists());
+            assert!(blob.exists(&first_state_key).await.unwrap());
+
+            // Simulate coord crash between snapshot and commit by NOT
+            // calling either commit or abort — then retry.
+            let second = pooled.snapshot(sandbox_id).await.unwrap();
+            let second_dir = pooled.inner.snapshot_path_for(second.id);
+            let second_state_key = engram_chunk_store::snapshot_blob::state_blob_key(second.id);
+
+            // Second snapshot has a fresh id and exists on disk + blob.
+            assert_ne!(first.id, second.id);
+            assert!(second_dir.exists());
+            assert!(blob.exists(&second_state_key).await.unwrap());
+
+            // First attempt's artifacts are GONE — overwrite-in-place.
+            assert!(
+                !first_dir.exists(),
+                "retry must rm the prior attempt's snapshot dir",
+            );
+            assert!(
+                !blob.exists(&first_state_key).await.unwrap(),
+                "retry must delete the prior attempt's state.bin blob",
+            );
+        }
     }
 }

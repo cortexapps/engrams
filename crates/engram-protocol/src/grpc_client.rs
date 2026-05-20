@@ -128,6 +128,30 @@ impl GrpcHostClient {
         decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
     }
 
+    pub async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .commit_snapshot(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    pub async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .abort_snapshot(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     pub async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         let req = RestoreRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
@@ -533,6 +557,14 @@ impl HostClient for GrpcHostClient {
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // Disambiguates from the trait's `snapshot` method.
         Self::snapshot(self, id).await
+    }
+
+    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        Self::commit_snapshot(self, id).await
+    }
+
+    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+        Self::abort_snapshot(self, id).await
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {

@@ -132,6 +132,30 @@ impl HostService for HostServiceImpl {
         }))
     }
 
+    async fn commit_snapshot(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner
+            .commit_snapshot(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn abort_snapshot(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner
+            .abort_snapshot(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
     async fn restore(
         &self,
         req: Request<RestoreRequest>,
