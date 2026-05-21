@@ -211,7 +211,11 @@ async fn bake_shell_rootfs(repo: &str) -> (PathBuf, PathBuf) {
          RUN chmod +x /usr/local/bin/ttyd && mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(src.path().join("engram.toml"), format!("name = \"{repo}\"\n")).unwrap();
+    std::fs::write(
+        src.path().join("engram.toml"),
+        format!("name = \"{repo}\"\n"),
+    )
+    .unwrap();
 
     let images_dir = tempfile::tempdir().expect("images");
     let images_dir_path = images_dir.path().to_path_buf();
@@ -357,10 +361,7 @@ async fn assert_tunnel_round_trips(mut tunnel: ShellTunnel) {
 /// uses, against the PooledBackend that wraps the FC backend.
 /// This is the actual prod control flow — going through
 /// PooledBackend is what catches the forwarding bugs.
-async fn open_tunnel_via_pooled(
-    pooled: &PooledBackend,
-    id: engram_core::SandboxId,
-) -> ShellTunnel {
+async fn open_tunnel_via_pooled(pooled: &PooledBackend, id: engram_core::SandboxId) -> ShellTunnel {
     let port = pooled
         .start_shell(id)
         .await
@@ -384,9 +385,7 @@ async fn open_tunnel_via_pooled(
         .await
         .expect("vm_internal_ip must resolve");
     let netns_name = pooled.netns_name_for(id).await;
-    eprintln!(
-        "--- opening shell tunnel: guest_ip={guest_ip} port={port} netns={netns_name:?} ---"
-    );
+    eprintln!("--- opening shell tunnel: guest_ip={guest_ip} port={port} netns={netns_name:?} ---");
 
     // Diagnostic: probe both layers BEFORE the WS dial so a
     // failure points at the right thing.
@@ -405,17 +404,7 @@ async fn open_tunnel_via_pooled(
         // TCP failure below means a userspace listener problem.
         let ping = std::process::Command::new("ip")
             .args([
-                "netns",
-                "exec",
-                ns,
-                "timeout",
-                "3",
-                "ping",
-                "-c",
-                "1",
-                "-W",
-                "2",
-                &guest_ip,
+                "netns", "exec", ns, "timeout", "3", "ping", "-c", "1", "-W", "2", &guest_ip,
             ])
             .output();
         if let Ok(o) = ping {

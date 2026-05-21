@@ -194,7 +194,8 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
         assert!(ver.status.success(), "fetch claude latest version failed");
         let version = String::from_utf8_lossy(&ver.stdout).trim().to_string();
         eprintln!("--- claude CLI version: {version} ---");
-        let url = format!("https://downloads.claude.ai/claude-code-releases/{version}/linux-x64/claude");
+        let url =
+            format!("https://downloads.claude.ai/claude-code-releases/{version}/linux-x64/claude");
         let dl = std::process::Command::new("curl")
             .args(["-fsSL", "--retry", "3", "-o"])
             .arg(&claude_bin)
@@ -250,7 +251,11 @@ async fn bake_harness_rootfs(
         "FROM debian:bookworm-slim\nRUN mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(src.path().join("engram.toml"), format!("name = \"{repo}\"\n")).unwrap();
+    std::fs::write(
+        src.path().join("engram.toml"),
+        format!("name = \"{repo}\"\n"),
+    )
+    .unwrap();
 
     let images = tempfile::tempdir().expect("images");
     let images_path = images.path().to_path_buf();
@@ -309,8 +314,7 @@ async fn bake_harness_rootfs(
     let substrate_path = images_path.join("harness-substrate.img");
     // Allow generous slack — the Claude CLI is ~70-100 MiB.
     let claude_size = std::fs::metadata(&claude_dir.join("claude")).unwrap().len();
-    let substrate_size =
-        engram_image_builder::recommended_size(claude_size).max(160 * 1024 * 1024);
+    let substrate_size = engram_image_builder::recommended_size(claude_size).max(160 * 1024 * 1024);
     Mke2fsPacker::default()
         .pack(substrate_src.path(), &substrate_path, substrate_size)
         .await
@@ -328,8 +332,7 @@ async fn spawn_real_proxy() -> (u16, String, Arc<engram_egress_proxy::Registry>)
     let proxy_dir = tempfile::tempdir().expect("proxy dir");
     let proxy_dir_path = proxy_dir.path().to_path_buf();
     std::mem::forget(proxy_dir);
-    let ca =
-        Arc::new(engram_egress_proxy::Ca::load_or_generate(&proxy_dir_path).expect("ca gen"));
+    let ca = Arc::new(engram_egress_proxy::Ca::load_or_generate(&proxy_dir_path).expect("ca gen"));
     let ca_pem = ca.cert_pem.clone();
     let registry = Arc::new(engram_egress_proxy::Registry::new());
     let mint = Arc::new(engram_egress_proxy::CertMint::new(ca.clone()));
@@ -348,8 +351,7 @@ async fn spawn_real_proxy() -> (u16, String, Arc<engram_egress_proxy::Registry>)
     let dns_port: u16 = engram_sandbox_firecracker::net::DEFAULT_DNS_PORT;
     let proxy_bind: std::net::SocketAddr = format!("0.0.0.0:{proxy_port}").parse().unwrap();
     let dns_bind: std::net::SocketAddr = format!("0.0.0.0:{dns_port}").parse().unwrap();
-    let mut proxy_cfg =
-        engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
+    let mut proxy_cfg = engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
     proxy_cfg.dns_bind_addr = Some(dns_bind);
     // SystemResolver: defer to the host's DNS so api.anthropic.com
     // resolves to its real IP. With a fake-upstream resolver we'd
@@ -395,17 +397,14 @@ fn capture_sink() -> (
         let collected = collected_for_sink.clone();
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(stream.as_mut());
-            let _attach: engram_harness_proto::HarnessAttach = match engram_harness_proto::read_msg(
-                &mut reader,
-            )
-            .await
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("--- sink handshake read failed: {e} ---");
-                    return;
-                }
-            };
+            let _attach: engram_harness_proto::HarnessAttach =
+                match engram_harness_proto::read_msg(&mut reader).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("--- sink handshake read failed: {e} ---");
+                        return;
+                    }
+                };
             let ack = engram_harness_proto::HarnessAttachAck {
                 ok: true,
                 message: None,
@@ -414,11 +413,9 @@ fn capture_sink() -> (
                 eprintln!("--- sink ack write failed: {e} ---");
                 return;
             }
-            while let Ok(frame) = engram_harness_proto::read_msg::<
-                _,
-                engram_harness_proto::HarnessFrame,
-            >(&mut reader)
-            .await
+            while let Ok(frame) =
+                engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader)
+                    .await
             {
                 if let engram_harness_proto::HarnessFrame::Event(ev) = frame {
                     eprintln!("--- captured HarnessEvent: {ev:?} ---");
@@ -543,8 +540,13 @@ async fn e2e_harness_cold_via_pooled_backend() {
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let (rootfs_path, substrate_path) =
-        bake_harness_rootfs("engram-e2e-harness-cold", &ca_pem, &harness_bin, &claude_bin).await;
+    let (rootfs_path, substrate_path) = bake_harness_rootfs(
+        "engram-e2e-harness-cold",
+        &ca_pem,
+        &harness_bin,
+        &claude_bin,
+    )
+    .await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -586,8 +588,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         .parse()
         .unwrap();
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
-    let network_allow =
-        engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
+    let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
         session_id,
         guest_ip,
@@ -615,8 +616,13 @@ async fn e2e_harness_warm_via_pooled_backend() {
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let (rootfs_path, substrate_path) =
-        bake_harness_rootfs("engram-e2e-harness-warm", &ca_pem, &harness_bin, &claude_bin).await;
+    let (rootfs_path, substrate_path) = bake_harness_rootfs(
+        "engram-e2e-harness-warm",
+        &ca_pem,
+        &harness_bin,
+        &claude_bin,
+    )
+    .await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -668,8 +674,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         .parse()
         .unwrap();
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
-    let network_allow =
-        engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
+    let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
         session_id,
         guest_ip,

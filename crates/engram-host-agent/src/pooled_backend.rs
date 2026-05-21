@@ -2959,7 +2959,11 @@ mod tests {
 
             let calls = inner.guest_ip_calls.lock().clone();
             assert_eq!(calls, vec![id], "must forward to inner");
-            assert_eq!(ip, inner.guest_ip_value.clone(), "must return inner's value");
+            assert_eq!(
+                ip,
+                inner.guest_ip_value.clone(),
+                "must return inner's value"
+            );
         }
     }
 
