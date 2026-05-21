@@ -246,6 +246,16 @@ async fn main() -> Result<(), HostAgentError> {
             if cli.egress_proxy_port > 0 {
                 fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
             }
+            // ADR 0014 follow-up: pin CPUID to a Cascade Lake baseline
+            // so warm snapshots stay portable across the bake-host CPU
+            // (AMD on Blacksmith runners) vs the prod-host CPU (Intel
+            // Cascade Lake n2). Without this, prod 2026-05-21 hit
+            // warm-restore guests whose glibc ifunc resolver picked
+            // AMD-only AVX-512 paths the prod CPU couldn't execute,
+            // segfaulting every shell exit. `ENGRAM_FC_CPU_TEMPLATE`
+            // env var overrides (`""` / `"none"` for passthrough, any
+            // other value for a custom template name).
+            fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
             // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
             // ext4 stub harness that warm-pool restore points the
             // harness symlink at. Content-identical to the one the
