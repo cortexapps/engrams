@@ -101,7 +101,38 @@ pub struct WarmPool {
     inner: Arc<WarmPoolInner>,
 }
 
+/// Operator-facing kill switch. `ENGRAM_WARM_POOL_DISABLED=1` (or
+/// `true` / `yes`, case-insensitive) forces the autoscaler to report
+/// `target=0` for every template — `gc_tick` then drains existing
+/// free-list slots and `maybe_refill` no-ops because `current >=
+/// target` is already true at 0. Coord falls through to cold-create.
+///
+/// Why an env var and not a CLI flag: prod host-agent is configured
+/// almost entirely through env (`ENGRAM_*`), and an env flip means
+/// ops can disable warm-pool on a single host without a re-deploy
+/// (set in helm values + roll the MIG, or apply directly to a
+/// running supervisor for emergency mitigation).
+///
+/// Used today (2026-05-21) to stop bleeding from the warm-restore
+/// CPU-mismatch bug — AMD bake runners produce snapshots whose
+/// guest CPUID claims AMD, restored on Intel Cascade Lake prod
+/// hosts; glibc's ifunc resolver picks AMD-only AVX-512 paths and
+/// every shell child fork segfaults on exit cleanup. Disabling
+/// warm-pool puts every session on the cold path where the guest's
+/// CPUID matches the actual prod CPU.
+fn warm_pool_disabled_from_env() -> bool {
+    matches!(
+        std::env::var("ENGRAM_WARM_POOL_DISABLED").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True") | Ok("yes") | Ok("YES") | Ok("Yes")
+    )
+}
+
 struct WarmPoolInner {
+    /// ADR 0014 followup 2026-05-21: when `true`, every per-template
+    /// target is pinned to 0 regardless of lease history. Set via
+    /// `ENGRAM_WARM_POOL_DISABLED` at construction; immutable for
+    /// the lifetime of the process.
+    disabled: bool,
     /// Free-list per template_ref. `Vec::pop` is the lease primitive.
     free_lists: DashMap<TemplateRef, Mutex<Vec<SandboxId>>>,
     /// Most recently observed (TemplateRecord + SnapshotMetadata)
@@ -185,8 +216,15 @@ struct KnownTemplate {
 
 impl WarmPool {
     pub fn new(backend: Arc<dyn SandboxBackend>) -> Self {
+        let disabled = warm_pool_disabled_from_env();
+        if disabled {
+            tracing::info!(
+                "warm pool disabled via ENGRAM_WARM_POOL_DISABLED — all sessions go cold",
+            );
+        }
         Self {
             inner: Arc::new(WarmPoolInner {
+                disabled,
                 free_lists: DashMap::new(),
                 known: DashMap::new(),
                 targets: DashMap::new(),
@@ -269,7 +307,7 @@ impl WarmPool {
         self.inner
             .targets
             .entry(template_ref)
-            .or_insert(FLOOR_TARGET);
+            .or_insert_with(|| self.initial_target());
         for sandbox_id in stale_drain {
             let _ = self.inner.backend.destroy(sandbox_id).await;
         }
@@ -477,7 +515,7 @@ impl WarmPool {
                 .targets
                 .get(&template_ref)
                 .map(|t| *t)
-                .unwrap_or(FLOOR_TARGET);
+                .unwrap_or_else(|| self.initial_target());
             let (refill_failures_since_last, last_error_class) =
                 self.drain_refill_failures(template_ref);
             out.push(WarmSlotCount {
@@ -507,7 +545,7 @@ impl WarmPool {
                 .targets
                 .get(&template_ref)
                 .map(|t| *t)
-                .unwrap_or(FLOOR_TARGET);
+                .unwrap_or_else(|| self.initial_target());
             out.push(WarmSlotCount {
                 template_ref,
                 available: 0,
@@ -616,7 +654,24 @@ impl WarmPool {
     /// headroom multiplier for burst tolerance." Driven by the
     /// observed lease rate, not heartbeat-reported slots, so it's
     /// resilient to template-ref skew.
+    /// The target a brand-new template should be assigned before the
+    /// autoscaler has had any lease history to act on. `FLOOR_TARGET`
+    /// in normal mode; `0` when the operator kill switch is on so
+    /// nothing ever spins up.
+    fn initial_target(&self) -> u32 {
+        if self.inner.disabled {
+            0
+        } else {
+            FLOOR_TARGET
+        }
+    }
+
     fn compute_target(&self, template_ref: TemplateRef, now: std::time::Instant) -> u32 {
+        // Operator kill switch: force every template to target=0 so
+        // gc_tick drains existing slots and maybe_refill no-ops.
+        if self.inner.disabled {
+            return 0;
+        }
         let history = match self.inner.lease_history.get(&template_ref) {
             Some(h) => h,
             None => return FLOOR_TARGET,
@@ -651,7 +706,7 @@ impl WarmPool {
             .targets
             .get(&template_ref)
             .map(|t| *t)
-            .unwrap_or(FLOOR_TARGET);
+            .unwrap_or_else(|| self.initial_target());
         let current = self
             .inner
             .free_lists
@@ -1335,6 +1390,67 @@ mod tests {
         if let Some((count, class)) = entry {
             assert_eq!(count, 0, "second list_slots must drain to zero");
             assert!(class.is_empty(), "class drained to empty");
+        }
+    }
+
+    /// ADR 0014 followup 2026-05-21: the operator kill switch
+    /// (`ENGRAM_WARM_POOL_DISABLED=1`) must pin every per-template
+    /// target to 0 — `observe_templates` sets it; `compute_target`
+    /// keeps it; `maybe_refill` no-ops because `current >= target`
+    /// is already true at 0. End-to-end: `backend.restore` is
+    /// never invoked, the free-list stays empty, and `list_slots`
+    /// reports either nothing (no entries) or an entry with
+    /// `target == 0 && available == 0`.
+    #[tokio::test]
+    async fn kill_switch_pins_target_to_zero_and_skips_refill() {
+        // Env var is process-global, so isolate. `WarmPool::new`
+        // captures the flag at construction; later mutations of the
+        // env are ignored by this instance.
+        let prev = std::env::var("ENGRAM_WARM_POOL_DISABLED").ok();
+        // SAFETY: serialized by this single-threaded test; no other
+        // test should be reading the var during this window. The
+        // restore at the end (or panic path) puts it back.
+        unsafe { std::env::set_var("ENGRAM_WARM_POOL_DISABLED", "1") };
+
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WarmPool::new(backend.clone() as Arc<dyn SandboxBackend>);
+        let (rec, meta) = template(SnapshotId::new());
+        pool.observe_templates(vec![(rec.clone(), meta.clone())])
+            .await;
+
+        // Give the would-be refill spawn time to either run or not.
+        // 500ms is enough — observe_templates -> maybe_refill -> spawn
+        // would have begun by now.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            *backend.restore_count.lock(),
+            0,
+            "kill switch must prevent backend.restore from being invoked",
+        );
+
+        let slots = pool.list_slots();
+        // Either the template hasn't entered list_slots yet (no
+        // refill_failures + no free-list entry) OR it appears with
+        // target=0. Both shapes are acceptable; assert the
+        // negative: no slot reports a non-zero target.
+        for slot in &slots {
+            if slot.template_ref == rec.template_ref {
+                assert_eq!(
+                    slot.target, 0,
+                    "kill switch must pin reported target to 0 (got {})",
+                    slot.target,
+                );
+                assert_eq!(slot.available, 0);
+            }
+        }
+
+        // Restore env so peer tests aren't confused by leakage.
+        unsafe {
+            match prev.as_deref() {
+                Some(v) => std::env::set_var("ENGRAM_WARM_POOL_DISABLED", v),
+                None => std::env::remove_var("ENGRAM_WARM_POOL_DISABLED"),
+            }
         }
     }
 
