@@ -745,20 +745,24 @@ pub async fn provision_netns(
     tap_name: &str,
     allocator: &parking_lot::Mutex<NetworkAllocator>,
 ) -> Result<NetnsSetup, NetError> {
-    // Reserve the bake CIDR before allocating a snat slot. In prod
-    // the bake CIDR is always slot 0 (permanently reserved by
-    // `NetworkAllocator::new`) so this reserve() is an idempotent
-    // no-op. In test scenarios where the bake CIDR came from a
-    // cold sandbox that allocated a non-slot-0 /30 (e.g. our
-    // e2e_shell_warm test bakes the VM at slot 1), we MUST reserve
-    // here before alloc — otherwise alloc could hand back the same
-    // /30 as the bake and TAP + veth-B end up sharing a subnet
-    // (caught by tests/e2e_shell.rs::e2e_shell_warm: TAP at .5,
-    // veth-B at .6, VM at .6 → SYN to VM's IP gets answered by the
-    // veth's stack, RST instead of forwarding to the in-VM
-    // listener). `SlotTaken` (slot already reserved) is fine
-    // — that's the prod case — so we ignore the error.
-    let _ = allocator.lock().reserve(bake_cidr);
+    // Reserve the bake CIDR before allocating a snat slot. The bake
+    // CIDR is the slot the BAKE-time VM occupied (recorded into the
+    // snapshot's state.bin); every warm-restored VM from this template
+    // inherits it via `ip=` cmdline. Multiple concurrent restores from
+    // the same template ALL share that /30 — we must `reserve` it so
+    // `alloc()` doesn't hand the same slot back to a different VM as
+    // a SNAT slot (which would collide on the host-visible side).
+    //
+    // `Ok(_)` = we are the first restore from this template on this
+    // host; remember so the error path can release it. `Err(SlotTaken)`
+    // = another live restore already reserved it; we MUST NOT release
+    // it on error or teardown (doing so reintroduces the collision —
+    // observed in prod 2026-05-21 where two warm restores from
+    // different templates ended up with two different sandboxes both
+    // claiming 10.200.0.5/30: the kernel's route table double-bound
+    // the slot, the SHELL tab's host→VM dial reached the wrong VM,
+    // and ttyd answered with Connection refused).
+    let reserved_here = allocator.lock().reserve(bake_cidr).is_ok();
     let snat_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
     let res = provision_netns_inner(sandbox_id, bake_cidr, snat_cidr, tap_name).await;
     if let Err(ref e) = res {
@@ -768,11 +772,10 @@ pub async fn provision_netns(
         let _ = run_cmd("ip", &["netns", "delete", &netns]).await;
         let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
         allocator.lock().free(snat_cidr);
-        // Best-effort release of the bake_cidr reservation we
-        // just took. `free()` no-ops for slot 0 (prod case) so this
-        // doesn't leak the permanent reservation; for non-slot-0
-        // (test) it releases the reservation we made above.
-        allocator.lock().free(bake_cidr);
+        if reserved_here {
+            // We were the first reserver on this host; safe to release.
+            allocator.lock().free(bake_cidr);
+        }
     }
     res
 }
@@ -877,12 +880,21 @@ pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<N
     }
     let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
     allocator.lock().free(setup.snat_cidr);
-    // Mirror provision_netns: release the bake_cidr reservation we
-    // took on entry. `free()` no-ops on slot 0 (prod case), so this
-    // doesn't release the permanent slot-0 reservation. For
-    // non-slot-0 bake CIDRs (the cold→snapshot→restore test path)
-    // it releases the reservation we made.
-    allocator.lock().free(setup.vm_cidr);
+    // Deliberately do NOT free the bake CIDR (`setup.vm_cidr`).
+    // Multiple concurrent warm restores from the same template share
+    // the SAME bake_cidr — releasing it here is correct only if WE
+    // were the last holder, and we don't track that. The conservative
+    // choice is to leak the slot: with a /16 pool (16K /30s) and a
+    // bake_cidr per unique template ever seen on this host, the leak
+    // is bounded far below pool exhaustion within any realistic host
+    // lifetime. Prod 2026-05-21 observed: when one teardown freed
+    // slot 1 (a shared bake_cidr), a subsequent cold-create alloc
+    // returned slot 1 again and bound a TAP at 10.200.0.5 — same /30
+    // as a still-live netns's veth-A — and `ip route` ambiguously
+    // dispatched host→VM traffic between the two. The SHELL tab's
+    // host→VM dial reached the WRONG VM (no ttyd), got Connection
+    // refused, and the dashboard surfaced a `proxy_shell: connect to
+    // ttyd: IO error: Connection refused` 503.
 }
 
 #[cfg(target_os = "linux")]
@@ -1091,6 +1103,60 @@ mod tests {
         // Misaligned /30 (lowest two bits set) → not a valid network.
         let misaligned = VmCidr::new(Ipv4Addr::from_str("10.200.0.5").unwrap());
         assert!(matches!(a.reserve(misaligned), Err(AllocError::OutOfPool)));
+    }
+
+    /// Regression test for prod 2026-05-21 SHELL-tab failure.
+    ///
+    /// Two warm restores from the same template share one bake_cidr.
+    /// The pre-fix `teardown_netns` released the bake_cidr after the
+    /// second restore tore down, even though the FIRST restore was
+    /// still alive and still claiming that /30 as its netns's TAP.
+    /// A subsequent cold-create's `alloc()` then returned that slot
+    /// again and bound a TAP on the host at the same /30 — so
+    /// `ip route` reported two devices for the same network and
+    /// host→VM dials reached the wrong VM.
+    ///
+    /// The fix: teardown_netns never frees `vm_cidr` (bake_cidr).
+    /// This test models the call sequence (reserve, alloc, alloc,
+    /// free the second snat only) and asserts the bake slot stays
+    /// in_use across the cold alloc that follows.
+    #[test]
+    fn bake_cidr_stays_reserved_across_concurrent_restore_teardown() {
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        // Pretend the bake's slot is 1 (10.200.0.4/30) — older bakes
+        // pre-M1.16 slot-0 fix land here.
+        let bake = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
+
+        // Warm restore A: reserve(bake) Ok, alloc snat → slot 2.
+        a.reserve(bake).unwrap();
+        let snat_a = a.alloc().unwrap();
+        assert_eq!(snat_a.cidr_str(), "10.200.0.8/30");
+
+        // Warm restore B (same template): reserve(bake) → SlotTaken
+        // (caller in `provision_netns` ignores this), alloc snat →
+        // slot 3.
+        assert!(matches!(a.reserve(bake), Err(AllocError::SlotTaken)));
+        let snat_b = a.alloc().unwrap();
+        assert_eq!(snat_b.cidr_str(), "10.200.0.12/30");
+
+        // Restore B tears down: free its snat. The fix is that
+        // teardown_netns does NOT also `free(bake)` — so the bake
+        // slot stays in_use.
+        a.free(snat_b);
+
+        // A cold-create's first alloc after this teardown must NOT
+        // hand back the bake slot (which restore A still relies on
+        // for its netns's TAP). Pre-fix this returned slot 1
+        // (10.200.0.4/30) and the collision broke the SHELL tab.
+        let cold = a.alloc().unwrap();
+        assert_ne!(
+            cold.cidr_str(),
+            "10.200.0.4/30",
+            "cold-create must not reclaim a bake_cidr still held by a live warm restore",
+        );
+        // It picks up the recently-freed snat_b slot 3 first (LIFO
+        // free-list), which is correct.
+        assert_eq!(cold.cidr_str(), "10.200.0.12/30");
     }
 
     #[test]
