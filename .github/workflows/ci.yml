@@ -339,14 +339,14 @@ jobs:
       # total). Without the cache, every CI run pays a ~19 min
       # download from `spec.ccfc.min` (Firecracker's S3 bucket).
       #
-      # On Blacksmith runners, actions/cache@v4 transparently uses
+      # On Blacksmith runners, actions/cache@v5 transparently uses
       # Blacksmith's colocated cache — see
       # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
       # No useblacksmith/* fork needed (those are archived). The
       # cache key hashes the fetch script content, so bumping
       # either URL (kernel or rootfs version) invalidates cleanly.
       - name: Cache FC kernel + rootfs artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/engram-fc-test
           key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
@@ -396,7 +396,7 @@ jobs:
       # tolerates whatever version is in the cache and only
       # re-downloads when the cache misses.
       - name: Cache Claude Code CLI
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/engram-e2e-harness
           # Refresh every ~week — gives some staleness so we
