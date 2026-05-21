@@ -325,33 +325,24 @@ async fn assert_tunnel_round_trips(mut tunnel: ShellTunnel) {
     // assertion that bash is actually alive in the VM, but ttyd's
     // own keepalive proves the WS path is healthy and a separate
     // dedicated test can stress the PTY-output path.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
-        let frame = timeout(remaining, tunnel.inbound.recv())
-            .await
-            .expect(
-                "ttyd should send a frame within 10s of WS handshake + resize. \
-                 Without one, the tunnel/pump may have negotiated WS at the \
-                 HTTP layer but failed downstream. Check /var/log/ttyd.log \
-                 inside the VM.",
-            )
-            .expect("inbound channel closed unexpectedly");
-        eprintln!("--- received ShellFrame from ttyd: {frame:?} ---");
-        match frame {
-            ShellFrame::Close(_) => {
-                panic!("ttyd closed the tunnel before sending any non-close frame");
-            }
-            _ => {
-                // Any other frame is success — Ping/Pong proves
-                // WS-level keepalive works; Text/Binary proves PTY
-                // output works. Either way the round-trip is real.
-                break;
-            }
-        }
-    }
+    // We only need ONE non-Close frame to prove the tunnel
+    // round-trips. ttyd may send a Ping (idle keepalive),
+    // Text/Binary (PTY output), or Pong (response to a ping we
+    // sent). Any of those is sufficient.
+    let frame = timeout(Duration::from_secs(10), tunnel.inbound.recv())
+        .await
+        .expect(
+            "ttyd should send a frame within 10s of WS handshake + resize. \
+             Without one, the tunnel/pump may have negotiated WS at the \
+             HTTP layer but failed downstream. Check /var/log/ttyd.log \
+             inside the VM.",
+        )
+        .expect("inbound channel closed unexpectedly");
+    eprintln!("--- received ShellFrame from ttyd: {frame:?} ---");
+    assert!(
+        !matches!(frame, ShellFrame::Close(_)),
+        "ttyd closed the tunnel before sending any non-close frame",
+    );
 
     let _ = tunnel.outbound.send(ShellFrame::Close(None)).await;
     drop(tunnel);
