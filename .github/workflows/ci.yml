@@ -372,14 +372,39 @@ jobs:
       # additionally needs engram-bootstrap and engram-harness-noop
       # statically linked for the harness path it shares with
       # harness_loopback.
-      - name: Build static musl binaries (agentd / bootstrap / noop)
+      - name: Build static musl binaries (agentd / bootstrap / noop / harness-claude)
+        # engram-harness-claude is the real wrapper that the
+        # e2e_harness tests load into the harness substrate at
+        # `/claude/harness`. Building it here lets the same `target/`
+        # serve both the unprivileged tests and the root-required
+        # e2e_harness pair below — no second cargo build pass.
         run: |
           cargo build \
             -p engram-agentd \
             -p engram-bootstrap \
             -p engram-harness-noop \
+            -p engram-harness-claude \
             --target x86_64-unknown-linux-musl \
             --release
+
+      # Cache the Claude Code CLI binary across CI runs. The
+      # e2e_harness tests download it from
+      # `downloads.claude.ai/claude-code-releases/latest`. Without
+      # caching every CI run pays a ~30s download + the upstream
+      # may rate-limit. Cache key is intentionally fuzzy (`latest`)
+      # since Anthropic's "latest" pointer floats; the test
+      # tolerates whatever version is in the cache and only
+      # re-downloads when the cache misses.
+      - name: Cache Claude Code CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/engram-e2e-harness
+          # Refresh every ~week — gives some staleness so we
+          # eventually pick up new Claude CLI versions, but doesn't
+          # re-download on every run.
+          key: claude-code-cli-${{ github.run_id }}
+          restore-keys: |
+            claude-code-cli-
 
       # Run the `#[ignore]`'d FC integration tests that don't need
       # root: boot, lifecycle, snapshot, snapshot_uffd, exec_real_vm,
@@ -500,6 +525,28 @@ jobs:
             --test option_d_warm_lease \
             --test netns_isolation \
             --test warm_proxy_chain \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+
+      # True-e2e tests (engram-host-agent crate): real bake + real
+      # FC microVM + PooledBackend + real proxy + (for harness)
+      # real Claude CLI + real api.anthropic.com 401 round-trip.
+      # These are the highest-fidelity tests we have for the
+      # cold-and-warm path the dashboard's SHELL tab + Claude
+      # harness use in prod.
+      #
+      # They reuse the same `target/` (debug builds, since the host
+      # binaries here don't need musl) and the same Claude CLI
+      # cache as the steps above. Net new runtime ~80s for the
+      # harness pair + ~70s for the shell pair, well within the
+      # existing FC job budget.
+      - name: True-e2e tests (root — e2e_shell, e2e_harness)
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test e2e_shell \
+            --test e2e_harness \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
