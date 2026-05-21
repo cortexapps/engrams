@@ -375,6 +375,15 @@ async fn main() -> Result<(), CoordinatorError> {
                     Some(cli.egress_proxy_port)
                 };
                 fc_cfg.host_id = Some(in_proc_host);
+                // ADR 0014 follow-up: pin CPUID to a Cascade Lake
+                // baseline so snapshots stay portable across host CPU
+                // changes (bake-runner vendor, MIG-driven instance
+                // rolls, region expansion). Without this, prod 2026-
+                // 05-21 hit AMD-bake → Intel-restore segfaults in
+                // every guest shell. `ENGRAM_FC_CPU_TEMPLATE` overrides
+                // (`""` / `"none"` disables, anything else passes
+                // through verbatim).
+                fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
                 let fc = Arc::new(FirecrackerBackend::new(
                     cli.sandbox_work_dir.clone(),
                     fc_cfg,

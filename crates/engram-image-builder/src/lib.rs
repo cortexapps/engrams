@@ -1159,6 +1159,14 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // source IP to a unique-per-VM host slot.
         fc_cfg.net_pool = capture_cfg.net_pool;
         fc_cfg.egress_proxy_port = None;
+        // ADR 0014 follow-up: bake-time + restore-time MUST agree on
+        // the CPU template, otherwise the snapshot captures the bake
+        // host's CPUID (AMD on Blacksmith runners 2026-05-21) and the
+        // guest's glibc ifunc resolver picks code paths the prod CPU
+        // (Intel Cascade Lake) can't execute. The host-agent picks up
+        // the same env var on startup so prod-side and bake-side stay
+        // in lockstep.
+        fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
         // ADR 0014 M1.12: boot through `engram-init` so the init
         // shim spawns engram-bootstrap (BOOTSTRAP_VSOCK_PORT
         // listener) before snapshot. Without this the bake captures
@@ -1444,6 +1452,11 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         fc_cfg.egress_proxy_port = None;
         fc_cfg.uffd_blob_root = Some(blob_root.clone());
         fc_cfg.stub_harness_path = Some(stub_path.to_path_buf());
+        // Same CPU template the primary bake used — this restore is
+        // loading the snapshot we just took, so the template MUST
+        // match or the load fails (or worse, succeeds with a CPUID
+        // mismatch the guest will trip over later).
+        fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
         // host_id is required for UFFD restore (spawn_uffd_handler
         // passes --publish-trace-host when set, but the publish target
         // is the same BlobStorage as --blob-root — in dev that's the

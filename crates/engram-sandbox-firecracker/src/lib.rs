@@ -239,6 +239,40 @@ pub struct FirecrackerConfig {
     /// resolution can't find the freshly-chunked memory bytes.
     /// `None` in production — runtime resolution is correct there.
     pub uffd_blob_root: Option<PathBuf>,
+    /// FC CPU template name passed verbatim to `PUT /machine-config`.
+    /// `None` = host passthrough (FC default; guest CPUID reflects
+    /// the underlying physical CPU). `Some("T2CL")` masks to a
+    /// Cascade Lake baseline so snapshots taken on one host restore
+    /// cleanly on a host with a different CPU vendor/family. Prod
+    /// host-agent + the bake-time FC VM should pin the SAME value;
+    /// resolved at startup via [`cpu_template_from_env`]. `None`
+    /// here keeps tests (which boot fresh VMs on whatever CI CPU is
+    /// available) opt-out by default — only the prod call sites
+    /// in `engram-coordinator` and `engram-image-builder` set it.
+    pub cpu_template: Option<String>,
+}
+
+/// Resolve the FC CPU template from `ENGRAM_FC_CPU_TEMPLATE`.
+///
+/// - Unset: defaults to `Some("T2CL")` — Cascade Lake baseline.
+///   Compatible with every Intel CL-or-newer prod host AND maskable
+///   on AMD bake runners (Firecracker rewrites CPUID at the
+///   hypervisor edge), so snapshots cross vendor boundaries
+///   without the guest's glibc ifunc resolver picking instructions
+///   the receive host can't execute.
+/// - Empty string or `"none"` (case-insensitive): `None` —
+///   passthrough. Use this when intentionally running a one-host
+///   workload where snapshots will never cross-restore (dev VM
+///   testing, FC integration tests on a known runner).
+/// - Any other value: `Some(value)` verbatim — lets ops dial up
+///   (e.g. `"T2"` for older Skylake compat) or hand-craft a custom
+///   template name without a code change.
+pub fn cpu_template_from_env() -> Option<String> {
+    match std::env::var("ENGRAM_FC_CPU_TEMPLATE") {
+        Err(_) => Some("T2CL".into()),
+        Ok(s) if s.is_empty() || s.eq_ignore_ascii_case("none") => None,
+        Ok(s) => Some(s),
+    }
 }
 
 /// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
@@ -347,6 +381,12 @@ impl FirecrackerConfig {
             stub_harness_path: None,
             working_set_trace_output: None,
             uffd_blob_root: None,
+            // Host-passthrough by default. Prod (`engram-coordinator`)
+            // and the bake (`engram-image-builder`) both opt in to a
+            // template via `cpu_template_from_env`. Tests stay opted
+            // out so `cargo test` on heterogeneous CI runners doesn't
+            // wedge if the runner CPU doesn't satisfy the template.
+            cpu_template: None,
         }
     }
 }
@@ -1151,6 +1191,7 @@ impl FirecrackerBackend {
             })?,
             mem_size_mib: spec.memory.max_mib,
             smt: false,
+            cpu_template: self.config.cpu_template.clone(),
         })
         .await?;
         // Append the per-sandbox `ip=...` to the kernel cmdline so
@@ -2933,6 +2974,7 @@ mod tests {
             stub_harness_path: None,
             working_set_trace_output: None,
             uffd_blob_root: None,
+            cpu_template: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }
@@ -3258,5 +3300,85 @@ mod tests {
         // weird state).
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!sandboxes.contains_key(&id));
+    }
+
+    // ---- cpu_template_from_env ------------------------------------------
+    //
+    // The env var is process-global so these tests have to serialize.
+    // A coarse Mutex behind a `OnceLock` is enough — these are unit
+    // tests, not perf-critical.
+
+    fn cpu_template_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Save+restore the env var so tests don't leak into each other.
+    /// (cargo test --jobs N runs tests in threads inside a single
+    /// process — without restoration, an unset in test A would
+    /// confuse test B running concurrently in the same process.)
+    struct CpuTemplateEnvGuard {
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl CpuTemplateEnvGuard {
+        fn new() -> Self {
+            let lock = cpu_template_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var("ENGRAM_FC_CPU_TEMPLATE").ok();
+            // SAFETY: synchronized via `lock`; no other thread in this
+            // process should touch the env var.
+            unsafe { std::env::remove_var("ENGRAM_FC_CPU_TEMPLATE") };
+            Self { prev, _lock: lock }
+        }
+        fn set(&self, value: &str) {
+            unsafe { std::env::set_var("ENGRAM_FC_CPU_TEMPLATE", value) };
+        }
+    }
+    impl Drop for CpuTemplateEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.as_deref() {
+                    Some(v) => std::env::set_var("ENGRAM_FC_CPU_TEMPLATE", v),
+                    None => std::env::remove_var("ENGRAM_FC_CPU_TEMPLATE"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_template_from_env_defaults_to_t2cl_when_unset() {
+        let _g = CpuTemplateEnvGuard::new();
+        assert_eq!(cpu_template_from_env(), Some("T2CL".into()));
+    }
+
+    #[test]
+    fn cpu_template_from_env_returns_none_for_empty_string() {
+        let g = CpuTemplateEnvGuard::new();
+        g.set("");
+        // Empty string is the "explicitly opt out" knob — useful in
+        // dev-vm shell snippets where you want `unset NAME` semantics
+        // without actually unsetting (which would re-enable the
+        // T2CL default).
+        assert_eq!(cpu_template_from_env(), None);
+    }
+
+    #[test]
+    fn cpu_template_from_env_returns_none_for_none_case_insensitive() {
+        let g = CpuTemplateEnvGuard::new();
+        for v in &["none", "None", "NONE", "nOnE"] {
+            g.set(v);
+            assert_eq!(cpu_template_from_env(), None, "input={v}");
+        }
+    }
+
+    #[test]
+    fn cpu_template_from_env_passes_through_custom_values() {
+        let g = CpuTemplateEnvGuard::new();
+        for v in &["T2", "T2S", "T2A", "C3", "T2CL"] {
+            g.set(v);
+            assert_eq!(cpu_template_from_env(), Some((*v).into()), "input={v}");
+        }
     }
 }

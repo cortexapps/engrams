@@ -504,6 +504,22 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     /// Symmetric multi-threading: `false` for the safest default.
     pub smt: bool,
+    /// CPUID mask the guest sees. `None` = host passthrough (FC's
+    /// default) — guest CPUID echoes the underlying physical CPU,
+    /// vendor and all. Snapshots taken under passthrough capture the
+    /// bake-host CPUID into the vCPU state and break on restore when
+    /// the receive host is a different CPU (observed prod 2026-05-21:
+    /// AMD-baked snapshot restored on Intel Cascade Lake — guest's
+    /// glibc ifunc resolver picked AMD-only AVX-512 paths and every
+    /// `fork+exec+wait` of an external binary segfaulted the shell on
+    /// exit cleanup at `RIP=0`). `Some("T2CL")` masks to a Cascade
+    /// Lake baseline that's portable across any Intel CL-or-newer
+    /// host AND, courtesy of FC's mask, across AMD bake runners too.
+    /// Other valid values: `"T2"`, `"T2S"`, `"T2A"`, `"C3"`, plus
+    /// FC's custom-template JSON form (see Firecracker's CPU
+    /// templates doc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -657,11 +673,29 @@ mod tests {
             vcpu_count: 2,
             mem_size_mib: 1024,
             smt: false,
+            cpu_template: None,
         };
         let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(v["vcpu_count"], 2);
         assert_eq!(v["mem_size_mib"], 1024);
         assert_eq!(v["smt"], false);
+        // Absent cpu_template must NOT appear on the wire (FC treats
+        // `null` differently from omitted in some endpoints; we want
+        // the host-passthrough default unchanged when the field is
+        // not set).
+        assert!(v.get("cpu_template").is_none());
+    }
+
+    #[test]
+    fn machine_config_serializes_cpu_template_when_set() {
+        let cfg = MachineConfig {
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            smt: false,
+            cpu_template: Some("T2CL".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["cpu_template"], "T2CL");
     }
 
     #[test]
