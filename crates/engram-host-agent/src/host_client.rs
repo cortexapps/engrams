@@ -218,11 +218,19 @@ impl HostClient for LocalHostClient {
         // script (prod session 73fe33a3 on 2026-05-20 saw the host
         // dial 48s after lease and still hit Connection refused).
         let port = self.sandbox.start_shell(sandbox_id).await?;
+        // `vm_internal_ip` not `guest_ip`. `guest_ip` returns the
+        // SNAT'd IP for warm-restored sandboxes (used by the
+        // egress-proxy registry) — but the shell-tab dial happens
+        // INSIDE the per-VM netns, where ttyd is at the VM's
+        // in-VM eth0 IP (the bake CIDR's guest octet), NOT the
+        // netns's veth IP. Using `guest_ip` here dials the netns's
+        // own veth and misses the VM (caught by
+        // `crates/engram-host-agent/tests/e2e_shell.rs::e2e_shell_warm`).
         let guest_ip = self
             .sandbox
-            .guest_ip(sandbox_id)
+            .vm_internal_ip(sandbox_id)
             .await
-            .ok_or_else(|| SandboxError::Vm("proxy_shell: guest_ip unavailable".into()))?;
+            .ok_or_else(|| SandboxError::Vm("proxy_shell: vm_internal_ip unavailable".into()))?;
         let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
         crate::proxy_shell::open_shell_tunnel_at(guest_ip, port, netns_name, ends).await?;

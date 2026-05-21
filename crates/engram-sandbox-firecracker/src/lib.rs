@@ -2645,6 +2645,35 @@ impl SandboxBackend for FirecrackerBackend {
         live.netns.as_ref().map(|ns| ns.netns_name.clone())
     }
 
+    /// In-VM dial target for the SHELL tab. Returns the IP ttyd is
+    /// bound to inside the guest — distinct from `guest_ip` which
+    /// returns the SNAT slot for warm sandboxes (used by the egress
+    /// proxy registry, NOT for direct ttyd dials).
+    ///
+    /// - Warm-restored sandboxes: every VM inherits the bake's
+    ///   eth0 IP `bake_cidr.guest()` (10.200.0.2 by default). The
+    ///   host's proxy_shell flow enters the per-VM netns before
+    ///   dialing, so 10.200.0.2 resolves through the TAP to the
+    ///   VM.
+    /// - Cold-created sandboxes: no netns indirection; the VM's
+    ///   eth0 is at `vm_cidr.guest()` and reachable from host root
+    ///   via the TAP.
+    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
+        let live = self.sandboxes.get(&id)?;
+        // Warm: TAP is inside the netns, VM eth0 is at the bake
+        // CIDR's guest octet. Every warm VM gets the same value
+        // because they live in separate netnses.
+        if let Some(ns) = live.netns.as_ref() {
+            return Some(ns.vm_cidr.guest().to_string());
+        }
+        // Cold: per-sandbox unique IP from the same pool, in root
+        // netns.
+        if let Some(net) = live.net.as_ref() {
+            return Some(net.vm_cidr.guest().to_string());
+        }
+        None
+    }
+
     /// Ask agentd to ensure `ttyd` is running and accepting on its
     /// port. Returns the bound port. ADR 0014 follow-up: replaces
     /// the prior assumption that the snapshot's in-VM init script

@@ -1736,6 +1736,10 @@ impl SandboxBackend for PooledBackend {
     async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
         self.inner.netns_name_for(id).await
     }
+
+    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
+        self.inner.vm_internal_ip(id).await
+    }
 }
 
 #[cfg(test)]

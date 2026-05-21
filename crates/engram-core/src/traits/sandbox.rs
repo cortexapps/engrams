@@ -261,6 +261,37 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// In-VM dial target for the SHELL tab.
+    ///
+    /// `guest_ip` returns the IP the host-side egress-proxy registry
+    /// uses to identify the session — for warm-restored sandboxes
+    /// that's the netns SNAT slot (e.g. 10.200.0.6), the IP the
+    /// host SEES traffic coming from after netns POSTROUTING SNAT.
+    /// That's the right value for the egress proxy.
+    ///
+    /// The SHELL tab needs a different IP: the in-VM `eth0`
+    /// address that ttyd is bound to. For warm-restored sandboxes
+    /// inside a per-VM netns, every VM gets the bake-time
+    /// `10.200.0.2` (the bake CIDR's guest octet), and the host's
+    /// `proxy_shell` flow enters the netns before dialing — so it
+    /// dials `10.200.0.2:7681` *through the TAP*, not the netns's
+    /// own veth IP. Returning `guest_ip` (the SNAT slot) here
+    /// would dial the veth and miss the VM entirely (prod-shape
+    /// failure mode caught by e2e_shell_warm: `connect 10.200.0.6:
+    /// 7681: Connection refused` because nothing's bound on the
+    /// netns's veth IP).
+    ///
+    /// For cold-created sandboxes there's no netns + SNAT
+    /// indirection: the VM's eth0 is on a TAP in root netns, so
+    /// `guest_ip` and `vm_internal_ip` collapse to the same value.
+    ///
+    /// Default returns the same value as `guest_ip`, matching the
+    /// behaviour of pre-M1.16 backends and any future backend that
+    /// doesn't need the distinction.
+    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
+        self.guest_ip(id).await
+    }
+
     /// How a harness process inside this backend's sandbox dials
     /// back to the host's harness channel. Drives the `argv` shape
     /// `resolve_harness` builds for the agent. Default is `Vsock`

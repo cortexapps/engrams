@@ -745,6 +745,20 @@ pub async fn provision_netns(
     tap_name: &str,
     allocator: &parking_lot::Mutex<NetworkAllocator>,
 ) -> Result<NetnsSetup, NetError> {
+    // Reserve the bake CIDR before allocating a snat slot. In prod
+    // the bake CIDR is always slot 0 (permanently reserved by
+    // `NetworkAllocator::new`) so this reserve() is an idempotent
+    // no-op. In test scenarios where the bake CIDR came from a
+    // cold sandbox that allocated a non-slot-0 /30 (e.g. our
+    // e2e_shell_warm test bakes the VM at slot 1), we MUST reserve
+    // here before alloc — otherwise alloc could hand back the same
+    // /30 as the bake and TAP + veth-B end up sharing a subnet
+    // (caught by tests/e2e_shell.rs::e2e_shell_warm: TAP at .5,
+    // veth-B at .6, VM at .6 → SYN to VM's IP gets answered by the
+    // veth's stack, RST instead of forwarding to the in-VM
+    // listener). `SlotTaken` (slot already reserved) is fine
+    // — that's the prod case — so we ignore the error.
+    let _ = allocator.lock().reserve(bake_cidr);
     let snat_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
     let res = provision_netns_inner(sandbox_id, bake_cidr, snat_cidr, tap_name).await;
     if let Err(ref e) = res {
@@ -754,6 +768,11 @@ pub async fn provision_netns(
         let _ = run_cmd("ip", &["netns", "delete", &netns]).await;
         let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
         allocator.lock().free(snat_cidr);
+        // Best-effort release of the bake_cidr reservation we
+        // just took. `free()` no-ops for slot 0 (prod case) so this
+        // doesn't leak the permanent reservation; for non-slot-0
+        // (test) it releases the reservation we made above.
+        allocator.lock().free(bake_cidr);
     }
     res
 }
@@ -858,6 +877,12 @@ pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<N
     }
     let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
     allocator.lock().free(setup.snat_cidr);
+    // Mirror provision_netns: release the bake_cidr reservation we
+    // took on entry. `free()` no-ops on slot 0 (prod case), so this
+    // doesn't release the permanent slot-0 reservation. For
+    // non-slot-0 bake CIDRs (the cold→snapshot→restore test path)
+    // it releases the reservation we made.
+    allocator.lock().free(setup.vm_cidr);
 }
 
 #[cfg(target_os = "linux")]
