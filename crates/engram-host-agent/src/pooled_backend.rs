@@ -1718,6 +1718,24 @@ impl SandboxBackend for PooledBackend {
     async fn guest_ip(&self, id: SandboxId) -> Option<String> {
         self.inner.guest_ip(id).await
     }
+
+    /// ADR 0014 follow-up: forward to inner. Without this, the
+    /// SandboxBackend trait's default impl (return Ok(7681)) would
+    /// run instead and the FC backend's actual vsock StartShell RPC
+    /// to in-VM agentd would never fire — host's proxy_shell would
+    /// then dial port 7681 blind and hit Connection refused whenever
+    /// the bake's init didn't auto-start ttyd or the warm-restore
+    /// stripped the listening socket. Prod 2026-05-20 session
+    /// 5c8d0ce5: zero start_shell logs on the host-agent despite a
+    /// completed proxy_shell GRPC roundtrip, exactly because this
+    /// forward was missing.
+    async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        self.inner.start_shell(id).await
+    }
+
+    async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
+        self.inner.netns_name_for(id).await
+    }
 }
 
 #[cfg(test)]
@@ -2779,6 +2797,166 @@ mod tests {
         // 8. The materialized file exists and is byte-equal.
         let materialized = tokio::fs::read(&expected).await.unwrap();
         assert_eq!(materialized, bytes, "materialized file bytes mismatch");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ADR 0014 follow-up (prod 2026-05-20 session 5c8d0ce5):
+    // PooledBackend MUST forward start_shell / netns_name_for /
+    // guest_ip to its inner backend. The SandboxBackend trait has
+    // default impls for these (Ok(7681) / None / None respectively)
+    // that exist for backends without that capability (process,
+    // VZ-without-netns). When PooledBackend wraps a FirecrackerBackend
+    // that DOES implement them, NOT forwarding silently routes
+    // through the trait defaults and the real FC capability never
+    // fires — observed in prod: zero start_shell logs on the host-
+    // agent despite a completed proxy_shell GRPC call, exactly
+    // because PooledBackend.start_shell was using the trait default.
+    // ──────────────────────────────────────────────────────────────
+
+    mod inner_forwarding_tests {
+        use super::*;
+        use parking_lot::Mutex;
+
+        /// SandboxBackend mock that RECORDS every call to the methods
+        /// PooledBackend is supposed to forward. We assert against
+        /// the captured counters/values after invoking PooledBackend's
+        /// surface.
+        struct SpyInner {
+            start_shell_calls: Mutex<Vec<SandboxId>>,
+            netns_name_for_calls: Mutex<Vec<SandboxId>>,
+            guest_ip_calls: Mutex<Vec<SandboxId>>,
+            /// Non-default response values so we can verify the
+            /// forward returned the inner's value, not the trait
+            /// default.
+            shell_port: u16,
+            netns_name: Option<String>,
+            guest_ip_value: Option<String>,
+        }
+        impl SpyInner {
+            fn new() -> Self {
+                Self {
+                    start_shell_calls: Mutex::new(Vec::new()),
+                    netns_name_for_calls: Mutex::new(Vec::new()),
+                    guest_ip_calls: Mutex::new(Vec::new()),
+                    // Pick non-default values so a "trait default ran
+                    // instead of our override" failure shows up as a
+                    // value mismatch, not just a counter mismatch.
+                    shell_port: 31337,
+                    netns_name: Some("engr-vm-spytest".into()),
+                    guest_ip_value: Some("10.200.0.42".into()),
+                }
+            }
+        }
+        #[async_trait]
+        impl SandboxBackend for SpyInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                PathBuf::new()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
+                self.start_shell_calls.lock().push(id);
+                Ok(self.shell_port)
+            }
+            async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
+                self.netns_name_for_calls.lock().push(id);
+                self.netns_name.clone()
+            }
+            async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+                self.guest_ip_calls.lock().push(id);
+                self.guest_ip_value.clone()
+            }
+        }
+
+        /// Regression guard: PooledBackend.start_shell MUST forward
+        /// to its inner backend's start_shell. Without forwarding,
+        /// the trait default returns Ok(7681) without ever touching
+        /// the inner — host-agent's proxy_shell then dials port
+        /// 7681 blind even when the FC backend would have correctly
+        /// minted the connection (warm restore in a netns, lazy
+        /// ttyd spawn, etc.). Prod 2026-05-20 session 5c8d0ce5 was
+        /// exactly this: zero `start_shell:` log lines on the
+        /// host-agent despite a successful proxy_shell GRPC roundtrip.
+        #[tokio::test]
+        async fn pooled_backend_forwards_start_shell_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            let port = pooled.start_shell(id).await.unwrap();
+
+            // Inner.start_shell received the sandbox id.
+            let calls = inner.start_shell_calls.lock().clone();
+            assert_eq!(
+                calls,
+                vec![id],
+                "PooledBackend.start_shell must forward to inner; got {} calls",
+                calls.len(),
+            );
+            // The returned port is the inner's value, NOT the trait
+            // default (7681). If we'd accidentally fallen through to
+            // the default, the value would be 7681 and the inner's
+            // counter would still be 0.
+            assert_eq!(
+                port, inner.shell_port,
+                "must return inner's port (proves the forward, not the default)",
+            );
+        }
+
+        /// Same regression but for netns_name_for. The host-agent's
+        /// proxy_shell uses this to decide cold-path (None → dial
+        /// from root) vs warm-path (Some → dial inside netns).
+        /// Without forwarding, every warm-restored sandbox looks
+        /// like a cold one and the proxy_shell dial misses the
+        /// VM entirely.
+        #[tokio::test]
+        async fn pooled_backend_forwards_netns_name_for_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            let ns = pooled.netns_name_for(id).await;
+
+            let calls = inner.netns_name_for_calls.lock().clone();
+            assert_eq!(calls, vec![id], "must forward to inner");
+            assert_eq!(
+                ns,
+                inner.netns_name.clone(),
+                "must return inner's value (proves the forward, not the default-None)",
+            );
+        }
+
+        /// guest_ip forwarding was correct pre-fix, but exists
+        /// here as a regression guard so we never lose it.
+        #[tokio::test]
+        async fn pooled_backend_forwards_guest_ip_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            let ip = pooled.guest_ip(id).await;
+
+            let calls = inner.guest_ip_calls.lock().clone();
+            assert_eq!(calls, vec![id], "must forward to inner");
+            assert_eq!(ip, inner.guest_ip_value.clone(), "must return inner's value");
+        }
     }
 
     // ──────────────────────────────────────────────────────────────
