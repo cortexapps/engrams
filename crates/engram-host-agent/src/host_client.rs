@@ -255,6 +255,21 @@ impl HostClient for LocalHostClient {
         harness_pack_uri: Option<String>,
         harness_name: Option<String>,
     ) -> Result<(), SandboxError> {
+        // ADR 0014 follow-up debug (2026-05-21): a sequence of warm
+        // sessions on `warm-f1b8520` mounted only the bake-time stub
+        // harness at `/run/engram/harnesses`, with no `swap_harness_
+        // drive` log on the host side. That means `session_harness_
+        // path` resolved to None — but it's not obvious whether the
+        // gRPC dropped the URI on the wire or the lookup short-
+        // circuited somewhere coord-side. Log what actually arrived
+        // here so the next session pinpoints the gap.
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            harness_pack_uri = harness_pack_uri.as_deref().unwrap_or("<none>"),
+            harness_name = harness_name.as_deref().unwrap_or("<none>"),
+            image_cache_present = self.image_cache.is_some(),
+            "launch_warm_sandbox: invoked",
+        );
         match self.warm_pool.as_ref() {
             Some(pool) => {
                 // ADR 0014 M1.12: resolve the session's harness URI
