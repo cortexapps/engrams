@@ -100,6 +100,28 @@ variable "warm_pool_size" {
   default     = 2
 }
 
+variable "warm_pool_disabled" {
+  type        = bool
+  description = <<-EOT
+    When true, host-agent receives `ENGRAM_WARM_POOL_DISABLED=1` and
+    forces every per-template target to 0 — no warm slots are ever
+    pre-restored on this host and every session takes the cold-create
+    path. Today (2026-05-21) flipped on to dodge two stacked warm-
+    restore bugs: (1) AMD-baked snapshot CPUID restored on Intel
+    Cascade Lake prod hosts puts the guest's glibc ifunc resolver on
+    AMD-only AVX-512 paths the underlying Intel CPU can't execute,
+    (2) `swap_harness_drive`'s symlink-and-PATCH dance doesn't
+    propagate the session's claude harness to the guest's mounted
+    `/dev/vdb` view. Cold-create dodges both because the guest boots
+    fresh on the prod CPU and constructs the harness substrate at
+    create time (no snapshot, no swap). Cost: ~20 s cold-boot latency
+    per session (vs. ~1 s warm). Acceptable while the warm-path
+    bugs land separately. Set back to `false` once the underlying
+    fixes ship.
+  EOT
+  default     = false
+}
+
 variable "nbd_slots" {
   type        = number
   description = <<-EOT

@@ -173,6 +173,7 @@ ENGRAM_SANDBOX_BACKEND=firecracker
 ENGRAM_KERNEL_IMAGE_PATH=${var.kernel_image_path}
 ENGRAM_SANDBOX_WORK_DIR=/var/lib/engram/sandboxes
 ENGRAM_WARM_POOL_SIZE=${var.warm_pool_size}
+${var.warm_pool_disabled ? "ENGRAM_WARM_POOL_DISABLED=1" : ""}
 ENGRAM_EGRESS_PROXY_PORT=${var.egress_proxy_port}
 ENGRAM_EGRESS_CA_SOURCE=${var.egress_ca_source}
 ${var.egress_ca_gcp_cert_secret == "" ? "" : "ENGRAM_EGRESS_CA_GCP_CERT_SECRET=${var.egress_ca_gcp_cert_secret}"}
