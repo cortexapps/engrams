@@ -1,3 +1,16 @@
+# ttyd: PTY-over-WebSocket server. Pulled from Docker Hub because
+# tsl0922's GitHub Releases page is still pinned at 1.7.7 (March
+# 2024) but the 1.7.7 *release binary* segfaults at `0x403296`
+# (NULL deref in the WS receive handler) on every inbound text or
+# binary frame — observed in prod 2026-05-21: every SHELL-tab
+# connection turned the receiving ttyd into a zombie within
+# milliseconds of the first frame. 1.7.8 is master HEAD as of
+# 2026-03-19 and fixes the crash (verified by running an AuthToken
+# JSON + input frame through the 1.7.8 image: it returns the prompt
+# instead of crashing). Multi-stage so we get a static binary from
+# tsl0922's image without inheriting Alpine as the runtime base.
+FROM tsl0922/ttyd:1.7.8 AS ttyd-source
+
 # debian-slim is enough now that the harness's runtime dependencies
 # (Anthropic's bundled-Bun `claude` binary) ship host-side via the
 # harness pack, mounted into every sandbox at
@@ -10,22 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ttyd: PTY-over-WebSocket server. Used by the dashboard's `SHELL`
-# tab — coordinator proxies a WebSocket from the browser to ttyd
-# inside the guest, ghostty-web on the browser side renders it.
-# Static binary, no runtime deps; ~1.3 MB. Architecture-aware so the
-# same Dockerfile baked for arm64 (VZ) or amd64 (FC) picks the right
-# release.
-ARG TTYD_VERSION=1.7.7
-RUN ARCH=$(dpkg --print-architecture) \
-    && case "$ARCH" in \
-        arm64) TTYD_ARCH=aarch64 ;; \
-        amd64) TTYD_ARCH=x86_64 ;; \
-        *) echo "unsupported arch $ARCH for ttyd"; exit 1 ;; \
-    esac \
-    && curl -fsSL -o /usr/local/bin/ttyd \
-        "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
-    && chmod +x /usr/local/bin/ttyd
+COPY --from=ttyd-source /usr/bin/ttyd /usr/local/bin/ttyd
+RUN chmod +x /usr/local/bin/ttyd
 
 RUN mkdir -p /workspace/.engram
 
