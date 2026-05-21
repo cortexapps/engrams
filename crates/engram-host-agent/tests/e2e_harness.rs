@@ -313,7 +313,7 @@ async fn bake_harness_rootfs(
 
     let substrate_path = images_path.join("harness-substrate.img");
     // Allow generous slack — the Claude CLI is ~70-100 MiB.
-    let claude_size = std::fs::metadata(&claude_dir.join("claude")).unwrap().len();
+    let claude_size = std::fs::metadata(claude_dir.join("claude")).unwrap().len();
     let substrate_size = engram_image_builder::recommended_size(claude_size).max(160 * 1024 * 1024);
     Mke2fsPacker::default()
         .pack(substrate_src.path(), &substrate_path, substrate_size)
@@ -497,9 +497,8 @@ async fn drive_harness(
                 _ => {}
             }
         }
-        if completed_ok.is_some() && agent_text.is_some() {
+        if let (Some(_ok), Some(text)) = (completed_ok, agent_text.as_ref()) {
             assert!(got_started, "got terminal event without RunStarted");
-            let text = agent_text.unwrap();
             // Claude API returns 401 when handed a bogus bearer
             // token. Asserting on the specific shape proves the
             // round-trip ran AND came back from the real upstream
