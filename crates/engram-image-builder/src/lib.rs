@@ -1109,8 +1109,36 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 ))
             })?;
             let p = work.path().join(".stub-harness.ext4");
+            // ADR 0014 M1.12 stub size: load-bearing. The stub is
+            // mounted as /dev/vdb at warm-pool bake time and
+            // captured in the snapshot. On warm lease, the host
+            // hot-swaps /dev/vdb's backing file to the session's
+            // harness pack ext4 via FC `PATCH /drives`. Firecracker
+            // accepts a larger replacement file and emits a
+            // virtio-blk "capacity change" notification — but the
+            // guest's mounted-FS view of /dev/vdb is fixed by the
+            // SUPERBLOCK + bgd that ext4 read at mount time. So
+            // any swap-target larger than the stub silently
+            // truncates: the guest sees only the first stub-many
+            // bytes of the new file, which (since ext4 puts metadata
+            // up front) shows up as `lost+found` and nothing else.
+            //
+            // Observed in prod 2026-05-21 session 0c83f95f: stub
+            // was 16 MiB, harness pack was 455 MiB, swap "succeeded"
+            // but `/run/engram/harnesses/` showed only lost+found
+            // and the harness never exec'd (no claude binary).
+            //
+            // Sizing rule: the stub must be at least as big as the
+            // largest harness pack we'll ever swap in. The Claude
+            // pack ships ~455 MiB; pick 1 GiB to leave headroom
+            // for future harnesses + Claude growth. The file is
+            // sparse (`set_len` doesn't write zeros on Linux ext4),
+            // so the snapshot's actual on-disk footprint stays
+            // dominated by ext4 metadata + lost+found (tens of
+            // MiB), not the 1 GiB nominal size.
+            const STUB_HARNESS_SIZE: u64 = 1024 * 1024 * 1024;
             Mke2fsPacker::default()
-                .pack(&stub_src, &p, 16 * 1024 * 1024)
+                .pack(&stub_src, &p, STUB_HARNESS_SIZE)
                 .await
                 .map_err(|e| BuildError::Config(format!("pack stub harness ext4: {e}")))?;
             Some(p)
