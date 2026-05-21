@@ -368,33 +368,38 @@ if [ "${ENGRAM_INIT_DEBUG:-0}" = "1" ]; then
         echo "  $(basename $p) name=$n dev=$d" >&2
     done
 fi
-# In-guest ttyd: serves an interactive bash session over WebSocket on
-# :7681. The coordinator's `GET /sessions/:id/shell` proxy bridges
-# browser <-> ttyd, ghostty-web on the browser side renders it. We
-# don't fail the boot if the binary is missing — older images that
-# predate the shell feature continue to work, the dashboard's SHELL
-# tab just shows "shell unavailable" for those sessions.
-#
-# /bin/sh is the safe-everywhere fallback (always present; debian-slim
-# bases ship dash). If the image happens to also include bash —
-# node:20-slim does at /usr/bin/bash — prefer it for an interactive
-# experience that matches what users expect from a terminal.
-# Absolute path required because PID 1's environment doesn't carry a
-# PATH and ttyd uses execvp to find the shell.
-#
-# We also export HOME / USER / PATH before launching ttyd. The
-# kernel's PID-1 env doesn't include these, and without them bash
-# resolves `~/.bashrc` to `/.bashrc` (does not exist) and skips it —
-# losing the prompt + ls-color aliases we baked into /root/.bashrc.
-# Setting them here is enough; bash inherits them through ttyd.
-if [ -x /usr/local/bin/ttyd ]; then
-    SHELL_BIN=/bin/sh
-    [ -x /usr/bin/bash ] && SHELL_BIN=/usr/bin/bash
-    export HOME=/root
-    export USER=root
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    (cd /workspace && /usr/local/bin/ttyd -W -p 7681 "$SHELL_BIN" >/var/log/ttyd.log 2>&1) &
+# Export the env that bootstrap, agentd, and the LAZY-SPAWNED ttyd
+# inherit through `exec`. PID 1's kernel env is bare (no HOME / USER
+# / PATH / SHELL), and bash without HOME resolves `~/.bashrc` to
+# `/.bashrc` (does not exist) and silently skips it — losing the
+# prompt + ls-color aliases we baked into /root/.bashrc. Set them
+# unconditionally so `agentd::shell::start_shell` (which forks ttyd
+# on the first SHELL-tab WS connect) inherits them via its parent.
+# Absolute paths because PID 1's env doesn't carry PATH unless we
+# put it there ourselves.
+export HOME=/root
+export USER=root
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+if [ -x /usr/bin/bash ]; then
+    export SHELL=/usr/bin/bash
+else
+    export SHELL=/bin/sh
 fi
+
+# Pre-M1.x revision started ttyd at boot here as a daemon, which
+# cost ~1s of cold-path agent_handshake (fork+exec+page-in of ttyd
+# binary + bash startup + libwebsockets init) for every session
+# whether the user clicked SHELL or not. We deleted that. Now the
+# first SHELL request triggers a lazy spawn via agentd's
+# `WireRequest::StartShell` handler — see
+# `engram-agentd/src/shell.rs::start_shell`. That handler probes
+# 127.0.0.1:7681, returns spawned=false if something's already
+# bound (legacy / re-entry path), else `Command::new(/usr/local/
+# bin/ttyd)` and waits up to READY_DEADLINE for the port to accept.
+# Trade: SHELL-tab open latency goes from ~0ms (already-running)
+# to ~150ms (fresh spawn). Worth it because the boot cost was paid
+# on every session create, and only a tiny fraction of sessions
+# actually use the SHELL tab.
 [ -x /sbin/engram-bootstrap ] && /sbin/engram-bootstrap &
 exec /sbin/engram-agentd --port __VSOCK_PORT__
 "#;
