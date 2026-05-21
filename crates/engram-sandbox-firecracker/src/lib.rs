@@ -254,22 +254,26 @@ pub struct FirecrackerConfig {
 
 /// Resolve the FC CPU template from `ENGRAM_FC_CPU_TEMPLATE`.
 ///
-/// - Unset: defaults to `Some("T2CL")` — Cascade Lake baseline.
-///   Compatible with every Intel CL-or-newer prod host AND maskable
-///   on AMD bake runners (Firecracker rewrites CPUID at the
-///   hypervisor edge), so snapshots cross vendor boundaries
-///   without the guest's glibc ifunc resolver picking instructions
-///   the receive host can't execute.
-/// - Empty string or `"none"` (case-insensitive): `None` —
-///   passthrough. Use this when intentionally running a one-host
-///   workload where snapshots will never cross-restore (dev VM
-///   testing, FC integration tests on a known runner).
-/// - Any other value: `Some(value)` verbatim — lets ops dial up
-///   (e.g. `"T2"` for older Skylake compat) or hand-craft a custom
-///   template name without a code change.
+/// - Unset: `None` (passthrough — guest CPUID reflects the
+///   underlying physical CPU). This is the safe default because
+///   built-in FC templates are vendor-pinned (`T2CL`, `T2`, `T2S`,
+///   `C3` are Intel-only; `T2A` is AMD-only). With AMD bake runners
+///   (Blacksmith's x64 pool) and Intel prod hosts (GCP n2 Cascade
+///   Lake), neither vendor's template loads on both sides — the
+///   bake fails with "CPU vendor mismatched between actual CPU and
+///   CPU template" if we try T2CL on AMD, or prod restore fails the
+///   same way if we baked with T2A. The whole point of the template
+///   was cross-vendor portability and the built-in set can't deliver
+///   it; revisit once we have a same-vendor bake runner (Intel KVM-
+///   capable EC2 via RunsOn, or a self-hosted GCP n2 runner) or a
+///   custom JSON template that fakes `GenuineIntel` on both vendors.
+/// - Empty string or `"none"` (case-insensitive): `None` — explicit
+///   passthrough. Same as unset; here for ops symmetry.
+/// - Any other value: `Some(value)` verbatim — opt-in for the
+///   day we ship a same-vendor bake.
 pub fn cpu_template_from_env() -> Option<String> {
     match std::env::var("ENGRAM_FC_CPU_TEMPLATE") {
-        Err(_) => Some("T2CL".into()),
+        Err(_) => None,
         Ok(s) if s.is_empty() || s.eq_ignore_ascii_case("none") => None,
         Ok(s) => Some(s),
     }
@@ -3348,9 +3352,13 @@ mod tests {
     }
 
     #[test]
-    fn cpu_template_from_env_defaults_to_t2cl_when_unset() {
+    fn cpu_template_from_env_defaults_to_none_when_unset() {
+        // Built-in FC templates are vendor-pinned; passthrough is the
+        // safe default until a same-vendor bake runner lands. Setting
+        // ENGRAM_FC_CPU_TEMPLATE=T2CL on an Intel-only fleet remains
+        // an opt-in we'd take once warm-pool is re-enabled.
         let _g = CpuTemplateEnvGuard::new();
-        assert_eq!(cpu_template_from_env(), Some("T2CL".into()));
+        assert_eq!(cpu_template_from_env(), None);
     }
 
     #[test]
