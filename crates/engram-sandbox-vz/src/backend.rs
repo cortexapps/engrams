@@ -394,15 +394,18 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
-        // ADR 0015 M1: one in-VM service. The host dials agentd on
-        // port 1024 with a SpawnHarness request; agentd's harness
-        // supervisor owns the mount + child spawn (was a separate
-        // engram-bootstrap process).
+        // ADR 0015 M1: one in-VM service, plain connect. VZ binds
+        // the host-side UDS at VM-config time, so `UnixStream::
+        // connect` returns a live stream immediately regardless of
+        // whether agentd in the guest has bound the virtio-console
+        // port yet — the wait happens naturally at the first read,
+        // which blocks until agentd writes the SpawnHarness response.
+        // No retry loop, no deadline knob; the FC path's boot-race
+        // problem doesn't exist here.
         //
-        // VZ doesn't use the option-D harness-late-bind path — its
-        // in-VM mount story is handled by engram-init via the VZ
-        // disk-attach config, not via SpawnHarness's mount params.
-        // Leave harness_{dev,mount} unset.
+        // VZ also doesn't use the option-D harness-late-bind path —
+        // its in-VM mount story is handled by engram-init via the
+        // VZ disk-attach config. Leave harness_{dev,mount} unset.
         tracing::debug!(
             sandbox_id = %id,
             argv0 = %agent.argv.first().map(|s| s.as_str()).unwrap_or("<empty>"),
@@ -414,25 +417,9 @@ impl SandboxBackend for VzBackend {
         };
         let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
 
-        // Boot-race retry. agentd's vsock listener binds after
-        // engram-init finishes its mounts — ~seconds on cold boot.
-        // 60 s budget matches FC's start_agent (same shape).
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut backoff = Duration::from_millis(100);
-        let mut conn = loop {
-            match UnixStream::connect(&agent_uds).await {
-                Ok(c) => break c,
-                Err(e) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(SandboxError::Vm(
-                            format!("connect agentd UDS {}: {e}", agent_uds.display()).into(),
-                        ));
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
-                }
-            }
-        };
+        let mut conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(format!("connect agentd UDS {}: {e}", agent_uds.display()).into())
+        })?;
 
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,

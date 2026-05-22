@@ -123,17 +123,24 @@ pub struct SandboxState {
 pub const ENGRAM_AGENTD_PORT: u32 = 1024;
 
 /// Filename FC uses for the per-port host-side UDS when the guest
-/// dials out via vsock: `<base>_<port>`. Extracted so callers
-/// (here for harness 1026) and FC's own filename convention stay
-/// in sync. See firecracker/docs/vsock.md for the protocol.
-fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
-    let port = engram_harness_proto::HARNESS_VSOCK_PORT;
+/// dials out via vsock: `<base>_<port>`. Build the path for an
+/// arbitrary port — used by the harness-event listener (1026) and
+/// the agentd-ready listener (1027). See `firecracker/docs/vsock.md`
+/// for the protocol.
+fn per_port_uds(base_vsock_uds: &Path, port: u32) -> PathBuf {
     let file_name = base_vsock_uds
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let parent = base_vsock_uds.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!("{file_name}_{port}"))
+    let with_port = format!("{file_name}_{port}");
+    match base_vsock_uds.parent() {
+        Some(parent) => parent.join(with_port),
+        None => PathBuf::from(with_port),
+    }
+}
+
+fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
+    per_port_uds(base_vsock_uds, engram_harness_proto::HARNESS_VSOCK_PORT)
 }
 
 /// Lowest CID we'll hand out to a guest. CIDs 0/1/2 are reserved
@@ -435,6 +442,14 @@ struct LiveSandbox {
     /// because the agent's eth0 needs IP_PNP DHCP+kernel boot before
     /// it can answer.
     guest_ip: parking_lot::Mutex<Option<String>>,
+    /// ADR 0015 M1: receiver for the agentd-readiness signal.
+    /// Switches to `true` when the in-VM agentd successfully dials
+    /// `<vsock_uds>_<ENGRAM_AGENTD_READY_PORT>` and writes its
+    /// `AgentReady` frame. `start_agent` awaits this; restored
+    /// sandboxes pre-set to `true` because agentd was already
+    /// running when the snapshot was captured. Replaces the
+    /// pre-M1 boot-race CONNECT-then-retry on port 1024.
+    agent_ready: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
@@ -779,6 +794,11 @@ impl FirecrackerBackend {
             vsock_cid: fc.vsock_cid,
             vsock_uds_path: fc.vsock_uds_base.clone(),
         };
+        // Reattach: agentd was already up when the previous host-
+        // agent generation tracked it, so the readiness watch starts
+        // already-true. No listener spawned — there's nothing left to
+        // wait for.
+        let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
         self.sandboxes.insert(
             id,
             LiveSandbox {
@@ -792,6 +812,7 @@ impl FirecrackerBackend {
                 // None on this path.
                 netns: None,
                 guest_ip: parking_lot::Mutex::new(None),
+                agent_ready: ready_rx,
             },
         );
 
@@ -869,48 +890,13 @@ impl FirecrackerBackend {
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
     }
 
-    /// Connect to the guest's vsock listener on `port`, retrying the
-    /// boot-race window (UDS exists but no in-guest listener yet —
-    /// FC closes with "early eof" on CONNECT response) until
-    /// `deadline`. Genuine non-retryable errors return immediately.
-    ///
-    /// Use this for any vsock call that races a freshly-booted
-    /// sandbox (exec, start_agent, start_shell). 60s matches the
-    /// cold-path agent_handshake budget — chunked-NBD page-ins
-    /// from GCS dominate the boot, and the listener doesn't appear
-    /// until engram-init completes its mounts.
-    async fn connect_fc_vsock_with_retry(
-        vsock_uds_path: &Path,
-        port: u32,
-        deadline: Duration,
-    ) -> Result<UnixStream, SandboxError> {
-        let until = std::time::Instant::now() + deadline;
-        let mut backoff = Duration::from_millis(100);
-        loop {
-            match Self::connect_fc_vsock(vsock_uds_path, port).await {
-                Ok(c) => return Ok(c),
-                Err(e) => {
-                    let msg = format!("{e}");
-                    let is_boot_race = msg.contains("read FC vsock CONNECT response")
-                        || msg.contains("connect to FC vsock UDS");
-                    if !is_boot_race || std::time::Instant::now() >= until {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
-                }
-            }
-        }
-    }
-
     /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
     /// read back `OK <peer>\n`, and return the resulting stream now
-    /// directly connected to the guest's listener on `port`. Shared
-    /// between exec (port 1024) and start_agent (port 1025 for
-    /// bootstrap).
-    ///
-    /// One-shot: callers that race the boot window should use
-    /// [`Self::connect_fc_vsock_with_retry`] instead.
+    /// directly connected to the guest's listener on `port`. One-shot:
+    /// callers that need to race the boot window are wrong — by ADR
+    /// 0015 M1, the boot window is closed before any host-side
+    /// dial-out by waiting on the per-sandbox `agent_ready` watch
+    /// (filled when agentd dials the host's ready port).
     async fn connect_fc_vsock(
         vsock_uds_path: &Path,
         port: u32,
@@ -1354,11 +1340,18 @@ impl FirecrackerBackend {
         // Pre-bind the host-side UDS that FC routes guest-to-host
         // vsock connections through. When the guest dials AF_VSOCK
         // CID=2 port=N, FC connects to `<vsock_uds>_<N>`. Binding
-        // BEFORE InstanceStart guarantees the harness's first
-        // dial-out lands on a live listener (the engram-init
-        // shim spawns engram-bootstrap which dials shortly after
-        // boot — we'd race otherwise).
+        // BEFORE InstanceStart guarantees the guest's first dial-out
+        // lands on a live listener:
+        //
+        //   - port 1026: harness adapter dials with HarnessAttach.
+        //   - port 1027 (ADR 0015 M1): agentd dials with AgentReady
+        //     once its RPC listener (port 1024) is bound. The accept
+        //     fills the `agent_ready` watch that `start_agent` blocks
+        //     on — replacing the pre-M1 boot-race poll loop.
         self.spawn_harness_listener(sandbox_id, &vsock_uds_path)
+            .await?;
+        let agent_ready_rx = self
+            .spawn_agent_ready_listener(sandbox_id, &vsock_uds_path)
             .await?;
 
         api.put_action(ActionType::InstanceStart).await?;
@@ -1434,6 +1427,7 @@ impl FirecrackerBackend {
                 // Cold create path: VM is in host root netns.
                 netns: None,
                 guest_ip: parking_lot::Mutex::new(None),
+                agent_ready: agent_ready_rx,
             },
         );
         if let Some(pid) = fc_pid {
@@ -1446,6 +1440,70 @@ impl FirecrackerBackend {
         }
         tracing::info!(%sandbox_id, jail = %jail_dir.display(), "firecracker microVM started");
         Ok(())
+    }
+
+    /// ADR 0015 M1: bind a host-side UDS for the in-VM agentd's
+    /// one-shot readiness dial. agentd dials AF_VSOCK CID=2 port=
+    /// `ENGRAM_AGENTD_READY_PORT` after binding its RPC listener;
+    /// FC bridges that to `<vsock_uds_path>_<port>` here. The first
+    /// successful accept reads the `AgentReady` frame and flips the
+    /// watch sender to `true`; `start_agent` blocks on the matching
+    /// receiver and proceeds straight to SpawnHarness with no poll.
+    ///
+    /// Returns the receiver half; caller stores it in `LiveSandbox`.
+    /// The accept task owns the sender and exits after the first
+    /// successful dial (subsequent dials are no-ops — agentd only
+    /// signals once per process lifetime).
+    async fn spawn_agent_ready_listener(
+        &self,
+        sandbox_id: SandboxId,
+        vsock_uds_path: &Path,
+    ) -> Result<tokio::sync::watch::Receiver<bool>, SandboxError> {
+        let path = per_port_uds(vsock_uds_path, engram_agentd::ENGRAM_AGENTD_READY_PORT);
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "bind agent-ready UDS {} for sandbox {sandbox_id}: {e}",
+                    path.display()
+                )
+                .into(),
+            )
+        })?;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            match listener.accept().await {
+                Ok((mut stream, _peer)) => {
+                    match engram_agentd::read_msg::<_, engram_agentd::AgentReady>(&mut stream).await
+                    {
+                        Ok(ready) => {
+                            tracing::info!(
+                                %sandbox_id,
+                                agent_version = %ready.agent_version,
+                                "agentd ready",
+                            );
+                            // Drop in case the sender side is gone —
+                            // sandbox already destroyed before agentd
+                            // got to dial. Harmless.
+                            let _ = tx.send(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %sandbox_id,
+                                error = %e,
+                                "agent-ready frame read failed; start_agent will block until \
+                                 deadline. Sandbox is likely broken (agentd dialed but didn't \
+                                 write a parseable AgentReady)."
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, %sandbox_id, "agent-ready UDS accept ended");
+                }
+            }
+        });
+        Ok(rx)
     }
 
     /// Bind a host-side UDS for inbound harness connections from
@@ -1720,6 +1778,11 @@ impl FirecrackerBackend {
         // the entry pruned so reconcile transitions the session.
         let fc_pid = child.id();
         let uffd_pid = uffd_handler.as_ref().and_then(|c| c.id());
+        // Restore path: agentd was captured already-running in the
+        // snapshot. It won't dial the ready port on resume (no
+        // startup happens). Pre-set the watch to true so start_agent
+        // proceeds immediately to SpawnHarness.
+        let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
@@ -1730,6 +1793,7 @@ impl FirecrackerBackend {
                 net: net_setup,
                 netns: netns_setup,
                 guest_ip: parking_lot::Mutex::new(None),
+                agent_ready: ready_rx,
             },
         );
         if let Some(pid) = fc_pid {
@@ -2274,38 +2338,13 @@ impl SandboxBackend for FirecrackerBackend {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.vsock_uds_path.clone()
         };
-        // The agent inside the guest takes a couple of seconds to come up
-        // after `create()` returns: kernel boot → init → engram-agentd
-        // bind on vsock 1024. Connecting before that returns "early eof"
-        // on the CONNECT response (FC closes the UDS when there's no
-        // listener on the requested guest port). 60s matches the
-        // cold-path agent_handshake budget — chunked-NBD page-ins
-        // from GCS dominate prod boots. Bail fast on non-boot-race
-        // errors so genuine breakage doesn't hide behind retries.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut sleep = Duration::from_millis(50);
-        loop {
-            match Self::exec_stream_via_fc_vsock(
-                id,
-                &vsock_uds_path,
-                ENGRAM_AGENTD_PORT,
-                cmd.clone(),
-            )
-            .await
-            {
-                Ok(s) => return Ok(s),
-                Err(e) => {
-                    let msg = format!("{e}");
-                    let is_boot_race = msg.contains("read FC vsock CONNECT response")
-                        || msg.contains("connect to FC vsock UDS");
-                    if !is_boot_race || std::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(sleep).await;
-                    sleep = (sleep * 2).min(Duration::from_secs(1));
-                }
-            }
-        }
+        // ADR 0015 M1: no boot-race retry here. Sessions only reach
+        // exec_stream after `start_agent` has returned, and
+        // start_agent now waits on the agent_ready watch (filled when
+        // agentd dials the host's ready port). If we hit `early eof`
+        // here, agentd genuinely went away after readiness signal —
+        // surface the error rather than masking with retries.
+        Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
@@ -2772,24 +2811,15 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
 
-        // Deadline must cover the cold-boot race: the UI auto-opens
-        // /shell as soon as coord emits Pending→Active, but for
-        // harness=none sessions Active fires ~14ms after FC start
-        // (no agent_handshake on that path) and agentd's vsock
-        // listener doesn't appear until engram-init finishes its
-        // chunked-NBD mounts — ~15-17s on prod. Pre-fix this was
-        // 15s with a non-retrying connect, which dropped the first
-        // WS connect with `read FC vsock CONNECT response: early eof`
-        // and the UI surfaced "abnormal close (no close frame
-        // received)". 60s matches start_agent's existing budget.
+        // ADR 0015 M1: no boot-race retry. `/shell` only fires after
+        // the session is Active, which now requires start_agent's
+        // ready-watch handshake. A one-shot CONNECT against agentd-
+        // 1024 is sufficient. The outer 15s timeout covers the
+        // ttyd spawn (~150ms typical), not the boot race.
         let fut = async {
-            let mut conn = Self::connect_fc_vsock_with_retry(
-                &vsock_uds_path,
-                ENGRAM_AGENTD_PORT,
-                Duration::from_secs(60),
-            )
-            .await
-            .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
@@ -2814,11 +2844,7 @@ impl SandboxBackend for FirecrackerBackend {
                 )),
             }
         };
-        // Slightly longer than the inner connect deadline so a
-        // legitimate connect (post-boot, agentd already up but
-        // ttyd spawn just kicked off) gets to complete its ~150ms
-        // ttyd ready probe without tripping the outer timeout.
-        tokio::time::timeout(Duration::from_secs(75), fut)
+        tokio::time::timeout(Duration::from_secs(15), fut)
             .await
             .map_err(|_| SandboxError::Vm("start_shell: timed out waiting for agentd".into()))?
     }
@@ -2875,32 +2901,61 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         agent: engram_core::types::sandbox::AgentSpec,
     ) -> Result<(), SandboxError> {
-        // ADR 0015 M1: one in-VM service, one wire surface. The
-        // host dials agentd on port 1024 with a SpawnHarness
-        // request; agentd's harness supervisor handles the mount +
-        // child spawn (was a separate engram-bootstrap process).
+        // ADR 0015 M1: one in-VM service, one wire surface, one
+        // event-driven readiness signal. The flow is:
         //
-        // `agent_handshake` wall-clock is recorded by the caller
-        // (`grpc_server::start_agent` for cold-create, `WarmPool::
-        // launch` for warm-lease) so the histogram can carry the
-        // `kind` label without this backend method knowing which
-        // path it's serving.
+        //   1. Block on the per-sandbox `agent_ready` watch — set to
+        //      `true` by the accept task we spawned in create() when
+        //      agentd dials in. No poll, no per-call retry budget;
+        //      kernel does the blocking, the deadline only catches
+        //      truly-dead VMs.
+        //   2. Plain one-shot CONNECT to agentd-1024. By contract
+        //      agentd's RPC listener is bound *before* it dials the
+        //      ready port, so if step 1 returned Ok the CONNECT
+        //      cannot race.
+        //   3. SpawnHarness.
         //
-        // 60s retry budget covers the cold-path race: chunked-NBD
-        // rootfs page-ins from GCS can delay engram-init for
-        // ~15-25 s before agentd binds vsock 1024. Steady state
-        // (chunks cached) is sub-second; the ceiling only matters
-        // on the cold path.
+        // Restored sandboxes (warm-pool refill, host-agent reattach)
+        // pre-set the watch to `true` because agentd was already
+        // running when the snapshot was captured. Steps 2-3 run
+        // immediately on those paths.
         let phase_start = std::time::Instant::now();
-        let vsock_uds_path = {
+        let (vsock_uds_path, mut agent_ready, has_harness) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.vsock_uds_path.clone()
+            (
+                live.state.vsock_uds_path.clone(),
+                live.agent_ready.clone(),
+                live.state.spec.harness_substrate.is_some(),
+            )
         };
 
-        let has_harness = {
-            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.spec.harness_substrate.is_some()
-        };
+        // Wait for agentd's startup dial. Deadline is generous
+        // (180 s) because the dev-vm's fake-gcs-server path can
+        // stretch chunked-NBD page-ins to ~2-3 min on a fresh chunk
+        // cache. Prod is ~15-20 s. Failure here means agentd never
+        // came up — a real bug, surfaced loudly rather than papered
+        // over.
+        let wait_deadline = Duration::from_secs(180);
+        if !*agent_ready.borrow() {
+            tokio::time::timeout(wait_deadline, agent_ready.wait_for(|v| *v))
+                .await
+                .map_err(|_| {
+                    SandboxError::Vm(
+                        format!(
+                            "agentd did not dial ready port within {}s — guest never bound \
+                             ENGRAM_AGENTD_PORT (kernel panic? engram-init hang?)",
+                            wait_deadline.as_secs()
+                        )
+                        .into(),
+                    )
+                })?
+                .map_err(|e| {
+                    SandboxError::Vm(
+                        format!("agent_ready watch closed unexpectedly: {e}").into(),
+                    )
+                })?;
+        }
+
         let (harness_dev, harness_mount) = if has_harness {
             (
                 Some("/dev/vdb".to_string()),
@@ -2909,7 +2964,6 @@ impl SandboxBackend for FirecrackerBackend {
         } else {
             (None, None)
         };
-
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
@@ -2917,12 +2971,7 @@ impl SandboxBackend for FirecrackerBackend {
             harness_mount,
         });
 
-        let mut conn = Self::connect_fc_vsock_with_retry(
-            &vsock_uds_path,
-            ENGRAM_AGENTD_PORT,
-            Duration::from_secs(60),
-        )
-        .await?;
+        let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
         engram_agentd::write_msg(&mut conn, &req)
             .await
             .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;

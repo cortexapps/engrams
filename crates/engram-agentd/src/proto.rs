@@ -63,6 +63,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// a real `cargo build` log line truncates.
 pub const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
 
+/// ADR 0015 M1: agentd dials the host on this port at startup,
+/// once its RPC listener is bound, to signal "I'm ready." The host
+/// blocks on `accept()` here in `start_agent` — no poll, no
+/// timeout-then-retry. Replaces the boot-race CONNECT-then-retry
+/// dance the host used to run against port 1024.
+pub const ENGRAM_AGENTD_READY_PORT: u32 = 1027;
+
+/// Wire frame agentd writes to the ready-port stream on startup.
+/// The presence of the frame is the readiness signal; the body is
+/// purely informational (logged on the host side for debugging /
+/// version-skew detection).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentReady {
+    /// Free-form version string for the agent build. Logged at info;
+    /// no semantics.
+    pub agent_version: String,
+}
+
 /// One exec request, wire-encoded as the *first* frame the host sends
 /// after connecting to the agent.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

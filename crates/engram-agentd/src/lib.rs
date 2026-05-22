@@ -22,6 +22,7 @@ pub mod shell;
 pub use handler::serve_connection;
 pub use harness_supervisor::HarnessSupervisor;
 pub use proto::{
-    read_msg, write_msg, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent, WireExecRequest,
-    WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse, MAX_MSG_BYTES,
+    read_msg, write_msg, AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent,
+    WireExecRequest, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
+    ENGRAM_AGENTD_READY_PORT, MAX_MSG_BYTES,
 };

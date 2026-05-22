@@ -225,6 +225,47 @@ async fn run_transport(
     let kind = std::env::var("ENGRAM_TRANSPORT").unwrap_or_else(|_| "vsock".into());
     tracing::info!(port, transport = %kind, "engram-agentd listening");
 
+    // ADR 0015 M1: dial the host on the readiness port. The host
+    // blocks on `accept()` here in its `start_agent` — replacing the
+    // pre-M1 boot-race CONNECT-then-retry against port 1024. Order
+    // matters: the dial happens AFTER `transport.listen(port)` has
+    // succeeded so the host's subsequent SpawnHarness call (also on
+    // `port`, 1024 in prod) is guaranteed to reach a live listener.
+    //
+    // Best-effort: failure to dial means the host won't know we're
+    // ready and start_agent will time out. That's a real bug we want
+    // to surface, but agentd itself can keep running — it might be a
+    // restored sandbox where the host's listener path has already
+    // been GC'd. Log loudly; don't die.
+    let agent_version = env!("CARGO_PKG_VERSION").to_string();
+    match transport.dial(engram_agentd::ENGRAM_AGENTD_READY_PORT).await {
+        Ok(mut conn) => {
+            let ready = engram_agentd::AgentReady { agent_version };
+            if let Err(e) = engram_agentd::write_msg(&mut conn, &ready).await {
+                tracing::warn!(
+                    error = %e,
+                    port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                    "AgentReady write failed; host will block on start_agent",
+                );
+            } else {
+                tracing::info!(
+                    port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                    "AgentReady frame written to host",
+                );
+            }
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut conn).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                "ready-port dial failed; host start_agent will block until its deadline. \
+                 Likely cause: snapshot restore (no host listener bound for this sandbox), \
+                 or host misconfigured. Proceeding to serve RPCs anyway.",
+            );
+        }
+    }
+
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
