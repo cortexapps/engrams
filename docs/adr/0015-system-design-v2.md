@@ -151,11 +151,20 @@ Accepted and being implemented now; M2–M9 are Proposed.
 | M2 | `SessionState` — explicit, gated state machine | Proposed |
 | M3 | `HostRegistry` as a TTL'd cache of PG truth | Proposed |
 | M4 | `Sandbox` as a content-addressed migratable value | Proposed |
-| M5 | `ImageBundle` (content) vs `WarmTemplate` (host-local snapshot) | Proposed |
+| **M5** | **Host-image readiness as the warm/cold contract — retire the `templates` table** | **Proposed, next to ship** |
 | M6 | Harness events as one typed stream on `GuestService` | Proposed |
 | M7 | FC drive references as content hashes via a `DriveResolver` trait | Proposed |
-| M8 | `enable_image` as a saga + periodic blob-orphan GC | Proposed |
-| M9 | Coord ↔ host as one bidirectional trait (or accept the split as final) | Proposed, flagged |
+| M8 | Coord ↔ host as one bidirectional trait (or accept the split as final) | Proposed, flagged |
+
+**Note on table evolution.** The original ADR had nine sections, with
+separate slots for "decouple ImageBundle from WarmTemplate" (M5) and
+"enable_image as a saga + GC" (M8). The 2026-05-22 deep-dive on
+`templates`'s dangling rows surfaced that both were band-aids on the
+same underlying choice: that we have a `templates` table at all.
+M5 and M8 are now collapsed into a single M5 milestone that retires
+the table outright; the old M9 (coord-host channel) becomes M8. See
+M5's body for the unified design and the [Insight: "delete the thing"](#insight-delete-the-thing-keeps-being-the-right-answer)
+note at the end of the Consequences section.
 
 ---
 
@@ -328,37 +337,168 @@ Cold sessions mid-boot might not be migratable; fail-loud is fine.
 
 ---
 
-### M5 — `ImageBundle` vs `WarmTemplate`
+### M5 — Host-image readiness as the warm/cold contract (retires `templates`)
 
-**Problem.** Bake-time canonical memory snapshot is baked into the
-OCI artifact. This makes "image" and "memory state of a booted
-sandbox of that image" the same concept, even though they're not.
-The cross-CPU-vendor restore problem we hit (T2CL Intel-baked,
-AMD-restored; AMD-baked, Intel-restored) is the direct manifestation:
-images become CPU-vendor-coupled because their snapshot is. Also: the
-bake step is ~30 s instead of ~3 s; `enable_image` blocks ~60 s
-waiting for the first warm slot.
+**Problem.** The `templates` table has been the source of two
+recurring bug classes:
 
-**Abstraction.** Split the concepts:
+1. **Cross-CPU-vendor snapshot disasters.** The OCI artifact ships
+   a bake-time canonical memory snapshot, and `templates.snapshot_id`
+   points at it. When the bake host's CPU vendor differs from the
+   restore host's (Blacksmith AMD bake → prod Intel restore, or the
+   reverse), the snapshot's CPUID is incompatible and the warm-
+   restored guest tripfaults on instructions the prod CPU doesn't
+   support. Forced us to disable warm pool entirely in prod
+   (`ENGRAM_WARM_POOL_DISABLED=1`, ADR 0014 follow-up).
+2. **Dangling rows.** `templates` lives in Postgres; the blobs it
+   references live in BlobStorage. Nothing reconciles them. Volume
+   nuked, GC sweep, accidental key deletion — the row survives,
+   the blobs don't, and host-agent's warm-pool refill loop spams
+   `blob_not_found` forever. We dodged this in dev with `just
+   integration-reset` (drops the postgres + fake-gcs volumes
+   together); prod has no such option.
 
-- **`ImageBundle`**: rootfs ext4 (chunked) + manifest. Pure content.
-  CPU-agnostic, kernel-agnostic, snapshot-free. This is what the
-  bake produces. Push time ~3 s.
-- **`WarmTemplate`**: an `ImageBundle` plus a memory snapshot
-  *generated locally at runtime* on the actual host CPU. First
-  session on a fresh host pays cold-boot cost and produces the
-  template; subsequent sessions lease from it.
+Reading the row column by column, almost nothing is load-bearing:
+`template_ref` is derivable from the image's content hash;
+`image_repo`/`image_tag` duplicate `enabled_images`;
+`harness_pack_uri` is vestigial after option-D; `snapshot_id` is the
+bake-time artifact we want to retire; `vcpus`/`memory_mib` belong on
+the image manifest; `active` is bookkeeping for the rebake-replaces-
+old pattern that wouldn't exist if warm-template state were host-
+local.
 
-**What it deletes.** The bake's `--capture-canonical-memory` flag
-and all its supporting code; the bake → templates row cascade in
-`enable_image`; the cross-vendor compatibility tax. Bake CI gets
-~10× faster.
+**Abstraction.** Drop the table. Replace "is there a warm template
+for image X" with a per-host readiness signal:
 
-**Open questions.** Where does the first WarmTemplate snapshot get
-generated — explicit operator action, first session, or a host-side
-warm-template-generator process? Probably "first session of a
-fresh-on-this-host image triggers template generation as a side
-effect".
+- **`enabled_images` is the only policy table.** It says "this image
+  is allowed for sessions" and nothing else. No cascade, no derived
+  rows.
+- **Hosts converge against `enabled_images` via heartbeat sync.** On
+  each heartbeat, the host diffs the coord's enabled set against
+  its local NVMe chunk cache. For any image whose chunks aren't all
+  present, the host kicks off a background prefetch that pulls the
+  missing chunks from BlobStorage into NVMe. The prefetch reuses
+  the existing `TieredChunkResolver` machinery — same code path
+  the lazy-fault path uses today, just driven by an active loop.
+- **Per-host readiness is a heartbeat-reported set.** Each
+  heartbeat carries `ready_images: [content_hash, ...]` — the set
+  of images for which every chunk is present locally. Coord
+  aggregates: "image X has N ready hosts."
+- **Scheduler routes only to ready hosts.** Session create resolves
+  `image_uri → content_hash`, then picks any host that reports
+  ready for that hash. If no host is ready, coord returns 503
+  with "still warming up" (same shape as no-capacity).
+
+The bake artifact is purely content: chunked rootfs + manifest. No
+`state.bin`, no `memory.bin`, no `sidecar.json`. Push time drops
+from ~30 s to ~3 s. CPU vendor stops mattering because there's no
+captured memory state to be CPU-specific.
+
+**Three-tier storage, all content-addressed:**
+
+| Tier | What | Role |
+|---|---|---|
+| BlobStorage (GCS) | Canonical sha256-keyed chunks. Cross-fleet dedup. | Source of truth. Holds *only* image content; no snapshots. |
+| Per-host NVMe chunk cache | Mirror of the chunks this host serves. Cross-image dedup within a host (every debian:bookworm-slim child shares base-layer chunks). | Fast local tier AND the inventory backing `ready_images`. |
+| Kernel page cache | Hot pages resident across sessions. | Free; the kernel handles it. |
+
+**What it deletes.**
+
+- The `templates` table entirely — schema, migration, `template_ref`
+  type, `upsert_template` / `list_active_templates` /
+  `resolve_template` in `engram-postgres`.
+- The bake's `--capture-canonical-memory` flag, the
+  `CanonicalCaptureConfig` struct, the bake-time FC boot + snapshot
+  capture pipeline, the embed-snapshot-in-OCI artifact path.
+- `enable_image`'s `materialize_and_cascade` — no cascade to write;
+  enable just inserts into `enabled_images`.
+- The `snapshots` table's role as bake-artifact holder (it may
+  still exist as a session-evacuation primitive once M4 lands;
+  TBD).
+- `WarmPool::observe_templates` and the active-template list in the
+  heartbeat-ack — replaced by the host-side prefetch loop driven
+  by `enabled_images`.
+- The entire saga-rollback work the old M8 was scoped to. No table
+  to keep consistent.
+- The "no warm slot" failure mode papered with `ENGRAM_WARM_POOL_
+  DISABLED=1` in prod today; warm pool simply doesn't exist as a
+  concept after M5. It returns as a *separate, optional* future
+  milestone (see "After M5" below).
+
+**What it adds.**
+
+- A `prefetch_loop` on the host-agent: reads enabled_images from
+  coord on heartbeat, walks each enabled image's manifest, pulls
+  missing chunks via the existing `TieredChunkResolver` into the
+  local cache, updates the ready set.
+- A `ready_images: Vec<ContentHash>` field on the heartbeat
+  request.
+- A coord-side aggregate (`HostRegistry::ready_hosts_for(hash)`) so
+  the scheduler can pick a target host.
+- A new error path on session create: "no host is ready for this
+  image" (HTTP 503). Different semantics from the current
+  no-capacity 503 — operators see "image is still being prefetched"
+  not "fleet is full."
+
+**Cold-boot expectations after M5 (no warm pool).**
+
+| Phase | Today (prod, cold) | After M5 |
+|---|---|---|
+| FC create + InstanceStart | ~180 ms | ~180 ms |
+| Kernel boot | ~2.5–3 s | ~2.5–3 s (slim-vmlinux future work targets <500 ms) |
+| ext4 mount (rootfs page-in) | ~10–15 s (GCS round-trips) | ~100 ms (chunks local) |
+| engram-init shim | ~150 ms | ~150 ms (future cleanup targets ~50 ms) |
+| agentd bind + ready dial | ~120 ms | ~120 ms (future cleanup targets ~50 ms) |
+| **Total** | **~17 s** | **~3.5 s** |
+
+That's a 5× improvement on cold-boot from the chunk-prefetch alone,
+which lands us in a position where the warm-pool re-introduction is
+optimization layered on a healthy floor rather than load-bearing.
+
+**After M5: returning the warm pool.**
+
+Sub-1 s TTFM is still the goal. With M5 in place, that becomes:
+
+1. **Slim vmlinux** (separate milestone, packer-image change) —
+   strip unused subsystems, target Kata-style <500 ms boot.
+2. **engram-init slim-down + agentd cold-start tuning** — replace
+   the shell shim with a direct-syscall binary; tokio
+   `current_thread`; bake the egress CA into a tiny ramdisk so the
+   `/dev/vdb` tmp-mount disappears. Targets ~700–800 ms total
+   cold-boot.
+3. **Warm pool, take 2** — generate the memory snapshot *at runtime
+   on each host* from the first cold-create per (host, image), then
+   lease subsequent sessions from that local snapshot. CPU-vendor
+   issue dissolves because each host snapshots on its own CPU.
+   `templates` doesn't return; the local snapshot is host-private
+   state in the host-agent process, surfaced through the same
+   `ready_images` mechanism with a "with_warm_slot" flag.
+
+Each of those is its own ADR; they don't need to land together.
+M5 is the cleanest single step that unblocks all of them.
+
+**Open questions.**
+
+- Eviction policy when NVMe fills. LRU on chunks is what we have
+  today; we'd extend the readiness signal to flip to false for
+  any image whose chunks got evicted out from under it. Operator
+  capacity-planning surface area, but cleaner than today's "warm
+  slot count" model.
+- Prefetch bandwidth. Hosts pulling chunks in parallel could
+  saturate fleet egress from BlobStorage. Bound the per-host
+  prefetch concurrency (start with 4 chunks in flight, tune from
+  metrics).
+- What about post-M5 image *deletes* from `enabled_images`? Hosts
+  see the image leave the set, then either: (a) immediately evict
+  its chunks (frees NVMe, regret-on-re-enable), or (b) keep chunks
+  cached and rely on LRU. (b) is what today's chunk cache does;
+  keep it.
+- Migration of in-flight prod images. The current `enabled_images`
+  rows that have bake-time snapshots associated need a one-time
+  re-enable to drop the snapshot references. Plan: M5's
+  implementation includes a migration that strips `snapshot_id`
+  from existing rows; old artifacts in BlobStorage age out via
+  normal LRU.
 
 ---
 
@@ -420,33 +560,7 @@ FC changes.
 
 ---
 
-### M8 — `enable_image` as a saga + blob-orphan GC
-
-**Problem.** `enable_image` is a multi-step cascade
-(materialize → verify → cascade) that's not atomic. Partial failure
-can leave a `templates` row pointing at blob keys that aren't in
-storage. The host's warm-pool refill loop then spams `blob_not_found`
-WARNs forever. We hit this on the dev-vm today and dodged it by
-adding `just integration-reset` (which nukes the DB volume).
-
-**Abstraction.** `enable_image` is a saga with explicit rollback:
-each step has a compensating action; partial failure unwinds
-cleanly. Independently, a periodic GC runs over `templates` and
-detects orphans — templates whose snapshot blobs are missing from
-`BlobStorage` — and reaps them. Same shape as ADR 0011's existing
-GC over `chunk_storage`.
-
-**What it deletes.** The fragile multi-step `materialize_and_cascade`
-in `enable_image.rs`; the operator-side cleanup that today is "drop
-the DB volume" (i.e., `just integration-reset`); the per-stale-row
-WARN noise.
-
-**Open questions.** Saga library or hand-rolled? Hand-rolled — only
-~5 steps; pulling in a saga crate would be over-engineering.
-
----
-
-### M9 — Coord ↔ host as one bidirectional trait (or accept the split)
+### M8 — Coord ↔ host as one bidirectional trait (or accept the split)
 
 **Problem.** Per ADR 0013, host → coord is HTTP/JSON (heartbeat,
 events, auth resolution) and coord → host is gRPC. The split was
@@ -473,43 +587,80 @@ section stays Proposed with low priority.
 
 **Net code.** We expect the v2 direction overall to remove on the
 order of 2-3 kLOC of bespoke scab-fix code (canonical-symlink layer,
-bootstrap process + protocol, per-call-site retry loops, stale-
-templates papering). New abstractions add code (the `GuestService`
-trait, the state machine module, the `DriveResolver` shim) but each
-is small. The shift is from breadth-of-bespoke to depth-of-trait.
+bootstrap process + protocol, per-call-site retry loops, the
+`templates` table + cascade + GC). New abstractions add code (the
+`GuestService` trait, the state machine module, the `DriveResolver`
+shim, the host prefetch loop) but each is small. The shift is from
+breadth-of-bespoke to depth-of-trait.
 
 **Tests.** Several test suites collapse (bootstrap's tests → agentd's;
 the per-call-site retry tests → state machine transition tests; the
-canonical-symlink tests → DriveResolver tests). New tests for the
-trait boundaries.
+canonical-symlink tests → DriveResolver tests; the
+`materialize_and_cascade` + templates upsert + warm-pool refill
+tests → host prefetch tests). New tests for the trait boundaries.
 
 **What gets harder.** Cross-version compatibility — once M1 lands,
 mixed old/new host-agents and bakes have a brief window of
 incompatibility. The atomic-cutover migration plan in each section
-covers this. The bigger M5 (runtime snapshot) and M7 (drive refs)
-moves require careful state.bin handling for in-flight snapshots —
-likely a one-time migration script.
+covers this. M5 retires the bake-time snapshot artifact — there's a
+one-time migration to strip `snapshot_id` from existing
+`enabled_images` rows and drop the `templates` + `snapshots`-as-
+bake-artifact tables. M7 (drive refs) requires careful state.bin
+handling for in-flight session snapshots — likely a separate
+migration script.
 
 **What stays unchanged.** All the load-bearing existing abstractions:
-`SandboxBackend`, `HostClient`, chunked storage, template_ref. The
-v2 direction is additive to those, not replacing them.
+`SandboxBackend`, `HostClient`, chunked storage. The v2 direction is
+additive to those, not replacing them.
+
+### Insight: "delete the thing" keeps being the right answer
+
+Three structural improvements identified during the M1
+implementation conversations followed the same pattern:
+
+1. **bootstrap + agentd collapse.** Not "fix the bootstrap-ready
+   race" → "delete bootstrap, fold its job into agentd."
+2. **Boot-race retry helper.** Not "tune the retry deadline" →
+   "delete the retry, have agentd dial the host on startup."
+3. **`templates` table.** Not "harden enable_image with a saga +
+   periodic GC" → "delete the table, hosts converge against
+   `enabled_images` via heartbeat sync."
+
+Each time the impulse was to patch around the symptom, and each
+time the cleaner move was to identify the underlying abstraction
+that shouldn't exist and remove it. The reason the codebase
+accumulated scab-fix surface area is that we kept choosing
+"harden" over "delete." Implementers of M2–M8 should hold this
+prior: when the next layer of complexity feels like the only way
+forward, look for the abstraction one layer down that could simply
+not exist.
 
 ## Phased rollout
 
-- **Phase 1 (this PR):** M1 only. Validates the "one wire surface"
-  pattern on the simplest payload (in-VM service collapse).
-- **Phase 2 (next few PRs):** M2 + M8. Both contained, both fix
-  real recurring bugs. M2 generalizes the readiness probe M1
-  introduces; M8 eliminates the integration-reset crutch.
-- **Phase 3 (medium-term):** M3 + M5. Both touch the warm-pool
-  story (M3: who owns truth; M5: where warm snapshots come from).
-  Ship together so the warm-pool semantics get a single coherent
-  refactor.
-- **Phase 4 (large investments):** M4 + M6 + M7. Each is its own ADR
-  + multi-PR effort. Sequencing depends on which bugs surface first.
-- **Phase 5 (decide later):** M9. Decide after we have prod
+- **Phase 1 (shipped):** M1 — in-VM service unification. Commits
+  `664cf61` (ADR) and `75ba2df` / `97de278` / `0d444e9` / `4b3f890`
+  (implementation + readiness-dial follow-on).
+- **Phase 2 (next):** **M5 — Host-image readiness + retire `templates`.**
+  Largest single simplification by code retired and biggest
+  cold-boot win (~17 s → ~3.5 s prod). Single ADR, single PR
+  series. Unblocks all subsequent warm-pool work.
+- **Phase 3 (cold-boot floor):** vmlinux slim-down + engram-init/
+  agentd cold-start tuning. Not in this ADR — separate milestones
+  layered on M5. Targets ~700–800 ms cold-boot.
+- **Phase 4 (warm pool, take 2):** Host-local runtime snapshot
+  generation, layered on the post-M5 storage model. Sub-1 s TTFM
+  via warm lease; cold-create falls back to the Phase 3 floor on
+  miss. CPU-vendor issue dissolved by construction.
+- **Phase 5 (session state correctness):** M2 + M3. Both touch
+  session/host lifecycle and benefit from M5's stable storage
+  model.
+- **Phase 6 (large refactors):** M4 (session migration), M6
+  (unified harness stream), M7 (DriveResolver). Each is its own
+  ADR + multi-PR effort. Sequencing depends on which bugs surface
+  first.
+- **Phase 7 (decide later):** M8. Decide after we have prod
   observability on the channel-split cost.
 
 Each phase ships its own implementation ADR. This document is the
 v2 direction summary, not the implementation plan for any single
-move beyond M1.
+move beyond M1 and M5.
