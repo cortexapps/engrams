@@ -1,14 +1,13 @@
 //! Phase 5 sign-off: harness end-to-end on a real Firecracker microVM.
 //!
 //! Exercises the full pipeline:
-//!   - bake an FC image with `engram-agentd` + `engram-bootstrap`
-//!     injected
+//!   - bake an FC image with `engram-agentd` injected
 //!   - build a harness substrate ext4 from a tempdir containing
 //!     `engram-harness-noop` at the canonical `<name>/harness` path
 //!   - boot a sandbox with both the rootfs and the substrate attached
 //!   - register a `HarnessSink` on the FC backend
-//!   - call `start_agent` to push a `BootstrapLaunch` for the noop
-//!     harness on vsock 1025
+//!   - call `start_agent` to push a `SpawnHarness` for the noop
+//!     harness on vsock 1024 (ADR 0015 M1)
 //!   - assert 3 `ToolCallCompleted` events arrive over vsock 1026
 //!     within 30 s
 //!
@@ -55,21 +54,17 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     // The canonical entry point is `scripts/run-boot-test.sh
     // harness_loopback`, which rebuilds these musl binaries before
     // calling `cargo test`. Direct `cargo test --ignored` invocations
-    // skip that step and risk silently running against a stale binary
-    // (e.g. an `engram-bootstrap` from before commit 7ba0e61 doesn't
-    // write the readiness byte, leading to a 15s timeout in
-    // `start_agent`). The SKIP message points at the script.
+    // skip that step and risk silently running against a stale binary.
+    // The SKIP message points at the script.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let musl = target_root
         .join("x86_64-unknown-linux-musl")
         .join("release");
     let agent_bin = musl.join("engram-agentd");
-    let bootstrap_bin = musl.join("engram-bootstrap");
     let noop_bin = musl.join("engram-harness-noop");
     for (label, p) in [
         ("engram-agentd", &agent_bin),
-        ("engram-bootstrap", &bootstrap_bin),
         ("engram-harness-noop", &noop_bin),
     ] {
         if !p.exists() {
@@ -85,7 +80,7 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
         }
     }
 
-    // ---- 1. Bake the rootfs with agent+bootstrap injected ----
+    // ---- 1. Bake the rootfs with agent injected ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(
         src.path().join("Dockerfile"),
@@ -121,7 +116,6 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
-                bootstrap_binary: Some(bootstrap_bin),
             }),
             canonical_memory_manifest: None,
             capture_canonical_memory: None,

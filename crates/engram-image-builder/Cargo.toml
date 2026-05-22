@@ -29,10 +29,11 @@ engram-storage-gcs.workspace = true
 # image-builder (for its integration tests that bake fixtures),
 # so the dep graph stays acyclic.
 engram-sandbox-firecracker.workspace = true
-# ADR 0014 M1.14: synthetic profile pass sends a `BootstrapLaunch`
-# over vsock to drive in-VM activity through the kernel paths warm-
-# lease will hit, so the UFFD handler's recorder captures them.
-engram-harness-proto.workspace = true
+# ADR 0014 M1.14 + ADR 0015 M1: synthetic profile pass sends a
+# `WireRequest::SpawnHarness` over vsock to drive in-VM activity
+# through the kernel paths warm-lease will hit, so the UFFD
+# handler's recorder captures them.
+engram-agentd.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true

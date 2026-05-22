@@ -43,60 +43,13 @@ use engram_core::SessionId;
 /// `<vsock_uds>_<port>.sock`; guest dials AF_VSOCK CID=2 port=1026).
 pub const HARNESS_VSOCK_PORT: u32 = 1026;
 
-/// Vsock port the in-guest `engram-bootstrap` listener binds. The
-/// host's `start_agent` connects to this port and pushes a
-/// [`BootstrapLaunch`] frame; bootstrap reads it and `exec`s the
-/// described argv (with merged env) so the per-session agent process
-/// can take over. Direction: host-to-guest (host writes
-/// `CONNECT 1025\n` to `<vsock_uds>`).
-pub const BOOTSTRAP_VSOCK_PORT: u32 = 1025;
-
-/// Single-byte readiness marker the in-VM bootstrap supervisor writes
-/// to its accepted stream before reading the [`BootstrapLaunch`]
-/// frame. The host's `start_agent` reads this byte first, then writes
-/// the launch — guaranteeing the guest is actually consuming bytes
-/// when the launch arrives. On virtio-console (VZ), the host's UDS
-/// pump accepts a dial immediately (the listener is bound at VM-
-/// config time), but bytes the host writes before the guest's port
-/// is open get dropped by VZ rather than queued. The byte's value
-/// is arbitrary; the host just checks for "one byte received".
-pub const BOOTSTRAP_READY_BYTE: u8 = 0xEB;
-
-/// Wire shape for the bootstrap-launch frame. The host sends this
-/// once after CONNECTing to [`BOOTSTRAP_VSOCK_PORT`]; bootstrap reads
-/// it, prepares the env, optionally mounts the harness device, and
-/// `exec`s `argv[0]` with the rest as arguments. Bootstrap exits
-/// (via exec replacing its image) — there is no reply.
-///
-/// Argv may reference any binary baked into the rootfs (typically
-/// `/sbin/engram-harness-noop` for dev or `/sbin/engram-harness-claude`
-/// for production). Env is merged on top of bootstrap's existing env;
-/// duplicate keys take the BootstrapLaunch value.
-///
-/// ADR 0014 M1.12 (option D): when `harness_dev` is set, bootstrap
-/// `mount(2)`s that block device at `harness_mount` (read-only ext4)
-/// before exec'ing argv. This lets warm-pool templates be harness-
-/// agnostic: the template snapshot captures a stub harness drive,
-/// and per-session `PATCH /drives` swaps in the session's chosen
-/// harness ext4. Cold-path sessions also use bootstrap-side mount
-/// now (engram-init no longer touches the harness); the wire shape
-/// is the same.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BootstrapLaunch {
-    pub argv: Vec<String>,
-    #[serde(default)]
-    pub env: std::collections::HashMap<String, String>,
-    /// `Some(path)` to ask bootstrap to mount that block device
-    /// before exec; `None` (or pre-M1.12 frames) skips the mount.
-    /// Typical value: `/dev/vdb`.
-    #[serde(default)]
-    pub harness_dev: Option<String>,
-    /// Where to mount `harness_dev`. Required when `harness_dev` is
-    /// set; ignored otherwise. Typical value:
-    /// `/run/engram/harnesses`.
-    #[serde(default)]
-    pub harness_mount: Option<String>,
-}
+// ADR 0015 M1: `BOOTSTRAP_VSOCK_PORT`, `BOOTSTRAP_READY_BYTE`, and
+// `BootstrapLaunch` were retired when the standalone
+// `engram-bootstrap` process was folded into agentd. The host now
+// dials agentd on `ENGRAM_AGENTD_PORT` (1024) with a
+// `WireRequest::SpawnHarness` carrying the same fields the old
+// `BootstrapLaunch` did. See:
+// `crates/engram-agentd/src/proto.rs::SpawnHarnessRequest`.
 
 /// Single-frame size cap. Same as `engram-agentd::proto::MAX_MSG_BYTES`.
 /// `transcript_delta` payloads are typically a few KB (one JSONL line
@@ -423,70 +376,6 @@ mod tests {
             ok: true,
         }));
         round_trip(HarnessFrame::Event(HarnessEvent::Idle));
-    }
-
-    /// ADR 0014 M1.12: option-D extension to BootstrapLaunch adds
-    /// `harness_dev` + `harness_mount` Option<String> fields. Lock
-    /// in the wire shape with serde defaults so an older host
-    /// sending a frame without the new fields still deserializes
-    /// cleanly on a new bootstrap, AND a new host's frame
-    /// (carrying the fields) round-trips correctly.
-    #[test]
-    fn bootstrap_launch_round_trip_with_harness_fields() {
-        round_trip(BootstrapLaunch {
-            argv: vec!["/sbin/engram-harness-claude".into(), "--session".into()],
-            env: [("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
-                .iter()
-                .cloned()
-                .collect(),
-            harness_dev: Some("/dev/vdb".into()),
-            harness_mount: Some("/run/engram/harnesses".into()),
-        });
-        // No-harness variant (kind = none sessions).
-        round_trip(BootstrapLaunch {
-            argv: vec!["/bin/sleep".into(), "infinity".into()],
-            env: Default::default(),
-            harness_dev: None,
-            harness_mount: None,
-        });
-    }
-
-    /// Backwards compat: a frame serialized in the pre-M1.12 shape
-    /// (argv + env only) MUST deserialize into the new struct with
-    /// `harness_dev` + `harness_mount` defaulting to None. Without
-    /// `#[serde(default)]` on the new fields this would fail.
-    #[test]
-    fn bootstrap_launch_deserializes_pre_m1_12_frame() {
-        // The legacy shape is just two fields. We synthesize what
-        // an older bootstrap binary would have read by constructing
-        // a JSON of the old shape and round-tripping through
-        // bincode-compatible serde to confirm Option<String> with
-        // serde(default) tolerates absent fields.
-        //
-        // Strategy: serialize a struct shaped like pre-M1.12, then
-        // try to deserialize as the new BootstrapLaunch. Use
-        // `serde_json` for the round-trip since bincode's
-        // sequence-driven format can't add optional fields without
-        // a version tag. JSON is the operationally-relevant test
-        // because the wire format here is bincode but the *concept*
-        // of "old client sends to new server" is what we care about
-        // — and bincode would just truncate, which serde(default)
-        // handles trivially.
-        #[derive(Serialize)]
-        struct LegacyShape {
-            argv: Vec<String>,
-            env: std::collections::HashMap<String, String>,
-        }
-        let legacy = LegacyShape {
-            argv: vec!["/sbin/old-harness".into()],
-            env: Default::default(),
-        };
-        let json = serde_json::to_string(&legacy).unwrap();
-        let new: BootstrapLaunch = serde_json::from_str(&json).unwrap();
-        assert_eq!(new.argv, vec!["/sbin/old-harness".to_string()]);
-        assert!(new.env.is_empty());
-        assert!(new.harness_dev.is_none());
-        assert!(new.harness_mount.is_none());
     }
 
     #[test]

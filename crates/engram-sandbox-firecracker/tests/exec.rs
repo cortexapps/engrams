@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use engram_agentd::serve_connection;
+use engram_agentd::{serve_connection, HarnessSupervisor};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::ExecRequest;
 use engram_sandbox_firecracker::FirecrackerBackend;
@@ -33,12 +33,16 @@ use common::drain;
 /// agent's `main.rs`.
 async fn spawn_test_agent(socket: PathBuf) -> JoinHandle<()> {
     let listener = UnixListener::bind(&socket).expect("bind UDS");
+    // One supervisor across all accepted connections — mirrors the
+    // real agent's main.rs shape.
+    let supervisor = HarnessSupervisor::new();
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let sup = supervisor.clone();
                     tokio::spawn(async move {
-                        let _ = serve_connection(stream, None).await;
+                        let _ = serve_connection(stream, None, sup).await;
                     });
                 }
                 Err(_) => return,

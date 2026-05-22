@@ -774,89 +774,54 @@ async fn create_session_inner(
         // get at L719. For v1 we accept the UNSPECIFIED-IP policy
         // already applied by LaunchWarmSandbox.
     } else {
-        match (agent_for_session, egress_policy) {
-            (Some(agent), Some(policy)) => {
-                if let Err(e) = state
-                    .services
-                    .host
-                    .start_agent(sandbox_id, agent, policy)
-                    .await
-                {
-                    tracing::error!(
-                        %session_id,
-                        %sandbox_id,
-                        %host_id,
-                        error = %e,
-                        "start_agent failed; marking session Failed",
-                    );
-                    let _ = state
-                        .services
-                        .meta
-                        .set_session_status(session_id, SessionStatus::Failed)
-                        .await;
-                    state.services.host.unbind_session(session_id).await;
-                    return Err(e.into());
-                }
+        // ADR 0015 M1: every cold-create session goes through
+        // `start_agent`, including `harness: none`. Agentd's
+        // SpawnHarness handler treats empty argv as a readiness
+        // probe (no child spawned, no error), so the same call
+        // serves both cases — and as a side-effect "session is
+        // Active" now actually implies "agentd is reachable on
+        // vsock", which makes the early-eof race that the no-
+        // harness path used to produce structurally impossible.
+        let agent = agent_for_session.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
+            argv: Vec::new(),
+            env: std::collections::HashMap::new(),
+        });
+        let policy = egress_policy.unwrap_or_else(|| {
+            // No guest IP yet → synthesize an unspecified-IP policy.
+            // host-agents without a live proxy treat policy
+            // application as a no-op, so this is safe; the agent
+            // can refine on a later `apply_egress_policy` once the
+            // IP shows up.
+            engram_core::types::egress::SessionEgressPolicy {
+                session_id,
+                sandbox_id,
+                guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                network_allow_hosts: network_for_proxy.allow_hosts.clone(),
+                network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
+                secrets: Vec::new(),
+                secret_mode: manifest.secret_mode,
             }
-            (Some(agent), None) => {
-                // No guest IP yet → no policy to bundle. Synthesize an
-                // empty SessionEgressPolicy with the unspecified IP;
-                // host-agents without a live proxy treat policy
-                // application as a no-op, so this is safe. The agent
-                // can still apply policy on a later
-                // `apply_egress_policy` call once the IP shows up.
-                let policy = engram_core::types::egress::SessionEgressPolicy {
-                    session_id,
-                    sandbox_id,
-                    guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                    network_allow_hosts: network_for_proxy.allow_hosts.clone(),
-                    network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-                    secrets: Vec::new(),
-                    secret_mode: manifest.secret_mode,
-                };
-                if let Err(e) = state
-                    .services
-                    .host
-                    .start_agent(sandbox_id, agent, policy)
-                    .await
-                {
-                    tracing::error!(
-                        %session_id,
-                        %sandbox_id,
-                        %host_id,
-                        error = %e,
-                        "start_agent failed (no guest IP path); marking session Failed",
-                    );
-                    let _ = state
-                        .services
-                        .meta
-                        .set_session_status(session_id, SessionStatus::Failed)
-                        .await;
-                    state.services.host.unbind_session(session_id).await;
-                    return Err(e.into());
-                }
-            }
-            (None, Some(policy)) => {
-                // No agent to spawn — just apply the egress policy so
-                // future `/exec` traffic flows through the proxy with
-                // the right allowlist.
-                if let Err(e) = state.services.host.apply_egress_policy(policy).await {
-                    tracing::warn!(
-                        %session_id,
-                        %sandbox_id,
-                        error = %e,
-                        "apply_egress_policy failed; proceeding without egress policy",
-                    );
-                }
-            }
-            (None, None) => {
-                // Sandbox without a harness and without a guest IP —
-                // nothing to apply, nothing to spawn. The session is
-                // already alive (row inserted, host bound); exec
-                // traffic will go through whatever default the host's
-                // proxy provides (typically allow-all in mode=all,
-                // deny-all in production with no policy registered).
-            }
+        });
+        if let Err(e) = state
+            .services
+            .host
+            .start_agent(sandbox_id, agent, policy)
+            .await
+        {
+            tracing::error!(
+                %session_id,
+                %sandbox_id,
+                %host_id,
+                error = %e,
+                "start_agent failed; marking session Failed",
+            );
+            let _ = state
+                .services
+                .meta
+                .set_session_status(session_id, SessionStatus::Failed)
+                .await;
+            state.services.host.unbind_session(session_id).await;
+            return Err(e.into());
         }
     }
     // Row was inserted as Active in Phase 5; no status update needed.

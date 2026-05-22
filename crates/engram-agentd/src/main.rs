@@ -171,13 +171,23 @@ async fn run(args: Args) -> std::io::Result<()> {
              accepting any host that can reach the listener"
         );
     }
+    // ADR 0015 M1: one supervisor owns the harness child process
+    // across the lifetime of the agent. Shared across all
+    // serve_connection tasks so a fresh `SpawnHarness` from any
+    // connection finds (and kills) the current child before
+    // launching the new one.
+    let supervisor = engram_agentd::HarnessSupervisor::new();
     match args.listen {
-        Listen::Unix(path) => run_unix(path, token).await,
-        Listen::Transport(port) => run_transport(port, token).await,
+        Listen::Unix(path) => run_unix(path, token, supervisor).await,
+        Listen::Transport(port) => run_transport(port, token, supervisor).await,
     }
 }
 
-async fn run_unix(listen_path: PathBuf, token: Option<String>) -> std::io::Result<()> {
+async fn run_unix(
+    listen_path: PathBuf,
+    token: Option<String>,
+    supervisor: std::sync::Arc<engram_agentd::HarnessSupervisor>,
+) -> std::io::Result<()> {
     use tokio::net::UnixListener;
     if listen_path.exists() {
         let _ = tokio::fs::remove_file(&listen_path).await;
@@ -189,7 +199,7 @@ async fn run_unix(listen_path: PathBuf, token: Option<String>) -> std::io::Resul
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _addr)) => spawn_serve(stream, token.clone()),
+                Ok((stream, _addr)) => spawn_serve(stream, token.clone(), supervisor.clone()),
                 Err(e) => tracing::warn!(error = %e, "accept failed"),
             },
             _ = &mut shutdown => {
@@ -205,7 +215,11 @@ async fn run_unix(listen_path: PathBuf, token: Option<String>) -> std::io::Resul
 /// `serve_connection` task; vsock yields concurrent streams as
 /// expected, console reopens `/dev/hvcN` per accept and effectively
 /// serializes (one exec at a time per port).
-async fn run_transport(port: u32, token: Option<String>) -> std::io::Result<()> {
+async fn run_transport(
+    port: u32,
+    token: Option<String>,
+    supervisor: std::sync::Arc<engram_agentd::HarnessSupervisor>,
+) -> std::io::Result<()> {
     let transport = engram_transport::from_env()?;
     let mut listener = transport.listen(port).await?;
     let kind = std::env::var("ENGRAM_TRANSPORT").unwrap_or_else(|_| "vsock".into());
@@ -215,7 +229,7 @@ async fn run_transport(port: u32, token: Option<String>) -> std::io::Result<()> 
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok(stream) => spawn_serve(stream, token.clone()),
+                Ok(stream) => spawn_serve(stream, token.clone(), supervisor.clone()),
                 Err(e) => tracing::warn!(error = %e, "transport accept failed"),
             },
             _ = &mut shutdown => {
@@ -228,12 +242,15 @@ async fn run_transport(port: u32, token: Option<String>) -> std::io::Result<()> 
 
 /// Hand an accepted stream to [`serve_connection`] on its own task,
 /// logging any per-connection error without tearing the listener down.
-fn spawn_serve<S>(stream: S, token: Option<String>)
-where
+fn spawn_serve<S>(
+    stream: S,
+    token: Option<String>,
+    supervisor: std::sync::Arc<engram_agentd::HarnessSupervisor>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        if let Err(e) = serve_connection(stream, token).await {
+        if let Err(e) = serve_connection(stream, token, supervisor).await {
             tracing::warn!(error = %e, "connection ended with error");
         }
     });

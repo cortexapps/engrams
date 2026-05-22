@@ -10,12 +10,14 @@
 
 use std::io;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use crate::harness_supervisor::HarnessSupervisor;
 use crate::proto::{
     read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireHandshake, WireHandshakeAck,
     WireRequest, WireResponse, WireStatResponse,
@@ -42,7 +44,11 @@ const READ_BUF_BYTES: usize = 8 * 1024;
 /// before it gets to send a [`WireExecRequest`]; mismatch returns
 /// an `Unauthorized`-flavoured `io::Error` after writing the
 /// rejection ack.
-pub async fn serve_connection<S>(stream: S, expected_token: Option<String>) -> io::Result<()>
+pub async fn serve_connection<S>(
+    stream: S,
+    expected_token: Option<String>,
+    supervisor: Arc<HarnessSupervisor>,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -131,6 +137,17 @@ where
                 Err(e) => WireResponse::Error {
                     kind: format!("{:?}", e.kind()),
                     message: format!("start_shell: {e}"),
+                },
+            };
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
+        WireRequest::SpawnHarness(req) => {
+            let resp = match supervisor.spawn(req).await {
+                Ok(pid) => WireResponse::HarnessSpawned { pid },
+                Err(e) => WireResponse::Error {
+                    kind: format!("{:?}", e.kind()),
+                    message: format!("spawn_harness: {e}"),
                 },
             };
             write_msg(&mut writer, &resp).await?;
@@ -419,7 +436,10 @@ mod tests {
         let (mut client, server) = duplex(64 * 1024);
 
         // Server side: handler reads request, runs cmd, writes events.
-        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(server, None, HarnessSupervisor::new()).await },
+            );
 
         // Client side: wrap the exec request in the multi-verb
         // envelope, then read events until EOF.
@@ -566,7 +586,10 @@ mod tests {
         // but here the handler must error. Drive serve_connection
         // manually so we can inspect the error.
         let (mut client, server) = duplex(1024);
-        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(server, None, HarnessSupervisor::new()).await },
+            );
         write_msg(
             &mut client,
             &WireRequest::Exec(WireExecRequest {
@@ -587,7 +610,10 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_surfaces_io_error() {
         let (mut client, server) = duplex(1024);
-        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(server, None, HarnessSupervisor::new()).await },
+            );
         write_msg(
             &mut client,
             &WireRequest::Exec(WireExecRequest {
@@ -611,7 +637,9 @@ mod tests {
         // an ok ack, then send WireExecRequest as usual.
         let (mut client, server) = duplex(64 * 1024);
         let token = "shared-secret".to_string();
-        let server_task = tokio::spawn(async move { serve_connection(server, Some(token)).await });
+        let server_task = tokio::spawn(async move {
+            serve_connection(server, Some(token), HarnessSupervisor::new()).await
+        });
 
         write_msg(
             &mut client,
@@ -661,8 +689,9 @@ mod tests {
     #[tokio::test]
     async fn handshake_with_wrong_token_is_rejected() {
         let (mut client, server) = duplex(64 * 1024);
-        let server_task =
-            tokio::spawn(async move { serve_connection(server, Some("expected".into())).await });
+        let server_task = tokio::spawn(async move {
+            serve_connection(server, Some("expected".into()), HarnessSupervisor::new()).await
+        });
         write_msg(
             &mut client,
             &WireHandshake {
@@ -691,7 +720,10 @@ mod tests {
         // straight away. Critical for back-compat with older hosts
         // that don't know about the handshake.
         let (mut client, server) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(server, None, HarnessSupervisor::new()).await },
+            );
         write_msg(
             &mut client,
             &WireRequest::Exec(WireExecRequest {
@@ -752,7 +784,10 @@ mod tests {
     /// back the single WireResponse. Used by the verb tests below.
     async fn round_trip(req: WireRequest) -> WireResponse {
         let (mut client, server) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move { serve_connection(server, None).await });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(server, None, HarnessSupervisor::new()).await },
+            );
         write_msg(&mut client, &req).await.unwrap();
         let resp: WireResponse = read_msg(&mut client).await.unwrap();
         let _ = server_task.await.unwrap();

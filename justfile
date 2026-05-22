@@ -224,8 +224,7 @@ bake repo dir='.':
         echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
     fi; \
     rustup target add $TARGET >/dev/null 2>&1 || true; \
-    cargo build -p engram-agentd    --target $TARGET --release; \
-    cargo build -p engram-bootstrap --target $TARGET --release; \
+    cargo build -p engram-agentd --target $TARGET --release; \
     TAG="${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
     STAGING="./var/bake/{{repo}}"; \
     rm -rf "$STAGING"; mkdir -p "$STAGING"; \
@@ -243,8 +242,7 @@ bake repo dir='.':
         --format ext4 \
         --images-dir ./var/bake/_staging \
         --transport $TRANSPORT \
-        --inject-agent     "target/$TARGET/release/engram-agentd" \
-        --inject-bootstrap "target/$TARGET/release/engram-bootstrap" \
+        --inject-agent "target/$TARGET/release/engram-agentd" \
         --push localhost:5001/{{repo}}; \
     echo ""; \
     echo "✓ pushed localhost:5001/{{repo}}:$TAG"; \
@@ -351,8 +349,7 @@ bake-harness NAME TAG="v1":
 # the env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) or from
 # the dashboard's session-create form.
 fc-bake-demo:
-    cargo build -p engram-agentd    --target x86_64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap --target x86_64-unknown-linux-musl --release
+    cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
     mkdir -p ./var/fc-bake-demo
     cp deploy/demo/Dockerfile  ./var/fc-bake-demo/Dockerfile
     cp deploy/demo/engram.toml ./var/fc-bake-demo/engram.toml
@@ -362,8 +359,7 @@ fc-bake-demo:
         --source ./var/fc-bake-demo \
         --format ext4 \
         --images-dir ./var/engram/images \
-        --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap
+        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd
 
 # ------------------------------------------------------------------
 # Apple Silicon — Virtualization.framework backend
@@ -476,8 +472,7 @@ vz-pull-ubuntu-kernel: vz-pull-kernel
 # and pick at session-create time with `--harness <name>`.
 vz-bake-demo:
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
-    cargo build -p engram-agentd    --target aarch64-unknown-linux-musl --release
-    cargo build -p engram-bootstrap --target aarch64-unknown-linux-musl --release
+    cargo build -p engram-agentd --target aarch64-unknown-linux-musl --release
     mkdir -p ./var/vz-bake-demo
     cp deploy/demo/Dockerfile  ./var/vz-bake-demo/Dockerfile
     cp deploy/demo/engram.toml ./var/vz-bake-demo/engram.toml
@@ -493,8 +488,7 @@ vz-bake-demo:
         --format ext4 \
         --images-dir ./var/engram/images \
         --transport console \
-        --inject-agent     target/aarch64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/aarch64-unknown-linux-musl/release/engram-bootstrap
+        --inject-agent target/aarch64-unknown-linux-musl/release/engram-agentd
 
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch

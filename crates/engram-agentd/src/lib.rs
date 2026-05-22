@@ -15,11 +15,13 @@
 //! `main.rs` ties them together with a CLI for the in-guest binary.
 
 pub mod handler;
+pub mod harness_supervisor;
 pub mod proto;
 pub mod shell;
 
 pub use handler::serve_connection;
+pub use harness_supervisor::HarnessSupervisor;
 pub use proto::{
-    read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireExecRequest, WireHandshake,
-    WireHandshakeAck, WireRequest, WireResponse, WireStatResponse, MAX_MSG_BYTES,
+    read_msg, write_msg, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent, WireExecRequest,
+    WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse, MAX_MSG_BYTES,
 };

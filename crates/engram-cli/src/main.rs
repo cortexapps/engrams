@@ -337,17 +337,6 @@ enum ImageCmd {
         #[arg(long)]
         inject_agent: Option<PathBuf>,
 
-        /// Inject a static-musl `engram-bootstrap` binary at
-        /// `/sbin/engram-bootstrap`. The default init shim spawns
-        /// it in the background; it listens on vsock 1025 for a
-        /// `BootstrapLaunch` from the host and exec's the per-
-        /// session harness over the virtio-fs mount at
-        /// `/run/engram/harnesses/`. Harness binaries themselves
-        /// are no longer baked into images — they live host-side
-        /// in `cfg.harnesses_dir`.
-        #[arg(long)]
-        inject_bootstrap: Option<PathBuf>,
-
         /// Which `engram-transport` impl the in-VM binaries should
         /// select at runtime. The init shim writes
         /// `ENGRAM_TRANSPORT=<value>` into the rootfs.
@@ -524,7 +513,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 docker_bin,
                 format,
                 inject_agent,
-                inject_bootstrap,
                 transport,
                 push,
                 capture_canonical_memory,
@@ -573,7 +561,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     docker_bin.as_deref(),
                     *format,
                     inject_agent.as_deref(),
-                    inject_bootstrap.as_deref(),
                     *transport,
                     push.as_deref(),
                     canonical,
@@ -1184,7 +1171,6 @@ async fn image_build(
     docker_bin: Option<&str>,
     format: Format,
     inject_agent: Option<&Path>,
-    inject_bootstrap: Option<&Path>,
     transport: engram_image_builder::Transport,
     push: Option<&str>,
     capture_canonical_memory: Option<engram_image_builder::CanonicalCaptureConfig>,
@@ -1201,7 +1187,6 @@ async fn image_build(
         vsock_port: 1024,
         transport,
         init_script: None,
-        bootstrap_binary: inject_bootstrap.map(|p| p.to_path_buf()),
     });
     let req = BuildRequest {
         source: source.to_path_buf(),

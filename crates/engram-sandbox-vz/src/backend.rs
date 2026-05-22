@@ -23,7 +23,7 @@ use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream,
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -394,29 +394,38 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
-        tracing::debug!(sandbox_id = %id, argv0 = %agent.argv.first().map(|s| s.as_str()).unwrap_or("<empty>"), "vz start_agent: dialing bootstrap UDS");
+        // ADR 0015 M1: one in-VM service. The host dials agentd on
+        // port 1024 with a SpawnHarness request; agentd's harness
+        // supervisor owns the mount + child spawn (was a separate
+        // engram-bootstrap process).
+        //
+        // VZ doesn't use the option-D harness-late-bind path — its
+        // in-VM mount story is handled by engram-init via the VZ
+        // disk-attach config, not via SpawnHarness's mount params.
+        // Leave harness_{dev,mount} unset.
+        tracing::debug!(
+            sandbox_id = %id,
+            argv0 = %agent.argv.first().map(|s| s.as_str()).unwrap_or("<empty>"),
+            "vz start_agent: dialing agentd UDS",
+        );
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.vsock_uds_path.clone()
         };
-        let bootstrap_uds =
-            port_uds_path(&vsock_uds_path, engram_harness_proto::BOOTSTRAP_VSOCK_PORT);
-        // The in-VM bootstrap supervisor takes a few seconds to
-        // come up after VM boot — same race FC handles. Retry the
-        // dial with backoff for ~15s before giving up. Bridge bind
-        // already happened in `create`, so the UDS exists; what
-        // can fail is the dial-through to the guest until bootstrap
-        // accept()s on port 1025.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+
+        // Boot-race retry. agentd's vsock listener binds after
+        // engram-init finishes its mounts — ~seconds on cold boot.
+        // 60 s budget matches FC's start_agent (same shape).
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut backoff = Duration::from_millis(100);
         let mut conn = loop {
-            match UnixStream::connect(&bootstrap_uds).await {
+            match UnixStream::connect(&agent_uds).await {
                 Ok(c) => break c,
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(SandboxError::Vm(
-                            format!("connect bootstrap UDS {}: {e}", bootstrap_uds.display())
-                                .into(),
+                            format!("connect agentd UDS {}: {e}", agent_uds.display()).into(),
                         ));
                     }
                     tokio::time::sleep(backoff).await;
@@ -425,60 +434,30 @@ impl SandboxBackend for VzBackend {
             }
         };
 
-        // Wait for bootstrap to write the readiness byte before
-        // sending the launch. The UDS dial returns the moment the
-        // host pump's UnixListener accepts (which happens at
-        // VM-config time, well before the guest is even booted), so
-        // a write at that point would race the guest port being
-        // opened — on VZ's virtio-console path those early bytes get
-        // dropped. Reading the marker first turns this into an
-        // ordering guarantee: bootstrap accepted → wrote → we read,
-        // so its read pump is definitely consuming.
-        use tokio::io::AsyncReadExt;
-        let mut marker = [0u8; 1];
-        match tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut marker)).await {
-            Ok(Ok(_)) => {
-                if marker[0] != engram_harness_proto::BOOTSTRAP_READY_BYTE {
-                    tracing::warn!(
-                        sandbox_id = %id,
-                        got = marker[0],
-                        "vz start_agent: unexpected bootstrap marker; proceeding anyway"
-                    );
-                }
-                tracing::debug!(sandbox_id = %id, "vz start_agent: bootstrap ready");
-            }
-            Ok(Err(e)) => {
-                return Err(SandboxError::Vm(
-                    format!("read bootstrap ready marker: {e}").into(),
-                ));
-            }
-            Err(_) => {
-                return Err(SandboxError::Vm(
-                    "timed out waiting for bootstrap ready marker (15s)".into(),
-                ));
-            }
-        }
-
-        // VZ backend doesn't use the option-D harness-late-bind path
-        // — its in-VM mount story is handled by engram-init via the
-        // VZ disk-attach config, not via bootstrap mount(2). Leave
-        // harness_{dev,mount} unset; bootstrap will skip the mount
-        // and exec directly. (If VZ ever joins the option-D path,
-        // populate these the same way the FC backend does.)
-        let launch = engram_harness_proto::BootstrapLaunch {
+        let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             harness_dev: None,
             harness_mount: None,
-        };
-        tracing::debug!(sandbox_id = %id, "vz start_agent: writing BootstrapLaunch frame");
-        engram_harness_proto::write_msg(&mut conn, &launch)
+        });
+        engram_agentd::write_msg(&mut conn, &req)
             .await
-            .map_err(|e| SandboxError::Vm(format!("write BootstrapLaunch: {e}").into()))?;
-        // Best-effort flush; bootstrap closes its end after exec.
-        let _ = conn.shutdown().await;
-        tracing::debug!(sandbox_id = %id, "vz start_agent: BootstrapLaunch sent");
-        Ok(())
+            .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
+        let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("read SpawnHarness response: {e}").into()))?;
+        match resp {
+            engram_agentd::WireResponse::HarnessSpawned { pid } => {
+                tracing::debug!(sandbox_id = %id, pid = ?pid, "vz start_agent: harness spawned");
+                Ok(())
+            }
+            engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                format!("SpawnHarness rejected ({kind}): {message}").into(),
+            )),
+            other => Err(SandboxError::Vm(
+                format!("SpawnHarness: unexpected response: {other:?}").into(),
+            )),
+        }
     }
 
     fn set_harness_sink(&self, sink: HarnessSink) {

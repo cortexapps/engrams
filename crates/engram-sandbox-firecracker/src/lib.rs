@@ -869,11 +869,48 @@ impl FirecrackerBackend {
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
     }
 
+    /// Connect to the guest's vsock listener on `port`, retrying the
+    /// boot-race window (UDS exists but no in-guest listener yet —
+    /// FC closes with "early eof" on CONNECT response) until
+    /// `deadline`. Genuine non-retryable errors return immediately.
+    ///
+    /// Use this for any vsock call that races a freshly-booted
+    /// sandbox (exec, start_agent, start_shell). 60s matches the
+    /// cold-path agent_handshake budget — chunked-NBD page-ins
+    /// from GCS dominate the boot, and the listener doesn't appear
+    /// until engram-init completes its mounts.
+    async fn connect_fc_vsock_with_retry(
+        vsock_uds_path: &Path,
+        port: u32,
+        deadline: Duration,
+    ) -> Result<UnixStream, SandboxError> {
+        let until = std::time::Instant::now() + deadline;
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            match Self::connect_fc_vsock(vsock_uds_path, port).await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let is_boot_race = msg.contains("read FC vsock CONNECT response")
+                        || msg.contains("connect to FC vsock UDS");
+                    if !is_boot_race || std::time::Instant::now() >= until {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+
     /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
     /// read back `OK <peer>\n`, and return the resulting stream now
     /// directly connected to the guest's listener on `port`. Shared
     /// between exec (port 1024) and start_agent (port 1025 for
     /// bootstrap).
+    ///
+    /// One-shot: callers that race the boot window should use
+    /// [`Self::connect_fc_vsock_with_retry`] instead.
     async fn connect_fc_vsock(
         vsock_uds_path: &Path,
         port: u32,
@@ -2241,10 +2278,11 @@ impl SandboxBackend for FirecrackerBackend {
         // after `create()` returns: kernel boot → init → engram-agentd
         // bind on vsock 1024. Connecting before that returns "early eof"
         // on the CONNECT response (FC closes the UDS when there's no
-        // listener on the requested guest port). Retry with exponential
-        // backoff for ~10s; bail fast on any non-handshake error so
-        // genuine breakage doesn't get hidden.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // listener on the requested guest port). 60s matches the
+        // cold-path agent_handshake budget — chunked-NBD page-ins
+        // from GCS dominate prod boots. Bail fast on non-boot-race
+        // errors so genuine breakage doesn't hide behind retries.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut sleep = Duration::from_millis(50);
         loop {
             match Self::exec_stream_via_fc_vsock(
@@ -2734,15 +2772,24 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
 
-        // Conservative deadline: ttyd binds in ~100ms under normal
-        // load; agentd's own ready-probe in-VM is bounded at 10s. Add
-        // headroom for the vsock RTT under load. If we hit this, the
-        // VM is severely degraded — surface loud rather than silently
-        // retrying like the old proxy_shell deadline.
+        // Deadline must cover the cold-boot race: the UI auto-opens
+        // /shell as soon as coord emits Pending→Active, but for
+        // harness=none sessions Active fires ~14ms after FC start
+        // (no agent_handshake on that path) and agentd's vsock
+        // listener doesn't appear until engram-init finishes its
+        // chunked-NBD mounts — ~15-17s on prod. Pre-fix this was
+        // 15s with a non-retrying connect, which dropped the first
+        // WS connect with `read FC vsock CONNECT response: early eof`
+        // and the UI surfaced "abnormal close (no close frame
+        // received)". 60s matches start_agent's existing budget.
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
+            let mut conn = Self::connect_fc_vsock_with_retry(
+                &vsock_uds_path,
+                ENGRAM_AGENTD_PORT,
+                Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
@@ -2767,7 +2814,11 @@ impl SandboxBackend for FirecrackerBackend {
                 )),
             }
         };
-        tokio::time::timeout(Duration::from_secs(15), fut)
+        // Slightly longer than the inner connect deadline so a
+        // legitimate connect (post-boot, agentd already up but
+        // ttyd spawn just kicked off) gets to complete its ~150ms
+        // ttyd ready probe without tripping the outer timeout.
+        tokio::time::timeout(Duration::from_secs(75), fut)
             .await
             .map_err(|_| SandboxError::Vm("start_shell: timed out waiting for agentd".into()))?
     }
@@ -2824,98 +2875,28 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         agent: engram_core::types::sandbox::AgentSpec,
     ) -> Result<(), SandboxError> {
+        // ADR 0015 M1: one in-VM service, one wire surface. The
+        // host dials agentd on port 1024 with a SpawnHarness
+        // request; agentd's harness supervisor handles the mount +
+        // child spawn (was a separate engram-bootstrap process).
+        //
         // `agent_handshake` wall-clock is recorded by the caller
         // (`grpc_server::start_agent` for cold-create, `WarmPool::
         // launch` for warm-lease) so the histogram can carry the
         // `kind` label without this backend method knowing which
-        // path it's serving. The tracing log here is still useful
-        // for per-sandbox forensics.
+        // path it's serving.
+        //
+        // 60s retry budget covers the cold-path race: chunked-NBD
+        // rootfs page-ins from GCS can delay engram-init for
+        // ~15-25 s before agentd binds vsock 1024. Steady state
+        // (chunks cached) is sub-second; the ceiling only matters
+        // on the cold path.
         let phase_start = std::time::Instant::now();
-        // Read sandbox state under the dashmap guard, drop it
-        // before any await — the path/cid we need is `Clone`.
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.vsock_uds_path.clone()
         };
 
-        // Connect to the in-guest engram-bootstrap. The bootstrap
-        // listener takes seconds to come up after VM boot — same
-        // race as `exec_stream`'s vsock CONNECT. Retry the
-        // handshake-only error patterns with backoff.
-        //
-        // Deadline is generous because cold chunked-NBD rootfs/
-        // workspace mounts can take 15-25s to page in their first
-        // blocks from GCS; engram-init blocks on those mounts
-        // before exec'ing the bootstrap binary, so the vsock
-        // listener doesn't appear until after the mounts complete.
-        // After the chunks land in the host's local cache,
-        // subsequent boots finish in well under a second; this
-        // ceiling only matters on the cold path.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut backoff = Duration::from_millis(100);
-        let mut conn = loop {
-            match Self::connect_fc_vsock(
-                &vsock_uds_path,
-                engram_harness_proto::BOOTSTRAP_VSOCK_PORT,
-            )
-            .await
-            {
-                Ok(c) => break c,
-                Err(e) => {
-                    let msg = format!("{e}");
-                    let is_boot_race = msg.contains("read FC vsock CONNECT response")
-                        || msg.contains("connect to FC vsock UDS");
-                    if !is_boot_race || std::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
-                }
-            }
-        };
-
-        // Wait for bootstrap's readiness marker before writing the
-        // launch. See vz/backend.rs::start_agent for why — same race
-        // shape, slightly different surface (vsock here, virtio-
-        // console there). The marker is a one-byte write bootstrap
-        // does immediately after `listener.accept()` returns.
-        use tokio::io::AsyncReadExt;
-        let mut marker = [0u8; 1];
-        match tokio::time::timeout(Duration::from_secs(60), conn.read_exact(&mut marker)).await {
-            Ok(Ok(_)) => {
-                if marker[0] != engram_harness_proto::BOOTSTRAP_READY_BYTE {
-                    tracing::warn!(
-                        sandbox_id = %id,
-                        got = marker[0],
-                        "fc start_agent: unexpected bootstrap marker; proceeding anyway"
-                    );
-                }
-            }
-            Ok(Err(e)) => {
-                return Err(SandboxError::Vm(
-                    format!("read bootstrap ready marker: {e}").into(),
-                ));
-            }
-            Err(_) => {
-                return Err(SandboxError::Vm(
-                    "timed out waiting for bootstrap ready marker (60s)".into(),
-                ));
-            }
-        }
-
-        // Push the BootstrapLaunch frame. The in-guest bootstrap
-        // is a long-running supervisor that loops on accept, so a
-        // call here also covers post-resume re-launch (the
-        // supervisor kill+respawns its child harness on every fresh
-        // launch frame). The connection drops on our end after the
-        // write — bootstrap reads the frame and goes back to
-        // accept().
-        // ADR 0014 M1.12 (option D): bootstrap mounts the harness
-        // device, not engram-init. Only sandboxes with an attached
-        // harness substrate get the mount instruction — sandboxes
-        // booted without a harness (rare, but supported for
-        // `kind = none` sessions) leave both fields None so bootstrap
-        // skips the mount step.
         let has_harness = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.spec.harness_substrate.is_some()
@@ -2928,24 +2909,44 @@ impl SandboxBackend for FirecrackerBackend {
         } else {
             (None, None)
         };
-        let launch = engram_harness_proto::BootstrapLaunch {
+
+        let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             harness_dev,
             harness_mount,
-        };
-        engram_harness_proto::write_msg(&mut conn, &launch)
+        });
+
+        let mut conn = Self::connect_fc_vsock_with_retry(
+            &vsock_uds_path,
+            ENGRAM_AGENTD_PORT,
+            Duration::from_secs(60),
+        )
+        .await?;
+        engram_agentd::write_msg(&mut conn, &req)
             .await
-            .map_err(|e| SandboxError::Vm(format!("write BootstrapLaunch: {e}").into()))?;
-        // Best-effort flush; bootstrap closes its end on exec.
-        let _ = conn.shutdown().await;
-        let elapsed = phase_start.elapsed().as_secs_f64();
-        tracing::info!(
-            sandbox_id = %id,
-            elapsed_ms = (elapsed * 1000.0) as u64,
-            "fc agent handshake complete",
-        );
-        Ok(())
+            .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
+        let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("read SpawnHarness response: {e}").into()))?;
+        match resp {
+            engram_agentd::WireResponse::HarnessSpawned { pid } => {
+                let elapsed = phase_start.elapsed().as_secs_f64();
+                tracing::info!(
+                    sandbox_id = %id,
+                    elapsed_ms = (elapsed * 1000.0) as u64,
+                    pid = ?pid,
+                    "fc agent handshake complete",
+                );
+                Ok(())
+            }
+            engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                format!("SpawnHarness rejected ({kind}): {message}").into(),
+            )),
+            other => Err(SandboxError::Vm(
+                format!("SpawnHarness: unexpected response: {other:?}").into(),
+            )),
+        }
     }
 
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {

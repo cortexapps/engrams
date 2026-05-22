@@ -186,6 +186,50 @@ pub enum WireRequest {
         /// Optional port override. `None` → 7681.
         port: Option<u16>,
     },
+    /// ADR 0015 M1: spawn (or respawn) the session's harness child
+    /// inside the guest. Replaces the standalone `engram-bootstrap`
+    /// supervisor process. The agent owns a single harness child
+    /// at a time; a fresh `SpawnHarness` call kills any prior child
+    /// before launching the new one — matching the kill+respawn
+    /// semantics bootstrap had for post-resume re-attach.
+    ///
+    /// Optionally mounts `harness_dev` at `harness_mount` (read-only
+    /// ext4) before exec'ing argv. Used by the warm-pool option-D
+    /// flow where the harness substrate is hot-swapped via FC
+    /// `PATCH /drives` and bootstrap-side mount makes the new
+    /// device visible to the harness.
+    ///
+    /// Empty argv is a **readiness probe**: the agent skips the
+    /// spawn and replies `HarnessSpawned { pid: None }` — useful
+    /// for callers that want to confirm agentd is reachable on
+    /// vsock without launching anything (the no-harness cold-start
+    /// path).
+    ///
+    /// Replies [`WireResponse::HarnessSpawned`] on success or
+    /// [`WireResponse::Error`] if the mount or spawn fails.
+    SpawnHarness(SpawnHarnessRequest),
+}
+
+/// Body of [`WireRequest::SpawnHarness`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnHarnessRequest {
+    /// argv to exec as the harness child. Empty = readiness probe;
+    /// no spawn happens, the agent replies `HarnessSpawned { pid:
+    /// None }`.
+    pub argv: Vec<String>,
+    /// Env merged on top of agentd's own env (additive; duplicate
+    /// keys take this value).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Block device to mount before spawning. `None` skips the
+    /// mount. Typical value `/dev/vdb` for the harness substrate.
+    #[serde(default)]
+    pub harness_dev: Option<String>,
+    /// Where to mount `harness_dev`. Required when `harness_dev`
+    /// is `Some`; ignored otherwise. Typical value
+    /// `/run/engram/harnesses`.
+    #[serde(default)]
+    pub harness_mount: Option<String>,
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.
@@ -213,6 +257,13 @@ pub enum WireResponse {
     ShellReady {
         port: u16,
         spawned: bool,
+    },
+    /// Reply to [`WireRequest::SpawnHarness`]. `pid` is the spawned
+    /// child's PID when argv was non-empty; `None` when the call
+    /// was a readiness probe (empty argv) or when the spawn
+    /// otherwise yielded no child (no-op case).
+    HarnessSpawned {
+        pid: Option<u32>,
     },
     /// Anything the agent couldn't fulfil. `message` is a short
     /// human-readable reason; `kind` mirrors the std `io::ErrorKind`

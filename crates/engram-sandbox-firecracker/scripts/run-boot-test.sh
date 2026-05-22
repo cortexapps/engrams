@@ -12,16 +12,15 @@ eval "$(bash "$here/fetch-fc-test-artifacts.sh")"
 # UFFD restore needs the handler binary built first.
 cargo build -p engram-uffd-handler
 
-# The real-VM tests bake engram-agentd, engram-bootstrap, and the
-# engram-harness-noop binary into the rootfs / harness substrate.
-# Build them statically for `x86_64-unknown-linux-musl` so they run
-# inside any rootfs without depending on the Nix dev shell's glibc /
-# dynamic-linker paths. .cargo/config.toml's `relocation-model=static`
-# ensures the resulting ELFs have no PT_INTERP. Release mode keeps
-# binaries small.
+# The real-VM tests bake engram-agentd and engram-harness-noop into
+# the rootfs / harness substrate. Build them statically for
+# `x86_64-unknown-linux-musl` so they run inside any rootfs without
+# depending on the Nix dev shell's glibc / dynamic-linker paths.
+# .cargo/config.toml's `relocation-model=static` ensures the
+# resulting ELFs have no PT_INTERP. Release mode keeps binaries
+# small.
 cargo build \
   -p engram-agentd \
-  -p engram-bootstrap \
   -p engram-harness-noop \
   --target x86_64-unknown-linux-musl \
   --release

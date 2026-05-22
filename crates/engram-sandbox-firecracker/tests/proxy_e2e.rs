@@ -272,7 +272,6 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
-                bootstrap_binary: None,
             }),
             canonical_memory_manifest: None,
             capture_canonical_memory: None,

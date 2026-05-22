@@ -148,13 +148,13 @@ pub struct CanonicalCaptureConfig {
     /// proceeds without a working-set trace and refill falls back
     /// to full-manifest prefetch.
     pub blob_root: Option<PathBuf>,
-    /// ADR 0014 M1.12: bypass the engram-init + stub-harness
-    /// scaffolding when `true`. Default `false` (production bakes
-    /// capture a bootstrap-on-accept snapshot). Set to `true` only
-    /// by the canonical-capture integration test fixture, which
-    /// boots a stock Ubuntu rootfs that has neither engram-init
-    /// nor engram-bootstrap baked in — without this opt-out the
-    /// kernel panics with `init=/sbin/engram-init` missing.
+    /// Bypass the engram-init + stub-harness scaffolding when
+    /// `true`. Default `false` (production bakes capture an
+    /// agentd-on-accept snapshot). Set to `true` only by the
+    /// canonical-capture integration test fixture, which boots a
+    /// stock Ubuntu rootfs that has no engram-init baked in —
+    /// without this opt-out the kernel panics with `init=/sbin/
+    /// engram-init` missing.
     pub skip_warm_pool_prep: bool,
     /// ADR 0014 M1.16: bake-time network pool. `Some(addr)`
     /// allocates a /30 + creates a host TAP + bakes
@@ -196,17 +196,11 @@ pub struct AgentInjection {
     pub transport: Transport,
     /// Override the default init script. When `None`, the baker
     /// writes a minimal `/bin/sh` shim that mounts `/proc`, `/sys`,
-    /// `/dev`, spawns any baked-in sidecars (engram-bootstrap), and
-    /// `exec`s `engram-agentd --port <port>`.
+    /// `/dev`, and `exec`s `engram-agentd --port <port>`. (Pre-ADR-
+    /// 0015 the shim also forked a separate `engram-bootstrap`
+    /// supervisor; that process was folded into agentd and the
+    /// shim is one-line shorter as a result.)
     pub init_script: Option<PathBuf>,
-    /// Optional `engram-bootstrap` binary. When provided, baked at
-    /// `/sbin/engram-bootstrap` (chmod 0755) and the default init
-    /// shim spawns it in the background before exec'ing agentd.
-    /// Required for any image that wants to run a harness over the
-    /// in-VM transport; safe to omit for images that only need the
-    /// exec channel.
-    #[allow(dead_code)] // surfaced via this struct's field so callers can construct it
-    pub bootstrap_binary: Option<PathBuf>,
 }
 
 /// Which `engram-transport` implementation the in-VM binaries
@@ -267,15 +261,11 @@ const TRANSPORT_PLACEHOLDER: &str = "__TRANSPORT__";
 /// Default init shim. Written to `/sbin/engram-init` when an
 /// [`AgentInjection`] is requested without an explicit override.
 /// Requires `/bin/sh` in the rootfs (alpine, debian-slim, ubuntu —
-/// all standard bases ship it). When `bootstrap_binary` is set on
-/// the injection, the shim spawns it in the background before
-/// exec'ing agentd; `[ -x ... ] &&` keeps it tolerant of images
-/// baked without bootstrap.
+/// all standard bases ship it).
 ///
-/// The exported `ENGRAM_TRANSPORT` env propagates to engram-bootstrap
-/// (forked here) and to engram-agentd (exec'd at the bottom). It
-/// also rides through `BootstrapLaunch.env` to harness adapters
-/// when bootstrap re-execs them, so all four in-VM binaries see a
+/// The exported `ENGRAM_TRANSPORT` env propagates to engram-agentd
+/// (exec'd at the bottom) and to any harness child agentd spawns
+/// via `WireRequest::SpawnHarness`, so all in-VM binaries see a
 /// consistent transport selection.
 const DEFAULT_INIT_SHIM: &str = r#"#!/bin/sh
 # engram-init — minimal init shim. Brings up just enough kernel
@@ -313,24 +303,22 @@ mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
-# ADR 0014 M1.12 (option D): engram-init no longer leaves a
-# persistent mount of the harness substrate at
-# /run/engram/harnesses. The host's BootstrapLaunch frame
-# nominates the harness device + mount point and
-# engram-bootstrap does the mount itself; this lets warm-pool
-# templates be harness-agnostic — the bake snapshot captures
-# bootstrap on accept() before any harness mount has happened,
-# then `PATCH /drives` per-session swaps the device's backing
-# file (see crates/engram-sandbox-firecracker/tests/
-# patch_drive_swap.rs).
+# ADR 0014 M1.12 (option D) + ADR 0015 M1: engram-init no longer
+# leaves a persistent mount of the harness substrate at
+# /run/engram/harnesses. The host's SpawnHarness frame nominates
+# the harness device + mount point and agentd does the mount
+# itself; this lets warm-pool templates be harness-agnostic — the
+# bake snapshot captures agentd on accept() before any harness
+# mount has happened, then `PATCH /drives` per-session swaps the
+# device's backing file (see crates/engram-sandbox-firecracker/
+# tests/patch_drive_swap.rs).
 #
-# But cold-create sessions don't go through the bootstrap-launch
-# path: init exec's agentd directly, and the egress-proxy CA
-# lives in the substrate at /.engram-host/ca.pem. To support
-# both flows we tmp-mount /dev/vdb, copy the CA into a
-# rootfs-persistent location, and unmount immediately — the
-# block-device page cache is still invalidated post-PATCH so
-# the warm path's bootstrap mount sees the swapped contents.
+# But cold-create sessions also need the egress-proxy CA from
+# /.engram-host/ca.pem on the harness substrate. We tmp-mount
+# /dev/vdb, copy the CA into a rootfs-persistent location, and
+# unmount immediately — the block-device page cache is still
+# invalidated post-PATCH so agentd's mount sees the swapped
+# contents on the warm path.
 mkdir -p /run/engram/harnesses /workspace 2>/dev/null || true
 if [ -b /dev/vdb ]; then
     mkdir -p /run/engram/.ca-stage 2>/dev/null || true
@@ -400,7 +388,12 @@ fi
 # to ~150ms (fresh spawn). Worth it because the boot cost was paid
 # on every session create, and only a tiny fraction of sessions
 # actually use the SHELL tab.
-[ -x /sbin/engram-bootstrap ] && /sbin/engram-bootstrap &
+#
+# ADR 0015 M1: bootstrap is no longer a separate process. Its
+# harness-supervisor responsibility moved into agentd, which the
+# host dials with `WireRequest::SpawnHarness` after the FC instance
+# is up. The legacy `/sbin/engram-bootstrap` is a no-op stub for
+# bakes that still ship it; this init shim no longer forks it.
 exec /sbin/engram-agentd --port __VSOCK_PORT__
 "#;
 
@@ -1086,16 +1079,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let work = tempfile::tempdir()
             .map_err(|e| BuildError::Config(format!("canonical bake tempdir: {e}")))?;
 
-        // ADR 0014 M1.12 (option D): produce a 16 MiB empty ext4 the
-        // bake attaches as the harness substrate (/dev/vdb). The init
-        // shim doesn't mount /dev/vdb; engram-bootstrap mounts it
-        // *after* receiving BootstrapLaunch at warm-lease time. The
-        // stub being attached at bake time is what lets us snapshot
-        // a bootstrap-on-accept state with the correct device-tree —
-        // FC's `swap_harness_drive` later swaps to the session's
-        // real harness, but the snapshot needs *something* openable
-        // at the embedded path. Skipped in test fixtures that boot a
-        // stock rootfs without engram-init (kernel panic otherwise).
+        // ADR 0014 M1.12 (option D) + ADR 0015 M1: produce a 16 MiB
+        // empty ext4 the bake attaches as the harness substrate
+        // (/dev/vdb). The init shim doesn't mount /dev/vdb; agentd's
+        // harness supervisor mounts it *after* receiving SpawnHarness
+        // at warm-lease time. The stub being attached at bake time
+        // is what lets us snapshot an agentd-on-accept state with
+        // the correct device-tree — FC's `swap_harness_drive` later
+        // swaps to the session's real harness, but the snapshot
+        // needs *something* openable at the embedded path. Skipped
+        // in test fixtures that boot a stock rootfs without
+        // engram-init (kernel panic otherwise).
         let stub_path = if capture_cfg.skip_warm_pool_prep {
             None
         } else {
@@ -1172,12 +1166,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // the same env var on startup so prod-side and bake-side stay
         // in lockstep.
         fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
-        // ADR 0014 M1.12: boot through `engram-init` so the init
-        // shim spawns engram-bootstrap (BOOTSTRAP_VSOCK_PORT
-        // listener) before snapshot. Without this the bake captures
-        // a kernel-only state and warm-launch's CONNECT gets RST.
-        // Test fixtures that boot a stock rootfs (no engram-init)
-        // override to a plain shell so the kernel doesn't panic.
+        // ADR 0015 M1: boot through `engram-init` so the init shim
+        // exec's engram-agentd (port 1024 listener) before snapshot.
+        // Without this the bake captures a kernel-only state and
+        // warm-launch's CONNECT gets RST. Test fixtures that boot
+        // a stock rootfs (no engram-init) override to a plain shell
+        // so the kernel doesn't panic.
         fc_cfg.default_boot_args = if capture_cfg.skip_warm_pool_prep {
             "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into()
         } else {
@@ -1394,11 +1388,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         memory_manifest_ref: engram_chunk_store::ManifestRef,
         primary_work_dir: &Path,
     ) -> Result<Option<PathBuf>, BuildError> {
-        use engram_harness_proto::{BootstrapLaunch, BOOTSTRAP_READY_BYTE, BOOTSTRAP_VSOCK_PORT};
+        use engram_agentd::{SpawnHarnessRequest, WireRequest, WireResponse};
         use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
+
+        // Reserved vsock port engram-agentd listens on inside the
+        // guest. Kept in sync with `engram_sandbox_firecracker::
+        // ENGRAM_AGENTD_PORT` via the same hardcoded constant.
+        const ENGRAM_AGENTD_PORT: u32 = 1024;
 
         let _ = memory_manifest_ref; // reserved for future telemetry
         let Some(uffd_bin) = capture_cfg.uffd_handler_bin.as_ref() else {
@@ -1500,12 +1499,11 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 BuildError::Config("profile-pass sidecar missing source_vsock_canonical".into())
             })?;
 
-        // Dial bootstrap, read FC's OK + the 1-byte READY signal,
-        // then push a synthetic BootstrapLaunch that mounts the
-        // stub harness and exec's /bin/true. The exact argv doesn't
-        // matter — what we want is for the kernel to walk through
-        // mount(2) + execve(2) so the UFFD handler observes the
-        // chunks underlying those code paths.
+        // Dial agentd, send a synthetic SpawnHarness that mounts
+        // the stub harness and exec's /bin/true. The exact argv
+        // doesn't matter — what we want is for the kernel to walk
+        // through mount(2) + execve(2) so the UFFD handler
+        // observes the chunks underlying those code paths.
         let profile_result: Result<(), BuildError> = async {
             let mut stream = UnixStream::connect(&vsock_path).await.map_err(|e| {
                 BuildError::Config(format!(
@@ -1514,7 +1512,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 ))
             })?;
             stream
-                .write_all(format!("CONNECT {BOOTSTRAP_VSOCK_PORT}\n").as_bytes())
+                .write_all(format!("CONNECT {ENGRAM_AGENTD_PORT}\n").as_bytes())
                 .await
                 .map_err(|e| BuildError::Config(format!("profile-pass write CONNECT: {e}")))?;
             // Read FC's "OK <cid>\n" line.
@@ -1541,35 +1539,29 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                     String::from_utf8_lossy(&header),
                 )));
             }
-            // Bootstrap writes 0xEB once we're connected through.
-            let mut ready = [0u8; 1];
-            stream
-                .read_exact(&mut ready)
-                .await
-                .map_err(|e| BuildError::Config(format!("profile-pass read READY_BYTE: {e}")))?;
-            if ready[0] != BOOTSTRAP_READY_BYTE {
-                return Err(BuildError::Config(format!(
-                    "profile-pass expected READY_BYTE 0x{:02x}, got 0x{:02x}",
-                    BOOTSTRAP_READY_BYTE, ready[0]
-                )));
-            }
-            // Send a BootstrapLaunch with /bin/true as the harness.
-            // /dev/vdb is the stub ext4 attached at bake time; mount
-            // it read-only at /run/engram/harnesses/_profile so the
-            // ext4 mount(2) code path runs.
-            let launch = BootstrapLaunch {
+            // SpawnHarness with /bin/true. /dev/vdb is the stub
+            // ext4 attached at bake time; mount it read-only at
+            // /run/engram/harnesses/_profile so the ext4 mount(2)
+            // code path runs.
+            let req = WireRequest::SpawnHarness(SpawnHarnessRequest {
                 argv: vec!["/bin/true".into()],
                 env: Default::default(),
                 harness_dev: Some("/dev/vdb".into()),
                 harness_mount: Some("/run/engram/harnesses/_profile".into()),
-            };
-            engram_harness_proto::write_msg(&mut stream, &launch)
+            });
+            engram_agentd::write_msg(&mut stream, &req)
                 .await
-                .map_err(|e| BuildError::Config(format!("profile-pass write launch: {e}")))?;
-            stream
-                .shutdown()
-                .await
-                .map_err(|e| BuildError::Config(format!("profile-pass shutdown: {e}")))?;
+                .map_err(|e| BuildError::Config(format!("profile-pass write SpawnHarness: {e}")))?;
+            // Drain the response so we know agentd actually spawned
+            // the child before we destroy the VM.
+            let resp: WireResponse = engram_agentd::read_msg(&mut stream).await.map_err(|e| {
+                BuildError::Config(format!("profile-pass read SpawnHarness response: {e}"))
+            })?;
+            if let WireResponse::Error { kind, message } = resp {
+                return Err(BuildError::Config(format!(
+                    "profile-pass SpawnHarness rejected ({kind}): {message}"
+                )));
+            }
             // Let the kernel fault its way through mount(2) + execve(2).
             // The UFFD handler's recorder window defaults to 5s; sleep
             // a hair longer than the synthetic activity so we capture
@@ -1832,17 +1824,6 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
     }
 
     install_file(&injection.agent_binary, &agent_dst, "agent").await?;
-
-    if let Some(bootstrap) = injection.bootstrap_binary.as_deref() {
-        if !bootstrap.exists() {
-            return Err(BuildError::Config(format!(
-                "bootstrap_binary {} does not exist",
-                bootstrap.display()
-            )));
-        }
-        let dst = rootfs_dir.join("sbin/engram-bootstrap");
-        install_file(bootstrap, &dst, "bootstrap").await?;
-    }
 
     match &injection.init_script {
         Some(src) => install_file(src, &init_dst, "init").await?,

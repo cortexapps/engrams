@@ -25,7 +25,6 @@ unsafe_code = "allow"
 engram-core.workspace = true
 engram-chunk-store.workspace = true
 engram-agentd.workspace = true
-engram-harness-proto.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true

@@ -16,7 +16,6 @@ members = [
     "crates/engram-cloud-gcp",
     "crates/engram-cloud-static",
     "crates/engram-cloud-mock",
-    "crates/engram-bootstrap",
     "crates/engram-harness-claude",
     "crates/engram-harness-noop",
     "crates/engram-harness-proto",
