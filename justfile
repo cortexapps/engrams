@@ -172,6 +172,14 @@ integration-up:
 integration-down:
     bash deploy/dev/integration-down.sh
 
+# Hard-reset the integration stack: kills processes, drops compose
+# volumes (postgres + fake-gcs + registry), wipes ./var dirs. Use
+# when prior runs have left stale `templates` rows whose snapshot
+# blobs are gone — the warm-pool refill loop spams logs and can
+# starve real session creates. After this, run `just integration-up`.
+integration-reset:
+    bash deploy/dev/integration-reset.sh
+
 # Smoke-test the full bake → enable → warm-pool → session flow
 # against the local integration stack. Times each step and
 # asserts the warm path actually triggers. Run after
