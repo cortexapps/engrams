@@ -838,15 +838,61 @@ pub async fn delete_session(
         return Ok(StatusCode::NO_CONTENT);
     }
 
+    // ADR 0015 M2: transition to Completed *before* destroying the
+    // sandbox. The reconcile pass that runs on every heartbeat looks
+    // for `status='active'` sessions whose `sandbox_id` is missing
+    // from the host's running set; moving to Completed first removes
+    // this row from that view so reconcile can't race us into
+    // HostLost while we're waiting for the host RPC. The DB UPDATE
+    // is fast (single locked row); the destroy that follows is
+    // best-effort and can take seconds.
+    //
+    // If a sibling path (preemption drain, dead-host detector) flipped
+    // the row first, our transition fails with Conflict — treat that
+    // as idempotent success, the session is already on its way out.
+    match state
+        .services
+        .meta
+        .transition_session(id, SessionState::Completed)
+        .await
+    {
+        Ok(prev) => {
+            state
+                .emit(
+                    id,
+                    SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Completed,
+                        at: chrono::Utc::now(),
+                    },
+                )
+                .await?;
+        }
+        Err(engram_core::MetaError::Conflict(msg)) => {
+            tracing::info!(
+                session_id = %id,
+                error = %msg,
+                "delete_session: state machine raced us (likely reconciler flipped to terminal first); returning 204 idempotently"
+            );
+            // Still tear down whatever's left for tidiness, then 204.
+            if let Some(sandbox_id) = state.registry.unbind(id) {
+                let _ = state.services.host.destroy(sandbox_id).await;
+            }
+            state.services.host.unbind_session(id).await;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Status is Completed; reconcile won't touch this row anymore.
+    // Now tear down the sandbox and clear the routing columns.
     if let Some(sandbox_id) = state.registry.unbind(id) {
-        // Best-effort: a session being deleted shouldn't fail the API
-        // because the underlying VM already crashed or never came up.
         if let Err(e) = state.services.host.destroy(sandbox_id).await {
             tracing::warn!(
                 session_id = %id,
                 sandbox_id = %sandbox_id,
                 error = %e,
-                "sandbox destroy failed during session delete; continuing",
+                "sandbox destroy failed during session delete; host-agent reconcile will GC",
             );
         }
         // ADR 0006: the host-agent unregisters its local proxy
@@ -859,21 +905,6 @@ pub async fn delete_session(
     // anyway so an audit query "what sandboxes does the coordinator
     // think exist" matches reality.
     let _ = state.services.meta.assign_session_sandbox(id, None).await;
-    let prev = state
-        .services
-        .meta
-        .transition_session(id, SessionState::Completed)
-        .await?;
-    state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: prev,
-                to: SessionState::Completed,
-                at: chrono::Utc::now(),
-            },
-        )
-        .await?;
     state.services.host.unbind_session(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
