@@ -44,7 +44,7 @@ impl MetadataStore for MiniMeta {
         );
         Ok(id)
     }
-    async fn create_session_active(
+    async fn create_session_created(
         &self,
         session_id: SessionId,
         spec: SessionSpec,
@@ -56,7 +56,7 @@ impl MetadataStore for MiniMeta {
             Session {
                 id: session_id,
                 user_id: spec.user_id,
-                status: SessionState::Active,
+                status: SessionState::Created,
                 host_id: Some(host_id),
                 sandbox_id: Some(sandbox_id),
                 created_at: Utc::now(),

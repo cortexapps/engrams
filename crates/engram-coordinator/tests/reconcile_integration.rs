@@ -108,7 +108,7 @@ impl MetadataStore for ReconcileMeta {
     async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
         unimplemented!("test seeds sessions directly")
     }
-    async fn create_session_active(
+    async fn create_session_created(
         &self,
         _: SessionId,
         _: SessionSpec,

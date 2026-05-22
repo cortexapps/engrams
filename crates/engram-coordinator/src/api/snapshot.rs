@@ -126,22 +126,45 @@ pub async fn resume(
 /// counterpart: the idle evictor hot-suspends inactive sessions;
 /// this helper brings them back transparently on the next request.
 ///
-/// `Active` sessions are a no-op (Ok). `Idle` sessions are
-/// resumed via the existing `/resume` flow and the function
-/// returns once the session is Active again. Any other status
-/// (Pending, Completed, Failed) returns an error — auto-resume
-/// only undoes idle-eviction; it doesn't try to reanimate
-/// terminal sessions.
+/// `Active` sessions are a no-op (Ok). `Idle` sessions are resumed
+/// via the existing `/resume` flow and the function returns once the
+/// session is Active again.
+///
+/// ADR 0015 M2: every other state returns a typed error rather than
+/// falling through to a downstream handler that would race against
+/// agentd readiness. `Created` / `GuestReady` (session still mid-
+/// create or mid-resume; harness not yet running) return 409;
+/// `HostLost` / `Dead` are unrecoverable from this entry point and
+/// return 410; terminal `Completed` / `Failed` return 409 (no work
+/// is left to dispatch).
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
-    if session.status == SessionState::Idle {
-        resume_session(state.clone(), id).await?;
+    match session.status {
+        SessionState::Active => Ok(()),
+        SessionState::Idle => {
+            resume_session(state.clone(), id).await?;
+            Ok(())
+        }
+        SessionState::Created | SessionState::GuestReady => Err(ApiError::Conflict(format!(
+            "session is {} — agentd is not yet ready. \
+             Wait for the session to reach Active (subscribe to /sessions/:id/events) \
+             and retry.",
+            session.status.as_str()
+        ))),
+        SessionState::Pending => Err(ApiError::Conflict(
+            "session is pending — scheduling has not completed".into(),
+        )),
+        SessionState::HostLost => Err(ApiError::Gone(
+            "session's host went away; resume from a snapshot if one exists".into(),
+        )),
+        SessionState::Dead => Err(ApiError::Gone(
+            "session is dead — chunked manifests are gone or never existed".into(),
+        )),
+        SessionState::Failed | SessionState::Completed => Err(ApiError::Conflict(format!(
+            "session is {} (terminal); no work to dispatch",
+            session.status.as_str()
+        ))),
     }
-    // Active / Pending / Dead / Completed / Failed all fall through
-    // to the downstream handler. Dead in particular is terminal —
-    // the chunked manifests are gone (or never were), the session
-    // can't be brought back.
-    Ok(())
 }
 
 async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {

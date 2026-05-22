@@ -78,7 +78,7 @@ impl MetadataStore for MockMetadataStore {
     async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
         unreachable!("not exercised by registry_smoke")
     }
-    async fn create_session_active(
+    async fn create_session_created(
         &self,
         _: SessionId,
         _: SessionSpec,

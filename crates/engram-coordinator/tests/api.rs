@@ -80,7 +80,7 @@ impl MetadataStore for MockMetadataStore {
         Ok(id)
     }
 
-    async fn create_session_active(
+    async fn create_session_created(
         &self,
         session_id: SessionId,
         spec: SessionSpec,
@@ -90,7 +90,7 @@ impl MetadataStore for MockMetadataStore {
         let session = Session {
             id: session_id,
             user_id: spec.user_id,
-            status: SessionState::Active,
+            status: SessionState::Created,
             host_id: Some(host_id),
             sandbox_id: Some(sandbox_id),
             created_at: Utc::now(),
@@ -1031,7 +1031,7 @@ async fn delete_session_marks_completed_and_returns_204() {
         .await
         .unwrap();
     // The mock's create_session inserts at Pending (the legacy
-    // insert-then-update path); production uses create_session_active
+    // insert-then-update path); production uses create_session_created
     // / create_session_created which insert at a later state. Walk
     // the legal transitions to Active so DELETE sees a session in a
     // state from which Completed is reachable.
@@ -1930,9 +1930,10 @@ async fn exec_returns_404_for_unknown_session() {
 #[tokio::test]
 async fn exec_returns_409_when_session_has_no_live_sandbox() {
     // Pre-stage the session row directly in metadata (skipping the
-    // create handler) so the registry has no binding. This models
-    // either: a coordinator restart that lost the registry, or a
-    // session that was snapshotted and not yet resumed.
+    // create handler) so the registry has no binding. After ADR
+    // 0015 M2, a row in `Active` with no sandbox binding models
+    // "coord restart lost the in-memory registry"; `ensure_active`
+    // passes and the exec handler's own `registry.get` returns 409.
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
@@ -1942,6 +1943,7 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
         })
         .await
         .unwrap();
+    seed_to(&store, id, SessionState::Active).await;
     let app = build_app(store);
 
     let resp = app

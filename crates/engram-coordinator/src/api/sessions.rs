@@ -583,7 +583,7 @@ async fn create_session_inner(
     if let Err(e) = state
         .services
         .meta
-        .create_session_active(session_id, spec, host_id, sandbox_id)
+        .create_session_created(session_id, spec, host_id, sandbox_id)
         .await
     {
         tracing::error!(
@@ -698,6 +698,23 @@ async fn create_session_inner(
             secret_mode: manifest.secret_mode,
         }
     });
+    // ADR 0015 M2: emit the Pending→Created transition first so SSE
+    // subscribers see the lifecycle moment when the row materialized
+    // (the actual INSERT happened a few lines up). Pending is the
+    // API-caller's pre-insert view; we never persisted it, but the
+    // event log is the durable record of "request accepted, scheduler
+    // returned, row exists at Created."
+    let now_created = chrono::Utc::now();
+    state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Pending,
+                to: SessionState::Created,
+                at: now_created,
+            },
+        )
+        .await?;
     if let Err(e) = state
         .services
         .host
@@ -719,16 +736,19 @@ async fn create_session_inner(
         state.services.host.unbind_session(session_id).await;
         return Err(e.into());
     }
-    // Row was inserted as Active in Phase 5; no status update needed.
-    // Still emit a Pending→Active StatusChanged so SSE subscribers
-    // see the lifecycle event (`Pending` is the implicit pre-insert
-    // state from the API caller's point of view, even though we
-    // never persisted it).
+    // ADR 0015 M2: start_agent returned OK, so agentd is reachable
+    // and the harness (if any) is running. Now and only now does
+    // `Active` actually hold its meaning. Transition + emit.
+    let prev_for_active = state
+        .services
+        .meta
+        .transition_session(session_id, SessionState::Active)
+        .await?;
     state
         .emit(
             session_id,
             SessionEvent::StatusChanged {
-                from: SessionState::Pending,
+                from: prev_for_active,
                 to: SessionState::Active,
                 at: chrono::Utc::now(),
             },

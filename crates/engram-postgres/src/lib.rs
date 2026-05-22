@@ -93,7 +93,7 @@ impl MetadataStore for PostgresStore {
         Ok(SessionId(id))
     }
 
-    async fn create_session_active(
+    async fn create_session_created(
         &self,
         session_id: SessionId,
         spec: SessionSpec,
@@ -114,7 +114,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(session_id.as_uuid())
         .bind(spec.user_id.as_deref())
-        .bind(SessionState::Active.as_str())
+        .bind(SessionState::Created.as_str())
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
         .bind(&spec.image)

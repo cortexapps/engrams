@@ -707,14 +707,14 @@ pub(crate) mod tests {
         ) -> Result<engram_core::SessionId, MetaError> {
             unreachable!("create_session not used in state tests")
         }
-        async fn create_session_active(
+        async fn create_session_created(
             &self,
             _: engram_core::SessionId,
             _: SessionSpec,
             _: engram_core::HostId,
             _: engram_core::SandboxId,
         ) -> Result<(), MetaError> {
-            unreachable!("create_session_active not used in state tests")
+            unreachable!("create_session_created not used in state tests")
         }
         async fn get_session(&self, id: engram_core::SessionId) -> Result<Session, MetaError> {
             let s = self.session.lock();

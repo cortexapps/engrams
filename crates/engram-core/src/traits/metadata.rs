@@ -26,11 +26,19 @@ pub trait MetadataStore: Send + Sync {
     // ---- sessions ----
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
 
-    /// Atomically insert a session in `Active` status with `host_id`
+    /// Atomically insert a session in `Created` status with `host_id`
     /// and `sandbox_id` already bound. Used by the create-session API
     /// to only persist a row once scheduling has succeeded — so a
     /// transient capacity blip or unrecoverable scheduling error
     /// doesn't leave a `Pending` row that nothing will ever advance.
+    ///
+    /// ADR 0015 M2: the row enters life at `Created` (sandbox bound,
+    /// nothing else proven) rather than `Active` (the prior shape).
+    /// The create handler transitions to `Active` only after
+    /// `start_agent` succeeds, so `Active` actually implies "agentd
+    /// reachable + harness running" — no more silent dishonest-Active
+    /// rows where start_agent later failed but the column already
+    /// said Active.
     ///
     /// The caller mints the `SessionId` ahead of scheduling (because
     /// vm_spec env / harness arg construction needs it before the
@@ -45,7 +53,7 @@ pub trait MetadataStore: Send + Sync {
     /// reason we don't do that today: SessionSpec doesn't carry
     /// vm_spec / harness resolution context, and capturing it
     /// requires schema work that's bigger than the v1 fix.
-    async fn create_session_active(
+    async fn create_session_created(
         &self,
         session_id: SessionId,
         spec: SessionSpec,

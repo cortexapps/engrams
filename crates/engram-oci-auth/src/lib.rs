@@ -207,7 +207,7 @@ mod tests {
         async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
             unreachable!()
         }
-        async fn create_session_active(
+        async fn create_session_created(
             &self,
             _: SessionId,
             _: SessionSpec,
