@@ -423,7 +423,6 @@ impl SandboxBackend for ProcessBackend {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
-            canonical_memory_manifest: None,
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -644,7 +643,6 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
-            canonical_memory_manifest: None,
         }
     }
 

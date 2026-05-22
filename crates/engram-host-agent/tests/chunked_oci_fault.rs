@@ -613,14 +613,10 @@ async fn manifest_synthesis_from_bootstrap_unblocks_materialize_when_blob_empty(
         bundle: Some(engram_host_agent::image_cache::ImageBundle {
             schema_version: 2,
             disk_manifest: manifest_ref,
-            canonical_memory_manifest: None,
             bootstrap_disk_available: true,
-            bootstrap_memory_available: false,
         }),
         disk_bootstrap_path: Some(bs_path),
         disk_chunks_blob_digest: Some("sha256:notused_in_this_test".into()),
-        memory_bootstrap_path: None,
-        memory_chunks_blob_digest: None,
         digest: "sha256:bug_repro".into(),
     };
 
@@ -699,8 +695,6 @@ async fn cached_image_chunked_oci_drives_tiered_materialize_end_to_end() {
         bundle: None,
         disk_bootstrap_path: Some(bs_path),
         disk_chunks_blob_digest: Some(blob_digest),
-        memory_bootstrap_path: None,
-        memory_chunks_blob_digest: None,
         digest: "sha256:test_cached".into(),
     };
     assert!(cached.is_disk_chunked_oci());

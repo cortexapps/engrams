@@ -243,8 +243,6 @@ async fn bake_shell_rootfs(repo: &str) -> (PathBuf, PathBuf) {
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            canonical_memory_manifest: None,
-            capture_canonical_memory: None,
             parent_disk_bootstrap_path: None,
             parent_disk_chunks_blob_digest: None,
         })
@@ -484,7 +482,6 @@ async fn e2e_shell_cold_via_pooled_backend() {
         workdir: None,
         harness_substrate: Some(substrate_path),
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 
@@ -540,7 +537,6 @@ async fn e2e_shell_warm_via_pooled_backend() {
         workdir: None,
         harness_substrate: Some(substrate_path),
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // ---- Cold create + wait for VM to be ready ----

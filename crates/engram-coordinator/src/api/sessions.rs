@@ -523,7 +523,6 @@ async fn create_session_inner(
         // image bundle after the image-cache resolve, so we leave
         // it None at session-create. Sessions whose bundle carries
         // a canonical pick up the canonical mmap at restore time.
-        canonical_memory_manifest: None,
     };
 
     // -------- 5. Schedule + create the sandbox --------

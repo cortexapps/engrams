@@ -1,0 +1,21 @@
+-- ADR 0015 M5: drop the `templates` table.
+--
+-- The table is no longer read or written anywhere in the binary
+-- (the warm-pool driver, the enable-image cascade, and the
+-- `resolve_template`/`upsert_template`/`list_active_templates`/
+-- `get_template` metastore methods were all removed in the same
+-- PR). Hosts now report `ready_images` on each heartbeat; coord
+-- echoes `enabled_images` back; the scheduler will gate on
+-- readiness in a follow-up phase.
+--
+-- Migrations 0025_templates.sql + 0029_templates_harness_agnostic.sql
+-- created and reshaped this table. After this DROP, those columns
+-- are unrecoverable — but the data they carried (template_ref,
+-- snapshot_id, image_repo/tag, vcpus, memory_mib, harness_pack_uri,
+-- active) is either ephemeral state regenerated from heartbeats
+-- (active, capacity) or duplicated in enabled_images.manifest_toml
+-- (resources, image identity).
+--
+-- The `snapshots` table stays — it's still used by ADR 0011 idle-
+-- evicted session snapshots.
+DROP TABLE IF EXISTS templates;

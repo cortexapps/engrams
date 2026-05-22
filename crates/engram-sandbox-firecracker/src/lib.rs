@@ -490,17 +490,6 @@ struct FcSnapshotManifest {
     /// with PooledBackend+chunk_store or switch to RestoreMode::File.
     #[serde(default)]
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    /// ADR 0007 / Phase 5: canonical-base memory manifest. Identifies
-    /// the per-image bake-time canonical snapshot the UFFD handler
-    /// mmaps for cross-VM page-cache sharing. When equal to
-    /// `memory_manifest`, the resolver returns `Canonical` for every
-    /// fault (no chunk fetches; the local memory.bin mmap serves
-    /// everything). When different, divergent chunks fetch from the
-    /// chunk store. `None` is treated identically to "equal to
-    /// memory_manifest" — convenient default until the image-builder
-    /// bake-time canonical capture slice lands.
-    #[serde(default)]
-    canonical_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
     /// ADR 0007 / Phase 5: hint about whose working-set trace to
     /// prefault on the restoring host. Set to the snapshotting
     /// host's `HostId` so cross-host restore can ask
@@ -1681,13 +1670,12 @@ impl FirecrackerBackend {
                         ));
                     }
                 };
-                // No bake-time canonical yet → reuse the session ref
-                // as canonical. Resolver returns `Canonical` for every
-                // fault (canonical == session at every chunk hash),
-                // local memory.bin mmap serves the bytes, no chunk
-                // store I/O at runtime. The bake-time canonical-base
-                // slice will diverge these.
-                let canonical_ref = manifest.canonical_memory_manifest.unwrap_or(session_ref);
+                // ADR 0015 M5: bake-time canonical capture was retired,
+                // so canonical_ref == session_ref unconditionally. The
+                // UFFD resolver returns `Canonical` for every fault and
+                // the local memory.bin mmap serves bytes; no chunk-store
+                // I/O on the restore-fault path.
+                let canonical_ref = session_ref;
                 let uffd_uds = jail_dir.join("uffd.sock");
                 let _ = tokio::fs::remove_file(&uffd_uds).await;
                 // ADR 0007 Phase 5: replay the snapshotting
@@ -2444,12 +2432,6 @@ impl SandboxBackend for FirecrackerBackend {
             // in-place after FC returns (the bare backend can't
             // chunk memory.bin without a chunk-store wiring).
             memory_manifest: None,
-            // ADR 0007 Phase 5: canonical-base memory manifest
-            // lifted from the image bundle. Set on session create
-            // by PooledBackend; carried on the spec through every
-            // snapshot. UFFD handler `mmap`s the canonical file
-            // and serves shared-canonical reads from page cache.
-            canonical_memory_manifest: spec.canonical_memory_manifest,
             // ADR 0007 Phase 5: snapshotting host's id, so cross-
             // host restore can request this host's recorded
             // trace via `--prefault-trace <hint>`. Set from FC
@@ -3045,7 +3027,6 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
-            canonical_memory_manifest: None,
         }
     }
 
@@ -3192,7 +3173,6 @@ mod tests {
             }),
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
-            canonical_memory_manifest: None,
             trace_host_hint: None,
             source_rootfs_canonical: None,
             source_harness_canonical: None,

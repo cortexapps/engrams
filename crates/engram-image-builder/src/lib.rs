@@ -73,31 +73,6 @@ pub struct BuildRequest {
     /// `default_boot_args = "... init=/sbin/engram-init"` and the
     /// host's `exec_stream` reaches the in-guest agent over vsock.
     pub agent_injection: Option<AgentInjection>,
-    /// ADR 0007 Phase 5: pre-computed canonical-base memory
-    /// manifest. Two ways callers populate this:
-    ///
-    ///  1. Pre-computed by an external pipeline (sidecar Linux+KVM
-    ///     job) and passed in directly.
-    ///  2. Auto-captured at bake time by setting
-    ///     [`capture_canonical_memory`] — the baker boots the
-    ///     just-built rootfs via FC, pauses after `boot_wait`,
-    ///     snapshots `memory.bin`, chunks it into the store, and
-    ///     fills this field with the resulting [`ManifestRef`].
-    ///
-    /// `None` skips the canonical write to `bundle.json`, so
-    /// sessions of this image pay session-private memory cost at
-    /// restore time (functionally correct, no cross-VM dedup).
-    pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
-    /// ADR 0007 Phase 5: opt-in bake-time canonical memory
-    /// capture. When `Some`, the baker reuses
-    /// `FirecrackerBackend::create` + `snapshot` to boot the
-    /// just-built rootfs, wait for it to settle, and capture
-    /// `memory.bin`. The bytes get chunked into the chunk store
-    /// and the resulting [`ManifestRef`] populates
-    /// `bundle.json::canonical_memory_manifest`. Requires FC +
-    /// `/dev/kvm` on the runner; non-KVM CI lanes set this
-    /// `None` and rely on the pre-computed path above.
-    pub capture_canonical_memory: Option<CanonicalCaptureConfig>,
     /// ADR 0008 Phase 4: parent image's bootstrap, for cross-image
     /// chunk dedup. When `Some`, the disk-side bootstrap walks the
     /// parent's entries and reuses any chunk hashes that match —
@@ -112,66 +87,6 @@ pub struct BuildRequest {
     /// OCI layer digest of the parent's disk chunks blob. Required
     /// when `parent_disk_bootstrap_path` is set; ignored otherwise.
     pub parent_disk_chunks_blob_digest: Option<String>,
-}
-
-/// Bake-time canonical memory capture parameters. ADR 0007 Phase 5.
-#[derive(Clone, Debug)]
-pub struct CanonicalCaptureConfig {
-    /// Path to the FC kernel image (vmlinux). The same artifact
-    /// the production FC host uses; image-builder boots a transient
-    /// VM with it.
-    pub kernel_image_path: PathBuf,
-    /// `firecracker` binary. Defaults to PATH lookup in
-    /// `FirecrackerConfig::with_kernel`; override here when CI
-    /// pins a specific build.
-    pub firecracker_bin: Option<PathBuf>,
-    /// How long to wait after `InstanceStart` before snapshotting.
-    /// Production bakes pair this with a sentinel file the in-VM
-    /// init script writes; for v1 we use a fixed wait that's
-    /// generous enough for typical Python/Node images to reach
-    /// steady state (5–10 s post-boot).
-    pub boot_wait: std::time::Duration,
-    /// Guest RAM. The canonical snapshot's `memory.bin` size is
-    /// dominated by this — the chunked-storage compression ratio
-    /// means it's fine to grant generously. Defaults to 512 MiB
-    /// when caller passes `None`.
-    pub memory_mib: Option<u32>,
-    /// ADR 0014 M1.14: path to `engram-uffd-handler` for the
-    /// synthetic profile pass. When `None`, falls back to PATH
-    /// lookup ("engram-uffd-handler"). CI bakes that don't ship
-    /// the UFFD handler in PATH should pin this explicitly; we
-    /// skip the profile pass cleanly when the binary is missing.
-    pub uffd_handler_bin: Option<PathBuf>,
-    /// ADR 0014 M1.14: chunk-store root the bake's chunks land in
-    /// (the `--blob-root` the UFFD handler should read from on the
-    /// profile-pass). `None` skips the profile pass: the bake
-    /// proceeds without a working-set trace and refill falls back
-    /// to full-manifest prefetch.
-    pub blob_root: Option<PathBuf>,
-    /// Bypass the engram-init + stub-harness scaffolding when
-    /// `true`. Default `false` (production bakes capture an
-    /// agentd-on-accept snapshot). Set to `true` only by the
-    /// canonical-capture integration test fixture, which boots a
-    /// stock Ubuntu rootfs that has no engram-init baked in —
-    /// without this opt-out the kernel panics with `init=/sbin/
-    /// engram-init` missing.
-    pub skip_warm_pool_prep: bool,
-    /// ADR 0014 M1.16: bake-time network pool. `Some(addr)`
-    /// allocates a /30 + creates a host TAP + bakes
-    /// `ip=…:eth0:off` into the kernel cmdline, so the snapshot
-    /// captures a virtio-net device + an up eth0 inside the VM.
-    /// Required for the dashboard SHELL tab + egress to work
-    /// post-warm-restore: FC can't hot-add virtio-net after
-    /// `load_snapshot`, and the prod host's per-VM netns
-    /// re-creates the TAP inside the netns + SNATs the bake's
-    /// `10.200.0.2` to a unique-per-VM host slot.
-    ///
-    /// Production bakes pass `Some("10.200.0.0".parse().unwrap())`
-    /// (matching `FirecrackerConfig::default`); bake host needs
-    /// `CAP_NET_ADMIN` for `ip tuntap add`. `None` keeps the bake
-    /// netless — only useful for test fixtures without
-    /// `CAP_NET_ADMIN` that don't need post-restore networking.
-    pub net_pool: Option<std::net::Ipv4Addr>,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -405,11 +320,6 @@ pub struct BuildOutcome {
     /// per-sandbox disks via NBD (Linux+FC) or materialize-to-
     /// file (macOS+VZ).
     pub disk_manifest: Option<engram_chunk_store::ManifestRef>,
-    /// ADR 0007 Phase 5: bake-time canonical-base memory
-    /// manifest. `Some` when the baker captured a post-init
-    /// `memory.bin` via FC + chunked it; `None` when capture
-    /// was skipped. Mirrors `bundle.json::canonical_memory_manifest`.
-    pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
     /// Size of `rootfs_path` on disk.
     pub size_bytes: u64,
     /// ADR 0008 Phase 3: bootstrap JSON for the disk side of a
@@ -422,33 +332,6 @@ pub struct BuildOutcome {
     /// ADR 0008 Phase 3: path to the concatenated disk chunk blob.
     /// Paired with `disk_bootstrap_path`.
     pub disk_chunks_blob_path: Option<PathBuf>,
-    /// ADR 0008 Phase 3: memory-side counterpart of
-    /// `disk_bootstrap_path`. `Some` iff canonical memory was
-    /// captured at bake time.
-    pub memory_bootstrap_path: Option<PathBuf>,
-    pub memory_chunks_blob_path: Option<PathBuf>,
-    /// ADR 0014: bake-time captured FC `state.bin`. `Some` iff
-    /// `capture_canonical_memory` ran. `push_to_registry` reads
-    /// this and ships it as an OCI layer; coord's `enable_image`
-    /// pulls the layer and writes the bytes to its BlobStorage
-    /// at `state_blob_key(snapshot_id)`.
-    pub snapshot_state_path: Option<PathBuf>,
-    /// ADR 0014: bake-time captured FC sidecar `manifest.json`.
-    /// Paired with `snapshot_state_path`.
-    pub snapshot_sidecar_path: Option<PathBuf>,
-    /// ADR 0014 M1.14: working-set trace JSON produced by the
-    /// synthetic profile pass. `Some` iff the bake ran the profile
-    /// successfully. Coord materializes to BlobStorage at
-    /// `working_set_blob_key(snapshot_id)` on enable-image.
-    pub snapshot_working_set_path: Option<PathBuf>,
-    /// ADR 0014: full portable template snapshot. `Some` iff the
-    /// bake captured canonical memory. `state_blob_key` and
-    /// `sidecar_blob_key` are `None` here — coord assigns them on
-    /// enable-image after writing the OCI-shipped bytes to its
-    /// own BlobStorage. bundle.json's `canonical_snapshot` block
-    /// carries the same shape for downstream consumers reading
-    /// the artifact directly.
-    pub canonical_snapshot: Option<engram_core::types::snapshot::SnapshotMetadata>,
 }
 
 #[derive(Debug)]
@@ -458,15 +341,6 @@ pub enum BuildError {
     Docker(String),
     Ext4(Ext4Error),
     InvalidPath(String),
-    /// ADR 0014: caller requested `--capture-canonical-memory` but
-    /// the bake-time FC capture step failed (TAP provisioning,
-    /// /dev/kvm permissions, snapshot/restore plumbing, etc.).
-    /// Returned instead of silently producing an artifact whose
-    /// bundle.json lacks the canonical_snapshot block — that's the
-    /// failure mode that produced `demo:warm-75babf7` (TAP EPERM
-    /// in CI) and caused warm pool to silently never fire for
-    /// the image in prod.
-    CanonicalCapture(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -477,7 +351,6 @@ impl std::fmt::Display for BuildError {
             Self::Docker(m) => write!(f, "docker: {m}"),
             Self::Ext4(e) => write!(f, "ext4: {e}"),
             Self::InvalidPath(p) => write!(f, "invalid path: {p}"),
-            Self::CanonicalCapture(m) => write!(f, "canonical memory capture: {m}"),
         }
     }
 }
@@ -719,16 +592,9 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 // Format is intentionally tiny so a future "list
                 // images" CLI can fetch it cheaply.
                 //
-                // ADR 0007 Phase 5: `canonical_memory_manifest`
-                // ships as `null` until the bake-time canonical
-                // capture step runs (`req.capture_canonical_memory`).
-                // The field is optional both on the wire and in
-                // `ImageBundle`'s serde shape, so older bakes that
-                // never set it deserialise cleanly.
                 let bundle = serde_json::json!({
                     "schema_version": 1,
                     "disk_manifest": manifest_ref,
-                    "canonical_memory_manifest": req.canonical_memory_manifest,
                 });
                 tokio::fs::write(
                     image_dir.join("bundle.json"),
@@ -749,78 +615,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 (ext4_path, on_disk, Some(manifest_ref))
             }
         };
-
-        // ADR 0007 Phase 5 + ADR 0014: bake-time canonical memory
-        // capture. Three branches:
-        //   1. Caller supplied a pre-computed ref → use it as is
-        //      (no full snapshot, just the memory manifest).
-        //   2. Caller enabled auto-capture AND we have an ext4
-        //      rootfs (canonical only makes sense on FC) → boot
-        //      the rootfs once, snapshot, chunk memory.bin,
-        //      upload state.bin + sidecar to BlobStorage. Returns
-        //      a full portable SnapshotMetadata.
-        //   3. Otherwise → None (sessions pay session-private
-        //      memory cost at restore, functionally correct).
-        let (canonical_memory_manifest, canonical_snapshot) =
-            if let Some(mref) = req.canonical_memory_manifest {
-                (Some(mref), None)
-            } else if let (Some(capture_cfg), Some(disk_ref)) =
-                (req.capture_canonical_memory.as_ref(), disk_manifest)
-            {
-                match self
-                    .capture_canonical_memory(&rootfs_path, image_dir, capture_cfg)
-                    .await
-                {
-                    Ok(mut metadata) => {
-                        // ADR 0014 M1.11: the bundle's `canonical_snapshot`
-                        // block needs `disk_manifest` so the coord-side
-                        // materializer + heartbeat-ack carry it through to
-                        // hosts. Without this, warm-pool refill on a fresh
-                        // host has the memory side reachable in BlobStorage
-                        // but no way to materialize the rootfs file FC
-                        // needs at `load_snapshot` time → "Block: Virtio
-                        // backend error" on every refill until a cold
-                        // session create primes image_cache.
-                        metadata.disk_manifest = Some(disk_ref);
-                        tracing::info!(
-                            repo = %req.repo,
-                            tag = %req.tag,
-                            snapshot_id = %metadata.id,
-                            memory_manifest = ?metadata.memory_manifest,
-                            disk_manifest = ?metadata.disk_manifest,
-                            "captured canonical template snapshot at bake time"
-                        );
-                        (metadata.memory_manifest, Some(metadata))
-                    }
-                    Err(e) => {
-                        // Fail loud. Previously this was best-effort
-                        // with a WARN log, but a "successful" bake that
-                        // shipped without canonical_snapshot was the
-                        // exact mechanism behind `demo:warm-75babf7`
-                        // (TAP ioctl EPERM in CI; warn logged but exit
-                        // code 0; image pushed; coord cascade silently
-                        // skipped templates write; warm pool never
-                        // fired for the image; every session
-                        // cold-created in ~27s in prod).
-                        //
-                        // The caller explicitly asked for canonical
-                        // capture via `--capture-canonical-memory`.
-                        // Honor that — if capture can't happen, refuse
-                        // to ship a half-broken artifact. CI lanes that
-                        // genuinely don't have KVM should simply omit
-                        // the flag.
-                        tracing::error!(
-                            repo = %req.repo,
-                            tag = %req.tag,
-                            error = %e,
-                            "canonical memory capture failed; aborting bake",
-                        );
-                        return Err(BuildError::CanonicalCapture(format!("{e}")));
-                    }
-                }
-            } else {
-                (None, None)
-            };
 
         // ADR 0008 Phase 3: produce Nydus-shaped artifacts
         // alongside the existing bundle.json. For each kind that
@@ -896,86 +690,21 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             disk_chunks_blob_path = Some(blob_path);
         }
 
-        let mut memory_bootstrap_path = None;
-        let mut memory_chunks_blob_path = None;
-        if let Some(mem_ref) = canonical_memory_manifest {
-            let manifest = self
-                .chunk_store
-                .get_manifest(mem_ref)
-                .await
-                .map_err(|e| BuildError::Config(format!("re-read memory manifest: {e}")))?;
-            let (bootstrap, blob) =
-                engram_chunk_store::Bootstrap::build_from_manifest(&self.chunk_store, &manifest)
-                    .await
-                    .map_err(|e| BuildError::Config(format!("memory bootstrap build: {e}")))?;
-            let bs_path = image_dir.join("bootstrap.memory.json");
-            let blob_path = image_dir.join("chunks.memory.blob");
-            tokio::fs::write(
-                &bs_path,
-                serde_json::to_vec(&bootstrap)
-                    .map_err(|e| BuildError::Config(format!("memory bootstrap json: {e}")))?,
-            )
-            .await?;
-            tokio::fs::write(&blob_path, &blob).await?;
-            memory_bootstrap_path = Some(bs_path);
-            memory_chunks_blob_path = Some(blob_path);
-        }
-
-        // Re-write bundle.json now that we know whether the
-        // canonical memory ref is set. The earlier write inside
-        // the Ext4 branch already wrote a baseline bundle; this
-        // is the canonical-aware overwrite. Schema bumps to v2
+        // Re-write bundle.json with the disk_manifest now that the
+        // ext4 branch (above) wrote a baseline. Schema bumps to v2
         // when chunked-OCI artifacts were produced — v1 readers
-        // see `disk_manifest` still and work; v2 readers
-        // additionally consult `bootstrap_disk` /
-        // `bootstrap_memory` for Range-GET-on-fault. v3 (ADR 0014)
-        // adds `canonical_snapshot` for restorable template
-        // snapshots (state.bin + sidecar in BlobStorage).
+        // still see `disk_manifest` and work; v2 readers also
+        // consult `bootstrap_disk_available` for Range-GET-on-fault.
         if let Some(disk_ref) = disk_manifest {
-            let schema_version = if canonical_snapshot.is_some() {
-                3
-            } else if disk_bootstrap_path.is_some() {
-                2
-            } else {
-                1
-            };
+            let schema_version = if disk_bootstrap_path.is_some() { 2 } else { 1 };
             let mut bundle = serde_json::json!({
                 "schema_version": schema_version,
                 "disk_manifest": disk_ref,
-                "canonical_memory_manifest": canonical_memory_manifest,
             });
-            if let Some(snap) = canonical_snapshot.as_ref() {
-                // The full portable snapshot descriptor — coord +
-                // host-agent consume this to register a `templates`
-                // row and lease a warm slot keyed by the snapshot
-                // id, with state.bin + sidecar fetchable from
-                // BlobStorage at the keys recorded here.
-                //
-                // Serialize via `serde_json::to_value(snap)` rather
-                // than hand-rolling a JSON object: the cascade in
-                // engram-coordinator reads this block with
-                // `serde_json::from_value::<SnapshotMetadata>` and
-                // any field-name drift between the struct's serde
-                // shape and the hand-roll silently returns None →
-                // cascade skipped → templates row never written →
-                // warm pool never fires for this image. The prior
-                // hand-roll used "snapshot_id" but the struct's
-                // field is "id", and omitted required fields like
-                // `image_version` entirely.
-                bundle["canonical_snapshot"] = serde_json::to_value(snap).map_err(|e| {
-                    BuildError::Config(format!("serialize canonical_snapshot: {e}"))
-                })?;
-            }
             if disk_bootstrap_path.is_some() {
-                // We don't know the OCI layer digests yet (those
-                // are computed at push time when the registry
-                // checks the upload), so we just flag that the
-                // chunked-OCI shape is *available* — consumers
-                // resolve actual digests from the OCI manifest.
+                // OCI layer digests are computed at push time; we
+                // just flag that the chunked-OCI shape is available.
                 bundle["bootstrap_disk_available"] = serde_json::Value::Bool(true);
-            }
-            if memory_bootstrap_path.is_some() {
-                bundle["bootstrap_memory_available"] = serde_json::Value::Bool(true);
             }
             tokio::fs::write(
                 image_dir.join("bundle.json"),
@@ -985,623 +714,15 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await?;
         }
 
-        // ADR 0014: snapshot_state + sidecar are staged into
-        // image_dir by `capture_canonical_memory`. Surface their
-        // paths on BuildOutcome so `push_to_registry` can include
-        // them as OCI layers.
-        let (snapshot_state_path, snapshot_sidecar_path, snapshot_working_set_path) =
-            if canonical_snapshot.is_some() {
-                let s = image_dir.join("snapshot.state.bin");
-                let c = image_dir.join("snapshot.sidecar.json");
-                let w = image_dir.join("snapshot.working_set.json");
-                (
-                    s.exists().then_some(s),
-                    c.exists().then_some(c),
-                    w.exists().then_some(w),
-                )
-            } else {
-                (None, None, None)
-            };
-
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
             manifest_path,
             rootfs_path,
             disk_manifest,
-            canonical_memory_manifest,
             size_bytes: total_size,
             disk_bootstrap_path,
             disk_chunks_blob_path,
-            memory_bootstrap_path,
-            memory_chunks_blob_path,
-            snapshot_state_path,
-            snapshot_sidecar_path,
-            snapshot_working_set_path,
-            canonical_snapshot,
         })
-    }
-
-    /// Boot the just-baked rootfs via FC, wait `boot_wait`, then
-    /// snapshot `memory.bin` and chunk it into the chunk store.
-    /// ADR 0014: also uploads `state.bin` + sidecar JSON to
-    /// `BlobStorage` so production hosts can restore this template
-    /// snapshot without re-running the bake. Returns a full
-    /// [`SnapshotMetadata`] with all portable fields stamped
-    /// (memory_manifest, state_blob_key, sidecar_blob_key,
-    /// source_sandbox_id) — bundle.json's `canonical_snapshot`
-    /// block serializes the same data.
-    ///
-    /// Requires:
-    /// - `/dev/kvm` accessible to the bake user (the dev VM, the
-    ///   Blacksmith nested-virt runner, or a bare-metal builder)
-    /// - The `firecracker` binary on PATH (or `capture_cfg.
-    ///   firecracker_bin` set)
-    ///
-    /// The bake VM has **no networking** — `net_pool = None` —
-    /// and runs `init=/bin/bash` by default. Operators baking
-    /// agentd-injected images that need to reach steady-state
-    /// before snapshotting should set `boot_wait` proportionally
-    /// (5–10 s for typical Python/Node, longer for heavy
-    /// services). A sentinel-file detector is the right v2.
-    pub async fn capture_canonical_memory(
-        &self,
-        rootfs_path: &Path,
-        image_dir: &Path,
-        capture_cfg: &CanonicalCaptureConfig,
-    ) -> Result<engram_core::types::snapshot::SnapshotMetadata, BuildError> {
-        use engram_chunk_store::ManifestKind;
-        use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-        use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
-
-        // FC's create flow installs `rootfs_source` as a symlink target
-        // at `<work_dir>/rootfs/<sandbox_id>.dev`, and the kernel
-        // resolves relative symlink targets against the symlink's
-        // parent directory — not the bake's CWD. CLI invocations
-        // typically pass `--images-dir var/engram/images` (relative),
-        // so without this canonicalize FC's PUT /drives lands on a
-        // "No such file or directory" error.
-        let rootfs_path = tokio::fs::canonicalize(rootfs_path).await.map_err(|e| {
-            BuildError::Config(format!(
-                "canonicalize rootfs path {}: {e}",
-                rootfs_path.display()
-            ))
-        })?;
-
-        let work = tempfile::tempdir()
-            .map_err(|e| BuildError::Config(format!("canonical bake tempdir: {e}")))?;
-
-        // ADR 0014 M1.12 (option D) + ADR 0015 M1: produce a 16 MiB
-        // empty ext4 the bake attaches as the harness substrate
-        // (/dev/vdb). The init shim doesn't mount /dev/vdb; agentd's
-        // harness supervisor mounts it *after* receiving SpawnHarness
-        // at warm-lease time. The stub being attached at bake time
-        // is what lets us snapshot an agentd-on-accept state with
-        // the correct device-tree — FC's `swap_harness_drive` later
-        // swaps to the session's real harness, but the snapshot
-        // needs *something* openable at the embedded path. Skipped
-        // in test fixtures that boot a stock rootfs without
-        // engram-init (kernel panic otherwise).
-        let stub_path = if capture_cfg.skip_warm_pool_prep {
-            None
-        } else {
-            let stub_dir = work.path().join("stub");
-            tokio::fs::create_dir_all(&stub_dir).await.map_err(|e| {
-                BuildError::Config(format!(
-                    "create stub harness staging dir {}: {e}",
-                    stub_dir.display()
-                ))
-            })?;
-            let stub_src = stub_dir.join("src");
-            tokio::fs::create_dir_all(&stub_src).await.map_err(|e| {
-                BuildError::Config(format!(
-                    "create stub harness src dir {}: {e}",
-                    stub_src.display()
-                ))
-            })?;
-            let p = work.path().join(".stub-harness.ext4");
-            // ADR 0014 M1.12 stub size: load-bearing. The stub is
-            // mounted as /dev/vdb at warm-pool bake time and
-            // captured in the snapshot. On warm lease, the host
-            // hot-swaps /dev/vdb's backing file to the session's
-            // harness pack ext4 via FC `PATCH /drives`. Firecracker
-            // accepts a larger replacement file and emits a
-            // virtio-blk "capacity change" notification — but the
-            // guest's mounted-FS view of /dev/vdb is fixed by the
-            // SUPERBLOCK + bgd that ext4 read at mount time. So
-            // any swap-target larger than the stub silently
-            // truncates: the guest sees only the first stub-many
-            // bytes of the new file, which (since ext4 puts metadata
-            // up front) shows up as `lost+found` and nothing else.
-            //
-            // Observed in prod 2026-05-21 session 0c83f95f: stub
-            // was 16 MiB, harness pack was 455 MiB, swap "succeeded"
-            // but `/run/engram/harnesses/` showed only lost+found
-            // and the harness never exec'd (no claude binary).
-            //
-            // Sizing rule: the stub must be at least as big as the
-            // largest harness pack we'll ever swap in. The Claude
-            // pack ships ~455 MiB; pick 1 GiB to leave headroom
-            // for future harnesses + Claude growth. The file is
-            // sparse (`set_len` doesn't write zeros on Linux ext4),
-            // so the snapshot's actual on-disk footprint stays
-            // dominated by ext4 metadata + lost+found (tens of
-            // MiB), not the 1 GiB nominal size.
-            const STUB_HARNESS_SIZE: u64 = 1024 * 1024 * 1024;
-            Mke2fsPacker::default()
-                .pack(&stub_src, &p, STUB_HARNESS_SIZE)
-                .await
-                .map_err(|e| BuildError::Config(format!("pack stub harness ext4: {e}")))?;
-            Some(p)
-        };
-
-        let mut fc_cfg = FirecrackerConfig::with_kernel(&capture_cfg.kernel_image_path);
-        if let Some(bin) = &capture_cfg.firecracker_bin {
-            fc_cfg.firecracker_bin = bin.clone();
-        }
-        // Bake-time isolation: egress proxy stays off (the image
-        // is supposed to reach steady state on local resources).
-        // Networking IS configured when `capture_cfg.net_pool` is
-        // `Some` — ADR 0014 M1.16 needs the snapshot to capture a
-        // virtio-net device + an `ip=…`-up eth0 because FC can't
-        // hot-add network interfaces after `load_snapshot`.
-        // Production prod-host's warm-restore path recreates the
-        // bake's TAP inside a per-VM netns + SNATs the bake-time
-        // source IP to a unique-per-VM host slot.
-        fc_cfg.net_pool = capture_cfg.net_pool;
-        fc_cfg.egress_proxy_port = None;
-        // ADR 0014 follow-up: bake-time + restore-time MUST agree on
-        // the CPU template, otherwise the snapshot captures the bake
-        // host's CPUID (AMD on Blacksmith runners 2026-05-21) and the
-        // guest's glibc ifunc resolver picks code paths the prod CPU
-        // (Intel Cascade Lake) can't execute. The host-agent picks up
-        // the same env var on startup so prod-side and bake-side stay
-        // in lockstep.
-        fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
-        // ADR 0015 M1: boot through `engram-init` so the init shim
-        // exec's engram-agentd (port 1024 listener) before snapshot.
-        // Without this the bake captures a kernel-only state and
-        // warm-launch's CONNECT gets RST. Test fixtures that boot
-        // a stock rootfs (no engram-init) override to a plain shell
-        // so the kernel doesn't panic.
-        fc_cfg.default_boot_args = if capture_cfg.skip_warm_pool_prep {
-            "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into()
-        } else {
-            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into()
-        };
-        // Hand the FC backend the bake-time stub so its restore
-        // path can resolve the harness symlink — only meaningful
-        // here when we run a profiling-restore later (M1.14).
-        fc_cfg.stub_harness_path = stub_path.clone();
-
-        let backend = FirecrackerBackend::new(work.path(), fc_cfg);
-
-        let spec = SandboxSpec {
-            image: format!("canonical-bake:{}", uuid::Uuid::new_v4().simple()),
-            rootfs_source: Some(rootfs_path.to_path_buf()),
-            image_uri: None,
-            harness_pack_uri: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit {
-                max_mib: capture_cfg.memory_mib.unwrap_or(512),
-            },
-            disk: DiskLimit { max_gib: 4 },
-            ttl: None,
-            env: Default::default(),
-            workdir: None,
-            harness_substrate: stub_path.clone(),
-            network: Default::default(),
-            canonical_memory_manifest: None,
-        };
-
-        let sandbox_id = engram_core::traits::SandboxBackend::create(&backend, spec)
-            .await
-            .map_err(|e| BuildError::Config(format!("canonical bake create: {e}")))?;
-
-        // Wait for steady state. Production v2 will replace this
-        // with a sentinel file the init script writes (the agentd
-        // injection shim writes /run/engram/agentd-ready); v1's
-        // fixed wait works for any rootfs.
-        tokio::time::sleep(capture_cfg.boot_wait).await;
-
-        // ADR 0007 Phase 6: backend owns the staging dir; we look it
-        // up via snapshot_path_for after the snapshot completes so we
-        // can chunk the memory.bin it wrote.
-        let mut metadata = engram_core::traits::SandboxBackend::snapshot(&backend, sandbox_id)
-            .await
-            .map_err(|e| BuildError::Config(format!("canonical bake snapshot: {e}")))?;
-        let snap_dir =
-            engram_core::traits::SandboxBackend::snapshot_path_for(&backend, metadata.id);
-
-        // Snapshot wrote memory.bin into snap_dir. Chunk it into
-        // the store.
-        let memory_bin = snap_dir.join("memory.bin");
-        let memory_manifest = self
-            .chunk_store
-            .chunk_file(&memory_bin, ManifestKind::Memory, None)
-            .await
-            .map_err(|e| BuildError::Config(format!("chunk canonical memory.bin: {e}")))?;
-        let manifest_ref = engram_chunk_store::ManifestRef::new();
-        self.chunk_store
-            .put_manifest(manifest_ref, &memory_manifest)
-            .await
-            .map_err(|e| BuildError::Config(format!("put canonical manifest: {e}")))?;
-
-        // ADR 0014: copy state.bin + sidecar JSON into `image_dir`
-        // so `push_to_registry` can package them as OCI layers.
-        // Previously the bake uploaded these directly to its
-        // local BlobStorage — that coupled the bake's environment
-        // (LocalBlobStorage on a CI runner with no GCS creds) to
-        // the production deployment's blob backend, producing
-        // OCI artifacts prod hosts couldn't restore from. The
-        // current design: bake → OCI artifact → coord's
-        // `enable_image` materializes to BlobStorage at canonical
-        // keys derived from snapshot_id. blob keys are assigned
-        // app-side, not bake-side, so we leave them None here.
-        let state_path = snap_dir.join("state.bin");
-        let sidecar_path = snap_dir.join("manifest.json");
-        let staged_state = image_dir.join("snapshot.state.bin");
-        let staged_sidecar = image_dir.join("snapshot.sidecar.json");
-        tokio::fs::copy(&state_path, &staged_state)
-            .await
-            .map_err(|e| {
-                BuildError::Config(format!(
-                    "stage canonical state.bin into {}: {e}",
-                    staged_state.display()
-                ))
-            })?;
-
-        // ADR 0014: patch `memory_manifest` into the FC sidecar
-        // before staging it. The production session-snapshot path
-        // does this in `PooledBackend::snapshot` (the host that
-        // wrote the snapshot also chunks memory.bin and updates
-        // the sidecar in place), but the bake side never did —
-        // FC writes the sidecar without that field. On a
-        // cross-host warm-pool restore, `materialize_memory_if_missing`
-        // reads the sidecar to discover the memory_manifest ref;
-        // if the field is absent the function silently no-ops and
-        // FC restore later errors with "snapshot memory.bin missing".
-        let sidecar_bytes = tokio::fs::read(&sidecar_path).await.map_err(|e| {
-            BuildError::Config(format!(
-                "read fc manifest.json {}: {e}",
-                sidecar_path.display()
-            ))
-        })?;
-        let mut sidecar_value: serde_json::Value =
-            serde_json::from_slice(&sidecar_bytes).map_err(|e| {
-                BuildError::Config(format!(
-                    "parse fc manifest.json {}: {e}",
-                    sidecar_path.display()
-                ))
-            })?;
-        sidecar_value
-            .as_object_mut()
-            .ok_or_else(|| BuildError::Config("fc manifest.json root is not an object".into()))?
-            .insert(
-                "memory_manifest".into(),
-                serde_json::to_value(manifest_ref)
-                    .map_err(|e| BuildError::Config(format!("serialize memory_manifest: {e}")))?,
-            );
-        let patched = serde_json::to_vec_pretty(&sidecar_value)
-            .map_err(|e| BuildError::Config(format!("serialize patched sidecar: {e}")))?;
-        tokio::fs::write(&staged_sidecar, &patched)
-            .await
-            .map_err(|e| {
-                BuildError::Config(format!(
-                    "write patched sidecar to {}: {e}",
-                    staged_sidecar.display()
-                ))
-            })?;
-
-        // Stamp the metadata with everything a sibling host needs
-        // to restore. memory_manifest is the chunked manifest of
-        // memory.bin; canonical_memory_manifest is the same value
-        // here (this IS the canonical for the template).
-        // state_blob_key + sidecar_blob_key stay None — coord
-        // assigns them on enable-image based on snapshot_id.
-        metadata.memory_manifest = Some(manifest_ref);
-        metadata.source_sandbox_id = Some(sandbox_id);
-        metadata.state_blob_key = None;
-        metadata.sidecar_blob_key = None;
-
-        tracing::info!(
-            snapshot_id = %metadata.id,
-            source_sandbox = %sandbox_id,
-            memory_manifest = %manifest_ref,
-            "canonical bake snapshot uploaded; portable refs stamped",
-        );
-
-        // ADR 0014 M1.14: synthetic working-set profile pass. Restore
-        // the just-taken snapshot in UFFD mode, drive bootstrap
-        // through a synthetic mount+exec on the stub harness, dump
-        // the recorded trace to disk for OCI shipment. Best-effort:
-        // any failure here is logged at WARN and we proceed without
-        // a trace — refill falls back to full-manifest prefetch.
-        // Bake must be done with the primary backend BEFORE the
-        // profile pass: same kernel, same chunk store.
-        if let Err(e) = engram_core::traits::SandboxBackend::destroy(&backend, sandbox_id).await {
-            tracing::warn!(error = %e, "canonical bake VM destroy failed; FC child cleanup is kill-on-drop");
-        }
-        // Skip the M1.14 profile pass when there's no stub harness
-        // — the pass relies on bootstrap mounting /dev/vdb.
-        let profile_outcome = match stub_path.as_ref() {
-            Some(stub) => {
-                self.run_working_set_profile_pass(
-                    image_dir,
-                    capture_cfg,
-                    metadata.clone(),
-                    stub,
-                    manifest_ref,
-                    work.path(),
-                )
-                .await
-            }
-            None => Ok(None),
-        };
-        match profile_outcome {
-            Ok(Some(ws_path)) => {
-                tracing::info!(
-                    path = %ws_path.display(),
-                    "M1.14 profile pass produced working-set trace",
-                );
-            }
-            Ok(None) => {
-                tracing::info!("M1.14 profile pass skipped (uffd_handler_bin / blob_root not set)",);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "M1.14 profile pass failed; warm-pool refill will fall back to full-manifest prefetch",
-                );
-            }
-        }
-
-        // Primary bake VM already destroyed above (before the
-        // profile pass) — the profile pass uses a separate FC
-        // backend on a fresh work_dir.
-
-        Ok(metadata)
-    }
-
-    /// ADR 0014 M1.14: synthetic profile pass. Restores the
-    /// just-baked snapshot in a SECOND FC backend (UFFD mode) wired
-    /// to dump the working-set trace to a file, dials vsock to drive
-    /// activity, then tears down. Returns the staged trace path on
-    /// success (also stages it as `image_dir/snapshot.working_set.json`),
-    /// `Ok(None)` when skipped (caller didn't supply uffd handler /
-    /// blob root), or `Err(...)` on a real failure (caller logs +
-    /// proceeds without a trace).
-    async fn run_working_set_profile_pass(
-        &self,
-        image_dir: &Path,
-        capture_cfg: &CanonicalCaptureConfig,
-        metadata: engram_core::types::snapshot::SnapshotMetadata,
-        stub_path: &Path,
-        memory_manifest_ref: engram_chunk_store::ManifestRef,
-        primary_work_dir: &Path,
-    ) -> Result<Option<PathBuf>, BuildError> {
-        use engram_agentd::{SpawnHarnessRequest, WireRequest, WireResponse};
-        use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::UnixStream;
-
-        // Reserved vsock port engram-agentd listens on inside the
-        // guest. Kept in sync with `engram_sandbox_firecracker::
-        // ENGRAM_AGENTD_PORT` via the same hardcoded constant.
-        const ENGRAM_AGENTD_PORT: u32 = 1024;
-
-        let _ = memory_manifest_ref; // reserved for future telemetry
-        let Some(uffd_bin) = capture_cfg.uffd_handler_bin.as_ref() else {
-            return Ok(None);
-        };
-        let Some(blob_root) = capture_cfg.blob_root.as_ref() else {
-            return Ok(None);
-        };
-        if !uffd_bin.exists() {
-            return Err(BuildError::Config(format!(
-                "uffd_handler_bin {} does not exist",
-                uffd_bin.display()
-            )));
-        }
-
-        // Reuse the bake's primary work_dir for the profile FC: the
-        // snapshot files (state.bin, memory.bin, manifest.json) live
-        // there. The primary sandbox was already destroyed, so the
-        // jail dir is gone but the snapshots/ subtree survives.
-        // Trace output lives in a separate scratch tempdir so we
-        // can read it back regardless of what FC does to its jail.
-        let trace_scratch = tempfile::tempdir()
-            .map_err(|e| BuildError::Config(format!("profile-pass tempdir: {e}")))?;
-        let trace_out = trace_scratch.path().join("working_set.json");
-
-        // The bake patched the FC sidecar (manifest.json) in image_dir
-        // with memory_manifest before staging. The primary's sidecar
-        // is unpatched, so PooledBackend's `materialize_memory_if_missing`
-        // path can't infer the manifest from it. Copy the patched one
-        // back into the primary work_dir's snapshot dir before
-        // restoring — that's what the runtime path reads.
-        let primary_snap_dir = primary_work_dir
-            .join("snapshots")
-            .join(metadata.id.to_string());
-        let patched_sidecar = image_dir.join("snapshot.sidecar.json");
-        if patched_sidecar.exists() {
-            tokio::fs::copy(&patched_sidecar, primary_snap_dir.join("manifest.json"))
-                .await
-                .map_err(|e| {
-                    BuildError::Config(format!("profile-pass overlay patched sidecar: {e}"))
-                })?;
-        }
-
-        let mut fc_cfg = FirecrackerConfig::with_kernel(&capture_cfg.kernel_image_path);
-        if let Some(bin) = &capture_cfg.firecracker_bin {
-            fc_cfg.firecracker_bin = bin.clone();
-        }
-        fc_cfg.uffd_handler_bin = uffd_bin.clone();
-        fc_cfg.restore_mode = RestoreMode::Uffd;
-        // Mirror the primary bake's net config so this profile FC's
-        // `load_snapshot` can re-allocate the manifest's /30 + TAP.
-        // Without this, restoring a snapshot baked with `net_pool =
-        // Some(…)` here would fail trying to open the bake-time TAP
-        // that doesn't exist on this allocator.
-        fc_cfg.net_pool = capture_cfg.net_pool;
-        fc_cfg.egress_proxy_port = None;
-        fc_cfg.uffd_blob_root = Some(blob_root.clone());
-        fc_cfg.stub_harness_path = Some(stub_path.to_path_buf());
-        // Same CPU template the primary bake used — this restore is
-        // loading the snapshot we just took, so the template MUST
-        // match or the load fails (or worse, succeeds with a CPUID
-        // mismatch the guest will trip over later).
-        fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
-        // host_id is required for UFFD restore (spawn_uffd_handler
-        // passes --publish-trace-host when set, but the publish target
-        // is the same BlobStorage as --blob-root — in dev that's the
-        // bake's local store, which is fine).
-        fc_cfg.host_id = Some(engram_core::HostId::new());
-        fc_cfg.working_set_trace_output = Some(trace_out.clone());
-
-        let profile_backend = FirecrackerBackend::new(primary_work_dir, fc_cfg);
-
-        // Restore the just-baked snapshot. The FC backend's restore
-        // path materializes the canonical-symlink + vsock-parent-dir
-        // fixups; UFFD handler spawns and starts recording.
-        let restored_id =
-            engram_core::traits::SandboxBackend::restore(&profile_backend, metadata.clone())
-                .await
-                .map_err(|e| BuildError::Config(format!("profile-pass restore: {e}")))?;
-
-        // Read the sidecar manifest from `image_dir` to discover
-        // the bake-side vsock UDS path. FC re-bound the host-side
-        // UDS at that exact path during load_snapshot (we ensured
-        // the parent dir exists via restore_canonical_symlinks).
-        let staged_sidecar = image_dir.join("snapshot.sidecar.json");
-        let sidecar_bytes = tokio::fs::read(&staged_sidecar).await.map_err(|e| {
-            BuildError::Config(format!(
-                "profile-pass read staged sidecar {}: {e}",
-                staged_sidecar.display()
-            ))
-        })?;
-        let sidecar_value: serde_json::Value = serde_json::from_slice(&sidecar_bytes)
-            .map_err(|e| BuildError::Config(format!("profile-pass parse sidecar: {e}")))?;
-        let vsock_path: PathBuf = sidecar_value
-            .get("source_vsock_canonical")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                BuildError::Config("profile-pass sidecar missing source_vsock_canonical".into())
-            })?;
-
-        // Dial agentd, send a synthetic SpawnHarness that mounts
-        // the stub harness and exec's /bin/true. The exact argv
-        // doesn't matter — what we want is for the kernel to walk
-        // through mount(2) + execve(2) so the UFFD handler
-        // observes the chunks underlying those code paths.
-        let profile_result: Result<(), BuildError> = async {
-            let mut stream = UnixStream::connect(&vsock_path).await.map_err(|e| {
-                BuildError::Config(format!(
-                    "profile-pass connect vsock {}: {e}",
-                    vsock_path.display()
-                ))
-            })?;
-            stream
-                .write_all(format!("CONNECT {ENGRAM_AGENTD_PORT}\n").as_bytes())
-                .await
-                .map_err(|e| BuildError::Config(format!("profile-pass write CONNECT: {e}")))?;
-            // Read FC's "OK <cid>\n" line.
-            let mut header = Vec::new();
-            loop {
-                let mut byte = [0u8; 1];
-                stream
-                    .read_exact(&mut byte)
-                    .await
-                    .map_err(|e| BuildError::Config(format!("profile-pass read OK: {e}")))?;
-                header.push(byte[0]);
-                if byte[0] == b'\n' {
-                    break;
-                }
-                if header.len() > 64 {
-                    return Err(BuildError::Config(
-                        "profile-pass FC vsock OK header too long".into(),
-                    ));
-                }
-            }
-            if !header.starts_with(b"OK ") {
-                return Err(BuildError::Config(format!(
-                    "profile-pass FC vsock unexpected header: {:?}",
-                    String::from_utf8_lossy(&header),
-                )));
-            }
-            // SpawnHarness with /bin/true. /dev/vdb is the stub
-            // ext4 attached at bake time; mount it read-only at
-            // /run/engram/harnesses/_profile so the ext4 mount(2)
-            // code path runs.
-            let req = WireRequest::SpawnHarness(SpawnHarnessRequest {
-                argv: vec!["/bin/true".into()],
-                env: Default::default(),
-                harness_dev: Some("/dev/vdb".into()),
-                harness_mount: Some("/run/engram/harnesses/_profile".into()),
-            });
-            engram_agentd::write_msg(&mut stream, &req)
-                .await
-                .map_err(|e| BuildError::Config(format!("profile-pass write SpawnHarness: {e}")))?;
-            // Drain the response so we know agentd actually spawned
-            // the child before we destroy the VM.
-            let resp: WireResponse = engram_agentd::read_msg(&mut stream).await.map_err(|e| {
-                BuildError::Config(format!("profile-pass read SpawnHarness response: {e}"))
-            })?;
-            if let WireResponse::Error { kind, message } = resp {
-                return Err(BuildError::Config(format!(
-                    "profile-pass SpawnHarness rejected ({kind}): {message}"
-                )));
-            }
-            // Let the kernel fault its way through mount(2) + execve(2).
-            // The UFFD handler's recorder window defaults to 5s; sleep
-            // a hair longer than the synthetic activity so we capture
-            // the tail faults too.
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            Ok(())
-        }
-        .await;
-
-        // Always destroy. The UFFD handler will exit and dump the
-        // trace to `trace_out` on clean shutdown.
-        let _ = engram_core::traits::SandboxBackend::destroy(&profile_backend, restored_id).await;
-        profile_result?;
-
-        // Give the UFFD handler a generous beat to land its stdout
-        // / file write — destroy returns when FC is gone but the
-        // handler exits asynchronously.
-        for _ in 0..20 {
-            if tokio::fs::metadata(&trace_out).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if !trace_out.exists() {
-            // Dump the UFFD handler's log (parked next to trace_out by
-            // spawn_uffd_handler) so the caller sees *why* the handler
-            // bailed without producing a trace.
-            let log_path = trace_out
-                .parent()
-                .map(|d| d.join("uffd-handler.log"))
-                .unwrap_or_else(|| trace_out.with_extension("log"));
-            let log_tail = tokio::fs::read_to_string(&log_path)
-                .await
-                .unwrap_or_else(|_| "<uffd-handler log not found>".into());
-            return Err(BuildError::Config(format!(
-                "profile-pass UFFD handler exited but no trace file produced\n--- uffd-handler.log ---\n{log_tail}"
-            )));
-        }
-
-        // Stage the trace into image_dir alongside state.bin + sidecar
-        // so `push_to_registry` includes it as an OCI layer.
-        let staged = image_dir.join("snapshot.working_set.json");
-        tokio::fs::copy(&trace_out, &staged).await.map_err(|e| {
-            BuildError::Config(format!(
-                "profile-pass stage trace to {}: {e}",
-                staged.display()
-            ))
-        })?;
-        Ok(Some(staged))
     }
 
     /// Push a freshly-baked image (output of [`Self::build`]) to a
@@ -1689,37 +810,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         ) {
             let disk_bootstrap_json = tokio::fs::read(bs_path).await.map_err(BuildError::Io)?;
             let disk_chunks_blob = tokio::fs::read(blob_path).await.map_err(BuildError::Io)?;
-            let (memory_bootstrap_json, memory_chunks_blob) = match (
-                outcome.memory_bootstrap_path.as_ref(),
-                outcome.memory_chunks_blob_path.as_ref(),
-            ) {
-                (Some(bs), Some(blob)) => (
-                    Some(tokio::fs::read(bs).await.map_err(BuildError::Io)?),
-                    Some(tokio::fs::read(blob).await.map_err(BuildError::Io)?),
-                ),
-                _ => (None, None),
-            };
-            // ADR 0014: ship state.bin + sidecar as OCI layers so
-            // the deployment's coord can materialize them to its
-            // own BlobStorage on enable-image. Both-or-neither
-            // symmetry is enforced by `push_chunked_image`.
-            let (snapshot_state, snapshot_sidecar_json) = match (
-                outcome.snapshot_state_path.as_ref(),
-                outcome.snapshot_sidecar_path.as_ref(),
-            ) {
-                (Some(s), Some(c)) => (
-                    Some(tokio::fs::read(s).await.map_err(BuildError::Io)?),
-                    Some(tokio::fs::read(c).await.map_err(BuildError::Io)?),
-                ),
-                _ => (None, None),
-            };
-            // ADR 0014 M1.14: optional working-set trace from the
-            // synthetic profile pass. May be absent on older bakes
-            // or when the profile pass was skipped/failed.
-            let snapshot_working_set_json = match outcome.snapshot_working_set_path.as_ref() {
-                Some(p) if p.exists() => Some(tokio::fs::read(p).await.map_err(BuildError::Io)?),
-                _ => None,
-            };
 
             let payload = engram_oci::ChunkedPushPayload {
                 manifest_toml: manifest_bytes,
@@ -1727,11 +817,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 bundle_json: bundle.clone(),
                 disk_bootstrap_json,
                 disk_chunks_blob,
-                memory_bootstrap_json,
-                memory_chunks_blob,
-                snapshot_state,
-                snapshot_sidecar_json,
-                snapshot_working_set_json,
             };
 
             let digest = oci
@@ -1868,80 +953,4 @@ async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
-}
-
-#[cfg(test)]
-mod tests {
-    use engram_core::types::snapshot::SnapshotMetadata;
-
-    /// Regression guard for the bake → cascade contract: bundle.json's
-    /// `canonical_snapshot` block must round-trip cleanly through
-    /// `SnapshotMetadata`'s serde shape. A previous hand-rolled
-    /// `serde_json::json!({...})` in the bake used the wrong field
-    /// names ("snapshot_id" instead of "id", missing required
-    /// `image_version`); the coord's
-    /// `serde_json::from_value::<SnapshotMetadata>(snap).ok()` silently
-    /// returned None and the templates cascade never fired in prod.
-    #[test]
-    fn bundle_canonical_snapshot_round_trips_through_snapshot_metadata() {
-        let original = SnapshotMetadata {
-            id: engram_core::SnapshotId::new(),
-            size_bytes: 4096,
-            created_at: chrono::Utc::now(),
-            image_version: "warm-test".into(),
-            disk_manifest: None,
-            memory_manifest: None,
-            source_sandbox_id: None,
-            state_blob_key: Some("state".into()),
-            sidecar_blob_key: Some("sidecar".into()),
-            rootfs_blob_key: None,
-            working_set_blob_key: None,
-        };
-
-        // Same serialization the bake uses to populate
-        // bundle["canonical_snapshot"].
-        let value = serde_json::to_value(&original).expect("serialize");
-
-        // Same deserialization the cascade uses to read it back.
-        let parsed: SnapshotMetadata =
-            serde_json::from_value(value).expect("cascade-side deserialize");
-
-        assert_eq!(parsed.id, original.id);
-        assert_eq!(parsed.image_version, original.image_version);
-        assert_eq!(parsed.state_blob_key, original.state_blob_key);
-        assert_eq!(parsed.sidecar_blob_key, original.sidecar_blob_key);
-    }
-
-    /// Regression guard for the silent best-effort behavior that
-    /// produced `demo:warm-75babf7` in prod. Prior to this commit,
-    /// `Err(_)` from the bake-time `capture_canonical_memory` call
-    /// degraded to `(None, None)` + a tracing::warn, the bake's
-    /// exit code stayed zero, and the pushed artifact had
-    /// `bundle.json` schema_version=2 with no canonical_snapshot —
-    /// coord's enable-image cascade silently skipped the templates
-    /// write, warm pool never fired, every session cold-created
-    /// (~27s).
-    ///
-    /// This test pins the new shape: BuildError::CanonicalCapture
-    /// exists and displays with a clear prefix. The actual
-    /// "capture-fails-aborts-bake" semantic is exercised in
-    /// integration tests under `tests/builder.rs` (gated behind
-    /// docker availability); this is the compile-time guarantee
-    /// that the variant and its Display impl are wired.
-    #[test]
-    fn canonical_capture_error_variant_exists_and_displays_clearly() {
-        let err = super::BuildError::CanonicalCapture(
-            "ip tuntap add tap-engr-9f5afd mode tap: Operation not permitted".into(),
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.starts_with("canonical memory capture:"),
-            "must surface the failure mode loudly in the prefix; got: {msg}"
-        );
-        assert!(
-            msg.contains("tuntap"),
-            "must thread the original error through so operators \
-             can diagnose without chasing log files; got: {msg}"
-        );
-    }
 }

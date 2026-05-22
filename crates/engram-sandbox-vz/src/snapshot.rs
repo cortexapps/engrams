@@ -147,7 +147,6 @@ mod tests {
             workdir: None,
             harness_substrate: None,
             network: Default::default(),
-            canonical_memory_manifest: None,
         }
     }
 

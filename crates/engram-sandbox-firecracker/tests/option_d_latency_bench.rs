@@ -92,7 +92,6 @@ async fn option_d_latency_within_budget() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // Source bake (once).

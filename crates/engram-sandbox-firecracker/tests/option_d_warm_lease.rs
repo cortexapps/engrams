@@ -97,7 +97,6 @@ async fn warm_lease_swaps_harness_and_guest_reads_session_bytes() {
         env: Default::default(),
         workdir: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // Bake-time: source sandbox boots with stub attached as /dev/vdb.

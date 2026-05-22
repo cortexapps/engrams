@@ -81,7 +81,6 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     let source_id = source.create(spec).await.expect("create on source");

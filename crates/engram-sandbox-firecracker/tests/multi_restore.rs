@@ -80,7 +80,6 @@ async fn serial_restore_from_one_canonical_n_times() {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // Step 1: Create source + let it settle + snapshot + destroy.

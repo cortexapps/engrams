@@ -123,7 +123,6 @@ async fn run_scenario(
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     eprintln!("[diag] backend.create — booting VM");

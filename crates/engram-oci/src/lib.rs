@@ -213,11 +213,6 @@ impl OciClient {
             ENGRAM_BUNDLE_MEDIA_TYPE,
             ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
             ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
-            ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE,
-            ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -234,10 +229,6 @@ impl OciClient {
         let mut bundle_path = None;
         let mut disk_bootstrap_path = None;
         let mut disk_chunks_blob_digest = None;
-        let mut memory_bootstrap_path = None;
-        let mut memory_chunks_blob_digest = None;
-        let mut snapshot_state_path = None;
-        let mut snapshot_sidecar_path = None;
         for layer in &data.layers {
             match layer.media_type.as_str() {
                 ENGRAM_MANIFEST_MEDIA_TYPE => {
@@ -269,24 +260,6 @@ impl OciClient {
                     // address it later.
                     disk_chunks_blob_digest = Some(sha256_digest(&layer.data).0);
                 }
-                ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE => {
-                    let p = dest.join("bootstrap.memory.json");
-                    write_file_bytes(&p, &layer.data).await?;
-                    memory_bootstrap_path = Some(p);
-                }
-                ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE => {
-                    memory_chunks_blob_digest = Some(sha256_digest(&layer.data).0);
-                }
-                ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE => {
-                    let p = dest.join("state.bin");
-                    write_file_bytes(&p, &layer.data).await?;
-                    snapshot_state_path = Some(p);
-                }
-                ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE => {
-                    let p = dest.join("sidecar.json");
-                    write_file_bytes(&p, &layer.data).await?;
-                    snapshot_sidecar_path = Some(p);
-                }
                 other => {
                     tracing::debug!(media_type = %other, "skipping unrecognized layer");
                 }
@@ -313,10 +286,6 @@ impl OciClient {
             bundle_path,
             disk_bootstrap_path,
             disk_chunks_blob_digest,
-            memory_bootstrap_path,
-            memory_chunks_blob_digest,
-            snapshot_state_path,
-            snapshot_sidecar_path,
             manifest_digest: Digest256(data.digest.unwrap_or_default()),
         })
     }
@@ -357,11 +326,6 @@ impl OciClient {
             ENGRAM_BUNDLE_MEDIA_TYPE,
             ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
             ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
-            ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE,
-            ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -416,11 +380,6 @@ impl OciClient {
             ENGRAM_BUNDLE_MEDIA_TYPE,
             ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
             ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
-            ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE,
-            ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE,
-            ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE,
             OCI_IMAGE_MEDIA_TYPE,
         ];
         let data = client
@@ -434,11 +393,6 @@ impl OciClient {
             bundle_json: None,
             disk_bootstrap_json: None,
             disk_chunks_blob: None,
-            memory_bootstrap_json: None,
-            memory_chunks_blob: None,
-            snapshot_state: None,
-            snapshot_sidecar_json: None,
-            snapshot_working_set_json: None,
         };
         for layer in data.layers {
             match layer.media_type.as_str() {
@@ -446,13 +400,6 @@ impl OciClient {
                 ENGRAM_BUNDLE_MEDIA_TYPE => out.bundle_json = Some(layer.data),
                 ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE => out.disk_bootstrap_json = Some(layer.data),
                 ENGRAM_CHUNKS_DISK_MEDIA_TYPE => out.disk_chunks_blob = Some(layer.data),
-                ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE => out.memory_bootstrap_json = Some(layer.data),
-                ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE => out.memory_chunks_blob = Some(layer.data),
-                ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE => out.snapshot_state = Some(layer.data),
-                ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE => out.snapshot_sidecar_json = Some(layer.data),
-                ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE => {
-                    out.snapshot_working_set_json = Some(layer.data)
-                }
                 _ => {}
             }
         }
@@ -562,48 +509,13 @@ impl OciClient {
         uri: &str,
         payload: ChunkedPushPayload,
     ) -> Result<Digest256, OciError> {
-        // Symmetric guard: memory bootstrap and chunks must travel
-        // together. A bootstrap without its chunk blob is
-        // unconsumable; a chunk blob without its bootstrap is
-        // un-addressable. Fail synchronously so a misconfigured
-        // bake doesn't push a half-baked artifact.
-        match (
-            payload.memory_bootstrap_json.is_some(),
-            payload.memory_chunks_blob.is_some(),
-        ) {
-            (true, true) | (false, false) => {}
-            _ => {
-                return Err(OciError::InvalidUri(
-                    "push_chunked_image: memory_bootstrap and memory_chunks must be \
-                     supplied together (both Some, or both None)"
-                        .into(),
-                ));
-            }
-        }
-        // Same symmetry for the canonical-snapshot state+sidecar
-        // pair. ADR 0014: the host's restore path needs both
-        // state.bin and the FC sidecar manifest to bring the VM
-        // back; one without the other strands the snapshot.
-        match (
-            payload.snapshot_state.is_some(),
-            payload.snapshot_sidecar_json.is_some(),
-        ) {
-            (true, true) | (false, false) => {}
-            _ => {
-                return Err(OciError::InvalidUri(
-                    "push_chunked_image: snapshot_state and snapshot_sidecar_json must be \
-                     supplied together (both Some, or both None)"
-                        .into(),
-                ));
-            }
-        }
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
         let client = Self::client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
-        let mut layers = vec![
+        let layers = vec![
             ImageLayer::new(
                 payload.manifest_toml,
                 ENGRAM_MANIFEST_MEDIA_TYPE.to_string(),
@@ -625,41 +537,6 @@ impl OciClient {
                 None,
             ),
         ];
-        if let Some(memory_bootstrap) = payload.memory_bootstrap_json {
-            layers.push(ImageLayer::new(
-                memory_bootstrap,
-                ENGRAM_BOOTSTRAP_MEMORY_MEDIA_TYPE.to_string(),
-                None,
-            ));
-        }
-        if let Some(memory_chunks) = payload.memory_chunks_blob {
-            layers.push(ImageLayer::new(
-                memory_chunks,
-                ENGRAM_CHUNKS_MEMORY_MEDIA_TYPE.to_string(),
-                None,
-            ));
-        }
-        if let Some(state_bin) = payload.snapshot_state {
-            layers.push(ImageLayer::new(
-                state_bin,
-                ENGRAM_SNAPSHOT_STATE_MEDIA_TYPE.to_string(),
-                None,
-            ));
-        }
-        if let Some(sidecar) = payload.snapshot_sidecar_json {
-            layers.push(ImageLayer::new(
-                sidecar,
-                ENGRAM_SNAPSHOT_SIDECAR_MEDIA_TYPE.to_string(),
-                None,
-            ));
-        }
-        if let Some(ws) = payload.snapshot_working_set_json {
-            layers.push(ImageLayer::new(
-                ws,
-                ENGRAM_SNAPSHOT_WORKING_SET_MEDIA_TYPE.to_string(),
-                None,
-            ));
-        }
 
         let config = Config::new(
             payload.config_json,
@@ -795,13 +672,6 @@ pub struct TemplateArtifacts {
     pub bundle_json: Option<Vec<u8>>,
     pub disk_bootstrap_json: Option<Vec<u8>>,
     pub disk_chunks_blob: Option<Vec<u8>>,
-    pub memory_bootstrap_json: Option<Vec<u8>>,
-    pub memory_chunks_blob: Option<Vec<u8>>,
-    pub snapshot_state: Option<Vec<u8>>,
-    pub snapshot_sidecar_json: Option<Vec<u8>>,
-    /// ADR 0014 M1.14: bake-time working-set trace. Coord
-    /// materializes to BlobStorage at `working_set_blob_key(snapshot_id)`.
-    pub snapshot_working_set_json: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -829,21 +699,6 @@ pub struct PulledImage {
     /// layer digest here so the runtime resolver can address the
     /// blob.
     pub disk_chunks_blob_digest: Option<String>,
-    /// ADR 0008 Phase 3: optional memory bootstrap. Mirrors the
-    /// disk fields; only present on bakes that captured canonical
-    /// memory.
-    pub memory_bootstrap_path: Option<PathBuf>,
-    pub memory_chunks_blob_digest: Option<String>,
-    /// ADR 0014 M1.3: canonical-snapshot `state.bin` layer pulled
-    /// to disk. `Some` for artifacts produced by a bake that ran
-    /// `--capture-canonical-memory`. Coord's `enable_image` reads
-    /// this file and uploads it to its `BlobStorage` at the
-    /// canonical `state_blob_key(snapshot_id)` so host-agents can
-    /// restore by key.
-    pub snapshot_state_path: Option<PathBuf>,
-    /// ADR 0014 M1.3: canonical-snapshot FC sidecar `manifest.json`
-    /// layer pulled to disk. Paired with `snapshot_state_path`.
-    pub snapshot_sidecar_path: Option<PathBuf>,
     pub manifest_digest: Digest256,
 }
 
@@ -860,21 +715,6 @@ pub struct ChunkedPushPayload {
     pub bundle_json: Vec<u8>,
     pub disk_bootstrap_json: Vec<u8>,
     pub disk_chunks_blob: Vec<u8>,
-    /// Optional canonical-memory side. Both must be `Some` together
-    /// or neither; an asymmetric payload is rejected at push time
-    /// because a memory bootstrap without its chunk blob is
-    /// unconsumable.
-    pub memory_bootstrap_json: Option<Vec<u8>>,
-    pub memory_chunks_blob: Option<Vec<u8>>,
-    /// ADR 0014 M1.3: canonical-snapshot FC state.bin layer. Same
-    /// "both or neither" rule as the memory pair — state.bin alone
-    /// is useless without the sidecar.
-    pub snapshot_state: Option<Vec<u8>>,
-    pub snapshot_sidecar_json: Option<Vec<u8>>,
-    /// ADR 0014 M1.14: working-set trace produced by the bake's
-    /// synthetic profile pass. Optional — falls back to full-manifest
-    /// prefetch when absent.
-    pub snapshot_working_set_json: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1047,92 +887,6 @@ mod tests {
                     msg.contains("rootfs_ext4 OR bundle_json"),
                     "expected explanatory error, got: {msg}",
                 );
-            }
-            other => panic!("expected InvalidUri, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn push_chunked_image_rejects_asymmetric_memory_payload() {
-        // ADR 0008 Phase 3: a memory bootstrap without its paired
-        // chunk blob (or vice versa) is malformed. Reject
-        // synchronously before any registry I/O.
-        let client = OciClient::new(std::sync::Arc::new(AnonymousResolver));
-        let base = ChunkedPushPayload {
-            manifest_toml: b"manifest = 'toml'".to_vec(),
-            config_json: b"{}".to_vec(),
-            bundle_json: b"{}".to_vec(),
-            disk_bootstrap_json: b"{}".to_vec(),
-            disk_chunks_blob: b"data".to_vec(),
-            memory_bootstrap_json: None,
-            memory_chunks_blob: None,
-            snapshot_state: None,
-            snapshot_sidecar_json: None,
-            snapshot_working_set_json: None,
-        };
-
-        // Bootstrap but no blob → reject.
-        let p = ChunkedPushPayload {
-            memory_bootstrap_json: Some(b"{}".to_vec()),
-            ..base.clone()
-        };
-        match client.push_chunked_image("localhost:5000/test:t1", p).await {
-            Err(OciError::InvalidUri(msg)) => {
-                assert!(msg.contains("memory_bootstrap"), "got: {msg}");
-            }
-            other => panic!("expected InvalidUri, got {other:?}"),
-        }
-
-        // Blob but no bootstrap → reject.
-        let p = ChunkedPushPayload {
-            memory_chunks_blob: Some(b"data".to_vec()),
-            ..base
-        };
-        match client.push_chunked_image("localhost:5000/test:t1", p).await {
-            Err(OciError::InvalidUri(msg)) => {
-                assert!(msg.contains("memory_bootstrap"), "got: {msg}");
-            }
-            other => panic!("expected InvalidUri, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn push_chunked_image_rejects_asymmetric_snapshot_payload() {
-        // ADR 0014 M1.3: state.bin and sidecar.json must travel as
-        // a pair. One without the other is not restorable on the
-        // receiver, so reject before the registry I/O.
-        let client = OciClient::new(std::sync::Arc::new(AnonymousResolver));
-        let base = ChunkedPushPayload {
-            manifest_toml: b"manifest = 'toml'".to_vec(),
-            config_json: b"{}".to_vec(),
-            bundle_json: b"{}".to_vec(),
-            disk_bootstrap_json: b"{}".to_vec(),
-            disk_chunks_blob: b"data".to_vec(),
-            memory_bootstrap_json: None,
-            memory_chunks_blob: None,
-            snapshot_state: None,
-            snapshot_sidecar_json: None,
-            snapshot_working_set_json: None,
-        };
-
-        let p = ChunkedPushPayload {
-            snapshot_state: Some(b"state".to_vec()),
-            ..base.clone()
-        };
-        match client.push_chunked_image("localhost:5000/test:t1", p).await {
-            Err(OciError::InvalidUri(msg)) => {
-                assert!(msg.contains("snapshot_state"), "got: {msg}");
-            }
-            other => panic!("expected InvalidUri, got {other:?}"),
-        }
-
-        let p = ChunkedPushPayload {
-            snapshot_sidecar_json: Some(b"{}".to_vec()),
-            ..base
-        };
-        match client.push_chunked_image("localhost:5000/test:t1", p).await {
-            Err(OciError::InvalidUri(msg)) => {
-                assert!(msg.contains("snapshot_state"), "got: {msg}");
             }
             other => panic!("expected InvalidUri, got {other:?}"),
         }

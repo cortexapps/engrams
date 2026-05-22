@@ -208,7 +208,6 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // FC backend assumes spec.rootfs_source is a regular file by

@@ -276,8 +276,6 @@ async fn bake_harness_rootfs(
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            canonical_memory_manifest: None,
-            capture_canonical_memory: None,
             parent_disk_bootstrap_path: None,
             parent_disk_chunks_blob_digest: None,
         })
@@ -565,7 +563,6 @@ async fn e2e_harness_cold_via_pooled_backend() {
         workdir: None,
         harness_substrate: Some(substrate_path),
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
     let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
@@ -641,7 +638,6 @@ async fn e2e_harness_warm_via_pooled_backend() {
         workdir: None,
         harness_substrate: Some(substrate_path),
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // Cold create → wait → snapshot → destroy → restore (warm netns path).

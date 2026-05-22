@@ -190,7 +190,6 @@ async fn snapshot_restore_round_trips_per_vm_network() {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // 1. create — provisions the TAP + reserves the /30

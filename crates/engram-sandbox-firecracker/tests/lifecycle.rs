@@ -59,7 +59,6 @@ async fn create_list_destroy_round_trip() {
         workdir: None,
         harness_substrate: None,
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
 
     // create

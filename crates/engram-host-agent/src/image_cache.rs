@@ -140,18 +140,12 @@ impl ImageCache {
                     let disk_bootstrap_path = optional_path(&dir.join("bootstrap.disk.json")).await;
                     let disk_chunks_blob_digest =
                         read_digest_sidecar(&dir.join("chunks.disk.blob.digest")).await;
-                    let memory_bootstrap_path =
-                        optional_path(&dir.join("bootstrap.memory.json")).await;
-                    let memory_chunks_blob_digest =
-                        read_digest_sidecar(&dir.join("chunks.memory.blob.digest")).await;
                     return Ok(CachedImage {
                         manifest_path,
                         rootfs_path: has_rootfs.then_some(rootfs_path),
                         bundle,
                         disk_bootstrap_path,
                         disk_chunks_blob_digest,
-                        memory_bootstrap_path,
-                        memory_chunks_blob_digest,
                         digest,
                     });
                 }
@@ -211,26 +205,12 @@ impl ImageCache {
                 .await
                 .map_err(CacheError::Io)?;
         }
-        let memory_bootstrap_path = pulled
-            .memory_bootstrap_path
-            .as_ref()
-            .map(|_| final_dir.join("bootstrap.memory.json"))
-            .filter(|p| p.exists());
-        let memory_chunks_blob_digest = pulled.memory_chunks_blob_digest.clone();
-        if let Some(d) = &memory_chunks_blob_digest {
-            fs::write(final_dir.join("chunks.memory.blob.digest"), d.as_bytes())
-                .await
-                .map_err(CacheError::Io)?;
-        }
-
         Ok(CachedImage {
             manifest_path: final_dir.join("manifest.toml"),
             rootfs_path: rootfs_present.then_some(rootfs_path),
             bundle,
             disk_bootstrap_path,
             disk_chunks_blob_digest,
-            memory_bootstrap_path,
-            memory_chunks_blob_digest,
             digest,
         })
     }
@@ -623,11 +603,6 @@ pub struct CachedImage {
     /// chunks. Not the per-chunk sha256 — that's per-entry in the
     /// bootstrap.
     pub disk_chunks_blob_digest: Option<String>,
-    /// ADR 0008 Phase 3: memory-side counterparts. `Some` iff the
-    /// bake captured canonical memory AND emitted Nydus-shaped
-    /// memory layers.
-    pub memory_bootstrap_path: Option<PathBuf>,
-    pub memory_chunks_blob_digest: Option<String>,
     pub digest: String,
 }
 
@@ -656,26 +631,12 @@ pub struct CachedImage {
 pub struct ImageBundle {
     pub schema_version: u32,
     pub disk_manifest: engram_chunk_store::ManifestRef,
-    /// ADR 0007 Phase 5: optional canonical-base memory manifest
-    /// captured by the image-builder at bake time. When set, the
-    /// UFFD handler `mmap`s the canonical memory file with
-    /// `MAP_PRIVATE` so every session of this image shares the
-    /// canonical pages via the host page cache. `None` for
-    /// images baked before the canonical-capture slice landed —
-    /// sessions still work but pay session-private memory cost.
-    #[serde(default)]
-    pub canonical_memory_manifest: Option<engram_chunk_store::ManifestRef>,
     /// ADR 0008 Phase 3: bake produced Nydus-shaped disk layers
     /// alongside the chunked manifest. v1 readers ignore (defaults
     /// to false via `#[serde(default)]`); v2 readers pair this with
     /// the `CachedImage::disk_bootstrap_path` populated at pull.
     #[serde(default)]
     pub bootstrap_disk_available: bool,
-    /// ADR 0008 Phase 3: same flag for the memory side. Only set
-    /// when canonical memory was captured at bake AND emitted as
-    /// chunked OCI layers.
-    #[serde(default)]
-    pub bootstrap_memory_available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1076,49 +1037,6 @@ mod tests {
     /// unsupported schema_version 3" on every cold session, even
     /// though materialization + warm-pool refill had succeeded.
     #[tokio::test]
-    async fn read_bundle_accepts_v3_with_canonical_snapshot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("bundle.json");
-        let disk_ref = engram_chunk_store::ManifestRef::new();
-        let mem_ref = engram_chunk_store::ManifestRef::new();
-        fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({
-                "schema_version": 3,
-                "disk_manifest": disk_ref,
-                "canonical_memory_manifest": mem_ref,
-                "bootstrap_disk_available": true,
-                "bootstrap_memory_available": true,
-                // The shape the bake actually emits — host-side
-                // image_cache ignores this block (coord materializes
-                // it), but the deserialize must still pass.
-                "canonical_snapshot": {
-                    "id": uuid::Uuid::new_v4(),
-                    "size_bytes": 4096,
-                    "created_at": chrono::Utc::now(),
-                    "image_version": "warm-test",
-                    "disk_manifest": disk_ref,
-                    "memory_manifest": mem_ref,
-                    "source_sandbox_id": uuid::Uuid::new_v4(),
-                    "state_blob_key": null,
-                    "sidecar_blob_key": null,
-                    "rootfs_blob_key": null,
-                    "working_set_blob_key": null,
-                },
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let got = read_bundle(&path).await.unwrap().expect("bundle present");
-        assert_eq!(got.schema_version, 3);
-        assert_eq!(got.disk_manifest, disk_ref);
-        assert_eq!(got.canonical_memory_manifest, Some(mem_ref));
-        assert!(got.bootstrap_disk_available);
-        assert!(got.bootstrap_memory_available);
-    }
-
-    #[tokio::test]
     async fn read_bundle_parses_well_formed_v2_with_bootstrap_flags() {
         // ADR 0008 Phase 3: v2 bundles carry bootstrap availability
         // flags. They must round-trip through the deserializer
@@ -1131,9 +1049,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": 2,
                 "disk_manifest": manifest_ref,
-                "canonical_memory_manifest": null,
                 "bootstrap_disk_available": true,
-                "bootstrap_memory_available": false,
             }))
             .unwrap(),
         )
@@ -1143,8 +1059,6 @@ mod tests {
         assert_eq!(got.schema_version, 2);
         assert_eq!(got.disk_manifest, manifest_ref);
         assert!(got.bootstrap_disk_available);
-        assert!(!got.bootstrap_memory_available);
-        assert!(got.canonical_memory_manifest.is_none());
     }
 
     // ---- ADR 0008 Phase 5: CachedImage chunked-OCI helpers ----
@@ -1156,8 +1070,6 @@ mod tests {
             bundle: None,
             disk_bootstrap_path: None,
             disk_chunks_blob_digest: None,
-            memory_bootstrap_path: None,
-            memory_chunks_blob_digest: None,
             digest: "sha256:test".into(),
         }
     }
@@ -1268,7 +1180,6 @@ mod tests {
         let got = read_bundle(&path).await.unwrap().expect("bundle present");
         assert_eq!(got.schema_version, 1);
         assert!(!got.bootstrap_disk_available);
-        assert!(!got.bootstrap_memory_available);
     }
 
     /// CA fingerprint should be deterministic (same PEM → same

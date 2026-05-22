@@ -117,8 +117,6 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            canonical_memory_manifest: None,
-            capture_canonical_memory: None,
             parent_disk_bootstrap_path: None,
             parent_disk_chunks_blob_digest: None,
         })
@@ -221,7 +219,6 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
         workdir: None,
         harness_substrate: Some(substrate_path),
         network: Default::default(),
-        canonical_memory_manifest: None,
     };
     let sandbox_id: SandboxId = backend.create(sandbox_spec).await.expect("create");
 

@@ -361,57 +361,6 @@ enum ImageCmd {
         /// about the image when a session references its URI.
         #[arg(long)]
         push: Option<String>,
-
-        /// ADR 0014 M1.3 / M1.11: capture a canonical memory snapshot
-        /// at bake time by booting the just-built rootfs in a transient
-        /// FC microVM, snapshotting after `--canonical-boot-wait`, and
-        /// chunking memory.bin into the chunk store. The resulting
-        /// `SnapshotMetadata` is written into the OCI artifact's
-        /// `bundle.json` under `canonical_snapshot`; the coordinator's
-        /// `POST /api/enabled-images` cascade reads it and seeds the
-        /// `snapshots` + `templates` rows, which makes the host-agent
-        /// warm-pool refill the template's slot. Without this flag the
-        /// image still works but every session takes the cold path.
-        ///
-        /// Requires `--canonical-kernel` (FC vmlinux) on the build host;
-        /// firecracker binary is looked up on PATH unless
-        /// `--canonical-firecracker-bin` is set.
-        #[arg(long, requires = "canonical_kernel")]
-        capture_canonical_memory: bool,
-
-        /// FC kernel image (vmlinux) used for the canonical-capture
-        /// transient VM. Only consulted when `--capture-canonical-memory`
-        /// is set.
-        #[arg(long)]
-        canonical_kernel: Option<PathBuf>,
-
-        /// Firecracker binary for the canonical-capture VM. Defaults to
-        /// PATH lookup.
-        #[arg(long)]
-        canonical_firecracker_bin: Option<PathBuf>,
-
-        /// Wall-clock seconds to wait after InstanceStart before taking
-        /// the canonical snapshot. Default 8s — generous enough for
-        /// typical Python/Node images to reach steady state. Set higher
-        /// for heavier rootfses.
-        #[arg(long, default_value = "8")]
-        canonical_boot_wait_secs: u64,
-
-        /// Guest RAM (MiB) for the canonical-capture VM. Default 512.
-        /// memory.bin in the snapshot is dominated by this.
-        #[arg(long)]
-        canonical_memory_mib: Option<u32>,
-
-        /// ADR 0014 M1.16: bake-time network pool. When set, the
-        /// bake VM gets a TAP + virtio-net + `ip=…` kernel cmdline
-        /// so the snapshot captures a fully configured eth0.
-        /// Required for the dashboard SHELL tab and warm-restore
-        /// egress, because FC can't hot-add virtio-net post-snapshot.
-        /// Prod bakes pass `10.200.0.0` to match the FC host pool;
-        /// bake host needs `CAP_NET_ADMIN`. Omit to keep the bake
-        /// netless.
-        #[arg(long)]
-        canonical_net_pool: Option<std::net::Ipv4Addr>,
     },
 }
 
@@ -515,44 +464,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 inject_agent,
                 transport,
                 push,
-                capture_canonical_memory,
-                canonical_kernel,
-                canonical_firecracker_bin,
-                canonical_boot_wait_secs,
-                canonical_memory_mib,
-                canonical_net_pool,
             } => {
-                let canonical = if *capture_canonical_memory {
-                    Some(engram_image_builder::CanonicalCaptureConfig {
-                        kernel_image_path: canonical_kernel
-                            .clone()
-                            .expect("clap `requires` enforces --canonical-kernel with --capture-canonical-memory"),
-                        firecracker_bin: canonical_firecracker_bin.clone(),
-                        boot_wait: std::time::Duration::from_secs(*canonical_boot_wait_secs),
-                        memory_mib: *canonical_memory_mib,
-                        // ADR 0014 M1.14: when these are present, the
-                        // image-builder runs a second restore in UFFD
-                        // mode to record the canonical working set.
-                        // Resolve the UFFD handler from the current
-                        // exe's directory (matches the cargo-built
-                        // target/release layout) and the bake's
-                        // chunk-store root from `images_dir/store`.
-                        uffd_handler_bin: std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.parent().map(|d| d.join("engram-uffd-handler")))
-                            .filter(|p| p.exists()),
-                        blob_root: Some(images_dir.join("store")),
-                        // Production bakes inject engram-init +
-                        // bootstrap; warm-pool prep is the point.
-                        skip_warm_pool_prep: false,
-                        // ADR 0014 M1.16: when set, the bake captures
-                        // a virtio-net + up eth0. Required for the
-                        // dashboard SHELL tab + warm-restore egress.
-                        net_pool: *canonical_net_pool,
-                    })
-                } else {
-                    None
-                };
                 image_build(
                     repo,
                     source,
@@ -563,7 +475,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     inject_agent.as_deref(),
                     *transport,
                     push.as_deref(),
-                    canonical,
                 )
                 .await
             }
@@ -1173,7 +1084,6 @@ async fn image_build(
     inject_agent: Option<&Path>,
     transport: engram_image_builder::Transport,
     push: Option<&str>,
-    capture_canonical_memory: Option<engram_image_builder::CanonicalCaptureConfig>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
@@ -1195,8 +1105,6 @@ async fn image_build(
         images_dir: images_dir.to_path_buf(),
         format,
         agent_injection,
-        canonical_memory_manifest: None,
-        capture_canonical_memory,
         parent_disk_bootstrap_path: None,
         parent_disk_chunks_blob_digest: None,
     };
