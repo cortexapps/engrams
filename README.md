@@ -324,14 +324,18 @@ runs complete in ~30s instead of hanging indefinitely. See
 A session is one bounded unit of agent work. It's two things on the wire: an `image` (the OCI URI of a baked rootfs) and an optional `harness` (which agent process to attach). The bake image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
 
 ```
-create → Active                                            (live VM)
+create → Created → Active                                  (sandbox bound; then agentd up + harness running)
        → idle TTL → Idle                                   (snapshot taken, chunks in BlobStorage, VM destroyed)
-       → next prompt/exec → Active                         (chunked resume, sub-second on same host)
+       → next prompt/exec → Created → Active               (chunked resume re-runs the create-shape transitions)
        ... loop ...
+       → host heartbeat-loss → HostLost → Idle / Dead      (recoverable snapshot → Idle; none → Dead)
        → chunked manifests unreachable / hard TTL → Dead   (terminal)
+       → DELETE /sessions/:id → Completed                  (terminal)
 ```
 
-`POST /sessions/:id/resume` is a single-tier dispatcher: **Idle** → restore from the snapshot's chunked manifests (snapshot-affinity-scheduled to the host that captured it); **Dead** → 410 Gone; anything else → 409. `ensure_active` auto-resumes Idle sessions on the next exec/prompt/SSE-subscribe so callers don't have to know whether the session is live or paused.
+The state machine is ADR 0015 M2 — `SessionState` in `engram-core::types::session`, with a single validated `transition_session` trait method behind every `UPDATE sessions SET status`. **Active is honest**: the row reaches it only after `start_agent` returns OK, so `/exec` / `/shell` / `/prompt` against an `Active` session no longer race agentd readiness. Earlier states (`Created`, `GuestReady`) return typed 409s with state-specific bodies instead of falling through.
+
+`POST /sessions/:id/resume` is a single-tier dispatcher: **Idle** → restore from the snapshot's chunked manifests (snapshot-affinity-scheduled to the host that captured it); **Dead** / **HostLost** without a recoverable snapshot → 410 Gone; anything else → 409. `ensure_active` auto-resumes Idle sessions on the next exec/prompt/SSE-subscribe so callers don't have to know whether the session is live or paused.
 
 **Chunk-store GC keeps storage cost bounded.** `engram_coordinator::chunk_gc::spawn` is a background cron (`ENGRAM_CHUNK_GC_INTERVAL_SECS`, default 1h) that fires `chunk_gc::run_once`. `POST /api/admin/gc-chunks` delegates to the same pipeline so explicit-trigger and cron-driver share code. `POST /api/admin/reap-materialize-dir` reaps the per-host assembled-`.ext4` file cache; in `--mode=coordinator` it fans out across every connected host via WS-RPC.
 

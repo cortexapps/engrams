@@ -1,9 +1,88 @@
 # ADR 0015: System design v2 — abstractions, not scab fixes
 
 Status: 2026-05-22 — overall **Proposed (v2 direction)**; sections **M1
-(in-VM service unification) and M5 (host-image readiness)** both
-Accepted + shipped. The remaining six sections stay Proposed pending
-their own implementation ADRs.
+(in-VM service unification), M5 (host-image readiness), and M2
+(SessionState machine)** Accepted + shipped. The remaining five
+sections stay Proposed pending their own implementation ADRs.
+
+M2 commit chain (in order):
+- `b0c8eca` — rename `SessionStatus` → `SessionState`; add `Created`,
+  `GuestReady`, `HostLost` variants; add the legality table via
+  `SessionState::can_transition_to` / `try_transition_to` +
+  `IllegalTransition` carrying both sides. ~30 files ripple the
+  rename. Zero behaviour change yet — every existing call site
+  still uses `set_session_status` / `create_session_active`.
+- `0d928e4` — replace `set_session_status` with the validated
+  `transition_session(id, target) -> Result<prev, MetaError>`.
+  Postgres impl does `SELECT ... FOR UPDATE` → `try_transition_to` →
+  `UPDATE` in a single transaction; the row-level lock prevents two
+  callers from validating against the same pre-state. Illegal
+  transitions surface as `MetaError::Conflict` carrying the
+  rendered `IllegalTransition`. Resume path
+  (`resume_from_fc_snapshot`) now goes `Idle → Created → Active`
+  instead of the prior illegal `Idle → Active`; if `start_agent`
+  fails on resume the session is left at `Created` and the response
+  surfaces the reattach failure rather than the prior
+  warn-then-mark-Active. DELETE is idempotent for already-terminal
+  sessions.
+- `aa215f8` — flip the create path. `create_session_active` →
+  `create_session_created`: row inserts at `Created` (not `Active`),
+  and the handler transitions to `Active` only after `start_agent`
+  returns OK. `ensure_active` tightens to return 409 for `Created` /
+  `GuestReady`, 410 for `HostLost` / `Dead`, distinct messages per
+  state instead of falling through.
+- `d69d140` — route host-loss through `HostLost`.
+  `mark_host_dead_and_reassign_sessions` → `_orphan_sessions`,
+  return shape `Vec<(SessionId, SessionState)>` so callers emit
+  honest `from` on `StatusChanged`. `dead_host.rs`,
+  `preemption_drain.rs`, and `reconcile.rs` all now drive
+  `Active → HostLost → {Idle if recoverable snapshot, Dead
+  otherwise}` as two transitions instead of jumping straight to
+  `Dead`. Also extends the legality table with the missing
+  `HostLost → Idle` edge.
+- `1734cb5` — drop the VZ `exec_stream` boot-race retry. Active now
+  implies `start_agent` returned; the 10 s exponential backoff has
+  nothing left to wait through. `send_prompt`'s harness-attach
+  retry intentionally stays — different race (SpawnHarness ack vs
+  the in-VM child dial-back), which M2 doesn't address.
+- `ee3b5a8` — web app catches up. `SessionState` rename, new
+  variants in `Glyph` / `PromptComposer` / `SessionManifest`,
+  terminal-banner for `host_lost` and `failed`, "warming up" hint
+  for `created` / `guest_ready`. Drops the stale `cold_evicted`
+  variant.
+- `42649dd` — dev-vm verification surfaced two bugs the unit tests
+  didn't catch:
+  1. Migration `0020_drop_cold_tier` had installed
+     `sessions_status_check` with the pre-M2 status set;
+     migration `0031_session_state_m2_variants` rebuilds it in
+     place with all nine M2 variants.
+  2. `delete_session` raced the reconciler — the heartbeat-driven
+     `Active → HostLost → Dead` could land between `host.destroy()`
+     and the DELETE's `transition_session(Completed)` call. Fixed
+     by reordering: transition to `Completed` *first* (millisecond
+     UPDATE; immediately drops the row out of the reconciler's
+     `WHERE status='active'` filter), then destroy the sandbox
+     best-effort. Conflict on a race-loss is treated as idempotent
+     204.
+
+Verification at the M2 boundary:
+- `just check` clean (748/748 workspace tests, fmt + clippy).
+- `just integration-test` on the dev-vm: bake → enable →
+  prefetch-ready → cold-create → DELETE cycle green. The
+  `session_events` table shows the new lifecycle:
+  ```
+  0 | status_changed | pending | created
+  1 | status_changed | created | active
+  2 | status_changed | active  | completed
+  ```
+  No spurious HostLost; DELETE wins the race over the reconciler
+  because of the transition-first ordering.
+- `Active` is now honest. The row reaches `Active` only after
+  `start_agent` returns OK, so `/exec` / `/shell` / `/prompt`
+  against an `Active` session no longer race agentd readiness.
+  Earlier states return typed 409s with state-specific bodies
+  (`session is created — agentd is not yet ready`, etc.) instead
+  of falling through to a downstream handler that would race.
 
 M5 commit chain (in order):
 - `d20e5da` — retire `templates` table + warm pool across coord,
@@ -107,9 +186,12 @@ but left underlying complexity in place. They form a class:
    independently. The "is the session ready" question requires asking
    the right one, and the no-harness create path that skips bootstrap
    entirely produces the early-eof race we reproduced today.
-2. **Fuzzy `SessionStatus::Active`.** What does Active mean? Sandbox
-   created? Agent reachable? Harness running? Depends on call path.
-   /exec, /shell, snapshot.ensure_active all interpret it differently.
+2. **Fuzzy `SessionStatus::Active`** *(retired by M2).* What does
+   Active mean? Sandbox created? Agent reachable? Harness running?
+   Depended on call path. /exec, /shell, snapshot.ensure_active all
+   interpreted it differently. M2 made Active a single typed state
+   — set only after `start_agent` returns — with `Created` /
+   `GuestReady` / `HostLost` as explicit intermediate states.
 3. **Split-brain registry vs PG.** `HostRegistry` (in-memory
    `sandbox_id → host_id` map) and `Postgres.sessions` are both
    sources of truth. They diverge on MIG roll until the heartbeat
@@ -181,7 +263,7 @@ Accepted and being implemented now; M2–M9 are Proposed.
 | # | Abstraction | Status |
 |---|---|---|
 | M1 | `GuestService` — one in-VM RPC surface, one readiness signal | **Accepted + shipped** (commits `75ba2df` / `97de278` / `0d444e9` / `4b3f890`) |
-| M2 | `SessionState` — explicit, gated state machine | Proposed |
+| M2 | `SessionState` — explicit, gated state machine | **Accepted + shipped** (commits `b0c8eca` / `0d928e4` / `aa215f8` / `d69d140` / `1734cb5` / `ee3b5a8` / `42649dd`) |
 | M3 | `HostRegistry` as a TTL'd cache of PG truth | Proposed |
 | M4 | `Sandbox` as a content-addressed migratable value | Proposed |
 | M5 | Host-image readiness as the warm/cold contract — retire the `templates` table | **Accepted + shipped** (commits `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`) |
@@ -285,39 +367,126 @@ principle above, we do not leave the bootstrap crate as a stub.
 
 ### M2 — `SessionState`: explicit, gated state machine
 
-**Problem.** `SessionStatus` today is `{Pending, Active, Idle, Dead,
-Failed, Paused}`. Active fires whenever the host returns from create;
-that doesn't mean usable. Each call site (`/exec`, `/shell`,
-snapshot.ensure_active) has its own interpretation and its own
-retry/wait logic. The harness=none race today is one symptom; the
-"why does /shell sometimes fail right after create" complaint is
-another.
+**Problem.** `SessionStatus` was `{Pending, Active, Idle, Completed,
+Failed, Dead}`. Active fired whenever the host returned from create;
+that didn't mean usable. Each call site (`/exec`, `/shell`,
+`snapshot.ensure_active`) had its own interpretation and its own
+retry/wait logic. The harness=none race was one symptom; the
+"why does /shell sometimes fail right after create" complaint was
+another. Worse, the create handler inserted the row directly at
+`Active` *before* calling `start_agent`, so the column's truthfulness
+was structurally limited.
 
-**Abstraction.** A typed state machine where every transition has a
-trigger (a specific event) and a guarantee (what's true post-
-transition). `SessionState::Active` means: sandbox exists, agentd is
-reachable, harness (if any) is running. /exec and /shell against a
-non-Active session return 409 with the actual state, not a vsock
-race. New states:
+**Abstraction (shipped).** A typed state machine where every
+transition has a published meaning and goes through a single
+validated entry point. `SessionState::Active` means: sandbox
+exists, agentd is reachable, harness (if any) is running. `/exec` /
+`/shell` / `/prompt` against a non-Active session return 409 with
+the actual state, not a vsock race. States:
 
-- `Pending` — row written, sandbox not yet picked
+- `Pending` — request accepted, scheduler not yet returned (in-memory
+  only; never persisted, never appears in a `WHERE status=...` query)
 - `Created` — sandbox bound to a host; nothing else proven
-- `GuestReady` — agentd RPC succeeded once (post-M1, this is when
-  start_agent returns)
-- `Active` — harness is running (or harness=none and GuestReady)
+- `GuestReady` — `start_agent` ready-dial fired (code-level only in
+  the normal path; collapsed into the Active write because
+  `start_agent` does both halves of the handshake in one RPC)
+- `Active` — agentd reachable AND harness running (or harness=none
+  and agentd ready). The only state in which `/exec` / `/shell` /
+  `/prompt` proceed.
+- `Idle` — snapshotted; `/resume` rehydrates
+- `HostLost` — heartbeat-loss against the bound host. Non-terminal:
+  M3 will wire the heartbeat-loss cache invalidation into this
+  transition; M4 will add `HostLost → Created` on a peer host.
+  Until then, the reconciler resolves `HostLost → Idle` (if a
+  recoverable snapshot exists) or `HostLost → Dead` (otherwise).
+- `Completed` — terminal (user-deleted)
+- `Failed` — terminal (create failed mid-flight)
+- `Dead` — terminal (chunked manifests gone or never were)
 
-Transitions are owned by `coord/api/sessions.rs`; the state machine
-itself lives in `engram-core/src/types/session.rs`. Event emission
-becomes the formal "we have crossed this barrier" signal.
+`SessionState::try_transition_to(target)` runs the legality table at
+every persistence-layer write. The table lives in
+`crates/engram-core/src/types/session.rs` and is the single source
+of truth — no call site encodes its own preconditions. Illegal
+transitions surface as `MetaError::Conflict` carrying the rendered
+`IllegalTransition` (both `from` and `to`), so logs and HTTP 409
+bodies show the actual collision instead of a generic "couldn't
+update."
 
-**What it deletes.** The per-caller retry loops in `/exec`,
-`/shell`, snapshot.ensure_active that exist because "Active" doesn't
-mean usable.
+**Persistence + transition helper.** `MetadataStore::transition_session(id,
+target)` replaces every direct `UPDATE sessions SET status = ...`
+call site. The Postgres impl does `SELECT ... FOR UPDATE` →
+`try_transition_to` → `UPDATE` in a single transaction; the
+row-level lock makes "two concurrent callers both validate against
+the same pre-state" structurally impossible. The trait method
+returns the previous state so callers can emit honest
+`StatusChanged { from: prev, to: target }` events without
+reconstructing context.
 
-**Open questions.** How do we express the typed transitions in Rust
-ergonomically? Probably an enum with explicit `transition_to`
-methods (not typestate — typestate's compile-time guarantees aren't
-worth the API churn here).
+**Create-path shape.** Per the latency-first ordering:
+
+- No PG write before the scheduler returns (no orphan-row class,
+  no reaper).
+- First persisted state is `Created` (`create_session_created`
+  replaces the prior `create_session_active`; insert with
+  `host_id` + `sandbox_id` populated, `status='created'`).
+- After `start_agent` succeeds, a second UPDATE transitions to
+  `Active`. One extra UPDATE per create vs. before M2, in exchange
+  for an `Active` that doesn't lie.
+- `Pending` lives only as the `from` of the first `StatusChanged`
+  event on the create path (the API caller's pre-insert view).
+
+**Host-loss shape.** Both the dead-host detector and the
+strike-based reconciler drive a two-stage transition per session:
+`Active → HostLost` first, then `HostLost → Idle` (if a recoverable
+snapshot exists) or `HostLost → Dead` (otherwise). Each stage emits
+its own `StatusChanged` event. The bulk trait method
+(`mark_host_dead_and_orphan_sessions`) returns `Vec<(SessionId,
+SessionState)>` so the caller emits honest `from` values; the
+Postgres impl reads the previous state inside the same UPDATE
+via a `WITH ... FOR UPDATE` CTE.
+
+**What it deleted.**
+
+- `MetadataStore::set_session_status` (replaced by
+  `transition_session`).
+- VZ's `exec_stream` boot-race retry loop. `Active` now implies
+  `start_agent` returned, which means agentd is bound on vsock 1024
+  — the 10 s exponential backoff has nothing left to wait for.
+- The "best-effort warn-then-mark-Active" behavior on the resume
+  path's `start_agent` failure. The session now stays at `Created`
+  if `start_agent` fails on resume, and the next `/exec` / `/shell`
+  / `/prompt` returns a state-specific 409 instead of a downstream
+  vsock error.
+
+**What it added.**
+
+- `SessionState` enum + `IllegalTransition` + `can_transition_to` /
+  `try_transition_to` in `engram-core/src/types/session.rs`.
+- `MetadataStore::transition_session` (trait + Postgres impl + five
+  test mocks).
+- Migration `0031_session_state_m2_variants.sql` — rebuilds
+  `sessions_status_check` to accept all nine variants. (Dev-vm
+  verification surfaced this; migration 0020's CHECK predated the
+  M2 additions.)
+- Two `StatusChanged` events per host-loss (the first lifecycle
+  moment is "host went away" — a distinct signal from "session is
+  unrecoverable"), giving M4 the seam it needs.
+- DELETE handler reordering: transition to `Completed` *before*
+  destroying the sandbox so the reconciler's
+  `WHERE status='active'` filter immediately skips the row. Without
+  this, `host.destroy()` could be slow enough that the reconciler
+  flipped the row to HostLost mid-DELETE and the final transition
+  failed with Conflict. Caught on the dev-vm; covered in the
+  verification at the top of this ADR.
+
+**Decision on typestate.** No. Sessions are DB-backed values
+loaded by ID across requests, so typestate's compile-time
+guarantees don't compose — every call site does a runtime
+match-and-dispatch into a typed wrapper anyway. The runtime-checked
+enum with `try_transition_to` gets the correctness payoff (illegal
+transitions surface immediately in tests and logs) without the
+generic-over-state-type viral propagation typestate forces on
+function signatures.
 
 ---
 
@@ -719,23 +888,30 @@ not exist.
   retired and biggest cold-boot win (~17 s → ~3.5 s prod target).
   Four-commit chain `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`.
   Unblocks all subsequent warm-pool work.
-- **Phase 3 (cold-boot floor):** vmlinux slim-down + engram-init/
+- **Phase 3 (shipped 2026-05-22):** **M2 — `SessionState`
+  machine.** `Active` becomes honest (only set after `start_agent`
+  returns); host-loss routes through `HostLost`; every transition
+  goes through one validated entry point. Seven-commit chain
+  `b0c8eca` / `0d928e4` / `aa215f8` / `d69d140` / `1734cb5` /
+  `ee3b5a8` / `42649dd`. Unblocks M3 (cache invalidation hooks
+  into the existing `HostLost` transition) and M4 (session
+  migration becomes `HostLost → Created` on a peer).
+- **Phase 4 (cold-boot floor):** vmlinux slim-down + engram-init/
   agentd cold-start tuning. Not in this ADR — separate milestones
   layered on M5. Targets ~700–800 ms cold-boot.
-- **Phase 4 (warm pool, take 2):** Host-local runtime snapshot
+- **Phase 5 (warm pool, take 2):** Host-local runtime snapshot
   generation, layered on the post-M5 storage model. Sub-1 s TTFM
-  via warm lease; cold-create falls back to the Phase 3 floor on
+  via warm lease; cold-create falls back to the Phase 4 floor on
   miss. CPU-vendor issue dissolved by construction.
-- **Phase 5 (session state correctness):** M2 + M3. Both touch
-  session/host lifecycle and benefit from M5's stable storage
-  model.
-- **Phase 6 (large refactors):** M4 (session migration), M6
+- **Phase 6 (session lifecycle, remaining):** M3 (HostRegistry TTL
+  cache invalidating on the M2 `HostLost` transition).
+- **Phase 7 (large refactors):** M4 (session migration), M6
   (unified harness stream), M7 (DriveResolver). Each is its own
   ADR + multi-PR effort. Sequencing depends on which bugs surface
   first.
-- **Phase 7 (decide later):** M8. Decide after we have prod
+- **Phase 8 (decide later):** M8. Decide after we have prod
   observability on the channel-split cost.
 
 Each phase ships its own implementation ADR. This document is the
 v2 direction summary, not the implementation plan for any single
-move beyond M1 and M5.
+move beyond M1, M2, and M5.
