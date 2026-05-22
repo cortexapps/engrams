@@ -41,6 +41,10 @@ kill_by_pidfile() {
     rm -f "$pidfile"
 }
 
+# Web SPA (vite). Vite spawns a child esbuild and a worker; SIGTERM on
+# the parent reaps both cleanly. Best-effort.
+kill_by_pidfile "$INTEG_DIR/web.pid" "web"
+
 # host-agent first so it gets a chance to deregister with the coord.
 kill_by_pidfile "$INTEG_DIR/host-agent.pid" "host-agent"
 # integration-up.sh runs host-agent under sudo for CAP_NET_ADMIN; the

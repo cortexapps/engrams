@@ -42,6 +42,8 @@
             protobuf                # protoc, for tonic-build when grpc lands
             llvmPackages.libclang   # bindgen for userfaultfd-sys (Linux only,
                                     # but harmless on macOS)
+            nodejs_22               # web SPA dev server (`just web` -> vite)
+            pnpm                    # workspace package manager for web/
           ] ++ lib.optionals stdenv.isDarwin [
             libiconv                # required by some macOS-aarch64 crates
           ];

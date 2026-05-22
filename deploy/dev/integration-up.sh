@@ -162,13 +162,54 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
+# ------------------------------------------------------------------
+# Web SPA — Vite dev server, bound to 0.0.0.0 so the same recipe
+# works whether you're sshing in (port-forward to localhost on
+# your laptop) or pointing a browser at the dev VM's IP. Optional:
+# set `ENGRAM_SKIP_WEB=1` to skip when you only need API access.
+# ------------------------------------------------------------------
+if [ "${ENGRAM_SKIP_WEB:-0}" != "1" ]; then
+    if command -v pnpm >/dev/null 2>&1; then
+        echo "==> web SPA: pnpm install (idempotent)"
+        # CI=true so pnpm doesn't try to prompt for confirmModulesPurge
+        # (no TTY when run from `just`). Idempotent: skipped when lockfile
+        # already satisfies node_modules.
+        (cd web && CI=true pnpm install --silent 2>&1) | tail -3
+        echo "==> start web dev server (vite, :5173, binding 0.0.0.0)"
+        (
+            cd web
+            ENGRAM_COORDINATOR_URL="http://127.0.0.1:8090" \
+                nohup pnpm dev --host 0.0.0.0 --port 5173 --strictPort \
+                >"../$INTEG_DIR/web.log" 2>&1 &
+            echo $! > "../$INTEG_DIR/web.pid"
+        )
+        # Vite logs "ready in <ms>" once the bundle is built.
+        for _ in $(seq 1 30); do
+            if grep -q 'ready in' "$INTEG_DIR/web.log" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+    else
+        echo "WARN: pnpm not on PATH; skipping web SPA. Run via nix develop or" >&2
+        echo "      install pnpm + nodejs on the host." >&2
+    fi
+fi
+
 echo ""
 echo "✓ integration stack up"
 echo "  coord:      http://127.0.0.1:8090  (PID $(cat $INTEG_DIR/coord.pid))"
 echo "  host-agent: 127.0.0.1:9101         (PID $(cat $INTEG_DIR/host-agent.pid))"
 echo "  registry:   http://localhost:5001"
 echo "  fake-gcs:   http://localhost:4443"
+if [ -f "$INTEG_DIR/web.pid" ] && kill -0 "$(cat "$INTEG_DIR/web.pid")" 2>/dev/null; then
+    echo "  web:        http://127.0.0.1:5173  (PID $(cat $INTEG_DIR/web.pid))"
+    echo ""
+    echo "  Port-forward from your laptop to reach the web UI:"
+    echo "  $ gcloud compute start-iap-tunnel <vm> 5173 --local-host-port=localhost:5173"
+fi
 echo ""
-echo "  logs:     $INTEG_DIR/coord.log, $INTEG_DIR/host-agent.log"
+echo "  logs:     $INTEG_DIR/coord.log, $INTEG_DIR/host-agent.log${ENGRAM_SKIP_WEB:+}"
+[ -f "$INTEG_DIR/web.log" ] && echo "            $INTEG_DIR/web.log"
 echo "  smoke:    just integration-test"
 echo "  teardown: just integration-down"
