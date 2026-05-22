@@ -66,6 +66,39 @@ pub struct ScheduleContext<'a> {
     /// Memory hint for capacity ranking. `None` falls through to
     /// "any host with > 0 free capacity" rather than a strict fit.
     pub memory_mib: Option<u32>,
+    /// ADR 0015 M5: when set, restricts the candidate pool to hosts
+    /// whose latest heartbeat reported this digest in `ready_images`.
+    /// `None` skips the readiness filter — used by restore paths and
+    /// anonymous flows that don't carry an `enabled_images` row.
+    pub required_image_digest: Option<engram_protocol::heartbeat::ManifestDigest>,
+}
+
+/// Why `pick_for_session` couldn't place a session. Distinguishes
+/// "image isn't prefetched anywhere yet" from "no host has
+/// capacity" so the API layer can return distinct 503 reasons.
+#[derive(Clone, Debug)]
+pub enum PickError {
+    /// No host's heartbeat has reported this digest in
+    /// `ready_images`. Operator action: wait for the host
+    /// prefetch loop to finish (typically seconds-to-minutes
+    /// depending on chunk-store warmth + bandwidth), or
+    /// investigate if BlobStorage egress is the bottleneck.
+    ImageNotReady(engram_protocol::heartbeat::ManifestDigest),
+    /// At least one host is ready for the image (or no digest
+    /// was required) but none has free capacity matching the
+    /// memory hint or is non-draining.
+    NoCapacity,
+}
+
+impl From<PickError> for SandboxError {
+    fn from(e: PickError) -> Self {
+        match e {
+            PickError::ImageNotReady(d) => SandboxError::ImageNotReady(d.as_str().to_string()),
+            PickError::NoCapacity => {
+                SandboxError::Vm("no host has free capacity for this session".into())
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -176,42 +209,64 @@ impl HostRegistry {
     }
 
     /// Session scheduler. Inputs the per-host heartbeat state (capacity,
-    /// local snapshots, draining) and ranks:
+    /// local snapshots, draining, ready_images) and ranks:
     ///
-    /// 1. Host with `prefer_snapshot_id` in `local_snapshots` — zero-
-    ///    cost hot-tier hit.
-    /// 2. Host with the largest free capacity (`total - used`), filtered
-    ///    against `memory_mib` if provided.
+    /// 0. ADR 0015 M5: when `ctx.required_image_digest` is set,
+    ///    restrict candidates to hosts that have prefetched that
+    ///    digest. No ready host → `Err(ImageNotReady)` (surfaces
+    ///    as HTTP 503 distinct from "no capacity").
+    /// 1. Host with `prefer_snapshot_id` in `local_snapshots` —
+    ///    zero-cost hot-tier hit.
+    /// 2. Host with the largest free capacity (`total - used`),
+    ///    filtered against `memory_mib` if provided.
     /// 3. Else any non-draining host.
-    /// 4. Else `None` (the coordinator surfaces this as a 503 / typed
-    ///    `BackendError::NotSupported("no host available")`).
-    ///
-    /// The pre-v5 warm-pool tier was deleted with ADR 0008 — chunked-
-    /// OCI rootfs + canonical-memory restore made the create-time
-    /// savings warm pools amortised no longer worth the complexity.
+    /// 4. Else `Err(NoCapacity)` — coordinator surfaces a 503.
     pub fn pick_for_session(
         &self,
         ctx: &ScheduleContext<'_>,
-    ) -> Option<(HostId, Arc<dyn HostClient>)> {
-        // Snapshot-affinity: any host carrying the requested snapshot.
+    ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
+        // Closure encoding "this host is a viable candidate".
+        // Non-draining + (no digest required OR ready for the digest).
+        let host_is_ready = |st: &HostState| {
+            if st.draining {
+                return false;
+            }
+            match ctx.required_image_digest.as_ref() {
+                Some(d) => st.ready_images.contains(d),
+                None => true,
+            }
+        };
+        let any_ready = self
+            .hosts
+            .iter()
+            .any(|e| host_is_ready(&e.value().state.read()));
+        if !any_ready {
+            return match ctx.required_image_digest.as_ref() {
+                Some(d) => Err(PickError::ImageNotReady(d.clone())),
+                None => Err(PickError::NoCapacity),
+            };
+        }
+
+        // Snapshot-affinity: any READY host carrying the requested snapshot.
         if let Some(target) = ctx.prefer_snapshot_id {
             for entry in self.hosts.iter() {
                 let st = entry.value().state.read();
-                if st.draining {
+                if !host_is_ready(&st) {
                     continue;
                 }
                 if st.local_snapshots.iter().any(|s| s.snapshot_id == target) {
-                    return Some((*entry.key(), entry.value().backend.clone()));
+                    return Ok((*entry.key(), entry.value().backend.clone()));
                 }
             }
         }
 
-        // Capacity-fit: largest free RAM that meets `memory_mib`.
+        // Capacity-fit: largest free RAM among ready hosts that
+        // meets `memory_mib`.
         let need = ctx.memory_mib.unwrap_or(0) as u64;
         let mut best_cap: Option<(u64, HostId, Arc<dyn HostClient>)> = None;
         for entry in self.hosts.iter() {
             let st = entry.value().state.read();
-            if st.draining {
+            if !host_is_ready(&st) {
                 continue;
             }
             let free = st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
@@ -225,13 +280,17 @@ impl HostRegistry {
             };
         }
         if let Some((_, host_id, backend)) = best_cap {
-            return Some((host_id, backend));
+            return Ok((host_id, backend));
         }
 
-        // Fallback: capacity reports may be empty (3a registrations,
-        // or hosts that haven't sent their first heartbeat). Pick any
-        // non-draining host.
-        self.pick_any()
+        // Fallback: ready host with no capacity report yet (first
+        // heartbeat hasn't landed). Pick any ready host so brand-
+        // new hosts can take work without waiting a tick.
+        self.hosts
+            .iter()
+            .find(|e| host_is_ready(&e.value().state.read()))
+            .map(|e| (*e.key(), e.value().backend.clone()))
+            .ok_or(PickError::NoCapacity)
     }
 
     /// Pick a host for `ctx`, then call `create` on that host's
@@ -242,7 +301,7 @@ impl HostRegistry {
         ctx: &ScheduleContext<'_>,
         spec: SandboxSpec,
     ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self.pick_for_session(ctx).ok_or_else(Self::no_host_error)?;
+        let (host_id, backend) = self.pick_for_session(ctx)?;
         let sandbox_id = backend.create(spec).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
@@ -258,7 +317,7 @@ impl HostRegistry {
         ctx: &ScheduleContext<'_>,
         metadata: SnapshotMetadata,
     ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self.pick_for_session(ctx).ok_or_else(Self::no_host_error)?;
+        let (host_id, backend) = self.pick_for_session(ctx)?;
         let sandbox_id = backend.restore(metadata).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
@@ -598,6 +657,7 @@ mod tests {
             image_version: "v",
             prefer_snapshot_id: Some(snap),
             memory_mib: None,
+            required_image_digest: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(
@@ -648,6 +708,7 @@ mod tests {
             image_version: "v",
             prefer_snapshot_id: None,
             memory_mib: None,
+            required_image_digest: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_big, "larger free capacity wins");
@@ -696,6 +757,7 @@ mod tests {
             image_version: "v",
             prefer_snapshot_id: None,
             memory_mib: None,
+            required_image_digest: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_ready);
@@ -752,8 +814,125 @@ mod tests {
             image_version: "v",
             prefer_snapshot_id: None,
             memory_mib: None,
+            required_image_digest: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h);
+    }
+
+    // ADR 0015 M5: readiness-gate scheduler tests.
+
+    #[test]
+    fn pick_for_session_requires_digest_in_ready_images() {
+        // Two hosts both have capacity; only one reports the
+        // required digest in `ready_images`. The scheduler must
+        // route to that host even if the other has more free RAM.
+        use engram_protocol::heartbeat::ManifestDigest;
+        let reg = HostRegistry::new();
+        let (b1, _d1) = dummy_backend();
+        let (b2, _d2) = dummy_backend();
+        let h_unready = HostId::new();
+        let h_ready = HostId::new();
+        reg.register(h_unready, b1);
+        reg.register(h_ready, b2);
+
+        let digest = ManifestDigest::new("sha256:abcd");
+        let mut ready_set = std::collections::HashSet::new();
+        ready_set.insert(digest.clone());
+
+        reg.update_state(
+            h_unready,
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: Default::default(),
+            },
+        );
+        reg.update_state(
+            h_ready,
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: 1_024,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: ready_set,
+            },
+        );
+
+        let ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: None,
+            required_image_digest: Some(digest),
+        };
+        let (picked, _) = match reg.pick_for_session(&ctx) {
+            Ok(v) => v,
+            Err(e) => panic!("expected pick to succeed, got {e:?}"),
+        };
+        assert_eq!(
+            picked, h_ready,
+            "readiness gate must beat raw capacity affinity",
+        );
+    }
+
+    #[test]
+    fn pick_for_session_returns_image_not_ready_when_no_host_carries_digest() {
+        // Two hosts, neither has prefetched the requested image.
+        // The scheduler must surface `ImageNotReady` carrying the
+        // missing digest, not fall back to a non-ready host.
+        use engram_protocol::heartbeat::ManifestDigest;
+        let reg = HostRegistry::new();
+        let (b1, _d1) = dummy_backend();
+        let (b2, _d2) = dummy_backend();
+        let h1 = HostId::new();
+        let h2 = HostId::new();
+        reg.register(h1, b1);
+        reg.register(h2, b2);
+
+        let digest = ManifestDigest::new("sha256:missing");
+        let ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: None,
+            required_image_digest: Some(digest.clone()),
+        };
+        match reg.pick_for_session(&ctx) {
+            Err(PickError::ImageNotReady(d)) => assert_eq!(d, digest),
+            Err(PickError::NoCapacity) => panic!("expected ImageNotReady, got NoCapacity"),
+            Ok(_) => panic!("expected ImageNotReady, got Ok"),
+        }
+    }
+
+    #[test]
+    fn pick_for_session_no_digest_required_still_schedules_on_any_host() {
+        // Restore + admin flows pass `required_image_digest = None`;
+        // the readiness gate must not interfere with them.
+        let reg = HostRegistry::new();
+        let (b, _d) = dummy_backend();
+        let h = HostId::new();
+        reg.register(h, b);
+
+        let ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: None,
+            required_image_digest: None,
+        };
+        let (picked, _) = match reg.pick_for_session(&ctx) {
+            Ok(v) => v,
+            Err(e) => panic!("expected pick to succeed, got {e:?}"),
+        };
         assert_eq!(picked, h);
     }
 }

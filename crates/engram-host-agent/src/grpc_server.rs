@@ -583,5 +583,6 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         SandboxError::Snapshot(_) | SandboxError::Io(_) | SandboxError::Vm(_) => {
             Status::internal(err.to_string())
         }
+        SandboxError::ImageNotReady(_) => Status::failed_precondition(err.to_string()),
     }
 }

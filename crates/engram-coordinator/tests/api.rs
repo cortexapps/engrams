@@ -408,6 +408,13 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
 struct TestFixture {
     app: axum::Router,
     meta: Arc<MockMetadataStore>,
+    /// ADR 0015 M5: pinned to the single in-process host so test
+    /// helpers can flip its `ready_images` set in lockstep with
+    /// `seed_enabled` calls. Production hosts populate this from
+    /// the prefetch supervisor + heartbeat, but the in-test ProcessBackend
+    /// has no chunks to prefetch — we just declare it ready.
+    host_registry: Arc<engram_coordinator::HostRegistry>,
+    test_host_id: engram_core::HostId,
 }
 
 impl TestFixture {
@@ -451,10 +458,22 @@ impl TestFixture {
             default_image_version: "warm-bootstrap".into(),
             ..CoordinatorConfig::default()
         };
-        let state = Arc::new(AppState::new(cfg, services));
+        // ADR 0015 M5: build the registry explicitly so we can keep
+        // a handle to it and pin the host id we use to seed
+        // `ready_images` from `write_image`.
+        let host_registry = Arc::new(engram_coordinator::HostRegistry::new());
+        let test_host_id = engram_core::HostId::new();
+        host_registry.register(test_host_id, services.host.clone());
+        let state = Arc::new(AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry.clone(),
+        ));
         let fx = Self {
             app: api::router(state),
             meta: meta.clone(),
+            host_registry,
+            test_host_id,
         };
         // Seed baseline images for the repos most tests use against
         // `api_create_session`. Stage B1 made `image` resolve via
@@ -472,9 +491,26 @@ impl TestFixture {
     /// the registry through the host-agent's cache, not from the
     /// coordinator's filesystem. Tests retain `write_image` for
     /// continuity; the body is a thin wrapper over `seed_enabled`.
+    ///
+    /// ADR 0015 M5: also marks the test host ready for the new
+    /// image's digest so the readiness gate in `pick_for_session`
+    /// lets the next session create through. Production hosts
+    /// populate this set via the prefetch supervisor; tests have
+    /// no chunks to fault so we just declare the host ready.
     fn write_image(&self, repo: &str, tag: &str, manifest_toml: &str) {
         let uri = format!("{repo}:{tag}");
-        seed_enabled(&self.meta, &uri, manifest_toml);
+        let digest = seed_enabled(&self.meta, &uri, manifest_toml);
+        self.mark_host_ready_for(digest);
+    }
+
+    fn mark_host_ready_for(&self, digest: engram_protocol::heartbeat::ManifestDigest) {
+        let prior = self
+            .host_registry
+            .snapshot_state(self.test_host_id)
+            .unwrap_or_default();
+        let mut next = prior;
+        next.ready_images.insert(digest);
+        self.host_registry.update_state(self.test_host_id, next);
     }
 }
 
@@ -482,7 +518,11 @@ impl TestFixture {
 /// that don't go through `TestFixture::write_image` (e.g. those wiring
 /// a custom backend) can use this to clear the strict image-resolution
 /// gate without spinning up the full fixture.
-fn seed_enabled(store: &MockMetadataStore, uri: &str, manifest_toml: &str) {
+fn seed_enabled(
+    store: &MockMetadataStore,
+    uri: &str,
+    manifest_toml: &str,
+) -> engram_protocol::heartbeat::ManifestDigest {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     uri.hash(&mut h);
@@ -494,12 +534,13 @@ fn seed_enabled(store: &MockMetadataStore, uri: &str, manifest_toml: &str) {
             id: uuid::Uuid::new_v4(),
             image_uri: uri.to_string(),
             manifest_toml: manifest_toml.to_string(),
-            manifest_digest: digest,
+            manifest_digest: digest.clone(),
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,
         },
     );
+    engram_protocol::heartbeat::ManifestDigest::new(&digest)
 }
 
 async fn body_json(body: Body) -> Value {

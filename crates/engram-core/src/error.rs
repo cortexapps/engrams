@@ -93,6 +93,11 @@ pub enum SandboxError {
     Snapshot(String),
     Io(std::io::Error),
     Timeout,
+    /// ADR 0015 M5: no host has prefetched the image referenced by
+    /// this session yet. Carries the manifest digest the scheduler
+    /// was looking for so the API surface can render a hint about
+    /// which artifact to wait on.
+    ImageNotReady(String),
 }
 
 impl fmt::Display for SandboxError {
@@ -106,6 +111,10 @@ impl fmt::Display for SandboxError {
             Self::Snapshot(msg) => write!(f, "snapshot error: {msg}"),
             Self::Io(e) => write!(f, "sandbox io error: {e}"),
             Self::Timeout => write!(f, "sandbox operation timed out"),
+            Self::ImageNotReady(digest) => write!(
+                f,
+                "image with manifest digest {digest} has not been prefetched by any host yet"
+            ),
         }
     }
 }

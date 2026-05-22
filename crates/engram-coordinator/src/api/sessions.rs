@@ -537,11 +537,18 @@ async fn create_session_inner(
         image_version: &image_tag,
         prefer_snapshot_id: None,
         memory_mib: Some(vm_spec.memory.max_mib),
+        // ADR 0015 M5: gate placement on hosts that have prefetched
+        // this image. `enabled.manifest_digest` is the same digest
+        // hosts include in their heartbeat's `ready_images`.
+        required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
+            &enabled.manifest_digest,
+        )),
     };
 
-    // ADR 0015 M5: cold-create only. The warm-pool lease path was
-    // retired with the `templates` table; sessions land on whichever
-    // host the scheduler picks (later phases gate on image readiness).
+    // ADR 0015 M5: cold-create only, gated on host readiness. Sessions
+    // land on a host whose latest heartbeat reported the manifest
+    // digest above in `ready_images`. No ready host → 503
+    // `image_not_ready` (distinct from "no capacity").
     let (host_id, sandbox_id) = match state.host_registry.create_for_session(&ctx, vm_spec).await {
         Ok((host_id, id)) => (host_id, id),
         Err(e) => {
@@ -550,10 +557,20 @@ async fn create_session_inner(
                 error = %e,
                 "session create rejected at scheduling; returning 503, no row persisted",
             );
-            return Err(ApiError::Unavailable(format!(
-                "no host has capacity for this session right now: {e}. \
-                 Retry shortly; capacity-fit recovers as hosts register or sessions drain."
-            )));
+            return Err(match e {
+                engram_core::SandboxError::ImageNotReady(digest) => ApiError::Unavailable(format!(
+                    "image `{}` (digest {digest}) has not been prefetched by any host yet. \
+                     Hosts diff `enabled_images` against their local NVMe chunk cache on each \
+                     heartbeat (~5s) and prefetch missing images; retry shortly. \
+                     If this persists, check BlobStorage egress and host-agent logs for \
+                     `image prefetch` lines.",
+                    req.image
+                )),
+                other => ApiError::Unavailable(format!(
+                    "no host has capacity for this session right now: {other}. \
+                     Retry shortly; capacity-fit recovers as hosts register or sessions drain."
+                )),
+            });
         }
     };
 

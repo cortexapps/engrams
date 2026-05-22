@@ -31,6 +31,7 @@ pub use host_client::LocalHostClient;
 pub mod heartbeat;
 pub mod idle_evictor;
 pub mod image_cache;
+pub mod image_prefetch;
 pub mod live_attach;
 pub mod metrics;
 pub mod orphan_reap;
@@ -397,21 +398,49 @@ impl HostAgent {
                 })
             });
 
+            // ADR 0015 M5: image-prefetch supervisor. Watches the
+            // heartbeat-ack's `enabled_images` set and pulls the
+            // chunked rootfs for any image not yet local on this
+            // host. Updates the shared `ImageReadiness` which the
+            // heartbeat builder reads to populate `ready_images`.
+            // Spawned only when chunk_store + image_cache are wired
+            // (production hosts; dev-process backend lacks both and
+            // simply never reports ready).
+            let readiness = image_prefetch::ImageReadiness::new();
+            let enabled_images_tx = match (
+                self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
+                self.image_cache.clone(),
+            ) {
+                (Some(chunk_store), Some(image_cache)) => {
+                    let (tx, _handle) = image_prefetch::spawn_supervisor(
+                        image_cache,
+                        chunk_store,
+                        readiness.clone(),
+                    );
+                    Some(tx)
+                }
+                _ => {
+                    tracing::warn!(
+                        "image_prefetch supervisor disabled: chunk_store or image_cache missing — \
+                         host will never report ready_images and coord will 503 every session",
+                    );
+                    None
+                }
+            };
+
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
-            // draining} every `heartbeat_interval` to any coord
-            // pod via the L4-LB. Coord pod that receives it
-            // updates host_registry capacity, runs the ADR 0009
-            // reconcile, and persists to PG. Idempotent across
-            // pods — heartbeats can fan out without harm.
+            // draining, ready_images} every `heartbeat_interval` to
+            // any coord pod via the L4-LB. Coord pod that receives
+            // it updates host_registry, runs ADR 0009 reconcile, and
+            // persists to PG. Idempotent across pods. The ack
+            // carries `enabled_images`, which the supervisor diffs
+            // against the local ready set.
             let heartbeat_interval = self.cfg.heartbeat_interval;
             let coord_for_heartbeat = coord_client.clone();
             let pooled_for_heartbeat = pooled.clone();
-            // ADR 0013 self-heal: ship `host_addr` on every heartbeat
-            // so a freshly-restarted coord pod can rebuild routing and
-            // register this host without waiting for the next agent
-            // restart.
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
+            let readiness_for_heartbeat = readiness.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -428,10 +457,6 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
-                    // ADR 0015 M5: ready_images comes from the
-                    // image_prefetch supervisor (wired in a follow-on
-                    // PR). Empty for now; coord's scheduler will 503
-                    // until at least one host reports ready.
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -442,13 +467,22 @@ impl HostAgent {
                         running_sandboxes,
                         draining: false,
                         host_addr: host_addr_for_heartbeat.clone(),
-                        ready_images: Vec::new(),
+                        ready_images: readiness_for_heartbeat.snapshot(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
-                        Ok(_resp) => {
-                            // ADR 0015 M5: heartbeat-ack carries
-                            // `enabled_images`. Consumed by the
-                            // image_prefetch supervisor (follow-on PR).
+                        Ok(resp) => {
+                            if let Some(tx) = enabled_images_tx.as_ref() {
+                                // send_modify avoids notifying on
+                                // no-op (same set as last tick).
+                                tx.send_if_modified(|cur| {
+                                    if *cur == resp.enabled_images {
+                                        false
+                                    } else {
+                                        *cur = resp.enabled_images;
+                                        true
+                                    }
+                                });
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(

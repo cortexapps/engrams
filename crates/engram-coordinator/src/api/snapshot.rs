@@ -267,6 +267,10 @@ async fn resume_from_fc_snapshot(
         image_version: image_tag,
         prefer_snapshot_id: Some(record.id),
         memory_mib: None,
+        // Restore from a snapshot reuses an existing in-memory image —
+        // no chunked-rootfs prefetch needed on the resume path. Snapshot
+        // affinity already constrains to a host that has the bytes.
+        required_image_digest: None,
     };
     // Build the SnapshotMetadata the trait now takes. The record
     // carries every field we need; we just round-trip it back into
