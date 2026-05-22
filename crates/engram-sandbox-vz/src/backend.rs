@@ -461,26 +461,19 @@ impl SandboxBackend for VzBackend {
             live.vsock_uds_path.clone()
         };
         let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
-        // Same boot-race retry as start_agent. engram-agentd inside
-        // the rootfs takes a couple of seconds to bind on vsock 1024
-        // after kernel init.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut backoff = Duration::from_millis(50);
-        let conn = loop {
-            match UnixStream::connect(&agent_uds).await {
-                Ok(c) => break c,
-                Err(e) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(SandboxError::Vm(
-                            format!("connect engram-agentd UDS {}: {e}", agent_uds.display())
-                                .into(),
-                        ));
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
-                }
-            }
-        };
+        // ADR 0015 M2: `Active` now actually means "agentd is bound
+        // and responsive to RPC" (the coord layer doesn't transition
+        // a row to Active until `start_agent` returns OK). exec_stream
+        // is only reachable from a handler that gated on Active, so
+        // agentd is provably listening on vsock 1024 by the time we
+        // get here — no boot-race window to retry through. A failed
+        // connect now reflects a real fault (process crashed, vsock
+        // tunnel torn down) that retrying wouldn't recover.
+        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(
+                format!("connect engram-agentd UDS {}: {e}", agent_uds.display()).into(),
+            )
+        })?;
         let (reader, writer) = tokio::io::split(conn);
         drive_exec_protocol(id, reader, writer, cmd).await
     }
