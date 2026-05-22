@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::types::host::PreemptionNotice;
-use engram_core::types::SessionStatus;
+use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
 use futures::StreamExt;
 use tokio::task::JoinHandle;
@@ -90,7 +90,7 @@ async fn run_drain(state: &SharedState, notice: PreemptionNotice) {
     };
     let pairs: Vec<(SessionId, SandboxId)> = sessions
         .into_iter()
-        .filter(|s| s.status == SessionStatus::Active)
+        .filter(|s| s.status == SessionState::Active)
         .filter_map(|s| {
             state
                 .registry
@@ -198,7 +198,7 @@ pub async fn drain_session(
     state
         .services
         .meta
-        .set_session_status(session_id, SessionStatus::Dead)
+        .set_session_status(session_id, SessionState::Dead)
         .await
         .map_err(|e| DrainError::Meta(e.to_string()))?;
 
@@ -206,8 +206,8 @@ pub async fn drain_session(
         .emit(
             session_id,
             SessionEvent::StatusChanged {
-                from: SessionStatus::Active,
-                to: SessionStatus::Dead,
+                from: SessionState::Active,
+                to: SessionState::Dead,
                 at: Utc::now(),
             },
         )
@@ -307,7 +307,7 @@ mod tests {
         Session {
             id,
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,
             image: "test/repo:drain-test".into(),
@@ -363,7 +363,7 @@ mod tests {
             .expect("drain should succeed");
 
         let after = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(after.status, SessionStatus::Dead);
+        assert_eq!(after.status, SessionState::Dead);
         assert_eq!(after.host_id, None);
         assert_eq!(after.sandbox_id, None);
         assert_eq!(state.registry.get(session_id), None);
@@ -411,7 +411,7 @@ mod tests {
         let mut transitioned = false;
         for _ in 0..50 {
             let s = state.services.meta.get_session(session_id).await.unwrap();
-            if s.status == SessionStatus::Dead {
+            if s.status == SessionState::Dead {
                 transitioned = true;
                 break;
             }

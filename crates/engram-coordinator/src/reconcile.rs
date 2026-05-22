@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::SessionStatus;
+use engram_core::types::SessionState;
 use engram_core::{HostId, SandboxId, SessionId};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
@@ -157,9 +157,9 @@ async fn flip_missing(
     };
 
     let new_status = if recoverable {
-        SessionStatus::Idle
+        SessionState::Idle
     } else {
-        SessionStatus::Dead
+        SessionState::Dead
     };
 
     // Cheap idempotency: if the session is already in target state
@@ -175,10 +175,7 @@ async fn flip_missing(
     let prev = session.status;
     if matches!(
         prev,
-        SessionStatus::Idle
-            | SessionStatus::Dead
-            | SessionStatus::Completed
-            | SessionStatus::Failed
+        SessionState::Idle | SessionState::Dead | SessionState::Completed | SessionState::Failed
     ) {
         tracing::debug!(
             session_id = %session_id,

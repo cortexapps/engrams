@@ -6,7 +6,7 @@ use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
 use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef};
-use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionStatus};
+use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
@@ -714,7 +714,7 @@ async fn create_session_inner(
         let _ = state
             .services
             .meta
-            .set_session_status(session_id, SessionStatus::Failed)
+            .set_session_status(session_id, SessionState::Failed)
             .await;
         state.services.host.unbind_session(session_id).await;
         return Err(e.into());
@@ -728,8 +728,8 @@ async fn create_session_inner(
         .emit(
             session_id,
             SessionEvent::StatusChanged {
-                from: SessionStatus::Pending,
-                to: SessionStatus::Active,
+                from: SessionState::Pending,
+                to: SessionState::Active,
                 at: chrono::Utc::now(),
             },
         )
@@ -768,7 +768,7 @@ async fn create_session_inner(
         StatusCode::CREATED,
         Json(CreateSessionResponse {
             session_id,
-            status: SessionStatus::Active.as_str(),
+            status: SessionState::Active.as_str(),
             image_version: image_tag,
             kind: "cold",
         }),
@@ -833,14 +833,14 @@ pub async fn delete_session(
     state
         .services
         .meta
-        .set_session_status(id, SessionStatus::Completed)
+        .set_session_status(id, SessionState::Completed)
         .await?;
     state
         .emit(
             id,
             SessionEvent::StatusChanged {
                 from: session.status,
-                to: SessionStatus::Completed,
+                to: SessionState::Completed,
                 at: chrono::Utc::now(),
             },
         )

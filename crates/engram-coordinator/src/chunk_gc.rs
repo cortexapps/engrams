@@ -186,7 +186,7 @@ mod tests {
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
     use engram_core::types::session::HarnessSpec;
-    use engram_core::types::{Session, SessionStatus};
+    use engram_core::types::{Session, SessionState};
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::sync::Arc;
@@ -235,7 +235,7 @@ mod tests {
         Session {
             id: engram_core::SessionId::new(),
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:gc".into(),

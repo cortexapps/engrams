@@ -5,7 +5,7 @@ use crate::types::event::PersistedEvent;
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential, SessionSecrets};
-use crate::types::session::{Session, SessionSpec, SessionStatus};
+use crate::types::session::{Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
 
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
@@ -76,7 +76,7 @@ pub trait MetadataStore: Send + Sync {
         Ok(all
             .into_iter()
             .filter_map(|s| match (s.status, s.host_id, s.sandbox_id) {
-                (SessionStatus::Active, Some(h), Some(sb)) if h == host_id => Some((s.id, sb)),
+                (SessionState::Active, Some(h), Some(sb)) if h == host_id => Some((s.id, sb)),
                 _ => None,
             })
             .collect())
@@ -84,7 +84,7 @@ pub trait MetadataStore: Send + Sync {
     async fn set_session_status(
         &self,
         id: SessionId,
-        status: SessionStatus,
+        status: SessionState,
     ) -> Result<(), MetaError>;
     async fn assign_session_host(
         &self,

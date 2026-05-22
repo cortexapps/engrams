@@ -20,7 +20,7 @@ use engram_cloud_mock::MockCloud;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SessionId};
 use engram_sandbox_process::ProcessBackend;
@@ -68,7 +68,7 @@ impl MetadataStore for MockMetadataStore {
         let session = Session {
             id,
             user_id: spec.user_id,
-            status: SessionStatus::Pending,
+            status: SessionState::Pending,
             host_id: None,
             sandbox_id: None,
             created_at: Utc::now(),
@@ -90,7 +90,7 @@ impl MetadataStore for MockMetadataStore {
         let session = Session {
             id: session_id,
             user_id: spec.user_id,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: Some(host_id),
             sandbox_id: Some(sandbox_id),
             created_at: Utc::now(),
@@ -118,7 +118,7 @@ impl MetadataStore for MockMetadataStore {
             .filter(|s| {
                 matches!(
                     s.status,
-                    SessionStatus::Pending | SessionStatus::Active | SessionStatus::Idle
+                    SessionState::Pending | SessionState::Active | SessionState::Idle
                 )
             })
             .cloned()
@@ -128,7 +128,7 @@ impl MetadataStore for MockMetadataStore {
     async fn set_session_status(
         &self,
         id: SessionId,
-        status: SessionStatus,
+        status: SessionState,
     ) -> Result<(), MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
@@ -194,11 +194,11 @@ impl MetadataStore for MockMetadataStore {
         let mut affected = Vec::new();
         for s in g.values_mut() {
             if s.host_id == Some(host_id)
-                && !matches!(s.status, SessionStatus::Completed | SessionStatus::Failed)
+                && !matches!(s.status, SessionState::Completed | SessionState::Failed)
             {
                 s.host_id = None;
                 s.sandbox_id = None;
-                s.status = SessionStatus::Dead;
+                s.status = SessionState::Dead;
                 s.last_active_at = Utc::now();
                 affected.push(s.id);
             }
@@ -774,7 +774,7 @@ async fn create_session_with_explicit_image_persists_full_row() {
     let session = store.get_session(id).await.unwrap();
     assert_eq!(session.image, "cortex/api:warm-pinned");
     assert!(session.harness.is_none());
-    assert_eq!(session.status, SessionStatus::Active);
+    assert_eq!(session.status, SessionState::Active);
 }
 
 #[tokio::test]
@@ -914,17 +914,17 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
     }
     let active_id = mk(&store, "alive").await;
     store
-        .set_session_status(active_id, SessionStatus::Active)
+        .set_session_status(active_id, SessionState::Active)
         .await
         .unwrap();
     let idle_id = mk(&store, "idle-too").await;
     store
-        .set_session_status(idle_id, SessionStatus::Idle)
+        .set_session_status(idle_id, SessionState::Idle)
         .await
         .unwrap();
     let dead_id = mk(&store, "done").await;
     store
-        .set_session_status(dead_id, SessionStatus::Completed)
+        .set_session_status(dead_id, SessionState::Completed)
         .await
         .unwrap();
 
@@ -987,7 +987,7 @@ async fn list_sessions_serializes_full_session_record() {
     assert_eq!(item["harness"]["kind"], "builtin");
     assert_eq!(item["harness"]["name"], "claude");
     assert_eq!(item["user_id"], "user-42");
-    assert_eq!(item["status"], SessionStatus::Pending.as_str());
+    assert_eq!(item["status"], SessionState::Pending.as_str());
     assert!(item["created_at"].is_string());
     assert!(item["last_active_at"].is_string());
 }
@@ -1016,7 +1016,7 @@ async fn delete_session_marks_completed_and_returns_204() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let after = store.get_session(id).await.unwrap();
-    assert_eq!(after.status, SessionStatus::Completed);
+    assert_eq!(after.status, SessionState::Completed);
 }
 
 #[tokio::test]
@@ -1469,7 +1469,7 @@ async fn snapshot_records_a_snapshot_and_keeps_session_active() {
     let after = store.get_session(id).await.unwrap();
     assert_eq!(
         after.status,
-        SessionStatus::Active,
+        SessionState::Active,
         "snapshot must NOT change session status — eviction is a separate call",
     );
 
@@ -1530,7 +1530,7 @@ async fn evict_local_requires_a_snapshot_to_exist() {
     // Session must still be Active and registry still bound.
     assert_eq!(
         store.get_session(id).await.unwrap().status,
-        SessionStatus::Active,
+        SessionState::Active,
     );
 }
 
@@ -1549,7 +1549,7 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
-        SessionStatus::Idle,
+        SessionState::Idle,
     );
 
     // Phase 4 Track B: an exec on an Idle session transparently
@@ -1568,7 +1568,7 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
     );
     assert_eq!(
         store.get_session(id).await.unwrap().status,
-        SessionStatus::Active,
+        SessionState::Active,
         "session is Active after auto-resume",
     );
     let v = body_json(resp.into_body()).await;
@@ -1618,7 +1618,7 @@ async fn resume_410_gone_when_no_snapshot_exists() {
         .await
         .unwrap();
     store
-        .set_session_status(id, SessionStatus::Idle)
+        .set_session_status(id, SessionState::Idle)
         .await
         .unwrap();
     let app = build_app(store);
@@ -1654,7 +1654,7 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
-        SessionStatus::Idle,
+        SessionState::Idle,
     );
 
     // Resume from snapshot.
@@ -1662,7 +1662,7 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
-        SessionStatus::Active,
+        SessionState::Active,
     );
 
     // The marker file must still be there in the resumed sandbox.
@@ -1965,7 +1965,7 @@ async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
-        SessionStatus::Completed
+        SessionState::Completed
     );
 
     // Subsequent exec must fail — the live sandbox is gone.

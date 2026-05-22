@@ -27,7 +27,7 @@ use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::HarnessSpec;
 use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use parking_lot::Mutex;
@@ -56,7 +56,7 @@ impl ReconcileMeta {
             Session {
                 id,
                 user_id: None,
-                status: SessionStatus::Active,
+                status: SessionState::Active,
                 host_id: Some(host),
                 sandbox_id: Some(sandbox),
                 image: "localhost:5001/demo:test".into(),
@@ -87,7 +87,7 @@ impl ReconcileMeta {
         self.snapshots.lock().entry(session).or_default().push(snap);
     }
 
-    fn status(&self, id: SessionId) -> SessionStatus {
+    fn status(&self, id: SessionId) -> SessionState {
         self.sessions.lock().get(&id).unwrap().status
     }
 
@@ -132,7 +132,7 @@ impl MetadataStore for ReconcileMeta {
             .filter(|s| {
                 matches!(
                     s.status,
-                    SessionStatus::Pending | SessionStatus::Active | SessionStatus::Idle
+                    SessionState::Pending | SessionState::Active | SessionState::Idle
                 )
             })
             .cloned()
@@ -141,7 +141,7 @@ impl MetadataStore for ReconcileMeta {
     async fn set_session_status(
         &self,
         id: SessionId,
-        status: SessionStatus,
+        status: SessionState,
     ) -> Result<(), MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
@@ -390,17 +390,17 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     // Verify the per-session terminal status:
     assert_eq!(
         meta.status(s_recoverable),
-        SessionStatus::Idle,
+        SessionState::Idle,
         "session with recoverable=true → Idle (resumable via cold-tier)"
     );
     assert_eq!(
         meta.status(s_dead),
-        SessionStatus::Dead,
+        SessionState::Dead,
         "session with recoverable=false → Dead (terminal; no resume path)"
     );
     assert_eq!(
         meta.status(s_present),
-        SessionStatus::Active,
+        SessionState::Active,
         "session whose sandbox is still in the heartbeat must NOT flip"
     );
 
@@ -485,7 +485,7 @@ async fn does_not_re_flip_already_terminal_sessions() {
             .reconcile_with_deps(meta.as_ref(), &events, host, &[])
             .await;
     }
-    assert_eq!(meta.status(session), SessionStatus::Dead);
+    assert_eq!(meta.status(session), SessionState::Dead);
     let after_first_flip = meta.emitted_events().len();
 
     // Even though the session row still exists, `list_active...`
@@ -497,7 +497,7 @@ async fn does_not_re_flip_already_terminal_sessions() {
             .reconcile_with_deps(meta.as_ref(), &events, host, &[])
             .await;
     }
-    assert_eq!(meta.status(session), SessionStatus::Dead);
+    assert_eq!(meta.status(session), SessionState::Dead);
     assert_eq!(
         meta.emitted_events().len(),
         after_first_flip,
@@ -529,10 +529,10 @@ async fn reconcile_does_not_flip_sessions_on_other_hosts() {
             .reconcile_with_deps(meta.as_ref(), &events, host_a, &[])
             .await;
     }
-    assert_eq!(meta.status(session_a), SessionStatus::Dead);
+    assert_eq!(meta.status(session_a), SessionState::Dead);
     assert_eq!(
         meta.status(session_b),
-        SessionStatus::Active,
+        SessionState::Active,
         "host_a's reconcile must not affect host_b's sessions"
     );
 }

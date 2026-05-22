@@ -41,7 +41,7 @@ use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::registry::{HarnessPack, RegistryAuthSpec, RegistryCredential};
 use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use engram_sandbox_process::ProcessBackend;
@@ -93,7 +93,7 @@ impl MetadataStore for MockMetadataStore {
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         Ok(vec![])
     }
-    async fn set_session_status(&self, _: SessionId, _: SessionStatus) -> Result<(), MetaError> {
+    async fn set_session_status(&self, _: SessionId, _: SessionState) -> Result<(), MetaError> {
         Ok(())
     }
     async fn assign_session_host(&self, _: SessionId, _: Option<HostId>) -> Result<(), MetaError> {

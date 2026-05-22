@@ -1,37 +1,167 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use super::ids::{HostId, SandboxId, SessionId};
 
+/// ADR 0015 M2: explicit session lifecycle state machine.
+///
+/// Each variant has a published meaning; transitions are validated
+/// against [`SessionState::can_transition_to`] / [`try_transition_to`]
+/// so illegal moves surface as runtime errors instead of silently
+/// corrupting the row. The legality table is the single source of
+/// truth — call sites do not encode their own preconditions.
+///
+/// Persistence: the column is `TEXT`; the wire form is the
+/// snake_case spelling of each variant. `Pending` is the only
+/// non-persisted state (it exists in the API caller's pre-insert
+/// view and as the `from` of the first `StatusChanged` event — no
+/// row in `sessions` ever has `status='pending'`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionStatus {
+pub enum SessionState {
+    /// Request accepted; scheduler hasn't returned yet. In-memory /
+    /// events-only — no row in `sessions` is ever written with this
+    /// state. The `from` side of the first `StatusChanged` event a
+    /// freshly-created session emits.
     Pending,
+    /// Sandbox is bound to a host (`host_id` + `sandbox_id` populated)
+    /// but nothing further is proven. `start_agent` has not yet run;
+    /// agentd may not be reachable; harness (if any) has not been
+    /// spawned. Calls into `/exec`, `/shell`, `/prompt` against a
+    /// `Created` session return 409.
+    Created,
+    /// `start_agent`'s ready-dial fired: agentd is reachable on vsock.
+    /// Code-level only in the normal create path — the create handler
+    /// collapses `Created → GuestReady → Active` into a single UPDATE
+    /// because `start_agent` does both halves in one RPC. Persists if
+    /// some future code splits the ready-probe and harness-spawn RPCs.
+    GuestReady,
+    /// Harness is running (or `harness=none` and agentd is ready). The
+    /// only state in which `/exec`, `/shell`, `/prompt` proceed
+    /// without a state-mismatch error.
     Active,
+    /// Sandbox has been evicted to a snapshot in BlobStorage. Resumes
+    /// via `Idle → Created → Active` (the resume path re-runs the
+    /// create-shape transitions on the new sandbox).
     Idle,
-    Completed,
+    /// Heartbeat-loss against the bound host. Non-terminal: M3 wires
+    /// the heartbeat-loss cache invalidation into this transition; M4
+    /// adds re-pick on a peer host (`HostLost → Created → Active`).
+    /// Until then the reconciler moves `HostLost → Idle` (if a
+    /// snapshot exists) or `HostLost → Dead` (otherwise).
+    HostLost,
+    /// Terminal: create failed mid-flight (insert failed,
+    /// `start_agent` failed, or scheduling collapsed after row
+    /// insertion).
     Failed,
-    /// Terminal: the session cannot resume. Engram is a one-shot
-    /// task runner; `Dead` ends the session. Under ADR 0007 (single-
-    /// tier durability), a session reaches `Dead` when its chunked
-    /// manifests are unreferenceable (GC'd, never written, or the
-    /// chunk store lost them) or when the user explicitly destroys.
-    /// Callers either accept the loss or start a fresh session.
+    /// Terminal: user-initiated delete.
+    Completed,
+    /// Terminal: the session cannot resume. Engram is a one-shot task
+    /// runner; `Dead` ends the session. A session reaches `Dead` when
+    /// its chunked manifests are unreferenceable (ADR 0007 GC, never
+    /// written, chunk store lost them) or when the user explicitly
+    /// destroys. Callers either accept the loss or start a fresh
+    /// session.
     Dead,
 }
 
-impl SessionStatus {
+impl SessionState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Created => "created",
+            Self::GuestReady => "guest_ready",
             Self::Active => "active",
             Self::Idle => "idle",
+            Self::HostLost => "host_lost",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Dead => "dead",
         }
     }
+
+    /// Terminal states reject every outgoing transition. Used by the
+    /// legality table; exposed so callers can short-circuit cheaply
+    /// (e.g. skip enqueuing work for a `Completed` session).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Failed | Self::Completed | Self::Dead)
+    }
+
+    /// Single source of truth for legal transitions. Per ADR 0015 M2:
+    ///
+    /// ```text
+    /// Pending     -> Created | Failed
+    /// Created     -> GuestReady | Active | Failed | HostLost
+    /// GuestReady  -> Active | Failed | HostLost
+    /// Active      -> Idle | HostLost | Failed | Completed | Dead
+    /// Idle        -> Created (resume) | Dead | Completed
+    /// HostLost    -> Created (re-pick + restore) | Dead | Completed
+    /// Failed      -> (terminal)
+    /// Completed   -> (terminal)
+    /// Dead        -> (terminal)
+    /// ```
+    ///
+    /// Self-transitions (e.g. `Active → Active`) are illegal: every
+    /// state change must be observable by event subscribers, and a
+    /// no-op transition is almost certainly a logic bug (concurrent
+    /// callers racing on the same UPDATE, double-fired event).
+    pub const fn can_transition_to(&self, target: Self) -> bool {
+        use SessionState::*;
+        // One arm per `from` state — keeps the table readable when
+        // adding/removing edges (and stays in sync with the doc-
+        // comment block above). Every `from` state covered, including
+        // the three terminal arms that always return false.
+        match self {
+            Pending => matches!(target, Created | Failed),
+            Created => matches!(target, GuestReady | Active | Failed | HostLost),
+            GuestReady => matches!(target, Active | Failed | HostLost),
+            Active => matches!(target, Idle | HostLost | Failed | Completed | Dead),
+            Idle => matches!(target, Created | Dead | Completed),
+            HostLost => matches!(target, Created | Dead | Completed),
+            Failed | Completed | Dead => false,
+        }
+    }
+
+    /// Consume `self` and produce the next state if the transition is
+    /// legal. Used by [`MetadataStore::transition_session`] (engram-
+    /// postgres) to gate every `UPDATE sessions SET status = ...` —
+    /// every persistence-layer write to `sessions.status` flows
+    /// through this check.
+    pub fn try_transition_to(self, target: Self) -> Result<Self, IllegalTransition> {
+        if self.can_transition_to(target) {
+            Ok(target)
+        } else {
+            Err(IllegalTransition {
+                from: self,
+                to: target,
+            })
+        }
+    }
 }
+
+/// Error returned by [`SessionState::try_transition_to`] when the
+/// requested move is not in the legality table. Carries both sides so
+/// the error surfaces in logs and HTTP bodies without the caller
+/// having to reconstruct context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IllegalTransition {
+    pub from: SessionState,
+    pub to: SessionState,
+}
+
+impl fmt::Display for IllegalTransition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "illegal session state transition: {} -> {}",
+            self.from.as_str(),
+            self.to.as_str()
+        )
+    }
+}
+
+impl std::error::Error for IllegalTransition {}
 
 /// Full OCI reference (registry host + repo path + tag) for the
 /// image this session boots from. Examples:
@@ -107,12 +237,12 @@ pub struct SessionSpec {
 pub struct Session {
     pub id: SessionId,
     pub user_id: Option<String>,
-    pub status: SessionStatus,
+    pub status: SessionState,
     pub host_id: Option<HostId>,
     /// In-memory `SandboxId` of the live sandbox serving this
-    /// session. `None` in `Pending` (sandbox not created yet) /
-    /// `Idle` (sandbox evicted) / `Dead` (host died) /
-    /// `Completed` / `Failed`.
+    /// session. Populated from `Created` onward; cleared back to
+    /// `None` on `Idle` (sandbox evicted), `HostLost` (host gone),
+    /// terminal states.
     #[serde(default)]
     pub sandbox_id: Option<SandboxId>,
     pub image: ImageRef,
@@ -127,33 +257,135 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_status_serializes_lowercase() {
-        let payload = serde_json::to_value(SessionStatus::Active).unwrap();
+    fn session_state_serializes_lowercase() {
+        let payload = serde_json::to_value(SessionState::Active).unwrap();
         assert_eq!(payload, serde_json::json!("active"));
-        let parsed: SessionStatus = serde_json::from_str(r#""idle""#).unwrap();
-        assert_eq!(parsed, SessionStatus::Idle);
+        let parsed: SessionState = serde_json::from_str(r#""idle""#).unwrap();
+        assert_eq!(parsed, SessionState::Idle);
     }
 
     #[test]
-    fn session_status_unknown_string_rejected() {
-        let res: Result<SessionStatus, _> = serde_json::from_str(r#""running""#);
+    fn session_state_new_variants_round_trip() {
+        // Wire shape for the three M2 additions. Anything that
+        // hardcodes the variant order or spelling on the client side
+        // (UI, integration scripts) must match these strings.
+        for (variant, wire) in [
+            (SessionState::Created, "created"),
+            (SessionState::GuestReady, "guest_ready"),
+            (SessionState::HostLost, "host_lost"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                serde_json::json!(wire)
+            );
+            let back: SessionState = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(back, variant);
+            assert_eq!(variant.as_str(), wire);
+        }
+    }
+
+    #[test]
+    fn session_state_unknown_string_rejected() {
+        let res: Result<SessionState, _> = serde_json::from_str(r#""running""#);
         assert!(res.is_err(), "unknown variants must fail to deserialize");
     }
 
     #[test]
-    fn session_status_as_str_matches_serde_form() {
+    fn session_state_as_str_matches_serde_form() {
         for s in [
-            SessionStatus::Pending,
-            SessionStatus::Active,
-            SessionStatus::Idle,
-            SessionStatus::Completed,
-            SessionStatus::Failed,
-            SessionStatus::Dead,
+            SessionState::Pending,
+            SessionState::Created,
+            SessionState::GuestReady,
+            SessionState::Active,
+            SessionState::Idle,
+            SessionState::HostLost,
+            SessionState::Completed,
+            SessionState::Failed,
+            SessionState::Dead,
         ] {
             let via_serde = serde_json::to_string(&s).unwrap();
             let trimmed = via_serde.trim_matches('"');
             assert_eq!(s.as_str(), trimmed, "as_str must match wire format");
         }
+    }
+
+    /// The full ADR 0015 M2 legality table. Every (from, to) pair we
+    /// allow must round-trip through `try_transition_to`; every pair
+    /// we don't allow must fail. The point is to make the table
+    /// itself the test contract — if you add an edge, you update this
+    /// test and `can_transition_to` together.
+    #[test]
+    fn legality_table_matches_adr() {
+        use SessionState::*;
+        let allowed: &[(SessionState, SessionState)] = &[
+            (Pending, Created),
+            (Pending, Failed),
+            (Created, GuestReady),
+            (Created, Active),
+            (Created, Failed),
+            (Created, HostLost),
+            (GuestReady, Active),
+            (GuestReady, Failed),
+            (GuestReady, HostLost),
+            (Active, Idle),
+            (Active, HostLost),
+            (Active, Failed),
+            (Active, Completed),
+            (Active, Dead),
+            (Idle, Created),
+            (Idle, Dead),
+            (Idle, Completed),
+            (HostLost, Created),
+            (HostLost, Dead),
+            (HostLost, Completed),
+        ];
+        let all_states = [
+            Pending, Created, GuestReady, Active, Idle, HostLost, Failed, Completed, Dead,
+        ];
+        for &from in &all_states {
+            for &to in &all_states {
+                let want = allowed.contains(&(from, to));
+                assert_eq!(
+                    from.can_transition_to(to),
+                    want,
+                    "({from:?} -> {to:?}) expected {want}"
+                );
+                let got = from.try_transition_to(to);
+                if want {
+                    assert_eq!(got, Ok(to));
+                } else {
+                    assert_eq!(got, Err(IllegalTransition { from, to }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_states_reject_all_outgoing() {
+        use SessionState::*;
+        for terminal in [Failed, Completed, Dead] {
+            assert!(terminal.is_terminal());
+            for target in [Pending, Created, GuestReady, Active, Idle, HostLost] {
+                assert_eq!(
+                    terminal.try_transition_to(target),
+                    Err(IllegalTransition {
+                        from: terminal,
+                        to: target,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn illegal_transition_displays_both_sides() {
+        let err = IllegalTransition {
+            from: SessionState::Active,
+            to: SessionState::Pending,
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("active"), "rendered: {rendered}");
+        assert!(rendered.contains("pending"), "rendered: {rendered}");
     }
 
     #[test]
@@ -216,7 +448,7 @@ mod tests {
         let original = Session {
             id: SessionId::new(),
             user_id: Some("u1".into()),
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
             image: "ghcr.io/cortex/api:warm-20260101T000000Z".into(),

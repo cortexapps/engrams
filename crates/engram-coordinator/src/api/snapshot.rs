@@ -22,7 +22,7 @@ use chrono::Utc;
 use engram_core::traits::storage::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::SnapshotRecord;
-use engram_core::types::{Session, SessionStatus};
+use engram_core::types::{Session, SessionState};
 use engram_core::{SandboxError, SandboxId, SessionId};
 use serde::Serialize;
 
@@ -134,7 +134,7 @@ pub async fn resume(
 /// terminal sessions.
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
-    if session.status == SessionStatus::Idle {
+    if session.status == SessionState::Idle {
         resume_session(state.clone(), id).await?;
     }
     // Active / Pending / Dead / Completed / Failed all fall through
@@ -155,8 +155,8 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
     //   Dead  → 410 Gone (no recoverable manifests).
     //   any other status → 409.
     match session.status {
-        SessionStatus::Idle => resume_from_idle(state, session).await,
-        SessionStatus::Dead => Err(ApiError::Gone(
+        SessionState::Idle => resume_from_idle(state, session).await,
+        SessionState::Dead => Err(ApiError::Gone(
             "snapshot_invalidated: session is terminal; chunked manifests are gone or never existed".into(),
         )),
         other => Err(ApiError::Conflict(format!(
@@ -211,14 +211,14 @@ async fn transition_to_dead_if_no_snapshot(
     let _ = state
         .services
         .meta
-        .set_session_status(id, SessionStatus::Dead)
+        .set_session_status(id, SessionState::Dead)
         .await;
     let _ = state
         .emit(
             id,
             SessionEvent::StatusChanged {
-                from: SessionStatus::Idle,
-                to: SessionStatus::Dead,
+                from: SessionState::Idle,
+                to: SessionState::Dead,
                 at: Utc::now(),
             },
         )
@@ -312,7 +312,7 @@ async fn resume_from_fc_snapshot(
             let _ = state
                 .services
                 .meta
-                .set_session_status(id, SessionStatus::Dead)
+                .set_session_status(id, SessionState::Dead)
                 .await;
             return Err(ApiError::Gone(
                 "snapshot_invalidated: session can't be revived; \
@@ -481,13 +481,13 @@ async fn bind_resumed_session(
 async fn finalize_resume(
     state: &SharedState,
     id: SessionId,
-    from: SessionStatus,
+    from: SessionState,
     resume_event: SessionEvent,
 ) -> Result<(), ApiError> {
     state
         .services
         .meta
-        .set_session_status(id, SessionStatus::Active)
+        .set_session_status(id, SessionState::Active)
         .await?;
     let now = Utc::now();
     state.emit(id, resume_event).await?;
@@ -496,7 +496,7 @@ async fn finalize_resume(
             id,
             SessionEvent::StatusChanged {
                 from,
-                to: SessionStatus::Active,
+                to: SessionState::Active,
                 at: now,
             },
         )
@@ -510,7 +510,7 @@ pub async fn evict_local(
 ) -> Result<StatusCode, ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
-    if session.status != SessionStatus::Active {
+    if session.status != SessionState::Active {
         return Err(ApiError::Conflict(format!(
             "session is {} — only Active sessions can be evicted",
             session.status.as_str()
@@ -555,7 +555,7 @@ pub async fn evict_local(
     state
         .services
         .meta
-        .set_session_status(id, SessionStatus::Idle)
+        .set_session_status(id, SessionState::Idle)
         .await?;
     let now = Utc::now();
     state.emit(id, SessionEvent::Evicted { at: now }).await?;
@@ -563,8 +563,8 @@ pub async fn evict_local(
         .emit(
             id,
             SessionEvent::StatusChanged {
-                from: SessionStatus::Active,
-                to: SessionStatus::Idle,
+                from: SessionState::Active,
+                to: SessionState::Idle,
                 at: now,
             },
         )

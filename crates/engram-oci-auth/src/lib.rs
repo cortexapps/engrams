@@ -181,7 +181,7 @@ mod tests {
     use super::*;
     use engram_core::types::registry::{HarnessPack, RegistryCredential};
     use engram_core::types::{
-        HostRecord, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
+        HostRecord, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
     };
     use engram_core::{HostId, MetaError, SandboxId, SessionId};
 
@@ -222,11 +222,7 @@ mod tests {
         async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
             Ok(vec![])
         }
-        async fn set_session_status(
-            &self,
-            _: SessionId,
-            _: SessionStatus,
-        ) -> Result<(), MetaError> {
+        async fn set_session_status(&self, _: SessionId, _: SessionState) -> Result<(), MetaError> {
             Ok(())
         }
         async fn assign_session_host(

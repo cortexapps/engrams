@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_core::types::{ExecRusage, SessionStatus};
+use engram_core::types::{ExecRusage, SessionState};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
 use engram_harness_proto::HarnessEvent;
 use engram_host_agent::harness::{EventSink, HarnessHub};
@@ -30,8 +30,8 @@ use crate::Services;
 pub enum SessionEvent {
     /// Session moved between lifecycle states.
     StatusChanged {
-        from: SessionStatus,
-        to: SessionStatus,
+        from: SessionState,
+        to: SessionState,
         at: DateTime<Utc>,
     },
     /// `POST /sessions/:id/exec*` started a new command. `exec_id` is
@@ -730,7 +730,7 @@ pub(crate) mod tests {
         async fn set_session_status(
             &self,
             id: engram_core::SessionId,
-            status: engram_core::types::SessionStatus,
+            status: engram_core::types::SessionState,
         ) -> Result<(), MetaError> {
             let mut s = self.session.lock();
             if id != s.id {
@@ -944,7 +944,7 @@ pub(crate) mod tests {
         let session = Session {
             id: session_id,
             user_id: None,
-            status: engram_core::types::SessionStatus::Active,
+            status: engram_core::types::SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:idle-dedup".into(),

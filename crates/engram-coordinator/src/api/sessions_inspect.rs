@@ -88,7 +88,7 @@ mod tests {
     use engram_core::traits::SandboxBackend;
     use engram_core::types::session::HarnessSpec;
     use engram_core::types::Session;
-    use engram_core::types::SessionStatus;
+    use engram_core::types::SessionState;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::sync::Arc;
@@ -138,7 +138,7 @@ mod tests {
         Session {
             id,
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:test".into(),

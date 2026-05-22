@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionStatus, SnapshotRecord,
+    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SessionId};
 use parking_lot::Mutex;
@@ -33,7 +33,7 @@ impl MetadataStore for MiniMeta {
             Session {
                 id,
                 user_id: spec.user_id,
-                status: SessionStatus::Pending,
+                status: SessionState::Pending,
                 host_id: None,
                 sandbox_id: None,
                 created_at: Utc::now(),
@@ -56,7 +56,7 @@ impl MetadataStore for MiniMeta {
             Session {
                 id: session_id,
                 user_id: spec.user_id,
-                status: SessionStatus::Active,
+                status: SessionState::Active,
                 host_id: Some(host_id),
                 sandbox_id: Some(sandbox_id),
                 created_at: Utc::now(),
@@ -80,7 +80,7 @@ impl MetadataStore for MiniMeta {
     async fn set_session_status(
         &self,
         id: SessionId,
-        status: SessionStatus,
+        status: SessionState,
     ) -> Result<(), MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
@@ -135,11 +135,11 @@ impl MetadataStore for MiniMeta {
         let mut affected = Vec::new();
         for s in g.values_mut() {
             if s.host_id == Some(host_id)
-                && !matches!(s.status, SessionStatus::Completed | SessionStatus::Failed)
+                && !matches!(s.status, SessionState::Completed | SessionState::Failed)
             {
                 s.host_id = None;
                 s.sandbox_id = None;
-                s.status = SessionStatus::Dead;
+                s.status = SessionState::Dead;
                 s.last_active_at = Utc::now();
                 affected.push(s.id);
             }
@@ -252,7 +252,7 @@ impl MetadataStore for MiniMeta {
     }
 }
 
-async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionStatus) -> SessionId {
+async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> SessionId {
     use engram_core::types::session::HarnessSpec;
     let id = meta
         .create_session(SessionSpec {
@@ -271,8 +271,8 @@ async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionStatus) -> S
 async fn evacuates_active_and_idle_sessions_clears_host_id() {
     let meta = MiniMeta::default();
     let host = HostId::new();
-    let s_active = seed_session(&meta, host, SessionStatus::Active).await;
-    let s_idle = seed_session(&meta, host, SessionStatus::Idle).await;
+    let s_active = seed_session(&meta, host, SessionState::Active).await;
+    let s_idle = seed_session(&meta, host, SessionState::Idle).await;
 
     let affected = meta
         .mark_host_dead_and_reassign_sessions(host)
@@ -289,11 +289,11 @@ async fn evacuates_active_and_idle_sessions_clears_host_id() {
     );
 
     let s_active_row = meta.get_session(s_active).await.unwrap();
-    assert_eq!(s_active_row.status, SessionStatus::Dead);
+    assert_eq!(s_active_row.status, SessionState::Dead);
     assert_eq!(s_active_row.host_id, None);
 
     let s_idle_row = meta.get_session(s_idle).await.unwrap();
-    assert_eq!(s_idle_row.status, SessionStatus::Dead);
+    assert_eq!(s_idle_row.status, SessionState::Dead);
     assert_eq!(s_idle_row.host_id, None);
 }
 
@@ -305,9 +305,9 @@ async fn skips_terminal_sessions_even_on_dead_host() {
     // to revive it via /resume.
     let meta = MiniMeta::default();
     let host = HostId::new();
-    let s_done = seed_session(&meta, host, SessionStatus::Completed).await;
-    let s_failed = seed_session(&meta, host, SessionStatus::Failed).await;
-    let s_active = seed_session(&meta, host, SessionStatus::Active).await;
+    let s_done = seed_session(&meta, host, SessionState::Completed).await;
+    let s_failed = seed_session(&meta, host, SessionState::Failed).await;
+    let s_active = seed_session(&meta, host, SessionState::Active).await;
 
     let affected = meta
         .mark_host_dead_and_reassign_sessions(host)
@@ -321,12 +321,12 @@ async fn skips_terminal_sessions_even_on_dead_host() {
     );
     assert_eq!(
         meta.get_session(s_done).await.unwrap().status,
-        SessionStatus::Completed,
+        SessionState::Completed,
         "completed must stay completed"
     );
     assert_eq!(
         meta.get_session(s_failed).await.unwrap().status,
-        SessionStatus::Failed
+        SessionState::Failed
     );
 }
 
@@ -335,8 +335,8 @@ async fn does_not_touch_sessions_on_other_hosts() {
     let meta = MiniMeta::default();
     let dead_host = HostId::new();
     let live_host = HostId::new();
-    let s_dead = seed_session(&meta, dead_host, SessionStatus::Active).await;
-    let s_live = seed_session(&meta, live_host, SessionStatus::Active).await;
+    let s_dead = seed_session(&meta, dead_host, SessionState::Active).await;
+    let s_live = seed_session(&meta, live_host, SessionState::Active).await;
 
     let affected = meta
         .mark_host_dead_and_reassign_sessions(dead_host)
@@ -351,7 +351,7 @@ async fn does_not_touch_sessions_on_other_hosts() {
         Some(live_host),
         "sessions on a different host must keep their host_id"
     );
-    assert_eq!(s_live_row.status, SessionStatus::Active);
+    assert_eq!(s_live_row.status, SessionState::Active);
 }
 
 #[tokio::test]
@@ -362,7 +362,7 @@ async fn idempotent_on_already_dead_host() {
     // host. The second caller just gets nothing to do.
     let meta = MiniMeta::default();
     let host = HostId::new();
-    let _s = seed_session(&meta, host, SessionStatus::Active).await;
+    let _s = seed_session(&meta, host, SessionState::Active).await;
 
     let first = meta
         .mark_host_dead_and_reassign_sessions(host)

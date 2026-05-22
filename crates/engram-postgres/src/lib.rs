@@ -12,7 +12,7 @@ use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
     EnabledImage, HarnessPack, HostCapacity, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionStatus, SnapshotRecord,
+    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -83,7 +83,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(id)
         .bind(spec.user_id.as_deref())
-        .bind(SessionStatus::Pending.as_str())
+        .bind(SessionState::Pending.as_str())
         .bind(&spec.image)
         .bind(harness_json)
         .bind(now)
@@ -114,7 +114,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(session_id.as_uuid())
         .bind(spec.user_id.as_deref())
-        .bind(SessionStatus::Active.as_str())
+        .bind(SessionState::Active.as_str())
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
         .bind(&spec.image)
@@ -195,7 +195,7 @@ impl MetadataStore for PostgresStore {
     async fn set_session_status(
         &self,
         id: SessionId,
-        status: SessionStatus,
+        status: SessionState,
     ) -> Result<(), MetaError> {
         let n = sqlx::query(
             r#"

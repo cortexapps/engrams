@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use engram_core::types::session::HarnessSpec;
 use engram_core::types::{
     EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionStatus, SnapshotRecord,
+    RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
@@ -30,7 +30,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     Ok(Session {
         id: SessionId(id),
         user_id: row.try_get("user_id").map_err(col_err)?,
-        status: parse_session_status(&status)?,
+        status: parse_session_state(&status)?,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
         image: image_uri,
@@ -208,17 +208,20 @@ pub(crate) fn harness_pack_from_row(row: &PgRow) -> Result<HarnessPack, MetaErro
     })
 }
 
-fn parse_session_status(s: &str) -> Result<SessionStatus, MetaError> {
+fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
     Ok(match s {
-        "pending" => SessionStatus::Pending,
-        "active" => SessionStatus::Active,
-        "idle" => SessionStatus::Idle,
-        "dead" => SessionStatus::Dead,
-        "completed" => SessionStatus::Completed,
-        "failed" => SessionStatus::Failed,
+        "pending" => SessionState::Pending,
+        "created" => SessionState::Created,
+        "guest_ready" => SessionState::GuestReady,
+        "active" => SessionState::Active,
+        "idle" => SessionState::Idle,
+        "host_lost" => SessionState::HostLost,
+        "dead" => SessionState::Dead,
+        "completed" => SessionState::Completed,
+        "failed" => SessionState::Failed,
         other => {
             return Err(MetaError::Serialization(format!(
-                "unknown session status: {other}"
+                "unknown session state: {other}"
             )));
         }
     })
@@ -242,22 +245,28 @@ mod tests {
     use super::*;
 
     /// Each enum variant must round-trip through the wire format the
-    /// migration uses. If you add a new variant to the enum, you must
-    /// also extend the SQL CHECK constraint and these parsers.
+    /// migration uses. ADR 0015 M2 expanded the set: `created`,
+    /// `guest_ready`, `host_lost` join the original six. If you add
+    /// a new variant, extend this test and `parse_session_state`
+    /// together — the column is `TEXT` with no CHECK constraint, so
+    /// the parser is the only enforcement.
     #[test]
-    fn session_status_parses_every_variant() {
+    fn session_state_parses_every_variant() {
         let variants = [
-            ("pending", SessionStatus::Pending),
-            ("active", SessionStatus::Active),
-            ("idle", SessionStatus::Idle),
-            ("completed", SessionStatus::Completed),
-            ("failed", SessionStatus::Failed),
-            ("dead", SessionStatus::Dead),
+            ("pending", SessionState::Pending),
+            ("created", SessionState::Created),
+            ("guest_ready", SessionState::GuestReady),
+            ("active", SessionState::Active),
+            ("idle", SessionState::Idle),
+            ("host_lost", SessionState::HostLost),
+            ("completed", SessionState::Completed),
+            ("failed", SessionState::Failed),
+            ("dead", SessionState::Dead),
         ];
         for (s, expected) in variants {
-            assert_eq!(parse_session_status(s).unwrap(), expected);
+            assert_eq!(parse_session_state(s).unwrap(), expected);
             // Round-trip: the as_str() output must parse back.
-            assert_eq!(parse_session_status(expected.as_str()).unwrap(), expected);
+            assert_eq!(parse_session_state(expected.as_str()).unwrap(), expected);
         }
     }
 
@@ -274,8 +283,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_session_status_returns_serialization_error() {
-        match parse_session_status("running") {
+    fn unknown_session_state_returns_serialization_error() {
+        match parse_session_state("running") {
             Err(MetaError::Serialization(msg)) => {
                 assert!(msg.contains("running"), "error must echo the bad value");
             }

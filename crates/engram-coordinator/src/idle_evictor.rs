@@ -20,7 +20,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
-use engram_core::types::SessionStatus;
+use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
 
 use crate::state::{SessionEvent, SharedState};
@@ -124,7 +124,7 @@ pub async fn evict_idle_session(
     if let Err(e) = state
         .services
         .meta
-        .set_session_status(session_id, SessionStatus::Idle)
+        .set_session_status(session_id, SessionState::Idle)
         .await
     {
         abort_inflight_snapshot(state, session_id, sandbox_id, "set_session_status").await;
@@ -156,8 +156,8 @@ pub async fn evict_idle_session(
         .emit(
             session_id,
             SessionEvent::StatusChanged {
-                from: SessionStatus::Active,
-                to: SessionStatus::Idle,
+                from: SessionState::Active,
+                to: SessionState::Idle,
                 at: now,
             },
         )
@@ -257,7 +257,7 @@ mod tests {
     use engram_cloud_mock::MockCloud;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
     use engram_core::types::session::HarnessSpec;
-    use engram_core::types::{Session, SessionStatus};
+    use engram_core::types::{Session, SessionState};
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::path::Path;
@@ -332,7 +332,7 @@ mod tests {
         let session = Session {
             id: session_id,
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
@@ -370,7 +370,7 @@ mod tests {
 
         // Session is Idle, sandbox_id cleared, registry unbound.
         let after = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(after.status, SessionStatus::Idle);
+        assert_eq!(after.status, SessionState::Idle);
         assert_eq!(after.sandbox_id, None);
         assert_eq!(state.registry.get(session_id), None);
 
@@ -530,7 +530,7 @@ mod tests {
         let session = Session {
             id: session_id,
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
@@ -736,7 +736,7 @@ mod tests {
         let session = Session {
             id: session_id,
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
@@ -833,7 +833,7 @@ mod tests {
         let session = Session {
             id: session_id,
             user_id: None,
-            status: SessionStatus::Active,
+            status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
@@ -851,6 +851,6 @@ mod tests {
 
         // Session stays Active (no eviction happened).
         let after = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(after.status, SessionStatus::Active);
+        assert_eq!(after.status, SessionState::Active);
     }
 }

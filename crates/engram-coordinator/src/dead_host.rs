@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::SessionStatus;
+use engram_core::types::SessionState;
 use engram_core::HostId;
 use sqlx::postgres::PgPool;
 
@@ -166,8 +166,8 @@ async fn evict_host(
     // already changed.
     for session_id in &session_ids {
         let event = SessionEvent::StatusChanged {
-            from: SessionStatus::Active,
-            to: SessionStatus::Dead,
+            from: SessionState::Active,
+            to: SessionState::Dead,
             at: Utc::now(),
         };
         let kind = event.kind();
