@@ -116,7 +116,23 @@ pub fn uffd_uds(jail_dir: &Path) -> PathBuf {
 /// Create (or replace) the symlink at `canonical` pointing at
 /// `target`. Idempotent: removes any pre-existing entry first.
 /// Errors map to `std::io::Error` for caller-side context wrapping.
+///
+/// Symlink targets are resolved relative to the symlink's *parent
+/// directory*, not the process CWD — so a relative target like
+/// `./var/host-sandboxes-integration/chunked-rootfs/<m>.ext4`
+/// installed at `<work_dir>/rootfs/<sid>.dev` resolves to
+/// `<work_dir>/rootfs/./var/...` and ENOENTs at every open. To
+/// keep callers position-independent we absolutise the target
+/// against the process CWD before symlinking (the target must
+/// exist when symlink lands — callers that violate this get an
+/// error here rather than a broken link later).
 pub async fn install_symlink(canonical: &Path, target: &Path) -> std::io::Result<()> {
+    let abs_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir()?;
+        cwd.join(target)
+    };
     // remove_file works for symlinks (it removes the link entry, not
     // the target). Ignore NotFound so first-time creation is a single
     // call.
@@ -125,7 +141,7 @@ pub async fn install_symlink(canonical: &Path, target: &Path) -> std::io::Result
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    tokio::fs::symlink(target, canonical).await
+    tokio::fs::symlink(&abs_target, canonical).await
 }
 
 /// Verify the rootfs canonical symlink exists at
