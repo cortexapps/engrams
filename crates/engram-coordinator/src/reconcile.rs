@@ -195,12 +195,12 @@ async fn flip_missing(
         );
     }
 
-    if let Err(e) = meta.set_session_status(session_id, new_status).await {
+    if let Err(e) = meta.transition_session(session_id, new_status).await {
         tracing::warn!(
             session_id = %session_id,
             error = %e,
             ?new_status,
-            "reconcile: set_session_status failed; will retry next tick"
+            "reconcile: transition_session failed; will retry next tick"
         );
         return;
     }

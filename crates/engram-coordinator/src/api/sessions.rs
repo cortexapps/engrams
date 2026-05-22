@@ -714,7 +714,7 @@ async fn create_session_inner(
         let _ = state
             .services
             .meta
-            .set_session_status(session_id, SessionState::Failed)
+            .transition_session(session_id, SessionState::Failed)
             .await;
         state.services.host.unbind_session(session_id).await;
         return Err(e.into());
@@ -809,6 +809,15 @@ pub async fn delete_session(
     // of silently succeeding.
     let session = state.services.meta.get_session(id).await?;
 
+    // Idempotent: a session already in a terminal state has nothing
+    // to tear down. Skip straight to 204 instead of trying to drive
+    // a `Completed`/`Failed`/`Dead` → `Completed` transition (which
+    // the state machine would reject as an illegal terminal-state
+    // move).
+    if session.status.is_terminal() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     if let Some(sandbox_id) = state.registry.unbind(id) {
         // Best-effort: a session being deleted shouldn't fail the API
         // because the underlying VM already crashed or never came up.
@@ -830,16 +839,16 @@ pub async fn delete_session(
     // anyway so an audit query "what sandboxes does the coordinator
     // think exist" matches reality.
     let _ = state.services.meta.assign_session_sandbox(id, None).await;
-    state
+    let prev = state
         .services
         .meta
-        .set_session_status(id, SessionState::Completed)
+        .transition_session(id, SessionState::Completed)
         .await?;
     state
         .emit(
             id,
             SessionEvent::StatusChanged {
-                from: session.status,
+                from: prev,
                 to: SessionState::Completed,
                 at: chrono::Utc::now(),
             },

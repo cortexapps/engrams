@@ -125,16 +125,19 @@ impl MetadataStore for MockMetadataStore {
             .collect())
     }
 
-    async fn set_session_status(
+    async fn transition_session(
         &self,
         id: SessionId,
-        status: SessionState,
-    ) -> Result<(), MetaError> {
+        target: SessionState,
+    ) -> Result<SessionState, MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.status = status;
+        let prev = s.status;
+        prev.try_transition_to(target)
+            .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        s.status = target;
         s.last_active_at = Utc::now();
-        Ok(())
+        Ok(prev)
     }
 
     async fn assign_session_host(
@@ -590,6 +593,39 @@ async fn api_create_session(app: axum::Router, repo: &str) -> SessionId {
     v["session_id"].as_str().unwrap().parse().unwrap()
 }
 
+/// Walk the ADR 0015 M2 legality table from the session's current
+/// state (whatever it is) to `target`. Tests in this file used to
+/// call `set_session_status(id, X)` to force a row into a given
+/// state; M2's `transition_session` validates every move, so tests
+/// have to go through legal intermediates exactly the way prod does.
+async fn seed_to(store: &MockMetadataStore, id: SessionId, target: SessionState) {
+    use SessionState::*;
+    let current = store.get_session(id).await.unwrap().status;
+    let path: &[SessionState] = match (current, target) {
+        // Already there — no-op.
+        (a, b) if a == b => &[],
+        // From Pending (just-created row).
+        (Pending, Created) => &[Created],
+        (Pending, GuestReady) => &[Created, GuestReady],
+        (Pending, Active) => &[Created, Active],
+        (Pending, Idle) => &[Created, Active, Idle],
+        (Pending, HostLost) => &[Created, Active, HostLost],
+        (Pending, Failed) => &[Failed],
+        (Pending, Completed) => &[Created, Active, Completed],
+        (Pending, Dead) => &[Created, Active, Dead],
+        // From Active (post-create test that wants a later state).
+        (Active, Idle) => &[Idle],
+        (Active, HostLost) => &[HostLost],
+        (Active, Completed) => &[Completed],
+        (Active, Dead) => &[Dead],
+        (Active, Failed) => &[Failed],
+        (from, to) => panic!("seed_to: no path defined from {from:?} to {to:?}"),
+    };
+    for step in path {
+        store.transition_session(id, *step).await.unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -913,20 +949,11 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
             .unwrap()
     }
     let active_id = mk(&store, "alive").await;
-    store
-        .set_session_status(active_id, SessionState::Active)
-        .await
-        .unwrap();
+    seed_to(&store, active_id, SessionState::Active).await;
     let idle_id = mk(&store, "idle-too").await;
-    store
-        .set_session_status(idle_id, SessionState::Idle)
-        .await
-        .unwrap();
+    seed_to(&store, idle_id, SessionState::Idle).await;
     let dead_id = mk(&store, "done").await;
-    store
-        .set_session_status(dead_id, SessionState::Completed)
-        .await
-        .unwrap();
+    seed_to(&store, dead_id, SessionState::Completed).await;
 
     let app = build_app(store);
     let resp = app
@@ -1003,6 +1030,12 @@ async fn delete_session_marks_completed_and_returns_204() {
         })
         .await
         .unwrap();
+    // The mock's create_session inserts at Pending (the legacy
+    // insert-then-update path); production uses create_session_active
+    // / create_session_created which insert at a later state. Walk
+    // the legal transitions to Active so DELETE sees a session in a
+    // state from which Completed is reachable.
+    seed_to(&store, id, SessionState::Active).await;
 
     let app = build_app(store.clone());
     let resp = app
@@ -1617,10 +1650,7 @@ async fn resume_410_gone_when_no_snapshot_exists() {
         })
         .await
         .unwrap();
-    store
-        .set_session_status(id, SessionState::Idle)
-        .await
-        .unwrap();
+    seed_to(&store, id, SessionState::Idle).await;
     let app = build_app(store);
     let resp = post(app, &format!("/sessions/{id}/resume"), json!({})).await;
     assert_eq!(resp.status(), StatusCode::GONE);

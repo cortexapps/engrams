@@ -93,8 +93,12 @@ impl MetadataStore for MockMetadataStore {
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         Ok(vec![])
     }
-    async fn set_session_status(&self, _: SessionId, _: SessionState) -> Result<(), MetaError> {
-        Ok(())
+    async fn transition_session(
+        &self,
+        _: SessionId,
+        target: SessionState,
+    ) -> Result<SessionState, MetaError> {
+        Ok(target)
     }
     async fn assign_session_host(&self, _: SessionId, _: Option<HostId>) -> Result<(), MetaError> {
         Ok(())

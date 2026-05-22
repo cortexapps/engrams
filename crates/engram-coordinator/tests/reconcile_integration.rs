@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 /// In-memory MetadataStore stub. Covers the methods reconcile calls
 /// (`list_active_sandbox_assignments_on_host`,
 /// `latest_snapshot_for_session`, `get_session`,
-/// `set_session_status`, `assign_session_sandbox`,
+/// `transition_session`, `assign_session_sandbox`,
 /// `append_session_event`). Every other method returns a sensible
 /// empty default so the trait compiles.
 #[derive(Default)]
@@ -138,16 +138,19 @@ impl MetadataStore for ReconcileMeta {
             .cloned()
             .collect())
     }
-    async fn set_session_status(
+    async fn transition_session(
         &self,
         id: SessionId,
-        status: SessionState,
-    ) -> Result<(), MetaError> {
+        target: SessionState,
+    ) -> Result<SessionState, MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.status = status;
+        let prev = s.status;
+        prev.try_transition_to(target)
+            .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        s.status = target;
         s.last_active_at = Utc::now();
-        Ok(())
+        Ok(prev)
     }
     async fn assign_session_host(
         &self,

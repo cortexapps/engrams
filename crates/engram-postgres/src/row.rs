@@ -208,6 +208,10 @@ pub(crate) fn harness_pack_from_row(row: &PgRow) -> Result<HarnessPack, MetaErro
     })
 }
 
+pub(crate) fn parse_session_state_for_lib(s: &str) -> Result<SessionState, MetaError> {
+    parse_session_state(s)
+}
+
 fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
     Ok(match s {
         "pending" => SessionState::Pending,

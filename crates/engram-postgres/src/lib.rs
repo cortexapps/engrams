@@ -192,12 +192,43 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
-    async fn set_session_status(
+    async fn transition_session(
         &self,
         id: SessionId,
-        status: SessionState,
-    ) -> Result<(), MetaError> {
-        let n = sqlx::query(
+        target: SessionState,
+    ) -> Result<SessionState, MetaError> {
+        // SELECT-then-UPDATE under a row-level lock so two concurrent
+        // callers can't both validate against the same pre-state. The
+        // transaction commits the UPDATE atomically with the lock
+        // release.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(
+            r#"
+            SELECT status FROM sessions WHERE id = $1 FOR UPDATE
+            "#,
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let current_raw: String = row.try_get("status").map_err(|e| {
+            MetaError::Serialization(format!("transition_session: read current: {e}"))
+        })?;
+        let current = row::parse_session_state_for_lib(&current_raw)?;
+        // Legality check — failure surfaces as Conflict with the
+        // rendered IllegalTransition (carrying both sides) so callers
+        // can format an HTTP 409 body without reconstructing context.
+        current.try_transition_to(target).map_err(|e| {
+            tracing::warn!(
+                session_id = %id,
+                from = %current.as_str(),
+                to = %target.as_str(),
+                "rejected illegal session state transition"
+            );
+            MetaError::Conflict(e.to_string())
+        })?;
+        sqlx::query(
             r#"
             UPDATE sessions
                SET status = $2, last_active_at = NOW(), updated_at = NOW()
@@ -205,15 +236,12 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(id.as_uuid())
-        .bind(status.as_str())
-        .execute(&self.pool)
+        .bind(target.as_str())
+        .execute(&mut *tx)
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
-            return Err(MetaError::NotFound);
-        }
-        Ok(())
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(current)
     }
 
     async fn assign_session_host(

@@ -727,17 +727,20 @@ pub(crate) mod tests {
         async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
             Ok(vec![self.session.lock().clone()])
         }
-        async fn set_session_status(
+        async fn transition_session(
             &self,
             id: engram_core::SessionId,
-            status: engram_core::types::SessionState,
-        ) -> Result<(), MetaError> {
+            target: engram_core::types::SessionState,
+        ) -> Result<engram_core::types::SessionState, MetaError> {
             let mut s = self.session.lock();
             if id != s.id {
                 return Err(MetaError::NotFound);
             }
-            s.status = status;
-            Ok(())
+            let prev = s.status;
+            prev.try_transition_to(target)
+                .map_err(|e| MetaError::Conflict(e.to_string()))?;
+            s.status = target;
+            Ok(prev)
         }
         async fn assign_session_host(
             &self,

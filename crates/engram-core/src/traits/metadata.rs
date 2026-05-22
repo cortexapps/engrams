@@ -81,11 +81,30 @@ pub trait MetadataStore: Send + Sync {
             })
             .collect())
     }
-    async fn set_session_status(
+    /// ADR 0015 M2: the single validated entry point for `UPDATE
+    /// sessions SET status = ...`. Reads the current state, runs
+    /// [`SessionState::try_transition_to`] against `target`, and
+    /// writes the UPDATE atomically. Returns the previous state on
+    /// success — callers use it as the `from` of the `StatusChanged`
+    /// event they emit.
+    ///
+    /// Errors:
+    /// - [`MetaError::NotFound`] — no row with this `id`.
+    /// - [`MetaError::Conflict`] — the transition is not in the
+    ///   legality table. The message is the rendered
+    ///   [`crate::types::session::IllegalTransition`] so logs and HTTP
+    ///   bodies show both sides.
+    ///
+    /// Impls must do the SELECT and UPDATE under a single row-level
+    /// lock to prevent two concurrent callers racing on the same
+    /// (from, to) — without that, both could validate against the
+    /// same pre-state and the second's UPDATE silently breaks the
+    /// invariant.
+    async fn transition_session(
         &self,
         id: SessionId,
-        status: SessionState,
-    ) -> Result<(), MetaError>;
+        target: SessionState,
+    ) -> Result<SessionState, MetaError>;
     async fn assign_session_host(
         &self,
         id: SessionId,

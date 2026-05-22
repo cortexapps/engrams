@@ -208,21 +208,32 @@ async fn transition_to_dead_if_no_snapshot(
     {
         return Ok(());
     }
-    let _ = state
+    match state
         .services
         .meta
-        .set_session_status(id, SessionState::Dead)
-        .await;
-    let _ = state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Idle,
-                to: SessionState::Dead,
-                at: Utc::now(),
-            },
-        )
-        .await;
+        .transition_session(id, SessionState::Dead)
+        .await
+    {
+        Ok(prev) => {
+            let _ = state
+                .emit(
+                    id,
+                    SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Dead,
+                        at: Utc::now(),
+                    },
+                )
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "transition_to_dead_if_no_snapshot: transition failed (likely already terminal); leaving as-is"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -312,7 +323,7 @@ async fn resume_from_fc_snapshot(
             let _ = state
                 .services
                 .meta
-                .set_session_status(id, SessionState::Dead)
+                .transition_session(id, SessionState::Dead)
                 .await;
             return Err(ApiError::Gone(
                 "snapshot_invalidated: session can't be revived; \
@@ -323,6 +334,28 @@ async fn resume_from_fc_snapshot(
         Err(e) => return Err(ApiError::from(e)),
     };
     bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
+    // ADR 0015 M2: resume re-runs the create-shape transitions on
+    // the new sandbox — Idle → Created (now that a host + sandbox are
+    // bound), then Created → Active after start_agent succeeds. This
+    // mirrors the create path so /exec, /shell, /prompt see "Active
+    // means agentd is reachable + harness is running" no matter
+    // whether the session is fresh or resumed.
+    let now = Utc::now();
+    let prev_for_created = state
+        .services
+        .meta
+        .transition_session(id, SessionState::Created)
+        .await?;
+    state
+        .emit(
+            id,
+            SessionEvent::StatusChanged {
+                from: prev_for_created,
+                to: SessionState::Created,
+                at: now,
+            },
+        )
+        .await?;
     // Re-launch the per-session agent so the in-VM agentd's
     // harness supervisor kill+respawns the harness for the restored
     // sandbox. Without this, the post-resume VM has the pre-snapshot
@@ -380,6 +413,7 @@ async fn resume_from_fc_snapshot(
         crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
             .ok()
             .flatten();
+    let mut start_agent_failed = false;
     if let Some(agent) = agent_opt {
         // Pre-existing gap (not introduced by ADR 0013): resume
         // doesn't re-apply the SessionEgressPolicy on the new
@@ -413,20 +447,49 @@ async fn resume_from_fc_snapshot(
                 session_id = %id,
                 sandbox_id = %new_sandbox_id,
                 error = %e,
-                "post-resume start_agent failed; harness may not reattach",
+                "post-resume start_agent failed; leaving session at Created so /exec returns 409",
             );
+            start_agent_failed = true;
         }
     }
-    finalize_resume(
-        &state,
-        id,
-        session.status,
-        SessionEvent::Resumed {
-            snapshot_id: record.id,
-            at: Utc::now(),
-        },
-    )
-    .await?;
+    if start_agent_failed {
+        // ADR 0015 M2 honesty: don't pretend the session is Active
+        // when agentd never re-attached. Leave at Created — next
+        // /exec/shell/prompt sees a 409 with the actual state instead
+        // of a vsock-not-reachable error. The user can re-issue
+        // /resume after fixing whatever broke the host's agentd.
+        return Ok(SnapshotResponse {
+            session_id: id,
+            snapshot_id: Some(record.id.to_string()),
+            size_bytes: Some(record.size_bytes),
+            note: "resumed; harness reattach failed — session left in Created",
+        });
+    }
+    let prev_for_active = state
+        .services
+        .meta
+        .transition_session(id, SessionState::Active)
+        .await?;
+    let now = Utc::now();
+    state
+        .emit(
+            id,
+            SessionEvent::Resumed {
+                snapshot_id: record.id,
+                at: now,
+            },
+        )
+        .await?;
+    state
+        .emit(
+            id,
+            SessionEvent::StatusChanged {
+                from: prev_for_active,
+                to: SessionState::Active,
+                at: now,
+            },
+        )
+        .await?;
 
     Ok(SnapshotResponse {
         session_id: id,
@@ -478,32 +541,6 @@ async fn bind_resumed_session(
     state.services.host.bind_session(id, sandbox_id).await;
 }
 
-async fn finalize_resume(
-    state: &SharedState,
-    id: SessionId,
-    from: SessionState,
-    resume_event: SessionEvent,
-) -> Result<(), ApiError> {
-    state
-        .services
-        .meta
-        .set_session_status(id, SessionState::Active)
-        .await?;
-    let now = Utc::now();
-    state.emit(id, resume_event).await?;
-    state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from,
-                to: SessionState::Active,
-                at: now,
-            },
-        )
-        .await?;
-    Ok(())
-}
-
 pub async fn evict_local(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
@@ -552,10 +589,10 @@ pub async fn evict_local(
     // exists. host_id stays so resume's snapshot affinity still
     // prefers the same host.
     let _ = state.services.meta.assign_session_sandbox(id, None).await;
-    state
+    let prev = state
         .services
         .meta
-        .set_session_status(id, SessionState::Idle)
+        .transition_session(id, SessionState::Idle)
         .await?;
     let now = Utc::now();
     state.emit(id, SessionEvent::Evicted { at: now }).await?;
@@ -563,7 +600,7 @@ pub async fn evict_local(
         .emit(
             id,
             SessionEvent::StatusChanged {
-                from: SessionState::Active,
+                from: prev,
                 to: SessionState::Idle,
                 at: now,
             },

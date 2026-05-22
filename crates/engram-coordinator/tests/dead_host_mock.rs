@@ -77,15 +77,18 @@ impl MetadataStore for MiniMeta {
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         Ok(self.sessions.lock().values().cloned().collect())
     }
-    async fn set_session_status(
+    async fn transition_session(
         &self,
         id: SessionId,
-        status: SessionState,
-    ) -> Result<(), MetaError> {
+        target: SessionState,
+    ) -> Result<SessionState, MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.status = status;
-        Ok(())
+        let prev = s.status;
+        prev.try_transition_to(target)
+            .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        s.status = target;
+        Ok(prev)
     }
     async fn assign_session_host(
         &self,
@@ -263,8 +266,29 @@ async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> Se
         .await
         .unwrap();
     meta.assign_session_host(id, Some(host)).await.unwrap();
-    meta.set_session_status(id, status).await.unwrap();
+    // Walk the ADR 0015 M2 legality table from Pending to `status`.
+    // Tests interact with `transition_session` exactly the way prod
+    // does — no escape hatch — so the seed helper reaches each target
+    // via the same transitions the running coord would.
+    for step in legal_path_from_pending(status) {
+        meta.transition_session(id, *step).await.unwrap();
+    }
     id
+}
+
+fn legal_path_from_pending(target: SessionState) -> &'static [SessionState] {
+    use SessionState::*;
+    match target {
+        Pending => &[],
+        Created => &[Created],
+        GuestReady => &[Created, GuestReady],
+        Active => &[Created, Active],
+        Idle => &[Created, Active, Idle],
+        HostLost => &[Created, Active, HostLost],
+        Failed => &[Failed],
+        Completed => &[Created, Active, Completed],
+        Dead => &[Created, Active, Dead],
+    }
 }
 
 #[tokio::test]

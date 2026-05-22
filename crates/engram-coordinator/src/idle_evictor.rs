@@ -121,15 +121,18 @@ pub async fn evict_idle_session(
             "idle eviction: assign_session_sandbox(None) failed",
         );
     }
-    if let Err(e) = state
+    let prev = match state
         .services
         .meta
-        .set_session_status(session_id, SessionState::Idle)
+        .transition_session(session_id, SessionState::Idle)
         .await
     {
-        abort_inflight_snapshot(state, session_id, sandbox_id, "set_session_status").await;
-        return Err(EvictError::Meta(e.to_string()));
-    }
+        Ok(prev) => prev,
+        Err(e) => {
+            abort_inflight_snapshot(state, session_id, sandbox_id, "transition_session").await;
+            return Err(EvictError::Meta(e.to_string()));
+        }
+    };
 
     if let Err(e) = state
         .emit(
@@ -156,7 +159,7 @@ pub async fn evict_idle_session(
         .emit(
             session_id,
             SessionEvent::StatusChanged {
-                from: SessionState::Active,
+                from: prev,
                 to: SessionState::Idle,
                 at: now,
             },

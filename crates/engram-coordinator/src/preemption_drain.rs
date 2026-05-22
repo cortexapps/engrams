@@ -195,10 +195,10 @@ pub async fn drain_session(
             "preemption drain: assign_session_sandbox(None) failed",
         );
     }
-    state
+    let prev = state
         .services
         .meta
-        .set_session_status(session_id, SessionState::Dead)
+        .transition_session(session_id, SessionState::Dead)
         .await
         .map_err(|e| DrainError::Meta(e.to_string()))?;
 
@@ -206,7 +206,7 @@ pub async fn drain_session(
         .emit(
             session_id,
             SessionEvent::StatusChanged {
-                from: SessionState::Active,
+                from: prev,
                 to: SessionState::Dead,
                 at: Utc::now(),
             },
