@@ -187,6 +187,18 @@ integration-reset:
 integration-test:
     bash deploy/dev/integration-test.sh
 
+# Persistent dev session — bakes + enables + creates a session and
+# leaves it running so you can poke at it with curl, wscat, or the
+# web UI. Idempotent: reuses an already-enabled image and an
+# already-live session for this commit. Companion to
+# integration-test (which always cleans up).
+#
+# Usage:
+#   just integration-session
+#   HARNESS=claude PROMPT='hi' just integration-session
+integration-session:
+    bash deploy/dev/integration-session.sh
+
 # Bake an image from a directory containing Dockerfile + engram.toml,
 # then push it to the local OCI registry. Auto-selects cross-compile
 # target + `--transport` flag based on host arch. Tag defaults to
