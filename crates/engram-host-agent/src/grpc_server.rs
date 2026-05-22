@@ -22,14 +22,11 @@ use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
 use engram_protocol::grpc::{
-    lease_warm_response::Outcome as PbLeaseOutcome, ApplyEgressPolicyRequest,
-    BindHarnessSessionRequest, CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit,
-    ExecFrame, ExecStartRequest, GuestIpResponse, LaunchWarmRequest, LeaseWarmRequest,
-    LeaseWarmResponse, ListSandboxesResponse, ProxyShellFrame, ProxyShellKind,
-    ReapMaterializeDirRequest, ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SnapshotResponse, StaleTemplate as PbStaleTemplate,
-    StartAgentRequest, UnbindHarnessSessionRequest, WarmSlotCount as PbWarmSlotCount,
-    WarmSlotsResponse,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
+    CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
+    ListSandboxesResponse, ProxyShellFrame, ProxyShellKind, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -291,89 +288,6 @@ impl HostService for HostServiceImpl {
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
-    }
-
-    /// ADR 0014: atomic take from the warm pool. The three response
-    /// outcomes (granted / stale / no_capacity) come from the
-    /// HostClient trait and map 1:1 onto the proto oneof.
-    async fn lease_warm_sandbox(
-        &self,
-        req: Request<LeaseWarmRequest>,
-    ) -> Result<Response<LeaseWarmResponse>, Status> {
-        use engram_core::traits::host_client::WarmLeaseOutcome;
-        let r = req.into_inner();
-        let template_ref = decode_template_ref(&r.template_ref)?;
-        let outcome = self
-            .inner
-            .lease_warm_sandbox(template_ref)
-            .await
-            .map_err(sandbox_to_status)?;
-        let pb_outcome = match outcome {
-            WarmLeaseOutcome::Granted(id) => {
-                PbLeaseOutcome::SandboxId(id.as_uuid().as_bytes().to_vec())
-            }
-            WarmLeaseOutcome::Stale { current_ref } => PbLeaseOutcome::Stale(PbStaleTemplate {
-                current_ref: current_ref.as_uuid().as_bytes().to_vec(),
-            }),
-            WarmLeaseOutcome::NoCapacity => PbLeaseOutcome::NoCapacity(Empty {}),
-        };
-        Ok(Response::new(LeaseWarmResponse {
-            outcome: Some(pb_outcome),
-        }))
-    }
-
-    /// ADR 0014: activate a leased warm sandbox by pushing a fresh
-    /// SpawnHarness (carrying the per-session agent + env) and
-    /// applying the egress policy to the host's proxy registry.
-    async fn launch_warm_sandbox(
-        &self,
-        req: Request<LaunchWarmRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        let r = req.into_inner();
-        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
-        let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
-        // ADR 0014 M1.12: proto3 string can't be `Option`; empty
-        // string on the wire means "no harness swap" (e.g.,
-        // `kind = none` sessions).
-        let harness_pack_uri = if r.harness_pack_uri.is_empty() {
-            None
-        } else {
-            Some(r.harness_pack_uri)
-        };
-        let harness_name = if r.harness_name.is_empty() {
-            None
-        } else {
-            Some(r.harness_name)
-        };
-        self.inner
-            .launch_warm_sandbox(sandbox_id, agent, policy, harness_pack_uri, harness_name)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
-    }
-
-    /// ADR 0014: inventory query for ops + scheduler shortcuts.
-    async fn list_warm_slots(
-        &self,
-        _req: Request<Empty>,
-    ) -> Result<Response<WarmSlotsResponse>, Status> {
-        let slots = self
-            .inner
-            .list_warm_slots()
-            .await
-            .map_err(sandbox_to_status)?;
-        let pb_slots = slots
-            .into_iter()
-            .map(|s| PbWarmSlotCount {
-                template_ref: s.template_ref.as_uuid().as_bytes().to_vec(),
-                available: s.available,
-                target: s.target,
-                refill_failures_since_last: s.refill_failures_since_last,
-                last_error_class: s.last_error_class,
-            })
-            .collect();
-        Ok(Response::new(WarmSlotsResponse { slots: pb_slots }))
     }
 
     async fn reap_materialize_dir(
@@ -645,20 +559,6 @@ fn decode_sandbox_id(bytes: &[u8]) -> Result<engram_core::SandboxId, Status> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(bytes);
     Ok(engram_core::SandboxId(uuid::Uuid::from_bytes(buf)))
-}
-
-fn decode_template_ref(bytes: &[u8]) -> Result<engram_core::types::ids::TemplateRef, Status> {
-    if bytes.len() != 16 {
-        return Err(Status::invalid_argument(format!(
-            "template_ref must be 16 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(bytes);
-    Ok(engram_core::types::ids::TemplateRef::from(
-        uuid::Uuid::from_bytes(buf),
-    ))
 }
 
 fn decode_session_id(bytes: &[u8]) -> Result<engram_core::SessionId, Status> {

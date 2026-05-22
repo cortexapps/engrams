@@ -2950,9 +2950,7 @@ impl SandboxBackend for FirecrackerBackend {
                     )
                 })?
                 .map_err(|e| {
-                    SandboxError::Vm(
-                        format!("agent_ready watch closed unexpectedly: {e}").into(),
-                    )
+                    SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
                 })?;
         }
 

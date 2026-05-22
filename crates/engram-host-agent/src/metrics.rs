@@ -59,25 +59,12 @@ pub fn init(addr: SocketAddr) {
 ///   - `agent_handshake` (entry-point emits this; covers
 ///     `notify_session_policy` + waiting on agentd's ready dial +
 ///     the SpawnHarness round-trip):
-///     - on the **cold-create** path, emitted from
-///       `grpc_server::start_agent` (the coord's gRPC entry).
-///       Time is dominated by in-VM boot: kernel + engram-init +
-///       ext4 mount + agentd bind before its readiness dial reaches
-///       the host.
-///     - on the **warm-lease** path, emitted from
-///       `WarmPool::launch`. Same downstream code, but bootstrap
-///       is already accept()'ing on the pre-restored microVM, so
-///       this should run sub-100ms in the happy case.
-///   - `warm_lease` (`WarmPool::lease` — DashMap pop primitive;
-///     sub-millisecond in the granted case, slightly longer when
-///     the requested template_ref is stale or unknown).
-/// - `outcome`: `success` / `invalid_spec` / `fc_error` / for
-///   `warm_lease` also `no_capacity` / `stale`.
-/// - `kind`: `cold` (sessions that took the full create path) or
-///   `warm` (warm-pool-leased sessions). Use this label to compare
-///   the same `phase` across the two paths — the headline win of
-///   ADR 0014 lands as `agent_handshake{kind="warm"}` being ~25×
-///   shorter than `agent_handshake{kind="cold"}`.
+///     ADR 0015 M5: cold-create is the only path; warm pool was
+///     retired. Emitted from `grpc_server::start_agent`. Time is
+///     dominated by in-VM boot: kernel + engram-init + ext4 mount +
+///     agentd bind before its readiness dial reaches the host.
+/// - `outcome`: `success` / `invalid_spec` / `fc_error`.
+/// - `kind`: `cold` only (kept as a label for future warm-pool v2).
 ///
 /// Pairs with the coord-side `engram_session_boot_seconds` — same
 /// operation, different vantage; comparing the two surfaces gRPC
@@ -85,20 +72,6 @@ pub fn init(addr: SocketAddr) {
 /// `histogram_quantile(0.95, sum by (phase, kind, le) (rate(
 /// engram_sandbox_boot_seconds_bucket[5m])))`.
 pub const SANDBOX_BOOT_SECONDS: &str = "engram_sandbox_boot_seconds";
-
-/// Histogram. ADR 0014 M1.13: per-phase timing of a warm-pool
-/// refill on the host. Labels:
-/// - `phase`: `prefetch` (parallel chunk fetch into NVMe before
-///   load_snapshot) or `restore` (the inner FC restore, including
-///   materialize_to_file_cached + load_snapshot_uffd).
-/// - `outcome`: `success` / `failed`.
-///
-/// The dominant cost on a chunk-cache-cold host is `prefetch` —
-/// parallel-fetching the snapshot's memory chunks from BlobStorage.
-/// On a chunk-cache-warm host (host has served the template before)
-/// prefetch is a sub-millisecond no-op; the cost moves into
-/// `restore` (load_snapshot UFFD setup + on-disk reads).
-pub const WARM_POOL_REFILL_SECONDS: &str = "engram_warm_pool_refill_seconds";
 
 /// Counter. Sandboxes the host has been asked to create, labelled
 /// by `outcome` (`success` / `invalid_spec` / `image_pull_failed`

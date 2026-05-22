@@ -1,13 +1,13 @@
 use chrono::{DateTime, Utc};
-use engram_core::types::ids::TemplateRef;
-use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::types::template::TemplateRecord;
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
 use serde::{Deserialize, Serialize};
 
 /// Heartbeat message: host -> coordinator, every ~5s. Reports
-/// current capacity, the snapshots held locally, and the set of
-/// sandbox_ids the host currently has live in its `SandboxBackend`.
+/// current capacity, the snapshots held locally, the set of
+/// sandbox_ids the host currently has live in its `SandboxBackend`,
+/// and (ADR 0015 M5) which images this host has fully prefetched to
+/// local NVMe — the scheduler uses the readiness set to gate session
+/// creates onto hosts that can serve them quickly.
 ///
 /// `running_sandboxes` is the load-bearing input to ADR 0009's
 /// reconciliation pass: the coord intersects this against
@@ -15,14 +15,6 @@ use serde::{Deserialize, Serialize};
 /// and any session whose sandbox is missing for N consecutive
 /// heartbeats transitions to `Idle` (if its latest snapshot is
 /// recoverable) or `Dead`.
-///
-/// Pre-v5: this carried a `warm_pools: Vec<WarmPoolReport>` field
-/// that reported per-image-version warm-slot ready/target counts.
-/// Warm pools were deleted as part of the ADR 0008 follow-up — the
-/// scheduling preference they enabled (route a session to a host
-/// that already had a matching warm slot) gave way to chunked-OCI
-/// content-addressable rootfs + canonical-memory restore (FC) and
-/// straight cold start (VZ). See the deletion commit for context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub host_id: HostId,
@@ -36,6 +28,15 @@ pub struct Heartbeat {
     /// Ordered for deterministic test fixtures; the coord doesn't care.
     pub running_sandboxes: Vec<SandboxId>,
     pub draining: bool,
+    /// ADR 0015 M5: manifest digests of every image this host has
+    /// fully prefetched to local NVMe. The scheduler's
+    /// `pick_for_session` filter requires the requested image's
+    /// digest to be present in some host's set; if zero hosts are
+    /// ready, the session create returns
+    /// `ApiError::ImageNotReady`. Drained on each heartbeat from
+    /// the host-agent's `image_prefetch` supervisor.
+    #[serde(default)]
+    pub ready_images: Vec<ManifestDigest>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -43,34 +44,6 @@ pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,
     pub running_sandboxes: u32,
-    /// ADR 0014: per-template warm slot inventory. The coord
-    /// scheduler uses this as a parallel-ask hint — hosts that
-    /// report zero (or no entry) for a template are skipped, no
-    /// gRPC round-trip needed. Empty `Vec` (the default) means
-    /// "no warm pool here", which is the mode=all / pre-warm-pool
-    /// state and matches what the coord scheduler treats as
-    /// "everyone is cold".
-    #[serde(default)]
-    pub warm_slots: Vec<WarmSlotReport>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WarmSlotReport {
-    pub template_ref: TemplateRef,
-    /// Sandboxes currently in the free-list (ready to lease).
-    pub available: u32,
-    /// Autoscaler target N this host is keeping the pool at.
-    pub target: u32,
-    /// ADR 0014 issue #5: refill failures observed since the last
-    /// heartbeat. Drained on read by `WarmPool::list_slots` so
-    /// each heartbeat reports the delta, not a cumulative count.
-    #[serde(default)]
-    pub refill_failures_since_last: u32,
-    /// Short classifier of the most recent failure
-    /// (`"blob_not_found"`, `"manifest_load"`, `"fc_spawn"`,
-    /// `"other"`). Empty when no failures since last heartbeat.
-    #[serde(default)]
-    pub last_error_class: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,21 +61,51 @@ pub struct HeartbeatAck {
     /// Sessions the coordinator has reassigned away from this host.
     /// The host should drop them from local state on next reconciliation.
     pub revoked_sessions: Vec<SessionId>,
-    /// ADR 0014: coord's authoritative active-template set, with
-    /// each entry's full SnapshotMetadata inlined so the host's
-    /// WarmPool can `restore` without a second round-trip.
-    /// Empty `Vec` means the coord has no active templates (or
-    /// hasn't enabled warm-pool yet) — the host's WarmPool will
-    /// drain its existing slots after the STALE_GRACE window.
+    /// ADR 0015 M5: coord's authoritative `enabled_images` set. Hosts
+    /// diff this against their local NVMe cache and drive prefetch
+    /// for any image whose chunks aren't all present. Empty means
+    /// "no images enabled" — host clears its ready set on next
+    /// supervisor tick.
     #[serde(default)]
-    pub active_templates: Vec<ActiveTemplate>,
+    pub enabled_images: Vec<EnabledImageRef>,
 }
 
-/// One entry in [`HeartbeatAck::active_templates`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ActiveTemplate {
-    pub record: TemplateRecord,
-    pub snapshot: SnapshotMetadata,
+/// Identity of one enabled image. Manifest digest is the sha256 of
+/// the OCI manifest (existing column on `enabled_images`); it's the
+/// content-addressed key the scheduler matches `ready_images`
+/// against.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnabledImageRef {
+    pub image_uri: String,
+    pub manifest_digest: ManifestDigest,
+}
+
+/// Newtype over the OCI manifest digest string (`sha256:<hex>`).
+/// Wraps the raw string so it's distinct from arbitrary `String`s
+/// in scheduler / readiness signatures.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ManifestDigest(pub String);
+
+impl ManifestDigest {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ManifestDigest {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl std::fmt::Display for ManifestDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[cfg(test)]
@@ -117,7 +120,6 @@ mod tests {
                 total_mib: 256_000,
                 used_mib: 64_000,
                 running_sandboxes: 7,
-                warm_slots: Vec::new(),
             },
             local_snapshots: vec![LocalSnapshotReport {
                 snapshot_id: SnapshotId::new(),
@@ -128,6 +130,7 @@ mod tests {
             }],
             running_sandboxes: vec![SandboxId::new(), SandboxId::new()],
             draining: false,
+            ready_images: Vec::new(),
         }
     }
 
@@ -172,11 +175,15 @@ mod tests {
         let original = HeartbeatAck {
             server_time: Utc::now(),
             revoked_sessions: vec![SessionId::new(), SessionId::new()],
-            active_templates: Vec::new(),
+            enabled_images: vec![EnabledImageRef {
+                image_uri: "localhost:5001/test/demo:warm-1".into(),
+                manifest_digest: ManifestDigest::new("sha256:abc123"),
+            }],
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: HeartbeatAck = serde_json::from_str(&json).unwrap();
         assert_eq!(back.revoked_sessions, original.revoked_sessions);
+        assert_eq!(back.enabled_images, original.enabled_images);
     }
 
     #[test]
@@ -188,5 +195,13 @@ mod tests {
         h.local_snapshots.clear();
         let v: serde_json::Value = serde_json::to_value(&h).unwrap();
         assert_eq!(v["local_snapshots"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn ready_images_serializes_as_array() {
+        let mut h = sample();
+        h.ready_images = vec![ManifestDigest::new("sha256:deadbeef")];
+        let v: serde_json::Value = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["ready_images"], serde_json::json!(["sha256:deadbeef"]));
     }
 }

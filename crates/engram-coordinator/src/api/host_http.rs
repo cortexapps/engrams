@@ -29,7 +29,9 @@ use chrono::{DateTime, Utc};
 use engram_core::types::host::{HostCapacity, HostMetadata, HostRecord, HostStatus};
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
-use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
+use engram_protocol::heartbeat::{
+    EnabledImageRef, HostCapacityReport, LocalSnapshotReport, ManifestDigest,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -65,17 +67,13 @@ pub struct RegisterResponse {
     /// invariant that existed on the WS path didn't survive into
     /// gRPC, since gRPC carries its own schema.
     pub coord_wire_version: u32,
-    /// ADR 0014 M1.11: the current active-templates set, same shape
-    /// the heartbeat-ack carries. Bootstrapping a fresh host through
-    /// the first heartbeat tick (~few seconds) leaves the warm pool
-    /// empty during that window; piggy-backing the template list on
-    /// `register` lets the host start its refill loop *immediately*
-    /// after registering, shrinking the post-MIG-roll "no warm
-    /// slots" window from `heartbeat_interval + refill_time` to just
-    /// `refill_time`. Default empty for old hosts that ignore the
-    /// field (forward-compat).
+    /// ADR 0015 M5: the current enabled-images set, same shape the
+    /// heartbeat-ack carries. Piggy-backing on register lets the
+    /// host start its prefetch loop immediately, shrinking the
+    /// first-ready window from `heartbeat_interval + prefetch_time`
+    /// to just `prefetch_time`.
     #[serde(default)]
-    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
+    pub enabled_images: Vec<EnabledImageRef>,
 }
 
 pub async fn register(
@@ -129,20 +127,17 @@ pub async fn register(
         std::sync::Arc::new(grpc_client);
     state.host_registry.register(req.host_id, backend);
 
-    // ADR 0014 M1.11: hand the host the current active-templates
-    // set so it can start its refill loop without waiting for the
-    // first heartbeat tick (~few seconds). On MIG roll this cuts
-    // the "no warm slots after deploy" window by roughly that
-    // interval. Failure here is non-fatal — the heartbeat path
-    // re-delivers the list on the next tick, same behavior as
-    // pre-this-change.
-    let active_templates = match state.services.meta.list_active_templates().await {
-        Ok(records) => active_templates_with_metadata(state.clone(), records).await,
+    // ADR 0015 M5: hand the host the current enabled-images set so
+    // it can start its prefetch loop without waiting for the first
+    // heartbeat tick. Failure here is non-fatal — the heartbeat
+    // path re-delivers on the next tick.
+    let enabled_images = match state.services.meta.list_enabled_images().await {
+        Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
             tracing::debug!(
                 host_id = %req.host_id,
                 error = %e,
-                "list_active_templates failed at register; host will pick them up on next heartbeat",
+                "list_enabled_images failed at register; host will pick them up on next heartbeat",
             );
             Vec::new()
         }
@@ -152,14 +147,14 @@ pub async fn register(
         host_id = %req.host_id,
         host_addr = %req.host_addr,
         agent_version = %req.agent_version,
-        active_templates = active_templates.len(),
+        enabled_images = enabled_images.len(),
         "host registered via /api/hosts/register",
     );
 
     Ok(Json(RegisterResponse {
         server_time: Utc::now(),
         coord_wire_version: engram_protocol::WIRE_VERSION,
-        active_templates,
+        enabled_images,
     }))
 }
 
@@ -186,12 +181,11 @@ pub struct HeartbeatRequest {
     /// rollout; once they've all redeployed, presence is the norm.
     #[serde(default)]
     pub host_addr: Option<String>,
-    /// ADR 0014: per-template warm-slot inventory reported by the
-    /// host. Empty when the host hasn't attached a warm pool. The
-    /// heartbeat handler copies this into `HostState.warm_slots`,
-    /// where the scheduler reads it as a parallel-ask hint.
+    /// ADR 0015 M5: manifest digests of images this host has fully
+    /// prefetched to local NVMe. The scheduler gates session
+    /// placement on `ready_images.contains(&digest)`.
     #[serde(default)]
-    pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
+    pub ready_images: Vec<ManifestDigest>,
 }
 
 #[derive(Serialize)]
@@ -202,12 +196,11 @@ pub struct HeartbeatResponse {
     /// the wire so a future revocation flow doesn't need a new
     /// endpoint.
     pub revoked_sessions: Vec<SessionId>,
-    /// ADR 0014: coord's authoritative active-template set. Each
-    /// entry carries the full SnapshotMetadata so the host's
-    /// WarmPool can `restore` without a follow-up RPC. Empty when
-    /// no templates have been registered yet.
+    /// ADR 0015 M5: coord's authoritative enabled-images set. The
+    /// host's prefetch supervisor diffs this against its local
+    /// `ready_images` and pulls missing chunks.
     #[serde(default)]
-    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
+    pub enabled_images: Vec<EnabledImageRef>,
 }
 
 pub async fn heartbeat(
@@ -257,46 +250,15 @@ pub async fn heartbeat(
         );
     }
 
-    // ADR 0014 issue #5: emit refill-failure metrics from the slot
-    // surface BEFORE the state replaces. Drain-on-host means each
-    // heartbeat carries the delta since the last drain, so the
-    // counter increments cleanly per failure.
-    for slot in &hb.warm_slots {
-        if slot.refill_failures_since_last == 0 {
-            continue;
-        }
-        let class = if slot.last_error_class.is_empty() {
-            "other"
-        } else {
-            slot.last_error_class.as_str()
-        };
-        metrics::counter!(
-            crate::metrics::WARM_POOL_REFILL_FAILURES_TOTAL,
-            "host_id" => host_id.to_string(),
-            "template_ref" => slot.template_ref.to_string(),
-            "error_class" => class.to_string(),
-        )
-        .increment(u64::from(slot.refill_failures_since_last));
-        tracing::warn!(
-            host_id = %host_id,
-            template_ref = %slot.template_ref,
-            error_class = class,
-            count = slot.refill_failures_since_last,
-            "warm-pool refill failures observed by host",
-        );
-    }
-
     // Refresh in-memory scheduler view so the next session-create
-    // on this pod sees fresh capacity. NB: in the stateless-coord
-    // world the in-memory host_registry is still load-bearing for
-    // mode=all + the WS path; the cutover commit revisits this.
+    // on this pod sees fresh capacity + readiness.
     state.host_registry.update_state(
         host_id,
         HostState {
             capacity: hb.capacity.clone(),
             local_snapshots: hb.local_snapshots.clone(),
             draining: hb.draining,
-            warm_slots: hb.warm_slots.clone(),
+            ready_images: hb.ready_images.iter().cloned().collect(),
         },
     );
 
@@ -326,16 +288,13 @@ pub async fn heartbeat(
         tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");
     }
 
-    // ADR 0014: ship the coord's authoritative active-template set
-    // so the host's WarmPool can drive its refill loop from
-    // heartbeat traffic alone. Each entry carries the full
-    // SnapshotMetadata required for `backend.restore`. Best-effort:
-    // a PG hiccup degrades to no-templates (the host's existing
-    // pool entries stay alive until STALE_GRACE expires).
-    let active_templates = match state.services.meta.list_active_templates().await {
-        Ok(records) => active_templates_with_metadata(state.clone(), records).await,
+    // ADR 0015 M5: ship the coord's authoritative enabled-images
+    // set so the host's prefetch loop drives from heartbeat alone.
+    // Best-effort: a PG hiccup degrades to no-images for this tick.
+    let enabled_images = match state.services.meta.list_enabled_images().await {
+        Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
-            tracing::debug!(host_id = %host_id, error = %e, "list_active_templates failed");
+            tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
             Vec::new()
         }
     };
@@ -343,67 +302,21 @@ pub async fn heartbeat(
     Ok(Json(HeartbeatResponse {
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
-        active_templates,
+        enabled_images,
     }))
 }
 
-/// ADR 0014: enrich each TemplateRecord with the matching
-/// SnapshotMetadata that the host needs to restore. Best-effort —
-/// templates whose snapshot row went missing are dropped from the
-/// response rather than aborting the heartbeat.
-async fn active_templates_with_metadata(
-    state: SharedState,
-    records: Vec<engram_core::types::template::TemplateRecord>,
-) -> Vec<engram_protocol::heartbeat::ActiveTemplate> {
-    let mut out = Vec::with_capacity(records.len());
-    for record in records {
-        // ADR 0014 M1.11: enrich from the snapshots row so the
-        // host doesn't have to round-trip through the sidecar JSON
-        // to discover memory_manifest, and (more importantly) gets
-        // disk_manifest so warm-pool refill can materialize the
-        // rootfs from BlobStorage chunks without an OCI pull.
-        // Without disk_manifest here, the host has no way to
-        // produce the rootfs file FC's `load_snapshot` requires
-        // and refills error out until `image_cache.ensure_image`
-        // primes the rootfs via a cold session create.
-        let snapshot_row = state
-            .services
-            .meta
-            .get_snapshot(record.snapshot_id)
-            .await
-            .ok()
-            .flatten();
-        let (disk_manifest, memory_manifest) = snapshot_row
-            .map(|r| (r.disk_manifest, r.memory_manifest))
-            .unwrap_or((None, None));
-        let snapshot = engram_core::types::snapshot::SnapshotMetadata {
-            id: record.snapshot_id,
-            size_bytes: 0,
-            created_at: record.created_at,
-            image_version: format!("{}:{}", record.image_repo, record.image_tag),
-            disk_manifest,
-            memory_manifest,
-            source_sandbox_id: None,
-            state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
-                record.snapshot_id,
-            )),
-            sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(
-                record.snapshot_id,
-            )),
-            rootfs_blob_key: None,
-            // ADR 0014 M1.14: stamp the working-set blob key
-            // unconditionally — pooled_backend's prefetch will fall
-            // back to full-manifest when the blob doesn't exist
-            // (older bakes that pre-date the profile pass, or pass
-            // failed/skipped). Cheap probe, no read cost when
-            // absent.
-            working_set_blob_key: Some(engram_chunk_store::snapshot_blob::working_set_blob_key(
-                record.snapshot_id,
-            )),
-        };
-        out.push(engram_protocol::heartbeat::ActiveTemplate { record, snapshot });
-    }
-    out
+/// ADR 0015 M5: project enabled-image rows down to the wire
+/// representation the host consumes — just `(image_uri, manifest_digest)`.
+fn enabled_image_refs_from_rows(
+    rows: Vec<engram_core::types::EnabledImage>,
+) -> Vec<EnabledImageRef> {
+    rows.into_iter()
+        .map(|row| EnabledImageRef {
+            image_uri: row.image_uri,
+            manifest_digest: ManifestDigest(row.manifest_digest),
+        })
+        .collect()
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----

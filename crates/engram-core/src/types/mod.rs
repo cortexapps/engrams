@@ -12,7 +12,6 @@ pub mod sandbox;
 pub mod session;
 pub mod shell;
 pub mod snapshot;
-pub mod template;
 
 pub use egress::*;
 pub use event::*;
@@ -25,4 +24,3 @@ pub use sandbox::*;
 pub use session::*;
 pub use shell::*;
 pub use snapshot::*;
-pub use template::*;

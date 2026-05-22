@@ -238,7 +238,10 @@ async fn run_transport(
     // restored sandbox where the host's listener path has already
     // been GC'd. Log loudly; don't die.
     let agent_version = env!("CARGO_PKG_VERSION").to_string();
-    match transport.dial(engram_agentd::ENGRAM_AGENTD_READY_PORT).await {
+    match transport
+        .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)
+        .await
+    {
         Ok(mut conn) => {
             let ready = engram_agentd::AgentReady { agent_version };
             if let Err(e) = engram_agentd::write_msg(&mut conn, &ready).await {

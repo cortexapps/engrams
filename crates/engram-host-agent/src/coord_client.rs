@@ -292,11 +292,6 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub server_time: DateTime<Utc>,
     pub coord_wire_version: u32,
-    /// ADR 0014 M1.11: bootstrap the host's warm-pool refill loop
-    /// without waiting for the first heartbeat ack. Default empty
-    /// for older coord deployments that don't emit the field.
-    #[serde(default)]
-    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
 }
 
 #[derive(Serialize)]
@@ -308,12 +303,6 @@ pub struct HeartbeatRequest {
     pub running_sandboxes: Vec<SandboxId>,
     #[serde(default)]
     pub draining: bool,
-    /// ADR 0014: optional per-template warm-slot inventory so the
-    /// coord scheduler can skip parallel-asking zero-slot hosts
-    /// without an extra ListWarmSlots round-trip. Empty when the
-    /// host has no warm pool attached (mode=all, pre-M1.6).
-    #[serde(default)]
-    pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
     /// ADR 0013: gRPC advertise URL the host registered with. Sent on
     /// every heartbeat so any coord pod can self-heal its in-memory
     /// registry from heartbeat traffic alone (coord rolling restart
@@ -322,17 +311,24 @@ pub struct HeartbeatRequest {
     /// advertise (`--grpc-listen-addr disabled`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_addr: Option<String>,
+    /// ADR 0015 M5: manifest digests of every image this host has
+    /// fully prefetched to local NVMe. The coord scheduler's
+    /// `pick_for_session` filter gates host selection on
+    /// `ready_images.contains(digest)`.
+    #[serde(default)]
+    pub ready_images: Vec<engram_protocol::heartbeat::ManifestDigest>,
 }
 
 #[derive(Deserialize)]
 pub struct HeartbeatResponse {
     pub server_time: DateTime<Utc>,
     pub revoked_sessions: Vec<SessionId>,
-    /// ADR 0014: coord's authoritative active-template set, each
-    /// entry carrying the full SnapshotMetadata so the host's
-    /// WarmPool can `restore` without a follow-up RPC.
+    /// ADR 0015 M5: coord's authoritative `enabled_images` set. The
+    /// host's prefetch supervisor diffs this against the local NVMe
+    /// chunk cache and drives chunk pulls for any image not yet
+    /// ready.
     #[serde(default)]
-    pub active_templates: Vec<engram_protocol::heartbeat::ActiveTemplate>,
+    pub enabled_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
 }
 
 #[derive(Serialize)]

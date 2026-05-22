@@ -31,11 +31,11 @@ pub fn build_heartbeat(
             total_mib: cap.total_mib,
             used_mib: cap.used_mib,
             running_sandboxes: cap.running_sandboxes,
-            warm_slots: Vec::new(),
         },
         local_snapshots: Vec::new(),
         running_sandboxes,
         draining,
+        ready_images: Vec::new(),
     }
 }
 

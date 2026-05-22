@@ -34,23 +34,6 @@ use crate::harness::{HarnessError, HarnessHub};
 pub struct LocalHostClient {
     sandbox: Arc<dyn SandboxBackend>,
     harness_hub: Arc<HarnessHub>,
-    /// ADR 0014 warm pool. `None` in dev (mode=all) and in tests
-    /// that don't exercise warm-lease. When `Some`, the
-    /// `lease_warm_sandbox` / `launch_warm_sandbox` /
-    /// `list_warm_slots` trait methods delegate here instead of
-    /// the no-op defaults.
-    warm_pool: Option<crate::warm_pool::WarmPool>,
-    /// ADR 0014 M1.12: needed by `launch_warm_sandbox` to resolve
-    /// the session's `harness_pack_uri` to a host-local ext4 path
-    /// before calling `WarmPool::launch` (which then does the FC
-    /// `swap_harness_drive`). `None` in tests / dev modes that
-    /// don't exercise the option-D path.
-    image_cache: Option<Arc<crate::image_cache::ImageCache>>,
-    /// ADR 0014 M1.12: needed for the egress-proxy CA stamping
-    /// step inside the harness ext4 (so the in-VM bootstrap can
-    /// inject it into the system trust store). `None` skips the
-    /// stamp; the harness ext4 is built without the CA.
-    egress_ca_pem: Option<String>,
 }
 
 impl LocalHostClient {
@@ -58,37 +41,7 @@ impl LocalHostClient {
         Self {
             sandbox,
             harness_hub,
-            warm_pool: None,
-            image_cache: None,
-            egress_ca_pem: None,
         }
-    }
-
-    /// Attach a warm pool (ADR 0014). The host-agent's boot path
-    /// constructs one with the same backend instance and calls this
-    /// before publishing the LocalHostClient to the gRPC server.
-    pub fn with_warm_pool(mut self, warm_pool: crate::warm_pool::WarmPool) -> Self {
-        self.warm_pool = Some(warm_pool);
-        self
-    }
-
-    /// Attach the host's image cache so `launch_warm_sandbox` can
-    /// resolve the session's `harness_pack_uri` to a local ext4
-    /// path (ADR 0014 M1.12 option D).
-    pub fn with_image_cache(
-        mut self,
-        image_cache: Arc<crate::image_cache::ImageCache>,
-        egress_ca_pem: Option<String>,
-    ) -> Self {
-        self.image_cache = Some(image_cache);
-        self.egress_ca_pem = egress_ca_pem;
-        self
-    }
-
-    /// Borrow the attached warm pool (for the heartbeat loop's
-    /// `list_slots` + `observe_templates` hooks in M1.7).
-    pub fn warm_pool(&self) -> Option<&crate::warm_pool::WarmPool> {
-        self.warm_pool.as_ref()
     }
 
     /// Convenience constructor for callers that don't need to route
@@ -235,93 +188,6 @@ impl HostClient for LocalHostClient {
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
         crate::proxy_shell::open_shell_tunnel_at(guest_ip, port, netns_name, ends).await?;
         Ok(tunnel)
-    }
-
-    async fn lease_warm_sandbox(
-        &self,
-        template_ref: engram_core::types::ids::TemplateRef,
-    ) -> Result<engram_core::traits::host_client::WarmLeaseOutcome, SandboxError> {
-        match self.warm_pool.as_ref() {
-            Some(pool) => Ok(pool.lease(template_ref).await),
-            None => Ok(engram_core::traits::host_client::WarmLeaseOutcome::NoCapacity),
-        }
-    }
-
-    async fn launch_warm_sandbox(
-        &self,
-        sandbox_id: SandboxId,
-        agent: AgentSpec,
-        policy: SessionEgressPolicy,
-        harness_pack_uri: Option<String>,
-        harness_name: Option<String>,
-    ) -> Result<(), SandboxError> {
-        // ADR 0014 follow-up debug (2026-05-21): a sequence of warm
-        // sessions on `warm-f1b8520` mounted only the bake-time stub
-        // harness at `/run/engram/harnesses`, with no `swap_harness_
-        // drive` log on the host side. That means `session_harness_
-        // path` resolved to None — but it's not obvious whether the
-        // gRPC dropped the URI on the wire or the lookup short-
-        // circuited somewhere coord-side. Log what actually arrived
-        // here so the next session pinpoints the gap.
-        tracing::info!(
-            sandbox_id = %sandbox_id,
-            harness_pack_uri = harness_pack_uri.as_deref().unwrap_or("<none>"),
-            harness_name = harness_name.as_deref().unwrap_or("<none>"),
-            image_cache_present = self.image_cache.is_some(),
-            "launch_warm_sandbox: invoked",
-        );
-        match self.warm_pool.as_ref() {
-            Some(pool) => {
-                // ADR 0014 M1.12: resolve the session's harness URI
-                // to a host-local ext4 path so the warm slot's
-                // bake-time stub harness drive can be swapped in
-                // for it. Sessions with no harness (`kind = none`)
-                // pass `None` and skip the swap entirely.
-                let session_harness_path = match (harness_pack_uri, self.image_cache.as_ref()) {
-                    (Some(uri), Some(cache)) => {
-                        // Coord ships the canonical session harness
-                        // name explicitly (e.g. "claude"); fall back
-                        // to URI-derived naming only for legacy
-                        // callers that didn't set the new proto
-                        // field. The cold-create path uses the same
-                        // canonical name via the
-                        // `ENGRAM_SESSION_HARNESS_NAME` env hint, so
-                        // both paths agree on the directory layout
-                        // bootstrap exec's
-                        // (`/run/engram/harnesses/<name>/harness`).
-                        let name = harness_name
-                            .unwrap_or_else(|| crate::pooled_backend::harness_name_from_uri(&uri));
-                        let cached = cache
-                            .ensure_harness_ext4(&uri, &name, self.egress_ca_pem.as_deref())
-                            .await
-                            .map_err(|e| {
-                                SandboxError::InvalidSpec(format!(
-                                    "warm-lease: harness cache pull {uri}: {e}"
-                                ))
-                            })?;
-                        Some(cached.ext4_path)
-                    }
-                    (Some(_), None) => {
-                        return Err(SandboxError::InvalidSpec(
-                            "warm-lease: harness_pack_uri set but no image_cache attached to LocalHostClient".into(),
-                        ));
-                    }
-                    (None, _) => None,
-                };
-                pool.launch(sandbox_id, agent, policy, session_harness_path)
-                    .await
-            }
-            None => Err(SandboxError::NotFound),
-        }
-    }
-
-    async fn list_warm_slots(
-        &self,
-    ) -> Result<Vec<engram_core::traits::host_client::WarmSlotCount>, SandboxError> {
-        match self.warm_pool.as_ref() {
-            Some(pool) => Ok(pool.list_slots()),
-            None => Ok(Vec::new()),
-        }
     }
 
     fn harness_dial(&self) -> HarnessDial {

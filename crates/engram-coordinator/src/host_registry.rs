@@ -42,9 +42,12 @@ pub struct HostState {
     pub capacity: HostCapacityReport,
     pub local_snapshots: Vec<LocalSnapshotReport>,
     pub draining: bool,
-    /// ADR 0014: per-template warm-slot inventory from the host's
-    /// most recent heartbeat. Empty for hosts without a warm pool.
-    pub warm_slots: Vec<engram_protocol::heartbeat::WarmSlotReport>,
+    /// ADR 0015 M5: manifest digests of images this host has fully
+    /// prefetched to local NVMe. `pick_for_session` gates host
+    /// selection on `ready_images.contains(&digest)`. Empty on a
+    /// freshly-registered host until its prefetch supervisor finishes
+    /// pulling the first enabled image.
+    pub ready_images: std::collections::HashSet<engram_protocol::heartbeat::ManifestDigest>,
 }
 
 /// Inputs the scheduler considers when picking a host. [`SandboxBackend`]
@@ -243,142 +246,6 @@ impl HostRegistry {
         let sandbox_id = backend.create(spec).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
-    }
-
-    /// ADR 0014: try the warm-pool lease path before falling through
-    /// to cold-create. Walks candidate hosts that report at least
-    /// one available slot for `template_ref` (via heartbeat
-    /// `warm_slots`), asks each in turn for a lease, then on the
-    /// first `Granted` outcome dispatches `LaunchWarmSandbox` with
-    /// the per-session agent + policy. Returns `Ok(Some(...))` on a
-    /// successful warm activation, `Ok(None)` when no host had a
-    /// slot (caller should fall back to cold-create), or `Err(_)`
-    /// only for genuinely fatal conditions.
-    ///
-    /// `Stale{current_ref}` outcomes are skipped silently — the
-    /// host's pool is on an older template_ref than coord knows.
-    /// Future M1.x: surface this back to the template-cache so the
-    /// coord lazily updates. v1 just tries the next host.
-    pub async fn try_warm_lease_for_session(
-        &self,
-        ctx: &ScheduleContext<'_>,
-        template_ref: engram_core::types::ids::TemplateRef,
-        agent: engram_core::types::sandbox::AgentSpec,
-        policy: engram_core::types::egress::SessionEgressPolicy,
-        // ADR 0014 M1.12 (option D): the session's chosen harness
-        // pack URI. The host swaps the warm slot's bake-time stub
-        // harness for this URI's ext4 before start_agent dials
-        // bootstrap. `None` for sessions without a harness
-        // (`kind = none`) — the bake-time stub stays attached.
-        harness_pack_uri: Option<String>,
-        // The session's canonical harness name (e.g. `"claude"`).
-        // Bootstrap exec's `/run/engram/harnesses/<name>/harness`
-        // inside the VM, so the host must build the harness ext4
-        // with this directory name — not whatever the URI's last
-        // path segment happens to be (which would yield
-        // `harness-claude` for the `harness-claude` repo URI).
-        // `None` iff `harness_pack_uri` is `None`.
-        harness_name: Option<String>,
-    ) -> Result<Option<(HostId, SandboxId)>, SandboxError> {
-        use engram_core::traits::host_client::WarmLeaseOutcome;
-        let candidates = self.candidates_with_warm_slot(template_ref);
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-        // Sequential rather than parallel — v1 fleets are small
-        // (single-digit hosts) and the lease RPC is sub-ms when the
-        // pool has capacity. Parallel-ask becomes interesting at
-        // fleet sizes where the wait-for-first-yes wins; defer the
-        // tokio::select! variant until measured demand.
-        let _ = ctx; // ScheduleContext not consumed today; reserved for
-                     // memory-fit / repo affinity refinements in M1.9+.
-        for (host_id, backend) in candidates {
-            let outcome = match backend.lease_warm_sandbox(template_ref).await {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(
-                        %host_id,
-                        %template_ref,
-                        error = %e,
-                        "warm-lease RPC failed; trying next host",
-                    );
-                    continue;
-                }
-            };
-            match outcome {
-                WarmLeaseOutcome::Granted(sandbox_id) => {
-                    // Launch on the same host. If it fails after a
-                    // successful lease, the leased slot is effectively
-                    // orphaned — that's a tracked-but-non-blocking
-                    // issue for v1; the warm pool's refill loop will
-                    // reach target again on its own. Surface the error
-                    // so the caller can cold-fall-back.
-                    if let Err(e) = backend
-                        .launch_warm_sandbox(
-                            sandbox_id,
-                            agent.clone(),
-                            policy.clone(),
-                            harness_pack_uri.clone(),
-                            harness_name.clone(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            %host_id,
-                            %sandbox_id,
-                            %template_ref,
-                            error = %e,
-                            "warm-launch failed after lease; falling back to cold-create",
-                        );
-                        // Best-effort: try to destroy the orphaned slot
-                        // so the autoscaler doesn't double-count it.
-                        let _ = backend.destroy(sandbox_id).await;
-                        continue;
-                    }
-                    self.sandbox_owner.insert(sandbox_id, host_id);
-                    return Ok(Some((host_id, sandbox_id)));
-                }
-                WarmLeaseOutcome::Stale { current_ref } => {
-                    tracing::debug!(
-                        %host_id,
-                        requested = %template_ref,
-                        host_current = %current_ref,
-                        "host reports stale template_ref; trying next",
-                    );
-                    continue;
-                }
-                WarmLeaseOutcome::NoCapacity => continue,
-            }
-        }
-        Ok(None)
-    }
-
-    /// Hosts whose most recent heartbeat reported at least one
-    /// available warm slot for `template_ref`. Ordered by available
-    /// count descending so the fullest pool gets asked first.
-    fn candidates_with_warm_slot(
-        &self,
-        template_ref: engram_core::types::ids::TemplateRef,
-    ) -> Vec<(HostId, Arc<dyn HostClient>)> {
-        let mut scored: Vec<(u32, HostId, Arc<dyn HostClient>)> = Vec::new();
-        for entry in self.hosts.iter() {
-            let st = entry.value().state.read();
-            if st.draining {
-                continue;
-            }
-            let available = st
-                .warm_slots
-                .iter()
-                .find(|s| s.template_ref == template_ref)
-                .map(|s| s.available)
-                .unwrap_or(0);
-            if available == 0 {
-                continue;
-            }
-            scored.push((available, *entry.key(), entry.value().backend.clone()));
-        }
-        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
-        scored.into_iter().map(|(_, h, b)| (h, b)).collect()
     }
 
     /// Same as `create_for_session` but for restoring from a snapshot.
@@ -701,11 +568,10 @@ mod tests {
                     total_mib: 4096,
                     used_mib: 0,
                     running_sandboxes: 0,
-                    warm_slots: Vec::new(),
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
-                warm_slots: Vec::new(),
+                ready_images: Default::default(),
             },
         );
         reg.update_state(
@@ -715,7 +581,6 @@ mod tests {
                     total_mib: 1024,
                     used_mib: 512,
                     running_sandboxes: 1,
-                    warm_slots: Vec::new(),
                 },
                 local_snapshots: vec![LocalSnapshotReport {
                     snapshot_id: snap,
@@ -725,7 +590,7 @@ mod tests {
                     last_accessed_at: chrono::Utc::now(),
                 }],
                 draining: false,
-                warm_slots: Vec::new(),
+                ready_images: Default::default(),
             },
         );
 
@@ -759,11 +624,10 @@ mod tests {
                     total_mib: 1024,
                     used_mib: 512,
                     running_sandboxes: 0,
-                    warm_slots: Vec::new(),
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
-                warm_slots: Vec::new(),
+                ready_images: Default::default(),
             },
         );
         reg.update_state(
@@ -773,11 +637,10 @@ mod tests {
                     total_mib: 16_384,
                     used_mib: 0,
                     running_sandboxes: 0,
-                    warm_slots: Vec::new(),
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
-                warm_slots: Vec::new(),
+                ready_images: Default::default(),
             },
         );
 
@@ -809,11 +672,10 @@ mod tests {
                     total_mib: 16_384,
                     used_mib: 0,
                     running_sandboxes: 0,
-                    warm_slots: Vec::new(),
                 },
                 local_snapshots: Vec::new(),
                 draining: true,
-                warm_slots: Vec::new(),
+                ready_images: Default::default(),
             },
         );
         reg.update_state(
@@ -823,11 +685,10 @@ mod tests {
                     total_mib: 1024,
                     used_mib: 512,
                     running_sandboxes: 0,
-                    warm_slots: Vec::new(),
                 },
                 local_snapshots: Vec::new(),
                 draining: false,
-                warm_slots: Vec::new(),
+                ready_images: Default::default(),
             },
         );
 
@@ -895,293 +756,5 @@ mod tests {
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h);
-    }
-
-    // ----- ADR 0014 M1.8 warm-lease scheduler tests -----
-
-    /// Recording HostClient that returns a pre-programmed
-    /// WarmLeaseOutcome on `lease_warm_sandbox` and captures every
-    /// `launch_warm_sandbox` call. Lets the test prime an outcome
-    /// per host + assert exactly which host got the launch.
-    #[derive(Clone)]
-    struct WarmRecorder {
-        outcome: engram_core::traits::host_client::WarmLeaseOutcome,
-        launch_log:
-            Arc<parking_lot::Mutex<Vec<(SandboxId, engram_core::types::sandbox::AgentSpec)>>>,
-    }
-
-    #[async_trait]
-    impl HostClient for WarmRecorder {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            Err(SandboxError::InvalidSpec("unused".into()))
-        }
-        async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
-            Ok(())
-        }
-        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-            Ok(Vec::new())
-        }
-        async fn exec_stream(
-            &self,
-            _: SandboxId,
-            _: ExecRequest,
-        ) -> Result<ExecStream, SandboxError> {
-            Err(SandboxError::InvalidSpec("unused".into()))
-        }
-        async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-            Err(SandboxError::InvalidSpec("unused".into()))
-        }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-            Err(SandboxError::InvalidSpec("unused".into()))
-        }
-        async fn start_agent(
-            &self,
-            _: SandboxId,
-            _: engram_core::types::sandbox::AgentSpec,
-            _: engram_core::types::egress::SessionEgressPolicy,
-        ) -> Result<(), SandboxError> {
-            Ok(())
-        }
-        async fn apply_egress_policy(
-            &self,
-            _: engram_core::types::egress::SessionEgressPolicy,
-        ) -> Result<(), SandboxError> {
-            Ok(())
-        }
-        async fn guest_ip(&self, _: SandboxId) -> Option<String> {
-            None
-        }
-        async fn bind_session(&self, _: SessionId, _: SandboxId) {}
-        async fn unbind_session(&self, _: SessionId) {}
-        async fn send_prompt(&self, _: SandboxId, _: String) -> Result<(), SandboxError> {
-            Ok(())
-        }
-        async fn acquire_shell(&self, _: SandboxId) -> Result<(), SandboxError> {
-            Ok(())
-        }
-        async fn release_shell(&self, _: SandboxId) -> Result<(), SandboxError> {
-            Ok(())
-        }
-        async fn lease_warm_sandbox(
-            &self,
-            _: engram_core::types::ids::TemplateRef,
-        ) -> Result<engram_core::traits::host_client::WarmLeaseOutcome, SandboxError> {
-            Ok(self.outcome.clone())
-        }
-        async fn launch_warm_sandbox(
-            &self,
-            sandbox_id: SandboxId,
-            agent: engram_core::types::sandbox::AgentSpec,
-            _policy: engram_core::types::egress::SessionEgressPolicy,
-            _harness_pack_uri: Option<String>,
-            _harness_name: Option<String>,
-        ) -> Result<(), SandboxError> {
-            self.launch_log.lock().push((sandbox_id, agent));
-            Ok(())
-        }
-    }
-
-    fn warm_state(template_ref: engram_core::types::ids::TemplateRef, available: u32) -> HostState {
-        HostState {
-            capacity: HostCapacityReport {
-                total_mib: 4096,
-                used_mib: 0,
-                running_sandboxes: 0,
-                warm_slots: Vec::new(),
-            },
-            local_snapshots: Vec::new(),
-            draining: false,
-            warm_slots: vec![engram_protocol::heartbeat::WarmSlotReport {
-                template_ref,
-                available,
-                target: available.max(1),
-                refill_failures_since_last: 0,
-                last_error_class: String::new(),
-            }],
-        }
-    }
-
-    fn empty_policy(session_id: SessionId) -> engram_core::types::egress::SessionEgressPolicy {
-        engram_core::types::egress::SessionEgressPolicy {
-            session_id,
-            sandbox_id: SandboxId::new(),
-            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-            network_allow_hosts: Default::default(),
-            network_allow_host_patterns: Default::default(),
-            secrets: Default::default(),
-            secret_mode: Default::default(),
-        }
-    }
-
-    fn ctx() -> ScheduleContext<'static> {
-        ScheduleContext {
-            repo: "r",
-            image_version: "v",
-            prefer_snapshot_id: None,
-            memory_mib: Some(64),
-        }
-    }
-
-    fn agent() -> engram_core::types::sandbox::AgentSpec {
-        engram_core::types::sandbox::AgentSpec {
-            argv: vec!["/bin/echo".into(), "warm".into()],
-            env: Default::default(),
-        }
-    }
-
-    /// Happy path: one host reports available warm slots for the
-    /// requested template; scheduler leases, launches, records
-    /// ownership.
-    #[tokio::test]
-    async fn warm_lease_grants_on_host_with_available_slot() {
-        let template_ref = engram_core::types::ids::TemplateRef::new();
-        let warm_sandbox = SandboxId::new();
-        let launch_log = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let recorder = Arc::new(WarmRecorder {
-            outcome: engram_core::traits::host_client::WarmLeaseOutcome::Granted(warm_sandbox),
-            launch_log: launch_log.clone(),
-        });
-
-        let reg = HostRegistry::new();
-        let host_id = HostId::new();
-        reg.register(host_id, recorder.clone() as Arc<dyn HostClient>);
-        reg.update_state(host_id, warm_state(template_ref, 1));
-
-        let result = reg
-            .try_warm_lease_for_session(
-                &ctx(),
-                template_ref,
-                agent(),
-                empty_policy(SessionId::new()),
-                None,
-                None,
-            )
-            .await
-            .expect("warm lease must not error");
-        let (got_host, got_sandbox) = result.expect("warm lease must grant");
-
-        assert_eq!(got_host, host_id, "lease must come from the warm-slot host");
-        assert_eq!(
-            got_sandbox, warm_sandbox,
-            "lease must surface the host's sandbox_id"
-        );
-        assert_eq!(launch_log.lock().len(), 1, "exactly one launch must fire");
-        assert_eq!(launch_log.lock()[0].0, warm_sandbox);
-        assert_eq!(
-            reg.sandbox_owner.get(&warm_sandbox).map(|r| *r.value()),
-            Some(host_id),
-            "ownership row must point at the host that launched",
-        );
-    }
-
-    /// Zero-slot host is skipped silently — the candidate filter
-    /// drops hosts whose heartbeat reports no inventory for the
-    /// requested template.
-    #[tokio::test]
-    async fn warm_lease_skips_zero_slot_host() {
-        let template_ref = engram_core::types::ids::TemplateRef::new();
-        let launch_log = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        // Recorder programmed to "Granted" — but the candidate
-        // filter shouldn't even reach it.
-        let recorder = Arc::new(WarmRecorder {
-            outcome: engram_core::traits::host_client::WarmLeaseOutcome::Granted(SandboxId::new()),
-            launch_log: launch_log.clone(),
-        });
-
-        let reg = HostRegistry::new();
-        let host_id = HostId::new();
-        reg.register(host_id, recorder as Arc<dyn HostClient>);
-        // available=0 — host reports it has no warm slot for this template.
-        reg.update_state(host_id, warm_state(template_ref, 0));
-
-        let result = reg
-            .try_warm_lease_for_session(
-                &ctx(),
-                template_ref,
-                agent(),
-                empty_policy(SessionId::new()),
-                None,
-                None,
-            )
-            .await
-            .expect("warm lease must not error");
-        assert!(result.is_none(), "no candidate ⇒ no lease");
-        assert!(
-            launch_log.lock().is_empty(),
-            "zero-slot host must not be asked to launch",
-        );
-    }
-
-    /// Stale outcome is skipped — host's pool is on an older
-    /// template_ref. Scheduler falls through to cold-create when
-    /// no other host has a Granted outcome to offer.
-    #[tokio::test]
-    async fn warm_lease_stale_outcome_falls_through() {
-        let template_ref = engram_core::types::ids::TemplateRef::new();
-        let stale_other = engram_core::types::ids::TemplateRef::new();
-        let launch_log = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let recorder = Arc::new(WarmRecorder {
-            outcome: engram_core::traits::host_client::WarmLeaseOutcome::Stale {
-                current_ref: stale_other,
-            },
-            launch_log: launch_log.clone(),
-        });
-
-        let reg = HostRegistry::new();
-        let host_id = HostId::new();
-        reg.register(host_id, recorder as Arc<dyn HostClient>);
-        // Heartbeat says the host has slots — but the lease itself
-        // returns Stale (template_ref skew).
-        reg.update_state(host_id, warm_state(template_ref, 1));
-
-        let result = reg
-            .try_warm_lease_for_session(
-                &ctx(),
-                template_ref,
-                agent(),
-                empty_policy(SessionId::new()),
-                None,
-                None,
-            )
-            .await
-            .expect("warm lease must not error");
-        assert!(result.is_none(), "stale-only outcomes ⇒ no lease");
-        assert!(
-            launch_log.lock().is_empty(),
-            "stale outcome must not trigger launch",
-        );
-    }
-
-    /// Draining host is excluded from the candidate set even if
-    /// heartbeat reported warm slots — drains stop fresh work.
-    #[tokio::test]
-    async fn warm_lease_skips_draining_host() {
-        let template_ref = engram_core::types::ids::TemplateRef::new();
-        let launch_log = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let recorder = Arc::new(WarmRecorder {
-            outcome: engram_core::traits::host_client::WarmLeaseOutcome::Granted(SandboxId::new()),
-            launch_log: launch_log.clone(),
-        });
-
-        let reg = HostRegistry::new();
-        let host_id = HostId::new();
-        reg.register(host_id, recorder as Arc<dyn HostClient>);
-        let mut st = warm_state(template_ref, 5);
-        st.draining = true;
-        reg.update_state(host_id, st);
-
-        let result = reg
-            .try_warm_lease_for_session(
-                &ctx(),
-                template_ref,
-                agent(),
-                empty_policy(SessionId::new()),
-                None,
-                None,
-            )
-            .await
-            .expect("warm lease must not error");
-        assert!(result.is_none(), "draining host must be skipped");
-        assert!(launch_log.lock().is_empty(), "no launch on draining host");
     }
 }

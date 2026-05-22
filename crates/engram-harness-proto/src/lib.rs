@@ -43,7 +43,6 @@ use engram_core::SessionId;
 /// `<vsock_uds>_<port>.sock`; guest dials AF_VSOCK CID=2 port=1026).
 pub const HARNESS_VSOCK_PORT: u32 = 1026;
 
-
 /// Single-frame size cap. Same as `engram-agentd::proto::MAX_MSG_BYTES`.
 /// `transcript_delta` payloads are typically a few KB (one JSONL line
 /// per tool call); 16 MiB gives plenty of headroom for outliers.

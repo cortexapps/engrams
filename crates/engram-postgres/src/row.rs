@@ -2,9 +2,7 @@
 //! `lib.rs` stay readable.
 
 use chrono::{DateTime, Utc};
-use engram_core::types::ids::TemplateRef;
 use engram_core::types::session::HarnessSpec;
-use engram_core::types::template::TemplateRecord;
 use engram_core::types::{
     EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
     RegistryCredential, Session, SessionSecrets, SessionStatus, SnapshotRecord,
@@ -207,26 +205,6 @@ pub(crate) fn harness_pack_from_row(row: &PgRow) -> Result<HarnessPack, MetaErro
         description: row.try_get("description").map_err(col_err)?,
         created_at,
         updated_at,
-    })
-}
-
-pub(crate) fn template_from_row(row: PgRow) -> Result<TemplateRecord, MetaError> {
-    let template_ref: Uuid = row.try_get("template_ref").map_err(col_err)?;
-    let snapshot_id: Uuid = row.try_get("snapshot_id").map_err(col_err)?;
-    let vcpus: i32 = row.try_get("vcpus").map_err(col_err)?;
-    let memory_mib: i32 = row.try_get("memory_mib").map_err(col_err)?;
-    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
-    Ok(TemplateRecord {
-        template_ref: TemplateRef::from(template_ref),
-        image_repo: row.try_get("image_repo").map_err(col_err)?,
-        image_tag: row.try_get("image_tag").map_err(col_err)?,
-        // Migration 0029 made harness_pack_uri nullable.
-        harness_pack_uri: row.try_get("harness_pack_uri").map_err(col_err)?,
-        snapshot_id: SnapshotId::from(snapshot_id),
-        vcpus: u32::try_from(vcpus.max(0)).unwrap_or(0),
-        memory_mib: u32::try_from(memory_mib.max(0)).unwrap_or(0),
-        created_at,
-        active: row.try_get("active").map_err(col_err)?,
     })
 }
 

@@ -540,124 +540,22 @@ async fn create_session_inner(
         memory_mib: Some(vm_spec.memory.max_mib),
     };
 
-    // ADR 0014 M1.8 + M1.12: try the warm-pool lease path before
-    // cold-create.
-    //   1. Resolve `(image_repo, image_tag)` to a template_ref via
-    //      MetadataStore::resolve_template. M1.12 (option D) dropped
-    //      harness_pack_uri from the lookup — templates are harness-
-    //      agnostic; the host swaps the harness drive per session.
-    //      None → no warm-eligible template; fall through.
-    //   2. Build a placeholder AgentSpec + SessionEgressPolicy with
-    //      `guest_ip = UNSPECIFIED` (matching the no-guest-IP cold
-    //      path). The host's warm-launch applies the policy +
-    //      sends SpawnHarness (with harness_dev=/dev/vdb so
-    //      agentd mounts the swapped harness).
-    //   3. Ask the registry for a warm lease + harness_pack_uri.
-    //      Lease success → skip cold-create.
-    //   4. On NoCapacity / all-Stale, fall through to cold-create
-    //      with one tracing::debug.
-    let warm_lease_outcome = {
-        match state
-            .services
-            .meta
-            .resolve_template(&image_repo, &image_tag)
-            .await
-        {
-            Ok(Some(template_ref)) => {
-                // Same UNSPECIFIED-IP policy shape as the no-guest-IP
-                // cold path. Per-IP egress rules are absent on the
-                // warm path until a M1.x follow-up adds a post-launch
-                // policy refresh keyed on the actual guest_ip.
-                let warm_agent = agent_for_session.clone();
-                let warm_policy = engram_core::types::egress::SessionEgressPolicy {
-                    session_id,
-                    sandbox_id: engram_core::SandboxId::new(), // overwritten by host on launch
-                    guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                    network_allow_hosts: network_for_proxy.allow_hosts.clone(),
-                    network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-                    secrets: Vec::new(),
-                    secret_mode: manifest.secret_mode,
-                };
-                // For no-agent sessions we still want to warm-lease,
-                // synthesising a noop AgentSpec — the warm-launch
-                // path requires *some* AgentSpec for the SpawnHarness
-                // frame. Empty argv would be a readiness probe (no
-                // child spawned), but the warm slot's in-VM agentd
-                // is already up — we want a child running so the
-                // leased VM stays usable for direct exec. Pass a
-                // sleep-forever shim.
-                let agent = warm_agent.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
-                    argv: vec!["/bin/sleep".into(), "infinity".into()],
-                    env: Default::default(),
-                });
-                // ADR 0014 M1.12 (option D): thread the session's
-                // harness URI through so the host can swap the warm
-                // slot's bake-time stub to the session's harness ext4
-                // before start_agent. Same URI cold-create would
-                // resolve to a host-local ext4 path.
-                let warm_harness_uri = harness_pack_uri.clone();
-                // Canonical harness name (e.g. "claude") for the
-                // in-VM dir layout `/run/engram/harnesses/<name>/`.
-                // Cold-create threads this via the
-                // `ENGRAM_SESSION_HARNESS_NAME` env hint; warm-launch
-                // needs it explicitly on the gRPC since the
-                // bake-time stub was attached without one.
-                let warm_harness_name = match &req.harness {
-                    HarnessSpec::Builtin { name } => Some(name.clone()),
-                    HarnessSpec::None => None,
-                };
-                state
-                    .host_registry
-                    .try_warm_lease_for_session(
-                        &ctx,
-                        template_ref,
-                        agent,
-                        warm_policy,
-                        warm_harness_uri,
-                        warm_harness_name,
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            %template_ref,
-                            error = %e,
-                            "warm-lease errored; falling back to cold-create",
-                        );
-                        None
-                    })
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::debug!(error = %e, "resolve_template failed; cold-create");
-                None
-            }
-        }
-    };
-
-    let (host_id, sandbox_id, warm_lease_taken) = match warm_lease_outcome {
-        Some((host_id, sandbox_id)) => {
-            tracing::info!(
-                %session_id,
-                %host_id,
-                %sandbox_id,
-                "warm-lease granted; skipping cold-create",
+    // ADR 0015 M5: cold-create only. The warm-pool lease path was
+    // retired with the `templates` table; sessions land on whichever
+    // host the scheduler picks (later phases gate on image readiness).
+    let (host_id, sandbox_id) = match state.host_registry.create_for_session(&ctx, vm_spec).await {
+        Ok((host_id, id)) => (host_id, id),
+        Err(e) => {
+            tracing::warn!(
+                image_uri = %req.image,
+                error = %e,
+                "session create rejected at scheduling; returning 503, no row persisted",
             );
-            (host_id, sandbox_id, true)
+            return Err(ApiError::Unavailable(format!(
+                "no host has capacity for this session right now: {e}. \
+                 Retry shortly; capacity-fit recovers as hosts register or sessions drain."
+            )));
         }
-        None => match state.host_registry.create_for_session(&ctx, vm_spec).await {
-            Ok((host_id, id)) => (host_id, id, false),
-            Err(e) => {
-                tracing::warn!(
-                    image_uri = %req.image,
-                    error = %e,
-                    "session create rejected at scheduling; returning 503, no row persisted",
-                );
-                return Err(ApiError::Unavailable(format!(
-                    "no host has capacity for this session right now: {e}. \
-                     Retry shortly; capacity-fit recovers as hosts register or sessions drain."
-                )));
-            }
-        },
     };
 
     // Atomic insert: row exists only once we have host_id + sandbox_id
@@ -755,75 +653,55 @@ async fn create_session_inner(
         .bind_session(session_id, sandbox_id)
         .await;
 
-    // -------- 6. Start the agent (if any) --------
+    // -------- 6. Start the agent --------
     //
-    // Workspace materialization is gone (ADR 0005): the bake image's
-    // `/workspace` is the workspace; nothing for the platform to do
-    // here. ADR 0013 bundles `policy` into the `start_agent` call so
-    // the host applies the policy atomically before spawning the
-    // agent — no more "notify then unary" race surface.
-    //
-    // ADR 0014: warm-lease already invoked LaunchWarmSandbox which
-    // applied the policy + sent SpawnHarness on the host side.
-    // Skip the start_agent call here to avoid double-spawning the
-    // agent. Per-IP egress refinement is a follow-up (see comment
-    // in the warm-lease block above).
-    if warm_lease_taken {
-        // M1.x follow-up: query guest_ip on the host and call
-        // apply_egress_policy with the full per-IP rules so the
-        // egress proxy gets the same treatment cold-create sessions
-        // get at L719. For v1 we accept the UNSPECIFIED-IP policy
-        // already applied by LaunchWarmSandbox.
-    } else {
-        // ADR 0015 M1: every cold-create session goes through
-        // `start_agent`, including `harness: none`. Agentd's
-        // SpawnHarness handler treats empty argv as a readiness
-        // probe (no child spawned, no error), so the same call
-        // serves both cases — and as a side-effect "session is
-        // Active" now actually implies "agentd is reachable on
-        // vsock", which makes the early-eof race that the no-
-        // harness path used to produce structurally impossible.
-        let agent = agent_for_session.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
-            argv: Vec::new(),
-            env: std::collections::HashMap::new(),
-        });
-        let policy = egress_policy.unwrap_or_else(|| {
-            // No guest IP yet → synthesize an unspecified-IP policy.
-            // host-agents without a live proxy treat policy
-            // application as a no-op, so this is safe; the agent
-            // can refine on a later `apply_egress_policy` once the
-            // IP shows up.
-            engram_core::types::egress::SessionEgressPolicy {
-                session_id,
-                sandbox_id,
-                guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                network_allow_hosts: network_for_proxy.allow_hosts.clone(),
-                network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-                secrets: Vec::new(),
-                secret_mode: manifest.secret_mode,
-            }
-        });
-        if let Err(e) = state
-            .services
-            .host
-            .start_agent(sandbox_id, agent, policy)
-            .await
-        {
-            tracing::error!(
-                %session_id,
-                %sandbox_id,
-                %host_id,
-                error = %e,
-                "start_agent failed; marking session Failed",
-            );
-            let _ = state
-                .services
-                .meta
-                .set_session_status(session_id, SessionStatus::Failed)
-                .await;
-            state.services.host.unbind_session(session_id).await;
-            return Err(e.into());
+    // ADR 0015 M1: every cold-create session goes through
+    // `start_agent`, including `harness: none`. Agentd's
+    // SpawnHarness handler treats empty argv as a readiness
+    // probe (no child spawned, no error), so the same call
+    // serves both cases — and as a side-effect "session is
+    // Active" now actually implies "agentd is reachable on
+    // vsock", which makes the early-eof race that the no-
+    // harness path used to produce structurally impossible.
+    let agent = agent_for_session.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
+        argv: Vec::new(),
+        env: std::collections::HashMap::new(),
+    });
+    let policy = egress_policy.unwrap_or_else(|| {
+        // No guest IP yet → synthesize an unspecified-IP policy.
+        // host-agents without a live proxy treat policy application
+        // as a no-op; the agent can refine on a later
+        // `apply_egress_policy` once the IP shows up.
+        engram_core::types::egress::SessionEgressPolicy {
+            session_id,
+            sandbox_id,
+            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            network_allow_hosts: network_for_proxy.allow_hosts.clone(),
+            network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
+            secrets: Vec::new(),
+            secret_mode: manifest.secret_mode,
         }
+    });
+    if let Err(e) = state
+        .services
+        .host
+        .start_agent(sandbox_id, agent, policy)
+        .await
+    {
+        tracing::error!(
+            %session_id,
+            %sandbox_id,
+            %host_id,
+            error = %e,
+            "start_agent failed; marking session Failed",
+        );
+        let _ = state
+            .services
+            .meta
+            .set_session_status(session_id, SessionStatus::Failed)
+            .await;
+        state.services.host.unbind_session(session_id).await;
+        return Err(e.into());
     }
     // Row was inserted as Active in Phase 5; no status update needed.
     // Still emit a Pending→Active StatusChanged so SSE subscribers
@@ -876,7 +754,7 @@ async fn create_session_inner(
             session_id,
             status: SessionStatus::Active.as_str(),
             image_version: image_tag,
-            kind: if warm_lease_taken { "warm" } else { "cold" },
+            kind: "cold",
         }),
     ))
 }

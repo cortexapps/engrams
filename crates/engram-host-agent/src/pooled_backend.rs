@@ -1553,17 +1553,7 @@ impl SandboxBackend for PooledBackend {
                 "warm-pool memory chunk prefetch failed; falling back to serial fault path",
             );
         }
-        let prefetch_outcome = if prefetched_chunks.is_ok() {
-            "success"
-        } else {
-            "failed"
-        };
-        metrics::histogram!(
-            crate::metrics::WARM_POOL_REFILL_SECONDS,
-            "phase" => "prefetch",
-            "outcome" => prefetch_outcome,
-        )
-        .record(prefetch_start.elapsed().as_secs_f64());
+        let _ = (prefetched_chunks, prefetch_start);
 
         // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
         // The backend owns its staging dir layout (Phase 6); we ask
@@ -1631,15 +1621,7 @@ impl SandboxBackend for PooledBackend {
             );
         }
 
-        let restore_start = std::time::Instant::now();
-        let inner_result = self.inner.restore(metadata).await;
-        metrics::histogram!(
-            crate::metrics::WARM_POOL_REFILL_SECONDS,
-            "phase" => "restore",
-            "outcome" => if inner_result.is_ok() { "success" } else { "failed" },
-        )
-        .record(restore_start.elapsed().as_secs_f64());
-        inner_result
+        self.inner.restore(metadata).await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
