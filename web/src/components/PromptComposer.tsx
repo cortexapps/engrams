@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { sendPrompt } from '../api';
-import type { SessionStatus } from '../types';
+import type { SessionState } from '../types';
 
 // PromptComposer pinned to the bottom of the transcript. The user's
 // reply joins the same column rhythm as the assistant turns: a glyph
@@ -12,7 +12,7 @@ import type { SessionStatus } from '../types';
 
 export interface PromptComposerProps {
   sessionId: string;
-  status: SessionStatus | undefined;
+  status: SessionState | undefined;
 }
 
 export function PromptComposer({ sessionId, status }: PromptComposerProps) {
@@ -20,20 +20,25 @@ export function PromptComposer({ sessionId, status }: PromptComposerProps) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Dead sessions are terminal — `prompt.rs` returns 410 Gone, no
-  // affordance beyond `engram session fork`. Render the dead-end
-  // state instead of a textarea the user can shout into.
+  // Terminal states — render a dead-end card instead of a textarea
+  // the user can shout into. `prompt.rs` returns 410/409 for each;
+  // there's no affordance beyond `engram session fork`.
   if (status === 'dead') {
+    return <TerminalBanner text="this session is dead — fork it to continue." />;
+  }
+  if (status === 'completed') {
+    return <TerminalBanner text="this session is completed — fork it to continue." />;
+  }
+  if (status === 'failed') {
+    return <TerminalBanner text="this session failed during create — start a new one." />;
+  }
+  // ADR 0015 M2: HostLost is a non-terminal failure — the host went
+  // away but the reconciler will resolve to Idle (if a snapshot
+  // exists) or Dead soon. Either way the user can't send a prompt
+  // right now. Tell them what's happening instead of failing silently.
+  if (status === 'host_lost') {
     return (
-      <div
-        className="mt-12 pt-6 font-display italic text-[0.92rem]"
-        style={{
-          color: 'var(--color-ink-quiet)',
-          borderTop: '1px solid var(--color-rule)',
-        }}
-      >
-        this session is dead — fork it to continue.
-      </div>
+      <TerminalBanner text="the host running this session went away — waiting for the reconciler to resolve to idle (resumable) or dead." />
     );
   }
 
@@ -135,6 +140,29 @@ export function PromptComposer({ sessionId, status }: PromptComposerProps) {
           session is idle — sending will resume it.
         </p>
       )}
+
+      {(status === 'created' || status === 'guest_ready') && (
+        <p
+          className="mt-2 ml-7 font-display italic text-[0.82rem]"
+          style={{ color: 'var(--color-ink-quiet)' }}
+        >
+          session is still starting up — agentd will be ready in a moment.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function TerminalBanner({ text }: { text: string }) {
+  return (
+    <div
+      className="mt-12 pt-6 font-display italic text-[0.92rem]"
+      style={{
+        color: 'var(--color-ink-quiet)',
+        borderTop: '1px solid var(--color-rule)',
+      }}
+    >
+      {text}
     </div>
   );
 }

@@ -5,9 +5,11 @@ import type { Session } from '../types';
 
 const STATUS_ORDER: Session['status'][] = [
   'active',
+  'created',
+  'guest_ready',
   'pending',
   'idle',
-  'cold_evicted',
+  'host_lost',
   'failed',
   'completed',
   'dead',

@@ -2,16 +2,39 @@
 // rather than generated — kept narrow to what the UI consumes.
 //
 // Shapes traced from:
-//   crates/engram-core/src/types/session.rs       (Session, SessionStatus)
+//   crates/engram-core/src/types/session.rs       (Session, SessionState)
 //   crates/engram-coordinator/src/api/hosts.rs    (HostView)
 //   crates/engram-coordinator/src/state.rs        (SessionEvent enum)
 //   crates/engram-harness-proto/src/lib.rs        (AgentRole)
 
-export type SessionStatus =
+/**
+ * ADR 0015 M2 lifecycle. Matches the Rust `SessionState` enum
+ * exactly. Persistence: `pending` and `guest_ready` are code-level
+ * only and won't appear on a row read from `GET /sessions/:id`; the
+ * server may still emit them as the `from`/`to` of an early
+ * `status_changed` event during create.
+ *
+ *   pending     — request accepted, scheduler not yet returned
+ *   created     — sandbox bound; agentd not yet started
+ *   guest_ready — agentd reachable; harness not yet running
+ *   active      — agentd reachable AND harness running (or
+ *                 harness=none and agentd is ready). Only state in
+ *                 which /exec, /shell, /prompt proceed.
+ *   idle        — snapshotted; /resume rehydrates
+ *   host_lost   — heartbeat-loss against the bound host. The
+ *                 reconciler resolves this to `idle` (if a
+ *                 recoverable snapshot exists) or `dead`.
+ *   completed   — terminal (user-deleted)
+ *   failed      — terminal (create failed mid-flight)
+ *   dead        — terminal (chunked manifests gone or never were)
+ */
+export type SessionState =
   | 'pending'
+  | 'created'
+  | 'guest_ready'
   | 'active'
   | 'idle'
-  | 'cold_evicted'
+  | 'host_lost'
   | 'completed'
   | 'failed'
   | 'dead';
@@ -29,7 +52,7 @@ export type HarnessSpec =
 export interface Session {
   id: string;
   user_id: string | null;
-  status: SessionStatus;
+  status: SessionState;
   host_id: string | null;
   sandbox_id: string | null;
   image: ImageRef;
@@ -97,8 +120,8 @@ export interface ExecRusage {
 export type SessionEvent =
   | {
       type: 'status_changed';
-      from: SessionStatus;
-      to: SessionStatus;
+      from: SessionState;
+      to: SessionState;
       at: string;
     }
   | {

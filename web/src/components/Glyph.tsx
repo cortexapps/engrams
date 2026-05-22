@@ -1,20 +1,22 @@
 import { motion } from 'framer-motion';
-import type { SessionStatus } from '../types';
+import type { SessionState } from '../types';
 
 // Status glyphs in the margin — these stand in for colored dots. The
 // shape carries the meaning, not the color.
 //
-//   ●  active             ◐  warming / starting
-//   ◌  idle / snapshotted  ○  pending
-//   ✕  dead                ✓  completed
-//   !  failed
+//   ●  active            ◐  created / guest_ready (starting)
+//   ◌  idle              ○  pending
+//   ⚠  host_lost         ✓  completed
+//   ✕  dead              !  failed
 //
 // Active sessions get a slow opacity heartbeat (see .glyph-heartbeat
 // in theme.css). Idle sessions render in verdigris to mark them as
-// archival, never amber. Dead sessions fade into ink-quiet.
+// archival, never amber. Dead sessions fade into ink-quiet. Host-
+// lost sessions render in amber to flag that they need attention
+// (snapshot exists → /resume; no snapshot → going Dead shortly).
 
 export interface GlyphProps {
-  status: SessionStatus;
+  status: SessionState;
   /** Override beat (e.g. event ticker doesn't pulse). */
   beat?: boolean;
 }
@@ -40,16 +42,19 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
   );
 }
 
-function glyphFor(status: SessionStatus): string {
+function glyphFor(status: SessionState): string {
   switch (status) {
     case 'pending':
       return '○';
+    case 'created':
+    case 'guest_ready':
+      return '◐';
     case 'active':
       return '●';
     case 'idle':
       return '◌';
-    case 'cold_evicted':
-      return '◇';
+    case 'host_lost':
+      return '⚠';
     case 'completed':
       return '✓';
     case 'failed':
@@ -59,16 +64,18 @@ function glyphFor(status: SessionStatus): string {
   }
 }
 
-function toneFor(status: SessionStatus): string {
+function toneFor(status: SessionState): string {
   switch (status) {
     case 'active':
       return 'var(--color-amber)';
     case 'idle':
       return 'var(--color-verdigris)';
-    case 'cold_evicted':
-      return 'var(--color-ink-quiet)';
     case 'pending':
+    case 'created':
+    case 'guest_ready':
       return 'var(--color-ink-faded)';
+    case 'host_lost':
+      return 'var(--color-amber)';
     case 'completed':
       return 'var(--color-ink-faded)';
     case 'failed':
