@@ -1,22 +1,17 @@
 //! In-VM harness child supervisor.
 //!
-//! ADR 0015 M1: collapses the prior `engram-bootstrap` standalone
-//! process into agentd. Holds the most recent harness child handle
-//! and provides idempotent kill+respawn semantics so the host can
-//! re-deliver a `SpawnHarness` frame after FC snapshot/restore
-//! invalidates the previous adapter's connection.
-//!
-//! The mount + egress-CA logic is lifted verbatim from
-//! `crates/engram-bootstrap/src/main.rs`. See ADR 0014 M1.12 for
-//! the option-D context (warm-pool templates are harness-agnostic;
-//! the per-session harness drive is hot-swapped via FC `PATCH
-//! /drives` and the supervisor mounts it just before exec).
+//! Holds the most recent harness child handle and provides
+//! idempotent kill+respawn semantics so the host can re-deliver a
+//! `SpawnHarness` frame after FC snapshot/restore invalidates the
+//! previous adapter's connection. ADR 0014 M1.12 (option D) is
+//! the warm-pool context: templates are harness-agnostic; the
+//! per-session harness drive is hot-swapped via FC `PATCH /drives`
+//! and this supervisor mounts it just before exec.
 //!
 //! Concurrency contract: at most one spawn-in-flight per agent.
 //! Concurrent SpawnHarness calls serialise on the inner mutex;
 //! second caller sees the new child after the first finishes its
-//! kill+respawn. Mirrors bootstrap's pre-M1 single-threaded
-//! accept-loop behavior.
+//! kill+respawn.
 
 use std::sync::Arc;
 
@@ -60,8 +55,8 @@ impl HarnessSupervisor {
         }
         let argv0 = req.argv[0].clone();
 
-        // Optional harness-drive mount. Same flags as bootstrap pre-
-        // M1: ext4 + read-only, idempotent across re-entry.
+        // Optional harness-drive mount. ext4 + read-only,
+        // idempotent across re-entry.
         let mut harness_mounted_at: Option<String> = None;
         if let (Some(dev), Some(mount)) = (req.harness_dev.as_deref(), req.harness_mount.as_deref())
         {
@@ -109,7 +104,7 @@ impl HarnessSupervisor {
 }
 
 /// `mount(2)` wrapper for the harness device. ext4 + read-only,
-/// idempotent (EBUSY → Ok). Lifted from engram-bootstrap.
+/// idempotent (EBUSY → Ok).
 #[cfg(target_os = "linux")]
 fn mount_harness(dev: &str, mount_point: &str) -> std::io::Result<()> {
     use nix::mount::{mount, MsFlags};
@@ -148,8 +143,7 @@ fn mount_harness(_dev: &str, _mount_point: &str) -> std::io::Result<()> {
 
 /// Append the egress-proxy CA at `<harness_mount>/.engram-host/ca.pem`
 /// to the system bundle and set the env-var family the harness
-/// child inherits. No-op when the CA file is absent. Lifted from
-/// engram-bootstrap.
+/// child inherits. No-op when the CA file is absent.
 #[cfg(target_os = "linux")]
 fn inject_egress_proxy_ca(harness_mount: &str, cmd: &mut Command) -> std::io::Result<()> {
     let ca_path = format!("{harness_mount}/.engram-host/ca.pem");

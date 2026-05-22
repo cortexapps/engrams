@@ -550,8 +550,8 @@ async fn create_session_inner(
     //   2. Build a placeholder AgentSpec + SessionEgressPolicy with
     //      `guest_ip = UNSPECIFIED` (matching the no-guest-IP cold
     //      path). The host's warm-launch applies the policy +
-    //      sends BootstrapLaunch (with harness_dev=/dev/vdb so
-    //      bootstrap mounts the swapped harness).
+    //      sends SpawnHarness (with harness_dev=/dev/vdb so
+    //      agentd mounts the swapped harness).
     //   3. Ask the registry for a warm lease + harness_pack_uri.
     //      Lease success → skip cold-create.
     //   4. On NoCapacity / all-Stale, fall through to cold-create
@@ -580,11 +580,12 @@ async fn create_session_inner(
                 };
                 // For no-agent sessions we still want to warm-lease,
                 // synthesising a noop AgentSpec — the warm-launch
-                // path requires *some* AgentSpec because the in-VM
-                // bootstrap supervisor exec's whatever argv it
-                // receives. Passing argv=[] would crash bootstrap;
-                // pass a sleep-forever shim so the launch succeeds
-                // and the leased VM stays usable for direct exec.
+                // path requires *some* AgentSpec for the SpawnHarness
+                // frame. Empty argv would be a readiness probe (no
+                // child spawned), but the warm slot's in-VM agentd
+                // is already up — we want a child running so the
+                // leased VM stays usable for direct exec. Pass a
+                // sleep-forever shim.
                 let agent = warm_agent.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
                     argv: vec!["/bin/sleep".into(), "infinity".into()],
                     env: Default::default(),
@@ -763,7 +764,7 @@ async fn create_session_inner(
     // agent — no more "notify then unary" race surface.
     //
     // ADR 0014: warm-lease already invoked LaunchWarmSandbox which
-    // applied the policy + sent BootstrapLaunch on the host side.
+    // applied the policy + sent SpawnHarness on the host side.
     // Skip the start_agent call here to avoid double-spawning the
     // agent. Per-IP egress refinement is a follow-up (see comment
     // in the warm-lease block above).

@@ -43,13 +43,6 @@ use engram_core::SessionId;
 /// `<vsock_uds>_<port>.sock`; guest dials AF_VSOCK CID=2 port=1026).
 pub const HARNESS_VSOCK_PORT: u32 = 1026;
 
-// ADR 0015 M1: `BOOTSTRAP_VSOCK_PORT`, `BOOTSTRAP_READY_BYTE`, and
-// `BootstrapLaunch` were retired when the standalone
-// `engram-bootstrap` process was folded into agentd. The host now
-// dials agentd on `ENGRAM_AGENTD_PORT` (1024) with a
-// `WireRequest::SpawnHarness` carrying the same fields the old
-// `BootstrapLaunch` did. See:
-// `crates/engram-agentd/src/proto.rs::SpawnHarnessRequest`.
 
 /// Single-frame size cap. Same as `engram-agentd::proto::MAX_MSG_BYTES`.
 /// `transcript_delta` payloads are typically a few KB (one JSONL line

@@ -204,12 +204,11 @@ pub enum WireRequest {
         /// Optional port override. `None` → 7681.
         port: Option<u16>,
     },
-    /// ADR 0015 M1: spawn (or respawn) the session's harness child
-    /// inside the guest. Replaces the standalone `engram-bootstrap`
-    /// supervisor process. The agent owns a single harness child
-    /// at a time; a fresh `SpawnHarness` call kills any prior child
-    /// before launching the new one — matching the kill+respawn
-    /// semantics bootstrap had for post-resume re-attach.
+    /// Spawn (or respawn) the session's harness child inside the
+    /// guest. The agent owns a single harness child at a time; a
+    /// fresh `SpawnHarness` call kills any prior child before
+    /// launching the new one — the host uses that for clean
+    /// re-attach after FC snapshot/restore.
     ///
     /// Optionally mounts `harness_dev` at `harness_mount` (read-only
     /// ext4) before exec'ing argv. Used by the warm-pool option-D

@@ -1279,8 +1279,8 @@ impl FirecrackerBackend {
 
         // Harness substrate: read-only ext4 image of the host's
         // `cfg.harnesses_dir`, attached as the second virtio-blk
-        // drive (`/dev/vdb`). The init shim mounts it at
-        // `/run/engram/harnesses` so `engram-bootstrap` can exec
+        // drive (`/dev/vdb`). agentd's harness supervisor mounts it
+        // at `/run/engram/harnesses` on SpawnHarness so it can exec
         // `/run/engram/harnesses/<name>/harness`. None when the
         // host's harness registry is empty.
         if let Some(substrate_path) = spec.harness_substrate.as_ref() {

@@ -68,8 +68,9 @@ pub fn split_image_ref(uri: &str) -> (&str, &str) {
 }
 
 /// What long-running agent process (if any) attaches to the session.
-/// `None` is the "VM with a shell" mode — engram-bootstrap runs but
-/// never receives a `BootstrapLaunch` frame.
+/// `None` is the "VM with a shell" mode — agentd runs RPC + shell
+/// but never spawns a harness child (`SpawnHarness` arrives with
+/// empty argv as a readiness probe).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HarnessSpec {

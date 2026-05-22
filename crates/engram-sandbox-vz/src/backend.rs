@@ -511,7 +511,7 @@ impl SandboxBackend for VzBackend {
         // per-sandbox rootfs into the snapshot dir, and resume.
         // The clone IS the snapshot — restore re-clones it back
         // to a fresh per-sandbox file and cold-boots a new VM.
-        // engram-bootstrap's supervisor pattern + Claude's
+        // agentd's harness supervisor pattern + Claude's
         // `--resume <session-id>` (persisted on the rootfs at
         // /workspace/.engram/claude-session-id) recover
         // conversation continuity across the cold boot.
@@ -633,9 +633,9 @@ impl SandboxBackend for VzBackend {
         // restoreMachineStateFromURL is not actually functional
         // for arm64 Linux guests (see snapshot() comment).
         // Cold-boot is the canonical path — Apple's own
-        // containerization framework uses it. The
-        // bootstrap-supervisor pattern + Claude's `--resume`
-        // hand off conversation continuity across the boot.
+        // containerization framework uses it. agentd's harness-
+        // supervisor pattern + Claude's `--resume` hand off
+        // conversation continuity across the boot.
         let mut vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
@@ -652,10 +652,8 @@ impl SandboxBackend for VzBackend {
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
 
         // Re-bind the virtio-console UDS bridge against the
-        // restored VM. The in-VM `engram-bootstrap` supervisor
-        // (kept alive by the bootstrap-as-supervisor pattern this
-        // backend matches) is reachable via <vsock_uds>_1025 just
-        // like a fresh VM.
+        // restored VM. The in-VM agentd is reachable via
+        // `<vsock_uds>_1024` just like a fresh VM.
         let harness_sink = self.harness_sink.lock().clone();
         let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink)
             .await

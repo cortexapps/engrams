@@ -138,10 +138,9 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
   - `engram-sandbox-vz` — macOS Apple Silicon. Apple Virtualization.framework via `objc2-virtualization` bindings. APFS clone-based snapshots. Mac dev with real microVM isolation. (ADR 0003.)
   - `engram-sandbox-process` — anywhere. Subprocesses, no isolation. Fastest iteration loop for orchestration-layer work.
 - Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back, preemption signal handler. Heartbeats `(capacity, local_snapshots, draining)` to the coordinator.
-- **`engram-bootstrap`**: in-VM supervisor (lives at `/sbin/engram-bootstrap`). Listens on the host↔guest control transport for `BootstrapLaunch` frames; on each frame, kills the previous harness child and spawns a fresh one. Necessary because `SandboxSpec` is agent-blind (per-session argv would freeze at the first session's id) and because FC snapshot/restore needs a clean re-spawn point on resume.
-- **`engram-agentd`**: in-VM exec daemon. Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `Ping`, `Shutdown`. First-frame token handshake (server side) gates non-trivial verbs.
+- **`engram-agentd`**: in-VM exec daemon + harness supervisor (PID 1 after the init shim). Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. First-frame token handshake (server side) gates non-trivial verbs. Owns the harness child process; each `SpawnHarness` kills the previous child and exec's a fresh one — clean re-spawn point on resume. On startup, dials the host's per-sandbox ready UDS so the host can block on `accept()` rather than poll for "is the in-VM listener bound."
 - **`engram-transport`**: backend-agnostic transport trait. `VsockTransport` (FC) and `ConsoleTransport` (VZ); chosen at runtime via `ENGRAM_TRANSPORT` set by the bake's init shim.
-- **`engram-image-builder`**: warm-image baker. `Dockerfile` + `engram.toml` → `docker build` → `docker create + export | tar -x` → optional `mke2fs -t ext4 -F -d`. Injects static-musl `engram-agentd` + `engram-bootstrap` + harness binaries + `/sbin/engram-init` shim into the rootfs.
+- **`engram-image-builder`**: warm-image baker. `Dockerfile` + `engram.toml` → `docker build` → `docker create + export | tar -x` → optional `mke2fs -t ext4 -F -d`. Injects static-musl `engram-agentd` + harness binaries + `/sbin/engram-init` shim into the rootfs.
 - **`engram-cli`**: ops/admin tool. `engram session {list,get,delete,logs,prompt,log,diff,fork,checkpoint}`, `engram host {list,get,drain}`, `engram image build`.
 
 ---
@@ -366,7 +365,7 @@ pub trait SandboxBackend: Send + Sync {
 **v1 implementations**:
 
 - **`engram-sandbox-firecracker` (production, Linux)** — drives Firecracker over its HTTP-over-Unix-socket API. Each sandbox owns a Firecracker process, a per-VM vsock UDS, and (forthcoming) a TAP device. Snapshot via `PATCH /vm Paused` + `PUT /snapshot/create`. Restore via `PUT /snapshot/load` with either `backend_type=File` or `backend_type=Uffd` (lazy paging via the `engram-uffd-handler` companion process — sub-100ms resume regardless of guest RAM size). All `SandboxBackend` methods exercised by integration tests against real microVMs. Production hardening (jailer, TAP networking, broker-mode HTTPS proxy, `SendCtrlAltDel` graceful shutdown) lands in Phase 6.
-- **`engram-sandbox-vz` (Mac dev, macOS Apple Silicon)** — drives Apple Virtualization.framework via `objc2-virtualization` bindings. Multi-port virtio-console for the host↔guest control plane (universal kernel support, no `CONFIG_VIRTIO_VSOCKETS=y` requirement). Snapshots are APFS rootfs clones (`clonefile(2)` ~50 ms even at 1.7 GB), since VZ's native `saveMachineStateToURL`/`restoreMachineStateFromURL` is broken upstream for arm64 Linux guests. Cold boot 562 ms; cold resume 746 ms. Same `engram-bootstrap` + `engram-agentd` + harness binaries that run on FC. ADR 0003.
+- **`engram-sandbox-vz` (Mac dev, macOS Apple Silicon)** — drives Apple Virtualization.framework via `objc2-virtualization` bindings. Multi-port virtio-console for the host↔guest control plane (universal kernel support, no `CONFIG_VIRTIO_VSOCKETS=y` requirement). Snapshots are APFS rootfs clones (`clonefile(2)` ~50 ms even at 1.7 GB), since VZ's native `saveMachineStateToURL`/`restoreMachineStateFromURL` is broken upstream for arm64 Linux guests. Cold boot 562 ms; cold resume 746 ms. Same `engram-agentd` + harness binaries that run on FC. ADR 0003.
 - **`engram-sandbox-process` (dev, anywhere)** — runs commands as plain host subprocesses, each rooted in a per-sandbox working directory. No isolation, no resource enforcement. Fastest-possible iteration loop for orchestration-layer work that doesn't need to exercise the in-VM code paths. `snapshot()` is a tarball of the workdir. **Never use in deployment.**
 
 #### In-guest agent (`engram-agentd`)
@@ -616,8 +615,7 @@ engram/
     ├── engram-host-agent/             # binary: per-host daemon
     ├── engram-image-builder/          # binary + library: image baker (Directory / Ext4 modes)
     ├── engram-cli/                    # binary: ops/admin
-    ├── engram-agentd/                 # binary + library: in-guest exec daemon (transport-agnostic)
-    ├── engram-bootstrap/              # binary: in-guest supervisor (handles harness re-spawn)
+    ├── engram-agentd/                 # binary + library: in-guest exec daemon + harness supervisor (transport-agnostic)
     ├── engram-uffd-handler/           # binary + library: userfaultfd page-fault handler
     ├── engram-transport/              # transport abstraction (vsock for FC / virtio-console for VZ)
     ├── engram-harness-proto/          # wire types (HarnessEvent / HarnessCommand)

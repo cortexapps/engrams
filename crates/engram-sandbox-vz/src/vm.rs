@@ -73,9 +73,8 @@ impl VmConfig {
             //     CONFIG_CONSOLE_LOGLEVEL_QUIET=4 for full silence.
             //   - `init=/sbin/engram-init` — our minimal init shim
             //     that mounts /proc /sys /dev, exports
-            //     ENGRAM_TRANSPORT, spawns engram-bootstrap, exec's
-            //     engram-agentd. The bake injects this at
-            //     /sbin/engram-init.
+            //     ENGRAM_TRANSPORT, and exec's engram-agentd. The
+            //     bake injects this at /sbin/engram-init.
             //   - `ip=dhcp` — Linux's IP_PNP path: kernel itself
             //     brings up eth0 and DHCPs for an address against
             //     VZ's NAT before userspace runs. The Kata kernel

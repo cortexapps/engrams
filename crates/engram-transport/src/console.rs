@@ -22,8 +22,7 @@
 //! call: first accept blocks until the host has its end ready and
 //! returns the fresh fd; subsequent accepts after a guest-side
 //! close + reopen mirror the same shape. This matches vsock's
-//! "fresh stream per accept" semantic on the consumer side
-//! (`engram-bootstrap`'s outer loop, etc.).
+//! "fresh stream per accept" semantic on the consumer side.
 //!
 //! # Why `tokio::fs::File`
 //!

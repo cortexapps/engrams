@@ -225,7 +225,7 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     };
     let sandbox_id: SandboxId = backend.create(sandbox_spec).await.expect("create");
 
-    // ---- 5. Push BootstrapLaunch via start_agent ----
+    // ---- 5. Push SpawnHarness via start_agent ----
     let session_id = engram_core::SessionId::new();
     let port = engram_harness_proto::HARNESS_VSOCK_PORT.to_string();
     let argv = vec![

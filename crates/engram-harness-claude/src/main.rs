@@ -2,8 +2,9 @@
 //!
 //! Lives at `/sbin/engram-harness-claude` inside the rootfs (or
 //! cargo-target/.../engram-harness-claude on the dev-mode
-//! ProcessBackend path). Spawned by `engram-bootstrap` after the
-//! host pushes a `BootstrapLaunch` describing this binary.
+//! ProcessBackend path). Exec'd by `engram-agentd`'s harness
+//! supervisor after the host pushes a `SpawnHarness` request
+//! describing this binary.
 //!
 //! Strategy: child-per-prompt. Per `Prompt` command, spawn `claude
 //! --print --output-format stream-json --dangerously-skip-permissions

@@ -57,13 +57,13 @@ pub fn init(addr: SocketAddr) {
 ///   - `create_total` (`pooled_backend::create` — rollup of the
 ///     three above; `agent_handshake` is a separate gRPC call)
 ///   - `agent_handshake` (entry-point emits this; covers
-///     `notify_session_policy` + the vsock CONNECT + the
-///     BootstrapLaunch write):
+///     `notify_session_policy` + waiting on agentd's ready dial +
+///     the SpawnHarness round-trip):
 ///     - on the **cold-create** path, emitted from
 ///       `grpc_server::start_agent` (the coord's gRPC entry).
 ///       Time is dominated by in-VM boot: kernel + engram-init +
-///       ext4 mount + bootstrap binary load before the host's
-///       CONNECT succeeds.
+///       ext4 mount + agentd bind before its readiness dial reaches
+///       the host.
 ///     - on the **warm-lease** path, emitted from
 ///       `WarmPool::launch`. Same downstream code, but bootstrap
 ///       is already accept()'ing on the pre-restored microVM, so

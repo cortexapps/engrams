@@ -1,9 +1,5 @@
-//! `tokio_vsock`-backed [`Transport`] implementation.
-//!
-//! Mirrors what `engram-bootstrap`, `engram-agentd`,
-//! `engram-harness-noop`, and `engram-harness-claude` used to inline
-//! before this crate existed. Linux-only — vsock is a Linux kernel
-//! feature.
+//! `tokio_vsock`-backed [`Transport`] implementation. Linux-only —
+//! vsock is a Linux kernel feature.
 
 use std::io;
 

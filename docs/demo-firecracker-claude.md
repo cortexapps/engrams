@@ -49,13 +49,13 @@ in-VM `claude` process picks it up.
 ```
 
 What this does:
-1. Cross-compiles `engram-agentd`, `engram-bootstrap`, and the
-   new `engram-harness-claude` for `x86_64-unknown-linux-musl`.
+1. Cross-compiles `engram-agentd` and `engram-harness-claude`
+   for `x86_64-unknown-linux-musl`.
 2. Builds a Docker image off `node:20-slim` with `git`,
    `ca-certificates`, and `@anthropic-ai/claude-code` installed.
 3. Runs `engram image build` to produce an ext4 rootfs at
    `./var/engram/images/local/claude-demo/warm-1.ext4` with
-   the three musl binaries injected at `/sbin/`.
+   the musl binaries injected at `/sbin/`.
 
 Rootfs is ~400 MB. Acceptable for the demo.
 
@@ -149,8 +149,8 @@ engram session prompt $SID "this should fail"
 - A real Slack bot / web app subscriber (out of scope here; the
   shape they need is what this round ships).
 - Subscription billing via mounted `~/.claude/.credentials.json`
-  (`SecretValue::File` + `BootstrapLaunch.files`). Half a day
-  whenever it becomes the priority.
+  (`SecretValue::File` + a SpawnHarness `files` field). Half a
+  day whenever it becomes the priority.
 - Per-user auth via `SessionContext.user_id` → secret resolver.
 - `engram-harness-opencode` and friends — the persistent-server
   adapter pattern is documented but not yet implemented.

@@ -14,14 +14,15 @@ What this exercises:
   written before the snapshot are still there after resume.
 
 What this also exercises (after the harness path landed):
-- Harness-driven flow on Firecracker: in-VM `engram-bootstrap`
-  listens on vsock 1025; the host's `start_agent` pushes a
-  `BootstrapLaunch` frame; bootstrap exec's the harness from
-  `/run/engram/harnesses/<name>/harness` (mounted from the
-  read-only ext4 substrate attached as `/dev/vdb`); the harness
-  dials AF_VSOCK CID=2 port=1026 back to a per-sandbox UDS the
-  FC backend pre-bound; events land in `session_events` and
-  drive the same `harness_hub.idle_sandboxes(ttl)` path used by
+- Harness-driven flow on Firecracker: in-VM `engram-agentd`
+  listens on vsock 1024; the host's `start_agent` pushes a
+  `SpawnHarness` request; agentd's harness supervisor exec's
+  the harness from `/run/engram/harnesses/<name>/harness`
+  (mounted from the read-only ext4 substrate attached as
+  `/dev/vdb`); the harness dials AF_VSOCK CID=2 port=1026 back
+  to a per-sandbox UDS the FC backend pre-bound; events land
+  in `session_events` and drive the same
+  `harness_hub.idle_sandboxes(ttl)` path used by
   ProcessBackend. Idle eviction fires automatically after 60s
   without harness events. End-to-end coverage in
   `crates/engram-sandbox-firecracker/tests/harness_loopback.rs`.

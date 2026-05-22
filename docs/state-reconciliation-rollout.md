@@ -314,14 +314,14 @@ after Phase 5's manifest format is defined.**
 - VZ startup pass scans manifests; for each with
   `last_local_snapshot`, cold-restores from the APFS clone +
   cold-boots the VM. Conversation continuity comes from the
-  bootstrap supervisor + `claude --resume <id>` per ADR 0003.
+  agentd harness supervisor + `claude --resume <id>` per ADR 0003.
 
 ### Gate
 
 **Case C' partially closed for VZ** (session continuity, not RAM
 continuity). End-to-end on macOS: `just dev` running an active VZ
 session; Ctrl-C the coord; `just dev` again. Assert: session
-continues with the bootstrap supervisor restarting the harness;
+continues with the agentd harness supervisor restarting the harness;
 conversation history via `claude --resume` survives.
 
 ---

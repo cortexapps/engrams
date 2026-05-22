@@ -40,7 +40,7 @@ use crate::types::{SandboxId, SessionId};
 #[derive(Clone, Debug)]
 pub enum WarmLeaseOutcome {
     /// Granted a warm slot — coord follows up with
-    /// [`HostClient::launch_warm_sandbox`] to push BootstrapLaunch.
+    /// [`HostClient::launch_warm_sandbox`] to push SpawnHarness.
     Granted(SandboxId),
     /// Host's warm pool is for an older template_ref than the
     /// coord asked about. `current_ref` is the host's most-recently-
@@ -243,8 +243,8 @@ pub trait HostClient: Send + Sync {
         Ok(WarmLeaseOutcome::NoCapacity)
     }
 
-    /// Activate a previously-leased warm sandbox: push BootstrapLaunch
-    /// to in-guest engram-bootstrap and apply the SessionEgressPolicy.
+    /// Activate a previously-leased warm sandbox: push SpawnHarness
+    /// to in-guest agentd and apply the SessionEgressPolicy.
     /// The pre-restored substrate is already running by this point;
     /// this RPC is the per-session activation, not the create.
     ///

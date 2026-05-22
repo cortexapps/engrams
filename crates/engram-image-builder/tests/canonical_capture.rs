@@ -130,9 +130,9 @@ async fn capture_canonical_memory_chunks_post_boot_memory() {
         // chunked-restore plumbing needs prod-shaped wiring.
         uffd_handler_bin: None,
         blob_root: None,
-        // The Ubuntu rootfs this test uses has no engram-init and
-        // no engram-bootstrap; opt out of the M1.12 stub-harness +
-        // engram-init scaffolding so the kernel can reach a shell.
+        // The Ubuntu rootfs this test uses has no engram-init; opt
+        // out of the stub-harness + engram-init scaffolding so the
+        // kernel can reach a shell.
         skip_warm_pool_prep: true,
         // CI nextest runs as the `runner` user, which lacks
         // `CAP_NET_ADMIN` — `ip tuntap add` would EPERM. Keep this

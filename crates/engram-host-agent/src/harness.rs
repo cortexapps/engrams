@@ -322,14 +322,14 @@ impl HarnessHub {
     ) -> Result<(), HarnessError> {
         // Look up the connection, retrying briefly if it isn't there
         // yet. The post-resume race: `ensure_active` returns once
-        // `start_agent` has written the BootstrapLaunch frame, but
-        // the in-VM bootstrap supervisor still needs to (a) accept
-        // the connection, (b) kill the previous adapter, (c) spawn
-        // the new one, (d) let the new adapter dial back over vsock
-        // and finish HarnessAttach. That's a few hundred ms in
-        // practice. Without a wait here, the user's prompt that
-        // triggered the resume races the handshake and bounces with
-        // NotAttached even though the system is healthy.
+        // `start_agent` has written the SpawnHarness frame, but
+        // agentd's harness supervisor still needs to (a) read the
+        // frame, (b) kill the previous adapter, (c) spawn the new
+        // one, (d) let the new adapter dial back over vsock and
+        // finish HarnessAttach. That's a few hundred ms in practice.
+        // Without a wait here, the user's prompt that triggered the
+        // resume races the handshake and bounces with NotAttached
+        // even though the system is healthy.
         let cmd_tx = {
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);

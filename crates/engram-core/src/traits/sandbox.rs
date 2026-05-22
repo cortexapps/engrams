@@ -65,9 +65,8 @@ pub trait SandboxBackend: Send + Sync {
     /// its target without racing against the spawn.
     ///
     /// Default impl errors with `InvalidSpec` — backends that
-    /// don't yet support agents (Firecracker until
-    /// `engram-bootstrap` lands) inherit it; backends that do
-    /// (ProcessBackend) override.
+    /// don't support spawning an in-VM agent inherit it; backends
+    /// that do (FC, VZ, ProcessBackend) override.
     async fn start_agent(&self, _id: SandboxId, _agent: AgentSpec) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `start_agent` yet".into(),

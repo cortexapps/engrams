@@ -4,8 +4,7 @@
 //! [`TemplateRef`]. Each entry is a sandbox that has been
 //! `restore_from_snapshot`d from the template's bake-time portable
 //! snapshot (state.bin + sidecar + memory chunks) and is currently
-//! paused with bootstrap awaiting a `BootstrapLaunch` frame on
-//! vsock.
+//! paused with agentd awaiting a `SpawnHarness` frame on vsock.
 //!
 //! ## Lifecycle
 //!
@@ -25,8 +24,8 @@
 //! - **Launch**: the activation step — coord calls
 //!   [`WarmPool::launch`] with the per-session agent + egress
 //!   policy; this delegates to `SandboxBackend::start_agent`,
-//!   which applies the policy and writes the `BootstrapLaunch`
-//!   frame to the in-guest bootstrap supervisor.
+//!   which applies the policy and writes the `SpawnHarness`
+//!   frame to the in-guest agentd.
 //!
 //! For M1.6 the autoscaler target is fixed at N=1 per template;
 //! M1.9 introduces lease-rate-driven scaling.
@@ -393,8 +392,8 @@ impl WarmPool {
 
     /// Activate a previously-leased warm sandbox: optionally swap
     /// the harness drive (ADR 0014 M1.12 option D), apply egress
-    /// policy, then push BootstrapLaunch. Pre-restored substrate
-    /// is already running; this is the per-session activation step.
+    /// policy, then push SpawnHarness. Pre-restored substrate is
+    /// already running; this is the per-session activation step.
     ///
     /// `session_harness_path` is `Some` for sessions whose chosen
     /// harness differs from the template's bake-time stub. The

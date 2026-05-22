@@ -3,10 +3,10 @@
 //!
 //! This is the sister to `engram-sandbox-firecracker` for hosts that
 //! can't run KVM. It mirrors FC's external surface — vsock channels
-//! exposed as UDS files at `<work_dir>/<sid>.vsock_{1024,1025,1026}`,
-//! BootstrapLaunch handshake, harness sink fanout, snapshot/restore —
-//! so the rest of the stack runs unchanged when the coordinator picks
-//! `--sandbox-backend=vz`.
+//! exposed as UDS files at `<work_dir>/<sid>.vsock_{1024,1026}`,
+//! SpawnHarness handshake against agentd, harness sink fanout,
+//! snapshot/restore — so the rest of the stack runs unchanged when
+//! the coordinator picks `--sandbox-backend=vz`.
 //!
 //! # Why in-process
 //!

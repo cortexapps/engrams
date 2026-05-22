@@ -97,9 +97,8 @@ Three process classes, four storage primitives, three wire surfaces.
 **`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Composes a local `SandboxBackend` (FC / VZ / Process — the VMM driver) and a `HarnessHub` (in-VM adapter routing) into a `LocalHostClient`; that's what's served over the WS to the coord (ADR 0011 splits the trait surfaces: `SandboxBackend` = "what kind of VM," `HostClient` = "where the work happens"). Hosts the chunked-OCI image cache + tiered chunk resolver, the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the filtering egress proxy on TCP/443 + UDP/53 + TCP/53 (ADRs 0006, 0010). Heartbeats `(capacity, local_snapshots, draining, running_sandboxes)` every 5 s.
 
 **In-guest binaries** (live inside each microVM, baked into the rootfs by `engram-image-builder`):
-- `engram-bootstrap` — PID 1's child after the init shim. Listens for `BootstrapLaunch` frames from the host-agent over vsock (FC) / virtio-console (VZ); on each frame, kills the previous harness child and spawns a fresh one. Necessary because `SandboxSpec` is agent-blind (per-session argv would freeze at the first session's id) and because FC snapshot/restore needs a clean re-spawn point on resume.
-- `engram-agentd` — exec daemon. Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `Ping`, `Shutdown`. Token-handshake gated.
-- `engram-harness-{noop,claude}` — the agent runtime (Claude Code or a deterministic test harness). Reports run state + tool calls back through the harness hub.
+- `engram-agentd` — PID 1's exec after the init shim. The in-VM control surface: serves length-prefixed bincode RPCs over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. Owns the harness child process (kill+respawn on each fresh `SpawnHarness`, so the host has a clean re-spawn point on resume). On startup, dials the host on `ENGRAM_AGENTD_READY_PORT` so the host knows when the in-VM listener is bound — no boot-race polling on the host side.
+- `engram-harness-{noop,claude}` — the agent runtime (Claude Code or a deterministic test harness), exec'd as agentd's harness child on `SpawnHarness`. Reports run state + tool calls back through the harness hub.
 
 ### Storage substrate (ADR 0007)
 
@@ -216,8 +215,7 @@ crates/
   engram-host-agent                 # binary: per-host daemon (chunked-OCI, NBD, reaper)
   engram-image-builder              # binary: warm-image baker (Directory + Ext4)
   engram-cli                        # binary: ops/admin tool
-  engram-agentd                     # binary: in-guest exec daemon
-  engram-bootstrap                  # binary: in-guest supervisor
+  engram-agentd                     # binary: in-guest exec daemon + harness supervisor
   engram-uffd-handler               # binary: userfaultfd page-fault handler
   engram-sandbox-firecracker        # SandboxBackend: FC microVMs (Linux production)
   engram-sandbox-vz                 # SandboxBackend: Apple VZ (macOS Apple Silicon)
@@ -241,7 +239,7 @@ The orchestration layer is VMM-agnostic — anything that implements `SandboxBac
 | `engram-sandbox-vz` | microVM (Hypervisor.framework) | APFS clone of rootfs | macOS 12+ on Apple Silicon | Mac dev with real microVM isolation. Sub-second cold boot, sub-second cold resume. ADR 0003. |
 | `engram-sandbox-firecracker` | microVM (KVM) | FC memory snapshot + UFFD lazy paging + NBD chunked disk | Linux + KVM | Production. Real isolation, real resource enforcement, sub-100ms hot resume. |
 
-`process` and `vz` are dev-side: `process` for the fastest possible iteration loop, `vz` for fidelity to the FC code paths (same `engram-bootstrap` + `engram-agentd` + harness binaries; same chunked-OCI session-create semantics). Production isolation is always Firecracker.
+`process` and `vz` are dev-side: `process` for the fastest possible iteration loop, `vz` for fidelity to the FC code paths (same `engram-agentd` + harness binaries; same chunked-OCI session-create semantics). Production isolation is always Firecracker.
 
 ## Quick start (dev, macOS or Linux)
 

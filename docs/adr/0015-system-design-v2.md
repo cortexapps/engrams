@@ -1,8 +1,36 @@
 # ADR 0015: System design v2 — abstractions, not scab fixes
 
-Status: Proposed, 2026-05-22. Section **M1 (in-VM service unification)
-is Accepted and ships in this PR**; the remaining eight sections stay
-Proposed pending their own implementation ADRs.
+Status: 2026-05-22 — overall **Proposed (v2 direction)**; section **M1
+(in-VM service unification) Accepted + shipped**. The remaining
+eight sections stay Proposed pending their own implementation ADRs.
+
+M1 commit chain (in order):
+- `75ba2df` — collapse `engram-bootstrap` into `engram-agentd`
+  (`WireRequest::SpawnHarness`, `HarnessSupervisor` module, atomic
+  deletion of the bootstrap crate / constants / wire types / CLI
+  flag / init-shim fork)
+- `97de278` — `ProcessBackend::start_agent` empty-argv readiness
+  short-circuit + drop straggling `bootstrap_binary: None` from test
+  fixtures
+- `0d444e9` — dev integration scripts stop building and injecting
+  bootstrap
+- `4b3f890` — replace the boot-race retry helper with a guest-
+  initiated readiness dial. New `ENGRAM_AGENTD_READY_PORT = 1027`;
+  agentd dials the host on startup; FC backend's `start_agent`
+  blocks on a `tokio::sync::watch` filled by the per-sandbox accept
+  task; `connect_fc_vsock_with_retry` deleted; `exec_stream` and
+  `start_shell` revert to plain one-shot connects (their callers
+  only run after Active, which now means agentd is provably bound)
+
+Verification at the M1 boundary:
+- `just check` clean (780/780 workspace tests, fmt + clippy).
+- `just integration-test` on the dev-vm: full bake → enable →
+  cascade → cold-create → cleanup cycle green.
+- `just integration-session` (harness=none) + immediate `/exec`:
+  60 ms wall, no `early eof`. The race the no-harness path used
+  to produce is structurally impossible — every session goes
+  through `start_agent`, which only returns after agentd's ready
+  dial.
 
 ## Context
 
@@ -119,7 +147,7 @@ Accepted and being implemented now; M2–M9 are Proposed.
 
 | # | Abstraction | Status |
 |---|---|---|
-| M1 | `GuestService` — one in-VM RPC surface, one readiness signal | **Accepted, in this PR** |
+| M1 | `GuestService` — one in-VM RPC surface, one readiness signal | **Accepted + shipped** (commits `75ba2df` / `97de278` / `0d444e9` / `4b3f890`) |
 | M2 | `SessionState` — explicit, gated state machine | Proposed |
 | M3 | `HostRegistry` as a TTL'd cache of PG truth | Proposed |
 | M4 | `Sandbox` as a content-addressed migratable value | Proposed |
@@ -163,10 +191,16 @@ probe — any successful RPC proves the daemon is up.
   injection branch that consumed it.
 - The `--inject-bootstrap` CLI flag on `engram-cli image build`,
   along with its plumbing through `image_build_local`.
-- The bootstrap-1025 retry path in
-  `engram-sandbox-firecracker::start_agent` (the helper
-  `connect_fc_vsock_with_retry` we already landed today covers
-  agentd-1024).
+- The entire boot-race retry-loop pattern. Pre-M1 we had three
+  copies of CONNECT-then-retry-on-early-eof (start_agent against
+  bootstrap-1025, exec_stream against agentd-1024, start_shell
+  against agentd-1024). After the readiness-dial design lands
+  (commit `4b3f890`), `start_agent` blocks on a `tokio::sync::watch`
+  filled when agentd dials the host on `ENGRAM_AGENTD_READY_PORT`;
+  exec_stream and start_shell go back to plain one-shot connects
+  because they only run after Active, and Active now means agentd
+  is provably bound. `connect_fc_vsock_with_retry` deleted; no
+  per-call deadline knobs anywhere.
 - The VZ backend's BootstrapLaunch path —
   `engram-sandbox-vz::start_agent` switched to SpawnHarness on
   agentd-1024 like FC, and the `engram-harness-proto` dependency on

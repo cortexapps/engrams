@@ -196,10 +196,7 @@ pub struct AgentInjection {
     pub transport: Transport,
     /// Override the default init script. When `None`, the baker
     /// writes a minimal `/bin/sh` shim that mounts `/proc`, `/sys`,
-    /// `/dev`, and `exec`s `engram-agentd --port <port>`. (Pre-ADR-
-    /// 0015 the shim also forked a separate `engram-bootstrap`
-    /// supervisor; that process was folded into agentd and the
-    /// shim is one-line shorter as a result.)
+    /// `/dev`, and `exec`s `engram-agentd --port <port>`.
     pub init_script: Option<PathBuf>,
 }
 
@@ -345,8 +342,8 @@ export ENGRAM_TRANSPORT=__TRANSPORT__
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
 # engram-init: pre-flight diagnostics. Quiet on the happy path
 # (ENGRAM_INIT_DEBUG=0); operators set ENGRAM_INIT_DEBUG=1 in
-# the bake's BootstrapLaunch.env to see /sys/class/virtio-ports
-# enumeration when bringing up a new kernel build.
+# the kernel cmdline to see /sys/class/virtio-ports enumeration
+# when bringing up a new kernel build.
 if [ "${ENGRAM_INIT_DEBUG:-0}" = "1" ]; then
     echo "engram-init: ENGRAM_TRANSPORT=$ENGRAM_TRANSPORT" >&2
     for p in /sys/class/virtio-ports/*; do
@@ -388,12 +385,6 @@ fi
 # to ~150ms (fresh spawn). Worth it because the boot cost was paid
 # on every session create, and only a tiny fraction of sessions
 # actually use the SHELL tab.
-#
-# ADR 0015 M1: bootstrap is no longer a separate process. Its
-# harness-supervisor responsibility moved into agentd, which the
-# host dials with `WireRequest::SpawnHarness` after the FC instance
-# is up. The legacy `/sbin/engram-bootstrap` is a no-op stub for
-# bakes that still ship it; this init shim no longer forks it.
 exec /sbin/engram-agentd --port __VSOCK_PORT__
 "#;
 

@@ -161,8 +161,8 @@ full chain works:
 3. Coord → host: `NotifyKind::SessionEgressPolicy(...)`; host's
    PooledBackend registers the policy in the egress proxy.
 4. Coord → host: `StartAgent`; host's FC backend opens a vsock
-   to `engram-bootstrap`, pushes the launch frame; harness
-   wrapper exec's Claude.
+   to `engram-agentd`, pushes a `SpawnHarness` frame; agentd's
+   harness supervisor exec's Claude.
 5. Coord → host: `SendHarnessPrompt`; host's hub forwards into
    the in-VM adapter; Claude starts.
 6. Claude DNS lookup `api.anthropic.com` → iptables REDIRECT

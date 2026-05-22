@@ -1,11 +1,11 @@
 //! Host↔guest byte-stream transport for the in-VM binaries.
 //!
-//! The four in-VM binaries (`engram-bootstrap`, `engram-agentd`,
-//! `engram-harness-noop`, `engram-harness-claude`) used to embed
-//! their own vsock-specific bind / dial code. This crate hoists that
-//! out and adds a second transport implementation —
-//! `virtio-console` — so the same binaries work regardless of which
-//! VMM is hosting the VM.
+//! The in-VM binaries (`engram-agentd`, `engram-harness-noop`,
+//! `engram-harness-claude`) use this crate's `Transport` trait to
+//! bind / dial without knowing which VMM is hosting the VM. Two
+//! impls ship: `VsockTransport` for Firecracker on Linux/KVM and
+//! `ConsoleTransport` (virtio-console) for Apple Virtualization
+//! on macOS.
 //!
 //! # Why two transports
 //!
@@ -44,9 +44,9 @@
 //!
 //! Both impls are Linux-only. On macOS / other hosts the crate
 //! compiles to an empty shell — the in-VM binaries themselves are
-//! Linux-only too (the workspace's `engram-bootstrap` /
-//! `engram-agentd` / `engram-harness-*` binaries already wrap their
-//! `main` in `#[cfg(target_os = "linux")]`), so this just keeps
+//! Linux-only too (the workspace's `engram-agentd` /
+//! `engram-harness-*` binaries already wrap their `main` in
+//! `#[cfg(target_os = "linux")]`), so this just keeps
 //! `cargo check --workspace` green on Apple Silicon.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -93,8 +93,7 @@ pub trait Transport: Send + Sync {
     /// coord's harness hub on `HARNESS_VSOCK_PORT` (1026).
     async fn dial(&self, port: u32) -> io::Result<BoxedStream>;
 
-    /// Bind a listener on `port`. Used by `engram-bootstrap` (1025)
-    /// and `engram-agentd` (1024).
+    /// Bind a listener on `port`. Used by `engram-agentd` (1024).
     async fn listen(&self, port: u32) -> io::Result<Box<dyn Listener>>;
 }
 

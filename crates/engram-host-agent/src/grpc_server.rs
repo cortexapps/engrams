@@ -323,7 +323,7 @@ impl HostService for HostServiceImpl {
     }
 
     /// ADR 0014: activate a leased warm sandbox by pushing a fresh
-    /// BootstrapLaunch (carrying the per-session agent + env) and
+    /// SpawnHarness (carrying the per-session agent + env) and
     /// applying the egress policy to the host's proxy registry.
     async fn launch_warm_sandbox(
         &self,
