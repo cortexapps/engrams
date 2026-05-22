@@ -161,17 +161,30 @@ pub trait MetadataStore: Send + Sync {
     /// replica's detector doesn't keep trying to re-kill them.
     async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError>;
 
-    /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id` on
-    /// every session pointed at it, (c) transition those sessions to
-    /// `Dead`. Returns the affected SessionIds so the caller
-    /// can emit per-session `StatusChanged` events. Postgres uses a
-    /// single transaction; the Mock takes its sessions mutex once.
-    /// Idempotent on a host already marked Dead — returns an empty
-    /// vec since no sessions still point at it.
-    async fn mark_host_dead_and_reassign_sessions(
+    /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id`
+    /// and `sandbox_id` on every non-terminal session pointed at it,
+    /// (c) transition those sessions to `HostLost`.
+    ///
+    /// ADR 0015 M2: the orphaned sessions move to `HostLost` rather
+    /// than straight to `Dead`. The caller then runs a per-session
+    /// snapshot check and drives the second-stage transition:
+    /// `HostLost -> Idle` if a recoverable snapshot exists,
+    /// `HostLost -> Dead` otherwise. Splitting the two stages makes
+    /// "host went away" a distinct lifecycle moment from "the
+    /// session is unrecoverable," which is what M4 (session
+    /// migration) needs as an entry point.
+    ///
+    /// Returns `(SessionId, previous_state)` pairs so the caller can
+    /// emit honest `StatusChanged { from: previous_state, to:
+    /// HostLost }` events instead of hand-encoding a placeholder
+    /// `from`. Postgres uses a single transaction; the Mock takes
+    /// its sessions mutex once. Idempotent on a host already marked
+    /// Dead — returns an empty vec since no sessions still point at
+    /// it.
+    async fn mark_host_dead_and_orphan_sessions(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<SessionId>, MetaError>;
+    ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
     // ---- snapshots ----
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;

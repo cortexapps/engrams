@@ -420,17 +420,21 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::host_from_row).collect()
     }
 
-    async fn mark_host_dead_and_reassign_sessions(
+    async fn mark_host_dead_and_orphan_sessions(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<SessionId>, MetaError> {
-        // Single transaction: hosts.status -> dead, every session row
-        // pointing at this host gets host_id cleared and status flipped
-        // to dead. Returning the affected session ids lets
-        // the caller emit per-session StatusChanged events without a
-        // second query. The hosts UPDATE deliberately omits a rows-
-        // affected check — calling this on a host already marked dead
-        // is a benign no-op (the sessions UPDATE returns an empty list).
+    ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
+        // ADR 0015 M2: orphaned sessions move to `host_lost`, not
+        // straight to `dead`. The caller runs a per-session snapshot
+        // check and drives `HostLost -> {Idle, Dead}` as a separate
+        // transition. Splitting the two stages keeps "host went away"
+        // a distinct lifecycle moment from "session is unrecoverable."
+        //
+        // RETURNING `id, prev_status` so the caller can emit honest
+        // StatusChanged events. The `prev_status` is read inside the
+        // same UPDATE via a CTE so we don't race with a concurrent
+        // transition_session on the same row — the row is locked for
+        // the duration of this transaction.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
         sqlx::query(r#"UPDATE hosts SET status = 'dead', updated_at = NOW() WHERE id = $1"#)
@@ -441,14 +445,21 @@ impl MetadataStore for PostgresStore {
 
         let rows = sqlx::query(
             r#"
-            UPDATE sessions
+            WITH prior AS (
+                SELECT id, status AS prev_status
+                  FROM sessions
+                 WHERE host_id = $1
+                   AND status NOT IN ('completed','failed','dead')
+                   FOR UPDATE
+            )
+            UPDATE sessions s
                SET host_id    = NULL,
                    sandbox_id = NULL,
-                   status     = 'dead',
+                   status     = 'host_lost',
                    last_active_at = NOW()
-             WHERE host_id = $1
-               AND status NOT IN ('completed','failed')
-            RETURNING id
+              FROM prior p
+             WHERE s.id = p.id
+            RETURNING s.id, p.prev_status
             "#,
         )
         .bind(host_id.as_uuid())
@@ -458,14 +469,14 @@ impl MetadataStore for PostgresStore {
 
         tx.commit().await.map_err(db_err)?;
 
-        let ids = rows
-            .iter()
+        rows.iter()
             .map(|r| {
                 let uuid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-                Ok(SessionId::from(uuid))
+                let raw: String = sqlx::Row::try_get(r, "prev_status").map_err(db_err)?;
+                let prev = row::parse_session_state_for_lib(&raw)?;
+                Ok((SessionId::from(uuid), prev))
             })
-            .collect::<Result<Vec<SessionId>, MetaError>>()?;
-        Ok(ids)
+            .collect::<Result<Vec<_>, MetaError>>()
     }
 
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {

@@ -96,7 +96,10 @@ impl SessionState {
     /// GuestReady  -> Active | Failed | HostLost
     /// Active      -> Idle | HostLost | Failed | Completed | Dead
     /// Idle        -> Created (resume) | Dead | Completed
-    /// HostLost    -> Created (re-pick + restore) | Dead | Completed
+    /// HostLost    -> Created (M4 re-pick on peer host)
+    ///              | Idle (resume from snapshot)
+    ///              | Dead (no recoverable snapshot)
+    ///              | Completed (user delete)
     /// Failed      -> (terminal)
     /// Completed   -> (terminal)
     /// Dead        -> (terminal)
@@ -118,7 +121,7 @@ impl SessionState {
             GuestReady => matches!(target, Active | Failed | HostLost),
             Active => matches!(target, Idle | HostLost | Failed | Completed | Dead),
             Idle => matches!(target, Created | Dead | Completed),
-            HostLost => matches!(target, Created | Dead | Completed),
+            HostLost => matches!(target, Created | Idle | Dead | Completed),
             Failed | Completed | Dead => false,
         }
     }
@@ -336,6 +339,7 @@ mod tests {
             (Idle, Dead),
             (Idle, Completed),
             (HostLost, Created),
+            (HostLost, Idle),
             (HostLost, Dead),
             (HostLost, Completed),
         ];

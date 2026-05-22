@@ -6,14 +6,21 @@
 //! each candidate. The winner:
 //!
 //! 1. Atomically marks the host `Dead` in Postgres and transitions
-//!    every session pointed at it to `Dead` with `host_id`
-//!    cleared.
-//! 2. Emits a `StatusChanged` event for each affected session so SSE
-//!    subscribers see the transition.
-//! 3. Fires `pg_notify('host_dead', host_id::text)` so other replicas
+//!    every non-terminal session pointed at it to `HostLost` with
+//!    `host_id` / `sandbox_id` cleared (ADR 0015 M2). `HostLost` is
+//!    the explicit "host went away, decide what to do next" state —
+//!    M4 (session migration) will turn it into a re-pick on a peer
+//!    host; until then we drive the second-stage transition here.
+//! 2. For each session: looks up the latest snapshot. If a
+//!    recoverable snapshot exists → `HostLost -> Idle` (the user can
+//!    /resume from the snapshot); otherwise → `HostLost -> Dead`.
+//! 3. Emits per-session `StatusChanged` events for both transitions
+//!    using the honest `from` returned by the bulk + the
+//!    second-stage transition_session calls.
+//! 4. Fires `pg_notify('host_dead', host_id::text)` so other replicas
 //!    drop the host from their in-memory `HostRegistry` (handled in
 //!    `pg_listener`).
-//! 4. Unregisters the host locally.
+//! 5. Unregisters the host locally.
 //!
 //! Active execs running on the dead host don't need explicit
 //! synthesis: dropping the host's `RemoteSandboxBackend` cascades
@@ -37,6 +44,43 @@ use sqlx::postgres::PgPool;
 
 use crate::host_registry::HostRegistry;
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
+use engram_core::SessionId;
+
+/// Persist + publish a `StatusChanged{from, to}` event. Inline here
+/// (rather than via `SharedState::emit`) so the dead-host detector
+/// can run without a full Services struct — same shape the reconcile
+/// pass uses. Errors are logged and swallowed because the persisted
+/// state already changed; rolling back the eviction is worse than a
+/// missed SSE event.
+async fn emit_status_changed(
+    meta: &Arc<dyn MetadataStore>,
+    events: &Arc<SessionEventBus>,
+    session_id: SessionId,
+    from: SessionState,
+    to: SessionState,
+) {
+    let event = SessionEvent::StatusChanged {
+        from,
+        to,
+        at: Utc::now(),
+    };
+    let kind = event.kind();
+    let payload = match serde_json::to_value(&event) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, %session_id, "serialize StatusChanged failed");
+            return;
+        }
+    };
+    match meta.append_session_event(session_id, kind, payload).await {
+        Ok(idx) => {
+            events.publish(session_id, IndexedEvent { idx, event });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %session_id, "persist StatusChanged failed");
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DeadHostConfig {
@@ -152,7 +196,7 @@ async fn evict_host(
         return Ok(());
     }
 
-    let session_ids = meta.mark_host_dead_and_reassign_sessions(host_id).await?;
+    let affected = meta.mark_host_dead_and_orphan_sessions(host_id).await?;
 
     // Notify other replicas so they drop their HostRegistry entry.
     sqlx::query("SELECT pg_notify('host_dead', $1)")
@@ -160,30 +204,48 @@ async fn evict_host(
         .execute(&mut *conn)
         .await?;
 
-    // Emit StatusChanged for every reassigned session so SSE clients
-    // see the transition in their event stream. Failures here are
-    // logged but don't roll back the eviction — the persistent state
-    // already changed.
-    for session_id in &session_ids {
-        let event = SessionEvent::StatusChanged {
-            from: SessionState::Active,
-            to: SessionState::Dead,
-            at: Utc::now(),
-        };
-        let kind = event.kind();
-        let payload = match serde_json::to_value(&event) {
-            Ok(p) => p,
+    // Stage 1: emit StatusChanged{prev -> HostLost} for every session
+    // the bulk touched. The `prev` came back from the UPDATE so the
+    // `from` is honest (not a hand-encoded `Active` that would lie if
+    // the session had been Idle).
+    for (session_id, prev) in &affected {
+        emit_status_changed(meta, events, *session_id, *prev, SessionState::HostLost).await;
+    }
+
+    // Stage 2: per-session snapshot-aware second transition. If a
+    // recoverable snapshot exists, the user can /resume — drive
+    // HostLost -> Idle. Otherwise the session is unrecoverable —
+    // HostLost -> Dead. Failures of either query/transition are
+    // logged and skipped; the row stays at HostLost and a future
+    // reconcile pass (or operator action) can move it on.
+    for (session_id, _) in &affected {
+        let snapshot = match meta.latest_snapshot_for_session(*session_id).await {
+            Ok(opt) => opt,
             Err(e) => {
-                tracing::warn!(error = %e, %session_id, "serialize StatusChanged failed");
+                tracing::warn!(
+                    error = %e,
+                    %session_id,
+                    "snapshot lookup failed; leaving session at HostLost"
+                );
                 continue;
             }
         };
-        match meta.append_session_event(*session_id, kind, payload).await {
-            Ok(idx) => {
-                events.publish(*session_id, IndexedEvent { idx, event });
+        let target = if snapshot.is_some() {
+            SessionState::Idle
+        } else {
+            SessionState::Dead
+        };
+        match meta.transition_session(*session_id, target).await {
+            Ok(prev) => {
+                emit_status_changed(meta, events, *session_id, prev, target).await;
             }
             Err(e) => {
-                tracing::warn!(error = %e, %session_id, "persist StatusChanged failed");
+                tracing::warn!(
+                    error = %e,
+                    %session_id,
+                    ?target,
+                    "HostLost second-stage transition failed; leaving session at HostLost"
+                );
             }
         }
     }
@@ -191,8 +253,8 @@ async fn evict_host(
     host_registry.unregister(host_id);
     tracing::info!(
         host_id = %host_id,
-        sessions_reassigned = session_ids.len(),
-        "host marked dead and sessions transitioned to dead",
+        sessions_orphaned = affected.len(),
+        "host marked dead; sessions moved through HostLost to Idle/Dead",
     );
 
     sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
@@ -208,7 +270,7 @@ mod tests {
     // The detector's polling loop and advisory-lock dance are
     // Postgres-specific and require a live database to test
     // meaningfully. The trait-layer logic
-    // (`mark_host_dead_and_reassign_sessions` semantics) is covered
+    // (`mark_host_dead_and_orphan_sessions` semantics) is covered
     // by Mock-based tests in `tests/dead_host_mock.rs`. End-to-end
     // multi-replica behaviour is the live-Postgres test
     // (`#[ignore]`'d, gated behind dev-VM Docker compose).

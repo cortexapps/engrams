@@ -268,10 +268,10 @@ mod tests {
         async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
             Ok(vec![])
         }
-        async fn mark_host_dead_and_reassign_sessions(
+        async fn mark_host_dead_and_orphan_sessions(
             &self,
             _: HostId,
-        ) -> Result<Vec<SessionId>, MetaError> {
+        ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
             Ok(vec![])
         }
         async fn record_snapshot(&self, _: SnapshotRecord) -> Result<(), MetaError> {

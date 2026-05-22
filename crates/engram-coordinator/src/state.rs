@@ -786,10 +786,11 @@ pub(crate) mod tests {
         async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
             Ok(Vec::new())
         }
-        async fn mark_host_dead_and_reassign_sessions(
+        async fn mark_host_dead_and_orphan_sessions(
             &self,
             _: HostId,
-        ) -> Result<Vec<engram_core::SessionId>, MetaError> {
+        ) -> Result<Vec<(engram_core::SessionId, engram_core::types::SessionState)>, MetaError>
+        {
             Ok(Vec::new())
         }
         async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {

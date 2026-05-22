@@ -140,28 +140,6 @@ async fn flip_missing(
     session_id: SessionId,
     host_id: HostId,
 ) {
-    // Recoverability check: latest snapshot's `recoverable`
-    // column. Phase 2 of the rollout sets this true after HEAD-
-    // verifying the chunked manifests are durable in BlobStorage.
-    let recoverable = match meta.latest_snapshot_for_session(session_id).await {
-        Ok(Some(s)) => s.recoverable,
-        Ok(None) => false,
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "reconcile: latest_snapshot_for_session failed; treating as not-recoverable"
-            );
-            false
-        }
-    };
-
-    let new_status = if recoverable {
-        SessionState::Idle
-    } else {
-        SessionState::Dead
-    };
-
     // Cheap idempotency: if the session is already in target state
     // (or terminal beyond it), skip. Avoids racing with an operator
     // who manually killed the session between the strike-out and now.
@@ -173,10 +151,7 @@ async fn flip_missing(
         }
     };
     let prev = session.status;
-    if matches!(
-        prev,
-        SessionState::Idle | SessionState::Dead | SessionState::Completed | SessionState::Failed
-    ) {
+    if prev.is_terminal() || matches!(prev, SessionState::Idle | SessionState::HostLost) {
         tracing::debug!(
             session_id = %session_id,
             ?prev,
@@ -195,63 +170,103 @@ async fn flip_missing(
         );
     }
 
-    if let Err(e) = meta.transition_session(session_id, new_status).await {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %e,
-            ?new_status,
-            "reconcile: transition_session failed; will retry next tick"
-        );
-        return;
-    }
-
-    let now = Utc::now();
-    let status_changed = SessionEvent::StatusChanged {
-        from: prev,
-        to: new_status,
-        at: now,
-    };
-    // Persist + publish via the same idx-allocation pattern as
-    // `AppState::emit`. Done inline (rather than via `AppState`) so
-    // the reconcile pass can be unit-tested without standing up the
-    // full Services struct.
-    let kind = status_changed.kind();
-    match serde_json::to_value(&status_changed) {
-        Ok(payload) => match meta.append_session_event(session_id, kind, payload).await {
-            Ok(idx) => {
-                events.publish(
-                    session_id,
-                    crate::state::IndexedEvent {
-                        idx,
-                        event: status_changed,
-                    },
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "reconcile: append_session_event failed; flip recorded but no event emitted"
-                );
-            }
-        },
+    // ADR 0015 M2 stage 1: Active -> HostLost (host went away).
+    let prev = match meta
+        .transition_session(session_id, SessionState::HostLost)
+        .await
+    {
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
-                "reconcile: status-changed event serialize failed; flip recorded but no event emitted"
+                "reconcile: transition to HostLost failed; will retry next tick"
+            );
+            return;
+        }
+    };
+    emit_status_changed(meta, events, session_id, prev, SessionState::HostLost).await;
+
+    // ADR 0015 M2 stage 2: HostLost -> {Idle if recoverable
+    // snapshot, Dead otherwise}. The `recoverable` column carries the
+    // result of the BlobStorage HEAD check at snapshot-take time —
+    // false here means even an Idle-ready snapshot wouldn't survive a
+    // /resume request.
+    let recoverable = match meta.latest_snapshot_for_session(session_id).await {
+        Ok(Some(s)) => s.recoverable,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "reconcile: latest_snapshot_for_session failed; treating as not-recoverable"
+            );
+            false
+        }
+    };
+    let new_status = if recoverable {
+        SessionState::Idle
+    } else {
+        SessionState::Dead
+    };
+    match meta.transition_session(session_id, new_status).await {
+        Ok(host_lost_prev) => {
+            emit_status_changed(meta, events, session_id, host_lost_prev, new_status).await;
+            tracing::info!(
+                session_id = %session_id,
+                host_id = %host_id,
+                final_state = ?new_status,
+                recoverable,
+                "ADR 0009 reconcile: orphaned session moved through HostLost"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                ?new_status,
+                "reconcile: HostLost second-stage transition failed; leaving at HostLost"
             );
         }
     }
+}
 
-    tracing::info!(
-        session_id = %session_id,
-        host_id = %host_id,
-        from = ?prev,
-        to = ?new_status,
-        recoverable,
-        "ADR 0009 reconcile: flipped session whose sandbox is missing from heartbeat"
-    );
+async fn emit_status_changed(
+    meta: &dyn MetadataStore,
+    events: &SessionEventBus,
+    session_id: SessionId,
+    from: SessionState,
+    to: SessionState,
+) {
+    let event = SessionEvent::StatusChanged {
+        from,
+        to,
+        at: Utc::now(),
+    };
+    let kind = event.kind();
+    let payload = match serde_json::to_value(&event) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "reconcile: status-changed event serialize failed"
+            );
+            return;
+        }
+    };
+    match meta.append_session_event(session_id, kind, payload).await {
+        Ok(idx) => {
+            events.publish(session_id, crate::state::IndexedEvent { idx, event });
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "reconcile: append_session_event failed; flip recorded but no event emitted"
+            );
+        }
+    }
 }
 
 /// Default cadence for the in-process reconciliation driver

@@ -192,10 +192,10 @@ impl MetadataStore for ReconcileMeta {
     async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
         Ok(Vec::new())
     }
-    async fn mark_host_dead_and_reassign_sessions(
+    async fn mark_host_dead_and_orphan_sessions(
         &self,
         _: HostId,
-    ) -> Result<Vec<SessionId>, MetaError> {
+    ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
         Ok(Vec::new())
     }
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
@@ -415,16 +415,38 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     // The third session keeps its sandbox_id.
     assert_eq!(meta.sandbox(s_present), Some(sb_present));
 
-    // StatusChanged events emitted for both flipped sessions.
+    // ADR 0015 M2: each flipped session emits TWO StatusChanged
+    // events — Active -> HostLost (host went away) followed by
+    // HostLost -> {Idle,Dead} (resolved per snapshot recoverability).
+    // Two flipped sessions × two events = four events.
     let emitted = meta.emitted_events();
-    let status_changed_count = emitted
+    let status_changed: Vec<_> = emitted
         .iter()
         .filter(|(_, kind, _)| kind == "status_changed")
+        .collect();
+    assert_eq!(
+        status_changed.len(),
+        4,
+        "two flipped sessions × (Active->HostLost + HostLost->Idle/Dead) = 4 events"
+    );
+    let host_lost_events = status_changed
+        .iter()
+        .filter(|(_, _, p)| p["to"] == "host_lost")
         .count();
     assert_eq!(
-        status_changed_count, 2,
-        "exactly one StatusChanged event per flipped session"
+        host_lost_events, 2,
+        "one Active->HostLost event per flipped session"
     );
+    let idle_events = status_changed
+        .iter()
+        .filter(|(_, _, p)| p["to"] == "idle")
+        .count();
+    let dead_events = status_changed
+        .iter()
+        .filter(|(_, _, p)| p["to"] == "dead")
+        .count();
+    assert_eq!(idle_events, 1, "the recoverable session ends in Idle");
+    assert_eq!(dead_events, 1, "the non-recoverable session ends in Dead");
 }
 
 /// Defends the load-bearing anti-flap property: a sandbox that's

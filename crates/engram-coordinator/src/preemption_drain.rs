@@ -168,9 +168,13 @@ pub async fn drain_session(
     // ADR 0006: host-agent unregisters its local proxy entry as
     // part of `destroy`. No coordinator-side cleanup.
 
-    // Step 2: mark Dead. ADR 0005: there is no resume path — the
-    // session is gone. Callers either accept the loss or start
-    // fresh.
+    // ADR 0015 M2 Step 2: the session's host went away (the cloud
+    // is reclaiming the VM). Drive the same two-stage transition
+    // pattern dead_host uses:
+    //   Active -> HostLost  (host_id / sandbox_id cleared)
+    //   HostLost -> Idle    (if a recoverable snapshot exists; the
+    //                       user can /resume from it)
+    //   HostLost -> Dead    (otherwise — no recoverable snapshot)
     if let Err(e) = state
         .services
         .meta
@@ -198,16 +202,44 @@ pub async fn drain_session(
     let prev = state
         .services
         .meta
-        .transition_session(session_id, SessionState::Dead)
+        .transition_session(session_id, SessionState::HostLost)
         .await
         .map_err(|e| DrainError::Meta(e.to_string()))?;
-
     state
         .emit(
             session_id,
             SessionEvent::StatusChanged {
                 from: prev,
-                to: SessionState::Dead,
+                to: SessionState::HostLost,
+                at: Utc::now(),
+            },
+        )
+        .await
+        .map_err(|e| DrainError::Emit(e.to_string()))?;
+
+    let snapshot = state
+        .services
+        .meta
+        .latest_snapshot_for_session(session_id)
+        .await
+        .map_err(|e| DrainError::Meta(e.to_string()))?;
+    let target = if snapshot.is_some() {
+        SessionState::Idle
+    } else {
+        SessionState::Dead
+    };
+    let prev = state
+        .services
+        .meta
+        .transition_session(session_id, target)
+        .await
+        .map_err(|e| DrainError::Meta(e.to_string()))?;
+    state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: prev,
+                to: target,
                 at: Utc::now(),
             },
         )

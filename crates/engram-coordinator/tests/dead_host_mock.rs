@@ -1,4 +1,4 @@
-//! Trait-layer tests for `MetadataStore::mark_host_dead_and_reassign_sessions`.
+//! Trait-layer tests for `MetadataStore::mark_host_dead_and_orphan_sessions`.
 //!
 //! The actual detector loop (advisory locks, polling cadence, NOTIFY
 //! emission) is Postgres-specific and tested separately against a
@@ -130,21 +130,20 @@ impl MetadataStore for MiniMeta {
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
         Ok(Vec::new())
     }
-    async fn mark_host_dead_and_reassign_sessions(
+    async fn mark_host_dead_and_orphan_sessions(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<SessionId>, MetaError> {
+    ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
         let mut g = self.sessions.lock();
         let mut affected = Vec::new();
         for s in g.values_mut() {
-            if s.host_id == Some(host_id)
-                && !matches!(s.status, SessionState::Completed | SessionState::Failed)
-            {
+            if s.host_id == Some(host_id) && !s.status.is_terminal() {
+                let prev = s.status;
                 s.host_id = None;
                 s.sandbox_id = None;
-                s.status = SessionState::Dead;
+                s.status = SessionState::HostLost;
                 s.last_active_at = Utc::now();
-                affected.push(s.id);
+                affected.push((s.id, prev));
             }
         }
         Ok(affected)
@@ -298,26 +297,31 @@ async fn evacuates_active_and_idle_sessions_clears_host_id() {
     let s_active = seed_session(&meta, host, SessionState::Active).await;
     let s_idle = seed_session(&meta, host, SessionState::Idle).await;
 
-    let affected = meta
-        .mark_host_dead_and_reassign_sessions(host)
-        .await
-        .unwrap();
+    let affected = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
 
-    let mut affected_sorted = affected.clone();
-    affected_sorted.sort();
-    let mut expected = vec![s_active, s_idle];
-    expected.sort();
+    // ADR 0015 M2: bulk transition lands the sessions in HostLost
+    // and reports each affected session's previous state so the
+    // caller can emit honest StatusChanged events.
+    let mut by_id: std::collections::HashMap<SessionId, SessionState> =
+        affected.into_iter().collect();
     assert_eq!(
-        affected_sorted, expected,
-        "both Active and Idle sessions on the dead host must transition"
+        by_id.remove(&s_active),
+        Some(SessionState::Active),
+        "Active session must report Active as its prev state"
     );
+    assert_eq!(
+        by_id.remove(&s_idle),
+        Some(SessionState::Idle),
+        "Idle session must report Idle as its prev state"
+    );
+    assert!(by_id.is_empty(), "no other sessions should be affected");
 
     let s_active_row = meta.get_session(s_active).await.unwrap();
-    assert_eq!(s_active_row.status, SessionState::Dead);
+    assert_eq!(s_active_row.status, SessionState::HostLost);
     assert_eq!(s_active_row.host_id, None);
 
     let s_idle_row = meta.get_session(s_idle).await.unwrap();
-    assert_eq!(s_idle_row.status, SessionState::Dead);
+    assert_eq!(s_idle_row.status, SessionState::HostLost);
     assert_eq!(s_idle_row.host_id, None);
 }
 
@@ -333,14 +337,11 @@ async fn skips_terminal_sessions_even_on_dead_host() {
     let s_failed = seed_session(&meta, host, SessionState::Failed).await;
     let s_active = seed_session(&meta, host, SessionState::Active).await;
 
-    let affected = meta
-        .mark_host_dead_and_reassign_sessions(host)
-        .await
-        .unwrap();
+    let affected = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
 
     assert_eq!(
         affected,
-        vec![s_active],
+        vec![(s_active, SessionState::Active)],
         "only the non-terminal session should be reassigned"
     );
     assert_eq!(
@@ -363,11 +364,11 @@ async fn does_not_touch_sessions_on_other_hosts() {
     let s_live = seed_session(&meta, live_host, SessionState::Active).await;
 
     let affected = meta
-        .mark_host_dead_and_reassign_sessions(dead_host)
+        .mark_host_dead_and_orphan_sessions(dead_host)
         .await
         .unwrap();
 
-    assert_eq!(affected, vec![s_dead]);
+    assert_eq!(affected, vec![(s_dead, SessionState::Active)]);
 
     let s_live_row = meta.get_session(s_live).await.unwrap();
     assert_eq!(
@@ -388,16 +389,10 @@ async fn idempotent_on_already_dead_host() {
     let host = HostId::new();
     let _s = seed_session(&meta, host, SessionState::Active).await;
 
-    let first = meta
-        .mark_host_dead_and_reassign_sessions(host)
-        .await
-        .unwrap();
+    let first = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
     assert_eq!(first.len(), 1);
 
-    let second = meta
-        .mark_host_dead_and_reassign_sessions(host)
-        .await
-        .unwrap();
+    let second = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
     assert!(
         second.is_empty(),
         "second call on an already-evacuated host must return empty"
@@ -409,7 +404,7 @@ async fn host_with_no_sessions_returns_empty() {
     let meta = MiniMeta::default();
     let lonely_host = HostId::new();
     let affected = meta
-        .mark_host_dead_and_reassign_sessions(lonely_host)
+        .mark_host_dead_and_orphan_sessions(lonely_host)
         .await
         .unwrap();
     assert!(affected.is_empty());
@@ -421,8 +416,6 @@ async fn arc_dyn_metadata_store_dispatches_correctly() {
     // dispatch reaches the same impl. (Compile-time check + smoke
     // call.)
     let meta: Arc<dyn MetadataStore> = Arc::new(MiniMeta::default());
-    let result = meta
-        .mark_host_dead_and_reassign_sessions(HostId::new())
-        .await;
+    let result = meta.mark_host_dead_and_orphan_sessions(HostId::new()).await;
     assert!(result.is_ok());
 }
