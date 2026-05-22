@@ -50,15 +50,14 @@ else
     echo "==> baking demo image @ $SHORT"
     cargo build --release -p engram-cli >/dev/null 2>&1
     cargo build --release --target x86_64-unknown-linux-musl \
-        -p engram-agentd -p engram-bootstrap >/dev/null 2>&1
+        -p engram-agentd >/dev/null 2>&1
     ./target/release/engram-cli image build \
         --repo integration-test/demo \
         --tag "warm-$SHORT" \
         --source deploy/demo \
         --format ext4 \
         --images-dir ./var/integration/images \
-        --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
-        --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
+        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
         --capture-canonical-memory \
         --canonical-kernel "${ENGRAM_KERNEL_IMAGE_PATH:-$HOME/.cache/engram-fc-test/vmlinux-5.10.223}" \
         --canonical-boot-wait-secs 8 \

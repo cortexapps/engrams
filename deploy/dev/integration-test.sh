@@ -52,13 +52,11 @@ IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 echo "==> step 1/5: bake demo image with canonical capture"
 echo "    target: $IMAGE_URI"
-cargo build --release -p engram-cli \
-    --target x86_64-unknown-linux-musl -p engram-agentd -p engram-bootstrap \
-    >/dev/null 2>&1 || true
 cargo build --release -p engram-cli >/dev/null 2>&1
-# musl bins for the in-VM agent + bootstrap shim.
+# ADR 0015 M1: agentd is the only in-VM binary; bootstrap collapsed
+# into it.
 cargo build --release --target x86_64-unknown-linux-musl \
-    -p engram-agentd -p engram-bootstrap >/dev/null 2>&1
+    -p engram-agentd >/dev/null 2>&1
 
 T0=$(date +%s.%N)
 ./target/release/engram-cli image build \
@@ -67,8 +65,7 @@ T0=$(date +%s.%N)
     --source deploy/demo \
     --format ext4 \
     --images-dir ./var/integration/images \
-    --inject-agent     target/x86_64-unknown-linux-musl/release/engram-agentd \
-    --inject-bootstrap target/x86_64-unknown-linux-musl/release/engram-bootstrap \
+    --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
     --capture-canonical-memory \
     --canonical-kernel "${ENGRAM_KERNEL_IMAGE_PATH:-$HOME/.cache/engram-fc-test/vmlinux-5.10.223}" \
     --canonical-boot-wait-secs 8 \
