@@ -92,15 +92,16 @@ ENABLE_ELAPSED=$(echo "$T1 - $T0" | bc)
 echo "    enable elapsed: ${ENABLE_ELAPSED}s"
 
 echo ""
-echo "==> step 3/5: verify templates_active = 1"
-TEMPLATES=$(docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+echo "==> step 3/5: verify a templates row landed for this image"
+TEMPLATE_TAG="warm-$SHORT"
+ROW_COUNT=$(docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
     psql -U engram -d engram -tA -c \
-    "select count(*) from templates where active=true")
-if [ "$(echo "$TEMPLATES" | tr -d ' \r\n')" != "1" ]; then
-    echo "ERROR: expected templates_active=1, got '$TEMPLATES'" >&2
+    "select count(*) from templates where active=true and image_tag='$TEMPLATE_TAG' and image_repo like '%integration-test/demo'")
+if [ "$(echo "$ROW_COUNT" | tr -d ' \r\n')" != "1" ]; then
+    echo "ERROR: expected exactly 1 active templates row for image_tag=$TEMPLATE_TAG, got '$ROW_COUNT'" >&2
     exit 1
 fi
-echo "    templates_active = 1 ✓"
+echo "    templates row landed for $TEMPLATE_TAG ✓"
 
 echo ""
 echo "==> step 4/5: POST /sessions (should lease warm)"
