@@ -74,7 +74,7 @@ cargo build -p engram-coordinator -p engram-host-agent
 # have NOPASSWD sudo, or this will block.
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY"
+    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_NBD_DEVICES,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY"
     if ! sudo -n true 2>/dev/null; then
         echo "ERROR: passwordless sudo required for host-agent TAP creation." >&2
         echo "       Add an entry to /etc/sudoers.d/ allowing this user NOPASSWD." >&2
@@ -112,6 +112,31 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
+# ADR 0007 Phase 4: opt-in NBD. Prod hosts use chunked-NBD for the
+# rootfs (mirrors GCS page-in latency); dev-vm gets the same path
+# instead of falling through to materialize-to-file. The dev-vm
+# Packer image loads `nbd nbds_max=4` (`/dev/nbd0..3`), but
+# `nbds_max` can be bumped on the kernel cmdline if a session
+# concurrency study needs more slots. NBD_DEVICES below stays in
+# sync with whatever's available; missing devices are a hard
+# error from the host-agent at startup.
+NBD_DEVICES_DEFAULT=""
+for n in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if [ -e "/dev/nbd$n" ]; then
+        if [ -z "$NBD_DEVICES_DEFAULT" ]; then
+            NBD_DEVICES_DEFAULT="/dev/nbd$n"
+        else
+            NBD_DEVICES_DEFAULT="$NBD_DEVICES_DEFAULT,/dev/nbd$n"
+        fi
+    fi
+done
+NBD_DEVICES="${ENGRAM_NBD_DEVICES:-$NBD_DEVICES_DEFAULT}"
+if [ -z "$NBD_DEVICES" ]; then
+    echo "WARN: no /dev/nbd* devices found; host-agent will fall back to" >&2
+    echo "      materialize-to-file. To enable NBD, modprobe the kernel module" >&2
+    echo "      (sudo modprobe nbd nbds_max=16) and rerun integration-up." >&2
+fi
+
 echo "==> start host-agent (dial 127.0.0.1:8090)"
 ENGRAM_KERNEL_IMAGE_PATH="$KERNEL" \
 ENGRAM_SANDBOX_WORK_DIR="./var/host-sandboxes-integration" \
@@ -122,6 +147,7 @@ ENGRAM_COORDINATOR_ENDPOINT="http://127.0.0.1:8090" \
 ENGRAM_BLOB_BACKEND="gcs" \
 ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
 STORAGE_EMULATOR_HOST="http://localhost:4443" \
+ENGRAM_NBD_DEVICES="$NBD_DEVICES" \
 ENGRAM_EGRESS_PROXY_PORT="0" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_host_agent::warm_pool=debug,engram_host_agent::pooled_backend=debug}" \
 nohup $SUDO ./target/debug/engram-host-agent >"$INTEG_DIR/host-agent.log" 2>&1 &
