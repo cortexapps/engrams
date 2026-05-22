@@ -911,7 +911,6 @@ async fn build_directory_with_agent_injection_writes_agent_and_init() {
         vsock_port: 1024,
         init_script: None,
         transport: Default::default(),
-        bootstrap_binary: None,
     });
 
     let outcome = builder.build(&request).await.expect("bake");
@@ -967,7 +966,6 @@ async fn build_with_missing_agent_binary_errors_cleanly() {
         vsock_port: 1024,
         init_script: None,
         transport: Default::default(),
-        bootstrap_binary: None,
     });
 
     let err = builder.build(&request).await.expect_err("should fail");
@@ -998,7 +996,6 @@ async fn build_with_init_script_override_uses_provided_script() {
         vsock_port: 1024,
         init_script: Some(init_src.path().to_path_buf()),
         transport: Default::default(),
-        bootstrap_binary: None,
     });
 
     let outcome = builder.build(&request).await.expect("bake");

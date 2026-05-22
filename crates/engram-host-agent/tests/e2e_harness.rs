@@ -233,11 +233,6 @@ async fn bake_harness_rootfs(
         .join("release")
         .join("engram-agentd");
     assert!(agent_bin.exists(), "musl agentd missing");
-    let bootstrap_bin = target_root
-        .join("x86_64-unknown-linux-musl")
-        .join("release")
-        .join("engram-bootstrap");
-    assert!(bootstrap_bin.exists(), "musl bootstrap missing");
 
     let src = tempfile::tempdir().expect("source dir");
     // No in-container network — the dev-vm's Docker daemon has DNS
@@ -280,7 +275,6 @@ async fn bake_harness_rootfs(
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
-                bootstrap_binary: Some(bootstrap_bin),
             }),
             canonical_memory_manifest: None,
             capture_canonical_memory: None,

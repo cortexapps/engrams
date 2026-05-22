@@ -242,7 +242,6 @@ async fn bake_shell_rootfs(repo: &str) -> (PathBuf, PathBuf) {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
-                bootstrap_binary: None,
             }),
             canonical_memory_manifest: None,
             capture_canonical_memory: None,

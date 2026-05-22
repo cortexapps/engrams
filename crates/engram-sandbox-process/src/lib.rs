@@ -128,6 +128,14 @@ impl SandboxBackend for ProcessBackend {
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
+        // ADR 0015 M1: empty argv is a readiness probe (no harness
+        // to spawn). Mirrors `engram_agentd::HarnessSupervisor::spawn`.
+        // Coord's harness=none cold-create path calls us with empty
+        // argv to confirm the sandbox is reachable, without launching
+        // anything.
+        if agent.argv.is_empty() {
+            return Ok(());
+        }
         // Idempotent: a second call with the agent already running
         // is a no-op. Resumed-then-checkpointed-then-resumed flows may
         // call start_agent more than once; we keep the first agent.
