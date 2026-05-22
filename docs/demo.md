@@ -30,9 +30,10 @@ runs the coordinator with:
 - `ENGRAM_DEV_AUTO_NOOP=1` — every new session auto-spawns the
   noop harness adapter, which dials the host-agent's harness TCP
   listener.
-Sessions go through the chunked-OCI cold path on every create
-(warm pools were retired with ADR 0008; chunk-cache hits keep the
-hot path fast).
+Sessions go through the chunked-OCI cold path on every create.
+Warm pools were retired with ADR 0008, briefly revived in ADR 0014,
+and retired again under ADR 0015 M5; hosts now prefetch image
+chunks into a per-host NVMe cache so cold-create reads stay local.
 
 Wait until you see:
 

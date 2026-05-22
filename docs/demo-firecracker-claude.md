@@ -76,7 +76,9 @@ Notes:
   pick `dev_claude_harness_path` (defaulted to
   `/sbin/engram-harness-claude` by the dev-firecracker recipe).
 - Sessions take the chunked-OCI cold path; warm pools were retired
-  with ADR 0008.
+  again with ADR 0015 M5 (after ADR 0014's `templates`-backed
+  attempt). Hosts prefetch chunks into local NVMe via the
+  heartbeat-driven readiness loop before sessions can land.
 
 ## Drive the demo
 

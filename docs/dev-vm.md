@@ -87,10 +87,9 @@ creation). Passwordless sudo is required on the dev-vm.
    ```bash
    bash .claude/skills/dev-vm/scripts/run.sh just integration-reset
    ```
-   Use this when stale `templates` rows from prior runs are
-   making the warm-pool refill loop spam the host-agent log
-   with `blob_not_found` (their snapshot blobs are gone with the
-   fake-gcs volume).
+   Use this between substantial schema changes, or when an
+   on-disk image cache or chunk cache is interfering with the
+   current bake.
 
 6. **End of day**:
    ```bash

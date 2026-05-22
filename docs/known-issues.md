@@ -5,25 +5,29 @@ deadline. Each item has the file/line of the offending code and a
 sketch of the proper fix so a future visitor (you, me, an agent) can
 land it without rediscovering the problem.
 
-## 1. ~~Warm-pool key ignores `repo`~~ (RESOLVED — warm pool restored on a new substrate)
+## 1. ~~Warm-pool key ignores `repo`~~ (RESOLVED — warm pool retired entirely under ADR 0015 M5)
 
-**The original warm pool (Phase 3–7) was retired in Phase 8** (ADR
-0008) because its pool key kept leaking abstractions: it ignored
-`repo`, then ignored `harness_substrate`, then needed `rootfs_source`
-to be a content-addressed digest. The lifecycle complexity stopped
-paying for itself once chunked-OCI cold start landed.
+**Phase 3-7's warm pool** was retired in Phase 8 (ADR 0008): its pool
+key kept leaking abstractions (ignored `repo`, then ignored
+`harness_substrate`, then needed `rootfs_source` to be a
+content-addressed digest). Lifecycle complexity stopped paying.
 
-**Phase 9 (ADR 0014) restored the warm pool on a different substrate.**
-The new key is `template_ref` — a UUID that points at a bake-time
-portable snapshot (state.bin + sidecar + memory chunks). Templates
-are content-addressed by `(image_repo, image_tag, harness_pack_uri,
-snapshot_id)` in the `templates` table; the pool keys on the
-template_ref UUID, not on user-visible bits like the spec. The prior
-sharp edges (key ignoring fields of the spec) don't apply because
-template_ref is opaque. The host's free-list is a flat
-`DashMap<TemplateRef, Vec<SandboxId>>`. WIRE shape: heartbeat carries
-`HostCapacityReport.warm_slots: Vec<WarmSlotReport>` again, but the
-report is keyed on template_ref rather than on the old `PoolKey`.
+**Phase 9 (ADR 0014) tried again** with a `template_ref`-keyed pool
+that targeted bake-time portable snapshots in a `templates` table.
+That substrate introduced its own two recurring bug classes —
+cross-CPU-vendor snapshot tripfaults and dangling rows whose blobs
+were gone — which forced `ENGRAM_WARM_POOL_DISABLED=1` in prod.
+
+**ADR 0015 M5 (shipped 2026-05-22) retired the warm pool entirely.**
+The `templates` table is dropped (migration 0030), the bake-time
+canonical capture path is deleted, and hosts diff the coord's
+`enabled_images` set against a per-host NVMe `ChunkCache` on every
+heartbeat. Each host reports `ready_images: Vec<ManifestDigest>`;
+the scheduler refuses to place sessions on hosts that haven't
+prefetched the requested image (HTTP 503 `ImageNotReady`, distinct
+from "no capacity"). Cold-boot is now the only path, with chunks
+already local; warm pool will return as a separate later
+milestone built on top of this storage floor.
 
 ## 2. VZ disk-attach failures leak the cloned rootfs
 

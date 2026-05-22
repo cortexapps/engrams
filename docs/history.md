@@ -380,6 +380,65 @@ shape; ADR 0012 ("warm pool deferred") flips from `deferred` →
 
 ---
 
+## Phase 10 — System design v2: in-VM service unification + host-image readiness (May 2026)
+
+**Goal**: address two recurring bug classes that no amount of
+incremental patching had retired. (1) Two in-VM processes
+(`engram-bootstrap` on vsock 1025, `engram-agentd` on 1024) with two
+readiness signals produced an "Active before agentd is reachable"
+race that the no-harness session path kept hitting. (2) The
+`templates` table introduced by Phase 9 became the source of
+cross-CPU-vendor snapshot tripfaults (forced
+`ENGRAM_WARM_POOL_DISABLED=1` in prod) and dangling rows whose
+blobs were gone (host-agent's refill loop spammed
+`blob_not_found`). ADR 0015 is the system-walk-through that turned
+both into structural fixes rather than scab patches.
+
+- **M1 — `GuestService` (April→May 2026)** collapsed
+  `engram-bootstrap` into `engram-agentd`. One vsock port (1024),
+  one wire protocol (`WireRequest::SpawnHarness`), one readiness
+  signal: agentd dials the host on startup, the host's
+  `start_agent` blocks on a `tokio::sync::watch` filled by the
+  per-sandbox accept task. `connect_fc_vsock_with_retry` deleted;
+  the boot-race the no-harness path used to produce is
+  structurally impossible because every session goes through
+  `start_agent`, which returns only after the ready dial. Commits
+  `75ba2df` / `97de278` / `0d444e9` / `4b3f890`.
+
+- **M5 — Host-image readiness (May 22 2026)** retired the
+  `templates` table, the warm pool driver, and the bake-time
+  canonical capture path in one atomic cutover. Migration
+  `0030_drop_templates.sql` drops the table; the OCI artifact
+  becomes pure content (chunked rootfs + manifest, no state.bin /
+  memory.bin / sidecar.json). Hosts diff coord's
+  `enabled_images` against a per-host NVMe `ChunkCache` on every
+  heartbeat, prefetch missing chunks via the existing
+  `TieredChunkResolver`, and report `ready_images:
+  Vec<ManifestDigest>` on the next outbound. The scheduler refuses
+  to place sessions on hosts that haven't prefetched the
+  requested image — `SandboxError::ImageNotReady` returns HTTP
+  503 with an operator-facing hint distinct from "no capacity".
+  ~4900 LOC net retired, ~1100 added. Four-commit chain
+  `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`. End-to-end
+  verified on the dev VM. Cold-boot expectations: prod target
+  ~3.5 s with chunks-local NVMe reads (down from ~17 s of
+  on-demand GCS page-ins).
+
+  Three field bugs were caught during dev-VM exercise rather
+  than unit tests: coord originally materialized chunks at a
+  fresh `ManifestRef`, the supervisor went through BlobStorage
+  rather than teeing into `ChunkCache`, and `ImageCache::ensure_image`
+  returned stale digests on registry re-pushes. All fixed in
+  `7ab8625` along with the integration-test script rewrite.
+
+Phases M2–M4 + M6–M8 of ADR 0015 stay Proposed. Warm pool's third
+incarnation will be a separate later milestone — host-local
+runtime snapshot generation, layered on M5's storage floor;
+CPU-vendor dissolved by construction because each host snapshots
+on its own CPU.
+
+---
+
 ## Cross-cutting
 
 These don't fit one phase but track across the timeline:

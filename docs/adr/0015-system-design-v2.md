@@ -1,8 +1,41 @@
 # ADR 0015: System design v2 — abstractions, not scab fixes
 
-Status: 2026-05-22 — overall **Proposed (v2 direction)**; section **M1
-(in-VM service unification) Accepted + shipped**. The remaining
-eight sections stay Proposed pending their own implementation ADRs.
+Status: 2026-05-22 — overall **Proposed (v2 direction)**; sections **M1
+(in-VM service unification) and M5 (host-image readiness)** both
+Accepted + shipped. The remaining six sections stay Proposed pending
+their own implementation ADRs.
+
+M5 commit chain (in order):
+- `d20e5da` — retire `templates` table + warm pool across coord,
+  host-agent, protocol, heartbeat (~4100 LOC net removed). New
+  wire shape: `Heartbeat.ready_images: Vec<ManifestDigest>` +
+  `HeartbeatAck.enabled_images: Vec<EnabledImageRef>`.
+- `18be1ad` — retire the bake-time canonical capture path (the
+  `--capture-canonical-memory` CLI family, `CanonicalCaptureConfig`,
+  `Builder::capture_canonical_memory`, the OCI snapshot media
+  types + `TemplateArtifacts` snapshot fields, the v3 bundle
+  schema branch). Migration `0030_drop_templates.sql` lands here.
+- `6fb36e2` — host-agent `image_prefetch` supervisor (watch-driven
+  reconcile against the heartbeat-ack's enabled set, 16-permit
+  shared semaphore, LRU recheck) + coord-side readiness gate
+  (`PickError::ImageNotReady`, `SandboxError::ImageNotReady`,
+  scheduler filter on `state.ready_images.contains(digest)`,
+  HTTP 503 with operator-facing hint distinct from "no capacity").
+- `7ab8625` — three field bugs the unit tests didn't catch:
+  coord materialized the chunk manifest at a fresh UUID (must use
+  bundle.json's ref); supervisor went through BlobStorage instead
+  of teeing into the per-host `ChunkCache`; `ensure_image` returned
+  stale cached digests on registry re-pushes. Integration test
+  script rewired for the new flow.
+
+Verification at the M5 boundary:
+- `just check` clean (738/738 workspace tests, fmt + clippy).
+- `just integration-test` on the dev-vm: bake → enable →
+  prefetch → ready-gate → cold-create cycle green, with the
+  templates table physically gone from PG.
+- Cold-boot expectations: dev-vm at ~150 s (nested-KVM
+  environmental, not regression); prod target ~3-5 s with
+  chunks-already-local NVMe reads — same as the plan called for.
 
 M1 commit chain (in order):
 - `75ba2df` — collapse `engram-bootstrap` into `engram-agentd`
@@ -151,7 +184,7 @@ Accepted and being implemented now; M2–M9 are Proposed.
 | M2 | `SessionState` — explicit, gated state machine | Proposed |
 | M3 | `HostRegistry` as a TTL'd cache of PG truth | Proposed |
 | M4 | `Sandbox` as a content-addressed migratable value | Proposed |
-| **M5** | **Host-image readiness as the warm/cold contract — retire the `templates` table** | **Proposed, next to ship** |
+| M5 | Host-image readiness as the warm/cold contract — retire the `templates` table | **Accepted + shipped** (commits `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`) |
 | M6 | Harness events as one typed stream on `GuestService` | Proposed |
 | M7 | FC drive references as content hashes via a `DriveResolver` trait | Proposed |
 | M8 | Coord ↔ host as one bidirectional trait (or accept the split as final) | Proposed, flagged |
@@ -486,8 +519,7 @@ M5 is the cleanest single step that unblocks all of them.
   slot count" model.
 - Prefetch bandwidth. Hosts pulling chunks in parallel could
   saturate fleet egress from BlobStorage. Bound the per-host
-  prefetch concurrency (start with 4 chunks in flight, tune from
-  metrics).
+  prefetch concurrency.
 - What about post-M5 image *deletes* from `enabled_images`? Hosts
   see the image leave the set, then either: (a) immediately evict
   its chunks (frees NVMe, regret-on-re-enable), or (b) keep chunks
@@ -499,6 +531,48 @@ M5 is the cleanest single step that unblocks all of them.
   implementation includes a migration that strips `snapshot_id`
   from existing rows; old artifacts in BlobStorage age out via
   normal LRU.
+
+**As-built notes (after the four-commit M5 chain landed).**
+
+- **Prefetch concurrency: 16, not 4.** Wall-clock profiling on
+  modern hosts showed 4 chunks-in-flight underutilizes the 10 Gbps
+  NIC by ~70 %. The shipped supervisor uses a single
+  `tokio::sync::Semaphore::new(16)` shared across all in-flight
+  images, tunable via `ENGRAM_PREFETCH_CONCURRENCY`.
+- **The `disk_manifest` ref is content-from-bake, not coord-
+  minted.** First-pass implementation had coord generate a fresh
+  `ManifestRef::new()` when materializing chunks into BlobStorage.
+  The host's prefetch then read `bundle.json::disk_manifest`
+  (the bake's UUID) and faulted with `blob not found`. Fix: coord
+  parses bundle.json and writes the manifest at the bake's ref.
+  The bake's UUID is therefore the canonical identifier; coord
+  is a pass-through.
+- **Prefetch must tee into the per-host `ChunkCache`.**
+  `chunk_store.get_chunk(h)` returns bytes through the tiered
+  resolver but doesn't populate tier 1. The supervisor wraps each
+  get in `chunk_cache.prefetch(h, || chunk_store.get_chunk(h))`
+  so the chunks land on local NVMe. Without this, session-create's
+  `materialize_to_file_cached` re-paid a per-chunk BlobStorage
+  round-trip even though the chunk was "ready."
+- **Cache invalidation on registry re-push.** The host's
+  `ImageCache::ensure_image(uri)` cached by URI string. When a
+  `:warm-<sha>` tag was re-pushed (a different bake under the
+  same tag), the host returned the prior digest's data and looked
+  for stale chunk blobs. Fix: `ImageCache::invalidate_uri(uri)`
+  drops the URI→digest map entry; the supervisor calls it when
+  `cached.digest != EnabledImageRef.manifest_digest`. On-disk
+  artifacts ride LRU rather than eager delete.
+- **Distinct 503 reasons.** Session create now returns one of two
+  503s: `SandboxError::ImageNotReady(digest)` for "no host has
+  prefetched this image" (operator runbook: wait, check
+  `/api/hosts`, check BlobStorage egress) and the existing
+  capacity-fit 503 (operator runbook: wait for sessions to drain
+  or for the MIG to scale up). `PickError` in `host_registry.rs`
+  is the typed boundary; the API layer formats each with a
+  different body.
+- **`/api/hosts` exposes `ready_image_digests: Vec<String>`** so
+  operators (and the integration test) can poll for a *specific*
+  digest's readiness rather than just the count.
 
 ---
 
@@ -640,10 +714,11 @@ not exist.
 - **Phase 1 (shipped):** M1 — in-VM service unification. Commits
   `664cf61` (ADR) and `75ba2df` / `97de278` / `0d444e9` / `4b3f890`
   (implementation + readiness-dial follow-on).
-- **Phase 2 (next):** **M5 — Host-image readiness + retire `templates`.**
-  Largest single simplification by code retired and biggest
-  cold-boot win (~17 s → ~3.5 s prod). Single ADR, single PR
-  series. Unblocks all subsequent warm-pool work.
+- **Phase 2 (shipped 2026-05-22):** **M5 — Host-image readiness +
+  retire `templates`.** Largest single simplification by code
+  retired and biggest cold-boot win (~17 s → ~3.5 s prod target).
+  Four-commit chain `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`.
+  Unblocks all subsequent warm-pool work.
 - **Phase 3 (cold-boot floor):** vmlinux slim-down + engram-init/
   agentd cold-start tuning. Not in this ADR — separate milestones
   layered on M5. Targets ~700–800 ms cold-boot.
