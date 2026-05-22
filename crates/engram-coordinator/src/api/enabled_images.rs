@@ -205,16 +205,29 @@ async fn materialize_disk_chunks(
     state: &SharedState,
     artifacts: &engram_oci::TemplateArtifacts,
 ) -> Result<(), ApiError> {
-    let (Some(boot), Some(blob_bytes)) = (
+    let (Some(boot), Some(blob_bytes), Some(bundle_json)) = (
         artifacts.disk_bootstrap_json.as_deref(),
         artifacts.disk_chunks_blob.as_deref(),
+        artifacts.bundle_json.as_deref(),
     ) else {
         return Ok(());
     };
     let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(boot)
         .map_err(|e| ApiError::Internal(format!("parse disk bootstrap json: {e}")))?;
     let manifest = bootstrap.to_manifest();
-    let manifest_ref = engram_core::types::manifest::ManifestRef::new();
+    // The bake wrote bundle.json with the disk_manifest ref it used
+    // against its LOCAL chunk store. Hosts re-read that ref on
+    // prefetch to ask `chunk_store.get_manifest(ref)` — so we must
+    // materialize at the SAME ref, not a fresh one. Otherwise the
+    // host's lookup faults with `blob not found` (ADR 0015 M5
+    // integration-test regression caught by the dev-vm smoke).
+    let manifest_ref = parse_disk_manifest_ref(bundle_json).ok_or_else(|| {
+        ApiError::BadRequest(
+            "bundle.json missing or unparseable `disk_manifest` field; \
+             can't materialize chunks without knowing the canonical ref"
+                .into(),
+        )
+    })?;
     let (wrote, deduped) = materialize_chunk_blob(
         state.services.blob.as_ref(),
         &state.services.chunk_store,
@@ -231,6 +244,19 @@ async fn materialize_disk_chunks(
         "materialized disk chunks into BlobStorage",
     );
     Ok(())
+}
+
+/// Parse the bake's bundle.json and pull out its `disk_manifest`
+/// ref, the same key hosts ask the chunk store for at prefetch
+/// time. The bake serializes `ManifestRef` via serde so the field
+/// is a JSON object `{manifest_id, version}`. Returns `None` for
+/// missing/malformed bundles — caller surfaces as 400.
+fn parse_disk_manifest_ref(
+    bundle_json: &[u8],
+) -> Option<engram_core::types::manifest::ManifestRef> {
+    let v: serde_json::Value = serde_json::from_slice(bundle_json).ok()?;
+    let field = v.get("disk_manifest")?.clone();
+    serde_json::from_value(field).ok()
 }
 
 /// Push a chunk-blob into BlobStorage at the content-addressed key

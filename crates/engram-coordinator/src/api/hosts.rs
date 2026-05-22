@@ -88,6 +88,11 @@ pub struct HostView {
     /// prefetched and is ready to serve. Live-only — reads as 0
     /// on a coord replica that hasn't received a heartbeat yet.
     pub ready_images: usize,
+    /// ADR 0015 M5: manifest digests of the prefetched images.
+    /// Exposed so callers (operators, integration tests) can
+    /// poll for a specific digest's readiness without guessing
+    /// from the count. Sorted for deterministic output.
+    pub ready_image_digests: Vec<String>,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
@@ -123,6 +128,12 @@ impl HostView {
                 )
             };
         let ready_images = live.ready_images.len();
+        let mut ready_image_digests: Vec<String> = live
+            .ready_images
+            .iter()
+            .map(|d| d.as_str().to_string())
+            .collect();
+        ready_image_digests.sort();
         Self {
             id: row.id,
             hostname: row.hostname,
@@ -132,6 +143,7 @@ impl HostView {
             running_sandboxes,
             local_snapshots: live.local_snapshots.len(),
             ready_images,
+            ready_image_digests,
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }

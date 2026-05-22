@@ -128,9 +128,9 @@ dev:
 # the OCI → BlobStorage materialization on enable-image is
 # exercised end-to-end.
 #
-# Use this when validating cross-host behavior locally: warm-pool
-# refill, register-time template delivery, the canonical-path
-# symlink contract, blob-backend coupling bugs.
+# Use this when validating cross-host behavior locally: host
+# image-prefetch supervisor (ADR 0015 M5), register-time enabled-
+# images delivery, blob-backend coupling bugs.
 dev-split:
     ENGRAM_DEV_SPLIT=1 tilt up
 
@@ -154,7 +154,7 @@ dev-down:
 #     logs in ./var/integration/host-agent.log)
 #
 # Once everything is up, run `just integration-test` to exercise
-# the bake → enable → warm-pool → session-create loop end-to-end
+# the bake → enable → host-prefetch → session-create loop end-to-end
 # against the local stack. `just integration-down` stops the
 # processes and the compose services.
 #
@@ -173,17 +173,14 @@ integration-down:
     bash deploy/dev/integration-down.sh
 
 # Hard-reset the integration stack: kills processes, drops compose
-# volumes (postgres + fake-gcs + registry), wipes ./var dirs. Use
-# when prior runs have left stale `templates` rows whose snapshot
-# blobs are gone — the warm-pool refill loop spams logs and can
-# starve real session creates. After this, run `just integration-up`.
+# volumes (postgres + fake-gcs + registry), wipes ./var dirs. After
+# this, run `just integration-up`.
 integration-reset:
     bash deploy/dev/integration-reset.sh
 
-# Smoke-test the full bake → enable → warm-pool → session flow
-# against the local integration stack. Times each step and
-# asserts the warm path actually triggers. Run after
-# `just integration-up`.
+# Smoke-test the full bake → enable → host-prefetch → session
+# flow against the local integration stack. Times each step.
+# Run after `just integration-up`.
 integration-test:
     bash deploy/dev/integration-test.sh
 

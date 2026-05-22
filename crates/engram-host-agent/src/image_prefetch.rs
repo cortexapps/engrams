@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use engram_chunk_store::{ChunkStore, Manifest};
+use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
 use parking_lot::RwLock;
 use tokio::sync::{watch, Semaphore};
@@ -103,6 +103,7 @@ const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30)
 pub fn spawn_supervisor(
     image_cache: ImageCache,
     chunk_store: ChunkStore,
+    chunk_cache: ChunkCache,
     readiness: Arc<ImageReadiness>,
 ) -> (
     watch::Sender<Vec<EnabledImageRef>>,
@@ -118,14 +119,13 @@ pub fn spawn_supervisor(
     );
     let handle = tokio::spawn(async move {
         loop {
-            // The current enabled set (snapshot of the watch's
-            // most recent value, so we re-poll on every iteration).
             let enabled = rx.borrow_and_update().clone();
             reconcile(
                 &enabled,
                 readiness.clone(),
                 image_cache.clone(),
                 chunk_store.clone(),
+                chunk_cache.clone(),
                 semaphore.clone(),
             )
             .await;
@@ -156,6 +156,7 @@ async fn reconcile(
     readiness: Arc<ImageReadiness>,
     image_cache: ImageCache,
     chunk_store: ChunkStore,
+    chunk_cache: ChunkCache,
     semaphore: Arc<Semaphore>,
 ) {
     let current = readiness.snapshot();
@@ -185,13 +186,24 @@ async fn reconcile(
             continue;
         }
         let image_uri = image.image_uri.clone();
+        let expected_digest = image.manifest_digest.clone();
         let digest = image.manifest_digest.clone();
         let readiness = readiness.clone();
         let image_cache = image_cache.clone();
         let chunk_store = chunk_store.clone();
+        let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
-            match prefetch_one(&image_uri, &image_cache, &chunk_store, &semaphore).await {
+            match prefetch_one(
+                &image_uri,
+                &expected_digest,
+                &image_cache,
+                &chunk_store,
+                &chunk_cache,
+                &semaphore,
+            )
+            .await
+            {
                 Ok(chunks) => {
                     readiness.mark_ready(digest.clone());
                     tracing::info!(
@@ -221,14 +233,39 @@ async fn reconcile(
 /// into the local cache. Returns the chunk count on success.
 async fn prefetch_one(
     image_uri: &str,
+    expected_digest: &ManifestDigest,
     image_cache: &ImageCache,
     chunk_store: &ChunkStore,
+    chunk_cache: &ChunkCache,
     semaphore: &Arc<Semaphore>,
 ) -> Result<usize, PrefetchError> {
-    let cached = image_cache
+    let mut cached = image_cache
         .ensure_image(image_uri)
         .await
         .map_err(|e| PrefetchError::ImageCache(format!("{e}")))?;
+
+    // ADR 0015 M5: when the registry has rotated under the same
+    // tag (a re-push of `:warm-<sha>`), the on-disk cache from
+    // the prior pull holds a stale bundle whose chunk manifest
+    // ref points at blob keys the coord no longer materialized.
+    // The coord's `enabled_images` advertises the current digest;
+    // if our cached digest differs, invalidate and re-pull. The
+    // prior digest's artifacts ride LRU eviction rather than an
+    // eager delete (any in-flight session still consuming the
+    // old digest is left intact).
+    if cached.digest != expected_digest.as_str() {
+        tracing::info!(
+            image_uri = %image_uri,
+            cached_digest = %cached.digest,
+            expected_digest = expected_digest.as_str(),
+            "cached image digest stale; invalidating and re-pulling",
+        );
+        image_cache.invalidate_uri(image_uri).await;
+        cached = image_cache
+            .ensure_image(image_uri)
+            .await
+            .map_err(|e| PrefetchError::ImageCache(format!("{e}")))?;
+    }
 
     let bundle = cached
         .bundle
@@ -250,22 +287,25 @@ async fn prefetch_one(
             .await
             .map_err(|_| PrefetchError::SemaphoreClosed)?;
         let chunk_store = chunk_store.clone();
+        let chunk_cache = chunk_cache.clone();
+        let hash = chunk.hash;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            chunk_store.get_chunk(chunk.hash).await
+            // Singleflight'd through ChunkCache::prefetch — concurrent
+            // calls for the same chunk dedup, and a successful fetch
+            // writes the bytes to the NVMe cache so the lazy-fault
+            // path on session boot hits tier 1 instead of paying a
+            // BlobStorage round-trip per page.
+            chunk_cache
+                .prefetch(hash, || async move { chunk_store.get_chunk(hash).await })
+                .await
         }));
     }
 
     for h in handles {
-        let bytes = h
-            .await
+        h.await
             .map_err(|e| PrefetchError::JoinError(format!("{e}")))?
             .map_err(|e| PrefetchError::ChunkFetch(format!("{e}")))?;
-        // Drop the bytes — `get_chunk` tees them into the cache
-        // through the tiered resolver, so we don't need to hold
-        // them in memory. Touching `len()` here is a no-op the
-        // compiler would optimize out without the explicit bind.
-        let _ = bytes.len();
     }
 
     Ok(total)
