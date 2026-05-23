@@ -72,10 +72,13 @@ service HostService {
   // upstream WebSocket to ttyd inside the right network namespace
   // and shuttles frames between the gRPC stream and ttyd.
   //
-  // First client frame MUST carry `sandbox_id` (other fields ignored
-  // server-side). Subsequent frames carry only `kind` + `data`
-  // (and `close_code`/`close_reason` when `kind == CLOSE`).
-  rpc ProxyShell(stream ProxyShellFrame) returns (stream ProxyShellFrame);
+  // First client message MUST be `ProxyShellMessage.open` carrying
+  // `sandbox_id`; subsequent messages from either side are pure
+  // shell-frame variants. See the comment block by
+  // `ProxyShellMessage` for the rationale (prior flat-bag shape let
+  // the sentinel get forwarded as a Binary frame to ttyd, which
+  // 1.7.8 rejects with a TCP-RST).
+  rpc ProxyShell(stream ProxyShellMessage) returns (stream ProxyShellMessage);
 
   // ---- pool warming ----
   // Lightweight no-op that forces TCP+H2 handshake when called on a
@@ -209,29 +212,63 @@ message ExecExit {
 }
 
 // --- ADR 0014 issue #6: ProxyShell ---
+//
+// Wire shape: the coord opens the stream by sending exactly one
+// `ProxyShellOpen` carrying `sandbox_id`; subsequent messages from
+// either side are pure shell-frame variants. The earlier shape
+// (single `ProxyShellFrame` with a `bytes sandbox_id` populated only
+// on the first frame and a `ProxyShellKind` field that picked which
+// of `data`/`close_code`/`close_reason` were meaningful) was a flat
+// field-bag — the host receiver tried to "defensively forward" the
+// sentinel's empty payload as if it were a WS Binary frame, which
+// ttyd 1.7.8 treats as a protocol violation and TCP-RSTs (prod
+// session 8725648d on 2026-05-23). The oneof here makes every
+// variant carry only its own meaningful fields, and makes Open a
+// distinct enum arm from any data variant so the bug class is
+// structurally impossible to express on either side.
 
-message ProxyShellFrame {
-  // Required on the first frame from client (coord) → server (host).
-  // 16-byte UUID. Ignored on every frame after the first, and on
-  // every frame from server → client.
-  bytes sandbox_id = 1;
-  // WebSocket message kind. Mirrors tokio_tungstenite::Message
-  // variants 1:1 — `kind=CLOSE` ends the stream.
-  ProxyShellKind kind = 2;
-  // The WS frame payload (binary or text). Empty for PING / PONG
-  // with no payload, and ignored for CLOSE.
-  bytes data = 3;
-  // Populated only when kind == CLOSE. close_code mirrors RFC 6455
-  // close codes.
-  uint32 close_code = 4;
-  string close_reason = 5;
+message ProxyShellMessage {
+  oneof body {
+    // Coord → host, sent exactly once at stream start. Carries
+    // the 16-byte UUID identifying which sandbox the host should
+    // dial. The host MUST reject a stream that opens with any
+    // other variant, and MUST reject any subsequent Open.
+    ProxyShellOpen open = 1;
+    // ShellFrame variants. Bidirectional from this point on:
+    // coord → host means "the browser typed this"; host → coord
+    // means "ttyd produced this".
+    ProxyShellText text = 2;
+    ProxyShellBinary binary = 3;
+    ProxyShellPing ping = 4;
+    ProxyShellPong pong = 5;
+    ProxyShellClose close = 6;
+  }
 }
 
-enum ProxyShellKind {
-  TEXT = 0;
-  BINARY = 1;
-  PING = 2;
-  PONG = 3;
-  CLOSE = 4;
+message ProxyShellOpen {
+  bytes sandbox_id = 1;
+}
+
+message ProxyShellText {
+  string data = 1;
+}
+
+message ProxyShellBinary {
+  bytes data = 1;
+}
+
+message ProxyShellPing {
+  bytes data = 1;
+}
+
+message ProxyShellPong {
+  bytes data = 1;
+}
+
+message ProxyShellClose {
+  // RFC 6455 close code. Zero + empty reason encodes the
+  // "Close with no body" case.
+  uint32 code = 1;
+  string reason = 2;
 }
 

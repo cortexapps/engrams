@@ -21,12 +21,14 @@ use engram_core::traits::HostClient;
 use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
+use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
     CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
-    ListSandboxesResponse, ProxyShellFrame, ProxyShellKind, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotResponse,
+    StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -82,7 +84,7 @@ pub async fn boot(
 impl HostService for HostServiceImpl {
     type ExecStartStream = Pin<Box<dyn Stream<Item = Result<ExecFrame, Status>> + Send + 'static>>;
     type ProxyShellStream =
-        Pin<Box<dyn Stream<Item = Result<ProxyShellFrame, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = Result<ProxyShellMessage, Status>> + Send + 'static>>;
 
     async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
         Ok(Response::new(Empty {}))
@@ -404,28 +406,48 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
     }
 
-    /// ADR 0014 issue #6: bidi WS-frame tunnel. First inbound frame
-    /// MUST carry `sandbox_id`; subsequent frames carry only the
-    /// `kind` + `data` (and close_code/close_reason when CLOSE).
-    /// The server opens a ShellTunnel via `HostClient::proxy_shell`
-    /// (which dials ttyd in the right netns), then bridges the gRPC
-    /// stream's frames to/from the tunnel's channels.
+    /// ADR 0014 issue #6: bidi WS-frame tunnel.
+    ///
+    /// Wire contract (ADR 0015 follow-up, prod session 8725648d on
+    /// 2026-05-23): the FIRST message MUST be a `ProxyShellOpen`
+    /// carrying `sandbox_id`. Any other variant as the first message
+    /// is `InvalidArgument`. Any subsequent `Open` is also
+    /// `InvalidArgument` (the open variant has no meaning past the
+    /// stream handshake). All other variants are pure ShellFrames
+    /// that we forward into the host-side tunnel. The prior shape
+    /// (single `ProxyShellFrame` with `sandbox_id` meaningful only
+    /// on the first frame, plus a `kind/data` field-bag) silently
+    /// forwarded the sentinel's empty payload as a WS Binary frame
+    /// to ttyd; 1.7.8 TCP-RSTs on that. The oneof here makes the bug
+    /// impossible to write in this direction.
     async fn proxy_shell(
         &self,
-        req: Request<tonic::Streaming<ProxyShellFrame>>,
+        req: Request<tonic::Streaming<ProxyShellMessage>>,
     ) -> Result<Response<Self::ProxyShellStream>, Status> {
         let mut inbound = req.into_inner();
 
-        // First frame carries sandbox_id. Wait for it (with a small
-        // budget so a misbehaving client doesn't pin a handler) and
-        // open the tunnel.
+        // First message must be Open. 5s budget so a misbehaving
+        // client doesn't pin a handler.
         use futures::StreamExt;
         let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next())
             .await
-            .map_err(|_| Status::deadline_exceeded("proxy_shell: no first frame within 5s"))?
-            .ok_or_else(|| Status::cancelled("proxy_shell: client closed before first frame"))?
-            .map_err(|e| Status::internal(format!("proxy_shell: recv first frame: {e}")))?;
-        let sandbox_id = decode_sandbox_id(&first.sandbox_id)?;
+            .map_err(|_| Status::deadline_exceeded("proxy_shell: no first message within 5s"))?
+            .ok_or_else(|| Status::cancelled("proxy_shell: client closed before first message"))?
+            .map_err(|e| Status::internal(format!("proxy_shell: recv first message: {e}")))?;
+        let sandbox_id = match first.body {
+            Some(ProxyShellBody::Open(open)) => decode_sandbox_id(&open.sandbox_id)?,
+            Some(other) => {
+                return Err(Status::invalid_argument(format!(
+                    "proxy_shell: first message must be Open, got {}",
+                    proxy_body_kind_name(&other),
+                )));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "proxy_shell: first message has empty body",
+                ));
+            }
+        };
 
         let tunnel = self
             .inner
@@ -438,45 +460,53 @@ impl HostService for HostServiceImpl {
         } = tunnel;
 
         // mpsc carrying frames out to the gRPC client (browser side).
-        let (out_tx, out_rx) = mpsc::channel::<Result<ProxyShellFrame, Status>>(64);
+        let (out_tx, out_rx) = mpsc::channel::<Result<ProxyShellMessage, Status>>(64);
 
         // gRPC inbound (client → us) drains `inbound`; we forward
         // each frame into the ShellTunnel's outbound channel (which
-        // the tunnel pump then writes to ttyd). The first frame
-        // we already consumed above — if it carried data (it
-        // shouldn't, but defensively forward it).
-        let first_payload = grpc_frame_to_shell_frame(first);
-        if let Some(sf) = first_payload {
-            let _ = tunnel_outbound.send(sf).await;
-        }
-        let tunnel_outbound_for_pump = tunnel_outbound.clone();
+        // the tunnel pump then writes to ttyd). Open is rejected
+        // here too — it's a stream-handshake variant, not data.
+        let out_tx_for_open_reject = out_tx.clone();
         tokio::spawn(async move {
             while let Some(next) = inbound.next().await {
-                let frame = match next {
-                    Ok(f) => f,
+                let msg = match next {
+                    Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(error = %e, "proxy_shell: client recv error");
                         break;
                     }
                 };
-                let Some(sf) = grpc_frame_to_shell_frame(frame) else {
-                    continue;
+                let sf = match proxy_body_to_shell_frame(msg.body) {
+                    Ok(Some(sf)) => sf,
+                    Ok(None) => continue, // body=None — ignore
+                    Err(e) => {
+                        // Open-after-handshake (or any other illegal
+                        // shape); tear down the stream with a typed
+                        // status so the client surfaces a clean
+                        // error instead of an opaque close.
+                        let _ = out_tx_for_open_reject
+                            .send(Err(Status::invalid_argument(format!("proxy_shell: {e}"))))
+                            .await;
+                        break;
+                    }
                 };
-                if tunnel_outbound_for_pump.send(sf).await.is_err() {
+                if tunnel_outbound.send(sf).await.is_err() {
                     break;
                 }
             }
             // Client closed; drop the tunnel outbound so the
             // tunnel's pump tears down.
-            drop(tunnel_outbound_for_pump);
+            drop(tunnel_outbound);
         });
 
         // Tunnel inbound (ttyd → us) drains here; we forward each
         // frame to the gRPC client out_tx.
         tokio::spawn(async move {
             while let Some(sf) = tunnel_inbound.recv().await {
-                let frame = shell_frame_to_grpc_frame(sf);
-                if out_tx.send(Ok(frame)).await.is_err() {
+                let msg = ProxyShellMessage {
+                    body: Some(shell_frame_to_proxy_body(sf)),
+                };
+                if out_tx.send(Ok(msg)).await.is_err() {
                     break;
                 }
             }
@@ -487,51 +517,75 @@ impl HostService for HostServiceImpl {
     }
 }
 
-/// Translate a proto `ProxyShellFrame` into the trait-level
-/// [`engram_core::types::shell::ShellFrame`]. `None` for frames that
-/// carry no payload (e.g. control frames the server should ignore).
-fn grpc_frame_to_shell_frame(
-    frame: ProxyShellFrame,
-) -> Option<engram_core::types::shell::ShellFrame> {
+/// Translate a server-bound `ProxyShellBody` into a [`ShellFrame`].
+///
+/// - `Ok(Some(frame))` for the data variants (Text/Binary/Ping/Pong/Close).
+/// - `Ok(None)` for `body == None` — the prost wire permits an
+///   empty oneof; we silently drop those rather than tear down the
+///   shell.
+/// - `Err(_)` for `Open` after the handshake. That's a protocol
+///   violation: Open is a one-shot stream-open variant, and we
+///   already consumed the legitimate first Open before reaching
+///   this codepath. The caller surfaces this as
+///   `InvalidArgument` on the gRPC stream.
+fn proxy_body_to_shell_frame(
+    body: Option<ProxyShellBody>,
+) -> Result<Option<engram_core::types::shell::ShellFrame>, String> {
     use engram_core::types::shell::{ShellClose, ShellFrame};
-    let kind = ProxyShellKind::try_from(frame.kind).ok()?;
-    Some(match kind {
-        ProxyShellKind::Text => ShellFrame::Text(String::from_utf8_lossy(&frame.data).into_owned()),
-        ProxyShellKind::Binary => ShellFrame::Binary(frame.data.into()),
-        ProxyShellKind::Ping => ShellFrame::Ping(frame.data.into()),
-        ProxyShellKind::Pong => ShellFrame::Pong(frame.data.into()),
-        ProxyShellKind::Close => {
-            if frame.close_code == 0 && frame.close_reason.is_empty() {
-                ShellFrame::Close(None)
+    Ok(match body {
+        None => None,
+        Some(ProxyShellBody::Open(_)) => {
+            return Err("Open is only legal as the first message".into());
+        }
+        Some(ProxyShellBody::Text(t)) => Some(ShellFrame::Text(t.data)),
+        Some(ProxyShellBody::Binary(b)) => Some(ShellFrame::Binary(b.data.into())),
+        Some(ProxyShellBody::Ping(p)) => Some(ShellFrame::Ping(p.data.into())),
+        Some(ProxyShellBody::Pong(p)) => Some(ShellFrame::Pong(p.data.into())),
+        Some(ProxyShellBody::Close(c)) => {
+            if c.code == 0 && c.reason.is_empty() {
+                Some(ShellFrame::Close(None))
             } else {
-                ShellFrame::Close(Some(ShellClose {
-                    code: frame.close_code as u16,
-                    reason: frame.close_reason,
-                }))
+                Some(ShellFrame::Close(Some(ShellClose {
+                    code: c.code as u16,
+                    reason: c.reason,
+                })))
             }
         }
     })
 }
 
-/// Translate a [`engram_core::types::shell::ShellFrame`] into a proto
-/// `ProxyShellFrame`. Used by both the host-agent server (ttyd →
-/// client) and the gRPC client (client → ttyd).
-fn shell_frame_to_grpc_frame(frame: engram_core::types::shell::ShellFrame) -> ProxyShellFrame {
+/// Translate a [`ShellFrame`] into the corresponding `ProxyShellBody`
+/// data variant. Total — every ShellFrame maps 1:1 to one of the
+/// data variants — so this never produces an `Open`.
+fn shell_frame_to_proxy_body(frame: engram_core::types::shell::ShellFrame) -> ProxyShellBody {
     use engram_core::types::shell::ShellFrame;
-    let (kind, data, close_code, close_reason) = match frame {
-        ShellFrame::Text(t) => (ProxyShellKind::Text, t.into_bytes(), 0, String::new()),
-        ShellFrame::Binary(b) => (ProxyShellKind::Binary, b.to_vec(), 0, String::new()),
-        ShellFrame::Ping(b) => (ProxyShellKind::Ping, b.to_vec(), 0, String::new()),
-        ShellFrame::Pong(b) => (ProxyShellKind::Pong, b.to_vec(), 0, String::new()),
-        ShellFrame::Close(None) => (ProxyShellKind::Close, Vec::new(), 0, String::new()),
-        ShellFrame::Close(Some(c)) => (ProxyShellKind::Close, Vec::new(), c.code as u32, c.reason),
-    };
-    ProxyShellFrame {
-        sandbox_id: Vec::new(),
-        kind: kind as i32,
-        data,
-        close_code,
-        close_reason,
+    match frame {
+        ShellFrame::Text(t) => ProxyShellBody::Text(ProxyShellText { data: t }),
+        ShellFrame::Binary(b) => ProxyShellBody::Binary(ProxyShellBinary { data: b.to_vec() }),
+        ShellFrame::Ping(b) => ProxyShellBody::Ping(ProxyShellPing { data: b.to_vec() }),
+        ShellFrame::Pong(b) => ProxyShellBody::Pong(ProxyShellPong { data: b.to_vec() }),
+        ShellFrame::Close(None) => ProxyShellBody::Close(ProxyShellClose {
+            code: 0,
+            reason: String::new(),
+        }),
+        ShellFrame::Close(Some(c)) => ProxyShellBody::Close(ProxyShellClose {
+            code: c.code as u32,
+            reason: c.reason,
+        }),
+    }
+}
+
+/// Render a `ProxyShellBody` variant name for diagnostics — used by
+/// the "first message must be Open" error to surface what was
+/// actually received without dumping the payload.
+fn proxy_body_kind_name(body: &ProxyShellBody) -> &'static str {
+    match body {
+        ProxyShellBody::Open(_) => "Open",
+        ProxyShellBody::Text(_) => "Text",
+        ProxyShellBody::Binary(_) => "Binary",
+        ProxyShellBody::Ping(_) => "Ping",
+        ProxyShellBody::Pong(_) => "Pong",
+        ProxyShellBody::Close(_) => "Close",
     }
 }
 

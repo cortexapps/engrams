@@ -24,9 +24,11 @@ use std::pin::Pin;
 use tonic::transport::Channel;
 
 use crate::grpc::host_service_client::HostServiceClient;
+use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest, Empty,
-    ExecStartRequest, GuestIpResponse, ProxyShellFrame, ProxyShellKind, ReapMaterializeDirRequest,
+    ExecStartRequest, GuestIpResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
     UnbindHarnessSessionRequest,
 };
@@ -403,7 +405,7 @@ impl GrpcHostClient {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
-        use engram_core::types::shell::{ShellFrame, ShellTunnel};
+        use engram_core::types::shell::ShellTunnel;
         use futures::StreamExt;
 
         let (tunnel, ends) = ShellTunnel::pair();
@@ -412,41 +414,22 @@ impl GrpcHostClient {
             inbound_tx,
         } = ends;
 
-        // Build the initial frame carrying sandbox_id. After that,
-        // each ShellFrame from `outbound_rx` becomes a ProxyShellFrame
-        // with empty `sandbox_id`. tonic wants a Stream<ProxyShellFrame>;
-        // we build one via async_stream wrapping the mpsc Receiver.
+        // First message on the stream is always `Open` — that's the
+        // *only* place sandbox_id lives now. Subsequent messages emit
+        // pure data variants. There's no way for the host to mistake
+        // the sentinel for a data frame because they're distinct enum
+        // arms in the prost-generated `ProxyShellBody`.
         let sandbox_bytes = sandbox_id.as_uuid().as_bytes().to_vec();
 
         let out_stream = async_stream::stream! {
-            // First frame: only sandbox_id matters; payload empty.
-            yield ProxyShellFrame {
-                sandbox_id: sandbox_bytes.clone(),
-                kind: ProxyShellKind::Binary as i32,
-                data: Vec::new(),
-                close_code: 0,
-                close_reason: String::new(),
+            yield ProxyShellMessage {
+                body: Some(ProxyShellBody::Open(ProxyShellOpen {
+                    sandbox_id: sandbox_bytes,
+                })),
             };
             while let Some(frame) = outbound_rx.recv().await {
-                let (kind, data, close_code, close_reason) = match frame {
-                    ShellFrame::Text(t) => (ProxyShellKind::Text, t.into_bytes(), 0, String::new()),
-                    ShellFrame::Binary(b) => (ProxyShellKind::Binary, b.to_vec(), 0, String::new()),
-                    ShellFrame::Ping(b) => (ProxyShellKind::Ping, b.to_vec(), 0, String::new()),
-                    ShellFrame::Pong(b) => (ProxyShellKind::Pong, b.to_vec(), 0, String::new()),
-                    ShellFrame::Close(None) => (ProxyShellKind::Close, Vec::new(), 0, String::new()),
-                    ShellFrame::Close(Some(c)) => (
-                        ProxyShellKind::Close,
-                        Vec::new(),
-                        c.code as u32,
-                        c.reason,
-                    ),
-                };
-                yield ProxyShellFrame {
-                    sandbox_id: Vec::new(),
-                    kind: kind as i32,
-                    data,
-                    close_code,
-                    close_reason,
+                yield ProxyShellMessage {
+                    body: Some(shell_frame_to_proxy_body(frame)),
                 };
             }
         };
@@ -461,35 +444,20 @@ impl GrpcHostClient {
 
         // Pump inbound (host → us) into the tunnel's inbound channel.
         tokio::spawn(async move {
-            use engram_core::types::shell::{ShellClose, ShellFrame};
             while let Some(next) = inbound_stream.next().await {
-                let frame = match next {
-                    Ok(f) => f,
+                let msg = match next {
+                    Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(error = %e, "proxy_shell client recv error");
                         break;
                     }
                 };
-                let kind = match ProxyShellKind::try_from(frame.kind) {
-                    Ok(k) => k,
-                    Err(_) => continue,
-                };
-                let sf = match kind {
-                    ProxyShellKind::Text => {
-                        ShellFrame::Text(String::from_utf8_lossy(&frame.data).into_owned())
-                    }
-                    ProxyShellKind::Binary => ShellFrame::Binary(frame.data.into()),
-                    ProxyShellKind::Ping => ShellFrame::Ping(frame.data.into()),
-                    ProxyShellKind::Pong => ShellFrame::Pong(frame.data.into()),
-                    ProxyShellKind::Close => {
-                        if frame.close_code == 0 && frame.close_reason.is_empty() {
-                            ShellFrame::Close(None)
-                        } else {
-                            ShellFrame::Close(Some(ShellClose {
-                                code: frame.close_code as u16,
-                                reason: frame.close_reason,
-                            }))
-                        }
+                let sf = match proxy_body_to_shell_frame(msg.body) {
+                    Ok(Some(sf)) => sf,
+                    Ok(None) => continue, // body=None or Open echoed back (server bug; drop)
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_shell decode error");
+                        break;
                     }
                 };
                 if inbound_tx.send(sf).await.is_err() {
@@ -500,6 +468,61 @@ impl GrpcHostClient {
 
         Ok(tunnel)
     }
+}
+
+/// Translate a [`ShellFrame`] into the corresponding `ProxyShellBody`
+/// variant. Total — there's no `None` outcome — because every
+/// `ShellFrame` variant maps 1:1 to a proxy variant.
+fn shell_frame_to_proxy_body(frame: engram_core::types::shell::ShellFrame) -> ProxyShellBody {
+    use engram_core::types::shell::ShellFrame;
+    match frame {
+        ShellFrame::Text(t) => ProxyShellBody::Text(ProxyShellText { data: t }),
+        ShellFrame::Binary(b) => ProxyShellBody::Binary(ProxyShellBinary { data: b.to_vec() }),
+        ShellFrame::Ping(b) => ProxyShellBody::Ping(ProxyShellPing { data: b.to_vec() }),
+        ShellFrame::Pong(b) => ProxyShellBody::Pong(ProxyShellPong { data: b.to_vec() }),
+        ShellFrame::Close(None) => ProxyShellBody::Close(ProxyShellClose {
+            code: 0,
+            reason: String::new(),
+        }),
+        ShellFrame::Close(Some(c)) => ProxyShellBody::Close(ProxyShellClose {
+            code: c.code as u32,
+            reason: c.reason,
+        }),
+    }
+}
+
+/// Translate a wire `ProxyShellBody` back into a [`ShellFrame`].
+/// Returns:
+/// - `Ok(Some(frame))` for the normal data variants.
+/// - `Ok(None)` for `body == None` (empty message — prost permits;
+///   we ignore) or for an `Open` echoed back from the server (would
+///   be a server-side bug; we drop without erroring rather than
+///   tear down the entire shell session).
+/// - `Err(_)` for genuinely malformed input — currently unreachable
+///   given the oneof, kept as a seam if we add fallible variants
+///   later (e.g. UTF-8 strict decoding).
+fn proxy_body_to_shell_frame(
+    body: Option<ProxyShellBody>,
+) -> Result<Option<engram_core::types::shell::ShellFrame>, String> {
+    use engram_core::types::shell::{ShellClose, ShellFrame};
+    Ok(match body {
+        None => None,
+        Some(ProxyShellBody::Open(_)) => None,
+        Some(ProxyShellBody::Text(t)) => Some(ShellFrame::Text(t.data)),
+        Some(ProxyShellBody::Binary(b)) => Some(ShellFrame::Binary(b.data.into())),
+        Some(ProxyShellBody::Ping(p)) => Some(ShellFrame::Ping(p.data.into())),
+        Some(ProxyShellBody::Pong(p)) => Some(ShellFrame::Pong(p.data.into())),
+        Some(ProxyShellBody::Close(c)) => {
+            if c.code == 0 && c.reason.is_empty() {
+                Some(ShellFrame::Close(None))
+            } else {
+                Some(ShellFrame::Close(Some(ShellClose {
+                    code: c.code as u16,
+                    reason: c.reason,
+                })))
+            }
+        }
+    })
 }
 
 // ---- helpers ----
