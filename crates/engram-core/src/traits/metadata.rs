@@ -244,31 +244,25 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// ADR 0007 chunk-store GC: enumerate every `manifest_id`
-    /// referenced by a live snapshot row. The chunk store's
-    /// `gc::run` takes this set as its "do not delete" filter.
-    /// Empty default returns no manifests — backends without a
-    /// real DB (mocks) can opt out by leaving the default.
+    /// Enumerate every disk `manifest_id` referenced by a live
+    /// snapshot row. Today's sole caller is `reap_materialize_dir`,
+    /// which uses the result as the "do not delete" filter when
+    /// pruning assembled `<manifest_id>-vN.ext4` files on hosts.
+    /// (The chunk-store GC that previously consumed this set was
+    /// removed 2026-05-23 — see ADR 0015 M5.)
     ///
-    /// Notes for callers:
-    /// - Returns DISTINCT ids; versions aren't surfaced because
-    ///   `gc::run` preserves every version of every live id.
-    /// - Doesn't include manifest_ids that only enabled images
-    ///   reference (no snapshot has been taken yet). Operators
-    ///   set a generous `retain_for` window to compensate, or
-    ///   layer enabled-image manifests on top before calling
-    ///   `gc::run`.
+    /// Returns DISTINCT ids; versions aren't surfaced. Default
+    /// `Ok(vec![])` keeps in-memory test impls quiet — the real
+    /// query lives in `engram-postgres`.
     async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
         Ok(Vec::new())
     }
 
-    /// Symmetric to `list_live_disk_manifest_ids` for the memory
-    /// side. ADR 0007 Phase 5 introduced `memory_manifest_id` on
-    /// the `snapshots` table; the GC sweep needs both axes so
-    /// chunks for retired session memories get collected on the
-    /// same cadence as disk chunks. Default `Ok(vec![])` keeps
-    /// in-memory test impls quiet — the real query lives in
-    /// `engram-postgres`.
+    /// Symmetric memory-side companion to
+    /// `list_live_disk_manifest_ids`. Currently unused by any
+    /// in-tree caller after the chunk-store GC was removed, but
+    /// kept on the trait so a future reintroduction has a
+    /// pre-shaped seam.
     async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
         Ok(Vec::new())
     }

@@ -88,7 +88,6 @@ pub fn router(state: SharedState) -> Router {
             "/api/enabled-images/disable",
             post(enabled_images::disable_enabled_image),
         )
-        .route("/api/admin/gc-chunks", post(admin::gc_chunks))
         .route(
             "/api/admin/reap-materialize-dir",
             post(admin::reap_materialize_dir),

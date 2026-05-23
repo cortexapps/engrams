@@ -12,8 +12,10 @@
 //!   manifest under a new `manifest_id` at version 1, with
 //!   `parent` set.
 //! - **Traces**: PUT/GET working-set traces by manifest+host.
-//! - **GC**: see `gc::run()` — sweeps chunks not referenced by any
-//!   live manifest after a retention TTL.
+//!
+//! Chunk-store GC was removed 2026-05-23 (see ADR 0015 M5 "Known
+//! regression — chunk-store GC deleted"). BlobStorage cost grows
+//! unbounded until a redesigned sweep ships.
 //!
 //! The local NVMe cache (`cache::ChunkCache`) is a separate layer
 //! consumed by adapters; this module's GETs go through the
@@ -73,14 +75,6 @@ impl ChunkStore {
     pub fn with_resolver(mut self, resolver: Arc<dyn ChunkResolver>) -> Self {
         self.resolver = resolver;
         self
-    }
-
-    /// Borrow the underlying blob storage. Crate-internal: GC and
-    /// corruption tests need to bypass the typed surface for raw
-    /// `list_prefix` / `head` / `delete`. Production callers go
-    /// through `put_chunk`, `get_manifest`, etc.
-    pub(crate) fn blob(&self) -> &Arc<dyn BlobStorage> {
-        &self.inner
     }
 
     /// Cloneable handle to the BlobStorage backing this `ChunkStore`.
@@ -383,7 +377,7 @@ mod tests {
         let h = s.put_chunk(b"original").await.unwrap();
         // Overwrite the stored chunk with different bytes — bypass
         // the chunk-store API.
-        let blob = s.blob().clone();
+        let blob = s.blob_storage();
         blob.put(&h.storage_key(), Bytes::from_static(b"corrupted"))
             .await
             .unwrap();

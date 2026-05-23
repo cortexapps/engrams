@@ -646,9 +646,10 @@ impl PooledBackend {
     ///   leaving them around per failed attempt accumulates.
     ///
     /// Chunks (memory + disk content-addressed manifests) are NOT
-    /// deleted here: they're shared across snapshots by content hash
-    /// and the existing `chunk_gc` sweep is the right tool. Same
-    /// reason we don't bother deleting from the chunk-cache LRU.
+    /// deleted here: they're shared across snapshots by content
+    /// hash. Cross-host lifecycle is currently no-op (chunk-store
+    /// GC was removed 2026-05-23 — see ADR 0015 M5). Same reason
+    /// we don't bother deleting from the chunk-cache LRU.
     ///
     /// Best-effort: every step's error is logged but never propagated
     /// beyond the WARN level. The caller (snapshot retry or

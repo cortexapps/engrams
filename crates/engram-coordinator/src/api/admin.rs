@@ -10,8 +10,9 @@
 //!
 //! ADR 0007 / Phase 7: the cold-tier flush endpoints (`flush_one`
 //! and `flush_idle`) are retired. Durability now flows through the
-//! chunk store; `gc_chunks` + `reap_materialize_dir` are the
-//! ongoing admin surface.
+//! chunk store; `reap_materialize_dir` is the ongoing admin
+//! surface. The chunk-store GC endpoint was removed 2026-05-23
+//! (see ADR 0015 M5 "Known regression — chunk-store GC deleted").
 
 use axum::extract::State;
 use axum::Json;
@@ -19,75 +20,6 @@ use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
-
-// ---------------------------------------------------------------------
-// ADR 0007 — chunk-store GC
-// ---------------------------------------------------------------------
-
-/// Query params for `POST /api/admin/gc-chunks`.
-#[derive(serde::Deserialize, Default)]
-pub struct GcChunksParams {
-    /// Minimum age (seconds) an unreferenced chunk must reach
-    /// before it's eligible for deletion. Defaults to 24h — long
-    /// enough that a session committing a new manifest version
-    /// isn't racing the sweep, short enough that storage cost
-    /// catches up reasonably fast.
-    ///
-    /// Operators bump this when the GC's live-set source is
-    /// incomplete (we currently only see manifest_ids referenced
-    /// by `snapshots` rows; enabled_images' canonical chunks
-    /// would otherwise be eligible for sweep until someone takes
-    /// a snapshot using them).
-    pub retain_secs: Option<u64>,
-}
-
-/// Wire shape of `POST /api/admin/gc-chunks` response.
-/// Mirrors `engram_chunk_store::gc::GcStats` with concrete types
-/// the JSON serializer can render directly.
-#[derive(Serialize)]
-pub struct GcChunksResult {
-    pub chunks_deleted: u64,
-    pub bytes_freed: u64,
-    pub chunks_retained_age: u64,
-    pub elapsed_ms: u64,
-    pub live_manifest_count: usize,
-    pub retain_secs: u64,
-}
-
-/// `POST /api/admin/gc-chunks` — fire a single GC pass against
-/// the chunk store. Matches the project's "explicit-trigger
-/// admin endpoints for testability" pattern: there's a future
-/// cron alongside, but the admin route is also what tests +
-/// drain-before-redeploy ops use directly.
-///
-/// Returns 500 on internal failures (chunk-store I/O, DB
-/// unreachable). Always safe to retry — the sweep is idempotent
-/// w.r.t. its own output (deleting an already-deleted chunk is
-/// a no-op).
-pub async fn gc_chunks(
-    State(state): State<SharedState>,
-    axum::extract::Query(params): axum::extract::Query<GcChunksParams>,
-) -> Result<Json<GcChunksResult>, ApiError> {
-    let retain_secs = params.retain_secs.unwrap_or(24 * 3600);
-    let retain_for = std::time::Duration::from_secs(retain_secs);
-
-    // Delegate to `chunk_gc::run_once` so the admin trigger and the
-    // background cron exercise the exact same pipeline — including
-    // the disk+memory live-set union (forgetting one would sweep
-    // the other side's chunks prematurely).
-    let result = crate::chunk_gc::run_once(&state, retain_for)
-        .await
-        .map_err(|e| ApiError::Internal(format!("chunk gc: {e}")))?;
-
-    Ok(Json(GcChunksResult {
-        chunks_deleted: result.stats.chunks_deleted,
-        bytes_freed: result.stats.bytes_freed,
-        chunks_retained_age: result.stats.chunks_retained_age,
-        elapsed_ms: result.stats.elapsed.as_millis() as u64,
-        live_manifest_count: result.live_manifest_count,
-        retain_secs,
-    }))
-}
 
 // ---------------------------------------------------------------------
 // ADR 0007 — materialize-dir orphan reap

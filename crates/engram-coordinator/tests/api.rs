@@ -2927,37 +2927,8 @@ async fn deleted_git_endpoints_return_404() {
 }
 
 // ---------------------------------------------------------------------
-// ADR 0007 — POST /api/admin/gc-chunks
+// ADR 0007 — POST /api/admin/reap-materialize-dir
 // ---------------------------------------------------------------------
-
-#[tokio::test]
-async fn admin_gc_chunks_returns_zero_on_empty_store() {
-    // Cleanest possible coverage: a freshly-built app has no
-    // snapshots → no live manifest_ids → the GC sweep has nothing
-    // to do. The response shape locks in the GcChunksResult JSON
-    // contract; a regression here surfaces immediately.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-
-    let resp = post(app, "/api/admin/gc-chunks", json!({})).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(
-        v["chunks_deleted"], 0,
-        "no snapshots, no chunks → nothing deleted",
-    );
-    assert_eq!(v["bytes_freed"], 0);
-    assert_eq!(v["live_manifest_count"], 0);
-    // Default retain_secs is 24h (86400). Operator overrides via
-    // ?retain_secs= query param.
-    assert_eq!(v["retain_secs"], 86_400);
-    // elapsed_ms is jitter; assert presence + type.
-    assert!(
-        v["elapsed_ms"].is_number(),
-        "elapsed_ms must be present + numeric: {v:?}",
-    );
-}
 
 #[tokio::test]
 async fn admin_reap_materialize_dir_reports_host_not_in_grpc_pool() {
@@ -3060,22 +3031,4 @@ async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
     assert!(v["bytes_freed"].as_u64().unwrap() > 0);
     assert!(!orphan_path.exists());
     assert!(!live_path.exists());
-}
-
-#[tokio::test]
-async fn admin_gc_chunks_honors_retain_secs_query_param() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-
-    // Operator picks 7-day retention — a generous window for
-    // deployments where bake produces chunks before any snapshot
-    // references them.
-    let resp = post(app, "/api/admin/gc-chunks?retain_secs=604800", json!({})).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(
-        v["retain_secs"], 604_800,
-        "retain_secs query param must round-trip into the response",
-    );
 }

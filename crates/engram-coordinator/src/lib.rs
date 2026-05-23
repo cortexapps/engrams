@@ -11,7 +11,6 @@ use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, 
 
 pub mod api;
 pub mod blob;
-pub mod chunk_gc;
 pub mod config;
 pub mod dead_host;
 pub mod error;
@@ -222,21 +221,12 @@ pub async fn run_with_registry_and_local(
         None
     };
 
-    // ADR 0007: cold-tier flush + disk-pressure detector retired in
-    // Phase 7. Durability now flows through the chunk store: chunks
-    // are durable in BlobStorage at snapshot time, the chunk-store
-    // GC reaps unreferenced bytes on a cadence, and the
-    // materialize-dir reaper handles the host-side assembled files.
-    //
-    // The chunk-store GC scheduler fires `chunk_gc::run_once` on the
-    // `ENGRAM_CHUNK_GC_INTERVAL_SECS` cadence (default 1h). The same
-    // pipeline is reachable via `POST /api/admin/gc-chunks` for ops
-    // + tests — explicit-trigger admin endpoints pattern. Setting
-    // the interval env to `0` disables the cron and leaves the admin
-    // endpoint as the sole trigger.
-    let _chunk_gc = chunk_gc::interval_from_env().and_then(|interval| {
-        chunk_gc::spawn(state.clone(), interval, chunk_gc::retain_for_from_env())
-    });
+    // Chunk-store GC removed 2026-05-23 after the prod incident
+    // documented in ADR 0015 M5 ("Known regression — chunk-store GC
+    // deleted"). The materialize-dir reaper (POST /api/admin/
+    // reap-materialize-dir) is unaffected. BlobStorage cost grows
+    // unbounded until a redesigned GC ships; that's the explicit
+    // tradeoff for the deletion.
 
     // Demo wiring: bind the harness-channel TCP listener so
     // `SandboxSpec::agent`-spawned harnesses (today: the dev

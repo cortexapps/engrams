@@ -43,7 +43,6 @@ pub mod bootstrap;
 pub mod cache;
 pub mod error;
 pub mod file;
-pub mod gc;
 pub mod manifest;
 pub mod resolver;
 pub mod snapshot_blob;

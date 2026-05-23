@@ -28,8 +28,9 @@
 //! - Detect external modifications to cache files (the bytes are
 //!   hash-verified on every read; corruption surfaces as
 //!   `HashMismatch` from the store layer).
-//! - GC. Eviction is local LRU; cross-host chunk lifecycle is
-//!   `gc::run`'s job.
+//! - GC. Eviction is local LRU; cross-host BlobStorage lifecycle
+//!   is currently no-op (the chunk-store GC was removed 2026-05-23
+//!   — see ADR 0015 M5 "Known regression").
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
