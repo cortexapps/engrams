@@ -2869,10 +2869,17 @@ impl SandboxBackend for FirecrackerBackend {
         }
         let api = FirecrackerClient::new(&api_sock);
         api.patch_vm_state(VmState::Paused).await?;
+        // ADR 0016 §A.1.2: same cancellation-safety story as
+        // create_snapshot — if our future is dropped between the
+        // pause above and the explicit resume below, async Drop
+        // can't run the resume. The guard's sync Drop spawns a
+        // detached resume task so the VM doesn't stay paused.
+        let mut guard = crate::client::ResumeOnDrop::arm(api.clone());
         let patch_result = api.patch_drive("harnesses", &harness_canonical).await;
         // Always try to resume so a partial failure doesn't leave
         // the VM paused. The patch error (if any) wins.
         let resume_result = api.patch_vm_state(VmState::Resumed).await;
+        guard.disarm();
         patch_result?;
         resume_result?;
         Ok(())

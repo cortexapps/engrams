@@ -184,6 +184,16 @@ impl FirecrackerClient {
 
         self.pause().await?;
 
+        // ADR 0016 §A.1.2: tokio cancellation between `pause` and the
+        // final `resume` below leaves the VM Paused, because async
+        // Drop can't run async cleanup. A `ResumeOnDrop` guard catches
+        // that case — if our future gets cancelled (caller times out,
+        // task is aborted, panic unwinds), the guard's Drop spawns a
+        // detached resume so the VM eventually unpauses. On the happy
+        // path we explicitly disarm before the inline resume so we
+        // don't double-resume.
+        let mut guard = ResumeOnDrop::arm(self.clone());
+
         let body = SnapshotCreateBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
             mem_file_path: mem_path.to_string_lossy().into_owned(),
@@ -195,6 +205,7 @@ impl FirecrackerClient {
         // succeeded — leaving the VM paused on error is worse than
         // doubling up on the failure path.
         let resume_res = self.resume().await;
+        guard.disarm();
 
         create_res?;
         resume_res?;
@@ -661,11 +672,222 @@ struct FaultMessage {
     fault_message: String,
 }
 
+// ---- ADR 0016 §A.1.2: ResumeOnDrop guard ----------------------------
+//
+// FC operations that pause the VM (`create_snapshot`,
+// `swap_harness_drive`) need a guarantee that the VM is resumed even
+// if the future driving the operation is dropped mid-sequence —
+// tokio task aborts, `tokio::time::timeout`, panic unwinds, caller
+// dropped its handle. The inline `resume().await` after the paused
+// work doesn't survive cancellation because the future is dropped
+// before the await point is reached.
+//
+// Async Drop is the missing language feature here. The next-best
+// pattern is a sync `Drop` that spawns a detached resume task. The
+// VM will be unpaused on the next runtime tick, regardless of what
+// happened to the original future. On the happy path the guard's
+// `disarm` is called after the inline resume so we don't
+// double-resume.
+//
+// Surfaced on 2026-05-23 during the COW diagnostic spot-check on
+// session 96392fd3: 3 successful flushes on the host with 0 PG
+// snapshot rows, then a follow-up prompt that the harness never
+// processed — consistent with a partially-completed snapshot
+// pipeline leaving the VM stuck Paused.
+
+/// Defuse-on-success guard: if dropped while armed, spawns a
+/// detached `resume` so the VM doesn't stay paused on cancellation.
+/// Defuse via [`Self::disarm`] after the inline resume completes on
+/// the happy path.
+pub(crate) struct ResumeOnDrop {
+    client: FirecrackerClient,
+    armed: bool,
+}
+
+impl ResumeOnDrop {
+    pub(crate) fn arm(client: FirecrackerClient) -> Self {
+        Self {
+            client,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Spawn a detached task — Drop is sync; we can't await here.
+        // The client is `Clone`; cloning is cheap (just a PathBuf +
+        // Duration). The task runs on whatever runtime owned the
+        // original future, which is still alive even if our future
+        // was cancelled (tokio cancellation drops futures, not the
+        // runtime).
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.resume().await {
+                tracing::warn!(
+                    socket = %client.socket().display(),
+                    error = %e,
+                    "ResumeOnDrop: detached resume after cancellation failed; \
+                     VM may remain paused. ADR 0016 §A.1.2.",
+                );
+            } else {
+                tracing::info!(
+                    socket = %client.socket().display(),
+                    "ResumeOnDrop: detached resume completed after cancellation",
+                );
+            }
+        });
+    }
+}
+
 // ---- Tests -----------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- ADR 0016 §A.1.2: ResumeOnDrop -------------------------------
+
+    /// Spin up a minimal Unix-socket "FC" server that records every
+    /// HTTP request it sees. Used by the ResumeOnDrop tests to assert
+    /// the detached task actually issues `PATCH /vm` with
+    /// `state=Resumed` on cancellation.
+    ///
+    /// Returns `(socket_path, handle)`. The handle exposes a channel
+    /// of received `(method, path, body)` tuples and a tempdir guard
+    /// keeping the socket alive for the duration of the test.
+    async fn spawn_recording_server() -> (
+        PathBuf,
+        tempfile::TempDir,
+        tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    // Read until we've seen \r\n\r\n + content-length
+                    // bytes. The clients in this crate write small
+                    // requests (PATCH /vm payload is ~20 bytes), so a
+                    // single read is plenty in practice.
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // Parse: METHOD PATH ... \r\n ... \r\n\r\nBODY
+                    let mut lines = raw.split("\r\n");
+                    let first = lines.next().unwrap_or("");
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                    let _ = tx.send((method, path, body));
+                    // Respond 204 No Content — FC's success shape.
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (socket, dir, rx)
+    }
+
+    #[tokio::test]
+    async fn resume_on_drop_fires_when_armed() {
+        // Construct a guard, drop it without disarming; expect the
+        // detached task to PATCH /vm with state=Resumed.
+        let (socket, _dir, mut rx) = spawn_recording_server().await;
+        let client = FirecrackerClient::new(&socket);
+        {
+            let _guard = ResumeOnDrop::arm(client);
+            // Guard dropped at end of scope (no disarm).
+        }
+        // Detached task runs on the runtime; give it a moment.
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("detached resume task should have run before timeout")
+            .expect("channel sender survives");
+        assert_eq!(received.0, "PATCH");
+        assert_eq!(received.1, "/vm");
+        assert!(
+            received.2.contains("Resumed"),
+            "body should request VmState::Resumed, got {}",
+            received.2,
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_on_drop_is_a_noop_when_disarmed() {
+        // Happy path: caller resumed inline and disarmed the guard.
+        // Drop must not spawn a second resume.
+        let (socket, _dir, mut rx) = spawn_recording_server().await;
+        let client = FirecrackerClient::new(&socket);
+        {
+            let mut guard = ResumeOnDrop::arm(client);
+            guard.disarm();
+        }
+        // No spawn should happen. Wait briefly to confirm.
+        let result = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "no resume should have fired after disarm; got {:?}",
+            result.ok().flatten(),
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_pause_and_resume_still_resumes_vm() {
+        // The actual scenario A.1.2 fixes: a task is cancelled while
+        // awaiting something inside the paused window. The guard's
+        // Drop must fire a detached resume so the VM doesn't stay
+        // paused. We simulate this by holding a ResumeOnDrop and
+        // letting the future be dropped via tokio::time::timeout.
+        let (socket, _dir, mut rx) = spawn_recording_server().await;
+        let client = FirecrackerClient::new(&socket);
+
+        // The future that times out holds the guard. On timeout the
+        // future is dropped; the guard's Drop fires.
+        let fut = async {
+            let _guard = ResumeOnDrop::arm(client);
+            // "Pause-then-PUT-then-resume" — simulate the long PUT
+            // by sleeping past the timeout. The outer
+            // `tokio::time::timeout` will cancel us mid-await.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // We never reach here in this test — the timeout fires
+            // first. If we DID reach here, we'd disarm before the
+            // inline resume.
+            unreachable!("test should have timed out by now");
+        };
+        let outcome = tokio::time::timeout(Duration::from_millis(50), fut).await;
+        assert!(
+            outcome.is_err(),
+            "outer timeout must fire to exercise the cancellation path"
+        );
+        // After cancellation, the spawned resume should arrive at the
+        // recording server.
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("detached resume must run after cancellation")
+            .expect("channel sender survives");
+        assert_eq!(received.0, "PATCH");
+        assert_eq!(received.1, "/vm");
+        assert!(received.2.contains("Resumed"));
+    }
 
     #[test]
     fn machine_config_serializes_to_swagger_field_names() {

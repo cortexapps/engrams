@@ -179,7 +179,7 @@ matching `tracing::info!` at the success completion. The shape
 mirrors the existing logs in `host_http::idle_eviction_candidates`
 post-call. ~5 lines of code; no behaviour change.
 
-### A.1.2 — VM not resumed after failed inner snapshot
+### A.1.2 — VM left paused on tokio cancellation between pause and resume
 
 **Evidence**: PG events for the session:
 
@@ -195,28 +195,78 @@ The user's second prompt landed on coord at 22:40:03,
 `POST /sessions/:id/prompt` succeeded (the user-role
 `agent_message` event was emitted, which is the side effect at the
 end of `api/prompt.rs::prompt`), but the harness never started a
-new run. Meanwhile agentd was responsive (it reported `ttyd ready`
-at 22:44:13), so the VM itself is alive.
+new run.
 
-**Hypothesis**: in `PooledBackend::snapshot`
-(`crates/engram-host-agent/src/pooled_backend.rs:1316`),
-`self.inner.snapshot(id).await?` (line 1380) calls FC's
-pause + capture + resume. If the *capture* fails after the *pause*,
-the error path at lines 1494-1502 does `rm -rf dest` to clean up the
-4 GiB orphan dir but **does not explicitly resume the FC VM**. If
-FC's snapshot wrapper left the VM paused on error, agentd
-continues running (its control vsock survives), but the harness
-adapter's vsock-to-agentd channel may have desync'd during the
-pause cycle. Subsequent prompts write to the host-side vsock UDS
-but the in-guest reader is in an inconsistent state.
+**First-pass hypothesis (rejected on closer reading)**: that
+`PooledBackend::snapshot`'s `self.inner.snapshot(id).await?` (line
+1380) failed after pausing without resuming. Wrong: the FC client
+at `crates/engram-sandbox-firecracker/src/client.rs:181-205`
+already handles this — `create_snapshot` does pause → PUT → resume
+and runs the resume *unconditionally* via a `let resume_res =
+self.resume().await;` after the create attempt, before propagating
+either error. On Err from PUT, the VM is still resumed.
 
-**Fix**: in `crates/engram-sandbox-firecracker/`'s `snapshot()`
-error paths, audit every branch that pauses the VM and ensure each
-failure path explicitly calls `vm.resume()` (or equivalent) before
-returning `Err`. Reuse the existing FC paused-state primitive;
-this is "every exit through resume" hygiene. Likely a 10-20 line
-diff plus a unit test that asserts the VM is unpaused after a
-mocked-failing capture.
+**Actual root cause**: **tokio cancellation between pause and
+resume**. If the outer future driving `create_snapshot` is dropped
+mid-await (gRPC RPC timeout, coord-side `tokio::time::timeout`,
+task abort, panic), the pause-PUT-resume sequence is interrupted.
+The PUT future is dropped; the resume call never reaches its
+`.await`. Async Drop can't run async cleanup, so the VM stays
+Paused. agentd inside the VM continues running off its prior
+state (its control vsock survives because vsock channels persist
+across pause), but anything that depended on the kernel scheduling
+forward — including the harness adapter that needs to wake up and
+read the new prompt — wedges.
+
+This is the classic "async cancellation gap" that async-Drop or a
+detached-resume-on-Drop pattern closes.
+
+**Fix**: introduce a `ResumeOnDrop` guard in `FirecrackerClient`:
+
+```rust
+struct ResumeOnDrop {
+    client: FirecrackerClient,
+    armed: bool,
+}
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        // Can't await in Drop. Spawn a detached resume task —
+        // the VM will be unpaused even if our future was dropped.
+        let api = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api.patch_vm_state(VmState::Resumed).await {
+                tracing::warn!(error = %e, "ResumeOnDrop: detached resume failed");
+            }
+        });
+    }
+}
+```
+
+Then `create_snapshot` becomes:
+
+```rust
+self.pause().await?;
+let mut guard = ResumeOnDrop { client: self.clone(), armed: true };
+let create_res = self.put("/snapshot/create", &body).await;
+let resume_res = self.resume().await;
+guard.armed = false;  // happy path: defuse; we just resumed inline
+create_res?;
+resume_res?;
+Ok(...)
+```
+
+On cancellation between `pause` and the explicit `resume`, the
+guard's Drop fires (it's stack-local; cancellation drops it), the
+detached task resumes the VM. On the happy path, we defuse the
+guard after the inline resume so we don't double-resume.
+
+Plus a unit test that constructs the client against a controllable
+mock FC API, races `create_snapshot` against a cancellation, and
+asserts the mock saw exactly one `pause` + one `resume`.
+
+**Caveat**: `FirecrackerClient` needs `Clone` for this. It's a thin
+wrapper over an HTTP unix-socket client; cheap to clone.
 
 ### A.1.3 — idle-eviction POST transport error vs heartbeat success
 
