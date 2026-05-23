@@ -34,7 +34,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
+};
 use engram_image_builder::{
     AgentInjection, BuildRequest, Builder, DockerCli, Ext4Packer, Format, Mke2fsPacker, Transport,
 };
@@ -353,6 +355,26 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         "PATH".into(),
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
     );
+    // ADR 0015 M1 (`4b3f890`): start_agent is the event-driven
+    // readiness barrier — it awaits agentd's host-bound readiness
+    // dial before returning. exec_stream no longer carries the
+    // pre-M1 boot-race retry loop, so callers must go through
+    // start_agent first or race the agentd-1024 listener. Empty
+    // argv is the readiness-only probe (`engram-agentd::
+    // SpawnHarnessRequest` skips the spawn when argv is empty) —
+    // we don't actually want a harness child for this test, just
+    // the proof that agentd is bound.
+    backend
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv: Vec::new(),
+                env: HashMap::new(),
+            },
+        )
+        .await
+        .expect("agentd readiness probe");
+
     // ---- 8. Exec curl from inside the VM ----
     // Seed /etc/hosts so the guest's resolver finds engram-test.invalid
     // (the IP is irrelevant — iptables REDIRECT catches all 443).
