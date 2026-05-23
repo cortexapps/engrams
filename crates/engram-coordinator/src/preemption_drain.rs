@@ -298,7 +298,10 @@ mod tests {
         std::fs::create_dir_all(&local_path).unwrap();
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes")));
-        let host_registry = Arc::new(HostRegistry::new());
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
         host_registry.register(
             engram_core::HostId::new(),
             Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
@@ -306,7 +309,7 @@ mod tests {
             )),
         );
         let services = Services {
-            meta: Arc::new(MiniMeta::new(session)),
+            meta: meta.clone(),
             cloud,
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),

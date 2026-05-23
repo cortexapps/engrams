@@ -463,7 +463,7 @@ impl TestFixture {
         // ADR 0015 M5: build the registry explicitly so we can keep
         // a handle to it and pin the host id we use to seed
         // `ready_images` from `write_image`.
-        let host_registry = Arc::new(engram_coordinator::HostRegistry::new());
+        let host_registry = Arc::new(engram_coordinator::HostRegistry::new(meta.clone()));
         let test_host_id = engram_core::HostId::new();
         host_registry.register(test_host_id, services.host.clone());
         let state = Arc::new(AppState::new_with_registry(

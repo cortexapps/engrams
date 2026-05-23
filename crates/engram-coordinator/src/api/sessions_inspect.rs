@@ -98,13 +98,16 @@ mod tests {
         let local = TempDir::new().unwrap();
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
-        let host_registry = Arc::new(HostRegistry::new());
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
         let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
             engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
         );
         host_registry.register(engram_core::HostId::new(), local_host);
         let services = Services {
-            meta: Arc::new(MiniMeta::new(session)),
+            meta: meta.clone(),
             cloud: Arc::new(MockCloud::new()),
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),

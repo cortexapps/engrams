@@ -339,7 +339,7 @@ async fn main() -> Result<(), CoordinatorError> {
     // through HostRegistry. For --mode=all we register a local backend
     // synchronously at startup; for --mode=coordinator the registry
     // starts empty and hosts dial in via /api/hosts/connect.
-    let host_registry = Arc::new(HostRegistry::new());
+    let host_registry = Arc::new(HostRegistry::new(meta_arc.clone()));
 
     // ADR 0007 Phase 5: stable HostId for `--mode=all`. Hoisted
     // up here (was computed below alongside the host_registry

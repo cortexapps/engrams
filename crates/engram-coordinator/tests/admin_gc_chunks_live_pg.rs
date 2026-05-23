@@ -85,7 +85,7 @@ async fn gc_chunks_endpoint_reports_live_manifest_count_from_db() {
 
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let services = Services {
-        meta,
+        meta: meta.clone(),
         cloud: Arc::new(MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             ProcessBackend::new(sandbox_dir),
@@ -110,7 +110,7 @@ async fn gc_chunks_endpoint_reports_live_manifest_count_from_db() {
     let state = Arc::new(AppState::new_with_registry(
         cfg,
         services,
-        Arc::new(HostRegistry::new()),
+        Arc::new(HostRegistry::new(meta.clone())),
     ));
     let app = api::router(state);
 

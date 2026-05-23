@@ -80,7 +80,8 @@ pub struct Services {
 
 /// Bootstrap the axum server. Returns once the bind future yields.
 pub async fn run(cfg: CoordinatorConfig, services: Services) -> Result<(), CoordinatorError> {
-    run_with_registry(cfg, services, Arc::new(HostRegistry::new())).await
+    let registry = Arc::new(HostRegistry::new(services.meta.clone()));
+    run_with_registry(cfg, services, registry).await
 }
 
 /// Variant of [`run`] that takes an externally-built [`HostRegistry`].

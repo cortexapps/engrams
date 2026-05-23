@@ -12,12 +12,15 @@
 //!    the `HostId` for the supplied `SandboxId`.
 //! 3. Aggregating `list` across all connected hosts.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use engram_core::traits::{HarnessDial, HostClient};
+use engram_core::traits::{HarnessDial, HostClient, MetadataStore};
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId, SnapshotId};
 use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
@@ -33,6 +36,22 @@ use parking_lot::RwLock;
 struct HostEntry {
     backend: Arc<dyn HostClient>,
     state: RwLock<HostState>,
+    /// ADR 0015 M3: millis-since-epoch of the most recent
+    /// observation (registration or heartbeat). `resolve_owner` uses
+    /// this to soft-invalidate the cache after [`HostRegistry::ttl`]
+    /// for hosts that have stopped heartbeating but haven't yet been
+    /// declared dead by the detector (operator-paused, network
+    /// partition that hasn't crossed the 30s threshold). A lazy
+    /// invalidator beats a background sweeper here — we only care
+    /// about freshness on the read path.
+    last_observed_heartbeat: AtomicI64,
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Heartbeat-derived view of a host. Updated by the WS supervisor
@@ -101,19 +120,85 @@ impl From<PickError> for SandboxError {
     }
 }
 
-#[derive(Default)]
+/// ADR 0015 M3: the in-memory routing cache, made coherent with the
+/// authoritative `sessions` row in Postgres.
+///
+/// The previous shape kept `sandbox_id → host_id` purely in memory;
+/// on host loss the entry persisted until the heartbeat-timeout path
+/// dropped the whole host, leaving a window where RPCs against a
+/// stale `SandboxId` got `tcp connect error`s from the gRPC pool or
+/// a generic `sandbox not found` from the registry timeout. M2 made
+/// the *PG* side of the mapping clean (sessions march through
+/// `HostLost` and `sessions.sandbox_id` is nulled), but didn't touch
+/// the cache.
+///
+/// M3 closes the loop:
+///
+/// 1. **Strict invalidation** — the per-session HostLost transition
+///    sites (`reconcile`, `preemption_drain`) call
+///    [`HostRegistry::invalidate_sandbox`] before the DB-side state
+///    flip, and [`HostRegistry::unregister`] now purges every
+///    `sandbox_owner` row pointing at the dying host, not just the
+///    `hosts` entry itself.
+/// 2. **Read-through on miss** — [`HostRegistry::resolve_owner`]
+///    falls back to `MetadataStore::host_for_sandbox` on a cache
+///    miss, repairs the entry if PG knows a current owner, and
+///    returns [`SandboxError::HostLost`] (→ 410 Gone) when the
+///    session is in a HostLost-class state.
+/// 3. **Fallback TTL** — each host entry tracks
+///    `last_observed_heartbeat`; entries past
+///    [`HostRegistry::ttl`] are soft-invalidated on read, so an
+///    operator-paused host (no heartbeats, dead-host detector also
+///    paused) doesn't keep serving stale routes forever.
 pub struct HostRegistry {
     hosts: DashMap<HostId, HostEntry>,
     /// Sandbox-to-host ownership map. Populated on `create` / `restore`,
     /// consulted by every method that takes an existing `SandboxId`.
     /// Without this the registry can't route `exec_stream(id)` because
-    /// `id` is local to the host that produced it.
+    /// `id` is local to the host that produced it. M3 makes this a
+    /// strict cache: invalidation on HostLost + read-through to PG
+    /// on miss.
     sandbox_owner: DashMap<SandboxId, HostId>,
+    /// PG-authoritative store consulted on cache miss. Driven through
+    /// `MetadataStore::host_for_sandbox` (ADR 0015 M3).
+    meta: Arc<dyn MetadataStore>,
+    /// Soft-invalidation horizon for `last_observed_heartbeat`. Entries
+    /// older than this fall through to a PG read on the next
+    /// `resolve_owner`. Configurable via `ENGRAM_HOST_REGISTRY_TTL_SECS`;
+    /// default 60s — well over the 5s heartbeat cadence but under
+    /// the dead-host detector's 30s threshold, so the TTL only fires
+    /// when *detection itself* is broken or paused.
+    ttl: Duration,
 }
 
 impl HostRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct a registry backed by `meta` for read-through cache
+    /// misses. TTL is read from `ENGRAM_HOST_REGISTRY_TTL_SECS`
+    /// (default 60s).
+    pub fn new(meta: Arc<dyn MetadataStore>) -> Self {
+        let ttl_secs = std::env::var("ENGRAM_HOST_REGISTRY_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+        Self {
+            hosts: DashMap::new(),
+            sandbox_owner: DashMap::new(),
+            meta,
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    /// Test-only: construct a registry whose read-through path uses
+    /// `meta` and whose TTL is `ttl`. Lets the M3 TTL-fallback tests
+    /// stage "host went silent" without sleeping for a real minute.
+    #[cfg(test)]
+    pub fn new_with_ttl(meta: Arc<dyn MetadataStore>, ttl: Duration) -> Self {
+        Self {
+            hosts: DashMap::new(),
+            sandbox_owner: DashMap::new(),
+            meta,
+            ttl,
+        }
     }
 
     /// Register a host. Replaces any prior registration for the same id
@@ -127,6 +212,7 @@ impl HostRegistry {
             HostEntry {
                 backend,
                 state: RwLock::new(HostState::default()),
+                last_observed_heartbeat: AtomicI64::new(now_millis()),
             },
         );
     }
@@ -140,10 +226,16 @@ impl HostRegistry {
 
     /// Update a host's heartbeat-derived state. Called by the WS
     /// supervisor on each inbound `Heartbeat`; the scheduler reads
-    /// the most recent value when picking a host.
+    /// the most recent value when picking a host. Also bumps
+    /// `last_observed_heartbeat` so the M3 TTL path sees the host as
+    /// fresh on the next `resolve_owner`.
     pub fn update_state(&self, host_id: HostId, state: HostState) {
         if let Some(entry) = self.hosts.get(&host_id) {
             *entry.value().state.write() = state;
+            entry
+                .value()
+                .last_observed_heartbeat
+                .store(now_millis(), Ordering::Relaxed);
         }
     }
 
@@ -170,12 +262,39 @@ impl HostRegistry {
         out
     }
 
-    /// Drop a host. Sandbox ownership rows for sandboxes created by
-    /// this host stay around — they're meaningless without their host
-    /// but cheap to leave; they get cleaned up the next time the
-    /// session migrates (Phase 3d) or the coordinator restarts.
+    /// Drop a host and every sandbox-ownership row that pointed at
+    /// it. Atomic for the caller's intent: post-call the registry
+    /// has zero stale references to `host_id`, so a subsequent
+    /// `resolve_owner(sb)` for any of those sandboxes either repairs
+    /// via PG (if the row got re-bound to a new host — M4 migration
+    /// path) or returns [`SandboxError::HostLost`].
+    ///
+    /// ADR 0015 M3: the previous shape only dropped `hosts.host_id`
+    /// and left `sandbox_owner` rows behind on the theory they were
+    /// "meaningless but cheap" — that theory was wrong once
+    /// `resolve_owner` started returning typed 410s on the basis of
+    /// "cache says known-owner but the owner is gone". The sweep
+    /// here is O(sandbox_owner.len) — acceptable given the map is
+    /// bounded by concurrent active sandboxes (low thousands in
+    /// prod) and `unregister` only fires on host death.
     pub fn unregister(&self, host_id: HostId) {
         self.hosts.remove(&host_id);
+        self.sandbox_owner.retain(|_sb, owner| *owner != host_id);
+    }
+
+    /// ADR 0015 M3: drop the cached owner for a single sandbox.
+    /// Called from the per-session HostLost transition sites
+    /// (`reconcile::flip_missing`, `preemption_drain`) once the DB
+    /// has cleared `sessions.sandbox_id` — the order is
+    /// "drop-cache-then-DB" on the in-memory side and
+    /// "clear-DB-then-flip-status" on the persistence side, so any
+    /// reader that races us either gets the stale cache entry (and
+    /// reaches a backend that's about to error), the read-through
+    /// PG path (and learns the session is HostLost → 410), or a
+    /// clean miss (→ 410 via the no-owner branch). Returns the
+    /// prior owner for logging.
+    pub fn invalidate_sandbox(&self, sandbox_id: SandboxId) -> Option<HostId> {
+        self.sandbox_owner.remove(&sandbox_id).map(|(_, h)| h)
     }
 
     /// Currently-connected host count. Used by `/healthz` and by tests.
@@ -341,16 +460,106 @@ impl HostRegistry {
         self.sandbox_owner.insert(sandbox_id, host_id);
     }
 
-    fn lookup(&self, sandbox_id: SandboxId) -> Result<Arc<dyn HostClient>, SandboxError> {
-        let host_id = self
-            .sandbox_owner
-            .get(&sandbox_id)
-            .map(|r| *r.value())
-            .ok_or(SandboxError::NotFound)?;
-        self.hosts
-            .get(&host_id)
-            .map(|e| e.value().backend.clone())
-            .ok_or(SandboxError::NotFound)
+    /// ADR 0015 M3 read-through cache lookup.
+    ///
+    /// Fast path: cache hit + host registered + host's
+    /// `last_observed_heartbeat` is within `self.ttl`. No DB
+    /// round-trip. This is the steady-state shape — every
+    /// well-behaved RPC against an `Active` session.
+    ///
+    /// Slow path (cache miss, or TTL-expired host entry, or stale
+    /// cache row pointing at a host the registry no longer knows
+    /// about): ask `MetadataStore::host_for_sandbox` who owns the
+    /// sandbox now. Outcomes:
+    ///
+    /// - PG returns `(host_id, session_status)` where the status is
+    ///   a HostLost-class state (`HostLost`, `Dead`, `Completed`,
+    ///   `Failed`) → return [`SandboxError::HostLost`]. The cache
+    ///   row, if any, gets pruned first so future reads don't keep
+    ///   hitting the fast path.
+    /// - PG returns a current owner whose host *is* registered and
+    ///   fresh → repair the cache row and return the backend.
+    /// - PG returns a current owner whose host *isn't* registered
+    ///   (or is past TTL) → [`SandboxError::HostLost`]: the row
+    ///   says the host should be reachable, but the registry can't
+    ///   reach it.
+    /// - PG returns `None` → [`SandboxError::NotFound`]: this
+    ///   sandbox id was never bound to a session, or its session
+    ///   row has been hard-deleted.
+    ///
+    /// If the PG call itself errors, the registry falls back to
+    /// `NotFound` — surfacing an internal error as a 404 here is
+    /// the lesser evil than mapping to 410 (which would lie about
+    /// the host being gone) or 500 (which doesn't compose with the
+    /// API layer's `From<SandboxError>` mapping). The error is
+    /// logged at WARN.
+    async fn resolve_owner(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(HostId, Arc<dyn HostClient>), SandboxError> {
+        // Fast path.
+        if let Some(host_id) = self.sandbox_owner.get(&sandbox_id).map(|r| *r.value()) {
+            if let Some(entry) = self.hosts.get(&host_id) {
+                if self.entry_is_fresh(&entry) {
+                    return Ok((host_id, entry.value().backend.clone()));
+                }
+            }
+            // Cache row exists but its host is missing or past TTL.
+            // Drop the stale row before consulting PG so a concurrent
+            // reader doesn't keep taking the in-memory path.
+            self.sandbox_owner.remove(&sandbox_id);
+        }
+
+        // Read-through to PG.
+        let pg = match self.meta.host_for_sandbox(sandbox_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    %sandbox_id,
+                    error = %e,
+                    "host_for_sandbox lookup failed; surfacing as NotFound"
+                );
+                return Err(SandboxError::NotFound);
+            }
+        };
+        let Some((host_id, status)) = pg else {
+            return Err(SandboxError::NotFound);
+        };
+        if Self::is_host_lost_status(status) {
+            return Err(SandboxError::HostLost);
+        }
+        // Active-class session in PG. Repair the cache iff we have a
+        // fresh host entry to back it.
+        let Some(entry) = self.hosts.get(&host_id) else {
+            return Err(SandboxError::HostLost);
+        };
+        if !self.entry_is_fresh(&entry) {
+            return Err(SandboxError::HostLost);
+        }
+        let backend = entry.value().backend.clone();
+        drop(entry);
+        self.sandbox_owner.insert(sandbox_id, host_id);
+        Ok((host_id, backend))
+    }
+
+    fn entry_is_fresh(&self, entry: &dashmap::mapref::one::Ref<'_, HostId, HostEntry>) -> bool {
+        let last = entry
+            .value()
+            .last_observed_heartbeat
+            .load(Ordering::Relaxed);
+        let now = now_millis();
+        let ttl_millis = self.ttl.as_millis() as i64;
+        now.saturating_sub(last) <= ttl_millis
+    }
+
+    fn is_host_lost_status(status: SessionState) -> bool {
+        matches!(
+            status,
+            SessionState::HostLost
+                | SessionState::Dead
+                | SessionState::Completed
+                | SessionState::Failed
+        )
     }
 
     fn no_host_error() -> SandboxError {
@@ -398,22 +607,22 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let backend = self.lookup(id)?;
+        let (_, backend) = self.resolve_owner(id).await?;
         backend.exec_stream(id, cmd).await
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        let backend = self.lookup(id)?;
+        let (_, backend) = self.resolve_owner(id).await?;
         backend.snapshot(id).await
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let backend = self.lookup(id)?;
+        let (_, backend) = self.resolve_owner(id).await?;
         backend.commit_snapshot(id).await
     }
 
     async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let backend = self.lookup(id)?;
+        let (_, backend) = self.resolve_owner(id).await?;
         backend.abort_snapshot(id).await
     }
 
@@ -425,7 +634,7 @@ impl HostClient for HostRegistry {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let backend = self.lookup(id)?;
+        let (_, backend) = self.resolve_owner(id).await?;
         let result = backend.destroy(id).await;
         // Drop the ownership row regardless — even if destroy errors,
         // the id is no longer routable to anything sensible. A future
@@ -441,7 +650,7 @@ impl HostClient for HostRegistry {
         agent: AgentSpec,
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
-        let backend = self.lookup(id)?;
+        let (_, backend) = self.resolve_owner(id).await?;
         backend.start_agent(id, agent, policy).await
     }
 
@@ -449,7 +658,7 @@ impl HostClient for HostRegistry {
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
-        let backend = self.lookup(policy.sandbox_id)?;
+        let (_, backend) = self.resolve_owner(policy.sandbox_id).await?;
         backend.apply_egress_policy(policy).await
     }
 
@@ -465,12 +674,12 @@ impl HostClient for HostRegistry {
     }
 
     async fn guest_ip(&self, id: SandboxId) -> Option<String> {
-        let backend = self.lookup(id).ok()?;
+        let (_, backend) = self.resolve_owner(id).await.ok()?;
         backend.guest_ip(id).await
     }
 
     async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
-        if let Ok(backend) = self.lookup(sandbox_id) {
+        if let Ok((_, backend)) = self.resolve_owner(sandbox_id).await {
             backend.bind_session(session_id, sandbox_id).await;
         }
     }
@@ -486,17 +695,17 @@ impl HostClient for HostRegistry {
     }
 
     async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError> {
-        let backend = self.lookup(sandbox_id)?;
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.send_prompt(sandbox_id, text).await
     }
 
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let backend = self.lookup(sandbox_id)?;
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.acquire_shell(sandbox_id).await
     }
 
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let backend = self.lookup(sandbox_id)?;
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.release_shell(sandbox_id).await
     }
 
@@ -504,7 +713,7 @@ impl HostClient for HostRegistry {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
-        let backend = self.lookup(sandbox_id)?;
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.proxy_shell(sandbox_id).await
     }
 
@@ -523,6 +732,245 @@ impl HostClient for HostRegistry {
 mod tests {
     use super::*;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
+    use parking_lot::Mutex as PlMutex;
+
+    /// Minimal `MetadataStore` for HostRegistry unit tests. The
+    /// existing scheduler / routing tests never trigger the M3
+    /// read-through path (the cache fast path always hits because
+    /// the host is freshly registered with a fresh
+    /// `last_observed_heartbeat`), so we only need a real impl of
+    /// `host_for_sandbox`. The M3 cache-miss tests below override
+    /// the slot with a richer entry.
+    #[derive(Default)]
+    struct StubMeta {
+        sandbox_to_session: PlMutex<std::collections::HashMap<SandboxId, (HostId, SessionState)>>,
+    }
+    #[allow(dead_code)]
+    impl StubMeta {
+        fn bind(&self, sb: SandboxId, host: HostId, status: SessionState) {
+            self.sandbox_to_session.lock().insert(sb, (host, status));
+        }
+    }
+    #[async_trait]
+    impl engram_core::traits::MetadataStore for StubMeta {
+        async fn create_session(
+            &self,
+            _: engram_core::types::session::SessionSpec,
+        ) -> Result<engram_core::SessionId, engram_core::MetaError> {
+            unreachable!("host_registry tests don't create sessions")
+        }
+        async fn create_session_created(
+            &self,
+            _: engram_core::SessionId,
+            _: engram_core::types::session::SessionSpec,
+            _: HostId,
+            _: SandboxId,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn get_session(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<engram_core::types::Session, engram_core::MetaError> {
+            Err(engram_core::MetaError::NotFound)
+        }
+        async fn list_active_sessions(
+            &self,
+        ) -> Result<Vec<engram_core::types::Session>, engram_core::MetaError> {
+            Ok(Vec::new())
+        }
+        async fn transition_session(
+            &self,
+            _: engram_core::SessionId,
+            _: SessionState,
+        ) -> Result<SessionState, engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn assign_session_host(
+            &self,
+            _: engram_core::SessionId,
+            _: Option<HostId>,
+        ) -> Result<(), engram_core::MetaError> {
+            Ok(())
+        }
+        async fn assign_session_sandbox(
+            &self,
+            _: engram_core::SessionId,
+            _: Option<SandboxId>,
+        ) -> Result<(), engram_core::MetaError> {
+            Ok(())
+        }
+        async fn host_for_sandbox(
+            &self,
+            sandbox_id: SandboxId,
+        ) -> Result<Option<(HostId, SessionState)>, engram_core::MetaError> {
+            Ok(self.sandbox_to_session.lock().get(&sandbox_id).copied())
+        }
+        async fn upsert_host(
+            &self,
+            _: engram_core::types::host::HostRecord,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn list_active_hosts(
+            &self,
+        ) -> Result<Vec<engram_core::types::host::HostRecord>, engram_core::MetaError> {
+            Ok(Vec::new())
+        }
+        async fn set_host_status(
+            &self,
+            _: HostId,
+            _: engram_core::types::host::HostStatus,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn touch_host_heartbeat(
+            &self,
+            _: HostId,
+            _: engram_core::types::host::HostStatus,
+            _: engram_core::types::host::HostCapacity,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn list_stale_hosts(
+            &self,
+            _: u64,
+        ) -> Result<Vec<engram_core::types::host::HostRecord>, engram_core::MetaError> {
+            Ok(Vec::new())
+        }
+        async fn mark_host_dead_and_orphan_sessions(
+            &self,
+            _: HostId,
+        ) -> Result<Vec<(engram_core::SessionId, SessionState)>, engram_core::MetaError> {
+            Ok(Vec::new())
+        }
+        async fn record_snapshot(
+            &self,
+            _: engram_core::types::snapshot::SnapshotRecord,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn list_snapshots_for_session(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<Vec<engram_core::types::snapshot::SnapshotRecord>, engram_core::MetaError>
+        {
+            Ok(Vec::new())
+        }
+        async fn latest_snapshot_for_session(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<Option<engram_core::types::snapshot::SnapshotRecord>, engram_core::MetaError>
+        {
+            Ok(None)
+        }
+        async fn append_session_event(
+            &self,
+            _: engram_core::SessionId,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<i64, engram_core::MetaError> {
+            Ok(0)
+        }
+        async fn list_session_events_since(
+            &self,
+            _: engram_core::SessionId,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<engram_core::types::event::PersistedEvent>, engram_core::MetaError>
+        {
+            Ok(Vec::new())
+        }
+        async fn upsert_registry_credential(
+            &self,
+            _: engram_core::types::registry::RegistryCredential,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn list_registry_credentials(
+            &self,
+        ) -> Result<Vec<engram_core::types::registry::RegistryCredential>, engram_core::MetaError>
+        {
+            Ok(Vec::new())
+        }
+        async fn registry_credential_for_host(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::registry::RegistryCredential>, engram_core::MetaError>
+        {
+            Ok(None)
+        }
+        async fn delete_registry_credential(&self, _: &str) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn upsert_harness_pack(
+            &self,
+            _: engram_core::types::registry::HarnessPack,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn list_harness_packs(
+            &self,
+        ) -> Result<Vec<engram_core::types::registry::HarnessPack>, engram_core::MetaError>
+        {
+            Ok(Vec::new())
+        }
+        async fn get_harness_pack(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::registry::HarnessPack>, engram_core::MetaError>
+        {
+            Ok(None)
+        }
+        async fn delete_harness_pack(&self, _: &str) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn upsert_enabled_image(
+            &self,
+            _: engram_core::types::registry::EnabledImage,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn list_enabled_images(
+            &self,
+        ) -> Result<Vec<engram_core::types::registry::EnabledImage>, engram_core::MetaError>
+        {
+            Ok(Vec::new())
+        }
+        async fn get_enabled_image(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::registry::EnabledImage>, engram_core::MetaError>
+        {
+            Ok(None)
+        }
+        async fn delete_enabled_image(&self, _: &str) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn upsert_session_secrets(
+            &self,
+            _: engram_core::types::registry::SessionSecrets,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn get_session_secrets(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<Option<engram_core::types::registry::SessionSecrets>, engram_core::MetaError>
+        {
+            Ok(None)
+        }
+        async fn delete_session_secrets(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+    }
+
+    fn stub_registry() -> HostRegistry {
+        HostRegistry::new(Arc::new(StubMeta::default()))
+    }
 
     fn live_spec() -> SandboxSpec {
         SandboxSpec {
@@ -548,7 +996,7 @@ mod tests {
             Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path()));
         let backend: Arc<dyn HostClient> =
             Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(raw));
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let host = HostId::new();
         reg.register(host, backend);
 
@@ -569,7 +1017,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_with_no_hosts_errors_clearly() {
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let err = reg.create(live_spec()).await.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -580,7 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_against_unknown_sandbox_id_returns_not_found() {
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let err = reg
             .exec_stream(
                 SandboxId::new(),
@@ -609,7 +1057,7 @@ mod tests {
 
     #[test]
     fn pick_for_session_prefers_host_with_target_snapshot() {
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b1, _d1) = dummy_backend();
         let (b2, _d2) = dummy_backend();
         let h_no_snap = HostId::new();
@@ -668,7 +1116,7 @@ mod tests {
 
     #[test]
     fn pick_for_session_chooses_largest_free_capacity() {
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b1, _d1) = dummy_backend();
         let (b2, _d2) = dummy_backend();
         let h_small = HostId::new();
@@ -716,7 +1164,7 @@ mod tests {
 
     #[test]
     fn pick_for_session_skips_draining_hosts() {
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b1, _d1) = dummy_backend();
         let (b2, _d2) = dummy_backend();
         let h_drain = HostId::new();
@@ -771,22 +1219,40 @@ mod tests {
         // The host then dials back in and `register`s. From that
         // point, exec/snapshot/destroy on the pre-existing sandbox_id
         // route to the right backend without going through `create`.
-        let reg = HostRegistry::new();
+        //
+        // ADR 0015 M3: routing is PG-authoritative now. The pre-
+        // restart binding lives on the `sessions` row in Postgres
+        // (that's what `repopulate_routing` reads from); the cache
+        // is a fast path, not the source of truth. We seed the stub
+        // accordingly so a host-still-missing lookup falls through
+        // to PG and surfaces HostLost, and a host-back lookup hits
+        // PG and repairs the cache.
+        let stub = Arc::new(StubMeta::default());
         let host = HostId::new();
         let sandbox = SandboxId::new();
+        stub.bind(sandbox, host, SessionState::Active);
+        let reg = HostRegistry::new(stub.clone() as Arc<dyn MetadataStore>);
 
-        // Pre-restart state: the row says sandbox X is on host Y.
+        // Pre-restart state: rebuild the in-memory cache from the
+        // PG row, mirroring what repopulate_routing does.
         reg.record_sandbox_owner(sandbox, host);
 
-        // Host hasn't dialed back yet — lookup fails because no
-        // backend is registered.
+        // Host hasn't dialed back yet — the cache fast path sees
+        // "owner not registered", falls through to PG, sees PG also
+        // says the host is the binding owner, and returns HostLost
+        // because we can't reach it.
         let err = reg
             .destroy(sandbox)
             .await
             .expect_err("no backend registered yet");
-        assert!(matches!(err, SandboxError::NotFound));
+        assert!(
+            matches!(err, SandboxError::HostLost),
+            "expected HostLost from PG read-through, got {err:?}",
+        );
 
-        // Host re-registers (same host_id). Now routing works.
+        // Host re-registers (same host_id). Now routing works: the
+        // cache fast path missed last time (we cleared the stale
+        // row), but PG repairs it on the next read.
         let dir = tempfile::tempdir().unwrap();
         let raw: Arc<dyn engram_core::traits::SandboxBackend> =
             Arc::new(engram_sandbox_process::ProcessBackend::new(dir.path()));
@@ -804,7 +1270,7 @@ mod tests {
         // First-heartbeat-not-yet-arrived case: registered host has
         // default-zero state. Scheduler still picks it as a fallback
         // so brand-new hosts can take work immediately.
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b1, _d1) = dummy_backend();
         let h = HostId::new();
         reg.register(h, b1);
@@ -828,7 +1294,7 @@ mod tests {
         // required digest in `ready_images`. The scheduler must
         // route to that host even if the other has more free RAM.
         use engram_protocol::heartbeat::ManifestDigest;
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b1, _d1) = dummy_backend();
         let (b2, _d2) = dummy_backend();
         let h_unready = HostId::new();
@@ -890,7 +1356,7 @@ mod tests {
         // The scheduler must surface `ImageNotReady` carrying the
         // missing digest, not fall back to a non-ready host.
         use engram_protocol::heartbeat::ManifestDigest;
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b1, _d1) = dummy_backend();
         let (b2, _d2) = dummy_backend();
         let h1 = HostId::new();
@@ -917,7 +1383,7 @@ mod tests {
     fn pick_for_session_no_digest_required_still_schedules_on_any_host() {
         // Restore + admin flows pass `required_image_digest = None`;
         // the readiness gate must not interfere with them.
-        let reg = HostRegistry::new();
+        let reg = stub_registry();
         let (b, _d) = dummy_backend();
         let h = HostId::new();
         reg.register(h, b);
@@ -934,5 +1400,175 @@ mod tests {
             Err(e) => panic!("expected pick to succeed, got {e:?}"),
         };
         assert_eq!(picked, h);
+    }
+
+    // ---------- ADR 0015 M3 ----------
+
+    #[tokio::test]
+    async fn invalidate_sandbox_removes_single_entry_and_returns_prior_owner() {
+        let reg = stub_registry();
+        let (b, _d) = dummy_backend();
+        let host = HostId::new();
+        reg.register(host, b);
+        let sb = SandboxId::new();
+        reg.record_sandbox_owner(sb, host);
+
+        let prev = reg.invalidate_sandbox(sb);
+        assert_eq!(prev, Some(host));
+        assert!(
+            reg.sandbox_owner.get(&sb).is_none(),
+            "the row must be gone after invalidate_sandbox",
+        );
+        // Second invalidate is a no-op (idempotent).
+        assert_eq!(reg.invalidate_sandbox(sb), None);
+    }
+
+    #[tokio::test]
+    async fn unregister_purges_every_sandbox_owner_entry_for_that_host() {
+        let reg = stub_registry();
+        let (b_a, _d_a) = dummy_backend();
+        let (b_b, _d_b) = dummy_backend();
+        let host_a = HostId::new();
+        let host_b = HostId::new();
+        reg.register(host_a, b_a);
+        reg.register(host_b, b_b);
+        let sb_a1 = SandboxId::new();
+        let sb_a2 = SandboxId::new();
+        let sb_b = SandboxId::new();
+        reg.record_sandbox_owner(sb_a1, host_a);
+        reg.record_sandbox_owner(sb_a2, host_a);
+        reg.record_sandbox_owner(sb_b, host_b);
+
+        reg.unregister(host_a);
+
+        assert!(
+            reg.sandbox_owner.get(&sb_a1).is_none(),
+            "host_a's first sandbox row must be purged",
+        );
+        assert!(
+            reg.sandbox_owner.get(&sb_a2).is_none(),
+            "host_a's second sandbox row must be purged",
+        );
+        assert_eq!(
+            reg.sandbox_owner.get(&sb_b).map(|r| *r.value()),
+            Some(host_b),
+            "host_b's row must survive",
+        );
+        assert!(!reg.contains(host_a));
+        assert!(reg.contains(host_b));
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_falls_back_to_pg_on_cache_miss() {
+        // PG knows the binding; the cache doesn't (coord restart
+        // hasn't repopulated yet). resolve_owner should consult PG,
+        // confirm the host is registered + fresh, and repair the
+        // cache.
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let sb = SandboxId::new();
+        stub.bind(sb, host, SessionState::Active);
+        let reg = HostRegistry::new(stub.clone());
+        let (b, _d) = dummy_backend();
+        reg.register(host, b);
+
+        let (resolved_host, _backend) = reg.resolve_owner(sb).await.expect("PG fallback");
+        assert_eq!(resolved_host, host);
+        assert_eq!(
+            reg.sandbox_owner.get(&sb).map(|r| *r.value()),
+            Some(host),
+            "resolve_owner must repair the cache on a successful PG hit",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_returns_host_lost_when_session_is_host_lost() {
+        // PG says the session has moved to HostLost. The registry
+        // must surface 410 (SandboxError::HostLost), not 404 — that's
+        // the whole point of M3.
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let sb = SandboxId::new();
+        stub.bind(sb, host, SessionState::HostLost);
+        let reg = HostRegistry::new(stub.clone());
+        let (b, _d) = dummy_backend();
+        reg.register(host, b);
+
+        match reg.resolve_owner(sb).await {
+            Err(SandboxError::HostLost) => {}
+            Err(e) => panic!("expected SandboxError::HostLost, got Err({e:?})"),
+            Ok(_) => panic!("expected SandboxError::HostLost, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_returns_host_lost_when_pg_host_is_unregistered() {
+        // PG returns a current owner whose host isn't in the
+        // registry — host hasn't dialled back in yet, or the
+        // registry just got purged. Either way, 410 is correct:
+        // we know who *should* serve the call and can't reach them.
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let sb = SandboxId::new();
+        stub.bind(sb, host, SessionState::Active);
+        let reg = HostRegistry::new(stub.clone());
+        // No reg.register(host, ...) — host is missing from the
+        // in-memory registry.
+
+        match reg.resolve_owner(sb).await {
+            Err(SandboxError::HostLost) => {}
+            Err(e) => panic!("expected SandboxError::HostLost, got Err({e:?})"),
+            Ok(_) => panic!("expected SandboxError::HostLost, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_returns_not_found_when_pg_has_no_row() {
+        // No row at all → genuine 404, not 410.
+        let stub = Arc::new(StubMeta::default());
+        let reg = HostRegistry::new(stub.clone());
+        let sb = SandboxId::new();
+
+        match reg.resolve_owner(sb).await {
+            Err(SandboxError::NotFound) => {}
+            Err(e) => panic!("expected SandboxError::NotFound, got Err({e:?})"),
+            Ok(_) => panic!("expected SandboxError::NotFound, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_soft_invalidates_entry_past_ttl_and_consults_pg() {
+        // Cache says host_a owns the sandbox; the host's
+        // last_observed_heartbeat is more than TTL ago. The fast
+        // path must drop to PG. In this test PG agrees with the
+        // cache and the host is still registered (and stale, but
+        // the act of `update_state` would have refreshed it; we
+        // simulate the gap manually via the test-only TTL).
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let sb = SandboxId::new();
+        stub.bind(sb, host, SessionState::Active);
+        // Sub-millisecond TTL → every read sees the entry as stale.
+        let reg = HostRegistry::new_with_ttl(
+            stub.clone() as Arc<dyn engram_core::traits::MetadataStore>,
+            Duration::from_nanos(1),
+        );
+        let (b, _d) = dummy_backend();
+        reg.register(host, b);
+        reg.record_sandbox_owner(sb, host);
+        // Wait a tick so the heartbeat timestamp is "in the past"
+        // by more than the (~1ns) TTL on a coarse-resolution clock.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        // The entry is past TTL → the fast path falls through to
+        // PG, which still returns the same host. Because the host
+        // is also past TTL, the read-through path treats it as
+        // unreachable and returns HostLost (the conservative
+        // M3 contract: "an operator-paused host cannot serve").
+        match reg.resolve_owner(sb).await {
+            Err(SandboxError::HostLost) => {}
+            Err(e) => panic!("expected SandboxError::HostLost from TTL fallback, got Err({e:?})"),
+            Ok(_) => panic!("expected SandboxError::HostLost from TTL fallback, got Ok"),
+        }
     }
 }

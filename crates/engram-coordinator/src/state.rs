@@ -361,7 +361,7 @@ impl AppState {
     /// `--mode=coordinator` should use [`AppState::new_with_registry`]
     /// to thread a registry that hosts dial into via WS.
     pub fn new(cfg: CoordinatorConfig, services: Services) -> Self {
-        let registry = Arc::new(HostRegistry::new());
+        let registry = Arc::new(HostRegistry::new(services.meta.clone()));
         registry.register(HostId::new(), services.host.clone());
         Self::new_with_registry(cfg, services, registry)
     }

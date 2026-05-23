@@ -141,7 +141,7 @@ async fn build_app_state(
         database_url: database_url.to_string(),
         ..CoordinatorConfig::default()
     };
-    let registry = Arc::new(HostRegistry::new());
+    let registry = Arc::new(HostRegistry::new(meta.clone()));
     registry.register(engram_core::HostId::new(), services.host.clone());
     let state = Arc::new(AppState::new_with_registry(cfg, services, registry));
 
