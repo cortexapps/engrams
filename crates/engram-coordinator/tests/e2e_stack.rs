@@ -428,12 +428,19 @@ async fn e2e_cold_session_claude_harness_can_exec_ls() {
 #[tokio::test]
 #[ignore = "requires ENGRAM_E2E_COORD_URL + Claude harness + real api.anthropic.com reachability"]
 async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
-    // Stub expected substring — we don't yet know exactly what
-    // Anthropic's 401 JSON looks like as it travels through Claude
-    // CLI's stream-json and into the harness's agent_message events.
-    // The first green CI run will print captured events on the
-    // RunCompletedNotOk path so we can tighten this.
-    const EXPECTED_ERROR_SUBSTR: &str = "authentication";
+    // Tightened from the iteration-1 stub after run 26338080977 showed
+    // the actual shape. Claude CLI surfaces Anthropic's 401 as an
+    // assistant-role agent_message with literal text:
+    //
+    //   "Invalid API key · Fix external API key"
+    //
+    // (the `·` is a middle dot, U+00B7; we only assert on the
+    // ASCII prefix). The harness's `run_completed.ok` is actually
+    // `true` on this path because the Claude CLI process itself
+    // exited cleanly — the auth error lives entirely in the
+    // stream-json output it printed before exit. That's why this
+    // test watches `agent_message` text, not the `ok` flag.
+    const EXPECTED_ERROR_SUBSTR: &str = "Invalid API key";
 
     let driver = Driver::from_env();
     let image = Driver::image_uri();
