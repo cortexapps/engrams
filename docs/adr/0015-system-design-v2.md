@@ -1,9 +1,84 @@
 # ADR 0015: System design v2 — abstractions, not scab fixes
 
 Status: 2026-05-22 — overall **Proposed (v2 direction)**; sections **M1
-(in-VM service unification), M5 (host-image readiness), and M2
-(SessionState machine)** Accepted + shipped. The remaining five
-sections stay Proposed pending their own implementation ADRs.
+(in-VM service unification), M5 (host-image readiness), M2
+(SessionState machine), and M3 (HostRegistry as a TTL'd cache over
+PG)** Accepted + shipped. The remaining four sections stay Proposed
+pending their own implementation ADRs.
+
+M3 commit chain (in order):
+- `6e74e71` — typed surface. `SandboxError::HostLost` joins the
+  enum in `engram-core/src/error.rs`; coord adds `ApiError::HostLost`
+  with its own `host_lost` slug (same 410 status as
+  `ApiError::Gone(_)`, but a distinct machine-readable code so
+  clients can tell "host disappeared, M4 may let you resume on a
+  peer" from "snapshot lost forever, fork instead"). The
+  `SessionState::HostLost` pre-flight in `api/snapshot.rs` switches
+  from `Gone` to `HostLost` so the slug is honest before the
+  read-through cache even runs. Host-agent's `sandbox_to_status`
+  picks up an exhaustive arm — `failed_precondition`, defensive
+  since host-agent never originates the variant.
+- `7cdc3d9` — PG-authoritative lookup.
+  `MetadataStore::host_for_sandbox(sb) -> Option<(HostId,
+  SessionState)>` lets the registry resolve "who owns this
+  sandbox right now, what state is its session in" in a single
+  round-trip. Default impl scans `list_active_sessions` for the
+  five in-crate test mocks; Postgres overrides with a single-row
+  query. Migration `0032_sessions_sandbox_id_index.sql` adds the
+  partial index `(sandbox_id) WHERE sandbox_id IS NOT NULL` —
+  M2's transition path nulls `sandbox_id` on HostLost, so the
+  partial form stays narrow as terminal rows accumulate.
+- `7f1290f` — `HostRegistry` becomes a strict read-through cache
+  over PG. New struct: holds `Arc<dyn MetadataStore>` + per-host
+  `last_observed_heartbeat: AtomicI64` + configurable TTL
+  (`ENGRAM_HOST_REGISTRY_TTL_SECS`, default 60s — under the
+  dead-host detector's 30s threshold so the TTL fires only when
+  detection itself is paused, the operator-paused case the M3
+  open question called out). Synchronous `lookup` becomes async
+  `resolve_owner`: fast path on cache hit + fresh host → return
+  immediately; slow path drops the stale row, calls
+  `host_for_sandbox`, surfaces `HostLost` for HostLost-class
+  statuses, repairs the cache for live owners whose host is
+  reachable, returns `NotFound` for rows PG doesn't know. New
+  `invalidate_sandbox(sb)` primitive for per-session
+  invalidation; refactored `unregister(host)` sweeps every
+  `sandbox_owner` row pointing at the dying host (the previous
+  "leave the row, it's cheap" comment was wrong once
+  resolve_owner started returning 410 on stale cache rows). Six
+  new unit tests cover the matrix; the existing
+  `record_sandbox_owner_lets_existing_id_route_post_restart`
+  gets updated to reflect PG-authoritative routing post-restart.
+- `ed9f889` — wire `invalidate_sandbox` into every per-session
+  HostLost transition site. `reconcile::flip_missing` invalidates
+  the cache row *before* clearing `sessions.sandbox_id` in PG
+  (drop-cache-then-DB; a racing reader either sees fresh PG
+  state or a stale-but-about-to-fail cache hit, never the worst
+  case where the cache fast path routes a post-flip exec to a
+  HostLost sandbox). `preemption_drain::drain_session` does the
+  same between `SandboxRegistry::unbind` and the best-effort
+  `destroy`. `dead_host.rs` needs no further wiring — the
+  `unregister(host)` sweep from the previous commit covers both
+  the local detector and the cross-replica `host_dead`
+  LISTEN/NOTIFY path automatically. New
+  `reconcile_invalidates_host_registry_cache_on_host_lost`
+  integration test proves selective per-sandbox invalidation
+  (the flipped sandbox's cache row is gone; the still-alive
+  sandbox's row survives).
+
+Verification at the M3 boundary:
+- `just check` clean (757/757 workspace tests, fmt + clippy).
+- The 410 contract is now end-to-end: PG knows
+  `SessionState::HostLost`, `MetadataStore::host_for_sandbox`
+  reports it, `HostRegistry::resolve_owner` returns
+  `SandboxError::HostLost`, the API mapping renders 410 with
+  the `host_lost` slug. The pre-M3 stale-cache window where the
+  same condition produced a `tcp connect error` from gRPC or a
+  generic 404 is gone.
+- The fallback TTL is lazy. There's no background sweeper —
+  staleness is checked on the read path inside `resolve_owner`,
+  so a paused host's cache entries become consistent with PG on
+  the next request, not on a timer. Matches the ADR M3 "fallback
+  TTL, not the primary mechanism" framing.
 
 M2 commit chain (in order):
 - `b0c8eca` — rename `SessionStatus` → `SessionState`; add `Created`,
@@ -192,10 +267,15 @@ but left underlying complexity in place. They form a class:
    interpreted it differently. M2 made Active a single typed state
    — set only after `start_agent` returns — with `Created` /
    `GuestReady` / `HostLost` as explicit intermediate states.
-3. **Split-brain registry vs PG.** `HostRegistry` (in-memory
-   `sandbox_id → host_id` map) and `Postgres.sessions` are both
-   sources of truth. They diverge on MIG roll until the heartbeat
-   timeout fires.
+3. **Split-brain registry vs PG** *(retired by M3).* `HostRegistry`
+   (in-memory `sandbox_id → host_id` map) and `Postgres.sessions`
+   were both sources of truth. They diverged on MIG roll until the
+   heartbeat timeout fired. M3 made PG authoritative and the
+   registry a strict read-through cache: heartbeat-loss explicitly
+   invalidates the cache; stale lookups fall through to a typed
+   `SandboxError::HostLost` → HTTP 410 instead of `tcp connect
+   error` or 404. A fallback TTL handles the operator-paused case
+   the dead-host detector doesn't trip.
 4. **Host-pinned sessions.** A session lives on one host for life.
    Host dies, session dies. Today this is policy; with snapshot/
    restore already implemented, it doesn't have to be.
@@ -264,7 +344,7 @@ Accepted and being implemented now; M2–M9 are Proposed.
 |---|---|---|
 | M1 | `GuestService` — one in-VM RPC surface, one readiness signal | **Accepted + shipped** (commits `75ba2df` / `97de278` / `0d444e9` / `4b3f890`) |
 | M2 | `SessionState` — explicit, gated state machine | **Accepted + shipped** (commits `b0c8eca` / `0d928e4` / `aa215f8` / `d69d140` / `1734cb5` / `ee3b5a8` / `42649dd`) |
-| M3 | `HostRegistry` as a TTL'd cache of PG truth | Proposed |
+| M3 | `HostRegistry` as a TTL'd cache of PG truth | **Accepted + shipped** (commits `6e74e71` / `7cdc3d9` / `7f1290f` / `ed9f889`) |
 | M4 | `Sandbox` as a content-addressed migratable value | Proposed |
 | M5 | Host-image readiness as the warm/cold contract — retire the `templates` table | **Accepted + shipped** (commits `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`) |
 | M6 | Harness events as one typed stream on `GuestService` | Proposed |
@@ -492,24 +572,107 @@ function signatures.
 
 ### M3 — `HostRegistry` as a TTL'd cache over PG
 
-**Problem.** `HostRegistry` keeps `sandbox_id → host_id` in memory;
-`Postgres.sessions` keeps the same mapping on disk. They diverge on
-MIG roll — the host vanishes, the DB row points at a dead host, the
-registry has stale entries until heartbeat-timeout fires. The
-divergent failure messages we see (`tcp connect error` from gRPC,
-`sandbox not found` after registry timeout) are this split brain.
+**Problem.** `HostRegistry` kept `sandbox_id → host_id` in memory;
+`Postgres.sessions` kept the same mapping on disk. They diverged on
+MIG roll — the host vanished, the DB row was nulled by the M2
+`HostLost` transition path, and the registry kept its stale entries
+until the dead-host detector got around to dropping the whole host
+(~30 s threshold). The divergent failure messages — `tcp connect
+error` from gRPC, generic `sandbox not found` from the registry —
+were two faces of this split brain.
 
-**Abstraction.** PG is authoritative. `HostRegistry` is a strict
-read-through cache. Heartbeat-loss explicitly invalidates the cache
-entry; subsequent RPCs against a stale ID fail-fast with a
-`SessionState::HostLost` rather than a TCP connect error. Once M2
-lands, the state machine has a clear transition: heartbeat-loss →
-SessionState becomes `HostLost`, the cache is invalidated, the next
-call gets a clean 410.
+**Abstraction (shipped).** PG is authoritative.
+`HostRegistry.sandbox_owner` is a strict read-through cache that
+holds an `Arc<dyn MetadataStore>` and calls
+`MetadataStore::host_for_sandbox(sb)` on every miss. The lookup
+helper became `async resolve_owner(sb) -> Result<(HostId, Arc<dyn
+HostClient>), SandboxError>`:
 
-**Open questions.** Cache freshness — TTL or strictly invalidate-on-
-heartbeat-loss? Probably the latter, with a fallback TTL for
-operator-paused hosts.
+- **Fast path** — cache hit + host currently registered + host's
+  `last_observed_heartbeat` is within the TTL → return the
+  backend, no DB round-trip. Steady-state shape for every
+  well-behaved RPC.
+- **Slow path** — PG returns the current owner + session status.
+  HostLost-class statuses (`HostLost` / `Dead` / `Completed` /
+  `Failed`) surface as `SandboxError::HostLost` → HTTP 410
+  (`host_lost` slug). PG-known host that isn't in the registry
+  also surfaces `HostLost` — we know who *should* serve and
+  can't reach them. PG returns nothing → genuine `NotFound`
+  → 404.
+
+**Invalidation paths.** Three sites, all flowing through the same
+M2 `HostLost` transition seam the previous milestone built:
+
+- `dead_host::evict_host_with_lock` — the refactored
+  `HostRegistry::unregister(host)` sweeps every `sandbox_owner`
+  row pointing at the dying host. The same path covers the
+  cross-replica fan-out: `pg_listener.rs` reacts to the
+  `host_dead` NOTIFY by calling `unregister` on each replica.
+- `reconcile::flip_missing` — invalidates the per-sandbox cache
+  row *before* clearing `sessions.sandbox_id`. Order matters: a
+  racing reader either gets the fresh PG state (HostLost → 410)
+  or a stale-but-about-to-fail cache hit, never the worst case
+  where the cache fast path routes a post-flip exec to a sandbox
+  PG already knows is HostLost. The reconcile pass piggybacks on
+  the `list_active_sandbox_assignments_on_host` query it already
+  issues, so no extra round-trip.
+- `preemption_drain::drain_session` — symmetric invalidation
+  between `SandboxRegistry::unbind` and the best-effort
+  `destroy`. Same reasoning: the VM is about to be reclaimed by
+  the cloud; a request arriving mid-shutdown must not get
+  routed to a destroying host.
+
+**Resolution of the open question.** The original M3 sketch asked
+"TTL or strictly invalidate-on-heartbeat-loss?" The answer
+landed both: explicit invalidation is the primary mechanism (all
+three sites above), and a lazy per-host TTL is the fallback for
+hosts that have stopped heartbeating but haven't yet been
+declared dead — operator pause, in-flight network partition, or
+a paused dead-host detector. The TTL check lives inside
+`resolve_owner` (no background sweeper); a host whose
+`last_observed_heartbeat` is older than the configurable horizon
+(`ENGRAM_HOST_REGISTRY_TTL_SECS`, default 60s) is treated as
+unreachable on the next read. Default is intentionally over 2×
+the 5s heartbeat cadence and under the 30s dead-host threshold,
+so the TTL only fires when detection itself is paused.
+
+**Decision on the registry shape.** `Arc<dyn MetadataStore>` lives
+on the struct itself, not threaded through every call site. Every
+`HostClient` impl method on `HostRegistry` already takes `&self`;
+making `lookup` async + holding the store is a strictly local
+change. The alternative — a separate `RoutingStore` wrapper that
+the API layer holds alongside the registry — would have splintered
+the routing surface across two types for no win.
+
+**What it deleted.**
+
+- The "leave the stale `sandbox_owner` row, it's cheap" comment
+  on `unregister`. It wasn't cheap once `resolve_owner` started
+  returning 410 on the basis of "cache says known-owner, owner
+  is gone".
+- The implicit assumption that `SandboxError::NotFound` covered
+  every "couldn't reach the sandbox" case. `HostLost` is now its
+  own typed branch with its own HTTP status and slug.
+
+**What it added.**
+
+- `SandboxError::HostLost` + `ApiError::HostLost(String)` with the
+  `host_lost` slug (distinct from the existing
+  `snapshot_invalidated` slug for snapshot-Dead cases).
+- `MetadataStore::host_for_sandbox(sb) -> Option<(HostId,
+  SessionState)>` — trait + Postgres impl + default for mocks.
+- Migration `0032_sessions_sandbox_id_index.sql` — partial index
+  `(sandbox_id) WHERE sandbox_id IS NOT NULL` for the per-miss
+  lookup.
+- Per-host `last_observed_heartbeat: AtomicI64` on `HostEntry`,
+  bumped from `register` and `update_state` (the heartbeat
+  handler's existing entry point).
+- `HostRegistry::invalidate_sandbox(sb) -> Option<HostId>` — the
+  per-session primitive the three transition sites call. Returns
+  the prior owner for logging; idempotent on a missing row.
+- `HostRegistry::new_with_ttl(meta, ttl)` (`#[cfg(test)]`) — lets
+  the TTL fallback test exercise a sub-millisecond horizon
+  without sleeping in CI.
 
 ---
 
@@ -896,15 +1059,22 @@ not exist.
   `ee3b5a8` / `42649dd`. Unblocks M3 (cache invalidation hooks
   into the existing `HostLost` transition) and M4 (session
   migration becomes `HostLost → Created` on a peer).
-- **Phase 4 (cold-boot floor):** vmlinux slim-down + engram-init/
+- **Phase 4 (shipped 2026-05-23):** **M3 — `HostRegistry` as a
+  TTL'd read-through cache over PG.** PG becomes authoritative
+  for sandbox-owner routing; the in-memory cache invalidates on
+  the M2 `HostLost` transition; stale lookups surface
+  `SandboxError::HostLost` → HTTP 410 instead of `tcp connect
+  error` or 404. Four-commit chain `6e74e71` / `7cdc3d9` /
+  `7f1290f` / `ed9f889`. Unblocks M4 (session migration is now a
+  `HostLost → Created` transition on a peer host — the seam M2
+  introduced is now invalidation-clean on both sides).
+- **Phase 5 (cold-boot floor):** vmlinux slim-down + engram-init/
   agentd cold-start tuning. Not in this ADR — separate milestones
   layered on M5. Targets ~700–800 ms cold-boot.
-- **Phase 5 (warm pool, take 2):** Host-local runtime snapshot
+- **Phase 6 (warm pool, take 2):** Host-local runtime snapshot
   generation, layered on the post-M5 storage model. Sub-1 s TTFM
-  via warm lease; cold-create falls back to the Phase 4 floor on
+  via warm lease; cold-create falls back to the Phase 5 floor on
   miss. CPU-vendor issue dissolved by construction.
-- **Phase 6 (session lifecycle, remaining):** M3 (HostRegistry TTL
-  cache invalidating on the M2 `HostLost` transition).
 - **Phase 7 (large refactors):** M4 (session migration), M6
   (unified harness stream), M7 (DriveResolver). Each is its own
   ADR + multi-PR effort. Sequencing depends on which bugs surface
@@ -914,4 +1084,4 @@ not exist.
 
 Each phase ships its own implementation ADR. This document is the
 v2 direction summary, not the implementation plan for any single
-move beyond M1, M2, and M5.
+move beyond M1, M2, M3, and M5.
