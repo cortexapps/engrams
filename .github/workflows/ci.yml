@@ -22,13 +22,13 @@ name: CI
 #                       snapshot, snapshot_uffd, exec_real_vm,
 #                       harness_loopback, multi_restore,
 #                       option_d_latency_bench, cross_host_restore.
-#                       ADR 0007 set:
-#                       canonical_capture (bake-time memory capture)
-#                       and nbd_chunked_disk (Linux + nbd, gated — see
-#                       the step). Root set under sudo for iptables +
-#                       TAP + loop mounts: host_startup, proxy_e2e,
-#                       snapshot_net, patch_drive_swap,
-#                       option_d_warm_lease.
+#                       ADR 0007 set: nbd_chunked_disk (Linux + nbd,
+#                       gated — see the step). (canonical_capture was
+#                       retired by ADR 0015 M5, `18be1ad`, when the
+#                       bake-time memory-snapshot path was removed.)
+#                       Root set under sudo for iptables + TAP + loop
+#                       mounts: host_startup, proxy_e2e, snapshot_net,
+#                       patch_drive_swap, option_d_warm_lease.
 #   - web:              pnpm install + tsc + vite build + vitest
 #
 # All jobs run on Blacksmith Linux runners
@@ -483,21 +483,6 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test nbd_chunked_disk \
-            --run-ignored ignored-only \
-            --no-fail-fast \
-            --test-threads=1
-
-      # ADR 0007 Phase 5 (slice 2): the image-builder boots the
-      # just-built rootfs once at bake time + chunks `memory.bin`
-      # into the chunk store, producing the canonical-base memory
-      # manifest that lets sessions of this image share canonical
-      # pages via the host page cache (MAP_PRIVATE + UFFD).
-      # Requires the same KVM + FC setup as the rest of this lane.
-      - name: Bake-time canonical memory capture (Linux + KVM + FC)
-        run: |
-          cargo nextest run \
-            -p engram-image-builder \
-            --test canonical_capture \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
