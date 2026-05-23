@@ -1826,7 +1826,7 @@ impl PooledBackend {
         // `ChunkedDiskBackend.state` so this is one cheap lookup
         // server-side.
         let (base_chunks, base_chunks_local) = if let Some(cache) = self.chunk_cache.as_ref() {
-            match self.chunk_store.as_ref().map(|s| s.clone()) {
+            match self.chunk_store.clone() {
                 Some(store) => match store.get_manifest(disk_manifest).await {
                     Ok(manifest) => {
                         let mut local = 0u32;
