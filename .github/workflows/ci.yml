@@ -802,10 +802,13 @@ jobs:
   # Firecracker; bakes the demo image locally; pulls the published
   # Claude harness pack; runs the three flows in `e2e_stack.rs`.
   #
-  # DAG dep on all the cheap gates so a fmt-broken or unit-broken
-  # PR doesn't burn 5min spinning up the stack just to fail. Runs
-  # in parallel with `bake-images.yml` so total OSS CI wall-clock
-  # stays bounded by `test-firecracker`.
+  # DAG dep on the cheap gates only (lint, test-linux, web,
+  # cross-musl-linux) plus the artifacts producer. `test-firecracker`
+  # is intentionally NOT in `needs:` — it tests the host-agent's
+  # PooledBackend in isolation; this lane tests the coord HTTP →
+  # gRPC → host-agent path. Orthogonal coverage; running them in
+  # parallel saves ~6min on the critical path on push-to-main and a
+  # flaky `proxy_e2e` doesn't suppress e2e-stack signal.
   # ------------------------------------------------------------------
   test-e2e-stack:
     name: e2e stack (coord HTTP → gRPC → FC)
@@ -814,7 +817,6 @@ jobs:
       - test-linux
       - web
       - cross-musl-linux
-      - test-firecracker
       - artifacts-e2e-stack
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
