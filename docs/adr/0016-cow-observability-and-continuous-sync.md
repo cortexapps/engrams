@@ -14,6 +14,11 @@ M1.x annotations and ADR 0015's per-milestone commit lists):
   types + trait + gRPC + PooledBackend impl, absorbed the planned
   commit 2), `285adf0` (coord endpoints + 1s-TTL cache), `7324baa`
   (web app integration). **Shipped 2026-05-23.**
+- **Phase A.1** — prod follow-ups surfaced by the COW diagnostic
+  during a spot-check on session `96392fd3-…` (2026-05-23). Four
+  separate code paths, one TF cleanup. Each its own commit; see
+  §"Phase A.1 follow-ups" below for the catalog and proposed fixes.
+  _(in flight)_
 - **Phase B** — continuous disk sync (5 commits + ADR update). _(pending)_
 - **Phase C** — chunk-GC pin-set redesign (6 commits + ADR final pass). _(pending)_
 
@@ -114,6 +119,175 @@ know about. The final commit at the end of Phase C flips the status to
   ends up gRPC. If it ends up HTTP (per the ADR's "open
   questions"), the host→coord channel that heartbeats already use
   is the natural fit — no new auth surface.
+
+---
+
+## Phase A.1 follow-ups (2026-05-23)
+
+Phase A's COW diagnostic, opened in prod against session
+`96392fd3-1d31-468c-b8db-5f9b125226db`, surfaced four real bugs
+that have nothing structurally to do with Phase A but were
+**invisible until the diagnostic surface existed**. This is exactly
+the kind of payoff the observability work was meant to enable — so
+catching them here, scoping them as Phase A.1, and fixing them
+in-session before Phase B is the right shape. Each is its own
+commit; sequencing chosen so observability work lands first and
+makes the rest easier to diagnose.
+
+The session was created on `engrams-fc-3drl` at 22:37:17 and showed
+"flush 2s ago" in the web UI even though no `snapshots` row was ever
+recorded in PG for that session. Pulling the thread led to all four
+of the items below.
+
+### Fix order
+
+1. **Observability first** — add `tracing::info!` at the top of
+   `idle_evictor::evict_idle_session` and at the host-pushed
+   candidate handler. Today neither logs entry; the silence let
+   Issues 2/4 hide for an unknown duration. Smallest change, gives
+   us data for the rest.
+2. **VM-not-resumed-after-failed-snapshot** — the user-facing one.
+   A second prompt to the session at 22:40:03 never produced a
+   `run_started` event. Hypothesis traced below.
+3. **idle-eviction transport error vs heartbeat success** — both
+   POSTs use the same `reqwest::Client`; only one fails. With
+   the new logs from Step 1 we'll know whether coord receives the
+   eviction POST partially or not at all.
+4. **`ws://` scheme in fc-host-mig TF** — pure tech-debt
+   alignment. Lowest blast radius; do last.
+
+### A.1.1 — silent `evict_idle_session` (observability gap)
+
+**Evidence**: 3 `chunked NBD disk flushed` lines on the host
+between 22:38:45 and 22:39:44. Each flush is only emitted from
+`PooledBackend::snapshot`, which means coord called
+`host.snapshot()` three times. But coord pod
+`engrams-coordinator-5c5ff978bf-r6lvp` shows zero log lines for
+this session between 22:37:09 and 22:46:40 — no
+`evict_idle_session`, no `host-pushed idle eviction failed`, no
+gRPC dispatch trace.
+
+**Root cause**: `crates/engram-coordinator/src/idle_evictor.rs:32`'s
+`evict_idle_session` has no entry-level log. The downstream `Err`
+arm in `api/host_http.rs:447-455` logs a WARN on failure, but
+nothing logs on entry or on success — so a coord that's snapshotting
+periodically without recording PG rows is structurally invisible.
+
+**Fix**: add a `tracing::info!(session_id, sandbox_id, "idle eviction
+pipeline started")` at the top of `evict_idle_session`, and a
+matching `tracing::info!` at the success completion. The shape
+mirrors the existing logs in `host_http::idle_eviction_candidates`
+post-call. ~5 lines of code; no behaviour change.
+
+### A.1.2 — VM not resumed after failed inner snapshot
+
+**Evidence**: PG events for the session:
+
+```
+22:38:09 harness_idle
+22:40:03 agent_message (role=user) — user's second prompt
+   — no run_started, no agent_message follow-up —
+22:44:13 (host log) agentd reports ttyd ready  ← user opened shell
+22:46:40 (coord log) shell proxy bridge ended  ← user gave up
+```
+
+The user's second prompt landed on coord at 22:40:03,
+`POST /sessions/:id/prompt` succeeded (the user-role
+`agent_message` event was emitted, which is the side effect at the
+end of `api/prompt.rs::prompt`), but the harness never started a
+new run. Meanwhile agentd was responsive (it reported `ttyd ready`
+at 22:44:13), so the VM itself is alive.
+
+**Hypothesis**: in `PooledBackend::snapshot`
+(`crates/engram-host-agent/src/pooled_backend.rs:1316`),
+`self.inner.snapshot(id).await?` (line 1380) calls FC's
+pause + capture + resume. If the *capture* fails after the *pause*,
+the error path at lines 1494-1502 does `rm -rf dest` to clean up the
+4 GiB orphan dir but **does not explicitly resume the FC VM**. If
+FC's snapshot wrapper left the VM paused on error, agentd
+continues running (its control vsock survives), but the harness
+adapter's vsock-to-agentd channel may have desync'd during the
+pause cycle. Subsequent prompts write to the host-side vsock UDS
+but the in-guest reader is in an inconsistent state.
+
+**Fix**: in `crates/engram-sandbox-firecracker/`'s `snapshot()`
+error paths, audit every branch that pauses the VM and ensure each
+failure path explicitly calls `vm.resume()` (or equivalent) before
+returning `Err`. Reuse the existing FC paused-state primitive;
+this is "every exit through resume" hygiene. Likely a 10-20 line
+diff plus a unit test that asserts the VM is unpaused after a
+mocked-failing capture.
+
+### A.1.3 — idle-eviction POST transport error vs heartbeat success
+
+**Evidence**: heartbeat (`POST /api/hosts/:id/heartbeat`) succeeds
+— PG `hosts.last_heartbeat_at` is fresh. idle-eviction
+(`POST /api/hosts/:id/idle-eviction-candidates`) on the *same*
+`CoordClient` instance fails every time with:
+
+```
+transport error: error sending request for url
+  (http://10.10.0.2:8080/.../idle-eviction-candidates)
+```
+
+A manual curl from the same host with the same bearer token to
+the same URL returns 200. The bug is somewhere in how reqwest's
+HTTP/2 connection pool reuses connections across multiple
+request paths.
+
+**Hypothesis**: `coord_client.rs:46-56` uses
+`pool_idle_timeout(90s)` on a shared `reqwest::Client`. Coord pods
+roll on every push (helm-deploy from CI); the internal LB
+(`10.10.0.2`) is stable but the back-end pod IP changes per roll.
+A pooled H2 connection bound to a now-gone pod can fail when
+reused. Heartbeat fires every 5s, gets reset/re-establishes
+quickly; idle-eviction fires less often and is more likely to draw
+a stale connection.
+
+Open question: why is heartbeat resilient and eviction not? Same
+client, same pool. Maybe heartbeat's smaller payload hits a happy
+path; maybe reqwest's connection reuse policy plays differently
+with the two URLs.
+
+**Fix (proposed)**: add `pool_max_idle_per_host(0)` for the
+eviction-only path, OR add `pool_idle_timeout(Duration::ZERO)` to
+the shared client globally. Cheap, lossy on H2 multiplexing but
+right answer until we understand the root cause. The richer fix is
+a code-level investigation into reqwest's stale-connection
+detection on H2.
+
+A.1.1's new logs will tell us whether coord ever receives these
+POSTs partially — that disambiguates "TCP stuck" from "request
+sent, response lost."
+
+### A.1.4 — `ws://` scheme in fc-host-mig TF
+
+**Evidence**: `engrams-internal/modules/engrams/main.tf:125`:
+
+```hcl
+coordinator_endpoint = "ws://${google_compute_address.coord_internal.address}:${local.coordinator_port}"
+```
+
+…written to `/etc/engram/host-agent.env` as
+`ENGRAM_COORDINATOR_ENDPOINT=ws://10.10.0.2:8080`. The host-agent's
+`coord_client.rs::trim_ws_suffix` rewrites `ws://` → `http://` for
+reqwest (which rejects WS schemes outright), so this *works* — but
+it's pre-ADR-0013 framing in a post-ADR-0013 world. The variable
+description (`engrams/deploy/terraform/gcp/modules/fc-host-mig/variables.tf:87`)
+still says "ws:// or wss:// URL the host-agent dials. Internal LB
+or service mesh entry; never the public ingress."
+
+**Fix**: change the OSS variable to `http_endpoint` or
+`coordinator_url` (both schemes carry meaning; pick whichever
+matches the actual transport), update the description to "http://
+or https:// URL", and update the engrams-internal caller to pass
+`http://${ip}:${port}`. Drop the `trim_ws_suffix` helper from
+host-agent's `coord_client.rs` once both repos are updated — it's a
+backward-compat shim with no other users now.
+
+This is two repos: engrams (OSS) for the variable + helper
+deletion, engrams-internal for the caller. Coordinate the change so
+neither side ships ahead of the other.
 
 ---
 

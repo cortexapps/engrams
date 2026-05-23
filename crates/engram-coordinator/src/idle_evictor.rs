@@ -34,14 +34,27 @@ pub async fn evict_idle_session(
     session_id: SessionId,
     sandbox_id: SandboxId,
 ) -> Result<(), EvictError> {
+    // ADR 0016 A.1.1: entry log. Was silent before — a coord pod
+    // running the pipeline repeatedly (e.g. retry storm, post-roll
+    // race) showed up only as host-side `chunked NBD disk flushed`
+    // lines with no coord-side counterpart, making the snapshot
+    // source impossible to attribute. Pair this with the
+    // "completed"/"skipping" logs below and the per-step warn arms
+    // so the full pipeline is auditable end-to-end.
+    tracing::info!(
+        session_id = %session_id,
+        sandbox_id = %sandbox_id,
+        "idle eviction pipeline started",
+    );
+
     // Guard: if the registry doesn't think this sandbox is bound to
     // the session anymore, the session was already evicted by some
     // other path (operator, dead-host detector). No-op cleanly.
     if state.registry.get(session_id) != Some(sandbox_id) {
-        tracing::debug!(
+        tracing::info!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
-            "idle eviction: sandbox no longer bound; skipping",
+            "idle eviction skipped: sandbox no longer bound",
         );
         return Ok(());
     }
@@ -184,6 +197,16 @@ pub async fn evict_idle_session(
              (host-side in-flight tracking may be stale until next retry overwrites)",
         );
     }
+
+    // ADR 0016 A.1.1: success log. Pairs with the entry log so a
+    // pipeline that flushes (host log) without committing (no PG
+    // row) shows up as an unmatched start/end pair in a grep.
+    tracing::info!(
+        session_id = %session_id,
+        sandbox_id = %sandbox_id,
+        snapshot_id = %metadata.id,
+        "idle eviction pipeline completed",
+    );
 
     Ok(())
 }
