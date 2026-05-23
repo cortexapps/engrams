@@ -13,10 +13,12 @@
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::Utc;
+use engram_core::types::SessionState;
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::cow_state::{fetch_for_host, CowStateView};
 use crate::error::ApiError;
 use crate::state::SharedState;
 
@@ -74,6 +76,85 @@ pub async fn log(
             "unknown kind `{other}` — only `conversation` is supported"
         ))),
     }
+}
+
+#[derive(Serialize)]
+pub struct SessionCowStateResponse {
+    pub session_id: SessionId,
+    /// Diagnostic for the session's currently-bound sandbox, or
+    /// `None` if the session has no live sandbox (Idle, HostLost,
+    /// Pending, terminal). The `tier` field on the embedded view
+    /// can still be useful for terminal/idle sessions because the
+    /// memory-tier fields project from the PG snapshot row even
+    /// when the disk-tier live data is absent. We don't bother
+    /// rendering that here for simplicity — clients see `None`
+    /// and know to read the (eventual) snapshot-row endpoint
+    /// instead.
+    pub state: Option<CowStateView>,
+}
+
+/// `GET /sessions/:id/cow-state`. ADR 0016 Phase A. Returns the
+/// per-session diagnostic projection for the currently-bound
+/// sandbox, fanned out through the per-host cache (so the web
+/// app's per-session polling doesn't storm the host).
+pub async fn cow_state(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+) -> Result<Json<SessionCowStateResponse>, ApiError> {
+    let session = state.services.meta.get_session(id).await?;
+    let (host_id, sandbox_id) = match (session.host_id, session.sandbox_id, session.status) {
+        (Some(h), Some(sb), SessionState::Active | SessionState::Created | SessionState::GuestReady) => {
+            (h, sb)
+        }
+        _ => {
+            // No live sandbox for this session (Idle, HostLost,
+            // terminal, or still Pending). Return a payload that
+            // says so without a host RPC.
+            return Ok(Json(SessionCowStateResponse {
+                session_id: id,
+                state: None,
+            }));
+        }
+    };
+    let backend = state
+        .host_registry
+        .backend_of(host_id)
+        .ok_or_else(|| ApiError::HostLost(format!(
+            "session {id} bound to host {host_id} which is no longer registered"
+        )))?;
+    let records = fetch_for_host(&state.cow_state_cache, host_id, backend)
+        .await
+        .map_err(ApiError::from)?;
+    let Some(record) = records.into_iter().find(|r| r.sandbox_id == sandbox_id) else {
+        // Host doesn't know this sandbox (transient mid-create, or
+        // it's a non-chunk-tracked backend on this host). Render as
+        // `None`; client interprets as "no live disk-tier data".
+        return Ok(Json(SessionCowStateResponse {
+            session_id: id,
+            state: None,
+        }));
+    };
+    // Memory-tier enrichment from the session's latest snapshot
+    // row. Same shape as the per-host handler.
+    let (memory_manifest, last_snapshot_at) = match state
+        .services
+        .meta
+        .latest_snapshot_for_session(id)
+        .await
+    {
+        Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
+        Ok(None) => (None, None),
+        Err(_) => (None, None),
+    };
+    Ok(Json(SessionCowStateResponse {
+        session_id: id,
+        state: Some(CowStateView::from_record(
+            &record,
+            Some(id),
+            memory_manifest,
+            last_snapshot_at,
+        )),
+    }))
 }
 
 #[cfg(test)]

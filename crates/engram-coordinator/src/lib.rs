@@ -12,6 +12,7 @@ use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, 
 pub mod api;
 pub mod blob;
 pub mod config;
+pub mod cow_state;
 pub mod dead_host;
 pub mod error;
 pub mod harness_paths;

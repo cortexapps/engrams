@@ -349,6 +349,11 @@ pub struct AppState {
     /// counter and the policy knob (`grace_ticks`). Invoked on
     /// every inbound `NotifyKind::Heartbeat` in `api/hosts.rs`.
     pub reconciler: crate::reconcile::Reconciler,
+    /// ADR 0016 Phase A: per-host COW diagnostic cache. The
+    /// `GET /api/{hosts,sessions}/:id/cow-state` handlers route
+    /// through this to avoid storming the host on web-app polling.
+    /// 1s TTL; cache eviction on host unregister.
+    pub cow_state_cache: Arc<crate::cow_state::CowStateCache>,
 }
 
 impl AppState {
@@ -389,6 +394,7 @@ impl AppState {
             harness_hub,
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
+            cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
         }
     }
 

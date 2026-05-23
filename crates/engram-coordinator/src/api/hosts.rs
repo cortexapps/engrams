@@ -10,6 +10,8 @@
 //! - `GET /api/hosts/:id` — one host's view.
 //! - `POST /api/hosts/:id/drain` — flip the row + scheduler view
 //!   to Draining so the scheduler stops picking it.
+//! - `GET /api/hosts/:id/cow-state` — ADR 0016 Phase A: per-sandbox
+//!   COW diagnostic for every chunk-tracked sandbox on this host.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -19,6 +21,7 @@ use engram_core::types::host::HostStatus;
 use engram_core::HostId;
 use serde::Serialize;
 
+use crate::cow_state::{fetch_for_host, CowStateView};
 use crate::error::ApiError;
 use crate::state::SharedState;
 
@@ -49,6 +52,99 @@ pub async fn get(
         .ok_or_else(|| ApiError::NotFound("host not found".into()))?;
     let live = state.host_registry.snapshot_state(host_id);
     Ok(Json(HostView::from_row_and_live(row, live)))
+}
+
+/// `GET /api/hosts/:id/cow-state`. ADR 0016 Phase A. Returns one
+/// row per chunk-tracked sandbox on the host — each enriched with
+/// its session_id (joined from `sessions.host_for_sandbox`) so the
+/// web app can pivot the same payload by host or by session.
+/// Backed by [`crate::cow_state::CowStateCache`] (1s TTL) so the
+/// web app's 1-2s polling doesn't fan out to the host on every
+/// request.
+pub async fn cow_state(
+    State(state): State<SharedState>,
+    Path(host_id): Path<HostId>,
+) -> Result<Json<HostCowStateResponse>, ApiError> {
+    let backend = state
+        .host_registry
+        .backend_of(host_id)
+        .ok_or_else(|| ApiError::NotFound("host not registered".into()))?;
+    let records = fetch_for_host(&state.cow_state_cache, host_id, backend)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Build a `sandbox_id → session_id` map for this host once via
+    // the M3-era `list_active_sandbox_assignments_on_host` query
+    // (already indexed on `(host_id, status)` per its docstring),
+    // then iterate the host's per-sandbox records. One PG round
+    // trip + one PG snapshot lookup per session — bounded by N
+    // sandboxes/host (tens, typical), not N total sessions.
+    let assignments = state
+        .services
+        .meta
+        .list_active_sandbox_assignments_on_host(host_id)
+        .await
+        .map_err(ApiError::from)?;
+    let session_for: std::collections::HashMap<engram_core::SandboxId, engram_core::SessionId> =
+        assignments
+            .into_iter()
+            .map(|(sid, sb)| (sb, sid))
+            .collect();
+
+    let mut sessions = Vec::with_capacity(records.len());
+    for record in records {
+        let session_id = session_for.get(&record.sandbox_id).copied();
+        // Memory-tier enrichment: project the session's latest
+        // snapshot row into `memory_manifest` + `last_snapshot_at`.
+        // No snapshot → `CowStateView` falls back to the host's
+        // `last_snapshot_unix_ms` (often also `0`, rendered as
+        // "never" by the consumer).
+        let (memory_manifest, last_snapshot_at) = match session_id {
+            Some(sid) => enrichment_for_session(&state, sid).await,
+            None => (None, None),
+        };
+        sessions.push(CowStateView::from_record(
+            &record,
+            session_id,
+            memory_manifest,
+            last_snapshot_at,
+        ));
+    }
+    Ok(Json(HostCowStateResponse {
+        host_id,
+        sessions,
+    }))
+}
+
+/// Memory-tier enrichment: project the session's latest snapshot row
+/// into the diagnostic view's `memory_manifest` +
+/// `last_snapshot_at` fields. Returns `(None, None)` when the
+/// session has never been snapshotted — `CowStateView` falls back to
+/// the host's in-memory `last_snapshot_unix_ms` in that case.
+async fn enrichment_for_session(
+    state: &SharedState,
+    session_id: engram_core::SessionId,
+) -> (
+    Option<engram_core::types::manifest::ManifestRef>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
+    match state
+        .services
+        .meta
+        .latest_snapshot_for_session(session_id)
+        .await
+    {
+        Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            tracing::debug!(
+                %session_id,
+                error = %e,
+                "cow-state enrichment: snapshot lookup failed; rendering without memory tier",
+            );
+            (None, None)
+        }
+    }
 }
 
 /// `POST /api/hosts/:id/drain`. Flips both the Postgres row and the
@@ -147,4 +243,14 @@ impl HostView {
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }
+}
+
+/// `GET /api/hosts/:id/cow-state` response shape (ADR 0016 Phase A).
+#[derive(Serialize)]
+pub struct HostCowStateResponse {
+    pub host_id: HostId,
+    /// One entry per chunk-tracked sandbox on this host. Sandboxes
+    /// without a chunk view (Process backend, VZ-without-NBD) are
+    /// omitted by the host-agent — they don't appear here either.
+    pub sessions: Vec<CowStateView>,
 }
