@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           # Three filters drive the downstream fan-out into
           # engrams-internal:
@@ -143,7 +143,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -152,7 +152,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Derive tags
         id: tags
@@ -173,7 +173,7 @@ jobs:
           { echo 'list<<EOF'; cat /tmp/tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Build + push ${{ matrix.image }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/${{ matrix.image }}.Dockerfile
