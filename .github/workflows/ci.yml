@@ -858,6 +858,11 @@ jobs:
       # nextest is what every other test step in this workflow uses.
       - uses: taiki-e/install-action@nextest
 
+      # `integration-up.sh` calls `just bootstrap` to seed the KEK
+      # env. Blacksmith runners don't ship `just` (it's only required
+      # by this lane; the other CI jobs hit cargo directly).
+      - uses: taiki-e/install-action@just
+
       - uses: arduino/setup-protoc@v3
         with:
           # Pin per the engrams-internal flake-reduction learning: the
