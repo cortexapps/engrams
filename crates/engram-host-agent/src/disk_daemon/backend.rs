@@ -23,6 +23,7 @@
 //! of fresh writes between snapshots; that's six dirty chunks.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -168,6 +169,12 @@ pub struct ChunkedDiskBackend {
     /// `chunk_idx -> dirty bytes`. Locked together so a concurrent
     /// read + write of the same chunk doesn't see torn state.
     dirty: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
+    /// Unix-millis timestamp of the last successful `flush()`
+    /// completion. `0` = never flushed since construction (the
+    /// sentinel the diagnostic surface renders as "never").
+    /// Read lock-free for the COW state RPC; written at the tail of
+    /// `flush()` after the new manifest is durably published.
+    last_flush_unix_ms: Arc<AtomicI64>,
 }
 
 struct BackendState {
@@ -199,6 +206,7 @@ impl ChunkedDiskBackend {
             cache,
             store,
             dirty: Arc::new(Mutex::new(HashMap::new())),
+            last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -220,6 +228,7 @@ impl ChunkedDiskBackend {
             cache,
             store,
             dirty: Arc::new(Mutex::new(HashMap::new())),
+            last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -243,6 +252,37 @@ impl ChunkedDiskBackend {
     /// guards.
     pub async fn manifest_ref(&self) -> ManifestRef {
         self.state.lock().await.manifest_ref
+    }
+
+    /// Number of dirty chunks currently buffered in RAM. ADR 0016
+    /// COW diagnostic — read by `PooledBackend::cow_state` for the
+    /// per-session/per-host endpoint. Locks `dirty` briefly; cheap
+    /// since the map is small (<< 1024 entries in realistic
+    /// workloads per the module docstring's analysis).
+    pub async fn dirty_chunks_count(&self) -> usize {
+        self.dirty.lock().await.len()
+    }
+
+    /// Total bytes resident in the dirty buffer. Sum of the
+    /// per-chunk vec lengths under the same lock as
+    /// [`Self::dirty_chunks_count`]. Used by the COW diagnostic AND
+    /// (Phase B) the flush-scheduler threshold check.
+    pub async fn dirty_bytes(&self) -> u64 {
+        self.dirty
+            .lock()
+            .await
+            .values()
+            .map(|v| v.len() as u64)
+            .sum()
+    }
+
+    /// Unix-millis timestamp of the most recent successful `flush()`
+    /// completion (any outcome, including zero-chunk flushes — the
+    /// signal is "we last verified durability at time T", not "we
+    /// last had something to flush"). `0` if `flush()` has never
+    /// completed since construction. Lock-free read via `Acquire`.
+    pub fn last_flush_unix_ms(&self) -> i64 {
+        self.last_flush_unix_ms.load(Ordering::Acquire)
     }
 
     /// Read `length` bytes from `offset`. Fans out across chunk
@@ -332,11 +372,13 @@ impl ChunkedDiskBackend {
         let mut dirty_guard = self.dirty.lock().await;
         let chunk_size = self.chunk_size;
         if dirty_guard.is_empty() {
-            return Ok(DiskFlushOutcome {
+            let out = DiskFlushOutcome {
                 manifest_ref: self.state.lock().await.manifest_ref,
                 chunks_flushed: 0,
                 bytes_uploaded: 0,
-            });
+            };
+            self.stamp_flush_completion();
+            return Ok(out);
         }
         let mut new_chunks: Vec<(usize, ChunkHash, u64)> = Vec::new();
         // Drain into a Vec so we can release the lock while
@@ -469,12 +511,27 @@ impl ChunkedDiskBackend {
             }
         }
         state.manifest_ref = new_ref;
+        drop(state);
+
+        self.stamp_flush_completion();
 
         Ok(DiskFlushOutcome {
             manifest_ref: new_ref,
             chunks_flushed: new_chunks.len(),
             bytes_uploaded,
         })
+    }
+
+    /// Stamp `last_flush_unix_ms` at flush completion. Helper so the
+    /// no-dirty-shortcut and the full flush path both record the
+    /// same signal: "we completed a flush at time T". ADR 0016 Phase
+    /// A — diagnostic for `cow_state`.
+    fn stamp_flush_completion(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.last_flush_unix_ms.store(now_ms, Ordering::Release);
     }
 
     /// Fetch a chunk's bytes — from the dirty buffer if present,
@@ -950,5 +1007,84 @@ mod tests {
             .await
             .expect("multi-level race must still converge");
         assert_eq!(outcome.manifest_ref.version, 4, "must land on v4");
+    }
+
+    // -- ADR 0016 Phase A: COW diagnostic accessors -------------------
+
+    #[tokio::test]
+    async fn dirty_chunks_count_zero_on_fresh_backend() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _, _dir) = build_backend(&manifest).await;
+        assert_eq!(backend.dirty_chunks_count().await, 0);
+        assert_eq!(backend.dirty_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn dirty_counters_track_writes_and_clear_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64 * 3;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+
+        backend.write(0, &[0xcc; 16]).await.unwrap();
+        // Touching one chunk materialises it whole — `dirty_bytes`
+        // counts the full chunk buffer, not just the patched range.
+        assert_eq!(backend.dirty_chunks_count().await, 1);
+        assert_eq!(backend.dirty_bytes().await, chunk_size);
+
+        // Second chunk via a write that lands inside chunk 1.
+        backend.write(chunk_size, &[0xdd; 8]).await.unwrap();
+        assert_eq!(backend.dirty_chunks_count().await, 2);
+        assert_eq!(backend.dirty_bytes().await, chunk_size * 2);
+
+        let _ = backend.flush().await.unwrap();
+        assert_eq!(backend.dirty_chunks_count().await, 0);
+        assert_eq!(backend.dirty_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn last_flush_unix_ms_is_zero_until_first_flush() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _, _dir) = build_backend(&manifest).await;
+        assert_eq!(
+            backend.last_flush_unix_ms(),
+            0,
+            "sentinel for 'never flushed'"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_flush_unix_ms_bumps_on_every_flush_including_no_dirty() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _, _dir) = build_backend(&manifest).await;
+        // No-dirty flush still records the completion timestamp —
+        // the diagnostic signal is "we last verified durability at
+        // T", not "we last had something to flush". Phase B's
+        // flush_scheduler decides whether to publish a callback
+        // based on chunks_flushed; this stamp is independent.
+        let _ = backend.flush().await.unwrap();
+        let first = backend.last_flush_unix_ms();
+        assert!(first > 0, "first flush must stamp a non-zero unix-ms");
+
+        // Sleep enough that the second flush lands on a distinct
+        // millisecond. 2 ms is the smallest portable sleep that
+        // reliably advances UNIX_EPOCH millis under tokio's mock
+        // clock-less runtime.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let _ = backend.flush().await.unwrap();
+        let second = backend.last_flush_unix_ms();
+        assert!(
+            second >= first,
+            "second flush stamp ({second}) must not regress past first ({first})",
+        );
     }
 }
