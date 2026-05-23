@@ -965,6 +965,14 @@ jobs:
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
           ENGRAM_SKIP_WEB: "1"
+          # Enable the per-session egress proxy. The local dev path
+          # defaults to disabled (unfiltered network — relies on the
+          # dev VM's host masquerade). The Blacksmith runner doesn't
+          # NAT FC TAP traffic to its outbound interface, so guests
+          # need to route via the proxy. Mirrors what `e2e_harness.rs`
+          # in test-firecracker already does at the PooledBackend
+          # layer.
+          ENGRAM_EGRESS_PROXY_PORT: "14443"
         run: |
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
           bash deploy/dev/integration-up.sh

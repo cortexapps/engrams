@@ -159,7 +159,7 @@ ENGRAM_BLOB_BACKEND="gcs" \
 ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
 STORAGE_EMULATOR_HOST="http://localhost:4443" \
 ENGRAM_NBD_DEVICES="$NBD_DEVICES" \
-ENGRAM_EGRESS_PROXY_PORT="0" \
+ENGRAM_EGRESS_PROXY_PORT="${ENGRAM_EGRESS_PROXY_PORT:-0}" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_host_agent::warm_pool=debug,engram_host_agent::pooled_backend=debug}" \
 nohup $SUDO "$INTEG_BIN_DIR/engram-host-agent" >"$INTEG_DIR/host-agent.log" 2>&1 &
 echo $! > "$INTEG_DIR/host-agent.pid"
