@@ -30,8 +30,20 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const SSE_WAIT_DEADLINE: Duration = Duration::from_secs(90);
+/// Per-HTTP-request timeout for the test's reqwest client. Cold
+/// `POST /sessions` on CI runs ~120s on a fresh chunk cache (FC
+/// boot + first NBD page-ins), so this needs to clear that with a
+/// little headroom.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long the auth-failure test waits for either an `agent_message`
+/// or a `run_completed(ok=false)` event after session-create
+/// returns. Claude's stream-json round-trip through the harness +
+/// egress proxy + api.anthropic.com 401 is typically <10s, but CI
+/// networking adds latency. 180s = "if no signal arrives in this
+/// long, Claude is genuinely hung (not just slow)" — a strong
+/// failure signal worth panicking on.
+const SSE_WAIT_DEADLINE: Duration = Duration::from_secs(180);
 
 /// Auth-failure observation outcome.
 ///
