@@ -123,6 +123,13 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with test-linux + test-e2e-stack: all three build
+          # the workspace's debug profile, so cargo's `target/debug/`
+          # contents (deps + workspace artifacts) populate the same
+          # cache bucket and each subsequent job sees prior deps as
+          # already-compiled.
+          shared-key: workspace-debug
 
       # `if: always()` so each gate runs regardless of which earlier
       # step failed — surfaces fmt + clippy + check failures together
@@ -184,6 +191,10 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with lint + test-e2e-stack — see lint's cache step
+          # for the rationale (debug-profile workspace dep graph).
+          shared-key: workspace-debug
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
@@ -645,7 +656,12 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: bake-demo-image
+          # Shared with artifacts-e2e-stack: both build release host
+          # binaries (engram-cli + others) AND musl-target release
+          # agentd. The release+musl dep graph is sizeable and very
+          # stable across commits — the shared cache saves ~1-2min
+          # on whichever job runs second.
+          shared-key: release-musl-bake
 
       - name: Build engram-cli + static-musl agentd
         run: |
@@ -782,7 +798,9 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: e2e-stack-binaries
+          # Shared with bake-demo-image — see that job's cache step
+          # for the rationale (release+musl dep graph).
+          shared-key: release-musl-bake
 
       - name: Build host binaries (release)
         run: |
@@ -892,7 +910,12 @@ jobs:
       - name: Cache cargo build (for the e2e test binary itself)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: e2e-stack-tests
+          # Shared with lint + test-linux: the e2e_stack test binary
+          # links in engram-coordinator's full dep graph at debug
+          # profile, so the cache populated by the earlier debug
+          # workspace jobs hits ~all of it. Saves ~1-2min of cold
+          # cargo compile on this lane.
+          shared-key: workspace-debug
 
       # Same KVM + UFFD relax pattern test-firecracker uses (lines
       # 308-312 above). Blacksmith runners ship /dev/kvm but the
