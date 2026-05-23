@@ -157,6 +157,16 @@ pub struct PooledBackend {
     /// restart between snapshot and commit/abort leaves an orphan dir
     /// — small bounded leak we accept until a host-side janitor lands).
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
+    /// ADR 0016 Phase A: unix-ms timestamp of the last successful
+    /// `snapshot(sandbox_id)` per sandbox. Read by `cow_state` to
+    /// populate the memory-tier RPO field. `0`/absent = never
+    /// snapshotted; the diagnostic surface renders `0` as "never".
+    /// Stamped at the tail of the `snapshot()` post-processing
+    /// block, after BlobStorage uploads succeed but before the
+    /// `inflight_snapshots` insert (which gates commit/abort).
+    /// Cleared on `destroy(sandbox_id)` so the entry doesn't
+    /// outlive its sandbox.
+    last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
 }
 
 impl PooledBackend {
@@ -175,6 +185,7 @@ impl PooledBackend {
             #[cfg(target_os = "linux")]
             nbd_sandboxes: Arc::new(DashMap::new()),
             inflight_snapshots: Arc::new(DashMap::new()),
+            last_snapshot_unix_ms: Arc::new(DashMap::new()),
         }
     }
 
@@ -1466,6 +1477,19 @@ impl SandboxBackend for PooledBackend {
                 // sandbox_id. Also lets a retry of this same sandbox's
                 // snapshot() find and tear down the prior attempt.
                 self.inflight_snapshots.insert(id, m.id);
+                // ADR 0016 Phase A: stamp the memory-tier RPO signal
+                // the `cow_state` RPC reports. Done AFTER post-
+                // processing succeeded — a snapshot whose state.bin /
+                // sidecar upload failed isn't durable and shouldn't
+                // advance the RPO indicator on the diagnostic
+                // surface. Pre-`commit_snapshot` is fine: the row
+                // hasn't been "claimed" by PG yet but the bytes are
+                // in BlobStorage, which is what the RPO measures.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.last_snapshot_unix_ms.insert(id, now_ms);
                 Ok(m)
             }
             Err(e) => {
@@ -1637,6 +1661,12 @@ impl SandboxBackend for PooledBackend {
         {
             let _ = self.nbd_sandboxes.remove(&id);
         }
+        // ADR 0016 Phase A: drop the COW diagnostic timestamp so
+        // the entry doesn't outlive its sandbox. A subsequent
+        // `cow_state(id)` returns `None` (no NBD entry, no
+        // snapshot timestamp) — same shape as a brand-new
+        // sandbox.
+        let _ = self.last_snapshot_unix_ms.remove(&id);
         result
     }
 
@@ -1713,6 +1743,142 @@ impl SandboxBackend for PooledBackend {
 
     async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
         self.inner.vm_internal_ip(id).await
+    }
+
+    /// ADR 0016 Phase A: COW diagnostic. Reads from the NBD-backed
+    /// disk state (`nbd_sandboxes`) + the per-host `chunk_cache`
+    /// for base-chunk locality + the in-memory `last_snapshot_unix_ms`
+    /// tracker for the memory-tier RPO. `None` when:
+    ///
+    /// - The sandbox isn't NBD-attached (Process backend, macOS dev,
+    ///   Linux with `nbd_pool` unwired). The disk tier has no
+    ///   chunk-granularity view; the diagnostic surface reports
+    ///   "not chunk-tracked" upstream by absence.
+    /// - The sandbox_id isn't known here. Coord-side
+    ///   `host_for_sandbox` already gates on this; a stray query
+    ///   inherits the same shape.
+    ///
+    /// Cost: one map lookup for nbd state, two lock acquisitions on
+    /// the `ChunkedDiskBackend` (dirty + state), one map traversal
+    /// over `state.base.chunks` to count locals via
+    /// `ChunkCache::contains`. Bounded by manifest size (~256–1024
+    /// entries typical), dominated by FS `try_exists` cost. Caller
+    /// caches the result for ~1s.
+    async fn cow_state(&self, id: SandboxId) -> Option<engram_core::types::cow_state::CowState> {
+        #[cfg(target_os = "linux")]
+        {
+            let entry = self.nbd_sandboxes.get(&id)?;
+            self.cow_state_for_entry(id, entry.backend.clone()).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
+    /// Bulk fan-out — one entry per NBD-attached sandbox. Skips any
+    /// per-sandbox lookup whose state read fails (best effort). One
+    /// dashmap iteration; the per-entry COW read holds its locks
+    /// only for its own state, so concurrent NBD writers see at most
+    /// a brief contention.
+    async fn cow_state_all(&self) -> Vec<engram_core::types::cow_state::CowStateRecord> {
+        #[cfg(target_os = "linux")]
+        {
+            let ids: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
+                .nbd_sandboxes
+                .iter()
+                .map(|e| (*e.key(), e.value().backend.clone()))
+                .collect();
+            let mut out = Vec::with_capacity(ids.len());
+            for (sandbox_id, backend) in ids {
+                if let Some(state) = self.cow_state_for_entry(sandbox_id, backend).await {
+                    out.push(engram_core::types::cow_state::CowStateRecord { sandbox_id, state });
+                }
+            }
+            out
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PooledBackend {
+    /// Compute a [`CowState`] from one NBD backend + the host's
+    /// caches. Shared by [`SandboxBackend::cow_state`] and
+    /// [`SandboxBackend::cow_state_all`] so the two never drift.
+    async fn cow_state_for_entry(
+        &self,
+        id: SandboxId,
+        backend: Arc<crate::disk_daemon::ChunkedDiskBackend>,
+    ) -> Option<engram_core::types::cow_state::CowState> {
+        let disk_manifest = backend.manifest_ref().await;
+        let dirty_chunks = backend.dirty_chunks_count().await as u32;
+        let dirty_bytes = backend.dirty_bytes().await;
+        let last_flush_unix_ms = backend.last_flush_unix_ms();
+
+        // Count base chunks (manifest entries) + how many are
+        // resident on local NVMe. Fetched once; the manifest comes
+        // from BlobStorage via the chunk store and is cached in
+        // `ChunkedDiskBackend.state` so this is one cheap lookup
+        // server-side.
+        let (base_chunks, base_chunks_local) = if let Some(cache) = self.chunk_cache.as_ref() {
+            match self.chunk_store.as_ref().map(|s| s.clone()) {
+                Some(store) => match store.get_manifest(disk_manifest).await {
+                    Ok(manifest) => {
+                        let mut local = 0u32;
+                        for chunk in &manifest.chunks {
+                            if cache.contains(chunk.hash).await {
+                                local += 1;
+                            }
+                        }
+                        (manifest.chunks.len() as u32, local)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            sandbox_id = %id,
+                            manifest = %disk_manifest,
+                            error = %e,
+                            "cow_state: failed to read disk manifest for locality counts; \
+                             falling back to base_chunks=0",
+                        );
+                        (0, 0)
+                    }
+                },
+                None => (0, 0),
+            }
+        } else {
+            // No chunk cache wired (dev / mode=all without
+            // NVMe tier). Manifest size is still observable, but
+            // "local vs remote" is meaningless without a cache —
+            // report both as 0 so the renderer can show "no
+            // locality tracking" rather than a confusing "0/0".
+            (0, 0)
+        };
+
+        let last_snapshot_unix_ms = self
+            .last_snapshot_unix_ms
+            .get(&id)
+            .map(|r| *r.value())
+            .unwrap_or(0);
+
+        Some(engram_core::types::cow_state::CowState {
+            disk_manifest,
+            dirty_chunks,
+            dirty_bytes,
+            last_flush_unix_ms,
+            base_chunks,
+            base_chunks_local,
+            // Memory manifest is snapshot-bounded and lives on the
+            // PG `snapshots` row, not host-side. Coord layers it on
+            // when projecting the host's response into the
+            // session-shaped endpoint (`GET /api/sessions/:id/cow-state`).
+            memory_manifest: None,
+            last_snapshot_unix_ms,
+        })
     }
 }
 

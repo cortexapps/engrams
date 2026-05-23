@@ -60,6 +60,16 @@ service HostService {
   // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
   rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
 
+  // ---- ADR 0016 Phase A: COW observability ----
+  //
+  // Per-sandbox diagnostic: dirty/synced chunk counts, current disk
+  // manifest version, last flush timestamp, and the snapshot-bounded
+  // memory-tier RPO signal. Read-only; coord fans these out to power
+  // `GET /api/{hosts,sessions}/:id/cow-state`. Caller caches the
+  // response for ~1s to keep the host load low under web-app polling.
+  rpc CowState(SandboxIdMessage) returns (CowStateResponse);
+  rpc CowStateAll(Empty) returns (CowStateAllResponse);
+
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
 
@@ -270,5 +280,26 @@ message ProxyShellClose {
   // "Close with no body" case.
   uint32 code = 1;
   string reason = 2;
+}
+
+// --- ADR 0016 Phase A: CowState / CowStateAll ---
+
+// `Some(CowState)` if the host hosts a chunk-tracked view of this
+// sandbox; `None` (state_bincode empty) otherwise. Wire shape uses
+// bincode for the payload (same pattern as `SnapshotResponse`), so
+// schema evolution stays in Rust-land and proto is just envelope.
+message CowStateResponse {
+  // bincode-encoded `engram_core::types::cow_state::CowState`.
+  // Empty bytes encode the `None` case — distinguished from a
+  // present-but-empty payload because `CowState` always carries a
+  // populated `disk_manifest`.
+  bytes state_bincode = 1;
+}
+
+message CowStateAllResponse {
+  // bincode-encoded `Vec<engram_core::types::cow_state::CowStateRecord>`.
+  // Empty vec is encoded as a non-empty bincode blob (the length
+  // prefix is 0); the proto field is non-optional.
+  bytes records_bincode = 1;
 }
 

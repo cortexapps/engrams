@@ -24,4 +24,9 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Bincode is the canonical wire-encoding for `CowState` /
+# `CowStateRecord` (carried inside the proto `bytes` field per
+# ADR 0013 / 0016). The round-trip tests exercise that wire shape;
+# production code paths in this crate don't depend on bincode.
+bincode.workspace = true
 toml.workspace = true

@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 use engram_core::error::SandboxError;
 use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend};
+use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -196,6 +197,14 @@ impl HostClient for LocalHostClient {
 
     fn set_harness_sink(&self, sink: HarnessSink) {
         self.sandbox.set_harness_sink(sink);
+    }
+
+    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
+        Ok(self.sandbox.cow_state(id).await)
+    }
+
+    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
+        Ok(self.sandbox.cow_state_all().await)
     }
 }
 

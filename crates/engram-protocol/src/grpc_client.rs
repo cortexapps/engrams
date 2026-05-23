@@ -15,6 +15,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::traits::HostClient;
+use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -32,6 +33,7 @@ use crate::grpc::{
     RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
     UnbindHarnessSessionRequest,
 };
+
 use crate::wire::{WireExecRequest, WireReapStats};
 
 /// Coord-side client wrapping a `tonic::transport::Channel` to one
@@ -287,6 +289,40 @@ impl GrpcHostClient {
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
+    }
+
+    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot. Empty
+    /// `state_bincode` on the wire encodes `None` (host has no
+    /// chunk-tracked view of this sandbox) so coord can distinguish
+    /// "not chunk-tracked" from "really nothing dirty".
+    pub async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .cow_state(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        if resp.state_bincode.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(decode_bincode(&resp.state_bincode, "CowState")?))
+    }
+
+    /// ADR 0016 Phase A: bulk COW fetch for one host. Returns one
+    /// record per chunk-tracked sandbox; ordering not guaranteed.
+    pub async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
+        let resp = self
+            .inner
+            .clone()
+            .cow_state_all(Empty {})
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        decode_bincode(&resp.records_bincode, "Vec<CowStateRecord>")
     }
 
     pub async fn reap_materialize_dir(
@@ -655,6 +691,14 @@ impl HostClient for GrpcHostClient {
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC
     // doesn't carry static capability or in-proc sink wiring.
+
+    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
+        Self::cow_state(self, id).await
+    }
+
+    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
+        Self::cow_state_all(self).await
+    }
 }
 
 /// Map a tonic Status into the same `SandboxError` shape today's WS

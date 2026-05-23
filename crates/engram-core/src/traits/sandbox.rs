@@ -7,6 +7,7 @@ use futures::stream::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::SandboxError;
+use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::ids::SandboxId;
 use crate::types::sandbox::{
@@ -316,6 +317,28 @@ pub trait SandboxBackend: Send + Sync {
     /// which lazily spawns ttyd and only replies once a probe succeeds.
     async fn start_shell(&self, _id: SandboxId) -> Result<u16, SandboxError> {
         Ok(7681)
+    }
+
+    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
+    /// `None` for backends without an NBD-chunked disk view
+    /// (Process, VZ-without-NBD, FC before its NBD attach lands) —
+    /// the diagnostic surface treats absence as "this sandbox isn't
+    /// chunk-tracked" rather than "this sandbox has zero dirty
+    /// bytes." Only `PooledBackend` overrides today; the FC + VZ
+    /// inner backends inherit the default. See [`CowState`] for
+    /// what the fields mean and ADR 0016 for the design.
+    async fn cow_state(&self, _id: SandboxId) -> Option<CowState> {
+        None
+    }
+
+    /// Bulk variant: one record per sandbox this backend hosts that
+    /// *has* a COW view. Skips sandboxes whose individual
+    /// `cow_state()` would return `None`. Default empty; only
+    /// `PooledBackend` overrides. Lets the host-side gRPC server
+    /// answer `CowStateAll` with one map-iteration rather than
+    /// `list() + N × cow_state()`.
+    async fn cow_state_all(&self) -> Vec<CowStateRecord> {
+        Vec::new()
     }
 }
 

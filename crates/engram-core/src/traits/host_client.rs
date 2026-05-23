@@ -24,6 +24,7 @@ use async_trait::async_trait;
 
 use crate::error::SandboxError;
 use crate::traits::sandbox::{HarnessDial, HarnessSink};
+use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
 use crate::types::shell::ShellTunnel;
@@ -183,4 +184,24 @@ pub trait HostClient: Send + Sync {
     /// local sink internally, and the closure (capturing coord-side
     /// state) wouldn't serialize anyway.
     fn set_harness_sink(&self, _sink: HarnessSink) {}
+
+    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
+    /// `None` if this host doesn't have a chunk-tracked view of
+    /// the sandbox (backend not NBD-attached, or the
+    /// `sandbox_id` isn't bound here). The caller — `cow_state`
+    /// fan-out at coord — treats `Ok(None)` and `Err(NotFound)`
+    /// uniformly. Default returns `None` so `HostClient` impls
+    /// that don't forward this can compile without changes.
+    async fn cow_state(&self, _id: SandboxId) -> Result<Option<CowState>, SandboxError> {
+        Ok(None)
+    }
+
+    /// ADR 0016 Phase A: bulk variant. One record per chunk-tracked
+    /// sandbox this host owns. Cheaper than `list() + N ×
+    /// cow_state()` over the wire — single RPC, single map walk on
+    /// the host. Default empty so non-host-agent impls (mocks,
+    /// in-proc test glue) compile.
+    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
+        Ok(Vec::new())
+    }
 }

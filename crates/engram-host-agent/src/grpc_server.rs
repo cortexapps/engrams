@@ -23,12 +23,12 @@ use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
-    CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
-    ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotResponse,
-    StartAgentRequest, UnbindHarnessSessionRequest,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CowStateAllResponse, CowStateResponse,
+    CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest,
+    GuestIpResponse, ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -324,6 +324,41 @@ impl HostService for HostServiceImpl {
             .map_err(|e| Status::internal(format!("reap_materialize_dir: {e}")))?;
         Ok(Response::new(ReapMaterializeDirResponse {
             stats_bincode: encode_bincode(&stats, "WireReapStats")?,
+        }))
+    }
+
+    /// ADR 0016 Phase A: per-sandbox COW diagnostic. Returns an
+    /// empty bincode blob when the host has no chunk-tracked view
+    /// of the sandbox — distinguishes "not chunk-tracked" from
+    /// "tracked but zero dirty" on the wire so the coord can render
+    /// the two states differently.
+    async fn cow_state(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<CowStateResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let state = self.inner.cow_state(id).await.map_err(sandbox_to_status)?;
+        let state_bincode = match state {
+            Some(s) => encode_bincode(&s, "CowState")?,
+            None => Vec::new(),
+        };
+        Ok(Response::new(CowStateResponse { state_bincode }))
+    }
+
+    /// ADR 0016 Phase A: bulk COW fetch. The bincode payload is a
+    /// `Vec<CowStateRecord>` — empty vec encodes as a non-empty
+    /// blob (the length prefix is 0).
+    async fn cow_state_all(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<CowStateAllResponse>, Status> {
+        let records = self
+            .inner
+            .cow_state_all()
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(CowStateAllResponse {
+            records_bincode: encode_bincode(&records, "Vec<CowStateRecord>")?,
         }))
     }
 
