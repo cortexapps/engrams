@@ -862,25 +862,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # actions/upload-artifact@v4 strips the longest common path
-      # prefix shared by all `path:` entries when packing — for the
-      # artifacts-e2e-stack upload that's `target/`, so the artifact
-      # contents are flattened to `release/...` +
-      # `x86_64-unknown-linux-musl/release/...`. Downloading directly
-      # into `./target/` reconstructs the expected layout in place.
-      - name: Download e2e binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: e2e-binaries
-          path: ./target/
-
-      - name: Mark e2e binaries executable
-        run: |
-          chmod +x target/release/engram-{coordinator,host-agent,cli}
-          chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,cli} \
-                target/x86_64-unknown-linux-musl/release/engram-agentd
-
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ''
@@ -952,6 +933,39 @@ jobs:
         run: |
           bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
             --cache-dir "$HOME/.cache/engram-fc-test"
+
+      # Pull the release binaries AFTER the Swatinem/rust-cache@v2
+      # restore step (`Cache cargo build` above). Surfaced in CI run
+      # 26344875066: rust-cache's restore prunes "stale" entries from
+      # target/<profile>/ when the lockfile hash changes (Cargo.lock
+      # touched by a workspace dep add in ADR 0016 Phase A). The
+      # download placed engram-coordinator/host-agent/cli at
+      # target/release/, the cache restore wiped them, and
+      # integration-up.sh dropped into its cargo-build fallback for
+      # coord + host-agent only — leaving engram-cli missing, which
+      # broke the next step's `./target/release/engram-cli registry
+      # add`. Moving the download below all rust-cache operations
+      # makes the order unambiguous: nothing can prune what hasn't
+      # been written yet.
+      #
+      # actions/upload-artifact@v4 strips the longest common path
+      # prefix shared by all `path:` entries when packing — for the
+      # artifacts-e2e-stack upload that's `target/`, so the artifact
+      # contents are flattened to `release/...` +
+      # `x86_64-unknown-linux-musl/release/...`. Downloading directly
+      # into `./target/` reconstructs the expected layout in place.
+      - name: Download e2e binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-binaries
+          path: ./target/
+
+      - name: Mark e2e binaries executable
+        run: |
+          chmod +x target/release/engram-{coordinator,host-agent,cli}
+          chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
+          ls -l target/release/engram-{coordinator,host-agent,cli} \
+                target/x86_64-unknown-linux-musl/release/engram-agentd
 
       # integration-up.sh boots: postgres + fake-gcs + registry via
       # docker-compose, then coord + host-agent as background
