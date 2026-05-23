@@ -1,0 +1,31 @@
+# Per-test timeouts so a hung test fails fast instead of pinning a
+# runner for the workflow's default 360-minute job timeout.
+#
+# Observed during run 26338390127: the
+# `engram-storage-gcs::put_streaming_round_trips_a_large_body` test
+# hung on a transient fake-gcs-server stall and would have burned
+# the full 6-hour job timeout without intervention. With this
+# config, nextest emits a SLOW notice every 30s and terminates the
+# test after 6 periods (= 3 min), so the same flake fails the job
+# in 3 minutes instead of 6 hours.
+#
+# Applies to BOTH local `cargo nextest` and CI. `just check` runs
+# nextest under the default profile, so the same cap protects dev
+# laptops too.
+
+[profile.default]
+# 3-minute hard cap per test. All non-ignored tests in the
+# workspace should complete well under this; the slowest ones
+# observed (image-builder's docker-bake test, sandbox-vz's full-
+# plumbing test) run in seconds-to-tens-of-seconds.
+slow-timeout = { period = "30s", terminate-after = 6 }
+
+# Integration tests in the new e2e_stack lane legitimately take
+# ~120s each (cold FC create + agent handshake), and the
+# auth-failure test has an internal 180s SSE deadline that needs
+# to fire before nextest kills the process — otherwise we lose
+# the captured-events diagnostic that's load-bearing for
+# iteration. Bump to 5 minutes for this binary only.
+[[profile.default.overrides]]
+filter = "binary(e2e_stack)"
+slow-timeout = { period = "60s", terminate-after = 5 }
