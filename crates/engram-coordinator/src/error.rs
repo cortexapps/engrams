@@ -13,6 +13,12 @@ pub enum ApiError {
     /// unavailable. Used for sessions whose FC snapshot was
     /// invalidated (Dead): the only affordance is to fork.
     Gone(String),
+    /// 410 Gone — ADR 0015 M3: the bound host is no longer
+    /// reachable. Same status as [`Self::Gone`] but a distinct
+    /// machine-readable slug (`host_lost`) so clients can tell
+    /// "snapshot lost forever" from "host disappeared, you may be
+    /// able to resume on another host once M4 ships re-pick".
+    HostLost(String),
     Unsupported(String),
     /// 503 — request was rejected because the system is temporarily
     /// unable to satisfy it. Used for capacity-fit failures at
@@ -36,7 +42,7 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Gone(_) => StatusCode::GONE,
+            Self::Gone(_) | Self::HostLost(_) => StatusCode::GONE,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,6 +55,7 @@ impl ApiError {
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::Gone(_) => "snapshot_invalidated",
+            Self::HostLost(_) => "host_lost",
             Self::Unsupported(_) => "unsupported",
             Self::Unavailable(_) => "unavailable",
             Self::Internal(_) => "internal",
@@ -61,6 +68,7 @@ impl ApiError {
             | Self::NotFound(m)
             | Self::Conflict(m)
             | Self::Gone(m)
+            | Self::HostLost(m)
             | Self::Unsupported(m)
             | Self::Unavailable(m)
             | Self::Internal(m) => m,
@@ -111,6 +119,11 @@ impl From<SandboxError> for ApiError {
             SandboxError::NotFound => Self::NotFound("sandbox not found".into()),
             SandboxError::AlreadyExists => Self::Conflict("sandbox already exists".into()),
             SandboxError::InvalidSpec(msg) => Self::BadRequest(msg),
+            SandboxError::HostLost => Self::HostLost(
+                "session host is no longer reachable; the sandbox is gone. \
+                 Resume from a snapshot or fork the session."
+                    .into(),
+            ),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -171,6 +184,15 @@ mod tests {
     fn sandbox_already_exists_maps_to_409() {
         let api: ApiError = SandboxError::AlreadyExists.into();
         assert_eq!(api.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn sandbox_host_lost_maps_to_410_with_host_lost_slug() {
+        // ADR 0015 M3: HostLost is 410 Gone with a distinct slug from
+        // snapshot-invalidation so clients can tell them apart.
+        let api: ApiError = SandboxError::HostLost.into();
+        assert_eq!(api.status(), StatusCode::GONE);
+        assert_eq!(api.slug(), "host_lost");
     }
 
     #[test]

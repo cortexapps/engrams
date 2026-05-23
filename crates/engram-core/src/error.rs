@@ -98,6 +98,13 @@ pub enum SandboxError {
     /// was looking for so the API surface can render a hint about
     /// which artifact to wait on.
     ImageNotReady(String),
+    /// ADR 0015 M3: the sandbox once existed but its owning host is
+    /// no longer reachable (heartbeat-loss confirmed, dead_host
+    /// detector fired, or operator-pause TTL elapsed). Distinguishes
+    /// "host went away mid-session" (410 Gone) from "we never knew
+    /// this sandbox" (404 NotFound) so callers can tell a transient
+    /// routing miss from a permanent ownership lapse.
+    HostLost,
 }
 
 impl fmt::Display for SandboxError {
@@ -115,6 +122,7 @@ impl fmt::Display for SandboxError {
                 f,
                 "image with manifest digest {digest} has not been prefetched by any host yet"
             ),
+            Self::HostLost => write!(f, "sandbox host is no longer reachable"),
         }
     }
 }

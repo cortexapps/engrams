@@ -584,5 +584,9 @@ fn sandbox_to_status(err: SandboxError) -> Status {
             Status::internal(err.to_string())
         }
         SandboxError::ImageNotReady(_) => Status::failed_precondition(err.to_string()),
+        // Host-agent never originates HostLost — that's a coord-side
+        // signal (ADR 0015 M3). Map defensively in case a future
+        // refactor surfaces it here.
+        SandboxError::HostLost => Status::failed_precondition(err.to_string()),
     }
 }

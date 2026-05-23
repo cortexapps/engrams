@@ -154,7 +154,7 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         SessionState::Pending => Err(ApiError::Conflict(
             "session is pending — scheduling has not completed".into(),
         )),
-        SessionState::HostLost => Err(ApiError::Gone(
+        SessionState::HostLost => Err(ApiError::HostLost(
             "session's host went away; resume from a snapshot if one exists".into(),
         )),
         SessionState::Dead => Err(ApiError::Gone(
