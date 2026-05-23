@@ -73,9 +73,11 @@ handshake loudly — same mechanism as previous WIRE_VERSION bumps.
     id=$1` in the same transaction that marks the snapshot complete.
 - Chunk-store GC clears the flag back to `false` when it reaps a
   manifest:
-  - One CTE addition in `crates/engram-coordinator/src/chunk_gc.rs` —
+  - When chunk-store GC is re-implemented (it was removed
+    2026-05-23 — see ADR 0015 M5), include a CTE that does
     `UPDATE snapshots SET recoverable=false WHERE disk_manifest_id IN
-    (reaped) OR memory_manifest_id IN (reaped)`.
+    (reaped) OR memory_manifest_id IN (reaped)` in the same
+    transaction as the manifest delete.
 
 ### Expected tests
 

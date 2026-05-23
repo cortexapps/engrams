@@ -245,15 +245,14 @@ TTL or explicit `DELETE /sessions/:id`. The ADR 0005 cold-tier flush
 endpoints retired in Phase 7 when chunked-immutable storage became the
 single durability primitive.
 
-### Chunk-store GC
+### Chunk-store GC — REMOVED 2026-05-23
 
-`engram_coordinator::chunk_gc::spawn` is the cron driver
-(`ENGRAM_CHUNK_GC_INTERVAL_SECS`, default 1h; `0` disables).
-Sweeps chunks unreferenced by any live snapshot's
-`disk_manifest` / `memory_manifest` after
-`ENGRAM_CHUNK_GC_RETAIN_SECS` (default 24h). Operators can
-trigger an on-demand sweep via
-`POST /api/admin/gc-chunks?retain_secs=<N>`.
+The chunk-store GC and its admin endpoint were deleted after a
+prod incident reaped freshly-enabled-image chunks before any host
+could prefetch them. BlobStorage cost grows unbounded until a
+redesigned sweep ships; see ADR 0015 M5 "Known regression —
+chunk-store GC deleted" for the post-mortem and design
+constraints for any re-implementation.
 
 ### Materialize-dir reap
 

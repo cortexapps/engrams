@@ -236,4 +236,7 @@ and have their own deferred-decision notes:
   `POST /api/admin/gc-chunks` for explicit triggers; the
   coordinator's `chunk_gc::spawn` is the cron driver (interval
   via `ENGRAM_CHUNK_GC_INTERVAL_SECS`, retain via
-  `ENGRAM_CHUNK_GC_RETAIN_SECS`).
+  `ENGRAM_CHUNK_GC_RETAIN_SECS`). *(Update 2026-05-23: the
+  chunk-store GC half was removed after a prod incident; see
+  ADR 0015 M5 "Known regression — chunk-store GC deleted." The
+  materialize-dir reap survives.)*

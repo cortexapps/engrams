@@ -1240,7 +1240,7 @@ Where to start in code, ordered by issue:
 - **#3 (stale `templates` rows).**
   - Cascade entry point: `crates/engram-coordinator/src/api/enabled_images.rs::enable_image` (the `if let Some(canonical) = bundle.canonical_snapshot { … }` branch added in M1.11). Add a `state.services.blob.head(blob_key)` pre-check before `record_snapshot` + `upsert_template` fire.
   - `record_snapshot` schema: `crates/engram-postgres/src/lib.rs`, search `record_snapshot` (~line 561) and `upsert_template` (~line 443) for the actual SQL.
-  - Coord-side sweeper: new module under `crates/engram-coordinator/src/` (similar shape to `chunk_gc.rs`); runs periodically, walks `templates WHERE active=true`, calls `blob.head()` on each row's snapshot blob keys, marks `active=false` (or deletes) rows whose blobs are missing.
+  - Coord-side sweeper: new module under `crates/engram-coordinator/src/` (cron + paired admin endpoint, modeled on the surviving `idle_evictor`); runs periodically, walks `templates WHERE active=true`, calls `blob.head()` on each row's snapshot blob keys, marks `active=false` (or deletes) rows whose blobs are missing. *(Update 2026-05-23: largely moot — `templates` was retired by ADR 0015 M5. Left as historical context.)*
   - Current stale templates query (run from prod-ops):
     ```sql
     select template_ref, image_repo, image_tag, snapshot_id, active

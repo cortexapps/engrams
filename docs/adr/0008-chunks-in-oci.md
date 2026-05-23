@@ -147,9 +147,10 @@ All chunks in BlobStorage are equally durable. "Cache" vs
 "snapshot" is a population-source label, not a lifetime
 distinction. A chunk is evictable iff no live manifest
 references its hash — same primitive
-`engram_coordinator::chunk_gc` already runs. Optional LRU
-eviction *within* the reachable set bounds cache growth
-without affecting correctness.
+`engram_coordinator::chunk_gc` originally ran (removed
+2026-05-23; see ADR 0015 M5). Optional LRU eviction *within*
+the reachable set bounds cache growth without affecting
+correctness.
 
 OCI tag retention governs durable image chunks at the
 registry side, as usual.
@@ -281,9 +282,11 @@ cross-host portability properties.
   lose image data. Snapshot chunks still need BlobStorage
   for durability.
 - **Snapshot path unchanged.** ✅ `PooledBackend::snapshot`,
-  the NBD flush, UFFD's memory-chunking path, the `chunk_gc`
-  reachability sweep, and `traces/<manifest_id>/<host>.json`
-  all continue to operate against BlobStorage as today.
+  the NBD flush, UFFD's memory-chunking path, and
+  `traces/<manifest_id>/<host>.json` all continue to operate
+  against BlobStorage as today. *(The `chunk_gc` reachability
+  sweep that previously rounded this out was removed 2026-05-23
+  — see ADR 0015 M5.)*
 - **First-fault cost on a fresh region.** ⚠
   Measured estimates: ~250-600 ms cold-boot wall (same-region
   registry, WS-trace prefault); ~3-5 s cross-region;

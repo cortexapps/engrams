@@ -52,16 +52,14 @@ still reflects ADR 0005's two-tier model).
 
 ### Remaining
 
-- ✅ **GC scheduler** — shipped as `engram_coordinator::chunk_gc`.
-  Background loop fires `chunk_gc::run_once` on the
-  `ENGRAM_CHUNK_GC_INTERVAL_SECS` cadence (default 1h); `0` disables.
-  Retention via `ENGRAM_CHUNK_GC_RETAIN_SECS` (default 24h). The
-  `POST /api/admin/gc-chunks` admin endpoint now delegates to the
-  same pipeline, so explicit-trigger and cron-driver exercise
-  identical code — including the disk+memory live-set union
-  (latent bug fix from the original admin endpoint, which only
-  read `list_live_disk_manifest_ids` and would have prematurely
-  swept memory chunks).
+- 🚫 **GC scheduler** — shipped as `engram_coordinator::chunk_gc`,
+  then **removed 2026-05-23** after a prod incident reaped freshly-
+  enabled-image chunks before any host could prefetch them. See
+  ADR 0015 M5 "Known regression — chunk-store GC deleted" for the
+  post-mortem and the design constraints any re-implementation
+  must respect. The rest of this rollout doc describes the GC
+  scaffolding as it stood pre-deletion; treat those passages as
+  historical.
 - 💤 **`list_prefix` on S3** — stub at
   `crates/engram-storage-s3/src/lib.rs` returns `Err(Config)`.
   Breaks GC on AWS. Fix when AWS lands.
@@ -132,9 +130,11 @@ still reflects ADR 0005's two-tier model).
   store and populates `SnapshotMetadata.disk_manifest`.
 - ✅ **Materialized file orphan reap** — shipped as
   `engram_host_agent::orphan_reap::reap_materialize_dir` +
-  `POST /api/admin/reap-materialize-dir`. `engram_coordinator::chunk_gc`
-  cron drives it; multi-host fanout via WS-RPC shipped in commit
-  `2971115` (WIRE v3 / `HostAdminHandler::reap_materialize_dir`).
+  `POST /api/admin/reap-materialize-dir`; multi-host fanout via
+  WS-RPC shipped in commit `2971115` (WIRE v3 /
+  `HostAdminHandler::reap_materialize_dir`). Currently driven only
+  by explicit admin-endpoint calls — the chunk-store GC cron that
+  previously fired the sibling sweep was removed 2026-05-23.
 - ✅ **Chunk cache wired into materialize path** —
   `PooledBackend::with_chunk_cache` routes chunk reads through the
   NVMe LRU on rematerialize. Default 200 GiB budget,
@@ -453,7 +453,8 @@ become the single durability primitive.
 - ✅ `crates/engram-coordinator/src/api/admin.rs::flush_one`,
   `flush_idle` + their wire route — deleted. `FlushResult` +
   `flush_inner` deleted. The admin surface is now
-  `gc_chunks` + `reap_materialize_dir`.
+  `reap_materialize_dir`. (`gc_chunks` was shipped here and then
+  removed 2026-05-23 — see ADR 0015 M5.)
 - ✅ `start_coordinator` — `disk_pressure::spawn` block gone.
 - ✅ `SnapshotEvent::ColdEvicted` + `SnapshotEvent::ColdResumed` —
   deleted from `engram-coordinator::state`.
@@ -890,11 +891,11 @@ tier.
        successful runs. Hosts without a wired `HostAdminHandler`
        (no `materialize_dir` configured) skip gracefully with a
        typed error. Cron scheduler pairs with #4.
-4. ✅ **Chunk-store GC scheduler** (Phase 1 gap) — shipped. Cron
-   loop `engram_coordinator::chunk_gc::spawn` in `start_coordinator`
-   + `POST /api/admin/gc-chunks` admin endpoint delegating to the
-   same `run_once` pipeline. Disk+memory live-set union (admin
-   endpoint previously only read disk). 8 unit tests.
+4. 🚫 **Chunk-store GC scheduler** (Phase 1 gap) — shipped, then
+   **removed 2026-05-23** after a prod incident. See ADR 0015 M5
+   "Known regression — chunk-store GC deleted" for the post-mortem
+   + redesign constraints. BlobStorage cost grows unbounded until
+   a new sweep ships.
 5. 🟡 **Phase 6 trait reshape + migration 0018/0019** — additive
    surface shipped (`SnapshotMetadata.disk_manifest`,
    `.memory_manifest`); full trait reshape lands alongside Phase 7

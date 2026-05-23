@@ -259,10 +259,11 @@ What shipped:
   + `SnapshotResidency` enum + `wrapped_dek/nonce/ciphertext/key_id`
   envelope-encryption quartet on snapshots all dropped.
 - **`engram_coordinator::chunk_gc::spawn`** — background cron that
-  fires `chunk_gc::run_once` on the `ENGRAM_CHUNK_GC_INTERVAL_SECS`
-  cadence (default 1h). `POST /api/admin/gc-chunks` delegates to
-  the same pipeline so explicit-trigger and cron-driver share
-  code.
+  fired `chunk_gc::run_once` on the `ENGRAM_CHUNK_GC_INTERVAL_SECS`
+  cadence (default 1h). `POST /api/admin/gc-chunks` delegated to
+  the same pipeline so explicit-trigger and cron-driver shared
+  code. **Removed 2026-05-23** after a prod incident; see ADR
+  0015 M5 "Known regression — chunk-store GC deleted."
 - **`POST /api/admin/reap-materialize-dir`** — in-proc in `--mode=all`,
   multi-host WS-RPC fanout in `--mode=coordinator` via
   `HostAdminHandler` (WIRE v3).

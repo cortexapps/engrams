@@ -239,12 +239,14 @@ without an exporter.
 shipped as both a library primitive and a `POST /api/admin/reap-materialize-dir`
 admin endpoint. Parses `<manifest_id>-vN.ext4` filenames + deletes
 any not referenced by a live `disk_manifest_id` row; `min_age_secs`
-guard protects in-flight clonefiles. The chunk-store GC scheduler
-(`engram_coordinator::chunk_gc`) drives this on a cadence. Multi-
-host fanout shipped via WS-RPC in commit `2971115` (WIRE v3 /
+guard protects in-flight clonefiles. Multi-host fanout shipped via
+WS-RPC in commit `2971115` (WIRE v3 /
 `HostAdminHandler::reap_materialize_dir`); in `--mode=coordinator`
 the admin endpoint walks every connected host and aggregates per-
-host outcomes.
+host outcomes. Currently driven by explicit admin-endpoint calls
+only — the chunk-store GC cron that previously fired the sibling
+sweep was removed 2026-05-23 (see ADR 0015 M5 "Known regression —
+chunk-store GC deleted").
 
 ## 15. Wire compatibility is enforced at hello but bincode-positional
 

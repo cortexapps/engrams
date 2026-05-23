@@ -122,6 +122,8 @@ table, set at **snapshot-creation time**:
    marks the snapshot complete.
 4. Chunk-store GC clears the flag back to `false` when it
    reaps a manifest (one CTE addition to `chunk_gc.rs`).
+   *(Update 2026-05-23: chunk-store GC was removed; see ADR
+   0015 M5. This step is moot until GC is re-implemented.)*
 
 Reconcile then trusts the column — zero per-tick I/O against
 BlobStorage. The column reflects "as of the last GC sweep,
