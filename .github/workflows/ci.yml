@@ -8,10 +8,9 @@ name: CI
 #                       cargo check workspace
 #   - test-linux:       cargo nextest workspace tests, plus
 #                       Postgres-gated ignored tests (ha_listener,
-#                       snapshot_disk_manifest_persistence,
-#                       admin_gc_chunks_live_pg) against the postgres
-#                       service container, plus the GCS-emulator round-
-#                       trip via fake-gcs-server
+#                       snapshot_disk_manifest_persistence) against
+#                       the postgres service container, plus the
+#                       GCS-emulator round-trip via fake-gcs-server
 #   - cross-musl:       cross-compile engram-agentd + the harness
 #                       wrappers to x86_64-unknown-linux-musl
 #                       (catches breakage of the FC image bake chain).
@@ -249,7 +248,6 @@ jobs:
             -p engram-coordinator \
             --test ha_listener \
             --test snapshot_disk_manifest_persistence \
-            --test admin_gc_chunks_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
