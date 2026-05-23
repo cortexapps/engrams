@@ -64,7 +64,18 @@ echo "==> seed GCS bucket"
 bash deploy/dev/seed-buckets.sh
 
 echo "==> build coordinator + host-agent"
-cargo build -p engram-coordinator -p engram-host-agent
+# CI lanes can pre-supply the binaries via an artifact and point at
+# them with ENGRAM_INTEG_BIN_DIR (typically target/release). If both
+# binaries already exist there, skip the rebuild — saves ~3min on
+# the e2e CI job, which downloads release binaries from the
+# `artifacts-e2e-stack` job's artifact.
+INTEG_BIN_DIR="${ENGRAM_INTEG_BIN_DIR:-./target/debug}"
+if [ -x "$INTEG_BIN_DIR/engram-coordinator" ] && \
+   [ -x "$INTEG_BIN_DIR/engram-host-agent" ]; then
+    echo "    binaries already present at $INTEG_BIN_DIR; skipping cargo build"
+else
+    cargo build -p engram-coordinator -p engram-host-agent
+fi
 
 # ADR 0014: host-agent provisions per-VM TAPs (via the `ip` shell-out)
 # and writes iptables rules. CAP_NET_ADMIN on the host-agent binary
@@ -101,7 +112,7 @@ ENGRAM_BLOB_BACKEND="gcs" \
 ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
 STORAGE_EMULATOR_HOST="http://localhost:4443" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_coordinator::api::enabled_images=trace}" \
-nohup ./target/debug/engram-coordinator >"$INTEG_DIR/coord.log" 2>&1 &
+nohup "$INTEG_BIN_DIR/engram-coordinator" >"$INTEG_DIR/coord.log" 2>&1 &
 echo $! > "$INTEG_DIR/coord.pid"
 
 echo "==> wait for coord /healthz"
@@ -150,7 +161,7 @@ STORAGE_EMULATOR_HOST="http://localhost:4443" \
 ENGRAM_NBD_DEVICES="$NBD_DEVICES" \
 ENGRAM_EGRESS_PROXY_PORT="0" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_host_agent::warm_pool=debug,engram_host_agent::pooled_backend=debug}" \
-nohup $SUDO ./target/debug/engram-host-agent >"$INTEG_DIR/host-agent.log" 2>&1 &
+nohup $SUDO "$INTEG_BIN_DIR/engram-host-agent" >"$INTEG_DIR/host-agent.log" 2>&1 &
 echo $! > "$INTEG_DIR/host-agent.pid"
 
 echo "==> wait for host registration"
