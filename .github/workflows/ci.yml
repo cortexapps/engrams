@@ -12,10 +12,11 @@ name: CI
 #                       admin_gc_chunks_live_pg) against the postgres
 #                       service container, plus the GCS-emulator round-
 #                       trip via fake-gcs-server
-#   - cross-musl:       cross-compile engram-agentd / engram-bootstrap
-#                       / the harness wrappers to
-#                       x86_64-unknown-linux-musl (catches breakage of
-#                       the FC image bake chain)
+#   - cross-musl:       cross-compile engram-agentd + the harness
+#                       wrappers to x86_64-unknown-linux-musl
+#                       (catches breakage of the FC image bake chain).
+#                       engram-bootstrap was collapsed into
+#                       engram-agentd by ADR 0015 M1 (`75ba2df`).
 #   - test-firecracker: every `#[ignore]`'d FC integration test under
 #                       nested virt. Unprivileged set: boot, lifecycle,
 #                       snapshot, snapshot_uffd, exec_real_vm,
@@ -219,13 +220,12 @@ jobs:
       # produce on Linux. If any of these stop building the demo bake
       # path is broken even when the host-target workspace check is
       # green.
-      - name: build agentd + bootstrap (musl)
+      - name: build agentd (musl)
         run: |
           cargo build \
             --target x86_64-unknown-linux-musl \
             --release \
-            -p engram-agentd \
-            -p engram-bootstrap
+            -p engram-agentd
 
       - name: build harness wrappers (musl)
         run: |
@@ -369,10 +369,11 @@ jobs:
       # exec_real_vm + harness_loopback bake static binaries into a
       # rootfs at runtime and boot it; the binaries must be musl-static
       # so they run against whatever libc the rootfs ships. proxy_e2e
-      # additionally needs engram-bootstrap and engram-harness-noop
-      # statically linked for the harness path it shares with
-      # harness_loopback.
-      - name: Build static musl binaries (agentd / bootstrap / noop / harness-claude)
+      # needs engram-harness-noop statically linked for the harness
+      # path it shares with harness_loopback. (ADR 0015 M1 collapsed
+      # engram-bootstrap into engram-agentd; the standalone crate is
+      # gone.)
+      - name: Build static musl binaries (agentd / noop / harness-claude)
         # engram-harness-claude is the real wrapper that the
         # e2e_harness tests load into the harness substrate at
         # `/claude/harness`. Building it here lets the same `target/`
@@ -381,7 +382,6 @@ jobs:
         run: |
           cargo build \
             -p engram-agentd \
-            -p engram-bootstrap \
             -p engram-harness-noop \
             -p engram-harness-claude \
             --target x86_64-unknown-linux-musl \

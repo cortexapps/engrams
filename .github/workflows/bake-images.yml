@@ -69,10 +69,12 @@ jobs:
           # deployed binary, so excluding them stops a CLI-only or
           # image-builder-only commit from triggering the entire
           # container-bake + FC-host-rebake + helm-deploy + TF-apply
-          # fan-out. engram-agentd / engram-bootstrap are baked
-          # *into the demo image* (which has its own manual bake
-          # workflow), so they don't affect coord/web/host-agent
-          # container images either. engram-harness-* belongs to
+          # fan-out. engram-agentd is baked *into the demo image*
+          # (which has its own manual bake workflow), so it doesn't
+          # affect coord/web/host-agent container images either.
+          # (ADR 0015 M1 collapsed engram-bootstrap into agentd; the
+          # standalone crate is gone, so it doesn't need its own
+          # negation here.) engram-harness-* belongs to
           # bake-harness-claude's lane, which has its own narrow
           # filters.
           filters: |
@@ -83,7 +85,6 @@ jobs:
               - '!crates/engram-cli/**'
               - '!crates/engram-image-builder/**'
               - '!crates/engram-agentd/**'
-              - '!crates/engram-bootstrap/**'
               - '!crates/engram-harness-claude/**'
               - '!crates/engram-harness-noop/**'
               - '!crates/engram-harness-proto/**'
@@ -98,7 +99,6 @@ jobs:
               - '!crates/engram-cli/**'
               - '!crates/engram-image-builder/**'
               - '!crates/engram-agentd/**'
-              - '!crates/engram-bootstrap/**'
               - '!crates/engram-harness-claude/**'
               - '!crates/engram-harness-noop/**'
               - '!crates/engram-harness-proto/**'
