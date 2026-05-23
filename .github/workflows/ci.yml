@@ -113,6 +113,12 @@ jobs:
       # workflow that touches Rust uses the same step.
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
 
@@ -166,6 +172,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - name: Install nextest
@@ -237,6 +249,12 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - name: Install musl-tools
@@ -321,6 +339,12 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -597,6 +621,12 @@ jobs:
       # ADR 0013: engram-protocol/build.rs needs protoc.
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install musl tooling
@@ -726,6 +756,12 @@ jobs:
 
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install musl tooling
@@ -829,6 +865,12 @@ jobs:
 
       - uses: arduino/setup-protoc@v3
         with:
+          # Pin per the engrams-internal flake-reduction learning: the
+          # action's "find the latest version" GH API path returns
+          # `Bad credentials` ~once in 20 runs (no retry, no helpful
+          # message — just a fast 401). Pinning skips that lookup and
+          # downloads the protoc release directly.
+          version: "25.9"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache cargo build (for the e2e test binary itself)
