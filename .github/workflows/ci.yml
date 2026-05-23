@@ -782,6 +782,17 @@ jobs:
       - artifacts-e2e-stack
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    # `contents: read` for the checkout; `packages: read` so this
+    # job's GITHUB_TOKEN can pull ghcr.io/cortexapps/engrams/
+    # harness-claude:main (and ghcr.io/cortexapps/engrams/demo:main
+    # once that's published). The token is wired through to the
+    # coord's `registry_credentials` table via `engram-cli registry
+    # add` below — host-agent then asks coord per ADR 0013's
+    # HttpAuthResolver path; never writes creds to docker config or
+    # disk.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v6
 
@@ -863,13 +874,6 @@ jobs:
           bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
             --cache-dir "$HOME/.cache/engram-fc-test"
 
-      - name: Log in to GHCR (pull-only — Claude harness pack)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       # integration-up.sh boots: postgres + fake-gcs + registry via
       # docker-compose, then coord + host-agent as background
       # processes. ENGRAM_INTEG_BIN_DIR=target/release tells it to
@@ -884,6 +888,24 @@ jobs:
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
           bash deploy/dev/integration-up.sh
 
+      # ADR 0013: host-agent doesn't read docker config; it asks
+      # the coord per-pull, and the coord reads sealed credentials
+      # from the `registry_credentials` PG table populated via
+      # `engram-cli registry add`. Seed ghcr.io with the GITHUB_TOKEN
+      # this job was issued (the `permissions: packages: read` block
+      # at the top of this job is what makes it pullable). Pipe via
+      # --password-stdin so the token never lands in argv / ps.
+      - name: Seed GHCR credential in coord PG
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | ./target/release/engram-cli \
+              --endpoint http://localhost:8090 \
+              registry add \
+              --host ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+
       - name: Bake demo image + capture URI
         run: |
           IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
@@ -897,7 +919,9 @@ jobs:
           # The host-agent's prefetch supervisor pulls it on first
           # session use (a few seconds; cached on the runner for
           # subsequent tests).
-          ./target/release/engram-cli harness add \
+          ./target/release/engram-cli \
+              --endpoint http://localhost:8090 \
+              harness add \
               --name claude \
               --registry-uri ghcr.io/cortexapps/engrams/harness-claude:main
 
