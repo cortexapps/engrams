@@ -157,6 +157,19 @@ pub async fn drain_session(
     // just lets us release Firecracker handles cleanly. Failure is
     // expected sometimes (mid-shutdown FC API may be unresponsive).
     state.registry.unbind(session_id);
+    // ADR 0015 M3: drop the HostRegistry sandbox-owner row before
+    // we destroy the sandbox. Otherwise a concurrent request can
+    // take the cache fast path and route to a host that's already
+    // mid-shutdown. The eventual `destroy` call below is best-
+    // effort; the cache invalidation is the load-bearing step.
+    if let Some(prev_host) = state.host_registry.invalidate_sandbox(sandbox_id) {
+        tracing::debug!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            prev_host = %prev_host,
+            "preemption drain: invalidated HostRegistry cache before destroy",
+        );
+    }
     if let Err(e) = state.services.host.destroy(sandbox_id).await {
         tracing::debug!(
             session_id = %session_id,

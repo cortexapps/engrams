@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use engram_coordinator::reconcile::{Reconciler, DEFAULT_GRACE_TICKS};
 use engram_coordinator::state::SessionEventBus;
+use engram_coordinator::HostRegistry;
 use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::HarnessSpec;
@@ -337,6 +338,8 @@ impl MetadataStore for ReconcileMeta {
 #[tokio::test]
 async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host = HostId::new();
@@ -360,7 +363,7 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     // heartbeat. No flips expected.
     let running = vec![sb_recoverable, sb_dead, sb_present];
     let flipped = reconciler
-        .reconcile_with_deps(meta.as_ref(), &events, host, &running)
+        .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &running)
         .await;
     assert!(flipped.is_empty(), "no missing sandboxes → no flips");
 
@@ -370,7 +373,7 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     let after_crash = vec![sb_present];
     for _ in 0..(DEFAULT_GRACE_TICKS as usize - 1) {
         let flipped = reconciler
-            .reconcile_with_deps(meta.as_ref(), &events, host, &after_crash)
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &after_crash)
             .await;
         assert!(
             flipped.is_empty(),
@@ -380,7 +383,7 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     // On the N-th consecutive missing heartbeat, both crashed
     // sessions cross the strike threshold and flip.
     let mut flipped = reconciler
-        .reconcile_with_deps(meta.as_ref(), &events, host, &after_crash)
+        .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &after_crash)
         .await;
     flipped.sort();
     let mut expected = vec![s_recoverable, s_dead];
@@ -456,6 +459,8 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
 #[tokio::test]
 async fn re_appearing_sandbox_within_grace_does_not_flip() {
     let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host = HostId::new();
@@ -465,13 +470,13 @@ async fn re_appearing_sandbox_within_grace_does_not_flip() {
     // Two consecutive missing ticks…
     for _ in 0..(DEFAULT_GRACE_TICKS - 1) {
         let flipped = reconciler
-            .reconcile_with_deps(meta.as_ref(), &events, host, &[])
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
             .await;
         assert!(flipped.is_empty());
     }
     // …then the sandbox re-appears. Strikes counter must reset to 0.
     let flipped = reconciler
-        .reconcile_with_deps(meta.as_ref(), &events, host, &[sb])
+        .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[sb])
         .await;
     assert!(
         flipped.is_empty(),
@@ -482,12 +487,12 @@ async fn re_appearing_sandbox_within_grace_does_not_flip() {
     // just one (since the counter is back at 0).
     for _ in 0..(DEFAULT_GRACE_TICKS - 1) {
         let flipped = reconciler
-            .reconcile_with_deps(meta.as_ref(), &events, host, &[])
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
             .await;
         assert!(flipped.is_empty(), "post-recovery, strikes started over");
     }
     let flipped = reconciler
-        .reconcile_with_deps(meta.as_ref(), &events, host, &[])
+        .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
         .await;
     assert_eq!(flipped, vec![session], "flip on the (n+1)th total miss");
 }
@@ -498,6 +503,8 @@ async fn re_appearing_sandbox_within_grace_does_not_flip() {
 #[tokio::test]
 async fn does_not_re_flip_already_terminal_sessions() {
     let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host = HostId::new();
@@ -507,7 +514,7 @@ async fn does_not_re_flip_already_terminal_sessions() {
     // First strike-out cycle → flip to Dead (no snapshot).
     for _ in 0..DEFAULT_GRACE_TICKS {
         reconciler
-            .reconcile_with_deps(meta.as_ref(), &events, host, &[])
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
             .await;
     }
     assert_eq!(meta.status(session), SessionState::Dead);
@@ -519,7 +526,7 @@ async fn does_not_re_flip_already_terminal_sessions() {
     // further or emit additional events.
     for _ in 0..(DEFAULT_GRACE_TICKS * 2) {
         reconciler
-            .reconcile_with_deps(meta.as_ref(), &events, host, &[])
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
             .await;
     }
     assert_eq!(meta.status(session), SessionState::Dead);
@@ -536,6 +543,8 @@ async fn does_not_re_flip_already_terminal_sessions() {
 #[tokio::test]
 async fn reconcile_does_not_flip_sessions_on_other_hosts() {
     let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host_a = HostId::new();
@@ -551,7 +560,7 @@ async fn reconcile_does_not_flip_sessions_on_other_hosts() {
     // Active because its host (B) never reported anything.
     for _ in 0..DEFAULT_GRACE_TICKS {
         reconciler
-            .reconcile_with_deps(meta.as_ref(), &events, host_a, &[])
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host_a, &[])
             .await;
     }
     assert_eq!(meta.status(session_a), SessionState::Dead);
@@ -559,5 +568,48 @@ async fn reconcile_does_not_flip_sessions_on_other_hosts() {
         meta.status(session_b),
         SessionState::Active,
         "host_a's reconcile must not affect host_b's sessions"
+    );
+}
+
+/// ADR 0015 M3: when the reconcile pass flips Active → HostLost,
+/// the corresponding HostRegistry `sandbox_owner` entry must be
+/// gone. Without this, a subsequent `exec_stream(sb)` would take
+/// the cache fast path against a host whose session PG already
+/// knows is HostLost, returning a tcp-connect-error or a stale
+/// NotFound instead of a clean 410.
+#[tokio::test]
+async fn reconcile_invalidates_host_registry_cache_on_host_lost() {
+    let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
+    let events = Arc::new(SessionEventBus::new(64));
+    let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
+    let host = HostId::new();
+    let sb_lost = SandboxId::new();
+    let sb_alive = SandboxId::new();
+    meta.seed_active(host, sb_lost);
+    meta.seed_active(host, sb_alive);
+
+    // Mirror what create_for_session would have done at session
+    // create time: seed the in-memory ownership cache.
+    host_registry.record_sandbox_owner(sb_lost, host);
+    host_registry.record_sandbox_owner(sb_alive, host);
+
+    // sb_alive keeps showing up in the heartbeat; sb_lost vanishes.
+    for _ in 0..DEFAULT_GRACE_TICKS {
+        reconciler
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[sb_alive])
+            .await;
+    }
+
+    assert_eq!(
+        host_registry.host_of(sb_lost),
+        None,
+        "the flipped sandbox's cache row must be purged so a stale exec gets a 410, not a 404"
+    );
+    assert_eq!(
+        host_registry.host_of(sb_alive),
+        Some(host),
+        "the alive sandbox's cache row must survive — selective per-sandbox invalidation"
     );
 }

@@ -32,6 +32,7 @@ use engram_core::{HostId, SandboxId, SessionId};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::host_registry::HostRegistry;
 use crate::state::{SessionEvent, SessionEventBus, SharedState};
 
 /// Default number of consecutive heartbeats a sandbox must be
@@ -96,6 +97,7 @@ impl Reconciler {
         self.reconcile_with_deps(
             state.services.meta.as_ref(),
             &state.events,
+            &state.host_registry,
             host_id,
             running_sandboxes,
         )
@@ -106,10 +108,18 @@ impl Reconciler {
     /// tests. Returns the list of session-ids that crossed the strike
     /// threshold and got flipped this tick — caller can log / emit
     /// events / surface in `/api/admin/reconcile-now` responses.
+    ///
+    /// `host_registry` is consulted on every flip so the M3
+    /// invariant "PG and the in-memory cache move together" holds:
+    /// the sandbox-owner row gets dropped before we clear the DB,
+    /// avoiding the window where a concurrent reader sees a stale
+    /// in-memory route after PG already knows the session is
+    /// HostLost.
     pub async fn reconcile_with_deps(
         &self,
         meta: &dyn MetadataStore,
         events: &SessionEventBus,
+        host_registry: &HostRegistry,
         host_id: HostId,
         running_sandboxes: &[SandboxId],
     ) -> Vec<SessionId> {
@@ -122,13 +132,21 @@ impl Reconciler {
             }
         };
 
+        // Precompute the per-session sandbox_id from the assignments
+        // we already pulled — `flip_missing` needs it to invalidate
+        // the HostRegistry cache, and an extra `get_session` round-
+        // trip just to recover it would be wasteful.
+        let sandbox_by_session: HashMap<SessionId, SandboxId> =
+            assignments.iter().copied().collect();
+
         let to_flip = {
             let mut strikes = self.strikes.lock();
             apply_strikes(&mut strikes, &assignments, &running, self.grace_ticks)
         };
 
         for session_id in &to_flip {
-            flip_missing(meta, events, *session_id, host_id).await;
+            let sb = sandbox_by_session.get(session_id).copied();
+            flip_missing(meta, events, host_registry, *session_id, host_id, sb).await;
         }
         to_flip
     }
@@ -137,8 +155,10 @@ impl Reconciler {
 async fn flip_missing(
     meta: &dyn MetadataStore,
     events: &SessionEventBus,
+    host_registry: &HostRegistry,
     session_id: SessionId,
     host_id: HostId,
+    sandbox_id: Option<SandboxId>,
 ) {
     // Cheap idempotency: if the session is already in target state
     // (or terminal beyond it), skip. Avoids racing with an operator
@@ -158,6 +178,28 @@ async fn flip_missing(
             "reconcile: session already in non-active state; skipping flip"
         );
         return;
+    }
+
+    // ADR 0015 M3: drop the HostRegistry cache row *before* we
+    // touch PG. Order matters — a reader that races us either:
+    //   - takes the in-memory miss path and asks PG (which still
+    //     says Active, but the host already failed reconcile so
+    //     subsequent RPCs error out fast), or
+    //   - sees the fresh PG state we're about to write (HostLost
+    //     → SandboxError::HostLost → 410).
+    // The reverse order would briefly admit a window where a
+    // reader hits the cache fast path against a host the
+    // reconciler already knows is missing this sandbox.
+    let sandbox_id = sandbox_id.or(session.sandbox_id);
+    if let Some(sb) = sandbox_id {
+        if let Some(prev_host) = host_registry.invalidate_sandbox(sb) {
+            tracing::debug!(
+                session_id = %session_id,
+                sandbox_id = %sb,
+                prev_host = %prev_host,
+                "reconcile: invalidated HostRegistry cache before HostLost transition"
+            );
+        }
     }
 
     // Clear sandbox_id so coord routing and a future restart's
