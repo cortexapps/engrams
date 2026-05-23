@@ -88,6 +88,53 @@ export interface ListHostsResponse {
   hosts: HostView[];
 }
 
+// ---- ADR 0016 Phase A: COW state diagnostic ---------------------------
+//
+// Mirrors `engram_coordinator::cow_state::CowStateView` (Rust). One row
+// per chunk-tracked sandbox; rendered by `components/CowState.tsx` in
+// the host card and session detail page.
+
+export interface CowStateView {
+  sandbox_id: string;
+  session_id: string | null;
+  /** Current disk manifest version. Ticks on every `flush()`. */
+  disk_manifest_id: string;
+  disk_manifest_version: number;
+  /** Dirty chunks resident in host RAM (not yet flushed to BlobStorage). */
+  dirty_chunks: number;
+  dirty_bytes: number;
+  /** ISO-8601 timestamp of the last successful `flush()`. `null` =
+   * never flushed since the backend was constructed. */
+  last_flush_at: string | null;
+  /** Total chunks the disk manifest references. */
+  base_chunks: number;
+  /** Of `base_chunks`, how many are resident on this host's local
+   * NVMe cache vs. fetched on-demand from BlobStorage. */
+  base_chunks_local: number;
+  /** Most recent memory manifest captured in a snapshot. `null` if
+   * the session has never been snapshotted. */
+  memory_manifest_id: string | null;
+  memory_manifest_version: number | null;
+  /** ISO-8601 timestamp of the last successful snapshot. `null` =
+   * never snapshotted. */
+  last_snapshot_at: string | null;
+}
+
+export interface HostCowStateResponse {
+  host_id: string;
+  sessions: CowStateView[];
+}
+
+export interface SessionCowStateResponse {
+  session_id: string;
+  /** `null` when the session has no live sandbox (Idle, HostLost,
+   * Pending, terminal) — the disk-tier numbers don't exist. The
+   * memory-tier fields would still be projectable from PG but
+   * we don't surface them here; consumers can read the
+   * snapshot-row endpoint instead. */
+  state: CowStateView | null;
+}
+
 // ---- Image registry (for the create-session form) ---------------------
 
 /** Harness available on this deployment — read from `/api/harnesses`,

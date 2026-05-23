@@ -1,5 +1,6 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import type { HostView } from '../types';
+import { HostCowState } from './CowState';
 
 // "Manifest" because the visual model is a typeset ledger — entries
 // listed in order with capacity / snapshot counts in a tabular row.
@@ -70,6 +71,7 @@ function HostBlock({ host }: { host: HostView }) {
           {host.local_snapshots > 0 && ` · ${host.local_snapshots} snapshots`}
         </span>
       </div>
+      {host.status !== 'dead' && <HostCowState hostId={host.id} />}
     </motion.div>
   );
 }

@@ -8,6 +8,7 @@ import { PromptComposer } from '../components/PromptComposer';
 import { TabRow } from '../components/TabRow';
 import { TerminalPane } from '../components/TerminalPane';
 import { relativeTime } from '../components/SessionManifest';
+import { SessionCowState } from '../components/CowState';
 
 type ViewTab = 'transcript' | 'shell' | 'raw';
 
@@ -82,6 +83,16 @@ export function SessionDetail() {
           >
             image {session.image} · created{' '}
             {relativeTime(session.created_at)} ago · {events.length} events
+          </div>
+        )}
+
+        {/* ADR 0016 Phase A: per-session COW state. Lives in the
+            header so it's visible regardless of which tab the user
+            is on — operators looking at a session usually want to
+            know "is my work durable yet" without hunting for it. */}
+        {id && (
+          <div className="mt-4">
+            <SessionCowState sessionId={id} />
           </div>
         )}
 

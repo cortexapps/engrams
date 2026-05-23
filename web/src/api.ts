@@ -7,12 +7,14 @@ import type {
   HarnessDescriptor,
   HarnessPackSummary,
   HarnessSpec,
+  HostCowStateResponse,
   ImageRef,
   ListEnabledImagesResponse,
   ListHostsResponse,
   ListRegistriesResponse,
   ListSessionsResponse,
   Session,
+  SessionCowStateResponse,
 } from './types';
 
 // Same-origin in dev (Vite proxy → :8090). In a hosted prod build,
@@ -73,6 +75,17 @@ export const fetchHosts = () =>
 
 export const fetchSession = (id: string) =>
   getJSON<Session>(`/sessions/${id}`);
+
+// ---- ADR 0016 Phase A: COW state diagnostic --------------------------
+
+/** Per-host COW snapshot. One row per chunk-tracked sandbox. */
+export const fetchHostCowState = (hostId: string) =>
+  getJSON<HostCowStateResponse>(`/api/hosts/${hostId}/cow-state`);
+
+/** Per-session COW snapshot. `state` is `null` when the session has
+ * no live sandbox (Idle / HostLost / Pending / terminal). */
+export const fetchSessionCowState = (sessionId: string) =>
+  getJSON<SessionCowStateResponse>(`/sessions/${sessionId}/cow-state`);
 
 export const fetchHarnesses = () =>
   getJSON<HarnessDescriptor[]>('/api/harnesses');
