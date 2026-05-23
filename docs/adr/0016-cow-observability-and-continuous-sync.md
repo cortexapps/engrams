@@ -299,16 +299,44 @@ client, same pool. Maybe heartbeat's smaller payload hits a happy
 path; maybe reqwest's connection reuse policy plays differently
 with the two URLs.
 
-**Fix (proposed)**: add `pool_max_idle_per_host(0)` for the
-eviction-only path, OR add `pool_idle_timeout(Duration::ZERO)` to
-the shared client globally. Cheap, lossy on H2 multiplexing but
-right answer until we understand the root cause. The richer fix is
-a code-level investigation into reqwest's stale-connection
-detection on H2.
+**Fix shipped**: tighten `pool_idle_timeout` on the shared
+`reqwest::Client` from 90s to 10s
+(`crates/engram-host-agent/src/coord_client.rs:CoordClient::new`).
 
-A.1.1's new logs will tell us whether coord ever receives these
-POSTs partially — that disambiguates "TCP stuck" from "request
-sent, response lost."
+The cadence math justifies the value:
+- heartbeat fires every 5s, so a pooled connection stays warm
+  (re-uses on the next tick before the 10s timer expires).
+- harness_event fires per in-VM event, often sub-second during an
+  active run; pool stays warm during activity.
+- idle-eviction-candidates fires every 30s+ (the host's
+  `DEFAULT_POLL_INTERVAL` is 10s but the soft-TTL gate before a
+  POST happens ≥ 30s after harness_idle); pool entry is always >
+  10s old → always opens a fresh TCP. The stale-connection class
+  becomes structurally unreachable on this lane.
+
+Per-request overhead: one TCP connect over the internal LB
+(~5-10ms). Negligible against the workload.
+
+Also added: a `tracing::debug!` in `push_idle_eviction_candidates`
+that logs the reqwest `Error` kind (`is_connect`, `is_timeout`,
+`is_request`, `is_body`) on transport-level failures. The
+caller's `lib.rs::eviction_task` already logs the higher-level
+error; this is the per-class breakdown that lets us distinguish
+"stale pool" (is_connect=true) from "DNS" / "request body" / etc.
+in future investigations.
+
+A.1.1's `evict_idle_session` entry log on the coord side is the
+companion data point — together they let an investigator see
+whether a given POST attempt reached coord (entry log + completed
+log appear) or never made it past the host (transport-error log
+on host, nothing on coord).
+
+**Validation plan** (no prod hotfix): dev-vm can approximate this
+by killing+restarting the local coord mid-session. GCP LB
+connection-reset on backend roll isn't reproducible on localhost
+(no LB in the loop), but the "stale TCP after server restart"
+mechanic is the same, and the 10s timeout means recovery is
+bounded.
 
 ### A.1.4 — `ws://` scheme in fc-host-mig TF
 

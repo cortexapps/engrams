@@ -45,7 +45,35 @@ pub struct CoordClient {
 impl CoordClient {
     pub fn new(coord_url: String, auth_token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            // ADR 0016 §A.1.3: 10s pool-idle timeout (was 90s).
+            //
+            // Why tighten it. The coord LB front-end IP (10.10.0.2) is
+            // stable but the back-end pod rolls on every helm-deploy
+            // (multiple times per merge to main). GCP internal HTTP
+            // LB resets connections to drained back-ends, so any
+            // pooled TCP connection bound to a now-gone pod fails
+            // with `connection reset` on next reuse — surfaced to
+            // reqwest as a transport error.
+            //
+            // The lanes here have very different cadences:
+            //   - heartbeat: every 5s → pooled connection stays warm
+            //   - harness_event: per in-VM event, can be sub-second
+            //   - idle_eviction_candidates: every 30s+ → pool entry
+            //     can be 30-89s old → high stale-rate
+            //
+            // 10s pool idle keeps heartbeat + harness_event efficient
+            // (one cached TCP connection across each session of
+            // activity) but ensures slower lanes always pick a fresh
+            // connection. Per-request overhead is one TCP connect
+            // (~5-10ms over the internal LB) — negligible against
+            // the workload.
+            //
+            // Surfaced on 2026-05-23 during the COW diagnostic
+            // spot-check on session 96392fd3: the host's
+            // idle-eviction POSTs failed with `transport error`
+            // while heartbeats on the same `CoordClient` succeeded.
+            // Diagnosis: stale pool connection, exactly this class.
+            .pool_idle_timeout(Some(Duration::from_secs(10)))
             .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client builder must not fail with default config");
@@ -155,11 +183,27 @@ impl CoordClient {
         let url = self.endpoint(&format!("/api/hosts/{host_id}/idle-eviction-candidates"));
         let body = IdleEvictionCandidatesRequest { candidates };
         let builder = self.http.post(&url);
-        let resp = self
-            .auth(builder, &body)
-            .send()
-            .await
-            .map_err(CoordClientError::Transport)?;
+        let resp = match self.auth(builder, &body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // ADR 0016 §A.1.3: structured transport-error log
+                // so we can attribute pool-staleness vs DNS vs
+                // genuine connect-refused. The caller's existing
+                // "POST failed; retrying next tick" line in
+                // `lib.rs::eviction_task` loses this detail.
+                tracing::debug!(
+                    %host_id,
+                    is_connect = e.is_connect(),
+                    is_timeout = e.is_timeout(),
+                    is_request = e.is_request(),
+                    is_body = e.is_body(),
+                    error = %e,
+                    "idle-eviction transport error (reqwest); \
+                     `is_connect=true` usually means stale pool conn",
+                );
+                return Err(CoordClientError::Transport(e));
+            }
+        };
         decode_json(resp, "idle_eviction_candidates").await
     }
 }
