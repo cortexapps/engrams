@@ -30,6 +30,32 @@ name: CI
 #                       mounts: host_startup, proxy_e2e, snapshot_net,
 #                       patch_drive_swap, option_d_warm_lease.
 #   - web:              pnpm install + tsc + vite build + vitest
+#   - bake-demo-image:  push-to-main only. Bakes the canonical
+#                       deploy/demo rootfs as a chunked-OCI artifact
+#                       and pushes to
+#                       `ghcr.io/cortexapps/engrams/demo:warm-<sha>`
+#                       (+ :main / :latest aliases). Relocated from
+#                       engrams-internal/bake-demo-image.yml so the
+#                       prod demo image and the test image come from
+#                       one publish path.
+#   - artifacts-e2e-stack: release-builds engram-coordinator +
+#                       engram-host-agent + engram-cli + musl
+#                       engram-agentd ONCE and uploads as a workflow
+#                       artifact. Consumed by `test-e2e-stack` so
+#                       the e2e lane doesn't pay the compile cost
+#                       again.
+#   - test-e2e-stack:   true end-to-end against the prod-shape
+#                       stack: real coord HTTP API + real gRPC + real
+#                       host-agent + real Firecracker + real chunked
+#                       OCI via fake-gcs + real local registry +
+#                       published Claude harness pack. Runs three
+#                       flows: cold session with harness=none + exec
+#                       ls; cold session with harness=claude + exec
+#                       ls; cold session with harness=claude + bogus
+#                       API key + prompt → assert auth failure event.
+#                       Closes the gap that let prod session
+#                       8725648d's empty-Binary-frame bug ship (all
+#                       existing FC tests bypass the coord HTTP path).
 #
 # All jobs run on Blacksmith Linux runners
 # (https://docs.blacksmith.sh/blacksmith-runners/overview) — faster
@@ -540,4 +566,368 @@ jobs:
       - name: Restore ownership after sudo tests
         if: always()
         run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  # ------------------------------------------------------------------
+  # Demo image bake — relocated from
+  # engrams-internal/.github/workflows/bake-demo-image.yml so the
+  # production demo image and the e2e test image come from one
+  # publish path. Push-to-main only (PRs don't need to push; the
+  # e2e lane bakes its own image locally for test isolation). After
+  # this commit lands and one push-to-main produces the OSS-namespace
+  # image, delete bake-demo-image.yml from the engrams-internal repo
+  # and repoint its helm values at ghcr.io/cortexapps/engrams/demo.
+  # ------------------------------------------------------------------
+  bake-demo-image:
+    name: bake demo image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+          target: x86_64-unknown-linux-musl
+
+      # ADR 0013: engram-protocol/build.rs needs protoc.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install musl tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bake-demo-image
+
+      - name: Build engram-cli + static-musl agentd
+        run: |
+          # Static-musl agentd goes inside the guest rootfs via
+          # --inject-agent. (ADR 0015 M1 collapsed engram-bootstrap
+          # into engram-agentd, `75ba2df`.)
+          cargo build --release --target x86_64-unknown-linux-musl \
+              -p engram-agentd
+          # engram-cli runs on the host to drive the bake + push.
+          cargo build --release -p engram-cli
+
+      - name: Stage demo source
+        run: |
+          mkdir -p var/demo
+          cp deploy/demo/Dockerfile  var/demo/
+          cp deploy/demo/engram.toml var/demo/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: tags
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          BASE="ghcr.io/${{ github.repository }}/demo"
+          SHORT="${SHA:0:7}"
+          # `engram-cli image build --push` pushes to a single URI per
+          # call; we push once to the SHA-tagged variant and then
+          # alias :short / :latest / :main via crane.
+          echo "primary=$BASE:warm-$SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "extra_tags<<EOF"
+            echo "$BASE:warm-$SHORT"
+            echo "$BASE:main"
+            echo "$BASE:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bake + push demo image
+        env:
+          # engram-cli's tracing subscriber defaults to `warn`. Bump
+          # to `info` for the image-builder crate so the bake log
+          # surfaces the chunked-rootfs push progress.
+          RUST_LOG: info,engram_image_builder=info
+          PUSH_URI: ${{ steps.tags.outputs.primary }}
+        run: |
+          echo "Building + pushing $PUSH_URI"
+          # Binary follows the cargo package name (`engram-cli`); the
+          # `engram` you type at the shell is just clap's command-name,
+          # not the filename.
+          #
+          # ADR 0015 M5 (`18be1ad`) retired bake-time canonical
+          # memory capture along with the warm pool + `templates`
+          # table. Hot-tier startup is now driven by host prefetch
+          # of the chunked rootfs from BlobStorage on enable-image,
+          # not by a bake-time memory snapshot.
+          ./target/release/engram-cli image build \
+              --repo "${{ github.repository }}/demo" \
+              --tag "warm-${{ github.sha }}" \
+              --source var/demo \
+              --format ext4 \
+              --images-dir var/engram/images \
+              --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
+              --push "$PUSH_URI"
+          echo "Pushed: $PUSH_URI"
+
+      - name: Mirror primary tag to alias tags
+        env:
+          PRIMARY: ${{ steps.tags.outputs.primary }}
+          EXTRA_TAGS: ${{ steps.tags.outputs.extra_tags }}
+        run: |
+          # crane copies tags without re-uploading layers — saves
+          # bandwidth vs `docker pull && tag && push`. Same pattern
+          # bake-harness-claude.yml uses.
+          curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+            | sudo tar -xzf - -C /usr/local/bin crane
+          crane auth login ghcr.io \
+            -u "${{ github.actor }}" \
+            -p "${{ secrets.GITHUB_TOKEN }}"
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Mirroring $PRIMARY -> $tag"
+            crane copy "$PRIMARY" "$tag"
+          done <<< "$EXTRA_TAGS"
+
+      - name: Summarize
+        if: always()
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          echo "## Demo image bake" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- engrams SHA: \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- pushed: \`ghcr.io/${{ github.repository }}/demo:warm-$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # Build the release binaries the e2e lane consumes. Separated so the
+  # ~3min compile happens once and the e2e job downloads via the
+  # workflow artifact rather than rebuilding. Cache key shares with
+  # `test-firecracker` so deps are warm.
+  # ------------------------------------------------------------------
+  artifacts-e2e-stack:
+    name: build e2e binaries
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+          target: x86_64-unknown-linux-musl
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install musl tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-stack-binaries
+
+      - name: Build host binaries (release)
+        run: |
+          cargo build --release \
+              -p engram-coordinator \
+              -p engram-host-agent \
+              -p engram-cli
+
+      - name: Build musl agentd (release)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl \
+              -p engram-agentd
+
+      - name: Upload e2e binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-binaries
+          path: |
+            target/release/engram-coordinator
+            target/release/engram-host-agent
+            target/release/engram-cli
+            target/x86_64-unknown-linux-musl/release/engram-agentd
+          retention-days: 1
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # True end-to-end against the prod-shape stack. Brings up postgres
+  # + fake-gcs + local registry + real coord + real host-agent + real
+  # Firecracker; bakes the demo image locally; pulls the published
+  # Claude harness pack; runs the three flows in `e2e_stack.rs`.
+  #
+  # DAG dep on all the cheap gates so a fmt-broken or unit-broken
+  # PR doesn't burn 5min spinning up the stack just to fail. Runs
+  # in parallel with `bake-images.yml` so total OSS CI wall-clock
+  # stays bounded by `test-firecracker`.
+  # ------------------------------------------------------------------
+  test-e2e-stack:
+    name: e2e stack (coord HTTP → gRPC → FC)
+    needs:
+      - lint
+      - test-linux
+      - web
+      - cross-musl-linux
+      - test-firecracker
+      - artifacts-e2e-stack
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download e2e binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-binaries
+          path: ./target-artifacts/
+
+      - name: Stage downloaded binaries into target/release
+        run: |
+          # The artifact preserves the cargo path structure so the
+          # download lands at target-artifacts/target/release/... and
+          # target-artifacts/target/x86_64-unknown-linux-musl/release/...
+          # Move them under ./target so integration-up.sh + the bake
+          # script find them where they expect.
+          mkdir -p target/release
+          mkdir -p target/x86_64-unknown-linux-musl/release
+          mv target-artifacts/target/release/engram-coordinator         target/release/
+          mv target-artifacts/target/release/engram-host-agent          target/release/
+          mv target-artifacts/target/release/engram-cli                 target/release/
+          mv target-artifacts/target/x86_64-unknown-linux-musl/release/engram-agentd \
+             target/x86_64-unknown-linux-musl/release/
+          chmod +x target/release/engram-{coordinator,host-agent,cli}
+          chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
+          rm -rf target-artifacts
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+
+      # nextest is what every other test step in this workflow uses.
+      - uses: taiki-e/install-action@nextest
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo build (for the e2e test binary itself)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-stack-tests
+
+      # Same KVM + UFFD relax pattern test-firecracker uses (lines
+      # 308-312 above). Blacksmith runners ship /dev/kvm but the
+      # default perms exclude non-root user processes.
+      - name: Relax KVM + UFFD permissions
+        run: |
+          sudo chmod 0666 /dev/kvm
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          sudo chmod 0666 /dev/userfaultfd
+
+      - name: Install build deps (musl-tools, e2fsprogs)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              musl-tools e2fsprogs jq bc python3
+
+      - name: Install firecracker (v1.10.1)
+        run: |
+          FC_VER=v1.10.1
+          curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" \
+            -o /tmp/fc.tgz
+          tar -xzf /tmp/fc.tgz -C /tmp
+          sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" \
+              /usr/local/bin/firecracker
+          firecracker --version
+
+      - name: Cache FC kernel + rootfs artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/engram-fc-test
+          key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
+          restore-keys: |
+            fc-test-artifacts-
+
+      - name: Fetch FC kernel + rootfs artifacts
+        run: |
+          bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
+            --cache-dir "$HOME/.cache/engram-fc-test"
+
+      - name: Log in to GHCR (pull-only — Claude harness pack)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # integration-up.sh boots: postgres + fake-gcs + registry via
+      # docker-compose, then coord + host-agent as background
+      # processes. ENGRAM_INTEG_BIN_DIR=target/release tells it to
+      # skip the cargo build and run the binaries we downloaded.
+      # ENGRAM_SKIP_WEB=1 because there's no browser in CI to drive
+      # the SPA.
+      - name: Bring up prod-shape stack
+        env:
+          ENGRAM_INTEG_BIN_DIR: ./target/release
+          ENGRAM_SKIP_WEB: "1"
+        run: |
+          export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
+          bash deploy/dev/integration-up.sh
+
+      - name: Bake demo image + capture URI
+        run: |
+          IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
+          echo "    baked image: $IMAGE_URI"
+          echo "ENGRAM_E2E_IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Register Claude harness pack (prod image)
+        run: |
+          # Pulls ghcr.io/cortexapps/engrams/harness-claude:main —
+          # published by bake-harness-claude.yml on every push to main.
+          # The host-agent's prefetch supervisor pulls it on first
+          # session use (a few seconds; cached on the runner for
+          # subsequent tests).
+          ./target/release/engram-cli harness add \
+              --name claude \
+              --registry-uri ghcr.io/cortexapps/engrams/harness-claude:main
+
+      - name: Run e2e_stack tests
+        env:
+          ENGRAM_E2E_COORD_URL: http://127.0.0.1:8090
+          ENGRAM_E2E_HARNESS_NAME: claude
+          # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step.
+        run: |
+          cargo nextest run \
+              -p engram-coordinator \
+              --test e2e_stack \
+              --run-ignored ignored-only \
+              --no-fail-fast \
+              --test-threads=1
+
+      - name: Dump coord + host-agent logs on failure
+        if: failure()
+        run: |
+          echo "--- coord.log (last 200 lines) ---"
+          tail -200 var/integration/coord.log 2>/dev/null || true
+          echo ""
+          echo "--- host-agent.log (last 200 lines) ---"
+          tail -200 var/integration/host-agent.log 2>/dev/null || true
+
+      - name: Tear down stack
+        if: always()
+        run: |
+          bash deploy/dev/integration-down.sh || true
+          # integration-down.sh runs under sudo for the host-agent
+          # kill; chown back so the rust-cache action can read
+          # target/.
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
