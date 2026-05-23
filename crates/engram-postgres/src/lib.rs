@@ -288,6 +288,35 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn host_for_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<(HostId, SessionState)>, MetaError> {
+        // ADR 0015 M3: PG-authoritative read for the
+        // sandbox→host→session-status triple. Single-row, indexed on
+        // `sessions.sandbox_id` (added in the routing-rebuild work in
+        // ADR 0009). LIMIT 1 is paranoia — the column is logically
+        // unique while bound, but the schema doesn't enforce it.
+        let row: Option<(uuid::Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT host_id, status FROM sessions
+            WHERE sandbox_id = $1 AND host_id IS NOT NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(sandbox_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            None => Ok(None),
+            Some((host_uuid, status)) => Ok(Some((
+                HostId(host_uuid),
+                row::parse_session_state_for_lib(&status)?,
+            ))),
+        }
+    }
+
     async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
         let cloud_meta = serde_json::to_value(&host.cloud_metadata)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;

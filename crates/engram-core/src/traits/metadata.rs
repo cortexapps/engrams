@@ -130,6 +130,37 @@ pub trait MetadataStore: Send + Sync {
         sandbox_id: Option<SandboxId>,
     ) -> Result<(), MetaError>;
 
+    /// ADR 0015 M3: PG-authoritative lookup for "which host owns this
+    /// sandbox right now, and what state is its session in?"
+    /// `HostRegistry` calls this on cache miss (or after the per-host
+    /// TTL elapses) to repair stale `sandbox_owner` entries.
+    ///
+    /// Returns `(host_id, session_status)` for the session whose
+    /// `sandbox_id` column matches, or `None` when no row points at
+    /// this sandbox (already orphaned, never existed, or migrated
+    /// away). The `host_id` reflects the row's *current* binding —
+    /// callers should compare it against their in-memory cache and
+    /// repair if drifted. `session_status` lets `HostRegistry` decide
+    /// between `SandboxError::HostLost` (host known dead, 410) and
+    /// `SandboxError::NotFound` (sandbox unknown, 404) without a
+    /// second round-trip.
+    ///
+    /// Default scans `list_active_sessions` and filters in memory —
+    /// fine for in-memory test mocks. Postgres overrides with a
+    /// single-row indexed query.
+    async fn host_for_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<(HostId, SessionState)>, MetaError> {
+        let all = self.list_active_sessions().await?;
+        Ok(all
+            .into_iter()
+            .find_map(|s| match (s.host_id, s.sandbox_id) {
+                (Some(h), Some(sb)) if sb == sandbox_id => Some((h, s.status)),
+                _ => None,
+            }))
+    }
+
     // ---- hosts ----
     async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError>;
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
