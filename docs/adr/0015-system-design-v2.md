@@ -908,6 +908,12 @@ M5 is the cleanest single step that unblocks all of them.
 
 #### Known regression — chunk-store GC deleted (2026-05-23)
 
+**Status (2026-05-23):** redesign in flight — see
+[ADR 0016: COW observability and continuous disk sync](0016-cow-observability-and-continuous-sync.md).
+Phase C of that ADR discharges the "Design constraints for the next
+chunk GC" subsection below. This section stays as the post-mortem;
+the forward design lives in 0016.
+
 **Symptom.** A new FC host couldn't serve sessions for an existing
 enabled image (`demo:warm-6241732`). Coord returned 503
 `image_not_ready`; every host's prefetch supervisor logged
