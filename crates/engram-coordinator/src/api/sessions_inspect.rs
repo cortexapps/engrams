@@ -103,9 +103,11 @@ pub async fn cow_state(
 ) -> Result<Json<SessionCowStateResponse>, ApiError> {
     let session = state.services.meta.get_session(id).await?;
     let (host_id, sandbox_id) = match (session.host_id, session.sandbox_id, session.status) {
-        (Some(h), Some(sb), SessionState::Active | SessionState::Created | SessionState::GuestReady) => {
-            (h, sb)
-        }
+        (
+            Some(h),
+            Some(sb),
+            SessionState::Active | SessionState::Created | SessionState::GuestReady,
+        ) => (h, sb),
         _ => {
             // No live sandbox for this session (Idle, HostLost,
             // terminal, or still Pending). Return a payload that
@@ -116,12 +118,11 @@ pub async fn cow_state(
             }));
         }
     };
-    let backend = state
-        .host_registry
-        .backend_of(host_id)
-        .ok_or_else(|| ApiError::HostLost(format!(
+    let backend = state.host_registry.backend_of(host_id).ok_or_else(|| {
+        ApiError::HostLost(format!(
             "session {id} bound to host {host_id} which is no longer registered"
-        )))?;
+        ))
+    })?;
     let records = fetch_for_host(&state.cow_state_cache, host_id, backend)
         .await
         .map_err(ApiError::from)?;
@@ -136,16 +137,12 @@ pub async fn cow_state(
     };
     // Memory-tier enrichment from the session's latest snapshot
     // row. Same shape as the per-host handler.
-    let (memory_manifest, last_snapshot_at) = match state
-        .services
-        .meta
-        .latest_snapshot_for_session(id)
-        .await
-    {
-        Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
-        Ok(None) => (None, None),
-        Err(_) => (None, None),
-    };
+    let (memory_manifest, last_snapshot_at) =
+        match state.services.meta.latest_snapshot_for_session(id).await {
+            Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
+            Ok(None) => (None, None),
+            Err(_) => (None, None),
+        };
     Ok(Json(SessionCowStateResponse {
         session_id: id,
         state: Some(CowStateView::from_record(

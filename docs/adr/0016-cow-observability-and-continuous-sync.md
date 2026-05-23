@@ -1,15 +1,19 @@
 # ADR 0016: COW observability and continuous disk sync
 
-Status: 2026-05-23 — **Proposed**. Supersedes ADR 0015 M5 "Known
-regression — chunk-store GC deleted" (see
+Status: 2026-05-23 — **Proposed**, Phase A shipped. Supersedes ADR
+0015 M5 "Known regression — chunk-store GC deleted" (see
 `docs/adr/0015-system-design-v2.md` §"Known regression — chunk-store
 GC deleted") once Phase C lands.
 
 Phase chain (filled in as commits land — same shape as ADR 0014's
 M1.x annotations and ADR 0015's per-milestone commit lists):
 
-- **Phase 0** — this ADR, in Proposed status. _(pending)_
-- **Phase A** — observability surface (5 commits + ADR update). _(pending)_
+- **Phase 0** — this ADR, in Proposed status. Commit `eadbd03`.
+- **Phase A** — observability surface. Four commits + this update:
+  `050b189` (ChunkedDiskBackend accessors), `335f14a` (CowState
+  types + trait + gRPC + PooledBackend impl, absorbed the planned
+  commit 2), `285adf0` (coord endpoints + 1s-TTL cache), `7324baa`
+  (web app integration). **Shipped 2026-05-23.**
 - **Phase B** — continuous disk sync (5 commits + ADR update). _(pending)_
 - **Phase C** — chunk-GC pin-set redesign (6 commits + ADR final pass). _(pending)_
 
@@ -17,6 +21,99 @@ The ADR is updated at the end of each phase with what shipped, what
 diverged from this design, and any pitfalls future implementers should
 know about. The final commit at the end of Phase C flips the status to
 **Accepted**.
+
+---
+
+## Phase A as-built notes (2026-05-23)
+
+**Divergences from the Phase A design above:**
+
+- **The planned "Phase A commit 2 — `ChunkCache::has()`" collapsed
+  to a no-op.** `ChunkCache::contains(hash)` already existed at
+  `crates/engram-chunk-store/src/cache.rs:337`, with exactly the
+  semantics the design called for (`fs::try_exists` against the
+  per-hash cache path; cheap stat). The locality counter in
+  `PooledBackend::cow_state_for_entry` uses `contains` directly.
+  No new helper added; the commit slot dissolved into commit 3's
+  notes.
+- **Base-chunk locality cost.** The open question called out in the
+  ADR was whether `ChunkCache::has` would be O(1) or O(n). It's
+  O(1) — one `fs::try_exists` per chunk hash. For a 256-chunk
+  manifest the per-call cost is bounded by FS stat latency (sub-ms
+  per stat on NVMe). Total per-request is sub-100ms even at 1024
+  chunks; coord caches the response for 1s anyway. No HashSet
+  retrofit needed.
+- **`last_snapshot_unix_ms` lives on `PooledBackend`, not the inner
+  FC backend.** The Phase A design sketched it on
+  `SandboxBackend::last_snapshot_at(sandbox_id)`. Putting it on
+  `PooledBackend` is cleaner: that's where the snapshot wrapping
+  happens, and the stamp is gated on the post-processing
+  succeeding (BlobStorage uploads done, before
+  `commit_snapshot`). Cleared on `destroy`. Inner backends are
+  unchanged; only the wrapper that owns the upload pipeline
+  records the timestamp.
+- **`HostCowState` not wired to `HostRegistry::unregister`.** The
+  design imagined explicit cache eviction on host drop. Skipped
+  in this phase: the 1s TTL self-cleans orphaned slots before the
+  web app's next poll, and the DashMap is bounded by HostId count
+  (slow growth, not unbounded). If host churn ever shows up in
+  metrics, wire `cow_state_cache.forget_host(id)` from the
+  dead-host detector and the cross-replica pg_listener path.
+- **`/sessions/:id/cow-state` reuses the host cache via
+  `fetch_for_host`** rather than maintaining a separate
+  per-session cache. Two sessions on the same host share the
+  refresh budget; the per-session response is a single filtered
+  row from the host's vec. Same effect as a per-session cache but
+  half the bookkeeping.
+
+**Pitfalls / drive-bys encountered:**
+
+- **Workspace-scale cargo invocations during edits contend with
+  rust-analyzer's background check.** A `just check` after a
+  multi-crate edit burst took 14m on first try because a stale
+  rust-analyzer (from Thursday) + the live one (from the current
+  session) both ran `cargo check --workspace`, and the lock
+  contention pushed clippy behind them. Captured in the
+  `[no_workspace_cargo_mid_edit]` memory; future phases will avoid
+  the pattern. Mitigations applied this phase: killed the stale
+  rust-analyzer, batched all edits per commit and only ran
+  `just check` at commit boundaries.
+- **`pnpm install` was missing `@rollup/rollup-darwin-arm64`** in
+  the local `node_modules`. The lockfile listed it correctly; the
+  prior install had only the Linux variants — must have been an
+  install done on the dev VM or in CI that propagated. Vitest
+  failed with `Cannot find module '@rollup/rollup-darwin-arm64'`.
+  Fix: `CI=true pnpm install` on the macOS host. No lockfile
+  change needed; documented in the commit body for `7324baa`.
+- **`HostClient::host_for_sandbox` returns `(HostId, SessionState)`
+  but not `SessionId`.** The first cut of the per-host endpoint
+  used it for the sandbox→session join and silently always
+  returned no session_id. Replaced with one
+  `list_active_sandbox_assignments_on_host(host_id)` call per
+  request (already indexed, used by reconcile); builds a
+  per-request HashMap. Now correct + one fewer query per record
+  than the original sketch.
+
+**Notes for Phase B implementers:**
+
+- The accessors landed in `050b189`
+  (`dirty_chunks_count`/`dirty_bytes`/`current_manifest_ref`/
+  `last_flush_unix_ms`) are the inputs the `FlushScheduler` will
+  read for its threshold check. `dirty_bytes()` is the one that
+  the `tokio::sync::Notify` poked from `ensure_dirty` should
+  compare against `dirty_threshold_bytes`. The scheduler doesn't
+  need to compute its own bytes-tracker — reuse the accessor.
+- `PooledBackend::last_snapshot_unix_ms` is `DashMap<SandboxId,
+  i64>`. Phase B's `live_disk_manifest_*` should live in PG (per
+  the design), not on `PooledBackend`, because the data must
+  survive host-agent restart and be visible cross-replica. Don't
+  let the proximity to `last_snapshot_unix_ms` tempt anyone into
+  the host-local route.
+- The cow_state RPC's `bincode`-in-`bytes` wire shape is the
+  pattern Phase B's `PublishLiveManifest` should follow if it
+  ends up gRPC. If it ends up HTTP (per the ADR's "open
+  questions"), the host→coord channel that heartbeats already use
+  is the natural fit — no new auth surface.
 
 ---
 

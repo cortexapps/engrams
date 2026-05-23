@@ -45,10 +45,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         // ADR 0016 Phase A: per-session COW diagnostic.
-        .route(
-            "/sessions/:id/cow-state",
-            get(sessions_inspect::cow_state),
-        )
+        .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
         // ADR 0013 host → coord HTTP endpoints. The old
         // `/api/hosts/connect` WS handler has been retired —
         // host-agents register over HTTP, heartbeat over HTTP,

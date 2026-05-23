@@ -86,10 +86,7 @@ pub async fn cow_state(
         .await
         .map_err(ApiError::from)?;
     let session_for: std::collections::HashMap<engram_core::SandboxId, engram_core::SessionId> =
-        assignments
-            .into_iter()
-            .map(|(sid, sb)| (sb, sid))
-            .collect();
+        assignments.into_iter().map(|(sid, sb)| (sb, sid)).collect();
 
     let mut sessions = Vec::with_capacity(records.len());
     for record in records {
@@ -110,10 +107,7 @@ pub async fn cow_state(
             last_snapshot_at,
         ));
     }
-    Ok(Json(HostCowStateResponse {
-        host_id,
-        sessions,
-    }))
+    Ok(Json(HostCowStateResponse { host_id, sessions }))
 }
 
 /// Memory-tier enrichment: project the session's latest snapshot row

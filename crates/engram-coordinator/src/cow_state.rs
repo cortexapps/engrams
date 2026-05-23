@@ -124,7 +124,11 @@ impl CowStateCache {
             guard.captured_at = Some(now);
             guard.records = fresh.clone();
         }
-        Ok(if theirs_newer { guard.records.clone() } else { fresh })
+        Ok(if theirs_newer {
+            guard.records.clone()
+        } else {
+            fresh
+        })
     }
 
     /// Drop the slot for `host_id`. Called when a host is
@@ -150,7 +154,10 @@ pub async fn fetch_for_host(
     host_client: Arc<dyn HostClient>,
 ) -> Result<Vec<CowStateRecord>, SandboxError> {
     cache
-        .get_or_refresh(host_id, move || async move { host_client.cow_state_all().await })
+        .get_or_refresh(
+            host_id,
+            move || async move { host_client.cow_state_all().await },
+        )
         .await
 }
 
@@ -206,9 +213,8 @@ impl CowStateView {
         // host-side stamped, coord-side not committed). The `0`
         // sentinel on the host stamp encodes "never" and is
         // converted by `unix_ms_to_dt`.
-        let snapshot_at = last_snapshot_at.or_else(|| {
-            engram_core::types::cow_state::unix_ms_to_dt(state.last_snapshot_unix_ms)
-        });
+        let snapshot_at = last_snapshot_at
+            .or_else(|| engram_core::types::cow_state::unix_ms_to_dt(state.last_snapshot_unix_ms));
         Self {
             sandbox_id,
             session_id,
