@@ -1,9 +1,12 @@
 # ADR 0016: COW observability and continuous disk sync
 
-Status: 2026-05-23 — **Proposed**, Phase A shipped. Supersedes ADR
-0015 M5 "Known regression — chunk-store GC deleted" (see
-`docs/adr/0015-system-design-v2.md` §"Known regression — chunk-store
-GC deleted") once Phase C lands.
+Status: 2026-05-24 — **Proposed**, Phase A + Phase A.1 shipped
+(§A.1.1–§A.1.7; §A.1.8 reconsidered, not pursued). Phase B
+(continuous disk sync) and Phase C (chunk-GC pin-set redesign)
+remain pending; the ADR will flip to Accepted once Phase C ships.
+Supersedes ADR 0015 M5 "Known regression — chunk-store GC deleted"
+(see `docs/adr/0015-system-design-v2.md` §"Known regression —
+chunk-store GC deleted") once Phase C lands.
 
 Phase chain (filled in as commits land — same shape as ADR 0014's
 M1.x annotations and ADR 0015's per-milestone commit lists):
@@ -769,62 +772,61 @@ should fire on the post-resume API call (didn't on session
 the resume's `run_completed` carries a real assistant response,
 not `ConnectionRefused`.
 
-### A.1.8 — egress `Registry` refactor: split policy from IP index
+### A.1.8 — egress `Registry` refactor — **reconsidered, not pursued**
 
-**Motivation**: A.1.7 is a "must remember to register at this
-step" bug. The structural reason it's possible: the proxy's
-`Registry` keys policy entries by `guest_ip`. Every time a
-sandbox's IP changes (cold restore, host migration, future
-evacuation), every map entry has to be rewritten. There are
-multiple call sites that need updating; if any one is
-forgotten, you get A.1.7.
+**Original motivation** (kept for the audit trail): A.1.7 looked
+like a "must remember to register at this step" bug, and the
+structural reason it seemed possible was that `Registry` keys
+policy entries by `guest_ip`. The proposal was to split into a
+`policies` map keyed by `session_id` + a thin `ip_index` keyed
+by `Ipv4Addr`, so resume would only need to update `ip_index`.
 
-**Proposed refactor** (defense in depth; lands AFTER A.1.7's
-immediate fix is in prod):
+**Why dropped (decided 2026-05-24, post-A.1.7 ship)**:
 
-```rust
-pub struct Registry {
-    /// Policy bodies keyed by durable session_id. Stable across
-    /// IP changes. Updated on session create + manifest changes.
-    policies: DashMap<SessionId, PolicyBody>,
-    /// Forward map from guest IP to the current session_id.
-    /// Updated on bind/rebind; this is the *only* thing that
-    /// changes on snapshot restore.
-    ip_index: DashMap<Ipv4Addr, SessionId>,
-}
+1. **Registry already keeps a `by_session` index**. Reading
+   `crates/engram-egress-proxy/src/registry.rs:50-96`,
+   `Registry::register()` already maintains `by_session:
+   HashMap<SessionId, Ipv4Addr>` and explicitly replaces any
+   prior entry for the same session_id when called again —
+   removing the stale guest_ip mapping in the same critical
+   section. The "stale IP left behind after rebind" failure
+   mode the refactor was designed to prevent is **already
+   impossible** in the current code.
 
-impl Registry {
-    pub fn lookup(&self, ip: Ipv4Addr) -> Option<SessionState> {
-        let sid = *self.ip_index.get(&ip)?;
-        let policy = self.policies.get(&sid)?;
-        Some(SessionState::from_parts(sid, ip, policy.clone()))
-    }
-    pub fn register_policy(&self, session_id: SessionId, body: PolicyBody) { ... }
-    pub fn bind_ip(&self, ip: Ipv4Addr, session_id: SessionId) { ... }
-    pub fn unbind_ip(&self, ip: Ipv4Addr) { ... }
-}
-```
+2. **Root cause was the wire format, not the storage shape**.
+   The A.1.7 bug was that `resume_from_fc_snapshot` constructed
+   a `SessionEgressPolicy { guest_ip: Ipv4Addr::UNSPECIFIED }`
+   and passed it through `start_agent` →
+   `notify_session_policy` → `Registry::register`. The
+   registry registered exactly what it was told: an entry under
+   `0.0.0.0`. Splitting the registry into `policies` +
+   `ip_index` doesn't change the wire format — anyone
+   constructing a `SessionEgressPolicy` with a stale IP would
+   still produce the same bug. The fix has to live at the
+   policy-construction site (where A.1.7 fixed it).
 
-Resume path then only needs `bind_ip(new_guest_ip, session_id)` —
-one map mutation, one call site. The policy body doesn't need
-rebuilding unless the manifest itself changed.
+3. **The optimization is real but not load-bearing**. Sending
+   the full policy body on every resume (vs. once-per-session-
+   lifetime + an `ip_rebind` callback) is a wire-volume
+   optimization, not a correctness improvement. Resume rate is
+   measured in tens per minute per coord pod; the body is
+   sub-kilobyte. Not worth a wire-format break.
 
-**Why not before A.1.7's immediate fix**:
+4. **The next-best regression guard already exists**. A.1.7
+   ships with two unit tests (`assemble_resume_egress_policy_*`)
+   that lock in the policy assembly. A future regression would
+   show up there, not in a registry shape test.
 
-- The user-visible wedge needs to close in this milestone.
-- The refactor touches every `register_policy` call site in
-  the host-agent + every test that builds a `SessionState`.
-- Right size is "one PR after A.1.7 is in prod, with the
-  immediate fix as a regression guard."
+**Filed instead as deferred A.1.8b — resume-path integration
+test** (Phase B-or-later scope, not blocking M4 close):
+coord-side test that asserts the resume hot path queries
+`host.guest_ip(new_sandbox_id)` and the policy passed to
+`start_agent` carries that IP, not `0.0.0.0`. Higher-value
+than the registry refactor; cheaper to write.
 
-**Filed scope**: this becomes Phase A.1.8 in the M4 commit
-chain; per-commit `just check`-clean; lands in the same M4
-milestone but after A.1.7 is validated.
-
-**Unit test surface (when implemented)**: parameterized test
-that swaps IPs for the same session_id and asserts policy
-lookups stay correct via the new ip_index path. The existing
-`dns::tests` suite should pass with no semantic changes.
+**No code change for A.1.8 in this milestone.** Original
+proposal kept above in this section's history (commit `5fa045c`)
+for future readers who hit a related class of bug.
 
 ---
 
