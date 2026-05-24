@@ -1062,6 +1062,105 @@ CREATE INDEX idx_sessions_live_disk_manifest
 Partial index keeps the structure narrow as terminal rows accumulate
 (same pattern ADR 0015 M3's migration 0032 used for `sandbox_id`).
 
+**Migration number bump**: Phase B's migration was originally
+spec'd as `0033_sessions_live_disk_manifest.sql`. After
+A.1.5c shipped `0033_eviction_inflight.sql` (2026-05-24),
+Phase B's migration must take `0034_` (or whichever the next
+free number is when Phase B opens). Renumber + rename in the
+Phase B commit chain — do not leave a duplicate `0033`.
+
+#### Phase B failure mode to close: resumed sandboxes don't rejoin chunked-disk tracking
+
+**Surfaced 2026-05-24 on session 8588dc5c** (post-Phase-A.1
+validation). Two visible symptoms, one root cause.
+
+**Symptom 1 — COW diagnostic silent**: `GET /sessions/:id/cow-state`
+returned `state: null` for an Active session that had just
+resumed from snapshot. Web UI rendered the misleading copy
+"no live sandbox — disk-tier diagnostic unavailable while the
+session is idle / lost / pending."
+
+**Symptom 2 — second eviction can't snapshot**: after the
+session's first eviction+resume cycle completed cleanly, the
+host's `idle_evictor` tick fired every 10s for the next 10+
+minutes, each POST returning `accepted=0 failed=1` with coord
+warn-logging:
+
+```
+host-pushed idle eviction failed ... error=idle evict sandbox:
+sandbox vm error: grpc Internal error: snapshot error:
+non-canonical jail layout: rootfs canonical symlink missing
+at /var/lib/engram/sandboxes/rootfs/<sandbox_id>.dev: No such
+file or directory (os error 2)
+```
+
+The session stays Active permanently (until host roll or
+session terminate) — no data risk, no resource leak, but
+log-noisy and operationally surprising. A.1.5a's host-side
+gate doesn't suppress this because the failure is fast
+(~1ms): the spawned POST finishes immediately, gate releases,
+next 10s tick re-emits.
+
+**Root cause**: `cow_state_all` on the host-agent iterates
+`PooledBackend::nbd_sandboxes`, which is populated only by the
+cold-create path (`pooled_backend.rs:1284` — `nbd_sandboxes.insert`
+inside the NBD-attach branch of `create()`). The snapshot
+pipeline reads the same nbd-disk path expectations (the
+canonical rootfs symlink at
+`/var/lib/engram/sandboxes/rootfs/<sandbox_id>.dev`). The
+resume path restores via FC's snapshot API into a sandbox
+that doesn't go through the NBD-attach branch, so:
+(a) `nbd_sandboxes` stays empty for the resumed sandbox →
+cow_state_all returns nothing for it; (b) the canonical
+chunked-disk layout the snapshot path expects doesn't exist
+→ second eviction can't snapshot. Both symptoms collapse to
+"resume forgot to rejoin chunked-disk tracking".
+
+**Phase B fix**: when `FlushScheduler` lands (commit 10 in
+Phase B's chain), wire it on the **resume path** as well as
+on cold-create. The two call sites are:
+
+1. Cold-create: today wires NBD attach + `nbd_sandboxes.insert`
+   at `pooled_backend.rs:~1284`. Add: spawn `FlushScheduler`
+   for the new sandbox here.
+2. **Resume path** (currently broken for COW state): FC
+   snapshot restore returns a new `SandboxId` that today is
+   not added to `nbd_sandboxes`. Phase B must: (a) ensure the
+   resumed sandbox is registered with chunked-disk tracking
+   (insert into `nbd_sandboxes` with a `ChunkedDiskBackend`
+   that resumes from the snapshot's disk manifest, OR fall
+   back to a "no-tracking" sentinel that still appears in
+   `cow_state_all` with `dirty=0 / last_flush_at=null`); (b)
+   spawn `FlushScheduler` for the new sandbox.
+
+Open question for Phase B implementer: does FC's restore-from-
+snapshot use the NBD machinery at all? If the restored disk
+is a flat file on local disk (not chunk-NBD-backed), then
+"continuous flush" doesn't apply until the disk is converted
+back to chunked, which may be its own design problem. The
+quick answer for the diagnostic surface: emit a record with
+`dirty_chunks=0, dirty_bytes=0, last_flush_at=null` for any
+sandbox the host knows about but isn't NBD-tracking. The web
+UI then renders something honest ("steady-state since resume;
+flush scheduler reattaches on next manifest change") rather
+than the current misleading "no live sandbox" copy.
+
+**UI copy fix to land alongside the Phase B work**: change
+`web/src/components/CowState.tsx:208-209` from "no live
+sandbox — disk-tier diagnostic unavailable while the session
+is idle / lost / pending" to a message that conditionally
+renders based on actual session status (Idle vs. Active-but-
+diagnostic-not-tracked). Conditional gives a UX honest about
+which state the user is in.
+
+**Optional defensive measure independent of Phase B**: if
+the chunked-disk wiring on resume turns out to be larger than
+expected, ship an interim back-off in the host's
+`idle_evictor` so a sandbox whose snapshot RPC failed in the
+last N seconds (say 60s) skips emission. Closes the log
+storm without changing correctness. Filed as a minor knob;
+the Phase B root-cause fix supersedes it.
+
 ### Phase C — chunk-GC pin-set redesign
 
 The new pin set:
