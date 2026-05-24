@@ -837,16 +837,12 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
     let sync = driver.exec(sid, "sync").await;
     assert_eq!(sync.exit_status, Some(0), "sync should succeed");
 
-    // Force a flush so the chunks are durable in BlobStorage. Then
-    // snapshot + evict + resume. Without the flush, the snapshot
-    // would still drain the dirty buffer via its own internal
-    // backend.flush() call, but pinning the publish-via-admin-trigger
-    // here makes the test's assertion ordering cleaner.
-    let applied = driver.flush_now(sid).await;
-    assert_eq!(
-        applied.outcome, "applied",
-        "pre-snapshot flush should drain chunks; got {applied:?}",
-    );
+    // Best-effort flush via the admin trigger (the FlushScheduler
+    // may have already drained — same race as e2e_flush_now). The
+    // snapshot below will internally re-flush via its own
+    // backend.flush() call regardless, so the chunks ARE durable
+    // in BlobStorage by the time we evict.
+    let _ = driver.flush_now(sid).await;
 
     // Snapshot → evict-local → resume. Equivalent to the
     // idle-eviction → resume cycle prod exercises, minus the
