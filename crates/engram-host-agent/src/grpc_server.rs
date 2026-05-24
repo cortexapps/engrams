@@ -362,6 +362,28 @@ impl HostService for HostServiceImpl {
         }))
     }
 
+    /// ADR 0016 Phase B commit 4a — admin flush trigger. Returns
+    /// `Some(ManifestRef)` (bincode-encoded) if chunks were drained;
+    /// empty bytes otherwise.
+    async fn flush_sandbox(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<engram_protocol::grpc::FlushSandboxResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let outcome = self
+            .inner
+            .flush_sandbox(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        let manifest_ref_bincode = match outcome {
+            Some(mref) => encode_bincode(&mref, "ManifestRef")?,
+            None => Vec::new(),
+        };
+        Ok(Response::new(engram_protocol::grpc::FlushSandboxResponse {
+            manifest_ref_bincode,
+        }))
+    }
+
     /// Server-streaming exec. First frame is `started` (carries the
     /// host-assigned `exec_id`); subsequent frames carry stdout /
     /// stderr bytes; terminal frame is `exit` (always exactly one).

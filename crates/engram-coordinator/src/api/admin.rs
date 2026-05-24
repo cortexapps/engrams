@@ -14,9 +14,11 @@
 //! surface. The chunk-store GC endpoint was removed 2026-05-23
 //! (see ADR 0015 M5 "Known regression — chunk-store GC deleted").
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::Json;
 use serde::Serialize;
+
+use engram_core::SessionId;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -241,4 +243,107 @@ pub async fn reap_materialize_dir(
         materialize_dir: String::new(),
         per_host,
     }))
+}
+
+// ---------------------------------------------------------------------
+// ADR 0016 Phase B commit 4a — flush-now admin trigger
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct FlushNowResult {
+    /// `applied`: the host drained dirty chunks and coord wrote the
+    /// new manifest_ref. `idle`: host returned `None` (sandbox not
+    /// chunk-tracked OR no dirty bytes); no PG write. `stale`: host
+    /// returned a manifest_ref but coord's UPDATE was guarded out
+    /// because `sessions.sandbox_id` no longer matches (rebind /
+    /// destroy raced).
+    pub outcome: FlushNowOutcome,
+    /// New manifest version coord persisted, or `None` on `idle`/`stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<u64>,
+}
+
+#[derive(Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum FlushNowOutcome {
+    Applied,
+    Idle,
+    Stale,
+}
+
+/// `POST /api/admin/sessions/:id/flush-now` — explicit trigger for
+/// the FlushScheduler primitive (ADR 0016 Phase B). Forces an
+/// immediate flush on the session's bound sandbox + writes the new
+/// `sessions.live_disk_manifest_*` row + bumps `chunk_generation`.
+/// Pairs the scheduler's 30s tick / threshold-notify with an
+/// admin trigger so e2e tests and operators can drive the
+/// publish-to-PG round-trip without sleeping a cadence.
+///
+/// Returns:
+/// - 404 if the session is unknown
+/// - 409 if the session has no bound sandbox (Idle / never-bound)
+/// - 200 with `{outcome, manifest_version}` otherwise. `idle` means
+///   the host had no dirty bytes to flush; `stale` means the host
+///   produced a manifest but coord's row-update was guarded out
+///   (sandbox_id drift between flush and publish — same race the
+///   scheduler-publish path's sandbox_id guard catches).
+pub async fn flush_now(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<FlushNowResult>, ApiError> {
+    // Look up the session's bound sandbox. NotFound on the session
+    // row bubbles as 404; bound=None is a domain-level conflict.
+    let session = state.services.meta.get_session(session_id).await?;
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox (status={})",
+            session.status.as_str(),
+        )));
+    };
+    // Dispatch to the host that owns this sandbox.
+    let host_client = state.services.host.clone();
+    let flush_outcome = host_client.flush_sandbox(sandbox_id).await?;
+    let Some(manifest_ref) = flush_outcome else {
+        return Ok(Json(FlushNowResult {
+            outcome: FlushNowOutcome::Idle,
+            manifest_version: None,
+        }));
+    };
+    // Funnel directly into the same MetadataStore method the
+    // publisher's drain task uses. The sandbox_id guard inside the
+    // UPDATE catches the (rare) destroy-or-rebind race; coord just
+    // surfaces the outcome to the caller.
+    match state
+        .services
+        .meta
+        .update_live_disk_manifest(session_id, sandbox_id, manifest_ref)
+        .await?
+    {
+        engram_core::traits::UpdateOutcome::Applied => {
+            tracing::info!(
+                %session_id,
+                %sandbox_id,
+                manifest_id = %manifest_ref.manifest_id,
+                manifest_version = manifest_ref.version,
+                "admin flush_now: applied",
+            );
+            Ok(Json(FlushNowResult {
+                outcome: FlushNowOutcome::Applied,
+                manifest_version: Some(manifest_ref.version),
+            }))
+        }
+        engram_core::traits::UpdateOutcome::DroppedStale => {
+            tracing::warn!(
+                %session_id,
+                %sandbox_id,
+                manifest_id = %manifest_ref.manifest_id,
+                manifest_version = manifest_ref.version,
+                "admin flush_now: stale (sandbox_id mismatch on UPDATE)",
+            );
+            Ok(Json(FlushNowResult {
+                outcome: FlushNowOutcome::Stale,
+                manifest_version: None,
+            }))
+        }
+    }
 }

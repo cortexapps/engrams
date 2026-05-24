@@ -206,6 +206,13 @@ impl HostClient for LocalHostClient {
     async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
         Ok(self.sandbox.cow_state_all().await)
     }
+
+    async fn flush_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
+        self.sandbox.flush_sandbox(id).await
+    }
 }
 
 fn harness_err_to_sandbox(e: HarnessError) -> SandboxError {

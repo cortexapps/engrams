@@ -104,6 +104,11 @@ pub fn router(state: SharedState) -> Router {
             "/api/admin/reap-materialize-dir",
             post(admin::reap_materialize_dir),
         )
+        // ADR 0016 Phase B commit 4a: explicit admin trigger for the
+        // FlushScheduler primitive. E2E tests + ops use this to drive
+        // an immediate flush + publish round-trip without sleeping a
+        // 30s scheduler tick.
+        .route("/api/admin/sessions/:id/flush-now", post(admin::flush_now))
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

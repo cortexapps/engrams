@@ -3174,6 +3174,104 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
     assert_eq!(still_stored.version, 7);
 }
 
+// ---------------------------------------------------------------------
+// ADR 0016 Phase B commit 4a: admin flush-now endpoint
+//
+// 404, 409, and "idle" paths are reachable against the existing
+// ProcessBackend wiring (whose flush_sandbox default returns None).
+// The "applied" + "stale" outcomes exercise the full FC chunked-disk
+// pipeline and live in commit 4b's e2e test.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn flush_now_returns_404_when_session_unknown() {
+    let app = build_app(MockMetadataStore::arc());
+    let unknown = SessionId::new();
+    let resp = post(
+        app,
+        &format!("/api/admin/sessions/{unknown}/flush-now"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
+    let meta = MockMetadataStore::arc();
+    let session_id = SessionId::new();
+    {
+        let mut sessions = meta.sessions.lock();
+        sessions.insert(
+            session_id,
+            Session {
+                id: session_id,
+                user_id: None,
+                status: SessionState::Idle,
+                host_id: None,
+                sandbox_id: None,
+                image: "test/repo:no-bind".into(),
+                harness: engram_core::types::session::HarnessSpec::None,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
+    }
+    let app = build_app(meta);
+    let resp = post(
+        app,
+        &format!("/api/admin/sessions/{session_id}/flush-now"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
+    let meta = MockMetadataStore::arc();
+    let session_id = SessionId::new();
+    // Bound to a sandbox the local ProcessBackend doesn't know about
+    // — `flush_sandbox`'s trait default returns Ok(None), which the
+    // endpoint maps to `outcome: idle`.
+    let sandbox_id = engram_core::SandboxId::new();
+    {
+        let mut sessions = meta.sessions.lock();
+        sessions.insert(
+            session_id,
+            Session {
+                id: session_id,
+                user_id: None,
+                status: SessionState::Active,
+                host_id: None,
+                sandbox_id: Some(sandbox_id),
+                image: "test/repo:idle-flush".into(),
+                harness: engram_core::types::session::HarnessSpec::None,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
+    }
+    let app = build_app(meta.clone());
+    let resp = post(
+        app,
+        &format!("/api/admin/sessions/{session_id}/flush-now"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["outcome"], "idle");
+    assert!(body.get("manifest_version").is_none() || body["manifest_version"].is_null());
+    // No PG write happened — generation stayed at 0.
+    assert!(meta.live_disk_manifests.lock().is_empty());
+    assert_eq!(
+        meta.chunk_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+    );
+}
+
 #[tokio::test]
 async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     use std::sync::atomic::Ordering;

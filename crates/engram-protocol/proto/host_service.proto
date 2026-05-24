@@ -70,6 +70,21 @@ service HostService {
   rpc CowState(SandboxIdMessage) returns (CowStateResponse);
   rpc CowStateAll(Empty) returns (CowStateAllResponse);
 
+  // ---- ADR 0016 Phase B: admin flush trigger ----
+  //
+  // Force an immediate ChunkedDiskBackend::flush() on `id`. Pairs
+  // the FlushScheduler's implicit 30s tick with an explicit admin
+  // trigger per `[explicit_admin_triggers_for_testability]`. E2E
+  // tests drive this to verify the publish-to-PG round-trip without
+  // sleeping a full cadence; operators use it to flush a stuck
+  // sandbox's pending dirty bytes on demand.
+  //
+  // Response carries an optional manifest_ref: empty bytes encode
+  // `None` (sandbox not chunk-tracked, or zero dirty chunks), a
+  // full bincode blob encodes the new `ManifestRef` that the coord
+  // immediately funnels into `update_live_disk_manifest`.
+  rpc FlushSandbox(SandboxIdMessage) returns (FlushSandboxResponse);
+
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
 
@@ -301,5 +316,20 @@ message CowStateAllResponse {
   // Empty vec is encoded as a non-empty bincode blob (the length
   // prefix is 0); the proto field is non-optional.
   bytes records_bincode = 1;
+}
+
+// --- ADR 0016 Phase B commit 4a: FlushSandbox response ---
+
+// Outcome of `HostService.FlushSandbox`. `manifest_ref_bincode`
+// carries `Some(ManifestRef)` (bincode-encoded `Option<ManifestRef>`)
+// when chunks were drained, `None` otherwise. The wire shape mirrors
+// `CowStateResponse`'s empty-means-None convention: empty bytes
+// distinguish "sandbox not chunk-tracked OR zero dirty chunks" from
+// "drained N chunks, here's the new manifest version."
+message FlushSandboxResponse {
+  // bincode-encoded `Option<engram_core::types::manifest::ManifestRef>`.
+  // Empty bytes encode `None` (no chunk tracking / no dirty bytes);
+  // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
+  bytes manifest_ref_bincode = 1;
 }
 

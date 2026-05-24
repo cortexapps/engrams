@@ -204,4 +204,21 @@ pub trait HostClient: Send + Sync {
     async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
         Ok(Vec::new())
     }
+
+    /// ADR 0016 Phase B commit 4a — admin trigger for the
+    /// FlushScheduler primitive. Coord's
+    /// `POST /api/admin/sessions/:id/flush-now` calls this on the
+    /// session's bound host to force a flush + manifest publish.
+    /// Returns the new `ManifestRef` if any chunks were drained;
+    /// `None` if the sandbox isn't chunk-tracked or no dirty bytes
+    /// were buffered.
+    ///
+    /// Default `Ok(None)` so mocks and the warm-start scheduler-less
+    /// pre-Phase-B impls compile unchanged.
+    async fn flush_sandbox(
+        &self,
+        _id: SandboxId,
+    ) -> Result<Option<crate::types::manifest::ManifestRef>, SandboxError> {
+        Ok(None)
+    }
 }

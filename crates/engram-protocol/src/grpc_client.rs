@@ -325,6 +325,34 @@ impl GrpcHostClient {
         decode_bincode(&resp.records_bincode, "Vec<CowStateRecord>")
     }
 
+    /// ADR 0016 Phase B commit 4a — admin flush trigger. Coord's
+    /// `POST /api/admin/sessions/:id/flush-now` calls this. Empty
+    /// `manifest_ref_bincode` on the wire encodes `None` (no chunk
+    /// tracking / no dirty chunks); non-empty decodes to the new
+    /// `Some(ManifestRef)`.
+    pub async fn flush_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .flush_sandbox(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        if resp.manifest_ref_bincode.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(decode_bincode(
+            &resp.manifest_ref_bincode,
+            "ManifestRef",
+        )?))
+    }
+
     pub async fn reap_materialize_dir(
         &self,
         min_age_secs: u64,
@@ -698,6 +726,13 @@ impl HostClient for GrpcHostClient {
 
     async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
         Self::cow_state_all(self).await
+    }
+
+    async fn flush_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
+        Self::flush_sandbox(self, id).await
     }
 }
 

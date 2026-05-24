@@ -1899,6 +1899,45 @@ impl SandboxBackend for PooledBackend {
             Vec::new()
         }
     }
+
+    /// ADR 0016 Phase B commit 4a — admin trigger for the
+    /// FlushScheduler primitive. Forces an immediate flush on the
+    /// chunked-disk backend; returns the new manifest_ref if any
+    /// chunks were drained, `None` if the sandbox isn't NBD-attached
+    /// or has zero dirty bytes.
+    ///
+    /// Coord's `POST /api/admin/sessions/:id/flush-now` calls this
+    /// (via gRPC) and pipes the returned manifest_ref into
+    /// `MetadataStore::update_live_disk_manifest` immediately —
+    /// bypasses the publisher's coalescing drain so the round-trip
+    /// is deterministic for tests and operators.
+    async fn flush_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
+        #[cfg(target_os = "linux")]
+        {
+            let backend = self
+                .nbd_sandboxes
+                .get(&id)
+                .map(|entry| entry.backend.clone());
+            let Some(backend) = backend else {
+                return Ok(None);
+            };
+            let outcome = backend.flush().await.map_err(|e| {
+                SandboxError::Vm(format!("flush_sandbox: chunked-disk flush: {e}").into())
+            })?;
+            if outcome.chunks_flushed == 0 {
+                return Ok(None);
+            }
+            Ok(Some(outcome.manifest_ref))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

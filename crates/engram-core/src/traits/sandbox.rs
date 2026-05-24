@@ -340,6 +340,28 @@ pub trait SandboxBackend: Send + Sync {
     async fn cow_state_all(&self) -> Vec<CowStateRecord> {
         Vec::new()
     }
+
+    /// ADR 0016 Phase B commit 4a — explicit admin trigger for the
+    /// FlushScheduler's primitive. Forces an immediate
+    /// `ChunkedDiskBackend::flush()` on `id` and, if any chunks were
+    /// drained, returns the freshly-published `ManifestRef`. Returns
+    /// `Ok(None)` when this backend has no chunk-tracked view of
+    /// the sandbox (mirrors `cow_state` semantics) or when there
+    /// were no dirty chunks.
+    ///
+    /// Paired with the 30s tick + threshold-notify in
+    /// `FlushScheduler` per `[explicit_admin_triggers_for_testability]`:
+    /// the scheduler is the implicit trigger; this is the explicit
+    /// one. E2E tests use this to drive the publish-to-PG round-trip
+    /// without sleeping a full cadence. Operators use it to flush a
+    /// stuck sandbox's pending dirty bytes on demand. Default
+    /// `Ok(None)` so non-chunked backends compile unchanged.
+    async fn flush_sandbox(
+        &self,
+        _id: SandboxId,
+    ) -> Result<Option<crate::types::manifest::ManifestRef>, SandboxError> {
+        Ok(None)
+    }
 }
 
 /// How a harness process inside a sandbox reaches the host-side
