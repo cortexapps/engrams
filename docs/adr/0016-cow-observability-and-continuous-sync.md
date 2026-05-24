@@ -503,18 +503,328 @@ writes. Most PG ops are idempotent or conflict-rejecting, but
 it's untidy.
 
 **Deferred follow-up — §A.1.5c (cross-replica eviction guard)**:
-when multi-replica coord ships, gate `evict_idle_session` on a
-PG advisory lock keyed by `session_id`:
-`pg_try_advisory_lock(hashtext(session_id::text))`, held for
-the pipeline, released by RAII drop. One extra round-trip,
-durably serializes across all replicas. **Not in scope for the
-M4 milestone** — the prod symptom is closed by A.1.5a; A.1.5b
-covers single-replica cleanly; the multi-replica gap is latent
-and the fix is small when we need it. Filed here as a forward
-pointer so the next replica scale-out reads this section first.
+~~when multi-replica coord ships~~ → **promoted to immediate
+scope 2026-05-24** after a session-validation discussion. The
+DashMap is correct-but-narrow; rather than re-doing this when
+we scale replicas, A.1.5c lands in the same M4 milestone. See
+§A.1.5c below for the design.
 
-**Commits**: A.1.5a `21be0c3`; A.1.5b lands with this ADR
-update.
+**Commits**: A.1.5a `21be0c3`; A.1.5b `209c5dc`.
+
+### A.1.5c — cross-replica eviction guard (PG leasing row)
+
+**Evidence**: 2026-05-24 validation discussion. The per-pod
+A.1.5b guard works for today's single-replica prod but leaves
+a gap once we scale: a second coord pod can enter
+`evict_idle_session` past the (also per-pod) `registry.get()`
+guard while the first pod is still in `host.snapshot()`, then
+race on `record_snapshot` / `transition_session` writes. Most
+PG ops are idempotent or conflict-rejecting so end state stays
+correct, but it's untidy and exactly the class of bug we
+shouldn't be filing twice.
+
+**Design — eviction_inflight leasing row**:
+
+New PG table:
+
+```sql
+CREATE TABLE eviction_inflight (
+    session_id   UUID PRIMARY KEY,
+    locked_by    TEXT NOT NULL,           -- coord pod name / hostname
+    locked_at    TIMESTAMPTZ NOT NULL,
+    sandbox_id   UUID NOT NULL            -- for diagnostics
+);
+```
+
+At the top of `evict_idle_session`:
+
+```rust
+let leased = state.services.meta
+    .try_acquire_eviction_lease(session_id, sandbox_id, pod_id())
+    .await?;
+let _guard = match leased {
+    Some(g) => g,                          // RAII; release on drop
+    None => {
+        tracing::info!(... "eviction skipped: lease held by another pod");
+        return Ok(());
+    }
+};
+```
+
+`try_acquire_eviction_lease` is `INSERT INTO eviction_inflight
+(session_id, locked_by, locked_at, sandbox_id) VALUES (...)
+ON CONFLICT (session_id) DO NOTHING RETURNING locked_by`.
+Returns `Some(EvictionLease)` if the row was inserted, `None`
+if a conflict (another pod holds it). The returned guard's
+`Drop` impl spawns a background task that runs `DELETE FROM
+eviction_inflight WHERE session_id = $1`.
+
+Choice of leasing row over `pg_try_advisory_lock`:
+
+1. **Connection-pool friendly**. `pg_advisory_lock` is
+   connection-scoped; with sqlx's pool the acquire and release
+   must run on the *same* pooled connection, which is fragile
+   (the pool can hand the connection out between acquire and
+   release). A row is global state.
+2. **Debuggable from PG**. `SELECT * FROM eviction_inflight`
+   tells an operator which session is mid-eviction on which pod.
+   Advisory locks are visible only via `pg_locks`, which is
+   noisy.
+3. **Reusable shape**. The same pattern fits future
+   one-at-a-time-per-session operations (resume, drain, evac).
+4. **Stale-lease reaper**. A background task can sweep entries
+   older than N minutes with a warn log, analogous to A.1.5a's
+   180s sweep. Advisory locks have no comparable hook.
+
+Stale-lease policy: any row older than **180s** (same threshold
+as A.1.5a's host-side sweep) is reaped by a coord-side
+background task with a `tracing::warn!` carrying `locked_by`
+and `locked_at`. Pipeline duration is observed at 60-90s today,
+so 180s is a generous margin without leaking forever.
+
+**Replaces**: `AppState::inflight_evictions: DashMap` from
+A.1.5b. The DashMap deletion lands in the same commit as the
+leasing-row introduction so there's no period where both exist.
+
+**Unit + integration tests**:
+
+- Unit: trait-level `try_acquire_eviction_lease` on `MiniMeta`
+  with an injected conflict; assert second caller returns
+  `None`, first caller's RAII drop releases.
+- Integration (Postgres-gated): two concurrent
+  `evict_idle_session` calls against the same session; one
+  runs the pipeline, the other early-returns. Verify
+  `eviction_inflight` is empty after both complete.
+- Stale-lease reaper unit test with a fake clock.
+
+### A.1.6 — reconciler/eviction race in `evict_idle_session`
+
+**Evidence (prod, session `1edf09a3-8d5c-4295-a9f8-8676787c2474`,
+2026-05-24)**: with A.1.5a + A.1.5b deployed, the host-side
+retry storm was closed (single `pipeline started` log).
+However the pipeline never reached the matching `pipeline
+completed` log; instead, ~100s later the reconciler (ADR
+0009) logged `orphaned session moved through HostLost
+final_state=Idle recoverable=true` and the session reached
+Idle via the recovery path.
+
+**Root cause**: the eviction pipeline ordering in
+`evict_idle_session`:
+
+```
+1. snapshot()             ← 60-90s
+2. record_snapshot()
+3. registry.unbind()
+4. destroy()              ← host removes sandbox from running_sandboxes
+5. assign_session_sandbox(None)
+6. transition_session(Idle)  ← PG status flips
+7. emit events
+8. commit_snapshot()
+9. log "pipeline completed"
+```
+
+Between step 4 and step 6, the host's NEXT heartbeat (every
+5s) carries an empty `running_sandboxes` for this session.
+The reconciler runs on every heartbeat in `api/hosts.rs`,
+observes `session.sandbox_id IS NOT NULL` AND `host.running_sandboxes`
+does not contain that sandbox → marks the session as orphaned,
+runs `HostLost → Idle` because a recoverable snapshot row
+exists. The pipeline's eventual `transition_session(Idle)`
+then fails (state machine rejects Idle→Idle), the function
+bubbles `EvictError::Meta`, and `abort_inflight_snapshot`
+fires spuriously.
+
+End state is correct (recoverable snapshot, session is Idle)
+but reached via a side-door path, with misleading logs and a
+wasted abort_snapshot RPC.
+
+**Fix — reorder the pipeline**: do `transition_session(Idle)`
+BEFORE `destroy()`. Reconciler's existing guard already skips
+sessions whose status is non-Active (the orphan detector keys
+on Active sessions only — non-Active means "another path is
+handling lifecycle"), so once Idle is committed to PG, the
+reconciler will no-op on its next pass.
+
+New ordering:
+
+```
+1. snapshot()
+2. record_snapshot()
+3. registry.unbind()
+4. assign_session_sandbox(None)
+5. transition_session(Idle)  ← reconciler now sees Idle and no-ops
+6. destroy()                  ← can run after; host running_sandboxes drain is benign
+7. emit events
+8. commit_snapshot()
+9. log "pipeline completed"
+```
+
+**Why this is safe**:
+
+- `destroy()` already runs best-effort with a warn log on
+  failure; moving it after the PG state flip doesn't change
+  failure semantics.
+- The host's `running_sandboxes` and the PG `sessions.sandbox_id`
+  diverging briefly between step 5 and step 6 is exactly the
+  state the reconciler is designed to ignore (status≠Active).
+- Failed `destroy()` post-transition is a host-local leak;
+  the host's `orphan_reap` background task (existing) cleans
+  up.
+
+**Unit test**: extend the existing
+`evict_idle_session_runs_full_pipeline` test with an injected
+reconciler-style "set status Idle after step 3" callback;
+assert the eviction pipeline still reaches its completion log
+and does NOT call abort_snapshot.
+
+### A.1.7 — egress `SessionEgressPolicy` not rebuilt on resume
+
+**Evidence (prod, session `1edf09a3`, 2026-05-24)**: after a
+clean resume from snapshot (`af98f6fb` succeeded `8694b431`),
+the in-VM harness's DNS queries to `api.anthropic.com` were
+denied with `reason=UnknownGuest`. After ~3 minutes of retries,
+the harness gave up and emitted `"API Error: Unable to connect
+to API (ConnectionRefused)"` as its assistant response.
+
+**Root cause** (already commented in
+`crates/engram-coordinator/src/api/snapshot.rs:441-449`):
+
+> "Pre-existing gap (not introduced by ADR 0013): resume
+> doesn't re-apply the SessionEgressPolicy on the new sandbox's
+> host... the bundled `start_agent` here passes an
+> unspecified-IP policy that the host treats as 'no policy
+> applied'."
+
+`resume_from_fc_snapshot` builds a `placeholder_policy` with
+`guest_ip: Ipv4Addr::UNSPECIFIED` and empty allow-lists, passes
+it to `start_agent`. The host-side `notify_session_policy` does
+`Registry::register(SessionState { guest_ip: 0.0.0.0, ... })`,
+keying the entry under `0.0.0.0`. The actual restored guest IP
+(`10.200.0.10`, inherited from the snapshot) has no entry in
+the registry → all DNS queries deny with `UnknownGuest`.
+
+**Fix — extract `build_resume_egress_policy` helper**:
+
+New helper in `crates/engram-coordinator/src/api/sessions.rs`
+next to `resolve_manifest_secrets`:
+
+```rust
+pub(crate) async fn build_resume_egress_policy(
+    state: &SharedState,
+    session: &Session,
+    new_sandbox_id: SandboxId,
+) -> Result<Option<SessionEgressPolicy>, ApiError>
+```
+
+It does:
+
+1. Look up `enabled_images` by `session.image`. If absent,
+   return `Ok(None)` (resume continues with the existing
+   placeholder; dev / pre-fix sessions stay on the status quo).
+2. Parse the cached `manifest_toml`.
+3. Resolve manifest secrets via `services.secrets.resolve(...)`
+   — same call `resolve_manifest_secrets` uses, but we keep
+   the `SecretBundle` instead of folding into env (we need the
+   schema's per-secret `allow_hosts` / `allow_host_patterns`).
+4. Layer per-request overrides via `load_session_secrets` and
+   reconcile against the bundle's placeholder mapping.
+5. `state.services.host.guest_ip(new_sandbox_id).await` →
+   parse as `Ipv4Addr`. If absent/unparseable, return `Ok(None)`.
+6. Assemble `SessionEgressPolicy { guest_ip, session_id,
+   sandbox_id, network_allow_hosts, network_allow_host_patterns,
+   secrets, secret_mode }`.
+
+In `resume_from_fc_snapshot`, replace the placeholder block:
+
+```rust
+let policy = match build_resume_egress_policy(&state, &session, new_sandbox_id).await {
+    Ok(Some(p)) => p,
+    Ok(None) => /* existing placeholder; no enabled_images / no IP */,
+    Err(e) => {
+        tracing::warn!(... error=%e, "egress policy rebuild failed; resume continues with placeholder");
+        /* existing placeholder */
+    }
+};
+state.services.host.start_agent(new_sandbox_id, agent, policy).await?;
+```
+
+**Why error → placeholder, not bubble**: a transient secret-
+store hiccup or enabled_images-row-gone-missing shouldn't block
+a resume that would otherwise work. The harness will see an
+empty allow-list (deny-by-default), the user can re-`/resume`
+after operator fixes the root cause. Honest failure mode.
+
+**Unit test**: `MockHost::guest_ip` returns a known
+`10.200.0.7`; `MiniMeta` returns a synthesized `enabled_images`
+row with a fake manifest; in-memory `SecretStore` returns
+test values. Call `build_resume_egress_policy`, assert the
+returned `SessionEgressPolicy` carries the real IP + the
+manifest's allow-lists + the resolved secret placeholders.
+
+**Manual prod-ops verification (post-merge)**: create session,
+let it idle, send a follow-up prompt. Tail host logs filtered
+to `egress bypass complete sni=api.anthropic.com` — the line
+should fire on the post-resume API call (didn't on session
+`1edf09a3`'s second prompt). Confirm via session_events that
+the resume's `run_completed` carries a real assistant response,
+not `ConnectionRefused`.
+
+### A.1.8 — egress `Registry` refactor: split policy from IP index
+
+**Motivation**: A.1.7 is a "must remember to register at this
+step" bug. The structural reason it's possible: the proxy's
+`Registry` keys policy entries by `guest_ip`. Every time a
+sandbox's IP changes (cold restore, host migration, future
+evacuation), every map entry has to be rewritten. There are
+multiple call sites that need updating; if any one is
+forgotten, you get A.1.7.
+
+**Proposed refactor** (defense in depth; lands AFTER A.1.7's
+immediate fix is in prod):
+
+```rust
+pub struct Registry {
+    /// Policy bodies keyed by durable session_id. Stable across
+    /// IP changes. Updated on session create + manifest changes.
+    policies: DashMap<SessionId, PolicyBody>,
+    /// Forward map from guest IP to the current session_id.
+    /// Updated on bind/rebind; this is the *only* thing that
+    /// changes on snapshot restore.
+    ip_index: DashMap<Ipv4Addr, SessionId>,
+}
+
+impl Registry {
+    pub fn lookup(&self, ip: Ipv4Addr) -> Option<SessionState> {
+        let sid = *self.ip_index.get(&ip)?;
+        let policy = self.policies.get(&sid)?;
+        Some(SessionState::from_parts(sid, ip, policy.clone()))
+    }
+    pub fn register_policy(&self, session_id: SessionId, body: PolicyBody) { ... }
+    pub fn bind_ip(&self, ip: Ipv4Addr, session_id: SessionId) { ... }
+    pub fn unbind_ip(&self, ip: Ipv4Addr) { ... }
+}
+```
+
+Resume path then only needs `bind_ip(new_guest_ip, session_id)` —
+one map mutation, one call site. The policy body doesn't need
+rebuilding unless the manifest itself changed.
+
+**Why not before A.1.7's immediate fix**:
+
+- The user-visible wedge needs to close in this milestone.
+- The refactor touches every `register_policy` call site in
+  the host-agent + every test that builds a `SessionState`.
+- Right size is "one PR after A.1.7 is in prod, with the
+  immediate fix as a regression guard."
+
+**Filed scope**: this becomes Phase A.1.8 in the M4 commit
+chain; per-commit `just check`-clean; lands in the same M4
+milestone but after A.1.7 is validated.
+
+**Unit test surface (when implemented)**: parameterized test
+that swaps IPs for the same session_id and asserts policy
+lookups stay correct via the new ip_index path. The existing
+`dns::tests` suite should pass with no semantic changes.
 
 ---
 
