@@ -394,6 +394,128 @@ binary against `http://` env — works fine, shim is a no-op on
 HTTP schemes. After step 2 they're running the NEW no-shim binary
 against `http://` env — also fine. No window of incompatibility.
 
+### A.1.5 — idle-eviction retry storm
+
+**Evidence (prod, session `6b8e5d83-fcbf-42d7-af25-8c822c4a026d`,
+2026-05-24)**: A.1.1's new entry log fired 6+ times for the same
+sandbox over ~3 minutes with zero `pipeline completed` lines. The
+host's `idle eviction POST` failed every ~30s with `transport
+error` (`is_timeout=true`, not `is_connect=true` — so A.1.3 was
+*not* the culprit). The session stayed `Active`; a second user
+prompt sent during the retry storm went nowhere — the in-VM
+harness adapter wedged from cumulative FC pause/resume cycles
+each time a new `evict_idle_session` aborted the prior snapshot
+via `inflight_snapshots`.
+
+**Root cause**: the shared `CoordClient`'s 30s `reqwest` timeout
+is tighter than the worst-case `evict_idle_session` pipeline
+duration (memory dump + state.bin upload + chunked memory upload
++ PG inserts can run 60–90s on a session with cold blob storage).
+The host's tick loop awaited the POST synchronously; on timeout
+it un-set the in-flight bookkeeping (nothing held it across the
+timeout boundary) and the *next* tick picked the same idle
+sandbox up again. Each retry minted a fresh `evict_idle_session`,
+which `inflight_snapshots`-aborted the in-progress one. Pipeline
+never reached `record_snapshot`. The eviction was structurally
+incapable of completing.
+
+**Fix shipped** (two commits, sequenced):
+
+#### A.1.5a — host-side in-flight gate + fire-and-forget POST + 120s per-request timeout
+
+Three coupled changes in `engram-host-agent`:
+
+1. `HarnessHub::eviction_inflight: Mutex<HashMap<SandboxId, Instant>>`.
+   `idle_sandboxes()` now filters any sandbox already present.
+   Public methods: `mark_eviction_inflight`,
+   `clear_eviction_inflight`, `sweep_stale_evictions(max_age) ->
+   Vec<SandboxId>`.
+2. The eviction tick (`lib.rs`) marks every candidate, then
+   `tokio::spawn`s the POST and returns. The spawned task's
+   finally block unconditionally clears each marker (success /
+   transport error / timeout). The tick is no longer blocked by
+   the POST. A stale-entry sweep at the top of each tick reaps
+   markers older than **180s** with `tracing::warn!`, so a
+   wedged spawn can't permanently block re-eviction.
+3. `coord_client.rs::push_idle_eviction_candidates` gets a
+   per-request `RequestBuilder::timeout(120s)` override. The
+   shared client's 30s default stays right for heartbeat /
+   harness_event. 120s covers worst-case pipeline duration with
+   a 30s margin; the host-side gate suppresses the storm even
+   if a POST does time out.
+
+Three new unit tests in `harness::tests`:
+- `idle_sandboxes_skips_evictions_in_flight`
+- `sweep_stale_evictions_reaps_old_entries`
+- `mark_eviction_inflight_is_idempotent`
+
+Commit: `21be0c3`. 763/763 workspace tests pass.
+
+#### A.1.5b — coord-side re-entry guard
+
+Belt-and-suspenders for `evict_idle_session`. New
+`AppState::inflight_evictions: Arc<DashMap<SessionId, ()>>` and an
+RAII `InflightEvictionGuard` at the top of the pipeline:
+
+- `try_acquire` returns `None` if another `evict_idle_session`
+  call for the same session is already in flight **on this coord
+  pod**. The second caller returns `Ok(())` with an `info!` log
+  ("pipeline already in flight on this coord"). The first caller
+  owns the work.
+- Drop removes the entry — covers success, error, and panic
+  paths uniformly.
+
+New unit test
+`evict_idle_session_reentry_guard_serializes_concurrent_calls`:
+holds the guard manually, asserts the second call is a no-op
+(session stays Active, registry not unbound), drops the guard,
+runs the pipeline for real, asserts Drop releases on success.
+
+#### Known scope limitation — A.1.5b is per-pod (deferred §A.1.5c)
+
+`inflight_evictions` is in-process per coord replica. With a
+single coord replica (today's prod), this is sufficient. With
+N replicas the residual race is:
+
+- Pod A receives the host's POST, enters the pipeline.
+- The host's *next* tick (rare under A.1.5a's in-flight gate,
+  but possible if the spawned task panics and the 180s sweep
+  fires) round-robins to pod B.
+
+Cross-pod protection then falls to three existing layers:
+
+1. **Host-side eviction-inflight gate (A.1.5a)** — the primary
+   defence. The same host can't emit two POSTs for the same
+   sandbox no matter where they land.
+2. **Host's `inflight_snapshots` map** (ADR 0014 #1/#2) —
+   serializes `host.snapshot(sandbox_id)` at the host. One pod
+   wins; the other sees a conflict.
+3. **`registry.get(session_id)` guard** at the top of
+   `evict_idle_session` — once the winning pod unbinds the
+   sandbox, every subsequent caller no-ops.
+
+The residual window is between `host.snapshot()` starting on
+pod A and pod A's `registry.unbind()` — a second pod can pass
+the registry guard and enter the pipeline. The host's snapshot
+serializer prevents double-uploading; pod B then tries
+`record_snapshot` / `transition_session`, racing pod A's PG
+writes. Most PG ops are idempotent or conflict-rejecting, but
+it's untidy.
+
+**Deferred follow-up — §A.1.5c (cross-replica eviction guard)**:
+when multi-replica coord ships, gate `evict_idle_session` on a
+PG advisory lock keyed by `session_id`:
+`pg_try_advisory_lock(hashtext(session_id::text))`, held for
+the pipeline, released by RAII drop. One extra round-trip,
+durably serializes across all replicas. **Not in scope for the
+M4 milestone** — the prod symptom is closed by A.1.5a; A.1.5b
+covers single-replica cleanly; the multi-replica gap is latent
+and the fix is small when we need it. Filed here as a forward
+pointer so the next replica scale-out reads this section first.
+
+**Commits**: A.1.5a `21be0c3`; A.1.5b lands with this ADR
+update.
+
 ---
 
 ## Context

@@ -34,6 +34,25 @@ pub async fn evict_idle_session(
     session_id: SessionId,
     sandbox_id: SandboxId,
 ) -> Result<(), EvictError> {
+    // ADR 0016 §A.1.5b: coord-side re-entry guard. Belt-and-suspenders
+    // for the host-side gate (§A.1.5a). If two callers (e.g. the host
+    // idle-eviction POST + a concurrent operator drain) land in
+    // `evict_idle_session` for the same session on this same coord
+    // pod, the second one returns Ok(()) immediately. The first one
+    // owns the pipeline; the second's caller treats success as
+    // "in-flight, no action required".
+    let _guard = match InflightEvictionGuard::try_acquire(state, session_id) {
+        Some(g) => g,
+        None => {
+            tracing::info!(
+                session_id = %session_id,
+                sandbox_id = %sandbox_id,
+                "idle eviction skipped: pipeline already in flight on this coord",
+            );
+            return Ok(());
+        }
+    };
+
     // ADR 0016 A.1.1: entry log. Was silent before — a coord pod
     // running the pipeline repeatedly (e.g. retry storm, post-roll
     // race) showed up only as host-side `chunked NBD disk flushed`
@@ -209,6 +228,38 @@ pub async fn evict_idle_session(
     );
 
     Ok(())
+}
+
+/// ADR 0016 §A.1.5b: RAII guard around `state.inflight_evictions`.
+/// `try_acquire` returns `None` if another `evict_idle_session`
+/// call for the same session is already in flight on this coord.
+/// Drop removes the entry — covers success, error, and panic paths
+/// uniformly so a wedged pipeline can't permanently block a re-try.
+struct InflightEvictionGuard {
+    map: Arc<dashmap::DashMap<SessionId, ()>>,
+    session_id: SessionId,
+}
+
+impl InflightEvictionGuard {
+    fn try_acquire(state: &SharedState, session_id: SessionId) -> Option<Self> {
+        use dashmap::mapref::entry::Entry;
+        match state.inflight_evictions.entry(session_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(v) => {
+                v.insert(());
+                Some(Self {
+                    map: state.inflight_evictions.clone(),
+                    session_id,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for InflightEvictionGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.session_id);
+    }
 }
 
 /// ADR 0014 issue #1/#2: best-effort `abort_snapshot` after a
@@ -854,6 +905,82 @@ mod tests {
             aborts.load(Ordering::SeqCst),
             0,
             "abort_snapshot must NOT fire on full pipeline success",
+        );
+    }
+
+    /// ADR 0016 §A.1.5b regression guard. Two concurrent
+    /// `evict_idle_session` calls for the same session: one runs
+    /// the pipeline, the other returns Ok(()) early (re-entry
+    /// guard fired). Verifies the RAII guard releases on the
+    /// success path so a future eviction for the same session can
+    /// re-enter cleanly.
+    #[tokio::test]
+    async fn evict_idle_session_reentry_guard_serializes_concurrent_calls() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:reentry".into(),
+            harness: HarnessSpec::None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let state = build_state_with_session(session, sandbox_root.path());
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Manually hold the guard while a second call tries to enter:
+        // the second call must short-circuit to Ok(()) without
+        // touching the session.
+        state.inflight_evictions.insert(session_id, ());
+
+        evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("re-entry must return Ok(()) early, not error");
+
+        // Session was untouched — the early return happened before
+        // any pipeline work.
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Active,
+            "re-entry guard must short-circuit before transitioning session",
+        );
+        assert!(
+            state.registry.get(session_id).is_some(),
+            "re-entry guard must short-circuit before unbinding",
+        );
+
+        // Now drop the manual entry and let the *real* pipeline run.
+        // Verifies the guard releases on the (Ok early-return) path
+        // so a follow-on legitimate call can acquire.
+        state.inflight_evictions.remove(&session_id);
+
+        evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("second call (no concurrent holder) must run the pipeline");
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Idle,
+            "after the guard releases, a fresh eviction must complete",
+        );
+        // Guard released by Drop on the successful path too.
+        assert!(
+            !state.inflight_evictions.contains_key(&session_id),
+            "guard's Drop must remove the in-flight entry on success",
         );
     }
 

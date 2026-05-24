@@ -354,6 +354,14 @@ pub struct AppState {
     /// through this to avoid storming the host on web-app polling.
     /// 1s TTL; cache eviction on host unregister.
     pub cow_state_cache: Arc<crate::cow_state::CowStateCache>,
+    /// ADR 0016 §A.1.5b: coord-side re-entry guard for
+    /// `evict_idle_session`. Belt-and-suspenders against any caller
+    /// (host idle-eviction POST, operator drain, future M4.1
+    /// evacuation) that fires a second eviction while a prior
+    /// pipeline is still running on this coord pod. The host-side
+    /// in-flight gate (§A.1.5a) is the primary defence; this one
+    /// catches non-host callers and any cross-host weirdness.
+    pub inflight_evictions: Arc<DashMap<SessionId, ()>>,
 }
 
 impl AppState {
@@ -395,6 +403,7 @@ impl AppState {
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
+            inflight_evictions: Arc::new(DashMap::new()),
         }
     }
 
