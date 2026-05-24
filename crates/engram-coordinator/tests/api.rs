@@ -82,6 +82,7 @@ impl MetadataStore for MockMetadataStore {
             image: spec.image,
             harness: spec.harness,
             last_active_at: Utc::now(),
+            live_disk_manifest: None,
         };
         self.sessions.lock().insert(id, session);
         Ok(id)
@@ -104,6 +105,7 @@ impl MetadataStore for MockMetadataStore {
             image: spec.image,
             harness: spec.harness,
             last_active_at: Utc::now(),
+            live_disk_manifest: None,
         };
         self.sessions.lock().insert(session_id, session);
         Ok(())
@@ -3112,6 +3114,7 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
                 harness: engram_core::types::session::HarnessSpec::None,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
+                live_disk_manifest: None,
             },
         );
     }
@@ -3214,6 +3217,7 @@ async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
                 harness: engram_core::types::session::HarnessSpec::None,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
+                live_disk_manifest: None,
             },
         );
     }
@@ -3249,6 +3253,7 @@ async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
                 harness: engram_core::types::session::HarnessSpec::None,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
+                live_disk_manifest: None,
             },
         );
     }
@@ -3293,6 +3298,7 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
                 harness: engram_core::types::session::HarnessSpec::None,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
+                live_disk_manifest: None,
             },
         );
     }

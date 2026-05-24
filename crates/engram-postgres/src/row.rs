@@ -27,6 +27,22 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let harness_json: serde_json::Value = row.try_get("harness").map_err(col_err)?;
     let harness: HarnessSpec = serde_json::from_value(harness_json)
         .map_err(|e| MetaError::Serialization(format!("harness: {e}")))?;
+    // ADR 0016 Phase B: live_disk_manifest_* columns added in
+    // migration 0034. The both-or-neither CHECK constraint
+    // guarantees these two columns are either both NULL or both
+    // populated, so we collapse them into Option<ManifestRef>.
+    // Older SELECT statements that don't project these columns
+    // get `try_get` errors → fall back to None.
+    let live_disk_manifest_id: Option<Uuid> = row.try_get("live_disk_manifest_id").ok().flatten();
+    let live_disk_manifest_version: Option<i64> =
+        row.try_get("live_disk_manifest_version").ok().flatten();
+    let live_disk_manifest = match (live_disk_manifest_id, live_disk_manifest_version) {
+        (Some(mid), Some(ver)) => Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: mid,
+            version: ver as u64,
+        }),
+        _ => None,
+    };
     Ok(Session {
         id: SessionId(id),
         user_id: row.try_get("user_id").map_err(col_err)?,
@@ -37,6 +53,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         harness,
         created_at,
         last_active_at,
+        live_disk_manifest,
     })
 }
 

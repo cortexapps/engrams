@@ -253,6 +253,18 @@ pub struct Session {
     pub harness: HarnessSpec,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
+    /// ADR 0016 Phase B: the host's last-published live disk
+    /// manifest from the FlushScheduler. Updated by
+    /// `MetadataStore::update_live_disk_manifest`; cleared by
+    /// `assign_session_sandbox(None)`. Coord's
+    /// `effective_resume_disk_manifest` picks the newer of this
+    /// and `snapshots.disk_manifest` so the first resume after
+    /// continuous flush is enabled doesn't silently roll back to
+    /// the snapshot's stale disk lineage. `None` for sessions
+    /// that haven't gotten a publish (warm-pool / non-NBD hosts /
+    /// pre-Phase-B sessions).
+    #[serde(default)]
+    pub live_disk_manifest: Option<crate::types::manifest::ManifestRef>,
 }
 
 #[cfg(test)]
@@ -461,6 +473,7 @@ mod tests {
             },
             created_at: Utc::now(),
             last_active_at: Utc::now(),
+            live_disk_manifest: None,
         };
         let blob = serde_json::to_string(&original).unwrap();
         let back: Session = serde_json::from_str(&blob).unwrap();

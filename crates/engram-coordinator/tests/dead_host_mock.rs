@@ -40,6 +40,7 @@ impl MetadataStore for MiniMeta {
                 image: spec.image,
                 harness: spec.harness,
                 last_active_at: Utc::now(),
+                live_disk_manifest: None,
             },
         );
         Ok(id)
@@ -63,6 +64,7 @@ impl MetadataStore for MiniMeta {
                 image: spec.image,
                 harness: spec.harness,
                 last_active_at: Utc::now(),
+                live_disk_manifest: None,
             },
         );
         Ok(())

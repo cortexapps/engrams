@@ -294,6 +294,47 @@ async fn transition_to_dead_if_no_snapshot(
 /// local copy and reconstructs from chunks) is a follow-up task —
 /// the chunked manifests are the portable form, but FC's restore
 /// API still wants a directory on local disk today.
+/// ADR 0016 Phase B commit 6 — pick the disk manifest that should
+/// drive the resume. Returns the newer of `live_disk_manifest`
+/// (the host's last-published FlushScheduler manifest) and
+/// `snapshot_disk_manifest` (the lineage recorded at snapshot
+/// time).
+///
+/// Behaviour matrix:
+///
+/// | live      | snapshot  | result           | rationale                            |
+/// |-----------|-----------|------------------|--------------------------------------|
+/// | None      | None      | None             | Legacy session, no chunked manifest. |
+/// | None      | Some(s)   | Some(s)          | No live publish; snapshot wins.      |
+/// | Some(l)   | None      | Some(l)          | No snapshot manifest; live wins.     |
+/// | Some(l)   | Some(s)   | Some(newer)      | Same manifest_id → max(version).     |
+/// |           |           |                  | Different manifest_id → snapshot     |
+/// |           |           |                  | (live can't supersede a different    |
+/// |           |           |                  | lineage; safer fallback).            |
+///
+/// The "different manifest_id" branch is defensive: today both
+/// columns track the same `manifest_id` over a session's
+/// lifetime (the chunk-store version chain keeps the id stable;
+/// only `version` ticks). If we ever see them diverge, the
+/// snapshot lineage is authoritative because that's the
+/// (memory, disk) pair the user actually paused at.
+fn effective_resume_disk_manifest(
+    live: Option<engram_core::types::manifest::ManifestRef>,
+    snapshot: Option<engram_core::types::manifest::ManifestRef>,
+) -> Option<engram_core::types::manifest::ManifestRef> {
+    match (live, snapshot) {
+        (None, snap) => snap,
+        (Some(l), None) => Some(l),
+        (Some(l), Some(s)) => {
+            if l.manifest_id == s.manifest_id && l.version > s.version {
+                Some(l)
+            } else {
+                Some(s)
+            }
+        }
+    }
+}
+
 async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
@@ -330,6 +371,32 @@ async fn resume_from_fc_snapshot(
         // affinity already constrains to a host that has the bytes.
         required_image_digest: None,
     };
+    // ADR 0016 Phase B commit 6: pick the newer of
+    // `session.live_disk_manifest` and `record.disk_manifest`.
+    // Without this, the first resume after Phase B's continuous
+    // flush is enabled silently rolls the session back to the
+    // snapshot's stale disk lineage, throwing away every flush
+    // since the snapshot.
+    //
+    // `session.live_disk_manifest` is `None` when:
+    // - The session never went through Phase B (warm-pool /
+    //   non-NBD host / never had a publish land).
+    // - The session is mid-eviction and `assign_session_sandbox(None)`
+    //   cleared the column (commit 3's load-bearing race fix).
+    //
+    // In both `None` cases the resolver falls back to the
+    // snapshot's manifest, preserving the pre-Phase-B behaviour.
+    let effective_disk_manifest =
+        effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest);
+    if effective_disk_manifest != record.disk_manifest {
+        tracing::info!(
+            session_id = %id,
+            snapshot_disk_manifest = ?record.disk_manifest,
+            live_disk_manifest = ?session.live_disk_manifest,
+            effective_disk_manifest = ?effective_disk_manifest,
+            "resume: preferred live_disk_manifest over snapshot's stale lineage",
+        );
+    }
     // Build the SnapshotMetadata the trait now takes. The record
     // carries every field we need; we just round-trip it back into
     // the engine type the backend expects.
@@ -338,7 +405,7 @@ async fn resume_from_fc_snapshot(
         size_bytes: record.size_bytes,
         created_at: record.created_at,
         image_version: record.image_version.clone(),
-        disk_manifest: record.disk_manifest,
+        disk_manifest: effective_disk_manifest,
         memory_manifest: record.memory_manifest,
         // ADR 0014: portable-snapshot refs aren't yet plumbed onto
         // SnapshotRecord — the existing idle-resume path stays
@@ -803,5 +870,120 @@ mod recoverable_tests {
             .unwrap();
         let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None).await;
         assert!(r, "disk-only snapshots are recoverable on cold-boot");
+    }
+}
+
+#[cfg(test)]
+mod effective_resume_disk_manifest_tests {
+    use super::*;
+    use engram_core::types::manifest::ManifestRef;
+    use uuid::Uuid;
+
+    fn mref(version: u64) -> ManifestRef {
+        ManifestRef {
+            manifest_id: Uuid::new_v4(),
+            version,
+        }
+    }
+
+    /// Same `manifest_id`, live is newer → resolver picks live.
+    /// This is the load-bearing case: post-snapshot continuous
+    /// flushes (commit 4's FlushScheduler) advance the chain past
+    /// what the snapshot row captured.
+    #[test]
+    fn live_newer_than_snapshot_wins() {
+        let mid = Uuid::new_v4();
+        let live = ManifestRef {
+            manifest_id: mid,
+            version: 7,
+        };
+        let snap = ManifestRef {
+            manifest_id: mid,
+            version: 5,
+        };
+        assert_eq!(
+            effective_resume_disk_manifest(Some(live), Some(snap)),
+            Some(live),
+        );
+    }
+
+    /// Live and snapshot at the same version → snapshot wins (or
+    /// equivalently, both are valid; the resolver's defensive
+    /// `>` not `>=` keeps the choice deterministic). No real flush
+    /// landed between snapshot creation and now.
+    #[test]
+    fn live_equal_to_snapshot_picks_snapshot() {
+        let mid = Uuid::new_v4();
+        let live = ManifestRef {
+            manifest_id: mid,
+            version: 5,
+        };
+        let snap = ManifestRef {
+            manifest_id: mid,
+            version: 5,
+        };
+        assert_eq!(
+            effective_resume_disk_manifest(Some(live), Some(snap)),
+            Some(snap),
+        );
+    }
+
+    /// Live BEHIND snapshot (live=3, snap=5). Possible if the live
+    /// column wasn't refreshed before the snapshot wrote, OR a
+    /// stale publish landed pre-Phase-3's unbind-clear (defensive).
+    /// Snapshot wins.
+    #[test]
+    fn live_behind_snapshot_picks_snapshot() {
+        let mid = Uuid::new_v4();
+        let live = ManifestRef {
+            manifest_id: mid,
+            version: 3,
+        };
+        let snap = ManifestRef {
+            manifest_id: mid,
+            version: 5,
+        };
+        assert_eq!(
+            effective_resume_disk_manifest(Some(live), Some(snap)),
+            Some(snap),
+        );
+    }
+
+    /// Different manifest_ids → snapshot wins. Defensive: live
+    /// can't supersede a snapshot belonging to a different
+    /// chunked-disk lineage; the (memory, disk) pair the user
+    /// paused at is what we restore.
+    #[test]
+    fn different_manifest_ids_picks_snapshot() {
+        let live = mref(99);
+        let snap = mref(1);
+        assert_eq!(
+            effective_resume_disk_manifest(Some(live), Some(snap)),
+            Some(snap),
+        );
+    }
+
+    /// No live publish — never had Phase B running, or unbind
+    /// cleared it. Snapshot is the only signal.
+    #[test]
+    fn live_none_picks_snapshot() {
+        let snap = mref(2);
+        assert_eq!(effective_resume_disk_manifest(None, Some(snap)), Some(snap),);
+    }
+
+    /// No snapshot manifest — legacy snapshot row or a Phase-B-
+    /// only recovery path (M4.1 evacuation, future). Live wins.
+    #[test]
+    fn snapshot_none_picks_live() {
+        let live = mref(4);
+        assert_eq!(effective_resume_disk_manifest(Some(live), None), Some(live),);
+    }
+
+    /// Both None — no chunked-disk lineage on either side.
+    /// Resolver returns None; resume falls through to the legacy
+    /// materialize/flat-file path (commit 5's else branch).
+    #[test]
+    fn both_none_passes_through() {
+        assert_eq!(effective_resume_disk_manifest(None, None), None);
     }
 }

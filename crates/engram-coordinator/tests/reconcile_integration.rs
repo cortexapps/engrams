@@ -64,6 +64,7 @@ impl ReconcileMeta {
                 harness: HarnessSpec::None,
                 created_at: now,
                 last_active_at: now,
+                live_disk_manifest: None,
             },
         );
         id

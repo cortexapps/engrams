@@ -131,7 +131,8 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
                    image_uri, harness,
-                   created_at, last_active_at
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version
             FROM sessions WHERE id = $1
             "#,
         )
@@ -148,7 +149,8 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
                    image_uri, harness,
-                   created_at, last_active_at
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
             WHERE status IN ('pending','active','idle')
             "#,

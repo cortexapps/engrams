@@ -526,6 +526,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -724,6 +725,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -931,6 +933,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1035,6 +1038,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -1264,6 +1268,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1378,6 +1383,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -1468,6 +1474,7 @@ mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());

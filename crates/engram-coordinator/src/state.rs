@@ -1119,6 +1119,7 @@ pub(crate) mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -1179,6 +1180,7 @@ pub(crate) mod tests {
             harness: HarnessSpec::None,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
         };
         (session_id, Arc::new(MiniMeta::new(session)))
     }
