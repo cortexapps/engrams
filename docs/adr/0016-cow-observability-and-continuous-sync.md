@@ -22,7 +22,9 @@ M1.x annotations and ADR 0015's per-milestone commit lists):
   separate code paths, one TF cleanup. Each its own commit; see
   §"Phase A.1 follow-ups" below for the catalog and proposed fixes.
   _(in flight)_
-- **Phase B** — continuous disk sync (5 commits + ADR update). _(pending)_
+- **Phase B** — continuous disk sync. Design finalized 2026-05-24
+  (see §"Phase B design (2026-05-24)" below); 8 commits + ADR
+  bookends. _(design files; implementation in flight)_
 - **Phase C** — chunk-GC pin-set redesign (6 commits + ADR final pass). _(pending)_
 
 The ADR is updated at the end of each phase with what shipped, what
@@ -1160,6 +1162,277 @@ expected, ship an interim back-off in the host's
 last N seconds (say 60s) skips emission. Closes the log
 storm without changing correctness. Filed as a minor knob;
 the Phase B root-cause fix supersedes it.
+
+#### Phase B design (2026-05-24) — finalized approach
+
+Pre-implementation annotation, written before code lands so
+divergences can be captured at the closing bookend. Picks the
+"resume = full chunked-disk tracking" option from the failure-
+mode discussion above (not the no-tracking sentinel), and
+extends scope with restart-time rehydration and the
+`effective_resume_disk_manifest` resolver after a Plan-agent
+review surfaced two failure modes that would otherwise undercut
+Phase B's purpose on the first resume and on host-agent
+restart.
+
+**Unified attach surface.** Every chunked-disk lifecycle path
+converges on `PooledBackend::nbd_sandboxes.insert(sandbox_id,
+NbdSandboxState)`. The scheduler is spawned at insertion and
+cancelled via field-ordered Drop. `NbdSandboxState` grows a
+new field, ordered first so Drop runs scheduler-cancel →
+NBD-daemon-disconnect → slot-release:
+
+```rust
+pub struct NbdSandboxState {
+    pub scheduler: FlushSchedulerHandle,   // NEW — Drops first
+    pub backend: Arc<ChunkedDiskBackend>,  // Arc-shared with scheduler
+    pub handle: NbdHandle,                 // existing
+    pub slot: NbdSlot,                     // existing
+}
+```
+
+The scheduler holds an `Arc<ChunkedDiskBackend>` clone, so a
+mid-flight `backend.flush().await` survives the
+`nbd_sandboxes.remove()` call and runs to completion. The
+resulting publish (if any) lands harmlessly because coord's
+`sessions.sandbox_id == publish.sandbox_id` guard drops stale
+publishes from destroyed bindings.
+
+The NBD-attach + sidecar `spec.rootfs_source` patching + dual
+canonical symlink install (host + source-keyed, both pointing
+at `/dev/nbdN`) is factored out of `PooledBackend::create()`
+into a shared `attach_chunked_disk_pre_*` helper used by
+**three call sites**: cold-create, resume, and restart
+rehydration. The bytes-materialization branch of
+`materialize_disk_if_missing` is deleted outright — no legacy
+shim. Path-patching and symlink-install logic that
+materialization shared is kept (the NBD path needs it too).
+
+**`FlushScheduler` shape.** New module
+`crates/engram-host-agent/src/disk_daemon/flush_scheduler.rs`:
+
+```rust
+pub struct FlushSchedulerConfig {
+    pub interval: Duration,         // 30s; ENGRAM_FLUSH_INTERVAL_SECS
+    pub dirty_threshold_bytes: u64, // 256 MiB; ENGRAM_FLUSH_DIRTY_THRESHOLD_MIB
+    pub enabled: bool,              // ENGRAM_CONTINUOUS_FLUSH_DISABLED=1 disables
+}
+
+impl FlushScheduler {
+    pub fn spawn(
+        sandbox_id: SandboxId,
+        session_id: Option<SessionId>,   // None for warm-pool (future)
+        backend: Arc<ChunkedDiskBackend>,
+        publisher: Arc<dyn LiveManifestPublisher>,
+        config: FlushSchedulerConfig,
+    ) -> FlushSchedulerHandle;
+}
+```
+
+Loop selects between `interval.tick()` and
+`backend.threshold_notify().notified()`; calls
+`backend.flush().await`; short-circuits the publish if
+`outcome.chunks_flushed == 0` or `session_id.is_none()`.
+
+The `Option<SessionId>` parameter is the **only** concession
+to the warm pool. Warm-pool spawn passes `None`; the
+assignment step (when warm pool returns) cancels the
+no-session scheduler and re-spawns with `Some(sid)`. The dirty
+buffer lives on the Arc-shared `ChunkedDiskBackend`, so the
+re-spawn loses nothing. No `ArcSwap` cell, no runtime-mutable
+session slot — that's forward complexity for code that doesn't
+exist. If warm-pool's redesign wants something more graceful,
+`tokio::sync::watch::channel` is the idiomatic shape.
+
+**Threshold-notify in `ChunkedDiskBackend`.** New field
+`threshold_notify: Arc<Notify>` plus a `threshold_bytes`
+config. `ensure_dirty` computes the crossing **inside the same
+mutex** the flush drain takes — two writers landing on
+different chunks can both observe `post-write > threshold` if
+they read `dirty_bytes()` separately, but only one observes
+the monotonic crossing edge under the lock. Compute the
+crossing inside the guard, drop the guard, then
+`notify_one()`. The existing `dirty_bytes()` helper already
+sums under lock; refactor the crossing check to reuse it
+rather than open-code a second sum.
+
+**Coord side.** Migration `0034_sessions_live_disk_manifest.sql`
+(renumbered from this ADR's original `0033_` — A.1.5c took
+that slot on 2026-05-24). The migration also creates the
+one-row `chunk_generation` table Phase C's mid-sweep barrier
+reads:
+
+```sql
+ALTER TABLE sessions
+  ADD COLUMN live_disk_manifest_id UUID NULL,
+  ADD COLUMN live_disk_manifest_version BIGINT NULL,
+  ADD COLUMN live_disk_manifest_at TIMESTAMPTZ NULL,
+  ADD CONSTRAINT live_disk_manifest_both_or_neither CHECK (
+    (live_disk_manifest_id IS NULL) = (live_disk_manifest_version IS NULL));
+CREATE INDEX idx_sessions_live_disk_manifest
+  ON sessions (live_disk_manifest_id)
+  WHERE live_disk_manifest_id IS NOT NULL;
+
+CREATE TABLE chunk_generation (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE,
+    generation BIGINT NOT NULL DEFAULT 0,
+    CHECK (id));
+INSERT INTO chunk_generation (id, generation) VALUES (TRUE, 0)
+  ON CONFLICT DO NOTHING;
+```
+
+Creating `chunk_generation` here means Phase C is a pure
+consumer — no retrofit of Phase B's writers when it lands.
+
+`MetadataStore::update_live_disk_manifest(session_id,
+sandbox_id, manifest_ref)` runs a single TX:
+
+1. `UPDATE sessions SET live_disk_manifest_* = $1.. WHERE id =
+   $2 AND sandbox_id = $3` — the `sandbox_id` guard is the
+   core stale-publish defence.
+2. If `rows_affected == 0` → return
+   `UpdateOutcome::DroppedStale`, no generation bump.
+3. If `rows_affected == 1` → `UPDATE chunk_generation SET
+   generation = generation + 1` → return
+   `UpdateOutcome::Applied`.
+
+`POST /internal/live-manifest` on `host_http.rs` mirrors the
+heartbeat-lane bearer-auth shape (`require_bearer`
+middleware). Payload `{session_id, sandbox_id, manifest_id,
+manifest_version}`; handler calls `update_live_disk_manifest`;
+`info!` on `Applied`, `warn!` on `DroppedStale` with the
+mismatch fields.
+
+Host publisher with **per-session coalescing**:
+`CoordClient::publish_live_manifest` enqueues into a per-host
+bounded mpsc (capacity 16). A single drain task POSTs and
+collapses pending entries for the same session — only the
+latest `manifest_ref` per session matters; earlier ones are
+strictly dominated. Worst-case backlog is "publish burst after
+slow coord pod restart" where N stale publishes for the same
+session compress to one. Same per-request 120s timeout as
+A.1.5a's eviction POST.
+
+**Resume-path NBD attach.** `pooled_backend.rs::restore`
+becomes:
+
+```rust
+async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, _> {
+    materialize_state_if_missing(...)?;
+    materialize_sidecar_if_missing(...)?;
+
+    let disk_manifest = metadata.disk_manifest.clone()
+        .ok_or(SandboxError::Snapshot("resume requires disk_manifest"))?;
+
+    let pending = self.attach_chunked_disk_pre_restore(&src, disk_manifest).await?;
+    // ^ acquires slot, builds ChunkedDiskBackend::from_blob,
+    //   spawns NBD daemon, patches sidecar spec.rootfs_source
+    //   + installs canonical symlinks (host + source-keyed) → /dev/nbdN.
+
+    let new_id = self.inner.restore(metadata).await?;
+
+    let scheduler = FlushScheduler::spawn(
+        new_id, Some(session_id), pending.backend.clone(),
+        self.publisher.clone(), self.flush_config.clone());
+    self.nbd_sandboxes.insert(new_id, NbdSandboxState {
+        scheduler, backend: pending.backend,
+        handle: pending.handle, slot: pending.slot,
+    });
+    Ok(new_id)
+}
+```
+
+FC's snapshot restore opens `path_on_host` as a virtio-blk
+drive. The kernel backs virtio-blk with `/dev/nbdN`; no FC-
+side change needed. The dual-symlink (host + source-keyed —
+FC's `state.bin` embeds the source path; the receiver must
+install a symlink under the source's path too, per
+`engram-sandbox-firecracker/src/lib.rs:1877`'s
+`restore_canonical_symlinks`) install runs through the shared
+helper so all three call sites stay in sync.
+
+**`effective_resume_disk_manifest` resolver.** Without this,
+the first resume after continuous flush enables silently rolls
+the session back to `snapshots.disk_manifest`, throwing away
+every flush since the snapshot — defeating Phase B's purpose
+on the resume path. Coord-side helper:
+
+```rust
+async fn effective_resume_disk_manifest(
+    meta: &MetadataStore, snapshot: &SnapshotRow, session: &Session,
+) -> Option<ManifestRef> {
+    match (session.live_disk_manifest.as_ref(), snapshot.disk_manifest.as_ref()) {
+        (Some(live), Some(snap)) if live.version > snap.version => Some(live.clone()),
+        (Some(live), None) => Some(live.clone()),
+        (_, snap) => snap.cloned(),
+    }
+}
+```
+
+Wired into `resume_from_fc_snapshot` so the
+`SnapshotMetadata.disk_manifest` passed to the host's
+`restore()` is always the effective one. Reused by restart
+rehydration.
+
+**Restart-time rehydration.** Host-agent's `nbd_sandboxes` is
+in-process state. On host-agent restart (crash, deploy roll)
+it's empty even though PG says the host has Active sandboxes
+assigned. Without rehydration, post-restart Phase B is
+silently degraded: COW diagnostic returns null,
+`FlushScheduler` never spawns, continuous flush stops for
+every survivor. New `MetadataStore::list_active_sandboxes_on_host(host_id)
+-> Vec<(SessionId, SandboxId, EffectiveDiskManifest)>`. Host-
+agent startup hook (after `HostRegistry::register`, before
+serving heartbeats) iterates the list and calls the same
+shared `attach_chunked_disk` helper + spawns `FlushScheduler`.
+Reuses `effective_resume_disk_manifest` to pick the newer of
+live-vs-snapshot manifest per row.
+
+**Open engineering question to verify on dev-vm during commit
+7**: a host-agent crash mid-sandbox drops the NBD daemon and
+FC's I/O to `/dev/nbdN` starts erroring. Whether FC recovers
+when the daemon is re-spun on the same device number depends
+on NBD semantics around connection re-establishment. If FC
+doesn't recover, rehydration still rebuilds COW/scheduler
+state for survivors (so future flush attempts make sense) but
+the survivor is wedged from FC's side — pre-existing host-
+agent-restart durability gap, orthogonal to Phase B, file as
+its own follow-up ADR if the test confirms it.
+
+**Commit chain (ADR bookends + 8 commits)**:
+
+- **Commit 0**: this annotation block — design files before
+  code, per `[adr_bookends_substantive_work]`.
+- **Commit 1**: `backend.rs` threshold-notify wiring (additive).
+- **Commit 2**: `flush_scheduler.rs` module + shared
+  `attach_chunked_disk` helper + cold-create wiring. Scheduler
+  publishes to a no-op `LiveManifestPublisher` impl until
+  commit 4 wires the real publisher.
+- **Commit 3**: Migration `0034_` + `chunk_generation` table +
+  `MetadataStore::update_live_disk_manifest`. No callers yet.
+- **Commit 4**: `POST /internal/live-manifest` endpoint +
+  per-session-coalescing `CoordClient::publish_live_manifest`
+  + drain task. Wire real publisher into the cold-create
+  scheduler.
+- **Commit 5**: Resume-path NBD attach (clean replacement of
+  `materialize_disk_if_missing`'s bytes branch). Closes the
+  two failure-mode symptoms above via regression tests.
+- **Commit 6**: `effective_resume_disk_manifest` resolver +
+  wiring into `resume_from_fc_snapshot`.
+- **Commit 7**: Restart-time rehydration via the shared helper.
+- **Commit 8**: UI copy fix
+  (`web/src/components/CowState.tsx:208-209` conditional on
+  session status) + this ADR's closing bookend with commit
+  hashes, divergences, and pitfalls.
+
+**Out of scope for Phase B (filed, not addressed)**:
+
+- **Warm pool** — scheduler API anticipates it via
+  `Option<SessionId>` at spawn; no warm-pool code lands.
+- **FC-side NBD-loss recovery** — surfaced by commit 7's
+  dev-vm test; gets its own ADR if needed.
+- **Phase C** — separate phase; Phase B leaves
+  `chunk_generation` groundwork ready.
 
 ### Phase C — chunk-GC pin-set redesign
 
