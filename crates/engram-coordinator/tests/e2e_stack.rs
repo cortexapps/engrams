@@ -197,6 +197,28 @@ impl Driver {
             .map(|r| r.status());
     }
 
+    /// ADR 0016 Phase B commit 4a admin trigger. Forces an
+    /// immediate `ChunkedDiskBackend::flush()` on the session's
+    /// bound sandbox + publishes the manifest_ref into
+    /// `sessions.live_disk_manifest_*` in the same coord-side TX.
+    /// Returns the parsed response body.
+    async fn flush_now(&self, sid: SessionId) -> FlushNowResponse {
+        let path = format!("/api/admin/sessions/{sid}/flush-now");
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("POST /api/admin/sessions/:id/flush-now");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "flush_now failed: {status} body={text}"
+        );
+        serde_json::from_str(&text).expect("decode FlushNowResponse")
+    }
+
     /// Stream session_events until the deadline, watching for an
     /// Anthropic auth-failure signal in either of the shapes
     /// documented on `AuthFailureSignal`.
@@ -371,6 +393,13 @@ struct ExecResponse {
     stderr: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FlushNowResponse {
+    outcome: String,
+    #[serde(default)]
+    manifest_version: Option<u64>,
+}
+
 // ---------- Tests ----------
 
 #[tokio::test]
@@ -470,5 +499,124 @@ async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
             SSE_WAIT_DEADLINE.as_secs()
         ),
     }
+    driver.delete(sid).await;
+}
+
+/// ADR 0016 Phase B commit 4b: end-to-end exercise of the
+/// FlushScheduler primitive via the admin `flush-now` endpoint.
+/// This is the explicit-trigger counterpart to the scheduler's 30s
+/// implicit cadence, and the only way to verify the
+/// chunked-disk-write → `backend.flush()` → coord
+/// `update_live_disk_manifest` → PG row update round-trip in CI
+/// without sleeping a full cadence. Without this test, the prod-
+/// shape chunked-disk write path silently regresses on any change to
+/// the `nbd_sandboxes` wiring or the `update_live_disk_manifest` TX
+/// shape — neither covered by the in-process unit tests.
+///
+/// Test path:
+/// 1. Cold-create a session against the demo (chunked-OCI) image.
+///    PooledBackend's resolve_rootfs branches to NBD attach; the
+///    sandbox gets entered into `nbd_sandboxes` and the
+///    FlushScheduler spawns.
+/// 2. Exec `dd if=/dev/zero of=/var/dirty.bin bs=1M count=8` —
+///    writes 8 MiB into the chunked-disk-backed rootfs. Bigger than
+///    a 16 MiB chunk on disk but the dirty bytes still drain on the
+///    next flush. We use `/dev/zero` (not /urandom) so the write is
+///    deterministic and the chunk store dedupes cleanly across
+///    re-runs.
+/// 3. POST `/api/admin/sessions/:id/flush-now`. With dirty bytes
+///    on the host, the coord-side handler dispatches to
+///    `HostClient::flush_sandbox`, drains the chunked-disk dirty
+///    buffer, returns `Some(ManifestRef)`, and pipes it through
+///    `update_live_disk_manifest`.
+/// 4. Assert `outcome == "applied"` and `manifest_version >= 1`.
+///    The base manifest from the demo bake is version 1 (or whatever
+///    the OCI publish lineage was at), and the first flush
+///    increments to the next version — so we only assert > 0, not a
+///    specific value the bake history controls.
+/// 5. Call flush_now a second time. With no new writes, the host's
+///    dirty buffer is empty; `flush_sandbox` returns `None` and the
+///    endpoint replies with `outcome == "idle"`. Pins the
+///    short-circuit path so a future regression that turns the
+///    no-dirty case into a spurious `Applied` would fail loud.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let sid = driver.create_session_none_harness(&image).await;
+
+    // First flush BEFORE any writes: outcome `idle`. Pinning the
+    // pre-write state confirms the session is actually bound (vs
+    // 409 / 404) and that the scheduler hasn't already flushed on
+    // its own tick (the create-to-flush window is ≪ 30s under
+    // default config; race-free for this assertion under CI
+    // latency).
+    let pre = driver.flush_now(sid).await;
+    assert_eq!(
+        pre.outcome, "idle",
+        "first flush before any writes should be idle; got {pre:?}",
+    );
+    assert!(
+        pre.manifest_version.is_none(),
+        "idle outcome must NOT carry a manifest_version; got {pre:?}",
+    );
+
+    // Write enough dirty bytes that at least one full 16 MiB chunk
+    // gets materialised in the dirty buffer.
+    //
+    // `/var` is writable + survives the run; the demo image's
+    // workdir varies, so anchoring at `/var` is the deterministic
+    // choice. `count=8` keeps the exec inside the default 30s
+    // timeout even on cold-cache CI runs.
+    let dd = driver
+        .exec(
+            sid,
+            "dd if=/dev/zero of=/var/dirty.bin bs=1M count=8 status=none",
+        )
+        .await;
+    assert_eq!(
+        dd.exit_status,
+        Some(0),
+        "dd should succeed; stderr=<{}>",
+        dd.stderr,
+    );
+    // `sync` so the writes actually hit the chunked-disk backend
+    // rather than sitting in the guest page cache. Without this,
+    // a fast CI runner can race the test's flush_now against the
+    // guest's writeback timer.
+    let sync = driver.exec(sid, "sync").await;
+    assert_eq!(sync.exit_status, Some(0), "sync should succeed");
+
+    // Force the flush via the admin trigger — no sleep needed.
+    let applied = driver.flush_now(sid).await;
+    assert_eq!(
+        applied.outcome, "applied",
+        "post-write flush should drain chunks + apply; got {applied:?}",
+    );
+    let v_after_first = applied
+        .manifest_version
+        .expect("applied outcome must carry a manifest_version");
+    assert!(
+        v_after_first > 0,
+        "first applied flush should produce a non-zero manifest version; got {v_after_first}",
+    );
+
+    // Second call with no fresh writes: dirty buffer drained, so
+    // `flush_sandbox` returns None → outcome `idle`. Catches a
+    // regression where the host returns `Some(prior_manifest)` on
+    // a zero-chunk flush (which would tick chunk_generation on
+    // every admin call — silent pin-set churn).
+    let idle = driver.flush_now(sid).await;
+    assert_eq!(
+        idle.outcome, "idle",
+        "second flush with no new writes should be idle; got {idle:?}",
+    );
+    assert!(
+        idle.manifest_version.is_none(),
+        "idle outcome must NOT carry a manifest_version; got {idle:?}",
+    );
+
     driver.delete(sid).await;
 }
