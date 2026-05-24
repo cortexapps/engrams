@@ -2021,7 +2021,81 @@ impl SandboxBackend for PooledBackend {
     /// - Symptom 2: snapshot path expects the canonical chunked-
     ///   disk layout (symlinks + nbd_sandboxes entry). Both are
     ///   present after a NBD-attach resume.
-    #[cfg(target_os = "linux")]
+    /// ADR 0016 Phase B commit 4a — admin trigger for the
+    /// FlushScheduler primitive. Forces an immediate flush on the
+    /// chunked-disk backend; returns the new manifest_ref if any
+    /// chunks were drained, `None` if the sandbox isn't NBD-attached
+    /// or has zero dirty bytes.
+    ///
+    /// Coord's `POST /api/admin/sessions/:id/flush-now` calls this
+    /// (via gRPC) and pipes the returned manifest_ref into
+    /// `MetadataStore::update_live_disk_manifest` immediately —
+    /// bypasses the publisher's coalescing drain so the round-trip
+    /// is deterministic for tests and operators.
+    async fn flush_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
+        #[cfg(target_os = "linux")]
+        {
+            let backend = self
+                .nbd_sandboxes
+                .get(&id)
+                .map(|entry| entry.backend.clone());
+            let Some(backend) = backend else {
+                return Ok(None);
+            };
+            let outcome = backend.flush().await.map_err(|e| {
+                SandboxError::Vm(format!("flush_sandbox: chunked-disk flush: {e}").into())
+            })?;
+            if outcome.chunks_flushed == 0 {
+                return Ok(None);
+            }
+            Ok(Some(outcome.manifest_ref))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PooledBackend {
+    /// ADR 0016 Phase B commit 5 — pre-restore half of the
+    /// resume-path NBD attach. Spawned from `restore()` before
+    /// `inner.restore()` reads the sidecar.
+    ///
+    /// When all four conditions hold — Linux + `nbd_pool` +
+    /// `chunk_store` + `chunk_cache` — AND the snapshot row carries
+    /// a chunked `disk_manifest`, this returns `Ok(Some(state))`:
+    ///
+    /// 1. Build a `ChunkedDiskBackend` from the snapshot's disk
+    ///    manifest. The base manifest IS the snapshot's manifest;
+    ///    no flat-file materialization happens.
+    /// 2. Acquire a `/dev/nbdN` slot + spawn the NBD daemon. State
+    ///    carries `scheduler: None` (the FlushScheduler is installed
+    ///    post-`inner.restore` when the new sandbox_id is known).
+    /// 3. Patch the FC sidecar's `spec.rootfs_source` to the NBD
+    ///    device path. `restore_canonical_symlinks` (called from
+    ///    `inner.restore`) then installs BOTH canonical symlinks
+    ///    (host + source-keyed per FC's `state.bin` embedded path)
+    ///    pointing at /dev/nbdN. FC's `load_snapshot` reads through
+    ///    the symlink → through virtio-blk → through the NBD daemon
+    ///    → through `ChunkedDiskBackend::read`. No bytes ever resident.
+    ///
+    /// On any short-circuit (no nbd_pool, no disk_manifest, etc.),
+    /// returns `Ok(None)` and the caller falls back to
+    /// `materialize_disk_if_missing` (the pre-Phase-B path).
+    ///
+    /// Closes ADR 0016 §"Phase B failure mode to close":
+    /// - Symptom 1: cow_state_all iterates `nbd_sandboxes`. The
+    ///   resumed sandbox is now in that map → diagnostic returns
+    ///   non-null.
+    /// - Symptom 2: snapshot path expects the canonical chunked-
+    ///   disk layout (symlinks + nbd_sandboxes entry). Both are
+    ///   present after a NBD-attach resume.
     async fn prepare_resume_nbd_attach(
         &self,
         metadata: &SnapshotMetadata,
@@ -2077,48 +2151,6 @@ impl SandboxBackend for PooledBackend {
         Ok(Some(state))
     }
 
-    /// ADR 0016 Phase B commit 4a — admin trigger for the
-    /// FlushScheduler primitive. Forces an immediate flush on the
-    /// chunked-disk backend; returns the new manifest_ref if any
-    /// chunks were drained, `None` if the sandbox isn't NBD-attached
-    /// or has zero dirty bytes.
-    ///
-    /// Coord's `POST /api/admin/sessions/:id/flush-now` calls this
-    /// (via gRPC) and pipes the returned manifest_ref into
-    /// `MetadataStore::update_live_disk_manifest` immediately —
-    /// bypasses the publisher's coalescing drain so the round-trip
-    /// is deterministic for tests and operators.
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        #[cfg(target_os = "linux")]
-        {
-            let backend = self
-                .nbd_sandboxes
-                .get(&id)
-                .map(|entry| entry.backend.clone());
-            let Some(backend) = backend else {
-                return Ok(None);
-            };
-            let outcome = backend.flush().await.map_err(|e| {
-                SandboxError::Vm(format!("flush_sandbox: chunked-disk flush: {e}").into())
-            })?;
-            if outcome.chunks_flushed == 0 {
-                return Ok(None);
-            }
-            Ok(Some(outcome.manifest_ref))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = id;
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl PooledBackend {
     /// Compute a [`CowState`] from one NBD backend + the host's
     /// caches. Shared by [`SandboxBackend::cow_state`] and
     /// [`SandboxBackend::cow_state_all`] so the two never drift.
