@@ -43,6 +43,12 @@ pub struct CoordClient {
 }
 
 impl CoordClient {
+    /// `coord_url` must be `http://host[:port]` or `https://host[:port]`.
+    /// ADR 0013 retired the WS dialer; ADR 0016 §A.1.4 retired the
+    /// `ws://`/`wss://` compat shim once all TF configs migrated. A
+    /// non-HTTP scheme here is a deployment misconfiguration; the
+    /// `reqwest` builder downstream will reject it with a clear
+    /// "builder error for url" at the first send.
     pub fn new(coord_url: String, auth_token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
             // ADR 0016 §A.1.3: 10s pool-idle timeout (was 90s).
@@ -79,7 +85,7 @@ impl CoordClient {
             .expect("reqwest client builder must not fail with default config");
         Self {
             http,
-            base_url: trim_ws_suffix(&coord_url),
+            base_url: coord_url.trim_end_matches('/').to_string(),
             auth_token: auth_token.unwrap_or_default(),
         }
     }
@@ -205,62 +211,6 @@ impl CoordClient {
             }
         };
         decode_json(resp, "idle_eviction_candidates").await
-    }
-}
-
-fn trim_ws_suffix(coord_url: &str) -> String {
-    // Tolerate callers that pass the WS-flavored URL inherited from
-    // the pre-0013 dialer config (`ws://coord:8080/api/hosts/connect`
-    // is what the Terraform startup script writes today). Strip the
-    // `/api/hosts/connect` suffix AND rewrite the `ws://` / `wss://`
-    // scheme to `http://` / `https://` — reqwest rejects WS schemes
-    // outright with "builder error for url" otherwise.
-    let trimmed = coord_url.trim_end_matches('/');
-    let trimmed = if let Some(stripped) = trimmed.strip_suffix("/api/hosts/connect") {
-        stripped
-    } else {
-        trimmed
-    };
-    if let Some(rest) = trimmed.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-#[cfg(test)]
-mod trim_ws_suffix_tests {
-    use super::trim_ws_suffix;
-
-    #[test]
-    fn strips_connect_suffix_and_rewrites_ws_scheme() {
-        assert_eq!(
-            trim_ws_suffix("ws://coord:8080/api/hosts/connect"),
-            "http://coord:8080",
-        );
-        assert_eq!(
-            trim_ws_suffix("wss://coord:8080/api/hosts/connect"),
-            "https://coord:8080",
-        );
-    }
-
-    #[test]
-    fn passes_http_url_through_untouched_after_suffix_strip() {
-        assert_eq!(
-            trim_ws_suffix("http://coord:8080/api/hosts/connect"),
-            "http://coord:8080",
-        );
-        assert_eq!(trim_ws_suffix("http://coord:8080"), "http://coord:8080");
-    }
-
-    #[test]
-    fn handles_trailing_slash() {
-        assert_eq!(
-            trim_ws_suffix("ws://coord:8080/api/hosts/connect/"),
-            "http://coord:8080",
-        );
     }
 }
 

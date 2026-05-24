@@ -84,12 +84,21 @@ variable "kernel_image_path" {
 
 variable "coordinator_endpoint" {
   type        = string
-  description = "ws:// or wss:// URL the host-agent dials. Internal LB or service mesh entry; never the public ingress."
+  description = <<-EOT
+    `http://` or `https://` URL the host-agent dials. Internal LB
+    or service mesh entry; never the public ingress.
+
+    ADR 0013 retired the WebSocket dialer; ADR 0016 §A.1.4 retired
+    the `ws://`/`wss://` compat shim. Non-HTTP schemes will be
+    rejected by `reqwest` at the first request with a "builder
+    error for url" — a clearer failure than the silent rewrite the
+    shim used to do.
+  EOT
 }
 
 variable "coordinator_token" {
   type        = string
-  description = "Bearer token the host-agent sends on its WS upgrade."
+  description = "Bearer token the host-agent sends as `Authorization: Bearer ...`."
   sensitive   = true
   default     = ""
 }

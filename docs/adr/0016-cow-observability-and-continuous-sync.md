@@ -355,17 +355,44 @@ description (`engrams/deploy/terraform/gcp/modules/fc-host-mig/variables.tf:87`)
 still says "ws:// or wss:// URL the host-agent dials. Internal LB
 or service mesh entry; never the public ingress."
 
-**Fix**: change the OSS variable to `http_endpoint` or
-`coordinator_url` (both schemes carry meaning; pick whichever
-matches the actual transport), update the description to "http://
-or https:// URL", and update the engrams-internal caller to pass
-`http://${ip}:${port}`. Drop the `trim_ws_suffix` helper from
-host-agent's `coord_client.rs` once both repos are updated — it's a
-backward-compat shim with no other users now.
+**Fix shipped**: clean drop, no compat shim. There are no other
+deployments using this module path; preserving the
+`trim_ws_suffix` helper for backwards compatibility would just
+add code that future readers have to wonder about.
 
-This is two repos: engrams (OSS) for the variable + helper
-deletion, engrams-internal for the caller. Coordinate the change so
-neither side ships ahead of the other.
+Three changes across both repos:
+
+1. `engrams/deploy/terraform/gcp/modules/fc-host-mig/variables.tf`
+   — variable description updated to `http://` / `https://` only;
+   call out that non-HTTP schemes will be rejected at the first
+   request.
+2. `engrams/crates/engram-host-agent/src/coord_client.rs` — drop
+   `fn trim_ws_suffix` and its three unit tests; replace the
+   `base_url: trim_ws_suffix(&coord_url)` with a direct
+   `coord_url.trim_end_matches('/').to_string()`. `reqwest::Client`
+   rejects non-HTTP schemes at construction with a clear "builder
+   error for url".
+3. `engrams-internal/modules/engrams/main.tf:125` — `local.coordinator_endpoint`
+   changed from `ws://...` to `http://...`.
+
+**Sequencing for prod rollout** (no hotfix, just operator-mediated
+order): the engrams-internal TF change must apply (terraform apply
++ MIG roll) before the engrams host-agent change is deployed.
+Otherwise a freshly-pulled host-agent will receive the stale
+`ws://` env, fail to construct its `reqwest::Client`, and crash
+loop. Order:
+
+1. Merge engrams-internal commit; `terraform apply`; wait for MIG
+   to roll all FC hosts (new instance template version → new env
+   file → new host-agent process reads `http://`).
+2. Merge engrams commit; CI builds + pushes new images; coord rolls
+   on the next helm-deploy; future host-agent images (next MIG
+   refresh) pick up the shim-removed binary.
+
+Between steps 1 and 2 the prod hosts are running the OLD shim
+binary against `http://` env — works fine, shim is a no-op on
+HTTP schemes. After step 2 they're running the NEW no-shim binary
+against `http://` env — also fine. No window of incompatibility.
 
 ---
 
