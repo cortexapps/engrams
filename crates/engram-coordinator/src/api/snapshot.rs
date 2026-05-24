@@ -30,6 +30,30 @@ use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
 use crate::state::{SessionEvent, SharedState};
 
+/// ADR 0016 §A.1.7 fallback: synthesize an unspecified-IP
+/// `SessionEgressPolicy`. Used only when
+/// `build_resume_egress_policy` returns `None` (no manifest bundle,
+/// host has no guest IP, or IP unparseable). The host treats a
+/// zero-IP policy as "no policy applied" — same observable behavior
+/// as the pre-fix code path. SecretMode is `Broker` because Broker
+/// is the benign default (zero secrets means broker mode does
+/// nothing); see the matching create-path placeholder in
+/// `api/sessions.rs`.
+fn placeholder_egress_policy(
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+) -> engram_core::types::egress::SessionEgressPolicy {
+    engram_core::types::egress::SessionEgressPolicy {
+        session_id,
+        sandbox_id,
+        guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+        network_allow_hosts: vec![],
+        network_allow_host_patterns: vec![],
+        secrets: vec![],
+        secret_mode: engram_core::types::image::SecretMode::Broker,
+    }
+}
+
 #[derive(Serialize)]
 pub struct SnapshotResponse {
     pub session_id: SessionId,
@@ -405,18 +429,25 @@ async fn resume_from_fc_snapshot(
     // SecretStore hiccup, or pre-fix session with no sealed row
     // resume with a thinner env (the pre-fix status quo) instead of
     // failing the whole resume.
-    let mut resume_base_env =
-        match crate::api::sessions::resolve_manifest_secrets(&state, &session).await {
-            Ok(env) => env,
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %id,
-                    error = %e,
-                    "resolve_manifest_secrets failed; resume continues without manifest env",
-                );
-                std::collections::HashMap::new()
-            }
-        };
+    // ADR 0016 §A.1.7: load the full bundle (manifest + SecretBundle
+    // + env-with-placeholders) once and reuse it both for the launch
+    // env below AND for the post-resume egress policy rebuild. Avoids
+    // a second SecretStore round-trip on the resume hot path.
+    let resume_bundle = match crate::api::sessions::resume_manifest_bundle(&state, &session).await {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "resume_manifest_bundle failed; resume continues without manifest env",
+            );
+            None
+        }
+    };
+    let mut resume_base_env = resume_bundle
+        .as_ref()
+        .map(|b| b.env.clone())
+        .unwrap_or_default();
     match crate::api::sessions::load_session_secrets(&state, id).await {
         Ok(Some(overrides)) => {
             for (k, v) in overrides {
@@ -438,32 +469,39 @@ async fn resume_from_fc_snapshot(
             .flatten();
     let mut start_agent_failed = false;
     if let Some(agent) = agent_opt {
-        // Pre-existing gap (not introduced by ADR 0013): resume
-        // doesn't re-apply the SessionEgressPolicy on the new
-        // sandbox's host, so a resume onto a fresh host gets an
-        // empty egress registry. Filed as a follow-up; the bundled
-        // start_agent here passes an unspecified-IP policy that
-        // the host treats as "no policy applied" — same observable
-        // behavior as before. To fix properly we need to rebuild
-        // the manifest + secret bundle here (extract a helper from
-        // create_session_inner) and pass a populated policy.
-        let placeholder_policy = engram_core::types::egress::SessionEgressPolicy {
-            session_id: id,
-            sandbox_id: new_sandbox_id,
-            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-            network_allow_hosts: vec![],
-            network_allow_host_patterns: vec![],
-            secrets: vec![],
-            // SecretMode is required by the struct; Broker is the
-            // benign default (broker mode does nothing if there are
-            // no secrets to broker). Same as if create had been
-            // called with an empty secret bundle.
-            secret_mode: engram_core::types::image::SecretMode::Broker,
+        // ADR 0016 §A.1.7: rebuild the SessionEgressPolicy for the
+        // new sandbox. Before this fix, resume passed an
+        // `Ipv4Addr::UNSPECIFIED` placeholder policy — the host
+        // registered an entry under `0.0.0.0`, the actual restored
+        // guest IP (inherited from the snapshot) had no entry, and
+        // every DNS query from the resumed VM denied with
+        // `reason=UnknownGuest`. Validated 2026-05-24 on session
+        // 1edf09a3: harness retried for 3 minutes then emitted
+        // "API Error: Unable to connect to API (ConnectionRefused)".
+        //
+        // Three failure modes fall back to the legacy placeholder so
+        // we never regress to "resume errors out": (a) the manifest
+        // bundle load failed above (already warn-logged); (b) the
+        // host has no guest IP for this sandbox (process backend,
+        // VZ in some configs — `build_resume_egress_policy` returns
+        // None); (c) the IP is unparseable.
+        let policy = match resume_bundle.as_ref() {
+            Some(b) => crate::api::sessions::build_resume_egress_policy(
+                &state,
+                id,
+                new_sandbox_id,
+                &b.bundle,
+                &b.manifest,
+                &b.env,
+            )
+            .await
+            .unwrap_or_else(|| placeholder_egress_policy(id, new_sandbox_id)),
+            None => placeholder_egress_policy(id, new_sandbox_id),
         };
         if let Err(e) = state
             .services
             .host
-            .start_agent(new_sandbox_id, agent, placeholder_policy)
+            .start_agent(new_sandbox_id, agent, policy)
             .await
         {
             tracing::warn!(

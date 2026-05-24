@@ -109,13 +109,30 @@ pub(crate) async fn persist_session_secrets(
     Ok(())
 }
 
+/// Material returned by [`resume_manifest_bundle`] — everything the
+/// resume path needs from the image manifest and its secret schema
+/// to (1) build the post-resume launch env and (2) rebuild the
+/// per-session egress policy (§A.1.7) without a second SecretStore
+/// round-trip.
+pub(crate) struct ResumeManifestBundle {
+    pub manifest: ImageManifest,
+    pub bundle: SecretBundle,
+    /// `manifest.env` with `apply_secrets_to_env` already applied
+    /// (placeholders in Broker mode, raw values in Literal mode).
+    /// Per-request overrides from `load_session_secrets` are NOT
+    /// folded in here — the caller layers them on top.
+    pub env: HashMap<String, String>,
+}
+
 /// Re-resolve the image manifest's `[secrets.*]` schema against the
-/// deployment's `SecretStore` for a session, returning the env map
-/// the harness should boot with. Looks up the session's image_uri
-/// in `enabled_images`, parses the cached manifest, calls
+/// deployment's `SecretStore` for a session. Looks up the session's
+/// image_uri in `enabled_images`, parses the cached manifest, calls
 /// `services.secrets.resolve(...)` with the same `(repo, tag)`
-/// context the create path used, and applies the bundle into a
-/// fresh env map via the same `apply_secrets_to_env` rules.
+/// context the create path used, and applies the bundle into a fresh
+/// env map via the same `apply_secrets_to_env` rules. Returns the
+/// parsed manifest + the resolved bundle + the env-with-placeholders
+/// so callers that also need to rebuild the egress policy can do so
+/// without a second resolve.
 ///
 /// Re-resolving (vs. snapshotting at create) means an operator who
 /// rotates a secret in the deployment's secret store mid-session
@@ -123,10 +140,10 @@ pub(crate) async fn persist_session_secrets(
 /// harness with a stale value would be a bug, not the fix. The
 /// caller is expected to fold per-request overrides
 /// (CLAUDE_CODE_OAUTH_TOKEN, etc.) on top via [`load_session_secrets`].
-pub(crate) async fn resolve_manifest_secrets(
+pub(crate) async fn resume_manifest_bundle(
     state: &SharedState,
     session: &Session,
-) -> Result<HashMap<String, String>, ApiError> {
+) -> Result<ResumeManifestBundle, ApiError> {
     let enabled = state
         .services
         .meta
@@ -149,8 +166,6 @@ pub(crate) async fn resolve_manifest_secrets(
         repo,
         image_tag: tag,
     };
-    // Resume doesn't accept new per-request overrides — those came in
-    // at create time and ride through via load_session_secrets.
     let bundle: SecretBundle = state
         .services
         .secrets
@@ -159,7 +174,83 @@ pub(crate) async fn resolve_manifest_secrets(
         .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
     let mut env: HashMap<String, String> = manifest.env.clone();
     apply_secrets_to_env(&mut env, &bundle, manifest.secret_mode, session.id);
-    Ok(env)
+    Ok(ResumeManifestBundle {
+        manifest,
+        bundle,
+        env,
+    })
+}
+
+/// ADR 0016 §A.1.7: rebuild the post-resume [`SessionEgressPolicy`]
+/// from a previously-loaded [`ResumeManifestBundle`] + the new
+/// sandbox's guest IP. Returns `None` when the host doesn't know a
+/// guest IP for this sandbox (process backend, VZ in some configs)
+/// or when the IP isn't parseable as v4 — callers then fall through
+/// to the legacy unspecified-IP placeholder, matching the pre-fix
+/// behaviour.
+///
+/// Async only because of `host.guest_ip`. Pure assembly delegated to
+/// [`assemble_resume_egress_policy`] for testability.
+pub(crate) async fn build_resume_egress_policy(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: engram_core::SandboxId,
+    bundle: &SecretBundle,
+    manifest: &ImageManifest,
+    env_with_placeholders: &HashMap<String, String>,
+) -> Option<engram_core::types::egress::SessionEgressPolicy> {
+    let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
+    let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    Some(assemble_resume_egress_policy(
+        session_id,
+        sandbox_id,
+        guest_ip,
+        bundle,
+        manifest,
+        env_with_placeholders,
+    ))
+}
+
+/// Pure synchronous assembly path for the resume egress policy.
+/// Split out from [`build_resume_egress_policy`] so unit tests can
+/// exercise the placeholder-matching + allow-list cloning logic
+/// without standing up a SharedState. The behaviour mirrors the
+/// create path's policy build (sessions.rs around line 635) by
+/// construction.
+pub(crate) fn assemble_resume_egress_policy(
+    session_id: SessionId,
+    sandbox_id: engram_core::SandboxId,
+    guest_ip: std::net::Ipv4Addr,
+    bundle: &SecretBundle,
+    manifest: &ImageManifest,
+    env_with_placeholders: &HashMap<String, String>,
+) -> engram_core::types::egress::SessionEgressPolicy {
+    let mut secrets = Vec::new();
+    for (name, resolved) in &bundle.secrets {
+        // The env's value for this secret IS the placeholder the
+        // proxy will see in-VM. In Broker mode this is
+        // `engram_ph_*`; in Literal mode it's the raw value. Either
+        // way, the proxy substitutes when an outbound request's
+        // body / header matches it.
+        let Some(placeholder) = env_with_placeholders.get(name).cloned() else {
+            continue;
+        };
+        secrets.push(engram_core::types::egress::EgressSecretEntry {
+            placeholder,
+            real_value: resolved.value.clone(),
+            allow_hosts: resolved.schema.allow_hosts.clone(),
+            allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
+        });
+    }
+    engram_core::types::egress::SessionEgressPolicy {
+        session_id,
+        sandbox_id,
+        guest_ip,
+        network_allow_hosts: manifest.network.allow_hosts.clone(),
+        network_allow_host_patterns: manifest.network.allow_host_patterns.clone(),
+        secrets,
+        secret_mode: manifest.secret_mode,
+    }
 }
 
 /// Reverse of [`persist_session_secrets`]: fetch the sealed row,
@@ -976,4 +1067,176 @@ pub(crate) fn resolve_harness(
         }
     };
     Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::traits::ResolvedSecret;
+    use engram_core::types::image::{NetworkPolicy, SecretSchema};
+    use engram_core::SandboxId;
+
+    /// ADR 0016 §A.1.7 regression guard. The pure assembly path
+    /// must:
+    ///
+    /// 1. Stamp the *real* `guest_ip` onto the policy (was
+    ///    `Ipv4Addr::UNSPECIFIED` pre-fix — root cause of the
+    ///    `UnknownGuest` DNS denials on session 1edf09a3).
+    /// 2. Carry the manifest's `network.allow_*` lists verbatim.
+    /// 3. Emit one `EgressSecretEntry` per resolved secret that
+    ///    has a corresponding placeholder in the env map, pairing
+    ///    the env's placeholder with the bundle's real value and
+    ///    the schema's per-secret allow lists.
+    /// 4. Skip resolved secrets that lack a matching env entry —
+    ///    that means `apply_secrets_to_env` filtered them (e.g.
+    ///    the manifest declared a secret but the placeholder
+    ///    machinery dropped it). Better to under-populate than
+    ///    crash.
+    #[test]
+    fn assemble_resume_egress_policy_uses_real_guest_ip_and_allow_lists() {
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let guest_ip: std::net::Ipv4Addr = "10.200.0.7".parse().unwrap();
+
+        // Manifest: one network allow-host, broker mode, one
+        // declared secret with an allow-list of its own.
+        let mut secrets_schema = HashMap::new();
+        secrets_schema.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            SecretSchema {
+                allow_hosts: vec!["api.anthropic.com".into()],
+                allow_host_patterns: vec!["*.anthropic.com".into()],
+                required: true,
+                description: None,
+                r#ref: None,
+            },
+        );
+        let manifest = ImageManifest {
+            name: "test-image".into(),
+            description: None,
+            env: HashMap::new(),
+            secrets: secrets_schema,
+            network: NetworkPolicy {
+                default: engram_core::types::image::NetworkDefault::Deny,
+                allow_hosts: vec!["registry.npmjs.org".into()],
+                allow_host_patterns: vec!["*.openai.com".into()],
+            },
+            resources: Default::default(),
+            secret_mode: SecretMode::Broker,
+        };
+
+        // Bundle: one resolved secret; the schema's allow_hosts must
+        // round-trip into the EgressSecretEntry.
+        let mut bundle_inner = HashMap::new();
+        bundle_inner.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            ResolvedSecret {
+                value: "sk-real-secret-do-not-leak".into(),
+                schema: SecretSchema {
+                    allow_hosts: vec!["api.anthropic.com".into()],
+                    allow_host_patterns: vec!["*.anthropic.com".into()],
+                    required: true,
+                    description: None,
+                    r#ref: None,
+                },
+            },
+        );
+        let bundle = SecretBundle {
+            secrets: bundle_inner,
+        };
+
+        // env-with-placeholders: simulates Broker-mode
+        // `apply_secrets_to_env` having inserted a placeholder.
+        let mut env_with_ph = HashMap::new();
+        env_with_ph.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "engram_ph_test_abcd1234".to_string(),
+        );
+
+        let policy = assemble_resume_egress_policy(
+            session_id,
+            sandbox_id,
+            guest_ip,
+            &bundle,
+            &manifest,
+            &env_with_ph,
+        );
+
+        // 1. Real IP, not UNSPECIFIED.
+        assert_eq!(policy.guest_ip, guest_ip);
+        assert_ne!(policy.guest_ip, std::net::Ipv4Addr::UNSPECIFIED);
+        assert_eq!(policy.session_id, session_id);
+        assert_eq!(policy.sandbox_id, sandbox_id);
+
+        // 2. Network allow lists from manifest.
+        assert_eq!(policy.network_allow_hosts, vec!["registry.npmjs.org"]);
+        assert_eq!(policy.network_allow_host_patterns, vec!["*.openai.com"]);
+        assert_eq!(policy.secret_mode, SecretMode::Broker);
+
+        // 3. One secret entry, placeholder from env, real value from
+        // bundle, allow-lists from the schema.
+        assert_eq!(policy.secrets.len(), 1);
+        let entry = &policy.secrets[0];
+        assert_eq!(entry.placeholder, "engram_ph_test_abcd1234");
+        assert_eq!(entry.real_value, "sk-real-secret-do-not-leak");
+        assert_eq!(entry.allow_hosts, vec!["api.anthropic.com"]);
+        assert_eq!(entry.allow_host_patterns, vec!["*.anthropic.com"]);
+    }
+
+    /// Resolved secrets without a placeholder in the env map are
+    /// silently dropped from the egress policy — they can't be
+    /// substituted on outbound traffic anyway because the in-VM
+    /// env doesn't carry their placeholder. Under-populating the
+    /// secrets list is strictly safer than panicking.
+    #[test]
+    fn assemble_resume_egress_policy_skips_secrets_missing_from_env() {
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let guest_ip: std::net::Ipv4Addr = "10.200.0.8".parse().unwrap();
+
+        let manifest = ImageManifest {
+            name: "test-image".into(),
+            description: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            network: NetworkPolicy::default(),
+            resources: Default::default(),
+            secret_mode: SecretMode::Broker,
+        };
+
+        let mut bundle_inner = HashMap::new();
+        bundle_inner.insert(
+            "MISSING_FROM_ENV".to_string(),
+            ResolvedSecret {
+                value: "v".into(),
+                schema: SecretSchema {
+                    allow_hosts: vec!["x.example".into()],
+                    allow_host_patterns: vec![],
+                    required: true,
+                    description: None,
+                    r#ref: None,
+                },
+            },
+        );
+        let bundle = SecretBundle {
+            secrets: bundle_inner,
+        };
+        let env_with_ph: HashMap<String, String> = HashMap::new();
+
+        let policy = assemble_resume_egress_policy(
+            session_id,
+            sandbox_id,
+            guest_ip,
+            &bundle,
+            &manifest,
+            &env_with_ph,
+        );
+
+        assert_eq!(policy.guest_ip, guest_ip);
+        assert!(
+            policy.secrets.is_empty(),
+            "secret with no placeholder in env must be skipped, got {:?}",
+            policy.secrets,
+        );
+    }
 }
