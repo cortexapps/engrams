@@ -136,22 +136,32 @@ pub async fn evict_idle_session(
         return Err(EvictError::Meta(e.to_string()));
     }
 
-    // Step 3: destroy the sandbox. Best-effort — even on failure we
-    // still want to mark the session Idle so a future resume doesn't
-    // try to route to a dead sandbox.
-    state.registry.unbind(session_id);
-    if let Err(e) = state.services.host.destroy(sandbox_id).await {
-        tracing::warn!(
-            session_id = %session_id,
-            sandbox_id = %sandbox_id,
-            error = %e,
-            "idle eviction: destroy failed; continuing to mark session Idle",
-        );
-    }
-    // ADR 0006: host-agent unregisters its local proxy entry as
-    // part of `destroy`. No coordinator-side cleanup needed.
+    // ADR 0016 §A.1.6: PG-side transitions happen BEFORE
+    // `destroy()`. The reconciler (ADR 0009) runs on every host
+    // heartbeat and treats `session.sandbox_id IS NOT NULL` +
+    // `host.running_sandboxes does not contain sandbox_id` as an
+    // orphan to be recovered via HostLost→Idle. If destroy() ran
+    // before transition_session, a heartbeat landing in the window
+    // between those two steps would race ahead and flip the
+    // session to Idle via the recovery path, leaving this
+    // pipeline's later `transition_session(Idle→Idle)` to fail
+    // (state-machine rejects same-state), `abort_snapshot` to
+    // fire spuriously, and the matched `pipeline completed` log
+    // never to appear. Validated on session 1edf09a3 (2026-05-24).
+    //
+    // Reordering to PG-first means: by the time the host's next
+    // heartbeat reports `running_sandboxes` missing this sandbox,
+    // `session.status` is already Idle and reconcile's
+    // active-only guard no-ops. The destroy() call's host-side
+    // bookkeeping (proxy unregister, jail teardown) still runs;
+    // a failed destroy() is best-effort the same as before.
 
-    // Step 4: clear sandbox_id, set Idle, emit events.
+    // Step 3a: registry.unbind() — purely in-memory, no coord-
+    // visible state change. Safe to run before PG transitions.
+    state.registry.unbind(session_id);
+
+    // Step 3b (PG, Idle-before-destroy): clear sandbox_id on the
+    // session row.
     if let Err(e) = state
         .services
         .meta
@@ -164,6 +174,10 @@ pub async fn evict_idle_session(
             "idle eviction: assign_session_sandbox(None) failed",
         );
     }
+    // Step 3c (PG, Idle-before-destroy): flip to Idle. Once this
+    // commits, the reconciler will no-op on every subsequent
+    // heartbeat for this session because the reconcile pass keys
+    // on Active status only.
     let prev = match state
         .services
         .meta
@@ -176,6 +190,21 @@ pub async fn evict_idle_session(
             return Err(EvictError::Meta(e.to_string()));
         }
     };
+
+    // Step 4 (host destroy, post-PG): now the session is Idle,
+    // destroy the sandbox. Best-effort — failures don't bubble
+    // because the PG state is already correct; the host's
+    // orphan_reap background task cleans up a stuck sandbox.
+    if let Err(e) = state.services.host.destroy(sandbox_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            error = %e,
+            "idle eviction: destroy failed after Idle transition; orphan_reap will clean up",
+        );
+    }
+    // ADR 0006: host-agent unregisters its local proxy entry as
+    // part of `destroy`. No coordinator-side cleanup needed.
 
     if let Err(e) = state
         .emit(
@@ -1090,6 +1119,246 @@ mod tests {
             could_acquire_again,
             "guard's Drop must release the lease on the success path",
         );
+    }
+
+    /// ADR 0016 §A.1.6 regression guard. The eviction pipeline
+    /// must commit `transition_session(Idle)` to PG **before**
+    /// calling `host.destroy(sandbox_id)`. Pre-fix ordering put
+    /// destroy() at step 3 with transition_session at step 6 —
+    /// the ~ms-to-seconds gap let the heartbeat-driven reconciler
+    /// observe the now-orphan session, run HostLost→Idle, and
+    /// race ahead of the pipeline's own PG flip.
+    ///
+    /// This test wraps the standard HostClient stack with a spy
+    /// whose `destroy()` reads `MiniMeta`'s current session status
+    /// at call time and stashes it. After `evict_idle_session`
+    /// completes, the stashed status must be Idle — proving the
+    /// transition committed before destroy() was invoked.
+    #[tokio::test]
+    async fn evict_idle_session_transitions_to_idle_before_destroy() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
+
+        struct OrderedSpyHost {
+            inner: StdArc<dyn engram_core::traits::HostClient>,
+            meta: StdArc<MiniMeta>,
+            destroys: StdArc<AtomicU32>,
+            status_at_destroy: StdArc<parking_lot::Mutex<Option<SessionState>>>,
+            session_id: SessionId,
+        }
+
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for OrderedSpyHost {
+            async fn create(
+                &self,
+                spec: engram_core::types::sandbox::SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.destroys.fetch_add(1, Ordering::SeqCst);
+                // Read the session's status straight from MiniMeta
+                // at the precise moment destroy() is invoked. The
+                // pipeline reorder means this must already be Idle.
+                let snapshot = self.meta.session.lock().clone();
+                if snapshot.id == self.session_id {
+                    *self.status_at_destroy.lock() = Some(snapshot.status);
+                }
+                self.inner.destroy(id).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.inner.snapshot(id).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.commit_snapshot(id).await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.abort_snapshot(id).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+            ) {
+                self.inner.bind_session(session_id, sandbox_id).await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, text).await
+            }
+            async fn acquire_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.acquire_shell(sandbox_id).await
+            }
+            async fn release_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.release_shell(sandbox_id).await
+            }
+        }
+
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:reorder".into(),
+            harness: HarnessSpec::None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+
+        let destroys = StdArc::new(AtomicU32::new(0));
+        let status_at_destroy: StdArc<parking_lot::Mutex<Option<SessionState>>> =
+            StdArc::new(parking_lot::Mutex::new(None));
+        let spy: Arc<dyn engram_core::traits::HostClient> = Arc::new(OrderedSpyHost {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            meta: meta.clone(),
+            destroys: destroys.clone(),
+            status_at_destroy: status_at_destroy.clone(),
+            session_id,
+        });
+
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: spy,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-evict-reorder-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-evict-reorder-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("full pipeline must succeed under the reordered steps");
+
+        assert_eq!(
+            destroys.load(Ordering::SeqCst),
+            1,
+            "destroy must be called exactly once on full success",
+        );
+        // The crux of A.1.6: at the moment destroy() ran, the
+        // session was already Idle in MiniMeta. If this regresses
+        // (Idle-after-destroy ordering returns), the snapshot will
+        // be Active (or Created/some-mid-state) and the
+        // reconciler-race window reopens.
+        assert_eq!(
+            *status_at_destroy.lock(),
+            Some(SessionState::Idle),
+            "ADR 0016 §A.1.6: transition_session(Idle) must commit \
+             to PG BEFORE host.destroy() is invoked",
+        );
+
+        // Final state: still Idle (sanity).
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::Idle);
     }
 
     /// ADR 0016 §A.1.5c stale-lease reaper. Leases older than the
