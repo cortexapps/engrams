@@ -925,12 +925,11 @@ async fn materialize_disk_if_missing(
     }
 
     // Patch the FC sidecar's `spec.rootfs_source` to point at the
-    // just-materialized file. `restore_in_jail` reads this field
-    // to install the canonical-rootfs symlink that FC `load_snapshot`
-    // dereferences; the bake-time path (`/tmp/.tmpXXX/.../rootfs.ext4`)
-    // doesn't exist on the receiver, so without this patch FC errors
-    // out. Same pattern as the in-prod `patch_fc_manifest_memory_ref`,
-    // just for the disk field instead of memory.
+    // just-materialized file. ADR 0016 Phase B commit 5 factored
+    // this out into a shared helper so the resume-path NBD attach
+    // (which has no local file but needs the same sidecar patch
+    // pointing at /dev/nbdN) can call it without duplicating the
+    // serde + canonicalize ceremony.
     //
     // Must be absolute: the canonical-rootfs symlink lives at the
     // bake's `/tmp/.tmpXXX/rootfs/<src>.dev`, so a relative target
@@ -941,6 +940,33 @@ async fn materialize_disk_if_missing(
             local_rootfs.display()
         ))
     })?;
+    patch_sidecar_rootfs_source(src, &local_rootfs).await?;
+
+    Ok(())
+}
+
+/// ADR 0016 Phase B commit 5 — patch the FC sidecar's
+/// `spec.rootfs_source` to `target`. Shared by:
+///
+/// - `materialize_disk_if_missing` (legacy path): `target` is the
+///   freshly-written `<src>/<manifest_id>-vN.ext4` flat file.
+/// - `prepare_resume_nbd_attach` (Phase B path): `target` is the
+///   `/dev/nbdN` device served by the chunked-disk daemon.
+///
+/// `restore_canonical_symlinks` inside FC's `inner.restore` reads
+/// this field and installs two symlinks (host's `<work_dir>/rootfs/
+/// <new_sandbox_id>.dev` AND the source-keyed path FC's `state.bin`
+/// embeds at bake time). Both point at `target`. FC's `load_snapshot`
+/// then reads its rootfs through whichever symlink it dereferences —
+/// either a flat file or the NBD device.
+///
+/// Pre-Phase-B, the symlink target was always a flat file. Phase B
+/// makes the chunked-disk lineage land at `/dev/nbdN` instead,
+/// rejoining the resumed sandbox with `nbd_sandboxes` tracking.
+async fn patch_sidecar_rootfs_source(
+    src: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), SandboxError> {
     let sidecar_path = src.join("manifest.json");
     let bytes = fs::read(&sidecar_path).await.map_err(|e| {
         SandboxError::Snapshot(format!(
@@ -960,7 +986,7 @@ async fn materialize_disk_if_missing(
         .ok_or_else(|| SandboxError::Snapshot("fc sidecar spec is not an object".into()))?;
     spec.insert(
         "rootfs_source".into(),
-        serde_json::Value::String(local_rootfs.to_string_lossy().into_owned()),
+        serde_json::Value::String(target.to_string_lossy().into_owned()),
     );
     let patched = serde_json::to_vec_pretty(&value)
         .map_err(|e| SandboxError::Snapshot(format!("serialize patched sidecar: {e}")))?;
@@ -970,7 +996,6 @@ async fn materialize_disk_if_missing(
             sidecar_path.display()
         ))
     })?;
-
     Ok(())
 }
 
@@ -1703,25 +1728,70 @@ impl SandboxBackend for PooledBackend {
                     "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
                 );
             }
-            // ADR 0014: materialize rootfs from chunks (if disk_manifest
-            // is set) and patch the sidecar's spec.rootfs_source so
-            // restore_in_jail's canonical-rootfs symlink points at the
-            // local file. Without this, FC load_snapshot fails because
-            // the bake-time rootfs path doesn't exist on the receiver.
-            if let Err(e) = materialize_disk_if_missing(
-                chunk_store,
-                self.chunk_cache.as_ref(),
-                &src,
-                metadata.disk_manifest,
-                &self.materialize_lock,
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    src = %src.display(),
-                    "rootfs materialization failed; inner.restore will see whatever's there",
-                );
+        }
+
+        // ADR 0016 Phase B commit 5: rebuild chunked-disk tracking
+        // for the resumed sandbox.
+        //
+        // Branching mirrors the cold-create path's `resolve_rootfs`:
+        //
+        // - Linux + nbd_pool + chunk_store + chunk_cache + a
+        //   chunked `disk_manifest` on the snapshot row → take the
+        //   NBD attach path. ChunkedDiskBackend is rebased on the
+        //   manifest, an NBD daemon serves it at /dev/nbdN, and FC's
+        //   restore reads its rootfs through that block device. The
+        //   resumed sandbox enters `nbd_sandboxes` after
+        //   `inner.restore` returns the new sandbox_id; the
+        //   FlushScheduler spawns immediately. Closes ADR 0016 §
+        //   "Phase B failure mode to close" — both the COW-diagnostic-
+        //   silent symptom and the second-eviction-can't-snapshot
+        //   symptom.
+        //
+        // - Other configurations (macOS dev, hosts without NBD wired,
+        //   legacy snapshots whose `disk_manifest` is None) → fall
+        //   back to `materialize_disk_if_missing`, which writes the
+        //   bytes to a flat file and patches the sidecar. This path
+        //   doesn't enter `nbd_sandboxes` and doesn't get a
+        //   scheduler; it's the pre-Phase-B behaviour kept for
+        //   backwards compatibility on non-NBD configurations.
+        //
+        // The pending state is captured here (pre-restore) so the
+        // sidecar's `spec.rootfs_source` is patched to /dev/nbdN
+        // BEFORE `inner.restore` reads the sidecar to install the
+        // canonical-rootfs symlinks.
+        #[cfg(target_os = "linux")]
+        let pending_nbd_state = self.prepare_resume_nbd_attach(&metadata, &src).await?;
+
+        // Non-NBD fallback runs only when the NBD path didn't take.
+        // On macOS this is the only path; on Linux it covers hosts
+        // without nbd_pool/chunk_store/chunk_cache wired or
+        // snapshots with disk_manifest=None.
+        let took_nbd_path: bool;
+        #[cfg(target_os = "linux")]
+        {
+            took_nbd_path = pending_nbd_state.is_some();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            took_nbd_path = false;
+        }
+        if !took_nbd_path {
+            if let Some(chunk_store) = self.chunk_store.as_ref() {
+                if let Err(e) = materialize_disk_if_missing(
+                    chunk_store,
+                    self.chunk_cache.as_ref(),
+                    &src,
+                    metadata.disk_manifest,
+                    &self.materialize_lock,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        src = %src.display(),
+                        "rootfs materialization failed; inner.restore will see whatever's there",
+                    );
+                }
             }
         }
 
@@ -1733,7 +1803,25 @@ impl SandboxBackend for PooledBackend {
             );
         }
 
-        self.inner.restore(metadata).await
+        let new_id = self.inner.restore(metadata).await?;
+
+        // ADR 0016 Phase B commit 5: post-restore wiring. The new
+        // sandbox_id is only known here; install it into
+        // `nbd_sandboxes` together with the FlushScheduler so the
+        // resumed sandbox is first-class in the COW diagnostic and
+        // in the continuous-flush pipeline. Field-ordered Drop
+        // ensures scheduler-cancel → NBD-disconnect → slot-release
+        // on subsequent destroy.
+        #[cfg(target_os = "linux")]
+        if let Some(mut state) = pending_nbd_state {
+            state.install_flush_scheduler(
+                new_id,
+                self.live_manifest_publisher.clone(),
+                self.flush_config.clone(),
+            );
+            self.nbd_sandboxes.insert(new_id, state);
+        }
+        Ok(new_id)
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -1898,6 +1986,95 @@ impl SandboxBackend for PooledBackend {
         {
             Vec::new()
         }
+    }
+
+    /// ADR 0016 Phase B commit 5 — pre-restore half of the
+    /// resume-path NBD attach. Spawned from `restore()` before
+    /// `inner.restore()` reads the sidecar.
+    ///
+    /// When all four conditions hold — Linux + `nbd_pool` +
+    /// `chunk_store` + `chunk_cache` — AND the snapshot row carries
+    /// a chunked `disk_manifest`, this returns `Ok(Some(state))`:
+    ///
+    /// 1. Build a `ChunkedDiskBackend` from the snapshot's disk
+    ///    manifest. The base manifest IS the snapshot's manifest;
+    ///    no flat-file materialization happens.
+    /// 2. Acquire a `/dev/nbdN` slot + spawn the NBD daemon. State
+    ///    carries `scheduler: None` (the FlushScheduler is installed
+    ///    post-`inner.restore` when the new sandbox_id is known).
+    /// 3. Patch the FC sidecar's `spec.rootfs_source` to the NBD
+    ///    device path. `restore_canonical_symlinks` (called from
+    ///    `inner.restore`) then installs BOTH canonical symlinks
+    ///    (host + source-keyed per FC's `state.bin` embedded path)
+    ///    pointing at /dev/nbdN. FC's `load_snapshot` reads through
+    ///    the symlink → through virtio-blk → through the NBD daemon
+    ///    → through `ChunkedDiskBackend::read`. No bytes ever resident.
+    ///
+    /// On any short-circuit (no nbd_pool, no disk_manifest, etc.),
+    /// returns `Ok(None)` and the caller falls back to
+    /// `materialize_disk_if_missing` (the pre-Phase-B path).
+    ///
+    /// Closes ADR 0016 §"Phase B failure mode to close":
+    /// - Symptom 1: cow_state_all iterates `nbd_sandboxes`. The
+    ///   resumed sandbox is now in that map → diagnostic returns
+    ///   non-null.
+    /// - Symptom 2: snapshot path expects the canonical chunked-
+    ///   disk layout (symlinks + nbd_sandboxes entry). Both are
+    ///   present after a NBD-attach resume.
+    #[cfg(target_os = "linux")]
+    async fn prepare_resume_nbd_attach(
+        &self,
+        metadata: &SnapshotMetadata,
+        src: &std::path::Path,
+    ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
+        let (pool, chunk_store, chunk_cache) = match (
+            self.nbd_pool.as_ref(),
+            self.chunk_store.as_ref(),
+            self.chunk_cache.as_ref(),
+        ) {
+            (Some(p), Some(s), Some(c)) => (p, s, c),
+            // Non-NBD configuration. Caller falls back to
+            // materialize-to-file (the pre-Phase-B path).
+            _ => return Ok(None),
+        };
+        let Some(disk_ref) = metadata.disk_manifest else {
+            // Legacy snapshot without a chunked disk lineage — the
+            // materialize-to-file fallback handles it (and is itself
+            // a no-op when disk_manifest is None).
+            return Ok(None);
+        };
+
+        // 1+2. Spawn NBD. attach_manifest builds the ChunkedDiskBackend
+        //      rebased on `disk_ref` and starts the daemon. The
+        //      returned NbdSandboxState carries scheduler=None;
+        //      install_flush_scheduler runs post-restore.
+        let store_arc = Arc::new(chunk_store.clone());
+        let state = crate::disk_daemon::attach_manifest(
+            disk_ref,
+            chunk_cache.clone(),
+            store_arc,
+            pool,
+            self.flush_config.dirty_threshold_bytes,
+        )
+        .await
+        .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest (resume): {e}").into()))?;
+
+        // 3. Patch the FC sidecar's `spec.rootfs_source` to the NBD
+        //    device path. `restore_canonical_symlinks` (inside
+        //    `inner.restore`) follows this field to install the
+        //    canonical-rootfs symlinks; without the patch the symlink
+        //    targets the bake-time path that doesn't exist on the
+        //    receiver, FC errors, and the resume bails.
+        let device_path = state.device_path().to_path_buf();
+        patch_sidecar_rootfs_source(src, &device_path).await?;
+
+        tracing::info!(
+            src = %src.display(),
+            manifest = %disk_ref,
+            device = %device_path.display(),
+            "resume NBD attach: ChunkedDiskBackend ready, sidecar patched to /dev/nbdN",
+        );
+        Ok(Some(state))
     }
 
     /// ADR 0016 Phase B commit 4a — admin trigger for the
