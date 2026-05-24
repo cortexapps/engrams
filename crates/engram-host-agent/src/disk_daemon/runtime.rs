@@ -266,7 +266,13 @@ pub async fn attach_manifest(
     store: Arc<engram_chunk_store::ChunkStore>,
     slot_pool: &Arc<NbdSlotAllocator>,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
-    let backend = ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store).await?;
+    // ADR 0016 Phase B commit 1: threshold-driven notify wiring is
+    // in place, but the FlushScheduler that consumes the Notify
+    // doesn't ship until commit 2. Pass `u64::MAX` so the crossing
+    // check is structurally a no-op until commit 2 wires the
+    // scheduler and threads `FlushSchedulerConfig::dirty_threshold_bytes`
+    // through this call.
+    let backend = ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, u64::MAX).await?;
     let backend = Arc::new(backend);
     let slot = slot_pool.acquire().await;
     let handle = spawn(backend.clone(), slot.path()).await?;

@@ -33,7 +33,12 @@ use engram_chunk_store::{
     store::ChunkStore,
 };
 use engram_core::types::manifest::ManifestRef;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+
+/// ADR 0016 Phase B default: flush is triggered when dirty bytes
+/// cross 256 MiB. Cold-create + resume callers pass this; tests pass
+/// `u64::MAX` to disable threshold-driven notification.
+pub const DEFAULT_DIRTY_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Anything that can go wrong on the backend data plane.
 #[derive(Debug)]
@@ -175,6 +180,14 @@ pub struct ChunkedDiskBackend {
     /// Read lock-free for the COW state RPC; written at the tail of
     /// `flush()` after the new manifest is durably published.
     last_flush_unix_ms: Arc<AtomicI64>,
+    /// ADR 0016 Phase B: when dirty bytes monotonically cross
+    /// `threshold_bytes` inside the dirty-lock, `ensure_dirty` pokes
+    /// this Notify. The flush scheduler awaits `notified()` to wake
+    /// out of its tick interval and trigger an early flush. Set to
+    /// `u64::MAX` to disable threshold-driven wakeups (tests, or
+    /// any caller that doesn't run a scheduler against this backend).
+    threshold_notify: Arc<Notify>,
+    threshold_bytes: u64,
 }
 
 struct BackendState {
@@ -194,6 +207,7 @@ impl ChunkedDiskBackend {
         manifest_ref: ManifestRef,
         cache: ChunkCache,
         store: Arc<ChunkStore>,
+        threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
         let manifest = store.get_manifest(manifest_ref).await?;
         let base = PositionalDiskManifest::from_manifest(&manifest)?;
@@ -207,6 +221,8 @@ impl ChunkedDiskBackend {
             store,
             dirty: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
+            threshold_notify: Arc::new(Notify::new()),
+            threshold_bytes,
         })
     }
 
@@ -217,6 +233,7 @@ impl ChunkedDiskBackend {
         manifest: &Manifest,
         cache: ChunkCache,
         store: Arc<ChunkStore>,
+        threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
         let base = PositionalDiskManifest::from_manifest(manifest)?;
         let chunk_size = base.chunk_size;
@@ -229,7 +246,27 @@ impl ChunkedDiskBackend {
             store,
             dirty: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
+            threshold_notify: Arc::new(Notify::new()),
+            threshold_bytes,
         })
+    }
+
+    /// ADR 0016 Phase B accessor: hand out a clone of the threshold
+    /// `Notify` so the flush scheduler can park on `.notified()` and
+    /// wake when dirty bytes cross the threshold mid-write. One
+    /// permit max — multiple concurrent crossings collapse to one
+    /// flush, which is correct: a single flush drains the full
+    /// dirty buffer regardless of how many writers piled in.
+    pub fn threshold_notify(&self) -> Arc<Notify> {
+        self.threshold_notify.clone()
+    }
+
+    /// Current threshold in bytes. Pinned at construction; reported
+    /// by the COW state RPC if we want it visible to operators
+    /// later (not wired into the RPC schema today, but stable to
+    /// expose).
+    pub fn threshold_bytes(&self) -> u64 {
+        self.threshold_bytes
     }
 
     /// Bytes per chunk. NBD reads / writes that span chunk boundaries
@@ -574,6 +611,19 @@ impl ChunkedDiskBackend {
 
     /// Ensure the dirty buffer has a writeable copy of chunk `idx`.
     /// If not, copy the base chunk's bytes in. Idempotent.
+    ///
+    /// ADR 0016 Phase B: when the insert grows the dirty buffer's
+    /// total resident bytes past `threshold_bytes` (monotonic
+    /// crossing under the dirty lock), poke the threshold `Notify`
+    /// so the flush scheduler can wake early. Crossing detection is
+    /// inside the same lock that the flush drain takes — two
+    /// concurrent writers can both observe "post-write total >
+    /// threshold" if they sum `dirty_bytes()` separately, but only
+    /// one observes the monotonic edge under the lock. `notify_one`
+    /// stores at most one permit, so a missed wake on a sustained
+    /// past-threshold buffer is fine: the next call to `notified()`
+    /// returns immediately, the scheduler drains everything in one
+    /// flush.
     async fn ensure_dirty(
         &self,
         chunk_idx: usize,
@@ -603,10 +653,26 @@ impl ChunkedDiskBackend {
             Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
             None => Bytes::from(vec![0u8; chunk_len]),
         };
-        let mut dirty = self.dirty.lock().await;
-        dirty
-            .entry(chunk_idx)
-            .or_insert_with(|| base_bytes.to_vec());
+        let crossed = {
+            let mut dirty = self.dirty.lock().await;
+            let before: u64 = dirty.values().map(|v| v.len() as u64).sum();
+            // `or_insert_with` is the idempotency guard: if a racing
+            // writer already inserted while we fetched, our bytes
+            // are dropped and the dirty buffer's size is unchanged.
+            let inserted_len = match dirty.entry(chunk_idx) {
+                std::collections::hash_map::Entry::Occupied(_) => 0u64,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let len = base_bytes.len() as u64;
+                    slot.insert(base_bytes.to_vec());
+                    len
+                }
+            };
+            let after = before + inserted_len;
+            before < self.threshold_bytes && after >= self.threshold_bytes
+        };
+        if crossed {
+            self.threshold_notify.notify_one();
+        }
         Ok(())
     }
 }
@@ -652,7 +718,8 @@ mod tests {
         let manifest_ref = ManifestRef::new();
         store.put_manifest(manifest_ref, manifest).await.unwrap();
         let backend =
-            ChunkedDiskBackend::new(manifest_ref, manifest, cache, store.clone()).unwrap();
+            ChunkedDiskBackend::new(manifest_ref, manifest, cache, store.clone(), u64::MAX)
+                .unwrap();
         (backend, store, dir)
     }
 
@@ -679,7 +746,8 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
-        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
 
         let bytes = backend.read(0, 4096).await.unwrap();
         assert_eq!(bytes.len(), 4096);
@@ -704,7 +772,8 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
-        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
 
         // 2 KiB straddle: last 2 KiB of chunk 0 + first 2 KiB of chunk 1.
         let bytes = backend.read(2048, 4096).await.unwrap();
@@ -747,7 +816,8 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
-        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
 
         backend.write(0, &[0xcc; 16]).await.unwrap();
         let bytes = backend.read(0, 32).await.unwrap();
@@ -781,7 +851,8 @@ mod tests {
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
         let backend =
-            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone()).unwrap();
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone(), u64::MAX)
+                .unwrap();
 
         // Touch chunk 0 (mutate it) and chunk 1 (was sparse).
         backend.write(0, &[0xff; 64]).await.unwrap();
@@ -827,7 +898,7 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 1024 * 1024;
         let cache = ChunkCache::new(cfg);
-        let err = ChunkedDiskBackend::new(ManifestRef::new(), &mem, cache, store)
+        let err = ChunkedDiskBackend::new(ManifestRef::new(), &mem, cache, store, u64::MAX)
             .err()
             .unwrap();
         assert!(matches!(err, DiskBackendError::WrongKind(_)));
@@ -864,7 +935,8 @@ mod tests {
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
         let backend =
-            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone()).unwrap();
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone(), u64::MAX)
+                .unwrap();
 
         // Write 16 bytes of 0xCC at offset 0, then flush. The
         // dirty buffer is drained during flush; the next read
@@ -941,7 +1013,8 @@ mod tests {
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
         let backend =
-            ChunkedDiskBackend::new(manifest_ref, &base_manifest, cache, store.clone()).unwrap();
+            ChunkedDiskBackend::new(manifest_ref, &base_manifest, cache, store.clone(), u64::MAX)
+                .unwrap();
 
         // Dirty some bytes so flush has something to publish.
         backend.write(0, &[0xcc; 16]).await.unwrap();
@@ -999,7 +1072,8 @@ mod tests {
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
         let backend =
-            ChunkedDiskBackend::new(manifest_ref, &base_manifest, cache, store.clone()).unwrap();
+            ChunkedDiskBackend::new(manifest_ref, &base_manifest, cache, store.clone(), u64::MAX)
+                .unwrap();
 
         backend.write(0, &[0xee; 16]).await.unwrap();
         let outcome = backend
@@ -1033,7 +1107,8 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
-        let backend = ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store).unwrap();
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
 
         backend.write(0, &[0xcc; 16]).await.unwrap();
         // Touching one chunk materialises it whole — `dirty_bytes`
@@ -1085,6 +1160,163 @@ mod tests {
         assert!(
             second >= first,
             "second flush stamp ({second}) must not regress past first ({first})",
+        );
+    }
+
+    // -- ADR 0016 Phase B: threshold-notify wiring -------------------
+
+    /// Build a backend with an explicit `threshold_bytes`. Mirrors
+    /// `build_backend` but exposes the threshold knob so the
+    /// threshold-notify tests below can drive crossings deterministically.
+    async fn build_backend_with_threshold(
+        manifest: &Manifest,
+        threshold_bytes: u64,
+    ) -> (ChunkedDiskBackend, Arc<ChunkStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, manifest).await.unwrap();
+        let backend = ChunkedDiskBackend::new(
+            manifest_ref,
+            manifest,
+            cache,
+            store.clone(),
+            threshold_bytes,
+        )
+        .unwrap();
+        (backend, store, dir)
+    }
+
+    /// A first write that fits below the threshold does not fire the
+    /// notify; the second write that pushes dirty bytes past the
+    /// threshold does. The `tokio::time::timeout` on `notified()`
+    /// is the structural assertion — `notify_one` either parked a
+    /// permit (the await returns immediately) or it didn't (the
+    /// await times out).
+    #[tokio::test]
+    async fn writer_crosses_threshold_pokes_notify() {
+        let chunk_size = 4096u64;
+        let total = chunk_size * 4;
+        let manifest = synth_manifest(total, chunk_size, vec![]);
+        // Threshold at 2 chunks worth: one chunk write stays under,
+        // a second crosses.
+        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, chunk_size * 2).await;
+        let notify = backend.threshold_notify();
+
+        // First write: dirty buffer holds one full chunk (the write
+        // materialises the whole 4 KiB on first touch). 4 KiB < 8
+        // KiB → no crossing → no notify permit.
+        backend.write(0, &[0xcc; 8]).await.unwrap();
+        let below =
+            tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
+        assert!(
+            below.is_err(),
+            "notify must NOT fire before threshold is crossed",
+        );
+
+        // Second write touches chunk 1: dirty grows to 8 KiB, which
+        // is >= threshold. Crossing edge observed under the dirty
+        // lock; `notify_one` parks a permit.
+        backend.write(chunk_size, &[0xdd; 8]).await.unwrap();
+        let crossed =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
+        assert!(
+            crossed.is_ok(),
+            "notify must fire when dirty bytes cross threshold",
+        );
+    }
+
+    /// Once the buffer is past threshold, subsequent inserts on
+    /// already-dirty bytes don't re-fire — the cross is a one-shot
+    /// edge, not a level. The `notify_one` permit semantics give us
+    /// the "at most one wake per crossing" behaviour even if multiple
+    /// writers race; this test pins the in-lock guard (`before <
+    /// threshold && after >= threshold`) that prevents re-fires from
+    /// writers landing while the buffer is already saturated.
+    #[tokio::test]
+    async fn additional_writes_past_threshold_do_not_re_notify() {
+        let chunk_size = 4096u64;
+        let total = chunk_size * 8;
+        let manifest = synth_manifest(total, chunk_size, vec![]);
+        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, chunk_size * 2).await;
+        let notify = backend.threshold_notify();
+
+        // Force a crossing: chunk 0 + chunk 1 → 8 KiB == threshold.
+        backend.write(0, &[0xcc; 8]).await.unwrap();
+        backend.write(chunk_size, &[0xdd; 8]).await.unwrap();
+        let crossed =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
+        assert!(crossed.is_ok(), "crossing notify must fire");
+
+        // Subsequent writes that materialise more chunks don't
+        // re-cross — `before` is already >= threshold for them, so
+        // the guard suppresses the notify_one. Permits don't
+        // accumulate beyond 1; a fresh `notified()` here would only
+        // ever fire if a NEW crossing edge happened.
+        backend.write(chunk_size * 2, &[0xee; 8]).await.unwrap();
+        backend.write(chunk_size * 3, &[0xff; 8]).await.unwrap();
+        let level =
+            tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
+        assert!(
+            level.is_err(),
+            "notify must not re-fire while the buffer stays past threshold",
+        );
+    }
+
+    /// Many concurrent writers each materialising a fresh chunk; the
+    /// in-lock crossing detection means exactly one of them observes
+    /// the monotonic edge (before<threshold && after>=threshold).
+    /// The other writers either see before<threshold && after<threshold
+    /// (we haven't crossed yet) or before>=threshold (someone else
+    /// did). Observable invariant: no deadlock, no panic, notify
+    /// fires exactly once (a permit is parked).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_observe_single_crossing() {
+        let chunk_size = 4096u64;
+        let chunks: u64 = 8;
+        let total = chunk_size * chunks;
+        let manifest = synth_manifest(total, chunk_size, vec![]);
+        // Threshold sized so a single chunk insert does not cross
+        // (4 KiB < 16 KiB) but a few of them collectively do
+        // (4 KiB * 8 = 32 KiB > 16 KiB).
+        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, chunk_size * 4).await;
+        let notify = backend.threshold_notify();
+        let backend = Arc::new(backend);
+
+        let mut joins = Vec::with_capacity(chunks as usize);
+        for i in 0..chunks {
+            let backend = backend.clone();
+            joins.push(tokio::spawn(async move {
+                backend.write(i * chunk_size, &[i as u8; 8]).await.unwrap();
+            }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+
+        // The collective writes crossed the threshold. At least one
+        // writer observed the edge and poked `notify_one`; the
+        // permit is parked and consumable.
+        let woken =
+            tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified()).await;
+        assert!(
+            woken.is_ok(),
+            "concurrent crossing must park a notify permit",
+        );
+
+        // A second `notified()` should NOT immediately return —
+        // permits don't accumulate. Multiple in-lock observers of
+        // the crossing all call `notify_one` but at most one permit
+        // is stored.
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
+        assert!(
+            second.is_err(),
+            "notify_one stores at most one permit; a second consumer must wait",
         );
     }
 }
