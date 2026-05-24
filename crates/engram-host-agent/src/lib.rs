@@ -367,17 +367,44 @@ impl HostAgent {
                     cloud_metadata: None,
                 };
                 let cc = coord_client.clone();
+                let pooled_for_rehydrate = pooled.clone();
                 tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
                     loop {
                         match cc.register(&register_req).await {
-                            Ok(_resp) => {
+                            Ok(resp) => {
                                 tracing::info!(
                                     host_id = %register_req.host_id,
                                     host_addr = %register_req.host_addr,
+                                    rehydrate_sandboxes = resp.rehydrate_sandboxes.len(),
                                     "registered with coord via /api/hosts/register",
                                 );
+                                // ADR 0016 Phase B commit 7: rehydrate
+                                // any survivors PG knew about before
+                                // our restart. Best-effort per row;
+                                // one failure shouldn't block the
+                                // rest. Linux-only NBD path; the
+                                // PooledBackend method short-circuits
+                                // on missing config.
+                                #[cfg(target_os = "linux")]
+                                {
+                                    rehydrate_survivors(
+                                        &pooled_for_rehydrate,
+                                        &resp.rehydrate_sandboxes,
+                                    )
+                                    .await;
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = pooled_for_rehydrate;
+                                    if !resp.rehydrate_sandboxes.is_empty() {
+                                        tracing::info!(
+                                            count = resp.rehydrate_sandboxes.len(),
+                                            "rehydrate list returned but host isn't Linux/NBD; ignoring",
+                                        );
+                                    }
+                                }
                                 break;
                             }
                             Err(e) => {
@@ -667,6 +694,81 @@ impl HostAgent {
         tracing::info!("host-agent shutting down");
         Ok(())
     }
+}
+
+/// ADR 0016 Phase B commit 7: rebuild chunked-disk tracking for
+/// survivors PG already had bound to this host pre-restart. Called
+/// from the host-registration success branch with the list coord
+/// returned. Best-effort per row: a failure on one survivor logs
+/// + continues; the host doesn't fail registration over it.
+///
+/// Each survivor gets:
+/// 1. NBD slot + ChunkedDiskBackend rebuilt from the effective
+///    disk manifest (newer of `live_disk_manifest_*` and the
+///    latest recoverable snapshot — picked server-side by
+///    `MetadataStore::list_active_sandboxes_on_host_with_disk_manifest`).
+/// 2. NBD daemon spawned.
+/// 3. `nbd_sandboxes` entry installed.
+/// 4. FlushScheduler spawned with the (session_id, sandbox_id)
+///    pair. Continuous flush resumes immediately.
+/// 5. `egress_sessions` pre-populated so the publisher's
+///    sandbox→session lookup finds the binding on the first
+///    post-rehydrate tick.
+///
+/// Survivors without a chunked disk manifest (legacy sessions, or
+/// hosts where the publisher never landed a value) are skipped
+/// with a debug log. They run "untracked" until the next eviction
+/// snapshot.
+#[cfg(target_os = "linux")]
+async fn rehydrate_survivors(
+    pooled: &Arc<pooled_backend::PooledBackend>,
+    survivors: &[coord_client::RehydrateSandboxRef],
+) {
+    if survivors.is_empty() {
+        return;
+    }
+    let mut rehydrated = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for entry in survivors {
+        let (Some(mid), Some(ver)) = (entry.disk_manifest_id, entry.disk_manifest_version) else {
+            tracing::debug!(
+                session_id = %entry.session_id,
+                sandbox_id = %entry.sandbox_id,
+                "rehydrate skipped: no disk manifest on the survivor row",
+            );
+            skipped += 1;
+            continue;
+        };
+        let manifest_ref = engram_core::types::manifest::ManifestRef {
+            manifest_id: mid,
+            version: ver,
+        };
+        match pooled
+            .rehydrate_sandbox(entry.session_id, entry.sandbox_id, manifest_ref)
+            .await
+        {
+            Ok(true) => rehydrated += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %entry.session_id,
+                    sandbox_id = %entry.sandbox_id,
+                    manifest = %manifest_ref,
+                    error = %e,
+                    "rehydrate failed for survivor sandbox; continuing with the rest",
+                );
+                failed += 1;
+            }
+        }
+    }
+    tracing::info!(
+        total = survivors.len(),
+        rehydrated,
+        skipped,
+        failed,
+        "Phase B rehydration pass complete",
+    );
 }
 
 /// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).

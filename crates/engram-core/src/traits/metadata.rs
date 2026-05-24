@@ -90,6 +90,52 @@ pub trait MetadataStore: Send + Sync {
             })
             .collect())
     }
+
+    /// ADR 0016 Phase B commit 7 — restart-time rehydration source.
+    /// Returns one record per Active session bound to a sandbox on
+    /// `host_id`, including the effective disk manifest the host
+    /// should rebuild `ChunkedDiskBackend` from: the newer of
+    /// `sessions.live_disk_manifest_*` (last FlushScheduler publish)
+    /// and the latest recoverable snapshot's `disk_manifest`.
+    /// Same resolver semantic as `effective_resume_disk_manifest`
+    /// (commit 6); kept server-side so the host issues one query
+    /// per restart instead of N+1 round-trips.
+    ///
+    /// Default impl: scans `list_active_sessions()` + walks
+    /// `list_session_snapshots(...)` per row. Postgres overrides
+    /// with a single LEFT JOIN. The default exists so test mocks
+    /// without a snapshot index still satisfy the trait.
+    ///
+    /// `Option<ManifestRef>` is `None` when:
+    /// - The session never published a live manifest AND has no
+    ///   recoverable snapshot — legacy session or sandbox without
+    ///   chunked-disk tracking. Host skips rehydration (no
+    ///   `attach_chunked_disk` to call).
+    /// - The session's status changed mid-query (defensive).
+    async fn list_active_sandboxes_on_host_with_disk_manifest(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
+        let all = self.list_active_sessions().await?;
+        let mut out = Vec::new();
+        for s in all {
+            if !matches!(s.status, SessionState::Active) {
+                continue;
+            }
+            let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {
+                continue;
+            };
+            if h != host_id {
+                continue;
+            }
+            // Pick newer of live vs. latest snapshot. The default
+            // impl can't cheaply query "latest snapshot"; default
+            // to live_disk_manifest only and let PgMeta's override
+            // do the JOIN.
+            out.push((s.id, sb, s.live_disk_manifest));
+        }
+        Ok(out)
+    }
     /// ADR 0015 M2: the single validated entry point for `UPDATE
     /// sessions SET status = ...`. Reads the current state, runs
     /// [`SessionState::try_transition_to`] against `target`, and

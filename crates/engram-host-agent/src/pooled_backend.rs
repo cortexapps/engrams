@@ -2018,39 +2018,6 @@ impl SandboxBackend for PooledBackend {
         }
     }
 
-    /// ADR 0016 Phase B commit 5 — pre-restore half of the
-    /// resume-path NBD attach. Spawned from `restore()` before
-    /// `inner.restore()` reads the sidecar.
-    ///
-    /// When all four conditions hold — Linux + `nbd_pool` +
-    /// `chunk_store` + `chunk_cache` — AND the snapshot row carries
-    /// a chunked `disk_manifest`, this returns `Ok(Some(state))`:
-    ///
-    /// 1. Build a `ChunkedDiskBackend` from the snapshot's disk
-    ///    manifest. The base manifest IS the snapshot's manifest;
-    ///    no flat-file materialization happens.
-    /// 2. Acquire a `/dev/nbdN` slot + spawn the NBD daemon. State
-    ///    carries `scheduler: None` (the FlushScheduler is installed
-    ///    post-`inner.restore` when the new sandbox_id is known).
-    /// 3. Patch the FC sidecar's `spec.rootfs_source` to the NBD
-    ///    device path. `restore_canonical_symlinks` (called from
-    ///    `inner.restore`) then installs BOTH canonical symlinks
-    ///    (host + source-keyed per FC's `state.bin` embedded path)
-    ///    pointing at /dev/nbdN. FC's `load_snapshot` reads through
-    ///    the symlink → through virtio-blk → through the NBD daemon
-    ///    → through `ChunkedDiskBackend::read`. No bytes ever resident.
-    ///
-    /// On any short-circuit (no nbd_pool, no disk_manifest, etc.),
-    /// returns `Ok(None)` and the caller falls back to
-    /// `materialize_disk_if_missing` (the pre-Phase-B path).
-    ///
-    /// Closes ADR 0016 §"Phase B failure mode to close":
-    /// - Symptom 1: cow_state_all iterates `nbd_sandboxes`. The
-    ///   resumed sandbox is now in that map → diagnostic returns
-    ///   non-null.
-    /// - Symptom 2: snapshot path expects the canonical chunked-
-    ///   disk layout (symlinks + nbd_sandboxes entry). Both are
-    ///   present after a NBD-attach resume.
     /// ADR 0016 Phase B commit 4a — admin trigger for the
     /// FlushScheduler primitive. Forces an immediate flush on the
     /// chunked-disk backend; returns the new manifest_ref if any
@@ -2093,6 +2060,90 @@ impl SandboxBackend for PooledBackend {
 
 #[cfg(target_os = "linux")]
 impl PooledBackend {
+    /// ADR 0016 Phase B commit 7 — restart-time rehydration.
+    /// Coord hands the host a list of `(session_id, sandbox_id,
+    /// effective_disk_manifest)` rows at registration time;
+    /// this method rebuilds chunked-disk tracking for one entry.
+    ///
+    /// Steps:
+    /// 1. Acquire an NBD slot.
+    /// 2. Build `ChunkedDiskBackend` from the manifest_ref.
+    /// 3. Spawn the NBD daemon serving the slot.
+    /// 4. Insert into `nbd_sandboxes` keyed by `sandbox_id`.
+    /// 5. Install the FlushScheduler so continuous flush resumes
+    ///    for the survivor.
+    /// 6. Pre-populate `egress_sessions[sandbox_id] = session_id`
+    ///    so the LiveManifestPublisher's resolver finds the
+    ///    binding on the first post-rehydrate flush.
+    ///
+    /// **Out of scope** (see commit 8 closing notes):
+    /// - Patching the FC sidecar (this code path doesn't re-launch
+    ///   FC; the sandbox is already running from before the
+    ///   host-agent restart).
+    /// - Recovery of FC virtio-blk I/O after NBD device loss. If
+    ///   the kernel left the device in a stuck state, the FC
+    ///   sandbox's I/O likely failed and it's a candidate for
+    ///   eviction-to-snapshot, not rehydration. Out of scope.
+    ///
+    /// Skip (`Ok(false)`) on any short-circuit (no nbd_pool /
+    /// chunk_store / chunk_cache, or sandbox already present).
+    /// Callers log + move on.
+    pub async fn rehydrate_sandbox(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+    ) -> Result<bool, SandboxError> {
+        let (pool, chunk_store, chunk_cache) = match (
+            self.nbd_pool.as_ref(),
+            self.chunk_store.as_ref(),
+            self.chunk_cache.as_ref(),
+        ) {
+            (Some(p), Some(s), Some(c)) => (p, s, c),
+            _ => return Ok(false),
+        };
+        if self.nbd_sandboxes.contains_key(&sandbox_id) {
+            tracing::debug!(
+                %sandbox_id,
+                "rehydrate skipped: nbd_sandboxes entry already present",
+            );
+            return Ok(false);
+        }
+
+        let store_arc = Arc::new(chunk_store.clone());
+        let mut state = crate::disk_daemon::attach_manifest(
+            disk_manifest,
+            chunk_cache.clone(),
+            store_arc,
+            pool,
+            self.flush_config.dirty_threshold_bytes,
+        )
+        .await
+        .map_err(|e| SandboxError::Vm(format!("rehydrate nbd attach: {e}").into()))?;
+
+        state.install_flush_scheduler(
+            sandbox_id,
+            self.live_manifest_publisher.clone(),
+            self.flush_config.clone(),
+        );
+        self.nbd_sandboxes.insert(sandbox_id, state);
+
+        // Pre-populate egress_sessions so the LiveManifestPublisher
+        // resolver finds the binding on the first post-rehydrate
+        // flush. Without this, the scheduler would skip-publish
+        // with "sandbox not bound" — same shape as the pre-commit-
+        // 5163366 cold-create regression.
+        self.egress_sessions.insert(sandbox_id, session_id);
+
+        tracing::info!(
+            %session_id,
+            %sandbox_id,
+            manifest = %disk_manifest,
+            "rehydrated chunked-disk tracking + scheduler for survivor sandbox",
+        );
+        Ok(true)
+    }
+
     /// ADR 0016 Phase B commit 5 — pre-restore half of the
     /// resume-path NBD attach. Spawned from `restore()` before
     /// `inner.restore()` reads the sidecar.

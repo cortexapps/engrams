@@ -74,6 +74,39 @@ pub struct RegisterResponse {
     /// to just `prefetch_time`.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
+    /// ADR 0016 Phase B commit 7: rehydration source. One record
+    /// per Active session PG already has bound to this host with
+    /// a chunked-disk manifest. Host iterates this on startup,
+    /// rebuilds `ChunkedDiskBackend` from the effective manifest,
+    /// spawns the NBD daemon + FlushScheduler. Closes the
+    /// host-agent-restart-loses-COW-tracking gap the ADR's
+    /// commit-0 design called out.
+    ///
+    /// Empty when:
+    /// - The host's first registration (no Active sessions yet).
+    /// - The host's restart but no Active sessions in PG were
+    ///   bound (eviction sweep ran while the host was down).
+    /// - The coord lookup failed (we log + emit empty so the host
+    ///   continues; sandboxes recover via the M4 evac path).
+    #[serde(default)]
+    pub rehydrate_sandboxes: Vec<RehydrateSandboxRef>,
+}
+
+/// ADR 0016 Phase B commit 7: one entry in the rehydration list
+/// the host iterates at startup. Wire format mirrors the columns
+/// `MetadataStore::list_active_sandboxes_on_host_with_disk_manifest`
+/// returns; the host's startup hook rebuilds chunked-disk tracking
+/// from these.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RehydrateSandboxRef {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    /// The effective disk manifest the host should rebuild from
+    /// (newer of `sessions.live_disk_manifest_*` and the latest
+    /// recoverable `snapshots.disk_manifest`). `None` means there's
+    /// no chunked-disk lineage to rebuild — host skips this row.
+    pub disk_manifest_id: Option<uuid::Uuid>,
+    pub disk_manifest_version: Option<u64>,
 }
 
 pub async fn register(
@@ -143,11 +176,46 @@ pub async fn register(
         }
     };
 
+    // ADR 0016 Phase B commit 7: rehydration list. PG already
+    // knows which Active sessions are bound to this host (a host-
+    // agent restart drops `nbd_sandboxes` but PG persists the
+    // session→sandbox→host binding). Hand the list back so the
+    // host can rebuild `ChunkedDiskBackend` + spawn the
+    // FlushScheduler for each, restoring continuous-flush
+    // coverage. Failure non-fatal: a host that doesn't get the
+    // list runs blind for the survivors (same shape as pre-Phase-
+    // B behaviour); operator can manually re-register or evac.
+    let rehydrate_sandboxes = match state
+        .services
+        .meta
+        .list_active_sandboxes_on_host_with_disk_manifest(req.host_id)
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
+                session_id,
+                sandbox_id,
+                disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
+                disk_manifest_version: manifest.as_ref().map(|m| m.version),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                host_id = %req.host_id,
+                error = %e,
+                "rehydrate-list query failed at register; host will run blind for survivors",
+            );
+            Vec::new()
+        }
+    };
+
     tracing::info!(
         host_id = %req.host_id,
         host_addr = %req.host_addr,
         agent_version = %req.agent_version,
         enabled_images = enabled_images.len(),
+        rehydrate_sandboxes = rehydrate_sandboxes.len(),
         "host registered via /api/hosts/register",
     );
 
@@ -155,6 +223,7 @@ pub async fn register(
         server_time: Utc::now(),
         coord_wire_version: engram_protocol::WIRE_VERSION,
         enabled_images,
+        rehydrate_sandboxes,
     }))
 }
 

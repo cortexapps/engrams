@@ -335,6 +335,21 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub server_time: DateTime<Utc>,
     pub coord_wire_version: u32,
+    /// ADR 0016 Phase B commit 7: rehydration list. One entry per
+    /// Active session bound to this host with a chunked-disk
+    /// manifest PG knows about. Empty on first registration / no
+    /// survivors. Coord-side: see
+    /// `engram_coordinator::api::host_http::RehydrateSandboxRef`.
+    #[serde(default)]
+    pub rehydrate_sandboxes: Vec<RehydrateSandboxRef>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RehydrateSandboxRef {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub disk_manifest_id: Option<uuid::Uuid>,
+    pub disk_manifest_version: Option<u64>,
 }
 
 #[derive(Serialize)]

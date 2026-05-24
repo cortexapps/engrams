@@ -161,6 +161,117 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::session_from_row).collect()
     }
 
+    /// ADR 0016 Phase B commit 7 — single-query rehydration source.
+    /// LEFT JOIN against snapshots to compute the effective disk
+    /// manifest server-side (newer of live + latest recoverable
+    /// snapshot). Avoids the N+1 query the trait default would
+    /// produce.
+    async fn list_active_sandboxes_on_host_with_disk_manifest(
+        &self,
+        host_id: HostId,
+    ) -> Result<
+        Vec<(
+            SessionId,
+            SandboxId,
+            Option<engram_core::types::manifest::ManifestRef>,
+        )>,
+        MetaError,
+    > {
+        // CTE picks the LATEST recoverable snapshot per session
+        // (one row per session_id, ordered by created_at DESC).
+        // The outer SELECT joins it with the active-on-host
+        // sessions and picks max(live, snapshot) version when both
+        // share the same manifest_id; if they differ, snapshot
+        // wins (mirrors `effective_resume_disk_manifest`'s
+        // defensive branch).
+        let rows = sqlx::query(
+            r#"
+            WITH latest_snap AS (
+                SELECT DISTINCT ON (session_id)
+                       session_id,
+                       disk_manifest_id      AS snap_id,
+                       disk_manifest_version AS snap_version
+                FROM snapshots
+                WHERE session_id IS NOT NULL
+                  AND recoverable = TRUE
+                  AND disk_manifest_id IS NOT NULL
+                ORDER BY session_id, created_at DESC
+            )
+            SELECT s.id              AS session_id,
+                   s.sandbox_id      AS sandbox_id,
+                   s.live_disk_manifest_id      AS live_id,
+                   s.live_disk_manifest_version AS live_version,
+                   ls.snap_id        AS snap_id,
+                   ls.snap_version   AS snap_version
+            FROM sessions s
+            LEFT JOIN latest_snap ls ON ls.session_id = s.id
+            WHERE s.host_id    = $1
+              AND s.status     = 'active'
+              AND s.sandbox_id IS NOT NULL
+            "#,
+        )
+        .bind(host_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let session: Uuid = r
+                .try_get("session_id")
+                .map_err(|e| MetaError::Serialization(format!("rehydrate: session_id: {e}")))?;
+            let sandbox: Uuid = r
+                .try_get("sandbox_id")
+                .map_err(|e| MetaError::Serialization(format!("rehydrate: sandbox_id: {e}")))?;
+            let live_id: Option<Uuid> = r
+                .try_get("live_id")
+                .map_err(|e| MetaError::Serialization(format!("rehydrate: live_id: {e}")))?;
+            let live_version: Option<i64> = r
+                .try_get("live_version")
+                .map_err(|e| MetaError::Serialization(format!("rehydrate: live_version: {e}")))?;
+            let snap_id: Option<Uuid> = r
+                .try_get("snap_id")
+                .map_err(|e| MetaError::Serialization(format!("rehydrate: snap_id: {e}")))?;
+            let snap_version: Option<i64> = r
+                .try_get("snap_version")
+                .map_err(|e| MetaError::Serialization(format!("rehydrate: snap_version: {e}")))?;
+            let live = match (live_id, live_version) {
+                (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
+                    manifest_id: id,
+                    version: v as u64,
+                }),
+                _ => None,
+            };
+            let snap = match (snap_id, snap_version) {
+                (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
+                    manifest_id: id,
+                    version: v as u64,
+                }),
+                _ => None,
+            };
+            // Mirror `effective_resume_disk_manifest` exactly.
+            // Same-id → max(version). Different id → snapshot wins
+            // (defensive). Both None → None (sandbox without
+            // chunked-disk lineage, host skips rehydration).
+            let effective = match (live, snap) {
+                (None, snap) => snap,
+                (Some(l), None) => Some(l),
+                (Some(l), Some(s)) => {
+                    if l.manifest_id == s.manifest_id && l.version > s.version {
+                        Some(l)
+                    } else {
+                        Some(s)
+                    }
+                }
+            };
+            out.push((
+                SessionId::from(session),
+                SandboxId::from(sandbox),
+                effective,
+            ));
+        }
+        Ok(out)
+    }
+
     async fn list_active_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
