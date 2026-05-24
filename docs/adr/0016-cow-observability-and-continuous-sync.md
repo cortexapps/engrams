@@ -22,9 +22,12 @@ M1.x annotations and ADR 0015's per-milestone commit lists):
   separate code paths, one TF cleanup. Each its own commit; see
   §"Phase A.1 follow-ups" below for the catalog and proposed fixes.
   _(in flight)_
-- **Phase B** — continuous disk sync. Design finalized 2026-05-24
-  (see §"Phase B design (2026-05-24)" below); 8 commits + ADR
-  bookends. _(design files; implementation in flight)_
+- **Phase B** — continuous disk sync. Design finalized + shipped
+  2026-05-24 — 14 commits (8 planned + 6 prod-shape follow-ups
+  surfaced on dev-vm verification). See §"Phase B design
+  (2026-05-24)" for the planned design and §"Phase B as-built
+  notes (2026-05-24)" for the shipped chain, divergences, and
+  pitfalls.
 - **Phase C** — chunk-GC pin-set redesign (6 commits + ADR final pass). _(pending)_
 
 The ADR is updated at the end of each phase with what shipped, what
@@ -1433,6 +1436,194 @@ its own follow-up ADR if the test confirms it.
   dev-vm test; gets its own ADR if needed.
 - **Phase C** — separate phase; Phase B leaves
   `chunk_generation` groundwork ready.
+
+#### Phase B as-built notes (2026-05-24)
+
+Closing bookend per `[adr_bookends_substantive_work]`. Phase B
+shipped in 14 local commits across one day — broader than the
+8-commit plan from the §"Phase B design" subsection above because
+two follow-up commits paired with each major change (4a/4b for the
+admin trigger + e2e; 5a for the resume regression), plus three
+prod-shape bug-fix commits surfaced only on dev-vm verification.
+
+**Commit chain (in order; all local, not yet pushed):**
+
+| # | Hash | Title |
+|---|---|---|
+| 0 | `51667ce` | docs(adr-0016): open Phase B — finalized design |
+| 1 | `2f4146c` | feat(host-agent): commit 1 — threshold-notify on ChunkedDiskBackend |
+| 2 | `18508ab` | feat(host-agent): commit 2 — FlushScheduler + cold-create wiring |
+| drive-by | `f97a1c2` | fix(coord): A.1.5c — sweep_stale_eviction_leases test was racing chrono::Utc::now() |
+| 3 | `bd220e4` | feat(meta): commit 3 — sessions.live_disk_manifest_* + chunk_generation |
+| 4 | `c77a919` | feat(host-coord): commit 4 — POST /api/hosts/:id/live-manifest + coalescing publisher |
+| 4a | `0a3d67e` | feat(host-coord): commit 4a — admin flush-now endpoint |
+| 4b | `f401ed3` | test(coord): commit 4b — e2e_flush_now in test-e2e-stack lane |
+| 4b fix | `2c885bb` | fix(coord): 4b — gate e2e_flush_now applied-path on cow-state probe |
+| 5 | `f6c126c` | feat(host-agent): commit 5 — resume rejoins chunked-disk tracking |
+| 5a | `d8e5449` | test(coord): commit 5a — e2e regression for resume rejoins chunked-disk tracking |
+| 5 fix | `95043b6` | fix(host-agent): commit 5 — move prepare_resume_nbd_attach out of impl SandboxBackend |
+| 6 | `4ed5bcf` | feat(coord): commit 6 — effective_resume_disk_manifest resolver |
+| 4 fix | `5163366` | fix(host-agent): 4 — record sandbox→session binding regardless of egress proxy wiring |
+| 4b/5a fix | `39ceaa0` | fix(coord): 4b/5a — assert on cow-state end-state, not flush-now outcome |
+| 5a fix | `6108763` | fix(coord): 5a — drop racy pre-snapshot flush assertion too |
+| nextest | `48e761d` | test(nextest): 4b/5a — bump e2e_stack cap to 10 minutes |
+| 4 fix | `8706592` | fix(host-agent): 4 — clean egress_sessions on destroy regardless of egress wiring |
+| 7 | `11c7c96` | feat(host-coord): commit 7 — restart-time rehydration |
+| 8 | _this commit_ | feat(web): commit 8 — UI copy fix + ADR closing bookend |
+
+**Divergences from the design block above:**
+
+1. **Naming**: `POST /internal/live-manifest` → `POST /api/hosts/:id/live-manifest`.
+   The ADR design block called the publish endpoint `/internal/...`
+   but every existing host→coord endpoint uses `/api/hosts/:id/...`
+   and shares the `require_bearer` middleware. Adopted the
+   existing convention; no behaviour change.
+
+2. **`egress_sessions` becomes a Phase B primitive, not just an egress concern.**
+   Phase A's `egress_sessions: DashMap<SandboxId, SessionId>` only
+   meaningfully held bindings on hosts with an egress proxy
+   wired. The Phase B publisher resolves sandbox→session via this
+   map; that means hosts without a proxy (dev-stack, prod-egress-
+   disabled) must still populate it. Two fixes shipped during
+   prod-shape verification:
+   - `5163366`: hoisted the `egress_sessions.insert` in
+     `notify_session_policy` above the `Some(egress)` gate.
+   - `8706592`: hoisted the `egress_sessions.remove` in `destroy`
+     above the same gate.
+   Future cleanup: rename `egress_sessions` to reflect the broader
+   "session bindings the host knows about" semantic. Filed for a
+   later pass to avoid bloating Phase B.
+
+3. **E2E assertion model: end-state polling, not discrete outcomes.**
+   The original design pinned `flush_now → applied` post-write.
+   First dev-vm run surfaced the FlushScheduler tick (30s default)
+   racing the admin trigger — whichever fires first drains the
+   dirty buffer; the other returns `idle`. Phase B's actual claim
+   is that `disk_manifest_version` advances on writes regardless
+   of who drained the buffer, so the tests now poll cow-state's
+   `disk_manifest_version` (90s deadline) instead of asserting on
+   the discrete `flush_now` outcome. Race-tolerant + covers both
+   the admin-trigger and scheduler-tick paths.
+
+4. **`prepare_resume_nbd_attach` ended up inherent, not trait.**
+   First draft put it inside `impl SandboxBackend for PooledBackend`;
+   dev-vm `cargo check` caught the E0407 (not a trait method) and
+   `95043b6` moved it to `impl PooledBackend`. Pure structural
+   fix; macOS clippy/check didn't see the error because the helper
+   is `#[cfg(target_os = "linux")]`. Reinforces the
+   `[linux_only_clippy_via_dev_vm]` rule.
+
+**Pitfalls / drive-bys encountered:**
+
+- **Flake fix `f97a1c2`** — `sweep_stale_eviction_leases_reaps_old_entries`
+  test was racing `chrono::Utc::now()` on a fast machine. Caught
+  during the first `just check` after commit 2; fixed
+  unconditionally rather than papered over with a "re-run if it
+  fails" memory. Pairs with the new
+  `[fix_unrelated_issues_dont_paper_over]` rule.
+
+- **Live-manifest publisher needs `egress_sessions` populated even
+  without a proxy.** Captured above (divergence #2). Visible only
+  on the prod-shape integration stack; not a `just check`-level
+  bug.
+
+- **Resume regression test's NBD-busy cascade.** When the first
+  Phase B e2e test panicked, its `driver.delete(sid)` never
+  reached cleanup. The session's NBD slot stayed bound, the
+  resume test's session-create then exhausted the 4-slot pool.
+  Fixing the test assertion (end-state polling) removed the
+  panic and the cascade self-resolved. Cleaner long-term fix is
+  to wrap test bodies in a guard struct with Drop-on-panic
+  cleanup — filed as future hygiene.
+
+- **NBD kernel state survives host-agent restart.** When a
+  host-agent dies ungracefully (SIGKILL, OOM, deploy roll without
+  NBD_DISCONNECT), `/sys/block/nbdN/pid` keeps pointing at the
+  dead PID. The kernel considers the device "in use" until
+  someone successfully runs NBD_DISCONNECT. `nbd-client -d` from
+  userspace doesn't always succeed in this state. **In our
+  testing, the only reliable recovery was a host reboot.** This
+  bleeds into the M4.1 evacuation story: a host-agent restart
+  is currently NOT a clean operation if it had chunked-disk
+  sandboxes running. Filed as a separate concern (see "Out of
+  scope" below); commit 7's rehydration rebuilds the *bookkeeping*
+  state but doesn't fix kernel-side stuck devices.
+
+- **`cargo fmt` followed by `just check` flagged formatting drift
+  several times.** Sequence is: edit → `cargo fmt --all` → `just
+  check`. Skipping the fmt step makes the rustfmt diff at the top
+  of `just check` look like real failures.
+
+- **dev-vm SSH via `bash .claude/skills/dev-vm/scripts/ssh.sh`
+  was intermittent today.** The `gcloud compute ssh` wrapper hits
+  unreliable IAP tunnel hiccups. Falling back to the direct
+  `ssh engram-dev.us-west2-a.cortex-test-1608327238078 ...` alias
+  (populated by `gcloud compute config-ssh`) was consistently
+  faster + more reliable. Captured in the new
+  `[dev_vm_e2e_verification_workflow]` memory.
+
+**Dev-vm verification status:**
+
+- **e2e_flush_now_applies_then_short_circuits_on_no_dirty**:
+  passes on dev-vm with the full integration stack. End-state
+  poll catches the scheduler-tick path correctly; pre-write idle
+  + post-write version-advance assertions both fire.
+- **e2e_resume_rejoins_chunked_disk_tracking**: runs the full
+  cold-create → snapshot → evict → resume sequence end-to-end on
+  dev-vm; failed on the second dev-vm run with a transient coord→
+  host gRPC error AFTER the snapshot+SIGKILL step, during which
+  the host-agent appeared to hang. Investigation revealed
+  accumulated dead-PID NBD threads (5 of 8 slots) from prior
+  test runs — fixing the test panic (which left stale state)
+  removes the most common cause. The remaining destroy-path
+  reliability is filed as separate work.
+
+**Prod rollout sequence** (unchanged from §"Rollout" above):
+
+1. Ship Phase B with `ENGRAM_CONTINUOUS_FLUSH_DISABLED=1`.
+   Verify the code paths run in staging without producing
+   continuous publish traffic.
+2. Enable continuous flush in one prod region. Observe BlobStorage
+   PUT rate, total size, and the publisher's mpsc backlog metric
+   for ≥1 day. Growth is monotonic until Phase C — this is the
+   expected window.
+3. Spot-check `sessions.live_disk_manifest_*` advances continuously
+   for Active sessions; verify `chunk_generation` advances with
+   each publish.
+4. Roll out continuous flush to remaining regions.
+5. Phase C follows; until it ships, `chunk_generation` is
+   informational and BlobStorage growth stays monotonic.
+
+**Newly-filed follow-ups** (out of Phase B; documented for future
+work):
+
+- **NBD device kernel-state cleanup on host-agent startup.** The
+  host-agent's NBD pool allocator should probe `/sys/block/nbdN/pid`
+  on startup and force-disconnect any kernel-stale bindings before
+  inserting devices into the pool. Without this, ungraceful prior
+  exits accumulate stuck devices until reboot. Required for the
+  rehydration story to be operationally complete.
+
+- **Host-agent destroy-path reliability.** Today's dev-vm
+  investigation showed the host-agent appears to hang after a
+  FC SIGKILL during destroy, blocking subsequent gRPC calls.
+  Suspected interaction with the FlushScheduler's
+  `Arc<ChunkedDiskBackend>` + the NBD daemon's serve task.
+  Needs a focused investigation; not Phase B scope.
+
+- **Rename `egress_sessions`** to reflect its broader semantic as
+  the host's sandbox→session binding index (Phase B consumer +
+  Phase A egress consumer).
+
+- **FC-side NBD-loss recovery.** If `/dev/nbdN` goes into the
+  kernel-stuck state mid-sandbox, FC's I/O fails and the sandbox
+  is wedged. Recovery would need either NBD reset (separate
+  kernel work) or evac-to-snapshot triggered by a heartbeat-side
+  health check. Tracked for M4.1 / future evac milestone.
+
+**Phase B status**: design block above → as-built shipped here.
+The ADR overall stays **Proposed** until Phase C lands and flips
+it to **Accepted**.
 
 ### Phase C — chunk-GC pin-set redesign
 

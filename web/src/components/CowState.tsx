@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import type { CowStateView } from '../types';
 import { useHostCowState, useSessionCowState } from '../hooks/useCowState';
+import { useSession } from '../hooks/useSessions';
 
 // ADR 0016 Phase A: COW diagnostic surface. Two modes:
 //
@@ -178,6 +179,15 @@ export function HostCowState({ hostId }: { hostId: string }) {
 
 export function SessionCowState({ sessionId }: { sessionId: string }) {
   const query = useSessionCowState(sessionId);
+  // ADR 0016 Phase B commit 8: the previous copy "no live sandbox
+  // — disk-tier diagnostic unavailable while the session is idle /
+  // lost / pending" lied about Active sessions whose host hasn't
+  // wired the chunked-disk pipeline. Pre-Phase-B, resumed sessions
+  // ALSO hit this path even when Active (commit 5 fixes the
+  // resume case, but hosts without NBD wiring still produce null
+  // for Active sessions). Pulling session status here so the copy
+  // can be honest about which case the user is in.
+  const sessionQuery = useSession(sessionId);
   if (query.isPending) {
     return (
       <p
@@ -200,13 +210,25 @@ export function SessionCowState({ sessionId }: { sessionId: string }) {
   }
   const state = query.data?.state;
   if (!state) {
+    // Conditional copy: terminal/idle states say so honestly;
+    // Active-with-null means the host isn't running the chunked-
+    // disk pipeline (no nbd_pool / chunk_store wired, or a pre-
+    // commit-7 host that lost tracking on its last restart).
+    const status = sessionQuery.data?.status;
+    const message =
+      status === undefined
+        ? 'disk-tier diagnostic unavailable.'
+        : status === 'active'
+          ? 'no chunked-disk tracking for this Active session — the host hasn’t wired the NBD pipeline, or its tracking didn’t survive the last restart.'
+          : status === 'idle' || status === 'host_lost'
+            ? `session is ${status.replace('_', ' ')}; durability lives on the latest snapshot row.`
+            : `session is ${status.replace('_', ' ')} (terminal) — no live disk tier.`;
     return (
       <p
         className="font-mono text-[0.78rem] italic"
         style={{ color: 'var(--color-ink-faded)' }}
       >
-        no live sandbox — disk-tier diagnostic unavailable while the
-        session is idle / lost / pending.
+        {message}
       </p>
     );
   }
