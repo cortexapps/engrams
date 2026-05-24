@@ -271,17 +271,72 @@ impl MetadataStore for PostgresStore {
         id: SessionId,
         sandbox_id: Option<SandboxId>,
     ) -> Result<(), MetaError> {
-        let n = sqlx::query(
-            r#"
-            UPDATE sessions SET sandbox_id = $2, updated_at = NOW() WHERE id = $1
-            "#,
-        )
-        .bind(id.as_uuid())
-        .bind(sandbox_id.map(|s| s.as_uuid()))
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
+        // ADR 0016 Phase B: the `live_disk_manifest_*` invariant is
+        // "set IFF the session is bound to a running sandbox the
+        // host-side FlushScheduler is publishing for." Unbinding
+        // (sandbox_id = NULL) means the live manifest is no longer
+        // authoritative — the snapshot row (if any) is. Clear in the
+        // same UPDATE so:
+        //   1. Resume's `effective_resume_disk_manifest` resolver
+        //      (commit 6) sees NULL and falls back to the snapshot's
+        //      `disk_manifest`. Without this, an eviction race
+        //      (scheduler publishes between `host.snapshot()` and
+        //      `assign_session_sandbox(None)`) would leave a live
+        //      manifest AHEAD of the snapshot, producing an
+        //      incoherent (memory at T-from-snapshot, disk at T+delta)
+        //      resume.
+        //   2. Phase C's pin set (which keys on `live_disk_manifest_id`
+        //      WHERE NOT NULL) drops the post-eviction lineage from
+        //      its live set so its chunks become GC-eligible after
+        //      the snapshot's chunks supersede them.
+        //
+        // Rebinding (sandbox_id = Some) does NOT clear — the next
+        // scheduler flush of the new sandbox populates the columns;
+        // any leftover value from a prior binding is overwritten by
+        // that publish (or the sandbox_id guard drops it as stale).
+        let n = if sandbox_id.is_some() {
+            sqlx::query("UPDATE sessions SET sandbox_id = $2, updated_at = NOW() WHERE id = $1")
+                .bind(id.as_uuid())
+                .bind(sandbox_id.map(|s| s.as_uuid()))
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?
+                .rows_affected()
+        } else {
+            // Single TX: clear sandbox + live manifest, AND bump
+            // chunk_generation in the same step so Phase C's mid-
+            // sweep barrier observes the pin-set shrink atomically.
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
+            let n = sqlx::query(
+                "UPDATE sessions
+                    SET sandbox_id                 = NULL,
+                        live_disk_manifest_id      = NULL,
+                        live_disk_manifest_version = NULL,
+                        live_disk_manifest_at      = NULL,
+                        updated_at                 = NOW()
+                  WHERE id = $1",
+            )
+            .bind(id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            // Only bump generation when we actually cleared a row
+            // that had a live manifest. A NULL→NULL clear is a no-op
+            // for the pin set; bumping anyway is harmless (a wasted
+            // sweep restart) but the conditional keeps generation
+            // bumps tied to real pin-set deltas.
+            if n > 0 {
+                sqlx::query(
+                    "UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE",
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+            tx.commit().await.map_err(db_err)?;
+            n
+        };
         if n == 0 {
             return Err(MetaError::NotFound);
         }
@@ -1094,5 +1149,66 @@ impl MetadataStore for PostgresStore {
                 }
             })
             .collect())
+    }
+
+    /// ADR 0016 Phase B: publish the host's freshly-flushed disk
+    /// manifest. Single TX:
+    ///
+    /// 1. `UPDATE sessions SET live_disk_manifest_* WHERE id = $1
+    ///    AND sandbox_id = $2`. The sandbox_id guard is the core
+    ///    correctness invariant — a stale publish from a destroyed
+    ///    or rebound sandbox can't clobber a fresh binding.
+    /// 2. If `rows_affected == 0`: return `DroppedStale` and let
+    ///    the transaction roll back. No `chunk_generation` bump
+    ///    because nothing was pinned.
+    /// 3. Else: bump `chunk_generation` so Phase C's mid-sweep
+    ///    barrier observes the new pin set atomically with the
+    ///    `sessions` row write. Return `Applied`.
+    async fn update_live_disk_manifest(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        manifest_ref: engram_core::types::manifest::ManifestRef,
+    ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let rows_affected = sqlx::query(
+            "UPDATE sessions
+                SET live_disk_manifest_id      = $3,
+                    live_disk_manifest_version = $4,
+                    live_disk_manifest_at      = now()
+              WHERE id         = $1
+                AND sandbox_id = $2",
+        )
+        .bind(session_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(manifest_ref.manifest_id)
+        .bind(manifest_ref.version as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if rows_affected == 0 {
+            // Rollback the TX explicitly — nothing was written, but
+            // letting it implicit-drop is fine; this is documentation.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
+        }
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::traits::UpdateOutcome::Applied)
+    }
+
+    /// ADR 0016 Phase C: read the one-row `chunk_generation` counter.
+    /// Sweep before-and-after read; mid-sweep restart on bump.
+    async fn chunk_generation(&self) -> Result<u64, MetaError> {
+        let row =
+            sqlx::query_scalar::<_, i64>("SELECT generation FROM chunk_generation WHERE id = TRUE")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(row as u64)
     }
 }

@@ -724,6 +724,27 @@ pub(crate) mod tests {
         /// lease methods. Tests insert directly here to simulate
         /// a peer coord pod holding a lease.
         pub(crate) eviction_leases: PlMutex<EvictionLeaseMap>,
+        /// ADR 0016 Phase B: in-memory mirror of
+        /// `sessions.live_disk_manifest_*` for tests that exercise
+        /// the `update_live_disk_manifest` trait. Keyed by
+        /// `session_id` and gated by `sandbox_id` match against the
+        /// `session.sandbox_id` field above — same correctness
+        /// invariant as the PG `WHERE sandbox_id = $2` guard.
+        pub(crate) live_disk_manifests: PlMutex<
+            std::collections::HashMap<
+                SessionId,
+                (
+                    engram_core::SandboxId,
+                    engram_core::types::manifest::ManifestRef,
+                ),
+            >,
+        >,
+        /// ADR 0016 Phase C: in-memory mirror of the `chunk_generation`
+        /// counter. Bumped in the same critical section that writes
+        /// `live_disk_manifests` (or clears it via
+        /// `assign_session_sandbox(None)`) so tests can verify the
+        /// barrier behaviour Phase C will rely on.
+        pub(crate) chunk_generation: PlMutex<u64>,
     }
 
     /// Alias so the `clippy::type_complexity` lint stays happy on
@@ -747,6 +768,8 @@ pub(crate) mod tests {
                 snapshots: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
                 eviction_leases: PlMutex::new(std::collections::HashMap::new()),
+                live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
+                chunk_generation: PlMutex::new(0),
             }
         }
     }
@@ -816,6 +839,13 @@ pub(crate) mod tests {
                 return Err(MetaError::NotFound);
             }
             s.sandbox_id = sandbox_id;
+            // ADR 0016 Phase B: unbind clears the live manifest +
+            // bumps chunk_generation so Phase C's mid-sweep barrier
+            // observes the pin-set shrink atomically. Mirrors the
+            // PG path in engram-postgres::assign_session_sandbox.
+            if sandbox_id.is_none() && self.live_disk_manifests.lock().remove(&id).is_some() {
+                *self.chunk_generation.lock() += 1;
+            }
             Ok(())
         }
         async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
@@ -1041,6 +1071,35 @@ pub(crate) mod tests {
             });
             Ok(reaped)
         }
+
+        // ADR 0016 Phase B: in-memory mirror of
+        // `engram_postgres::update_live_disk_manifest`. The
+        // sandbox_id guard mirrors PG's `WHERE sandbox_id = $2`; a
+        // mismatch returns `DroppedStale` without touching the
+        // generation counter.
+        async fn update_live_disk_manifest(
+            &self,
+            session_id: SessionId,
+            sandbox_id: engram_core::SandboxId,
+            manifest_ref: engram_core::types::manifest::ManifestRef,
+        ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
+            // Match against the current session.sandbox_id under the
+            // session lock. NULL → DroppedStale (no binding). Other
+            // sandbox_id → DroppedStale (stale publish).
+            let bound = self.session.lock().sandbox_id;
+            if bound != Some(sandbox_id) {
+                return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
+            }
+            self.live_disk_manifests
+                .lock()
+                .insert(session_id, (sandbox_id, manifest_ref));
+            *self.chunk_generation.lock() += 1;
+            Ok(engram_core::traits::UpdateOutcome::Applied)
+        }
+
+        async fn chunk_generation(&self) -> Result<u64, MetaError> {
+            Ok(*self.chunk_generation.lock())
+        }
     }
 
     #[tokio::test]
@@ -1102,5 +1161,152 @@ pub(crate) mod tests {
                 "harness_idle".to_string(),
             ],
         );
+    }
+
+    // -- ADR 0016 Phase B: live_disk_manifest + chunk_generation -------
+
+    fn build_phase_b_meta(
+        sandbox_id: Option<engram_core::SandboxId>,
+    ) -> (engram_core::SessionId, Arc<MiniMeta>) {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: engram_core::types::SessionState::Active,
+            host_id: None,
+            sandbox_id,
+            image: "test/repo:phase-b".into(),
+            harness: HarnessSpec::None,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+        (session_id, Arc::new(MiniMeta::new(session)))
+    }
+
+    #[tokio::test]
+    async fn update_live_disk_manifest_applies_when_sandbox_matches() {
+        let sandbox_id = engram_core::SandboxId::new();
+        let (session_id, mini) = build_phase_b_meta(Some(sandbox_id));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let mref = engram_core::types::manifest::ManifestRef::new();
+
+        assert_eq!(meta.chunk_generation().await.unwrap(), 0);
+        let outcome = meta
+            .update_live_disk_manifest(session_id, sandbox_id, mref)
+            .await
+            .unwrap();
+        assert_eq!(outcome, engram_core::traits::UpdateOutcome::Applied);
+        // Generation bumps atomically with the write.
+        assert_eq!(meta.chunk_generation().await.unwrap(), 1);
+        // The stored manifest matches what we published.
+        let stored = mini
+            .live_disk_manifests
+            .lock()
+            .get(&session_id)
+            .copied()
+            .unwrap();
+        assert_eq!(stored.0, sandbox_id);
+        assert_eq!(stored.1, mref);
+    }
+
+    #[tokio::test]
+    async fn update_live_disk_manifest_drops_stale_on_sandbox_mismatch() {
+        let bound_sandbox = engram_core::SandboxId::new();
+        let stale_sandbox = engram_core::SandboxId::new();
+        let (session_id, mini) = build_phase_b_meta(Some(bound_sandbox));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let mref = engram_core::types::manifest::ManifestRef::new();
+
+        let outcome = meta
+            .update_live_disk_manifest(session_id, stale_sandbox, mref)
+            .await
+            .unwrap();
+        assert_eq!(outcome, engram_core::traits::UpdateOutcome::DroppedStale);
+        // Generation does NOT bump on a stale publish — Phase C's
+        // barrier must not see false pin-set changes.
+        assert_eq!(meta.chunk_generation().await.unwrap(), 0);
+        // Nothing stored either.
+        assert!(mini.live_disk_manifests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_live_disk_manifest_drops_stale_when_session_unbound() {
+        // sandbox_id = None on the session (e.g. between snapshot and
+        // resume). Any publish attempt is structurally stale.
+        let (session_id, mini) = build_phase_b_meta(None);
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let mref = engram_core::types::manifest::ManifestRef::new();
+        let sandbox_id = engram_core::SandboxId::new();
+
+        let outcome = meta
+            .update_live_disk_manifest(session_id, sandbox_id, mref)
+            .await
+            .unwrap();
+        assert_eq!(outcome, engram_core::traits::UpdateOutcome::DroppedStale);
+        assert_eq!(meta.chunk_generation().await.unwrap(), 0);
+    }
+
+    /// The load-bearing eviction-race mitigation: unbind clears the
+    /// live manifest in the same step it NULLs sandbox_id. Without
+    /// this, a publish that landed pre-unbind would leave a stale
+    /// live_disk_manifest_id pointing past the snapshot's manifest;
+    /// commit 6's effective_resume_disk_manifest resolver would
+    /// then prefer it and restore disk-state AHEAD of memory.
+    #[tokio::test]
+    async fn assign_session_sandbox_none_clears_live_manifest_and_bumps_generation() {
+        let sandbox_id = engram_core::SandboxId::new();
+        let (session_id, mini) = build_phase_b_meta(Some(sandbox_id));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let mref = engram_core::types::manifest::ManifestRef::new();
+
+        // Land a publish first.
+        meta.update_live_disk_manifest(session_id, sandbox_id, mref)
+            .await
+            .unwrap();
+        let gen_after_publish = meta.chunk_generation().await.unwrap();
+        assert_eq!(gen_after_publish, 1);
+        assert!(mini.live_disk_manifests.lock().contains_key(&session_id));
+
+        // Unbind. Live manifest disappears; generation bumps because
+        // the pin set shrunk.
+        meta.assign_session_sandbox(session_id, None).await.unwrap();
+        assert!(!mini.live_disk_manifests.lock().contains_key(&session_id));
+        assert_eq!(
+            meta.chunk_generation().await.unwrap(),
+            gen_after_publish + 1
+        );
+    }
+
+    /// Rebinding to a new sandbox does NOT clear the live manifest —
+    /// the next FlushScheduler publish from the new sandbox
+    /// overwrites it (or the sandbox_id guard drops the new publish
+    /// as stale if rebinding raced). This is the symmetric case to
+    /// the unbind-clears test.
+    #[tokio::test]
+    async fn assign_session_sandbox_some_does_not_clear_or_bump() {
+        let sandbox_id = engram_core::SandboxId::new();
+        let (session_id, mini) = build_phase_b_meta(Some(sandbox_id));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let mref = engram_core::types::manifest::ManifestRef::new();
+
+        meta.update_live_disk_manifest(session_id, sandbox_id, mref)
+            .await
+            .unwrap();
+        let gen_before = meta.chunk_generation().await.unwrap();
+
+        // Rebind to a new sandbox id (the eventual resume path).
+        let new_sandbox = engram_core::SandboxId::new();
+        meta.assign_session_sandbox(session_id, Some(new_sandbox))
+            .await
+            .unwrap();
+        // Generation does NOT bump on a Some(_) rebind — the live
+        // manifest from the prior sandbox is structurally stale and
+        // will be either overwritten or guarded-out on the next
+        // publish; bumping here would be a false barrier tick.
+        assert_eq!(meta.chunk_generation().await.unwrap(), gen_before);
+        // The map still has the prior publish (will be replaced on
+        // the new sandbox's first publish; the sandbox_id guard
+        // ensures no incoherent reads).
+        assert!(mini.live_disk_manifests.lock().contains_key(&session_id));
     }
 }

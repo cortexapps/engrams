@@ -4,6 +4,7 @@ use crate::error::MetaError;
 use crate::types::event::PersistedEvent;
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
+use crate::types::manifest::ManifestRef;
 use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential, SessionSecrets};
 use crate::types::session::{Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
@@ -396,6 +397,54 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<StaleEvictionLease>, MetaError> {
         Ok(Vec::new())
     }
+
+    /// ADR 0016 Phase B: write the host's freshly-flushed disk
+    /// manifest into `sessions.live_disk_manifest_*`, gated by a
+    /// `sandbox_id` match so a stale publish from a destroyed
+    /// sandbox can't clobber a fresh binding. Bumps
+    /// `chunk_generation` in the same transaction on `Applied` so
+    /// Phase C's GC barrier sees an atomic step from "old pin set
+    /// → write → new pin set" (no mid-sweep window where the new
+    /// manifest exists but the generation hasn't ticked).
+    ///
+    /// `DroppedStale` means the UPDATE matched zero rows — either
+    /// the session was destroyed between flush and publish, or the
+    /// sandbox was rebound. Coord-side handler logs a `warn!` with
+    /// the mismatch and returns 200 to the host (the host shouldn't
+    /// retry; the staleness is structural).
+    ///
+    /// Default returns `Applied` and does nothing, so test mocks
+    /// don't need to plumb the columns until they exercise Phase B.
+    async fn update_live_disk_manifest(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: SandboxId,
+        _manifest_ref: ManifestRef,
+    ) -> Result<UpdateOutcome, MetaError> {
+        Ok(UpdateOutcome::Applied)
+    }
+
+    /// ADR 0016 Phase C support: read the one-row `chunk_generation`
+    /// counter. Phase C's GC sweep reads this before listing the
+    /// pin set and again at the end; if it ticked, the sweep
+    /// restarts with a fresh pin set. Default `0` so non-PG
+    /// backends don't have to track it.
+    async fn chunk_generation(&self) -> Result<u64, MetaError> {
+        Ok(0)
+    }
+}
+
+/// Outcome of [`MetadataStore::update_live_disk_manifest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// The session row was updated and `chunk_generation` ticked.
+    /// Coord handler logs `info!`; host's coalescing mpsc moves on.
+    Applied,
+    /// The UPDATE matched zero rows — `sessions.sandbox_id !=
+    /// publish.sandbox_id` (destroyed/rebound) or the session is
+    /// gone. Coord handler logs `warn!` with the mismatch fields;
+    /// host shouldn't retry.
+    DroppedStale,
 }
 
 /// One row from [`MetadataStore::sweep_stale_eviction_leases`].
