@@ -156,7 +156,11 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     //    NbdSandboxState owns the live daemon + slot lease; drop
     //    cleanly tears down.
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("build slot pool");
-    let nbd_state = attach_manifest(manifest_ref, cache, store.clone(), &pool)
+    // ADR 0016 Phase B: threshold-notify wiring is irrelevant for
+    // this NBD-only test — pass `u64::MAX` to disable. The Phase B
+    // scheduler is also not installed (`scheduler: None`); the test
+    // only exercises the NBD wire format + kernel binding.
+    let nbd_state = attach_manifest(manifest_ref, cache, store.clone(), &pool, u64::MAX)
         .await
         .expect("spawn NBD daemon against /dev/nbd0");
     let nbd_device = nbd_state.device_path().to_path_buf();

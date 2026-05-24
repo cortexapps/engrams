@@ -167,6 +167,15 @@ pub struct PooledBackend {
     /// Cleared on `destroy(sandbox_id)` so the entry doesn't
     /// outlive its sandbox.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
+    /// ADR 0016 Phase B: continuous-flush scheduler config + the
+    /// publisher impl the scheduler hands its outcomes to. Cloned
+    /// into every cold-create / resume / restart-rehydration site
+    /// that spawns a scheduler. Defaults to the
+    /// [`crate::disk_daemon::NoOpLiveManifestPublisher`] in
+    /// commit 2; commit 4 wires the real coord-bound publisher via
+    /// [`Self::with_live_manifest_publisher`].
+    flush_config: crate::disk_daemon::FlushSchedulerConfig,
+    live_manifest_publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
 }
 
 impl PooledBackend {
@@ -186,7 +195,33 @@ impl PooledBackend {
             nbd_sandboxes: Arc::new(DashMap::new()),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
+            // ADR 0016 Phase B: scheduler defaults come from env at
+            // host-agent startup; the builder method
+            // `with_flush_scheduler` can override.
+            flush_config: crate::disk_daemon::FlushSchedulerConfig::from_env(),
+            live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
         }
+    }
+
+    /// Override the default Phase B flush scheduler config. The
+    /// production host-agent leaves this at `from_env()`; tests use
+    /// this to disable the scheduler entirely (`enabled = false`)
+    /// or tighten the interval to drive deterministic test cases.
+    pub fn with_flush_config(mut self, config: crate::disk_daemon::FlushSchedulerConfig) -> Self {
+        self.flush_config = config;
+        self
+    }
+
+    /// Attach the live-manifest publisher used by Phase B's flush
+    /// scheduler. Commit 4 wires a coord-bound publisher; commit 2
+    /// leaves the no-op default in place so commit 2's behaviour is
+    /// "scheduler runs, no coord traffic yet".
+    pub fn with_live_manifest_publisher(
+        mut self,
+        publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
+    ) -> Self {
+        self.live_manifest_publisher = publisher;
+        self
     }
 
     /// Attach a `/dev/nbdN` slot pool. When set + `chunk_store` +
@@ -451,6 +486,7 @@ impl PooledBackend {
             cache.clone(),
             store_arc,
             pool,
+            self.flush_config.dirty_threshold_bytes,
         )
         .await
         .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest: {e}").into()))?;
@@ -1279,8 +1315,22 @@ impl SandboxBackend for PooledBackend {
             // sandbox id. `destroy()` removes the entry (Drop tears
             // down the daemon + returns the slot); `snapshot()` reads
             // it back to call `backend.flush()`.
+            //
+            // ADR 0016 Phase B: post-`inner.create()` is the first
+            // point where the sandbox_id is known — install the
+            // FlushScheduler now. The scheduler is keyed by sandbox_id
+            // and resolves session_id via the publisher's own
+            // sandbox→session lookup (so warm-pool sandboxes share the
+            // same path without re-spawn machinery). Field-ordered
+            // Drop on `NbdSandboxState` guarantees scheduler-cancel →
+            // NBD-disconnect → slot-release.
             #[cfg(target_os = "linux")]
-            if let Some(state) = pending_nbd_state {
+            if let Some(mut state) = pending_nbd_state {
+                state.install_flush_scheduler(
+                    sandbox_id,
+                    self.live_manifest_publisher.clone(),
+                    self.flush_config.clone(),
+                );
                 self.nbd_sandboxes.insert(sandbox_id, state);
             }
             Ok(sandbox_id)

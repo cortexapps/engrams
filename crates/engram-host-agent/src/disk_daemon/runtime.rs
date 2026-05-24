@@ -230,17 +230,58 @@ impl Drop for NbdHandle {
 /// handle (Drop tears down), and the slot lease (Drop returns
 /// the `/dev/nbdN` path to the pool).
 ///
-/// Field order matters: `Drop` runs top-to-bottom, so `handle`
-/// gets disconnected from the kernel BEFORE the slot returns to
-/// the pool — that way a follow-up `acquire()` against the same
-/// path doesn't race the kernel's tear-down.
+/// Field order matters: `Drop` runs top-to-bottom, so the
+/// scheduler is cancelled FIRST (ADR 0016 Phase B — the spawned
+/// task holds an `Arc<ChunkedDiskBackend>` and might be mid-flush;
+/// `abort()` pre-empts cleanly at the next await), THEN the `handle`
+/// disconnects the NBD daemon, and finally the `slot` returns to
+/// the pool — so a follow-up `acquire()` against the same path
+/// doesn't race the kernel's tear-down. The scheduler field is
+/// `Option` because (a) commit 2 installs it post-create via
+/// [`Self::install_flush_scheduler`] once the sandbox_id is known,
+/// and (b) tests / callers that don't want continuous flush leave
+/// it `None`.
 pub struct NbdSandboxState {
+    /// ADR 0016 Phase B continuous flush. `Some` once
+    /// `install_flush_scheduler` has been called (cold create,
+    /// resume, restart rehydration). `None` until then, and `None`
+    /// permanently for callers that opt out (env var, tests).
+    pub scheduler: Option<crate::disk_daemon::FlushSchedulerHandle>,
     /// `flush()` produces the new manifest version on snapshot.
     pub backend: Arc<ChunkedDiskBackend>,
     /// Live daemon. Owns the OS thread + Tokio serve task.
     pub handle: NbdHandle,
     /// Slot lease. Returns to the pool when dropped.
     pub slot: NbdSlot,
+}
+
+impl NbdSandboxState {
+    /// Spawn the flush scheduler for this sandbox and hand the
+    /// resulting handle to the `scheduler` field. Idempotent on
+    /// already-installed schedulers (replaces — the prior handle's
+    /// `Drop` aborts the prior task). Skip when `config.enabled ==
+    /// false` so the kill-switch decision lives at one point.
+    ///
+    /// Called from the cold-create site in `PooledBackend` AFTER
+    /// `inner.create()` returns the sandbox_id; the resume + restart
+    /// call sites use the same helper.
+    pub fn install_flush_scheduler(
+        &mut self,
+        sandbox_id: engram_core::SandboxId,
+        publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
+        config: crate::disk_daemon::FlushSchedulerConfig,
+    ) {
+        if !config.enabled {
+            return;
+        }
+        let handle = crate::disk_daemon::FlushScheduler::spawn(
+            sandbox_id,
+            self.backend.clone(),
+            publisher,
+            config,
+        );
+        self.scheduler = Some(handle);
+    }
 }
 
 impl NbdSandboxState {
@@ -253,30 +294,37 @@ impl NbdSandboxState {
 
 /// One-call setup for a sandbox's NBD-backed rootfs:
 /// 1. Build a [`ChunkedDiskBackend`] from `disk_manifest_ref`
-///    (reading the manifest from the chunk store).
+///    (reading the manifest from the chunk store) with the Phase B
+///    threshold-notify wired.
 /// 2. Acquire a `/dev/nbdN` slot from `slot_pool`.
 /// 3. [`spawn`] the daemon against the acquired device.
 ///
-/// Returns the composite [`NbdSandboxState`] the caller stores
-/// for the sandbox's lifetime. Dropping the state tears the
-/// whole daemon down (handle → slot → cache references).
+/// Returns the composite [`NbdSandboxState`] the caller stores for
+/// the sandbox's lifetime; `scheduler` starts as `None`. The caller
+/// calls [`NbdSandboxState::install_flush_scheduler`] once
+/// `sandbox_id` is known (after `inner.create()` / `inner.restore()`).
+/// Dropping the state tears the whole daemon down (scheduler →
+/// handle → slot).
+///
+/// `threshold_bytes` is the dirty-bytes threshold beyond which the
+/// backend pokes its `Notify` to wake the scheduler early. Pass
+/// `FlushSchedulerConfig::dirty_threshold_bytes` so the scheduler
+/// and backend agree on the trigger point; tests pass `u64::MAX` to
+/// disable threshold-driven notifies.
 pub async fn attach_manifest(
     disk_manifest_ref: engram_core::types::manifest::ManifestRef,
     cache: engram_chunk_store::cache::ChunkCache,
     store: Arc<engram_chunk_store::ChunkStore>,
     slot_pool: &Arc<NbdSlotAllocator>,
+    threshold_bytes: u64,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
-    // ADR 0016 Phase B commit 1: threshold-driven notify wiring is
-    // in place, but the FlushScheduler that consumes the Notify
-    // doesn't ship until commit 2. Pass `u64::MAX` so the crossing
-    // check is structurally a no-op until commit 2 wires the
-    // scheduler and threads `FlushSchedulerConfig::dirty_threshold_bytes`
-    // through this call.
-    let backend = ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, u64::MAX).await?;
+    let backend =
+        ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
     let backend = Arc::new(backend);
     let slot = slot_pool.acquire().await;
     let handle = spawn(backend.clone(), slot.path()).await?;
     Ok(NbdSandboxState {
+        scheduler: None,
         backend,
         handle,
         slot,

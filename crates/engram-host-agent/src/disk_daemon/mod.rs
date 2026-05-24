@@ -36,13 +36,20 @@
 //!   `engram_host_agent::disk_daemon::runtime::spawn`).
 
 pub mod backend;
+pub mod flush_scheduler;
 pub mod nbd;
 pub mod slot;
 
 #[cfg(target_os = "linux")]
 pub mod runtime;
 
-pub use backend::{ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome};
+pub use backend::{
+    ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome, DEFAULT_DIRTY_THRESHOLD_BYTES,
+};
+pub use flush_scheduler::{
+    FlushScheduler, FlushSchedulerConfig, FlushSchedulerHandle, LiveManifestPublisher,
+    NoOpLiveManifestPublisher,
+};
 pub use nbd::{NbdCommand, NbdReply, NbdRequest, NbdWireError, NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC};
 pub use slot::{NbdSlot, NbdSlotAllocator};
 
