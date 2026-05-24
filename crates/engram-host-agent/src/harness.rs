@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use engram_core::{SandboxId, SessionId};
@@ -95,6 +95,17 @@ struct HubInner {
     /// `idle_sandboxes` skips it — the human is actively poking at
     /// the box and we don't snapshot-and-evict under their feet.
     shell_attached: Mutex<HashMap<SandboxId, u32>>,
+    /// ADR 0016 §A.1.5a: per-sandbox "an idle-eviction POST for this
+    /// sandbox is currently in flight on coord". Marked just before
+    /// the host's eviction-task POSTs candidates; cleared when the
+    /// fire-and-forget spawned task observes the POST's outcome
+    /// (success, transport error, or timeout). `idle_sandboxes`
+    /// filters out anything still in this map, so a second POST
+    /// can't race ahead of the first while coord is mid-pipeline.
+    /// Stored as `Instant` so the periodic stale sweep can reap
+    /// entries whose spawned task wedged (>180s — see eviction
+    /// task code).
+    eviction_inflight: Mutex<HashMap<SandboxId, Instant>>,
 }
 
 struct ConnectionHandle {
@@ -138,6 +149,7 @@ impl HarnessHub {
                 event_sink,
                 session_to_sandbox: Mutex::new(HashMap::new()),
                 shell_attached: Mutex::new(HashMap::new()),
+                eviction_inflight: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -389,6 +401,12 @@ impl HarnessHub {
         let idle_at = self.inner.last_idle_at.lock();
         let conns = self.inner.connections.lock();
         let shell = self.inner.shell_attached.lock();
+        // ADR 0016 §A.1.5a: skip sandboxes whose prior eviction POST
+        // is still in flight on coord. Without this, the 10s tick
+        // re-includes them while coord is still running the prior
+        // eviction's snapshot pipeline (typically 30s+), which
+        // produced the prod retry storm on 2026-05-24.
+        let inflight = self.inner.eviction_inflight.lock();
         let mut out = Vec::new();
         for (sandbox_id, handle) in conns.iter() {
             // Browser-shell connections express explicit "user is
@@ -397,6 +415,9 @@ impl HarnessHub {
             // sandbox falls back under the normal TTLs) when the
             // user closes the tab or otherwise drops the WebSocket.
             if shell.contains_key(sandbox_id) {
+                continue;
+            }
+            if inflight.contains_key(sandbox_id) {
                 continue;
             }
             let soft = idle_at
@@ -412,6 +433,45 @@ impl HarnessHub {
             }
         }
         out
+    }
+
+    /// ADR 0016 §A.1.5a: mark a sandbox as having an eviction POST
+    /// currently in flight on coord. Idempotent (re-marking refreshes
+    /// the Instant — used by the stale sweep to detect wedged
+    /// spawned tasks).
+    pub fn mark_eviction_inflight(&self, sandbox_id: SandboxId) {
+        self.inner
+            .eviction_inflight
+            .lock()
+            .insert(sandbox_id, Instant::now());
+    }
+
+    /// ADR 0016 §A.1.5a: clear the eviction-in-flight marker. Called
+    /// by the fire-and-forget spawned task in its finally block
+    /// regardless of POST outcome (success, transport error, timeout).
+    /// Idempotent; safe to call on an already-cleared entry.
+    pub fn clear_eviction_inflight(&self, sandbox_id: SandboxId) {
+        self.inner.eviction_inflight.lock().remove(&sandbox_id);
+    }
+
+    /// ADR 0016 §A.1.5a: sweep entries older than `max_age` and
+    /// return the sandbox_ids removed. Called at the top of each
+    /// eviction tick so a spawned task that wedged (e.g. reqwest
+    /// future hung forever) can't permanently block re-eviction of
+    /// the sandbox.
+    pub fn sweep_stale_evictions(&self, max_age: Duration) -> Vec<SandboxId> {
+        let mut guard = self.inner.eviction_inflight.lock();
+        let now = Instant::now();
+        let mut removed = Vec::new();
+        guard.retain(|sandbox_id, marked_at| {
+            if now.duration_since(*marked_at) >= max_age {
+                removed.push(*sandbox_id);
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 }
 
@@ -1112,5 +1172,113 @@ mod tests {
         .unwrap();
         let ack: HarnessAttachAck = read_msg(&mut conn).await.unwrap();
         assert!(!ack.ok, "unbound session should be rejected");
+    }
+
+    // ADR 0016 §A.1.5a — eviction in-flight gate -----------------
+
+    fn noop_sink() -> EventSink {
+        Arc::new(|_, _, _| Box::new(Box::pin(async {})))
+    }
+
+    #[tokio::test]
+    async fn idle_sandboxes_skips_evictions_in_flight() {
+        // Attach a sandbox, mark its last_idle_at to a value past the
+        // soft TTL, then mark it as "eviction in flight". `idle_sandboxes`
+        // should NOT return it. Clearing the marker un-suppresses.
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+        let _ack = drive_harness(harness_side, session_id, |_r, _w| async {}).await;
+
+        // Force the soft-idle bookkeeping past the TTL.
+        hub.inner
+            .last_idle_at
+            .lock()
+            .insert(sandbox_id, Utc::now() - chrono::Duration::seconds(120));
+
+        // Sanity: without the gate, this sandbox WOULD be returned.
+        let before = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
+        assert_eq!(before.len(), 1, "soft TTL should have fired");
+        assert_eq!(before[0].1, sandbox_id);
+
+        // Mark eviction in flight; same call now returns nothing.
+        hub.mark_eviction_inflight(sandbox_id);
+        let during = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
+        assert!(
+            during.is_empty(),
+            "eviction-in-flight should suppress the candidate; got {during:?}",
+        );
+
+        // Clear; sandbox re-appears as a candidate.
+        hub.clear_eviction_inflight(sandbox_id);
+        let after = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
+        assert_eq!(
+            after.len(),
+            1,
+            "clearing the marker should re-expose the candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_stale_evictions_reaps_old_entries() {
+        // Mark two sandboxes as in-flight, force one to be "old", run
+        // the sweep with a short max_age, assert only the old one is
+        // reaped and the still-fresh one is preserved.
+        let hub = HarnessHub::new(noop_sink());
+        let fresh = SandboxId::new();
+        let stale = SandboxId::new();
+        hub.mark_eviction_inflight(fresh);
+        hub.mark_eviction_inflight(stale);
+
+        // Backdate the stale entry's Instant. `Instant` doesn't have a
+        // public "set to past" API, but we can reach into the inner
+        // mutex to swap the value (the field is private; this is in-
+        // crate code so the test can access it).
+        {
+            let mut guard = hub.inner.eviction_inflight.lock();
+            let old = Instant::now()
+                .checked_sub(Duration::from_secs(300))
+                .unwrap_or_else(Instant::now);
+            guard.insert(stale, old);
+        }
+
+        let reaped = hub.sweep_stale_evictions(Duration::from_secs(180));
+        assert_eq!(reaped, vec![stale], "only the stale entry should be reaped");
+
+        // Fresh entry survives.
+        assert!(
+            hub.inner.eviction_inflight.lock().contains_key(&fresh),
+            "fresh entry must survive the sweep",
+        );
+        // Stale entry is gone.
+        assert!(
+            !hub.inner.eviction_inflight.lock().contains_key(&stale),
+            "stale entry must be removed",
+        );
+    }
+
+    #[test]
+    fn mark_eviction_inflight_is_idempotent() {
+        // Re-marking the same sandbox refreshes the Instant (used by
+        // the stale sweep to defer the deadline). Subsequent clears
+        // remove the single entry.
+        let hub = HarnessHub::new(noop_sink());
+        let sb = SandboxId::new();
+        hub.mark_eviction_inflight(sb);
+        let first = *hub.inner.eviction_inflight.lock().get(&sb).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        hub.mark_eviction_inflight(sb);
+        let second = *hub.inner.eviction_inflight.lock().get(&sb).unwrap();
+        assert!(
+            second > first,
+            "re-marking must refresh the Instant (second={second:?} first={first:?})",
+        );
+        hub.clear_eviction_inflight(sb);
+        assert!(
+            !hub.inner.eviction_inflight.lock().contains_key(&sb),
+            "clear must remove the entry",
+        );
     }
 }

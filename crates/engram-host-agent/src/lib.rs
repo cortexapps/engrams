@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::{CloudBackend, SandboxBackend};
+use engram_core::SandboxId;
 
 use crate::image_cache::ImageCache;
 
@@ -538,10 +539,31 @@ impl HostAgent {
                         );
                         continue;
                     }
+                    // ADR 0016 §A.1.5a: sweep wedged in-flight markers
+                    // before reading candidates. A spawned POST that
+                    // got stuck (reqwest future hung past its own
+                    // 120s timeout for some pathological reason)
+                    // would otherwise permanently block re-eviction of
+                    // its sandbox. 180s is 1.5× the per-request
+                    // timeout — by that point the POST is unambiguously
+                    // dead, even if the spawned task somehow hasn't
+                    // returned.
+                    let stale =
+                        eviction_hub.sweep_stale_evictions(std::time::Duration::from_secs(180));
+                    if !stale.is_empty() {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            count = stale.len(),
+                            "swept stale eviction-inflight markers (>180s); spawned POSTs presumed wedged",
+                        );
+                    }
+                    // `idle_sandboxes` now skips sandboxes whose prior
+                    // POST is still in flight (ADR 0016 §A.1.5a).
                     let pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
                     if pairs.is_empty() {
                         continue;
                     }
+                    let sandbox_ids: Vec<SandboxId> = pairs.iter().map(|(_, sb)| *sb).collect();
                     let candidates: Vec<coord_client::IdleCandidate> = pairs
                         .into_iter()
                         .map(|(session_id, sandbox_id)| coord_client::IdleCandidate {
@@ -550,16 +572,64 @@ impl HostAgent {
                             idle_since: None,
                         })
                         .collect();
-                    if let Err(e) = eviction_coord
-                        .push_idle_eviction_candidates(host_id, candidates)
-                        .await
-                    {
-                        tracing::debug!(
-                            host_id = %host_id,
-                            error = %e,
-                            "idle-eviction POST failed; retrying next tick",
-                        );
+                    // Mark BEFORE the spawn so the next tick (10s
+                    // away) can't double-post. The clear runs in the
+                    // spawned task's finally block — covers success,
+                    // transport error, and timeout uniformly.
+                    for sb in &sandbox_ids {
+                        eviction_hub.mark_eviction_inflight(*sb);
                     }
+                    // Fire-and-forget: don't block the tick loop on
+                    // the POST. Coord-side `evict_idle_session` can
+                    // legitimately take 60-90s for a fat session
+                    // (FC memory dump + state.bin upload + chunked
+                    // memory upload). Waiting inline made the host
+                    // retry-stormy when the POST hit its old 30s
+                    // timeout (ADR 0016 §A.1.5a, prod incident
+                    // 2026-05-24).
+                    //
+                    // Shutdown caveat: `eviction_task.abort()` on
+                    // process exit will not wait for these spawned
+                    // children. Detached POSTs may be torn down mid-
+                    // flight. Acceptable — the coord-side pipeline
+                    // is idempotent (the registry guard at the top
+                    // of `evict_idle_session` short-circuits on
+                    // re-entry per A.1.5b).
+                    let coord = eviction_coord.clone();
+                    let hub = eviction_hub.clone();
+                    let sandbox_ids_for_clear = sandbox_ids.clone();
+                    tokio::spawn(async move {
+                        let outcome = coord
+                            .push_idle_eviction_candidates(host_id, candidates)
+                            .await;
+                        // Finally: clear in-flight markers regardless
+                        // of outcome. A failed POST should NOT keep
+                        // the sandbox blocked from a retry on the
+                        // next tick — but the next tick will only
+                        // happen after this completes, which is the
+                        // whole point of the gate.
+                        for sb in &sandbox_ids_for_clear {
+                            hub.clear_eviction_inflight(*sb);
+                        }
+                        match outcome {
+                            Ok(resp) => {
+                                tracing::debug!(
+                                    %host_id,
+                                    accepted = resp.accepted,
+                                    failed = resp.failed,
+                                    "idle-eviction POST completed",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    %host_id,
+                                    error = %e,
+                                    "idle-eviction POST failed; \
+                                     will retry on next tick after clear",
+                                );
+                            }
+                        }
+                    });
                 }
             });
 

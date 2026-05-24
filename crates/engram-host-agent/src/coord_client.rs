@@ -188,7 +188,15 @@ impl CoordClient {
     ) -> Result<IdleEvictionCandidatesResponse, CoordClientError> {
         let url = self.endpoint(&format!("/api/hosts/{host_id}/idle-eviction-candidates"));
         let body = IdleEvictionCandidatesRequest { candidates };
-        let builder = self.http.post(&url);
+        // ADR 0016 §A.1.5a: per-request 120s timeout overrides the
+        // shared client's 30s default. Coord-side `evict_idle_session`
+        // can legitimately take 60-90s on a fat session (FC memory
+        // dump + state.bin upload + chunked memory upload + PG
+        // inserts). The 30s default produced the prod retry storm on
+        // 2026-05-24. 120s covers worst-case pipeline duration with
+        // a 30s margin; the host-side in-flight gate keeps the storm
+        // suppressed even if a POST does time out.
+        let builder = self.http.post(&url).timeout(Duration::from_secs(120));
         let resp = match self.auth(builder, &body).send().await {
             Ok(r) => r,
             Err(e) => {
