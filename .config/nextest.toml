@@ -25,7 +25,15 @@ slow-timeout = { period = "30s", terminate-after = 6 }
 # auth-failure test has an internal 180s SSE deadline that needs
 # to fire before nextest kills the process — otherwise we lose
 # the captured-events diagnostic that's load-bearing for
-# iteration. Bump to 5 minutes for this binary only.
+# iteration.
+#
+# ADR 0016 Phase B (commits 4b + 5a) added e2e_flush_now and
+# e2e_resume_rejoins; the resume test runs cold create → write →
+# flush → snapshot → evict → restore → write → flush → 90s end-
+# state poll, which on cold-cache CI runs lands at 280-320s.
+# Bumped from 5 minutes to 10 minutes (60s × 10) so a slow cold
+# bake doesn't time-out the run — the existing tests still
+# complete well under the cap, so the change is one-sided.
 [[profile.default.overrides]]
 filter = "binary(e2e_stack)"
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 10 }
