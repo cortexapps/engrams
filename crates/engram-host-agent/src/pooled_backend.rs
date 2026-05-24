@@ -1830,8 +1830,19 @@ impl SandboxBackend for PooledBackend {
         // rewritten. The destroy below tears down the VM; in the
         // brief window between the two, a closed-fail-by-default
         // registry would reject — which is the safe behavior.
+        //
+        // ADR 0016 Phase B 4: the `egress_sessions.remove` MUST run
+        // regardless of whether an egress proxy is wired — Phase B's
+        // LiveManifestPublisher resolves sandbox→session via this
+        // map, and leaking a (destroyed) sandbox_id binding would
+        // make the publisher repeat stale publishes for a session
+        // whose sandbox is gone. Sister-bug to the
+        // `notify_session_policy` fix (commit 5163366): both
+        // population AND cleanup must be unconditional now that the
+        // map is shared with the publisher.
+        let removed_session = self.egress_sessions.remove(&id).map(|(_, sid)| sid);
         if let Some(egress) = self.egress.as_ref() {
-            if let Some((_, session_id)) = self.egress_sessions.remove(&id) {
+            if let Some(session_id) = removed_session {
                 egress.registry.unregister(session_id);
             }
         }
