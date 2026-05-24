@@ -178,9 +178,32 @@ impl NbdHandle {
 
 impl Drop for NbdHandle {
     fn drop(&mut self) {
-        // Best-effort tear-down. Each step is independent: even
-        // if NBD_DISCONNECT fails, we still join the thread + abort
-        // the serve task so we don't leak.
+        // ADR 0017 Phase A: tear-down used to run the
+        // `kernel_thread.join()` inline, which blocks the calling
+        // tokio worker thread until the kernel-side NBD_DO_IT
+        // loop exits. When FC is SIGKILLed and the virtio-blk
+        // backend leaves in-flight I/O against /dev/nbdN, the
+        // kernel doesn't release NBD_DO_IT even after
+        // NBD_DISCONNECT — the join blocks indefinitely, and
+        // each destroy locks one tokio worker. With ~4 worker
+        // threads on prod hosts, four destroys are enough to
+        // stall the runtime (no heartbeat, no gRPC, coord
+        // declares the host dead). Observed on dev-vm 2026-05-24.
+        //
+        // Fix: do the cheap synchronous steps inline (NBD_DISCONNECT
+        // + serve-task abort) so the kernel side has its
+        // shutdown signal, then move the join + CLEAR_SOCK + fd
+        // close into a detached `std::thread::spawn`. Drop returns
+        // immediately; the kernel-side cleanup completes in the
+        // background. If the kernel never exits NBD_DO_IT (the
+        // ungraceful-FC case), this thread leaks rather than
+        // wedging the runtime. The `/dev/nbdN` path stays
+        // "kernel-busy" — the pool allocator (commit 1, this
+        // ADR) probes /sys/block/nbdN/pid on acquire so a busy
+        // slot is structurally invisible until it's actually
+        // recovered (by NBD_DISCONNECT completing, or by the
+        // startup cleanup in Phase B of this ADR).
+        let device_path = self.nbd_device.clone();
         if let Some(fd) = self.nbd_fd.as_ref() {
             // SAFETY: fd is owned by this struct; ioctl with a
             // direction-less command + no argument is the kernel's
@@ -191,7 +214,7 @@ impl Drop for NbdHandle {
                 tracing::warn!(
                     rc,
                     errno = io::Error::last_os_error().raw_os_error(),
-                    device = %self.nbd_device.display(),
+                    device = %device_path.display(),
                     "NBD_DISCONNECT ioctl failed during shutdown",
                 );
             }
@@ -199,28 +222,59 @@ impl Drop for NbdHandle {
         if let Some(task) = self.serve_task.take() {
             task.abort();
         }
-        if let Some(t) = self.kernel_thread.take() {
-            if let Err(panic) = t.join() {
-                tracing::warn!(?panic, "NBD kernel thread panicked");
-            }
+        // Move the kernel-thread join + CLEAR_SOCK + fd close into
+        // a detached std::thread so Drop returns immediately. The
+        // closure takes ownership of:
+        //   - kernel_thread (a JoinHandle<()>)
+        //   - nbd_fd (OwnedFd; close-on-drop)
+        let kernel_thread = self.kernel_thread.take();
+        let nbd_fd = self.nbd_fd.take();
+        if kernel_thread.is_some() || nbd_fd.is_some() {
+            std::thread::Builder::new()
+                .name(format!(
+                    "nbd-detach-{}",
+                    device_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "?".into())
+                ))
+                .spawn(move || {
+                    if let Some(t) = kernel_thread {
+                        if let Err(panic) = t.join() {
+                            tracing::warn!(
+                                ?panic,
+                                device = %device_path.display(),
+                                "NBD kernel thread panicked",
+                            );
+                        }
+                    }
+                    if let Some(fd) = nbd_fd.as_ref() {
+                        // SAFETY: fd still owned by the closure;
+                        // CLEAR_SOCK releases the kernel's reference
+                        // to the socketpair half we handed it.
+                        // Without this the kernel may keep the fd
+                        // alive past Drop.
+                        let raw = fd.as_raw_fd();
+                        let rc = unsafe { libc::ioctl(raw, NBD_CLEAR_SOCK) };
+                        if rc != 0 {
+                            tracing::debug!(
+                                rc,
+                                errno = io::Error::last_os_error().raw_os_error(),
+                                device = %device_path.display(),
+                                "NBD_CLEAR_SOCK ioctl failed (typically harmless on disconnect)",
+                            );
+                        }
+                    }
+                    // OwnedFd's Drop closes the device file when
+                    // `nbd_fd` goes out of scope at end of closure.
+                    drop(nbd_fd);
+                    tracing::debug!(
+                        device = %device_path.display(),
+                        "NBD detached cleanup complete",
+                    );
+                })
+                .ok(); // best-effort; if spawn fails, the cleanup is lost (acceptable — process is likely on its way out)
         }
-        if let Some(fd) = self.nbd_fd.as_ref() {
-            // SAFETY: fd still owned; NBD_CLEAR_SOCK releases the
-            // kernel's reference to the socketpair half we handed
-            // it. Without this the kernel may keep the fd alive
-            // past Drop.
-            let raw = fd.as_raw_fd();
-            let rc = unsafe { libc::ioctl(raw, NBD_CLEAR_SOCK) };
-            if rc != 0 {
-                tracing::debug!(
-                    rc,
-                    errno = io::Error::last_os_error().raw_os_error(),
-                    "NBD_CLEAR_SOCK ioctl failed (typically harmless on disconnect)",
-                );
-            }
-        }
-        // OwnedFd drop closes the device file.
-        let _ = self.nbd_fd.take();
     }
 }
 

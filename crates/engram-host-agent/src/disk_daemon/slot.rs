@@ -32,6 +32,44 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify};
 
+/// ADR 0017 Phase A: probe the kernel-side binding state of a
+/// `/dev/nbdN` device. Returns `true` iff `/sys/block/nbdN/pid`
+/// exists and has non-empty contents — the kernel's signal that
+/// the device is currently bound to an NBD daemon thread.
+///
+/// Used by [`NbdSlotAllocator::acquire`] to skip slots whose
+/// kernel-side cleanup is still in flight (the destroy path's
+/// detached `kernel_thread.join()` hasn't completed yet) AND
+/// slots whose bound PID is dead but the kernel hasn't released
+/// (the Phase B startup-cleanup target). Both cases produce a
+/// non-empty pid file; the probe treats them identically: skip
+/// for now, re-probe later.
+///
+/// On non-Linux platforms (macOS dev), `/sys/block` doesn't
+/// exist; the probe returns `false` (not busy) so the in-process
+/// slot pool used by tests on Mac stays functional.
+fn nbd_kernel_busy(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let pid_path = format!("/sys/block/{name}/pid");
+        match std::fs::read_to_string(&pid_path) {
+            Ok(s) => !s.trim().is_empty(),
+            // ENOENT: device has never been bound (or the kernel
+            // released the binding). Either way, not busy from our
+            // perspective.
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Lease handle for one `/dev/nbdN` slot. Auto-returns the slot to
 /// the allocator on `Drop` — sandboxes hold one of these for the
 /// lifetime of their NBD daemon and the lease's drop is what
@@ -108,22 +146,70 @@ impl NbdSlotAllocator {
     /// Wait for + claim a free slot. Returns immediately when the
     /// pool has a free path; otherwise sleeps until a sibling
     /// sandbox releases one.
+    ///
+    /// ADR 0017 Phase A: before handing out a path, probe its
+    /// kernel-side `/sys/block/nbdN/pid` to confirm the device is
+    /// actually free. The destroy path detaches the
+    /// kernel-thread join into a `std::thread::spawn` so the
+    /// destroy RPC returns immediately, but the kernel side may
+    /// still be cleaning up when the slot returns to the pool.
+    /// Without this probe, a fast re-acquire would hand out a
+    /// path whose `NBD_SET_SOCK` fails with EBUSY.
+    ///
+    /// The probe is best-effort: a missing `/sys/block/nbdN/pid`
+    /// is treated as "not busy" (matches kernel semantics when
+    /// the device has never been bound). On macOS the cfg-gated
+    /// no-op path is used; the slot pool is target-agnostic
+    /// but the probe is Linux-only.
     pub async fn acquire(self: &Arc<Self>) -> NbdSlot {
         loop {
             {
                 let mut free = self.free.lock().await;
-                if let Some(path) = free.pop_front() {
-                    return NbdSlot {
-                        path,
-                        allocator: self.clone(),
-                    };
+                let initial_len = free.len();
+                let mut probed = 0usize;
+                // Rotate-and-probe: pop, check kernel-busy, push to
+                // back if busy and continue. Bounded by the deque
+                // length so we don't spin forever when every slot
+                // is kernel-busy.
+                while let Some(path) = free.pop_front() {
+                    if !nbd_kernel_busy(&path) {
+                        return NbdSlot {
+                            path,
+                            allocator: self.clone(),
+                        };
+                    }
+                    tracing::debug!(
+                        device = %path.display(),
+                        "NBD slot kernel-busy (/sys/block/.../pid populated); skipping",
+                    );
+                    free.push_back(path);
+                    probed += 1;
+                    if probed >= initial_len {
+                        // Cycled through every slot in the deque,
+                        // all busy. Fall through to the wait below.
+                        break;
+                    }
                 }
             }
             // Lock dropped before await: standard tokio Notify
             // pattern. `notified()` registers interest BEFORE the
             // re-check, so a release-then-wait race can't miss a
             // wakeup.
-            self.notify.notified().await;
+            //
+            // Wake sources: another sandbox's NbdSlot::Drop fires
+            // a release; OR a slot's kernel-busy state clears and
+            // a separate caller re-probes it. The second source is
+            // best-effort — kernel state isn't observable as an
+            // event, so we just rely on the next caller's probe
+            // to pick up the cleared slot. To avoid permanent
+            // wait when only that path opens, periodic re-probe
+            // happens via tokio::time::sleep + retry — short
+            // timeout so a freshly-cleared kernel-stuck slot gets
+            // picked up within seconds, not minutes.
+            tokio::select! {
+                _ = self.notify.notified() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+            }
         }
     }
 
