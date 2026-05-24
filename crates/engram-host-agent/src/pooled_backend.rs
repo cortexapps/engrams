@@ -95,7 +95,14 @@ pub struct PooledBackend {
     /// `sandbox_id → session_id` index so `destroy(sandbox_id)` can
     /// call `Registry::unregister(session_id)`. Populated when a
     /// policy frame arrives.
-    egress_sessions: DashMap<SandboxId, SessionId>,
+    ///
+    /// ADR 0016 Phase B: wrapped in `Arc` so the
+    /// `LiveManifestPublisher`'s drain task can hold a clone for
+    /// the sandbox→session lookup at publish time. The lookup is
+    /// what lets warm-pool sandboxes (future) share the same
+    /// scheduler API — the publisher returns "skip" for any
+    /// sandbox not yet bound.
+    egress_sessions: Arc<DashMap<SandboxId, SessionId>>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
     /// the disk — chunks are fetched from `BlobStorage`, written to
@@ -173,9 +180,14 @@ pub struct PooledBackend {
     /// that spawns a scheduler. Defaults to the
     /// [`crate::disk_daemon::NoOpLiveManifestPublisher`] in
     /// commit 2; commit 4 wires the real coord-bound publisher via
-    /// [`Self::with_live_manifest_publisher`].
+    /// [`Self::with_live_manifest_coord_publisher`].
     flush_config: crate::disk_daemon::FlushSchedulerConfig,
     live_manifest_publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
+    /// Owns the drain task spawned by the live-manifest publisher.
+    /// Dropping aborts the task; held here so it shares
+    /// PooledBackend's lifetime. `None` for the no-op publisher (no
+    /// task to abort).
+    live_manifest_publisher_handle: Option<crate::disk_daemon::LiveManifestPublisherHandle>,
 }
 
 impl PooledBackend {
@@ -184,7 +196,7 @@ impl PooledBackend {
             inner,
             image_cache: None,
             egress: None,
-            egress_sessions: DashMap::new(),
+            egress_sessions: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
             chunk_cache: None,
@@ -200,6 +212,7 @@ impl PooledBackend {
             // `with_flush_scheduler` can override.
             flush_config: crate::disk_daemon::FlushSchedulerConfig::from_env(),
             live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
+            live_manifest_publisher_handle: None,
         }
     }
 
@@ -212,15 +225,48 @@ impl PooledBackend {
         self
     }
 
-    /// Attach the live-manifest publisher used by Phase B's flush
-    /// scheduler. Commit 4 wires a coord-bound publisher; commit 2
-    /// leaves the no-op default in place so commit 2's behaviour is
-    /// "scheduler runs, no coord traffic yet".
+    /// ADR 0016 Phase B commit 4: build a coord-bound publisher
+    /// using the host-agent's `CoordClient` and the freshly-wrapped
+    /// `egress_sessions` map. The publisher spawns its own drain
+    /// task; the returned `LiveManifestPublisherHandle` is held
+    /// inside PooledBackend so the task dies with us.
+    ///
+    /// Internal session resolver closes over a clone of
+    /// `self.egress_sessions` — that's the host-agent's
+    /// sandbox→session index, populated by `notify_session_policy`
+    /// (start_agent) and cleared by `destroy`. A publish that
+    /// arrives before `notify_session_policy` has populated the
+    /// entry (warm-pool sandbox pre-assignment, or the small
+    /// cold-create window between `inner.create()` and
+    /// `start_agent`) returns None from the resolver → drain task
+    /// skips with a debug log.
+    pub fn with_live_manifest_coord_publisher(
+        mut self,
+        coord: crate::coord_client::CoordClient,
+        host_id: engram_core::HostId,
+    ) -> Self {
+        let egress_sessions = Arc::clone(&self.egress_sessions);
+        let resolver: Arc<dyn crate::disk_daemon::SessionResolver> =
+            Arc::new(move |sandbox_id: SandboxId| -> Option<SessionId> {
+                egress_sessions.get(&sandbox_id).map(|e| *e)
+            });
+        let (publisher, handle) =
+            crate::disk_daemon::CoordLiveManifestPublisher::spawn(coord, host_id, resolver);
+        self.live_manifest_publisher = publisher;
+        self.live_manifest_publisher_handle = Some(handle);
+        self
+    }
+
+    /// Test hook: inject an arbitrary [`LiveManifestPublisher`]
+    /// (e.g. a recording mock). Production wiring uses
+    /// [`Self::with_live_manifest_coord_publisher`].
+    #[cfg(test)]
     pub fn with_live_manifest_publisher(
         mut self,
         publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
     ) -> Self {
         self.live_manifest_publisher = publisher;
+        self.live_manifest_publisher_handle = None;
         self
     }
 

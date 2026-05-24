@@ -246,6 +246,16 @@ impl HostAgent {
                 if let Some(pool) = self.nbd_pool.clone() {
                     p = p.with_nbd_pool(pool);
                 }
+                // ADR 0016 Phase B: wire the coord-bound
+                // live-manifest publisher. The publisher's drain
+                // task is owned by `p` (via
+                // `LiveManifestPublisherHandle`), so it dies with
+                // the host-agent process.
+                let publisher_coord = coord_client::CoordClient::new(
+                    coord_url.clone(),
+                    self.cfg.coordinator_token.clone(),
+                );
+                p = p.with_live_manifest_coord_publisher(publisher_coord, host_id);
                 Arc::new(p)
             };
             // ADR 0013: every harness event POSTs to the coord via

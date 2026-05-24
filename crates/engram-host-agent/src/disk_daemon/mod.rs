@@ -37,6 +37,7 @@
 
 pub mod backend;
 pub mod flush_scheduler;
+pub mod live_manifest_publisher;
 pub mod nbd;
 pub mod slot;
 
@@ -49,6 +50,9 @@ pub use backend::{
 pub use flush_scheduler::{
     FlushScheduler, FlushSchedulerConfig, FlushSchedulerHandle, LiveManifestPublisher,
     NoOpLiveManifestPublisher,
+};
+pub use live_manifest_publisher::{
+    CoordLiveManifestPublisher, LiveManifestPublisherHandle, SessionResolver,
 };
 pub use nbd::{NbdCommand, NbdReply, NbdRequest, NbdWireError, NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC};
 pub use slot::{NbdSlot, NbdSlotAllocator};

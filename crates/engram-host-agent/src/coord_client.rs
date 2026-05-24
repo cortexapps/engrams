@@ -180,6 +180,47 @@ impl CoordClient {
         Ok(())
     }
 
+    /// POST /api/hosts/:id/live-manifest
+    ///
+    /// ADR 0016 Phase B: tells coord that the host just flushed
+    /// `(sandbox_id, manifest_ref)` so `sessions.live_disk_manifest_*`
+    /// can be updated. Coord's UPDATE is gated on `sandbox_id` match,
+    /// so a stale publish (sandbox destroyed/rebound) returns
+    /// `LiveManifestPublishOutcome::Stale` and the host should NOT
+    /// retry; staleness is structural, not transient.
+    ///
+    /// Publishes are tiny (sub-100-byte payload) and fast; the
+    /// shared client's 30s default timeout is plenty. No per-request
+    /// override here, unlike the eviction lane in A.1.5a.
+    pub async fn publish_live_manifest(
+        &self,
+        host_id: HostId,
+        req: &LiveManifestPublishRequest,
+    ) -> Result<LiveManifestPublishResponse, CoordClientError> {
+        let url = self.endpoint(&format!("/api/hosts/{host_id}/live-manifest"));
+        let builder = self.http.post(&url);
+        let resp = match self.auth(builder, req).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // ADR 0016 §A.1.3 pattern: log transport-error
+                // breakdown for ops diagnosis. Don't escalate to
+                // warn — a single stale-pool error is benign; the
+                // drain task retries on the next wake.
+                tracing::debug!(
+                    %host_id,
+                    is_connect = e.is_connect(),
+                    is_timeout = e.is_timeout(),
+                    is_request = e.is_request(),
+                    is_body = e.is_body(),
+                    error = %e,
+                    "publish_live_manifest transport error",
+                );
+                return Err(CoordClientError::Transport(e));
+            }
+        };
+        decode_json(resp, "publish_live_manifest").await
+    }
+
     /// POST /api/hosts/:id/idle-eviction-candidates
     pub async fn push_idle_eviction_candidates(
         &self,
@@ -373,6 +414,31 @@ pub struct IdleEvictionCandidatesRequest {
 pub struct IdleEvictionCandidatesResponse {
     pub accepted: usize,
     pub failed: usize,
+}
+
+// ---- ADR 0016 Phase B: live disk manifest publish ----
+
+#[derive(Serialize, Deserialize)]
+pub struct LiveManifestPublishRequest {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub manifest_id: uuid::Uuid,
+    pub manifest_version: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LiveManifestPublishResponse {
+    /// `applied` → the UPDATE matched the row and chunk_generation
+    /// ticked. `stale` → `sessions.sandbox_id != publish.sandbox_id`
+    /// (destroyed or rebound); host should NOT retry.
+    pub outcome: LiveManifestPublishOutcome,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveManifestPublishOutcome {
+    Applied,
+    Stale,
 }
 
 /// `RegistryAuthResolver` impl that asks the coord for OCI creds

@@ -43,6 +43,13 @@ struct MockMetadataStore {
     enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_event_idx: Mutex<HashMap<SessionId, i64>>,
+    /// ADR 0016 Phase B: track `update_live_disk_manifest` writes so
+    /// the round-trip test can assert the row was updated.
+    live_disk_manifests: Mutex<HashMap<SessionId, engram_core::types::manifest::ManifestRef>>,
+    /// ADR 0016 Phase C: in-memory mirror of `chunk_generation` so
+    /// tests can assert the barrier ticked atomically with the
+    /// session-row write.
+    chunk_generation: std::sync::atomic::AtomicU64,
 }
 
 impl MockMetadataStore {
@@ -159,7 +166,44 @@ impl MetadataStore for MockMetadataStore {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
         s.sandbox_id = sandbox_id;
+        // ADR 0016 Phase B: clear live manifest + bump generation on
+        // unbind, matching the PgMeta semantics.
+        if sandbox_id.is_none() && self.live_disk_manifests.lock().remove(&id).is_some() {
+            self.chunk_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
+    }
+
+    // ADR 0016 Phase B: trait extension. Matches the PG / MiniMeta
+    // sandbox_id-guard semantics so the round-trip test verifies
+    // the handler routes Applied vs DroppedStale correctly.
+    async fn update_live_disk_manifest(
+        &self,
+        session_id: SessionId,
+        sandbox_id: engram_core::SandboxId,
+        manifest_ref: engram_core::types::manifest::ManifestRef,
+    ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
+        let bound = self
+            .sessions
+            .lock()
+            .get(&session_id)
+            .and_then(|s| s.sandbox_id);
+        if bound != Some(sandbox_id) {
+            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
+        }
+        self.live_disk_manifests
+            .lock()
+            .insert(session_id, manifest_ref);
+        self.chunk_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(engram_core::traits::UpdateOutcome::Applied)
+    }
+
+    async fn chunk_generation(&self) -> Result<u64, MetaError> {
+        Ok(self
+            .chunk_generation
+            .load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn upsert_host(&self, _host: HostRecord) -> Result<(), MetaError> {
@@ -3031,4 +3075,159 @@ async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
     assert!(v["bytes_freed"].as_u64().unwrap() > 0);
     assert!(!orphan_path.exists());
     assert!(!live_path.exists());
+}
+
+// ---------------------------------------------------------------------
+// ADR 0016 Phase B: live-manifest publish HTTP round-trip
+//
+// Exercises the full host→coord boundary for the FlushScheduler's
+// outcome: POST /api/hosts/:id/live-manifest with a JSON body
+// matching the host-side serialization, decoded by the coord
+// handler, dispatched into MetadataStore::update_live_disk_manifest,
+// returning the Applied/Stale envelope. Wire format and routing
+// regress here if anything diverges. Lives under the same axum
+// router production uses (auth, JSON codecs, route table) so a
+// missing route or shape mismatch fails loud.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_manifest_publish_round_trip_applied_and_stale() {
+    use std::sync::atomic::Ordering;
+
+    let meta = MockMetadataStore::arc();
+    // Seed an Active session with a bound sandbox.
+    let session_id = SessionId::new();
+    let sandbox_id = engram_core::SandboxId::new();
+    {
+        let mut sessions = meta.sessions.lock();
+        sessions.insert(
+            session_id,
+            Session {
+                id: session_id,
+                user_id: None,
+                status: SessionState::Active,
+                host_id: None,
+                sandbox_id: Some(sandbox_id),
+                image: "test/repo:live-manifest".into(),
+                harness: engram_core::types::session::HarnessSpec::None,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
+    }
+    let app = build_app(meta.clone());
+    let host_id = engram_core::HostId::new();
+    let manifest_id = uuid::Uuid::new_v4();
+
+    // -- Applied path: matching sandbox_id, version=7 --
+    let resp = post(
+        app.clone(),
+        &format!("/api/hosts/{host_id}/live-manifest"),
+        json!({
+            "session_id": session_id,
+            "sandbox_id": sandbox_id,
+            "manifest_id": manifest_id,
+            "manifest_version": 7u64,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["outcome"], "applied");
+    // The mock stored the published ref + bumped generation in the
+    // same logical TX as the row update.
+    let stored = meta
+        .live_disk_manifests
+        .lock()
+        .get(&session_id)
+        .copied()
+        .expect("live manifest stored");
+    assert_eq!(stored.manifest_id, manifest_id);
+    assert_eq!(stored.version, 7);
+    assert_eq!(meta.chunk_generation.load(Ordering::SeqCst), 1);
+
+    // -- Stale path: wrong sandbox_id (simulates publish-after-rebind) --
+    let stale_sandbox = engram_core::SandboxId::new();
+    let resp = post(
+        app.clone(),
+        &format!("/api/hosts/{host_id}/live-manifest"),
+        json!({
+            "session_id": session_id,
+            "sandbox_id": stale_sandbox,
+            "manifest_id": manifest_id,
+            "manifest_version": 8u64,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["outcome"], "stale");
+    // Generation does NOT advance on stale; the prior Applied
+    // value (version=7) is untouched.
+    assert_eq!(meta.chunk_generation.load(Ordering::SeqCst), 1);
+    let still_stored = meta
+        .live_disk_manifests
+        .lock()
+        .get(&session_id)
+        .copied()
+        .expect("prior manifest still present");
+    assert_eq!(still_stored.version, 7);
+}
+
+#[tokio::test]
+async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
+    use std::sync::atomic::Ordering;
+
+    let meta = MockMetadataStore::arc();
+    let session_id = SessionId::new();
+    let sandbox_id = engram_core::SandboxId::new();
+    {
+        let mut sessions = meta.sessions.lock();
+        sessions.insert(
+            session_id,
+            Session {
+                id: session_id,
+                user_id: None,
+                status: SessionState::Active,
+                host_id: None,
+                sandbox_id: Some(sandbox_id),
+                image: "test/repo:unbind".into(),
+                harness: engram_core::types::session::HarnessSpec::None,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
+    }
+    let app = build_app(meta.clone());
+    let host_id = engram_core::HostId::new();
+    let manifest_id = uuid::Uuid::new_v4();
+
+    // Publish first, so unbinding has something to clear.
+    let resp = post(
+        app.clone(),
+        &format!("/api/hosts/{host_id}/live-manifest"),
+        json!({
+            "session_id": session_id,
+            "sandbox_id": sandbox_id,
+            "manifest_id": manifest_id,
+            "manifest_version": 3u64,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let gen_after_publish = meta.chunk_generation.load(Ordering::SeqCst);
+
+    // Direct trait call (no API endpoint for assign_session_sandbox).
+    // ADR 0016 Phase B: this is the load-bearing eviction-race
+    // mitigation — assign_session_sandbox(None) clears the live
+    // manifest + bumps chunk_generation in the same logical step
+    // the sandbox_id NULLs out.
+    engram_core::traits::MetadataStore::assign_session_sandbox(meta.as_ref(), session_id, None)
+        .await
+        .unwrap();
+    assert!(meta.live_disk_manifests.lock().get(&session_id).is_none());
+    assert_eq!(
+        meta.chunk_generation.load(Ordering::SeqCst),
+        gen_after_publish + 1,
+    );
 }

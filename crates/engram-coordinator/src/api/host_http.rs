@@ -414,6 +414,82 @@ pub struct IdleEvictionCandidatesResponse {
     pub failed: usize,
 }
 
+// ---- POST /api/hosts/:id/live-manifest (ADR 0016 Phase B) ----
+
+#[derive(Deserialize)]
+pub struct LiveManifestPublishRequest {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub manifest_id: uuid::Uuid,
+    pub manifest_version: u64,
+}
+
+#[derive(Serialize)]
+pub struct LiveManifestPublishResponse {
+    pub outcome: LiveManifestPublishOutcome,
+}
+
+#[derive(Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveManifestPublishOutcome {
+    Applied,
+    Stale,
+}
+
+/// ADR 0016 Phase B: host's FlushScheduler tells us a fresh manifest
+/// version landed for `(session_id, sandbox_id)`. We UPDATE
+/// `sessions.live_disk_manifest_*` gated on `sandbox_id` match; on
+/// `Applied` we also bump `chunk_generation` (the Phase C mid-sweep
+/// barrier) in the same TX via `MetadataStore::update_live_disk_manifest`.
+///
+/// `Stale` (UPDATE matched zero rows) is logged as WARN — the host
+/// shouldn't retry; the staleness is structural (sandbox destroyed
+/// or rebound). Operators chasing repeated WARNs are likely seeing
+/// an issue with sandbox-binding bookkeeping, not Phase B.
+pub async fn live_manifest_publish(
+    State(state): State<SharedState>,
+    Path(host_id): Path<HostId>,
+    Json(req): Json<LiveManifestPublishRequest>,
+) -> Result<Json<LiveManifestPublishResponse>, ApiError> {
+    let manifest_ref = engram_core::types::manifest::ManifestRef {
+        manifest_id: req.manifest_id,
+        version: req.manifest_version,
+    };
+    let outcome = state
+        .services
+        .meta
+        .update_live_disk_manifest(req.session_id, req.sandbox_id, manifest_ref)
+        .await?;
+    match outcome {
+        engram_core::traits::UpdateOutcome::Applied => {
+            tracing::debug!(
+                %host_id,
+                session_id = %req.session_id,
+                sandbox_id = %req.sandbox_id,
+                manifest_id = %req.manifest_id,
+                manifest_version = req.manifest_version,
+                "live_disk_manifest applied",
+            );
+            Ok(Json(LiveManifestPublishResponse {
+                outcome: LiveManifestPublishOutcome::Applied,
+            }))
+        }
+        engram_core::traits::UpdateOutcome::DroppedStale => {
+            tracing::warn!(
+                %host_id,
+                session_id = %req.session_id,
+                sandbox_id = %req.sandbox_id,
+                manifest_id = %req.manifest_id,
+                manifest_version = req.manifest_version,
+                "live_disk_manifest dropped as stale (sandbox_id mismatch)",
+            );
+            Ok(Json(LiveManifestPublishResponse {
+                outcome: LiveManifestPublishOutcome::Stale,
+            }))
+        }
+    }
+}
+
 pub async fn idle_eviction_candidates(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,

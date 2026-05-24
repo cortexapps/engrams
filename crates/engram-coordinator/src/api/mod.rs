@@ -61,6 +61,14 @@ pub fn router(state: SharedState) -> Router {
             "/api/hosts/:id/idle-eviction-candidates",
             post(host_http::idle_eviction_candidates),
         )
+        // ADR 0016 Phase B: host's FlushScheduler publishes
+        // freshly-flushed disk manifests so cow-state +
+        // effective_resume_disk_manifest can see the latest disk
+        // lineage between snapshot boundaries.
+        .route(
+            "/api/hosts/:id/live-manifest",
+            post(host_http::live_manifest_publish),
+        )
         .route(
             "/sessions/:id/harness-events",
             post(host_http::harness_event_ingest),
