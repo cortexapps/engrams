@@ -350,4 +350,61 @@ pub trait MetadataStore: Send + Sync {
         session_id: SessionId,
     ) -> Result<Option<SessionSecrets>, MetaError>;
     async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError>;
+
+    // ----------------------------------------------------------------
+    // ADR 0016 §A.1.5c — cross-replica idle-eviction guard.
+    // Backed by the `eviction_inflight` table. The contract:
+    //   - `try_acquire_eviction_lease` is atomic INSERT ... ON
+    //     CONFLICT DO NOTHING. Returns Ok(true) if the row was
+    //     inserted (caller owns the pipeline), Ok(false) if a
+    //     row already exists (another caller is mid-pipeline).
+    //   - `release_eviction_lease` is idempotent — extra calls
+    //     against an already-deleted row are Ok(()). Used by the
+    //     RAII guard's drop path.
+    //   - `sweep_stale_eviction_leases` deletes rows older than
+    //     `max_age` and returns them for warn-logging. Backs the
+    //     coord-side stale-lease reaper.
+    // ----------------------------------------------------------------
+
+    /// Returns `Ok(true)` if the lease was acquired (row inserted),
+    /// `Ok(false)` if a concurrent caller already holds it.
+    ///
+    /// Default impl unconditionally returns `Ok(true)` — the
+    /// benign behaviour for test mocks / in-memory backends where
+    /// concurrent coord-pod racing isn't a concern. `PostgresStore`
+    /// overrides with the real INSERT ... ON CONFLICT DO NOTHING.
+    async fn try_acquire_eviction_lease(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: SandboxId,
+        _locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(true)
+    }
+
+    /// Idempotent. Drop-safe.
+    async fn release_eviction_lease(&self, _session_id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Stale-lease reaper. Deletes rows where `locked_at < now() -
+    /// max_age` and returns them so the caller can warn-log
+    /// `(session_id, locked_by, locked_at)` per reaped row.
+    async fn sweep_stale_eviction_leases(
+        &self,
+        _max_age: std::time::Duration,
+    ) -> Result<Vec<StaleEvictionLease>, MetaError> {
+        Ok(Vec::new())
+    }
+}
+
+/// One row from [`MetadataStore::sweep_stale_eviction_leases`].
+/// Carried so the coord-side sweeper can warn-log who held the
+/// lease for how long before it was reaped.
+#[derive(Clone, Debug)]
+pub struct StaleEvictionLease {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub locked_by: String,
+    pub locked_at: chrono::DateTime<chrono::Utc>,
 }

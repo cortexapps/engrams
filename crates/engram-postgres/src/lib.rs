@@ -1019,4 +1019,80 @@ impl MetadataStore for PostgresStore {
         // ever existed.
         Ok(())
     }
+
+    // ----------------------------------------------------------------
+    // ADR 0016 §A.1.5c — eviction_inflight leasing row.
+    // ----------------------------------------------------------------
+
+    async fn try_acquire_eviction_lease(
+        &self,
+        session_id: SessionId,
+        sandbox_id: engram_core::SandboxId,
+        locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        // ON CONFLICT (session_id) DO NOTHING returns 0 rows
+        // affected when the row already exists. Atomic vs. a
+        // racing INSERT from another coord pod.
+        let res = sqlx::query(
+            "INSERT INTO eviction_inflight (session_id, locked_by, sandbox_id) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (session_id) DO NOTHING",
+        )
+        .bind(session_id.as_uuid())
+        .bind(locked_by)
+        .bind(sandbox_id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn release_eviction_lease(&self, session_id: SessionId) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM eviction_inflight WHERE session_id = $1")
+            .bind(session_id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        // Idempotent: missing row = already released / never held.
+        Ok(())
+    }
+
+    async fn sweep_stale_eviction_leases(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Vec<engram_core::traits::StaleEvictionLease>, MetaError> {
+        // DELETE ... RETURNING is one statement; rows lifted to
+        // app-side for warn-logging. Interval is passed as seconds
+        // (BIGINT-castable) because the sqlx postgres driver doesn't
+        // bind `std::time::Duration` natively.
+        let max_age_secs = max_age.as_secs() as i64;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                uuid::Uuid,
+                String,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "DELETE FROM eviction_inflight \
+             WHERE locked_at < now() - make_interval(secs => $1::double precision) \
+             RETURNING session_id, sandbox_id, locked_by, locked_at",
+        )
+        .bind(max_age_secs as f64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(session_id, sandbox_id, locked_by, locked_at)| {
+                engram_core::traits::StaleEvictionLease {
+                    session_id: SessionId::from(session_id),
+                    sandbox_id: engram_core::SandboxId::from(sandbox_id),
+                    locked_by,
+                    locked_at,
+                }
+            })
+            .collect())
+    }
 }

@@ -354,14 +354,14 @@ pub struct AppState {
     /// through this to avoid storming the host on web-app polling.
     /// 1s TTL; cache eviction on host unregister.
     pub cow_state_cache: Arc<crate::cow_state::CowStateCache>,
-    /// ADR 0016 §A.1.5b: coord-side re-entry guard for
-    /// `evict_idle_session`. Belt-and-suspenders against any caller
-    /// (host idle-eviction POST, operator drain, future M4.1
-    /// evacuation) that fires a second eviction while a prior
-    /// pipeline is still running on this coord pod. The host-side
-    /// in-flight gate (§A.1.5a) is the primary defence; this one
-    /// catches non-host callers and any cross-host weirdness.
-    pub inflight_evictions: Arc<DashMap<SessionId, ()>>,
+    /// ADR 0016 §A.1.5c: stable identifier for this coord pod —
+    /// stamped on the `eviction_inflight.locked_by` column so
+    /// `SELECT * FROM eviction_inflight` tells an operator which
+    /// pod is mid-eviction on which session. Defaults to
+    /// `hostname` (the k8s pod name in prod); cheap to override
+    /// via the `ENGRAM_COORD_POD_ID` env var if local tests want
+    /// a deterministic value.
+    pub pod_id: Arc<String>,
 }
 
 impl AppState {
@@ -403,7 +403,7 @@ impl AppState {
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
-            inflight_evictions: Arc::new(DashMap::new()),
+            pod_id: Arc::new(resolve_pod_id()),
         }
     }
 
@@ -456,6 +456,25 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// ADR 0016 §A.1.5c: resolve a stable pod identifier for the
+/// `eviction_inflight.locked_by` column. Precedence:
+///   1. `ENGRAM_COORD_POD_ID` env (explicit override for local tests).
+///   2. `HOSTNAME` env (set by k8s on every pod).
+///   3. `unknown` string (no panic; the column is diagnostic).
+fn resolve_pod_id() -> String {
+    if let Ok(v) = std::env::var("ENGRAM_COORD_POD_ID") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(v) = std::env::var("HOSTNAME") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    "unknown".to_string()
+}
 
 /// Replay a harness event that arrived from a remote host (via
 /// `NotifyKind::HarnessEvent`) through the coord's local hub. The
@@ -700,7 +719,24 @@ pub(crate) mod tests {
         /// when true, the next `record_snapshot` call returns an error.
         /// Reset to false on use.
         pub(crate) fail_next_record_snapshot: PlMutex<bool>,
+        /// ADR 0016 §A.1.5c: in-memory mirror of the
+        /// `eviction_inflight` PG table for the trait's three
+        /// lease methods. Tests insert directly here to simulate
+        /// a peer coord pod holding a lease.
+        pub(crate) eviction_leases: PlMutex<EvictionLeaseMap>,
     }
+
+    /// Alias so the `clippy::type_complexity` lint stays happy on
+    /// MiniMeta's leases field. Mirrors `eviction_inflight`'s
+    /// shape: `session_id → (sandbox_id, locked_by, locked_at)`.
+    pub(crate) type EvictionLeaseMap = std::collections::HashMap<
+        SessionId,
+        (
+            engram_core::SandboxId,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >;
 
     impl MiniMeta {
         pub(crate) fn new(session: Session) -> Self {
@@ -710,6 +746,7 @@ pub(crate) mod tests {
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
+                eviction_leases: PlMutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -950,6 +987,59 @@ pub(crate) mod tests {
         }
         async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
             Ok(())
+        }
+
+        // ADR 0016 §A.1.5c: in-memory mirror of the
+        // `eviction_inflight` PG table so the trait's lease
+        // semantics are exercised end-to-end by the idle_evictor
+        // unit tests.
+        async fn try_acquire_eviction_lease(
+            &self,
+            session_id: SessionId,
+            sandbox_id: engram_core::SandboxId,
+            locked_by: &str,
+        ) -> Result<bool, MetaError> {
+            let mut guard = self.eviction_leases.lock();
+            if guard.contains_key(&session_id) {
+                return Ok(false);
+            }
+            guard.insert(
+                session_id,
+                (sandbox_id, locked_by.to_string(), chrono::Utc::now()),
+            );
+            Ok(true)
+        }
+
+        async fn release_eviction_lease(&self, session_id: SessionId) -> Result<(), MetaError> {
+            self.eviction_leases.lock().remove(&session_id);
+            Ok(())
+        }
+
+        async fn sweep_stale_eviction_leases(
+            &self,
+            max_age: std::time::Duration,
+        ) -> Result<Vec<engram_core::traits::StaleEvictionLease>, MetaError> {
+            let mut guard = self.eviction_leases.lock();
+            let now = chrono::Utc::now();
+            let cutoff = match chrono::Duration::from_std(max_age) {
+                Ok(d) => now - d,
+                Err(_) => return Ok(Vec::new()),
+            };
+            let mut reaped = Vec::new();
+            guard.retain(|session_id, (sandbox_id, locked_by, locked_at)| {
+                if *locked_at < cutoff {
+                    reaped.push(engram_core::traits::StaleEvictionLease {
+                        session_id: *session_id,
+                        sandbox_id: *sandbox_id,
+                        locked_by: locked_by.clone(),
+                        locked_at: *locked_at,
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok(reaped)
         }
     }
 
