@@ -1875,22 +1875,41 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        let sandbox_id = policy.sandbox_id;
+        let session_id = policy.session_id;
+
+        // ADR 0016 Phase B commit 4: the host-side
+        // LiveManifestPublisher's SessionResolver reads
+        // `egress_sessions` to map sandbox_id → session_id at
+        // publish time. Phase A's design tied population to the
+        // egress-proxy branch, which means hosts without a wired
+        // proxy (the integration-up.sh dev stack, prod hosts with
+        // egress disabled) silently never populate the map — every
+        // FlushScheduler publish then skips with "sandbox not
+        // bound to a session" even though the session IS bound.
+        //
+        // Insert FIRST, unconditionally. The egress-proxy registration
+        // below is still gated on `self.egress`; only the sandbox→
+        // session bookkeeping is universal.
+        self.egress_sessions.insert(sandbox_id, session_id);
+
         let Some(egress) = self.egress.as_ref() else {
             // No proxy attached — egress is unfiltered. The
             // coordinator may still send policy frames (the
             // coordinator-side codepath doesn't know whether a host
-            // happens to have a proxy); silently no-op.
+            // happens to have a proxy); skip the egress-proxy
+            // registration but the sandbox→session map insert above
+            // still ran, so Phase B's publisher resolver sees the
+            // binding.
             tracing::debug!(
-                session_id = %policy.session_id,
-                "notify_session_policy: no local egress proxy, ignoring",
+                %sandbox_id,
+                %session_id,
+                "notify_session_policy: no local egress proxy, binding recorded for Phase B publisher only",
             );
             return Ok(());
         };
-        let sandbox_id = policy.sandbox_id;
-        let session_id = policy.session_id;
         crate::egress::register_policy(&egress.registry, policy)
             .map_err(|e| SandboxError::InvalidSpec(format!("translate egress policy: {e}")))?;
-        self.egress_sessions.insert(sandbox_id, session_id);
         tracing::debug!(
             %sandbox_id,
             %session_id,
