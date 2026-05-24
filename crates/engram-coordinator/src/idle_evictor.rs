@@ -1404,23 +1404,27 @@ mod tests {
             .await
             .unwrap();
 
-        // Reach into MiniMeta to backdate `stale_session`'s lease.
-        // We can't access the field directly through the trait
-        // object, so we go through a downcast helper added on
-        // MiniMeta. Simpler: shadow with a direct construction
-        // wouldn't reuse the state; instead, use a 0-second
-        // sweep age to reap everything older than NOW (i.e. all
-        // current entries).
+        // Age both leases past the sweep's `max_age` deterministically.
+        // The earlier draft of this test passed `max_age = 0s` and
+        // relied on `locked_at < now()` being true for both leases
+        // by virtue of "the acquires happened before the sweep
+        // call". On a fast machine `chrono::Utc::now()` can return
+        // the same microsecond for two adjacent calls; the strict
+        // `<` in MiniMeta::sweep_stale_eviction_leases (state.rs)
+        // then skipped the second lease and `reaped_ids.contains(&fresh_session)`
+        // failed intermittently. Sleeping ≥1 ms past `max_age = 1ms`
+        // makes the assertion structurally deterministic regardless
+        // of clock tick boundaries — no production-code change
+        // needed.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let reaped = state
             .services
             .meta
-            .sweep_stale_eviction_leases(std::time::Duration::from_secs(0))
+            .sweep_stale_eviction_leases(std::time::Duration::from_millis(1))
             .await
             .unwrap();
         let reaped_ids: std::collections::HashSet<_> =
             reaped.iter().map(|l| l.session_id).collect();
-        // With max_age=0, every existing lease (locked_at < now())
-        // is reaped.
         assert!(reaped_ids.contains(&stale_session));
         assert!(reaped_ids.contains(&fresh_session));
         for lease in &reaped {
