@@ -18,8 +18,10 @@ use std::time::Duration;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
+use engram_core::types::registry::EnabledImage;
 use engram_core::types::session::HarnessSpec;
-use engram_core::types::{SandboxId, SessionSpec};
+use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::{SandboxId, SessionSpec, SnapshotId};
 use uuid::Uuid;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
@@ -207,4 +209,128 @@ async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
             .any(|r| r.manifest_id == mref.manifest_id),
         "live manifest must drop out of the live set after the sandbox is unbound",
     );
+}
+
+// ---- Commit 2: barrier-coverage extension to enable_image + record_snapshot ----
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn record_snapshot_bumps_chunk_generation() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+
+    // Need a session row for the snapshot FK.
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "phase-c-snapshot-bump-test:warm-1".into(),
+            harness: HarnessSpec::None,
+            user_id: None,
+        })
+        .await
+        .expect("create session");
+
+    let before = meta.chunk_generation().await.expect("read gen before");
+
+    // Snapshot WITH a disk_manifest — the common shape. The bump
+    // is unconditional regardless of whether manifests are present
+    // (simpler invariant; over-bumping costs at most a wasted sweep
+    // restart, bounded by max_restart_attempts).
+    let snap = SnapshotRecord {
+        id: SnapshotId::new(),
+        session_id: Some(session_id),
+        host_id: None,
+        image_version: "warm-1".into(),
+        size_bytes: 1024,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        disk_manifest: Some(ManifestRef {
+            manifest_id: Uuid::new_v4(),
+            version: 1,
+        }),
+        memory_manifest: None,
+        recoverable: false,
+    };
+    meta.record_snapshot(snap).await.expect("record snapshot");
+
+    let after = meta.chunk_generation().await.expect("read gen after");
+    assert!(
+        after > before,
+        "record_snapshot must bump chunk_generation (was {before}, now {after})",
+    );
+
+    // Re-record under the same id (ON CONFLICT path) — also bumps.
+    // INSERT-vs-UPDATE in one TX both end with the
+    // chunk_generation bump statement.
+    let snap2 = SnapshotRecord {
+        id: SnapshotId::new(),
+        session_id: Some(session_id),
+        host_id: None,
+        image_version: "warm-1".into(),
+        size_bytes: 2048,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: false,
+    };
+    meta.record_snapshot(snap2)
+        .await
+        .expect("record snapshot 2");
+    let after_two = meta.chunk_generation().await.expect("read gen after 2");
+    assert!(
+        after_two > after,
+        "second record_snapshot must bump again (was {after}, now {after_two})",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn upsert_enabled_image_bumps_chunk_generation() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+
+    let before = meta.chunk_generation().await.expect("read gen before");
+
+    // Unique image_uri per test run so concurrent runs don't trample.
+    let image_uri = format!("phase-c-image-bump-test:warm-{}", Uuid::new_v4());
+    let image = EnabledImage {
+        id: Uuid::new_v4(),
+        image_uri: image_uri.clone(),
+        manifest_toml: "image = { uri = \"test\" }\n".into(),
+        manifest_digest: format!("sha256:{:064x}", 0xdeadbeefu32),
+        last_refreshed_at: Utc::now(),
+        created_at: Utc::now(),
+        updated_at: None,
+    };
+    meta.upsert_enabled_image(image.clone())
+        .await
+        .expect("insert");
+
+    let after_insert = meta
+        .chunk_generation()
+        .await
+        .expect("read gen after insert");
+    assert!(
+        after_insert > before,
+        "INSERT path must bump chunk_generation (was {before}, now {after_insert})",
+    );
+
+    // ON CONFLICT path — refresh the manifest_toml and re-upsert.
+    let mut updated = image.clone();
+    updated.manifest_toml = "image = { uri = \"test-v2\" }\n".into();
+    meta.upsert_enabled_image(updated).await.expect("update");
+
+    let after_update = meta
+        .chunk_generation()
+        .await
+        .expect("read gen after update");
+    assert!(
+        after_update > after_insert,
+        "ON CONFLICT path must bump chunk_generation too (was {after_insert}, now {after_update})",
+    );
+
+    // Cleanup so re-runs against the same DB stay independent.
+    meta.delete_enabled_image(&image_uri).await.expect("delete");
 }

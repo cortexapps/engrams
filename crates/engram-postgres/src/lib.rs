@@ -683,6 +683,14 @@ impl MetadataStore for PostgresStore {
         // previous hot-tier (`local_path`) + cold-tier (envelope-
         // encrypted blob ref) columns retired with Phase 7
         // (migration 0020).
+        //
+        // ADR 0016 Phase C: bump `chunk_generation` in the same TX
+        // so the GC barrier sees the new pin-set entry atomically
+        // with the row write. Without this, a sweep that read the
+        // pin set before the row committed would miss the snapshot's
+        // chunks; with the bump, the sweep's post-collection
+        // generation read catches the divergence and restarts.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
         sqlx::query(
             r#"
             INSERT INTO snapshots
@@ -714,9 +722,14 @@ impl MetadataStore for PostgresStore {
         .bind(snap.memory_manifest.map(|m| m.manifest_id))
         .bind(snap.memory_manifest.map(|m| m.version as i64))
         .bind(snap.recoverable)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -1064,6 +1077,15 @@ impl MetadataStore for PostgresStore {
     // ---------- enabled images ----------
 
     async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError> {
+        // ADR 0016 Phase C: bump `chunk_generation` in the same TX
+        // as the row write so a GC sweep that collected the pin
+        // set before the row committed observes the divergence at
+        // its post-collection generation read and restarts. The
+        // chunks themselves are materialized to BlobStorage by
+        // separate `materialize_disk_chunks` code BEFORE this
+        // method is called; the window between materialize and
+        // row-insert is what the barrier closes.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
         sqlx::query(
             r#"
             INSERT INTO enabled_images
@@ -1083,9 +1105,14 @@ impl MetadataStore for PostgresStore {
         .bind(&image.manifest_digest)
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
