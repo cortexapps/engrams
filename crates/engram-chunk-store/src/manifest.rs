@@ -141,6 +141,24 @@ impl ChunkHash {
         let hex = self.to_hex();
         format!("chunks/sha256/{}/{}", &hex[..2], &hex[2..])
     }
+
+    /// Reverse of [`Self::storage_key`]. Returns `None` for keys
+    /// that don't match the `chunks/sha256/<2hex>/<62hex>` shape —
+    /// e.g. stray non-chunk keys returned by a wildcard prefix
+    /// listing. Phase C's GC sweep uses this to translate
+    /// `BlobStorage::list_prefix("chunks/sha256/")` entries back
+    /// into `ChunkHash` for pin-set lookup.
+    pub fn from_storage_key(key: &str) -> Option<Self> {
+        let rest = key.strip_prefix("chunks/sha256/")?;
+        let (head, tail) = rest.split_once('/')?;
+        if head.len() != 2 || tail.len() != 62 {
+            return None;
+        }
+        let mut hex = String::with_capacity(64);
+        hex.push_str(head);
+        hex.push_str(tail);
+        Self::from_hex(&hex).ok()
+    }
 }
 
 impl fmt::Debug for ChunkHash {

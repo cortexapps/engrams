@@ -11,6 +11,7 @@ use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, 
 
 pub mod api;
 pub mod blob;
+pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
 pub mod dead_host;
@@ -235,12 +236,17 @@ pub async fn run_with_registry_and_local(
         None
     };
 
-    // Chunk-store GC removed 2026-05-23 after the prod incident
-    // documented in ADR 0015 M5 ("Known regression — chunk-store GC
-    // deleted"). The materialize-dir reaper (POST /api/admin/
-    // reap-materialize-dir) is unaffected. BlobStorage cost grows
-    // unbounded until a redesigned GC ships; that's the explicit
-    // tradeoff for the deletion.
+    // ADR 0016 Phase C: chunk-store GC, redesigned. Pin-set unions
+    // enabled_images + sessions.live_disk_manifest_* + recoverable
+    // snapshots (disk + memory); `chunk_generation` barrier catches
+    // mid-sweep flush races; 24h grace period in
+    // `chunk_gc_candidates` absorbs straggling races. Gated by
+    // `ENGRAM_CHUNK_GC_ENABLED` (default ON; the grace window is
+    // the real safety net in active-development posture).
+    let _chunk_gc_sweep = {
+        let cfg = chunk_gc::ChunkGcConfig::from_env();
+        tokio::spawn(chunk_gc::gc_sweep_loop(state.clone(), cfg))
+    };
 
     // Demo wiring: bind the harness-channel TCP listener so
     // `SandboxSpec::agent`-spawned harnesses (today: the dev
