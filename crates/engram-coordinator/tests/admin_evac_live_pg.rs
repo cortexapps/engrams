@@ -150,10 +150,14 @@ impl HostClient for FakeBackend {
     }
     async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         self.calls.lock().push("restore".into());
-        Ok(self
-            .next_restore_id
-            .lock()
-            .unwrap_or_else(|| SandboxId::new()))
+        // Tests always preload an id; the fallback is defensive.
+        // Match-based dispatch avoids clippy's unwrap_or_default lint
+        // (Default for SandboxId would mint a nil UUID, masking
+        // test bugs) and unwrap_or_else's redundant_closure lint.
+        Ok(match *self.next_restore_id.lock() {
+            Some(id) => id,
+            None => SandboxId::new(),
+        })
     }
     async fn start_agent(
         &self,
@@ -192,13 +196,47 @@ impl HostClient for FakeBackend {
     }
 }
 
+/// Upsert a `hosts` row so the `sessions.host_id` foreign key is
+/// satisfied. PG enforces the FK; the unit tests bypass it via the
+/// in-memory FakeMeta, but live-PG needs the parent row.
+///
+/// Hostname is unique per `host_id` because `upsert_host`'s
+/// `ON CONFLICT (hostname)` would otherwise update an existing
+/// fixed-name row in place — leaving the new host_id unindexed and
+/// re-firing the FK violation we're trying to avoid. The host_id
+/// suffix guarantees collision-free seeding across tests in the
+/// shared PG instance.
+async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: &str) {
+    use engram_core::types::host::HostRecord;
+    use engram_core::types::{HostCapacity, HostMetadata, HostStatus};
+    meta.upsert_host(HostRecord {
+        id: host_id,
+        hostname: format!("{label}-{host_id}"),
+        cloud_metadata: HostMetadata::default(),
+        capacity: HostCapacity {
+            total_gb: 100,
+            used_gb: 10,
+            total_mib: 65_536,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        status: HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: None,
+    })
+    .await
+    .expect("upsert_host");
+}
+
 /// Mint a fresh session row at Active status with `host_id` and
 /// `sandbox_id` bound. Returns the session_id for follow-up queries.
+/// Inserts the `hosts` row first to keep PG's FK happy.
 async fn seed_active_session(
     meta: &Arc<dyn MetadataStore>,
     host_id: HostId,
     sandbox_id: SandboxId,
 ) -> SessionId {
+    ensure_host_row(meta, host_id, "source").await;
     let session_id = meta
         .create_session(SessionSpec {
             image: format!("ghcr.io/test/img:t-{}", uuid::Uuid::new_v4()),
@@ -263,6 +301,7 @@ async fn evacuate_to_alive_source_drives_state_through_host_lost_to_created() {
     registry.record_sandbox_owner(old_sandbox, source_host);
 
     let session_id = seed_active_session(&meta, source_host, old_sandbox).await;
+    ensure_host_row(&meta, target_host, "target").await;
 
     let receipt = evacuate_to(&registry, &meta, session_id, old_sandbox, target_host)
         .await
@@ -308,6 +347,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
     registry.register(target_host, target_be.clone());
 
     let session_id = seed_active_session(&meta, dead_source, SandboxId::new()).await;
+    ensure_host_row(&meta, target_host, "target").await;
     // Simulate dead_host.rs's first-stage flip: Active → HostLost.
     meta.transition_session(session_id, SessionState::HostLost)
         .await
@@ -366,6 +406,7 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
 
     let old_sandbox = SandboxId::new();
     let session_id = seed_active_session(&meta, dead_source, old_sandbox).await;
+    ensure_host_row(&meta, target_host, "target").await;
 
     // Set live_disk_manifest_*. The update is sandbox-id-gated so we
     // pass the current binding.
