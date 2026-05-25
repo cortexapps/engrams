@@ -1,12 +1,10 @@
 # ADR 0016: COW observability and continuous disk sync
 
-Status: 2026-05-25 — **Proposed**, Phase A + Phase A.1 + Phase B
-shipped (§A.1.1–§A.1.7 shipped; §A.1.8 reconsidered, not pursued).
-Phase C (chunk-GC pin-set redesign) opens with the design block
-below; the ADR will flip to Accepted once Phase C ships.
-Supersedes ADR 0015 M5 "Known regression — chunk-store GC deleted"
-(see `docs/adr/0015-system-design-v2.md` §"Known regression —
-chunk-store GC deleted") once Phase C lands.
+Status: 2026-05-25 — **Accepted**. Phase A + Phase A.1 + Phase B +
+Phase C all shipped (§A.1.1–§A.1.7 shipped; §A.1.8 reconsidered,
+not pursued). Supersedes ADR 0015 M5 "Known regression — chunk-
+store GC deleted" — that section now points back here for the
+redesigned implementation.
 
 Phase chain (filled in as commits land — same shape as ADR 0014's
 M1.x annotations and ADR 0015's per-milestone commit lists):
@@ -28,13 +26,11 @@ M1.x annotations and ADR 0015's per-milestone commit lists):
   (2026-05-24)" for the planned design and §"Phase B as-built
   notes (2026-05-24)" for the shipped chain, divergences, and
   pitfalls.
-- **Phase C** — chunk-GC pin-set redesign. Design finalized
-  2026-05-25; 8-commit chain (Phase 0 opening + commits 1–6 for
-  the schema/code/admin surface + commit 6a for the e2e CI test
-  + commit 7 for the closing bookend that flips this ADR to
-  Accepted and rewrites ADR 0015 M5 §"Known regression" as a
-  pointer). See §"Phase C design (2026-05-25) — finalized
-  approach" for the implementation plan. _(in flight)_
+- **Phase C** — chunk-GC pin-set redesign. **Shipped 2026-05-25**
+  — 9-commit chain (`5cadbcc` opening + 8 implementation/test
+  commits + this closing bookend). See §"Phase C as-built notes
+  (2026-05-25)" for the commit chain table, divergences from the
+  design block, and constraint-discharge mapping.
 
 The ADR is updated at the end of each phase with what shipped, what
 diverged from this design, and any pitfalls future implementers should
@@ -1860,6 +1856,155 @@ former, it imports straight through.
 - **`BlobStorage::head` returning real `last_modified`.** Phase C
   sidesteps this by tracking timestamps in PG. Worth doing for
   other reasons but not Phase C scope.
+
+#### Phase C as-built notes (2026-05-25)
+
+Closing bookend per `[adr_bookends_substantive_work]`. Phase C
+shipped in 9 commits across one day (opening + 8 implementation/
+test commits + this closing bookend) with no prod-shape follow-up
+commits required:
+
+| # | Hash | Title |
+|---|---|---|
+| 0 | `5cadbcc` | docs(adr-0016): open Phase C — finalized design |
+| 1 | `b5d636e` | feat(meta): commit 1 — chunk_gc_candidates table + helpers |
+| 2 | `7751b02` | feat(meta): commit 2 — bump chunk_generation on enable_image + record_snapshot |
+| 3a | `b5ac4d2` | feat(meta): commit 3a — persist enabled_images.disk_manifest_* |
+| 3b | `ffc3865` | feat(chunk-store): commit 3b — PinSet collection |
+| 4 | `a5add18` | feat(coord): commit 4 — chunk_gc sweep orchestrator |
+| 5 | `3de456a` | feat(coord): commit 5 — chunk-gc admin endpoints |
+| 6 | `b0ab3ec` | test(coord): commit 6 — Postgres integration tests |
+| 6a | `389019c` | test(coord): commit 6a — e2e_chunk_gc regression catch |
+| 7 | _this commit_ | docs(adr-0016+0015): close Phase C — Accepted |
+
+**Divergences from the design block above:**
+
+1. **Commit 3 split into 3a + 3b.** The original design called for
+   one commit ("PinSet collection + manifest resolver"). The
+   resolver investigation surfaced that the `EnabledImage` →
+   `ManifestRef` resolution required persisting the ref on the
+   row at materialize-time — the bake's `bundle.json` lives in
+   an OCI layer that the host's `ImageCache` pulls on prefetch,
+   but coord has no `ImageCache`. Persisting via new
+   `disk_manifest_id` / `disk_manifest_version` columns (migration
+   0036) made the pin-set query a pure PG SELECT, no OCI round-
+   trip per sweep. Split into 3a (schema + populate) + 3b (PinSet
+   module).
+
+2. **`ENGRAM_CHUNK_GC_ENABLED` defaults ON, not OFF.** The
+   original ADR rollout plan was cautious-rollout: ship OFF, dry-
+   run ≥1 week, enable sweeps after spot-checking. User direction
+   during commit 4 was "default ON" given the active-development
+   posture (no users yet, the 24h candidate-table grace is the
+   real safety net). The cautious rollout sequence stays
+   available — operators can set `ENGRAM_CHUNK_GC_ENABLED=0` to
+   disable the background loop once we have production users and
+   want to ship in dry-run-first mode.
+
+3. **Two new MetadataStore methods for snapshot pin-set sources.**
+   The original design implied reuse of
+   `list_live_{disk,memory}_manifest_ids` (which return `Uuid`
+   only, no version, and don't filter by `recoverable=true`).
+   Phase C needs full `ManifestRef`s (id + version) AND the
+   recoverable filter. Commit 3b added
+   `list_recoverable_snapshot_disk_manifests` +
+   `list_recoverable_snapshot_memory_manifests`. The original
+   Uuid-only helpers stay for `reap_materialize_dir`.
+
+4. **`run_one_sweep` refactored into wrapper + `_inner`.** Commit
+   4 wrote `run_one_sweep(state: &SharedState, ...)`. Commit 6's
+   integration tests need to drive the orchestrator without
+   constructing a full `AppState`; refactored to a thin wrapper
+   plus `run_one_sweep_inner(meta, blob, chunk_store, ...)`.
+   Production callers (admin handlers + background loop) unchanged.
+
+**Constraint discharge.** Maps ADR 0015 M5 §"Design constraints
+for the next chunk GC" → landed implementation:
+
+1. **Live set unions every source.** `PinSet::collect` (commit
+   3b) enumerates four sources: `enabled_images.disk_manifest_*`,
+   `sessions.live_disk_manifest_*`,
+   `snapshots WHERE recoverable=true` (disk), same (memory).
+   Adding a new lineage requires either extending
+   `PinSet::collect` (visible in PR diff) or relying on the
+   `chunk_generation` barrier's restart loop (commit 4) to
+   catch the race.
+
+2. **Retention works for cloud backends.** Commit 1's
+   `chunk_gc_candidates` table tracks `first_seen_at` in PG, not
+   derived from `BlobObjectMeta.etag`. The grace window is
+   explicit in PG and works identically for GCS,
+   LocalBlobStorage, and any future backend.
+
+3. **Prefetch's chunk store OCI tier-3 fallback.** Explicitly out
+   of scope for Phase C — independent of pin-set correctness.
+   Filed as a follow-up.
+
+4. **Whether content-addressed chunks need explicit GC at all.**
+   Phase C ships explicit GC. The lifecycle-rules-on-bucket
+   alternative remains a future simplification once the union-
+   pin-set approach has run in prod long enough to confirm it's
+   reliable.
+
+**Pitfalls / drive-bys encountered:**
+
+- **Cargo target-dir lock contention.** Working in a second git
+  worktree (separate `target/`) saturated cores via parallel
+  rustc invocations, and rust-analyzer's background workspace
+  check (auto-launched by Claude Code's LSP integration) layered
+  on top of `just check` made some commit-boundary checks take
+  5+ minutes instead of ~45s.
+- **`cargo nextest -p X -p Y` invalidates the `--workspace` test
+  cache.** Feature unification resolves features as a subset of
+  the workspace, producing different `-C metadata` fingerprints.
+  Saved as `[cargo_p_invalidates_workspace_cache]` memory.
+- **Background cargo output via `| tail -N`.** Pipeline buffers
+  until EOF; cargo's "Blocking waiting for file lock" messages
+  hidden during a 19-minute stall. Saved as
+  `[background_cargo_no_tail_pipe]` memory.
+- **VZ test variance under CPU contention.**
+  `engram-sandbox-vz vm::tests::vz_vm_new_full_plumbing_runs_or_fails_cleanly`
+  took 41s on idle runs, 180s+ (timeout) on loaded runs in the
+  same session. Environmental, not a regression in our code.
+- **No back-compat shim for the new `enabled_images.disk_manifest_*`
+  columns.** Existing rows from before migration 0036 keep NULL
+  refs; the pin-set partial index naturally excludes them.
+  Operators re-enable images via the existing
+  `POST /api/enabled-images` workflow to populate the columns.
+  Acceptable because the project is in active development; we'd
+  re-evaluate this if we had users.
+
+**Dev-vm verification status:**
+
+- Unit tests (`gc::tests` in engram-chunk-store, `chunk_gc::tests`
+  in engram-coordinator) pass via `cargo test`.
+- Postgres-gated integration tests run in CI's "Postgres-gated
+  ignored tests" lane:
+  `chunk_gc_helpers_live_pg.rs` (commit 1 + 2 helpers + barrier-
+  bump coverage), `admin_chunk_gc_live_pg.rs` (commit 6 sweep
+  orchestrator + grace-period semantics).
+- End-to-end regression test runs in CI's `test-e2e-stack` lane:
+  `e2e_stack.rs::e2e_chunk_gc_sweep_does_not_delete_live_image_chunks`
+  is the load-bearing M5 regression catch.
+
+**Newly-filed follow-ups** (out of Phase C scope):
+
+- **OCI tier-3 fallback wiring in the shared chunk store.**
+  Discharges ADR 0015 M5 constraint #3. Independent of GC
+  correctness; useful prefetch resilience.
+- **State/sidecar/manifests prefix sweeps.** Phase C only sweeps
+  `chunks/sha256/`. Re-evaluate if those prefixes ever show
+  monotonic growth.
+- **`BlobStorage::head` returning real `last_modified`.** Phase C
+  sidesteps via PG timestamps, but a backend-level field would
+  be useful for other operator tools.
+- **Production rollout from default-ON to dry-run-first.** Once
+  we have production users, ship a transitional config that
+  defaults to dry-run-only (`SweepMode::DryRun`) for ≥1 week
+  before enabling promote-pass deletes.
+
+**Phase C status**: design block above → as-built shipped here.
+The ADR is now **Accepted**.
 
 ### Why a separate ADR
 

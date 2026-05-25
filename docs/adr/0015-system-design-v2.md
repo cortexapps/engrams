@@ -906,113 +906,19 @@ M5 is the cleanest single step that unblocks all of them.
   operators (and the integration test) can poll for a *specific*
   digest's readiness rather than just the count.
 
-#### Known regression — chunk-store GC deleted (2026-05-23)
+#### Known regression — chunk-store GC deleted (2026-05-23) — RESOLVED
 
-**Status (2026-05-23):** redesign in flight — see
-[ADR 0016: COW observability and continuous disk sync](0016-cow-observability-and-continuous-sync.md).
-Phase C of that ADR discharges the "Design constraints for the next
-chunk GC" subsection below. This section stays as the post-mortem;
-the forward design lives in 0016.
-
-**Symptom.** A new FC host couldn't serve sessions for an existing
-enabled image (`demo:warm-6241732`). Coord returned 503
-`image_not_ready`; every host's prefetch supervisor logged
-`chunk fetch: blob storage: blob not found` on the chunk hashes the
-image's disk manifest enumerated. The manifest itself was present in
-GCS; the chunks it referenced were not.
-
-**Root cause (two compounding bugs).**
-
-1. **Live-set omission.** `chunk_gc::run_once` unioned only
-   `list_live_disk_manifest_ids` + `list_live_memory_manifest_ids`,
-   both sourced from `snapshots`. M5's `materialize_disk_chunks`
-   introduced a *new* live manifest lineage — the per-image
-   chunked-rootfs manifest at the bake's UUID — but nothing in the
-   coord ever taught GC about it. To GC, every enabled image's
-   chunks looked like garbage. The 13:27 sweep on 2026-05-23
-   deleted 264 chunks (528 MB), including all 14 chunks for the
-   image enabled 13 minutes earlier.
-
-2. **Retention silently disabled for cloud backends.**
-   `engram_chunk_store::gc::run` parsed
-   `BlobObjectMeta.etag` via `parse_local_etag_to_systemtime` to
-   estimate chunk age. That helper only understands
-   `LocalBlobStorage`'s `"secs-nanos"` etag; GCS etags don't parse,
-   so the `None` arm fell through to `age_ok = true` and the
-   `retain_for=86400s` window was a no-op. Every GC log line
-   showed `chunks_retained_age=0`, confirming the retention check
-   had never fired in prod. The comment's "live-set filter is our
-   safety" guarantee held only as long as the live set was
-   complete — which M5 broke.
-
-**Compounding why hosts can't self-heal.** Production host-agent
-wires plain `ChunkStore::new(blob)` (`main.rs:341`). The
-`TieredChunkResolver` with the OCI Range-GET tier-3 fallback is
-only installed per-session inside `pooled_backend.rs`, not on the
-shared chunk store the prefetch supervisor consumes. Once
-BlobStorage returns NotFound, prefetch is stuck — there's no OCI
-re-pull path despite `image_prefetch.rs`'s docstring claiming
-otherwise.
-
-**Decision.** Delete the chunk-store GC entirely rather than patch
-it. The two bugs aren't independent — they masked each other:
-adding manifest lineages quietly broke retention assumptions, and
-broken retention meant the live-set omission turned into immediate
-data loss rather than a 24-hour grace window. A redesigned GC
-should treat both correctly from the start, and the existing code
-is a poor scaffold. Removed:
-
-- `crates/engram-chunk-store/src/gc.rs`
-- `crates/engram-coordinator/src/chunk_gc.rs`
-- `crates/engram-coordinator/src/api/admin.rs::gc_chunks` + types +
-  route
-- `crates/engram-coordinator/tests/admin_gc_chunks_live_pg.rs` and
-  the two unit tests in `tests/api.rs`
-
-`MetadataStore::list_live_*_manifest_ids` survives — the
-`reap_materialize_dir` admin endpoint still uses
-`list_live_disk_manifest_ids` to prune assembled `.ext4` files on
-hosts. Don't remove that trait method without also reworking the
-reaper.
-
-**Cost of the deletion.** BlobStorage cost grows unbounded until a
-redesigned GC ships. Today's only chunk-producing paths are
-session-snapshot writes and `enable_image` materializations, both
-relatively low-rate, so this is a real cost but not an urgent one.
-
-**Design constraints for the next chunk GC.**
-
-1. The live set MUST union every source of live manifest lineages,
-   not just `snapshots`. M5 demonstrated that adding a lineage in
-   one place silently invalidates GC if it's not also taught
-   there. Either the live set is computed from a single union
-   query that's hard to forget to extend (e.g. a view over
-   `snapshots` + `enabled_images` + future tables), or the
-   manifest lineage itself carries a "live by construction" marker
-   that GC reads directly without enumerating sources.
-
-2. Retention MUST work for cloud backends. The proximal fix is
-   making `BlobStorage::head` return a real `last_modified` from
-   the backend (GCS returns it on every HEAD; we currently drop
-   it). The retention-window branch should fail closed when age
-   is unavailable, not open — the cost of over-retention is
-   storage; the cost of under-retention is data loss.
-
-3. Prefetch's chunk store MUST have an OCI tier-3 fallback. The
-   `image_prefetch.rs:25` docstring already claims this exists
-   ("Tier 3: OCI Range GET against the chunked artifact (safety
-   net; CDN-fills BlobStorage on hit)"). Wiring the
-   `TieredChunkResolver` into the shared host-agent ChunkStore
-   (currently only per-session) would let prefetch survive any
-   future BlobStorage hole, GC-related or not.
-
-4. Consider whether content-addressed chunks need explicit GC at
-   all. Lifecycle rules on the GCS bucket (delete after N days
-   since last access) would handle storage cost without requiring
-   the coord to maintain a correct live-set query — at the cost
-   of giving up the ability to GC "logically unreachable but
-   recently accessed" chunks. The tradeoff may be worth it given
-   how thoroughly the live-set approach failed.
+Resolved by [ADR 0016 Phase C, shipped 2026-05-25](0016-cow-observability-and-continuous-sync.md#phase-c-as-built-notes-2026-05-25).
+The redesigned chunk-GC unions four pin-set sources
+(`enabled_images.disk_manifest_*`, `sessions.live_disk_manifest_*`,
+recoverable `snapshots.{disk,memory}_manifest_*`), uses a
+`chunk_generation` PG barrier to catch mid-sweep flush races, and
+gates promote-pass deletes behind a 24h candidate-table grace
+window — discharging all four design constraints originally
+enumerated here. See ADR 0016 §"Phase C as-built notes" for the
+commit chain and constraint-discharge mapping. The 2026-05-23
+incident post-mortem (symptom, root cause, two compounding bugs in
+the prior GC) is preserved in this section's git history.
 
 ---
 
