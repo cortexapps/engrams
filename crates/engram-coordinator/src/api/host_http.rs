@@ -325,16 +325,27 @@ pub async fn heartbeat(
         );
     }
 
-    // ADR 0018 Phase B: placeholder NBD-unhealthy observability. Real
-    // evac trigger lands in commit 5; this log just confirms the
-    // field is flowing end-to-end so operators can validate the
-    // protocol upgrade independent of the trigger ship.
+    // ADR 0018 Phase B: NBD-loss-triggered evacuation. Gated on
+    // ENGRAM_NBD_AUTO_EVAC=1 — default off until the
+    // resume-from-Created path lands. The trigger module handles
+    // session resolution + state-machine drive + dead-source primitive
+    // dispatch. Best-effort per-sandbox; failures log and the affected
+    // session sits at HostLost or wherever the partial transition left
+    // it.
     if !hb.nbd_unhealthy.is_empty() {
         tracing::info!(
             host_id = %host_id,
             count = hb.nbd_unhealthy.len(),
-            "heartbeat reports nbd-unhealthy sandboxes (trigger wiring lands in commit 5)",
+            "heartbeat reports nbd-unhealthy sandboxes; dispatching trigger",
         );
+        crate::nbd_loss_trigger::process_unhealthy(
+            &state.services.meta,
+            &state.host_registry,
+            &state.events,
+            host_id,
+            &hb.nbd_unhealthy,
+        )
+        .await;
     }
 
     // Refresh in-memory scheduler view so the next session-create
