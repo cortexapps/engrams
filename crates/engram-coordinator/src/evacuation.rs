@@ -25,10 +25,12 @@ use std::sync::Arc;
 
 use engram_core::traits::MetadataStore;
 use engram_core::types::evacuation::{EvacLoss, EvacReceipt};
-use engram_core::types::session::SessionState;
+use engram_core::types::manifest::ManifestRef;
+use engram_core::types::session::{Session, SessionState};
+use engram_core::types::snapshot::{SnapshotMetadata, SnapshotRecord};
 use engram_core::{HostId, MetaError, SandboxError, SandboxId, SessionId};
 
-use crate::host_registry::HostRegistry;
+use crate::host_registry::{HostRegistry, PickError, ScheduleContext};
 
 /// Errors specific to the evacuation primitive. Wraps the upstream
 /// `SandboxError` / `MetaError` so callers can distinguish which step
@@ -41,6 +43,14 @@ pub enum EvacError {
     SnapshotFailed(SandboxError),
     RestoreFailed(SandboxError),
     Rebind(MetaError),
+    /// No recoverable state to restore from. Dead-source path returns
+    /// this when both `snapshot` and `session.live_disk_manifest` are
+    /// `None`. Caller routes to `HostLost → Dead`.
+    NoRecoverableState,
+    /// No host could accept the relocate (no capacity, or no host
+    /// with the image prefetched). Caller logs + retries later or
+    /// routes to `HostLost → Dead`.
+    NoTargetAvailable(PickError),
 }
 
 impl std::fmt::Display for EvacError {
@@ -56,6 +66,10 @@ impl std::fmt::Display for EvacError {
             Self::SnapshotFailed(e) => write!(f, "source-side snapshot failed: {e}"),
             Self::RestoreFailed(e) => write!(f, "target-side restore failed: {e}"),
             Self::Rebind(e) => write!(f, "PG rebind failed: {e}"),
+            Self::NoRecoverableState => {
+                write!(f, "no snapshot or live disk manifest — session cannot be evacuated")
+            }
+            Self::NoTargetAvailable(e) => write!(f, "no host could accept the relocate: {e:?}"),
         }
     }
 }
@@ -63,9 +77,35 @@ impl std::fmt::Display for EvacError {
 impl std::error::Error for EvacError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TargetIsSource { .. } | Self::TargetNotRegistered { .. } => None,
+            Self::TargetIsSource { .. }
+            | Self::TargetNotRegistered { .. }
+            | Self::NoRecoverableState
+            | Self::NoTargetAvailable(_) => None,
             Self::SourceLookup(e) | Self::SnapshotFailed(e) | Self::RestoreFailed(e) => Some(e),
             Self::Rebind(e) => Some(e),
+        }
+    }
+}
+
+/// Pick the disk manifest the target should restore from. Mirrors the
+/// `effective_resume_disk_manifest` semantics in `api/snapshot.rs`:
+/// when both live and snapshot manifests exist, prefer the live one
+/// only if it's a strictly newer version of the same manifest_id
+/// lineage; otherwise the snapshot wins (different lineage means we
+/// trust the (memory, disk) pair the snapshot captured together).
+fn pick_evac_disk_manifest(
+    live: Option<ManifestRef>,
+    snapshot: Option<ManifestRef>,
+) -> Option<ManifestRef> {
+    match (live, snapshot) {
+        (None, snap) => snap,
+        (Some(l), None) => Some(l),
+        (Some(l), Some(s)) => {
+            if l.manifest_id == s.manifest_id && l.version > s.version {
+                Some(l)
+            } else {
+                Some(s)
+            }
         }
     }
 }
@@ -201,6 +241,155 @@ pub async fn evacuate_to(
         new_host_id: target_host,
         new_sandbox_id,
         loss: EvacLoss::None,
+    })
+}
+
+/// Mechanics for **dead-source** evacuation. Used by `dead_host.rs`'s
+/// second-stage transition (Phase B) when a host is already marked
+/// Dead and the session has been flipped to `HostLost` — the source
+/// backend is unreachable, so a fresh source-side snapshot isn't
+/// possible.
+///
+/// Restores from existing artifacts:
+///
+/// - **Disk**: `pick_evac_disk_manifest(session.live_disk_manifest,
+///   snapshot.disk_manifest)`. Live wins when newer (continuous-sync
+///   captured a flush after the snapshot). Snapshot wins on different
+///   lineage or older live.
+/// - **Memory**: from `snapshot.memory_manifest` when a snapshot
+///   exists. Memory loss is accepted when only the live disk manifest
+///   is available — `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`.
+///
+/// Failure modes:
+///
+/// - `snapshot.is_none() && session.live_disk_manifest.is_none()` →
+///   `NoRecoverableState`. Caller drives `HostLost → Dead`.
+/// - Target pick fails (no capacity, image not ready) →
+///   `NoTargetAvailable`. Caller logs + may retry; nothing changed.
+/// - Target-side restore fails → `RestoreFailed`. Caller may retry
+///   against a different host; nothing changed.
+/// - PG rebind fails after restore → new sandbox is up on target
+///   without a PG row pointing at it (same orphan window as
+///   `evacuate_to`). Idle evictor / host-agent restart sweep reaps.
+///
+/// Leaves the session at `Created` on the new host. Caller is
+/// responsible for the start_agent + Active transition — symmetric
+/// with `evacuate_to`.
+pub async fn evacuate_dead_source(
+    registry: &Arc<HostRegistry>,
+    meta: &Arc<dyn MetadataStore>,
+    session: Session,
+    snapshot: Option<SnapshotRecord>,
+) -> Result<EvacReceipt, EvacError> {
+    let session_id = session.id;
+    let old_sandbox_id = session.sandbox_id;
+
+    let disk_manifest = pick_evac_disk_manifest(
+        session.live_disk_manifest.clone(),
+        snapshot.as_ref().and_then(|s| s.disk_manifest.clone()),
+    );
+    let memory_manifest = snapshot.as_ref().and_then(|s| s.memory_manifest.clone());
+
+    if disk_manifest.is_none() && memory_manifest.is_none() {
+        return Err(EvacError::NoRecoverableState);
+    }
+
+    let (loss, reason) = if memory_manifest.is_some() {
+        (EvacLoss::None, "")
+    } else {
+        (
+            EvacLoss::Memory {
+                reason: "source-dead-no-snapshot".into(),
+            },
+            "source-dead-no-snapshot",
+        )
+    };
+    let _ = reason; // structured-log placeholder; metric label lives on `loss.as_str()`.
+
+    // Build the SnapshotMetadata. When we have a snapshot row, lift
+    // its fields verbatim (id, size, image_version, source_sandbox_id,
+    // blob keys). For the no-snapshot live-disk-only path, mint a
+    // zero metadata that the backend treats as "fresh boot from this
+    // disk manifest" (FC's chunked-restore path) — size_bytes=0 is
+    // honest, no blob keys to clean up.
+    let metadata = match snapshot.as_ref() {
+        Some(s) => SnapshotMetadata {
+            id: s.id,
+            size_bytes: s.size_bytes,
+            created_at: s.created_at,
+            image_version: s.image_version.clone(),
+            disk_manifest,
+            memory_manifest,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+        },
+        None => SnapshotMetadata {
+            id: engram_core::SnapshotId::new(),
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            image_version: String::new(),
+            disk_manifest,
+            memory_manifest: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+        },
+    };
+
+    let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
+    let ctx = ScheduleContext {
+        repo: image_repo,
+        image_version: image_tag,
+        prefer_snapshot_id: snapshot.as_ref().map(|s| s.id),
+        memory_mib: None,
+        // Phase C extends this with image-warm + zone preferences.
+        // Today we accept any host that can take the work.
+        required_image_digest: None,
+    };
+
+    // Split pick + restore so picker errors and backend errors keep
+    // distinct typing — picker failures are `NoTargetAvailable`
+    // (operator action: free capacity or wait for image prefetch);
+    // backend failures are `RestoreFailed` (retry against another
+    // host or surface to user).
+    let (target_host, target_backend) = registry
+        .pick_for_session(&ctx)
+        .map_err(EvacError::NoTargetAvailable)?;
+    let new_sandbox_id = target_backend
+        .restore(metadata)
+        .await
+        .map_err(EvacError::RestoreFailed)?;
+
+    // Routing cache: invalidate the stale source binding (the source
+    // host is dead, so this is usually already gone from
+    // `host_registry.unregister`, but defensive). Insert the new.
+    if let Some(old) = old_sandbox_id {
+        registry.invalidate_sandbox(old);
+    }
+    registry.record_sandbox_owner(new_sandbox_id, target_host);
+
+    // PG rebind. dead_host.rs has already flipped Active → HostLost
+    // (via `mark_host_dead_and_orphan_sessions`), so we drive
+    // HostLost → Created here.
+    meta.assign_session_host(session_id, Some(target_host))
+        .await
+        .map_err(EvacError::Rebind)?;
+    meta.assign_session_sandbox(session_id, Some(new_sandbox_id))
+        .await
+        .map_err(EvacError::Rebind)?;
+    meta.transition_session(session_id, SessionState::Created)
+        .await
+        .map_err(EvacError::Rebind)?;
+
+    Ok(EvacReceipt {
+        new_host_id: target_host,
+        new_sandbox_id,
+        loss,
     })
 }
 
@@ -797,6 +986,237 @@ mod tests {
             evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, bogus_target).await;
         assert!(matches!(result, Err(EvacError::TargetNotRegistered { .. })));
         assert!(source_be.calls().is_empty(), "no calls on source");
+    }
+
+    fn make_snapshot_for(
+        session_id: SessionId,
+        disk: Option<ManifestRef>,
+        memory: Option<ManifestRef>,
+    ) -> SnapshotRecord {
+        SnapshotRecord {
+            id: engram_core::SnapshotId::new(),
+            session_id: Some(session_id),
+            host_id: None,
+            image_version: "test".into(),
+            size_bytes: 1024,
+            created_at: chrono::Utc::now(),
+            last_accessed_at: chrono::Utc::now(),
+            disk_manifest: disk,
+            memory_manifest: memory,
+            recoverable: true,
+        }
+    }
+
+    fn fake_manifest(id: u128, version: u64) -> ManifestRef {
+        ManifestRef {
+            manifest_id: uuid::Uuid::from_u128(id),
+            version,
+        }
+    }
+
+    /// Helper: build a HostRegistry + register one target host with
+    /// fresh capacity. Returns (registry, target_host, target_backend).
+    fn build_registry_with_target(
+        meta: Arc<FakeMeta>,
+    ) -> (Arc<HostRegistry>, HostId, Arc<FakeBackend>) {
+        let registry = Arc::new(HostRegistry::new(meta));
+        let target_host = HostId::new();
+        let target_be = Arc::new(FakeBackend::default());
+        registry.register(target_host, target_be.clone());
+        // pick_for_session's capacity fallback path requires a fresh
+        // host with no draining flag — register() sets defaults that
+        // suffice.
+        (registry, target_host, target_be)
+    }
+
+    /// Arm 1: snapshot present + live_disk fresher (same lineage, higher
+    /// version) → restore uses the live manifest as disk, snapshot's
+    /// memory_manifest as memory. Loss=None.
+    #[tokio::test]
+    async fn evac_dead_source_uses_live_disk_when_newer() {
+        let meta = Arc::new(FakeMeta::default());
+        let lineage = 0xABCD;
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = Some(fake_manifest(lineage, 5));
+        let session_id = session.id;
+        meta.install_session(session.clone());
+
+        let snapshot = make_snapshot_for(
+            session_id,
+            Some(fake_manifest(lineage, 3)),
+            Some(fake_manifest(lineage + 1, 1)),
+        );
+
+        let (registry, target_host, target_be) = build_registry_with_target(meta.clone());
+        let new_sandbox = SandboxId::new();
+        target_be.set_restore_id(new_sandbox);
+
+        let receipt = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            Some(snapshot),
+        )
+        .await
+        .expect("happy path");
+        assert_eq!(receipt.new_host_id, target_host);
+        assert_eq!(receipt.new_sandbox_id, new_sandbox);
+        assert_eq!(receipt.loss, EvacLoss::None);
+
+        let updated = meta.session(session_id);
+        assert_eq!(updated.status, SessionState::Created);
+        assert_eq!(updated.host_id, Some(target_host));
+        assert_eq!(updated.sandbox_id, Some(new_sandbox));
+    }
+
+    /// Arm 2: snapshot present, no live_disk → restore uses the
+    /// snapshot's disk + memory. Loss=None.
+    #[tokio::test]
+    async fn evac_dead_source_uses_snapshot_when_no_live_disk() {
+        let meta = Arc::new(FakeMeta::default());
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = None;
+        let session_id = session.id;
+        meta.install_session(session.clone());
+
+        let snapshot = make_snapshot_for(
+            session_id,
+            Some(fake_manifest(0x1234, 7)),
+            Some(fake_manifest(0x5678, 7)),
+        );
+
+        let (registry, _target_host, target_be) = build_registry_with_target(meta.clone());
+        target_be.set_restore_id(SandboxId::new());
+
+        let receipt = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            Some(snapshot),
+        )
+        .await
+        .expect("snapshot-only happy path");
+        assert_eq!(receipt.loss, EvacLoss::None);
+    }
+
+    /// Arm 3: no snapshot, live_disk present → disk-only restore.
+    /// Loss=Memory{reason}.
+    #[tokio::test]
+    async fn evac_dead_source_disk_only_records_memory_loss() {
+        let meta = Arc::new(FakeMeta::default());
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = Some(fake_manifest(0xCAFE, 9));
+        let session_id = session.id;
+        meta.install_session(session.clone());
+
+        let (registry, _target_host, target_be) = build_registry_with_target(meta.clone());
+        target_be.set_restore_id(SandboxId::new());
+
+        let receipt = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+        )
+        .await
+        .expect("disk-only happy path");
+        match &receipt.loss {
+            EvacLoss::Memory { reason } => {
+                assert_eq!(reason, "source-dead-no-snapshot");
+            }
+            other => panic!("expected Memory loss, got {other:?}"),
+        }
+
+        // PG was rebound through HostLost → Created.
+        let updated = meta.session(session_id);
+        assert_eq!(updated.status, SessionState::Created);
+    }
+
+    /// Arm 4: no snapshot, no live_disk → NoRecoverableState. Caller
+    /// (dead_host.rs) routes this to HostLost → Dead.
+    #[tokio::test]
+    async fn evac_dead_source_no_state_errors_no_recoverable() {
+        let meta = Arc::new(FakeMeta::default());
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = None;
+        let session_id = session.id;
+        meta.install_session(session.clone());
+
+        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone());
+
+        let result = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(EvacError::NoRecoverableState)));
+
+        // PG untouched at HostLost.
+        let updated = meta.session(session_id);
+        assert_eq!(updated.status, SessionState::HostLost);
+    }
+
+    /// No registered target host → NoTargetAvailable. Caller logs +
+    /// may retry.
+    #[tokio::test]
+    async fn evac_dead_source_no_target_returns_no_target_available() {
+        let meta = Arc::new(FakeMeta::default());
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = Some(fake_manifest(0x1, 1));
+        meta.install_session(session.clone());
+
+        // Empty registry — no hosts to pick.
+        let registry = Arc::new(HostRegistry::new(meta.clone()));
+
+        let result = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));
+    }
+
+    /// pick_evac_disk_manifest semantics: same lineage → newer wins;
+    /// different lineage → snapshot wins; None handling. Cheap pure-
+    /// function test, mirrors the api/snapshot.rs effective_resume
+    /// tests.
+    #[test]
+    fn pick_disk_prefers_live_only_when_newer_same_lineage() {
+        let live = fake_manifest(0xAA, 5);
+        let snap = fake_manifest(0xAA, 3);
+        assert_eq!(
+            pick_evac_disk_manifest(Some(live.clone()), Some(snap.clone())),
+            Some(live)
+        );
+    }
+
+    #[test]
+    fn pick_disk_falls_back_to_snapshot_on_different_lineage() {
+        let live = fake_manifest(0xAA, 99);
+        let snap = fake_manifest(0xBB, 1);
+        assert_eq!(
+            pick_evac_disk_manifest(Some(live), Some(snap.clone())),
+            Some(snap),
+        );
+    }
+
+    #[test]
+    fn pick_disk_handles_either_none() {
+        let snap = fake_manifest(0xAA, 1);
+        assert_eq!(
+            pick_evac_disk_manifest(None, Some(snap.clone())),
+            Some(snap.clone())
+        );
+        let live = fake_manifest(0xBB, 1);
+        assert_eq!(
+            pick_evac_disk_manifest(Some(live.clone()), None),
+            Some(live)
+        );
+        assert_eq!(pick_evac_disk_manifest(None, None), None);
     }
 
     /// Session already in HostLost (e.g. dead_host.rs flipped it

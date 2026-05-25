@@ -32,6 +32,18 @@
 //! Without this detector, sessions on a dead host stay `Active`
 //! forever (with a `host_id` pointing at a host that won't respond);
 //! operators can still `POST /sessions/:id/migrate` by hand.
+//!
+//! **ADR 0018 Phase B (auto-evac):** when
+//! `ENGRAM_DEAD_HOST_AUTO_EVAC=1`, the second-stage routes
+//! `HostLost → Created` on a peer host via
+//! `evacuation::evacuate_dead_source` whenever recoverable state
+//! exists (snapshot row OR `sessions.live_disk_manifest_*`). The
+//! fall-through to `HostLost → Dead` stays for the no-state case;
+//! the legacy `HostLost → Idle` path stays as the default until the
+//! /resume-from-Created completion path lands (a follow-up that
+//! extends `api/snapshot.rs::resume_session`). Until then, auto-
+//! evac'd sessions end at Created on a peer and require operator-
+//! initiated restart of start_agent to reach Active.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,9 +54,20 @@ use engram_core::types::SessionState;
 use engram_core::HostId;
 use sqlx::postgres::PgPool;
 
+use crate::evacuation::{evacuate_dead_source, EvacError};
 use crate::host_registry::HostRegistry;
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
 use engram_core::SessionId;
+
+/// Read the auto-evac flag. Default `false` — opt-in until the
+/// resume-from-Created path lands and auto-evac becomes truly
+/// stuck-free.
+fn auto_evac_enabled() -> bool {
+    std::env::var("ENGRAM_DEAD_HOST_AUTO_EVAC")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// Persist + publish a `StatusChanged{from, to}` event. Inline here
 /// (rather than via `SharedState::emit`) so the dead-host detector
@@ -212,12 +235,20 @@ async fn evict_host(
         emit_status_changed(meta, events, *session_id, *prev, SessionState::HostLost).await;
     }
 
-    // Stage 2: per-session snapshot-aware second transition. If a
-    // recoverable snapshot exists, the user can /resume — drive
-    // HostLost -> Idle. Otherwise the session is unrecoverable —
-    // HostLost -> Dead. Failures of either query/transition are
-    // logged and skipped; the row stays at HostLost and a future
-    // reconcile pass (or operator action) can move it on.
+    // Stage 2: per-session snapshot-aware second transition.
+    //
+    // ADR 0018 Phase B: when ENGRAM_DEAD_HOST_AUTO_EVAC=1 and the
+    // session has recoverable state (snapshot row OR
+    // sessions.live_disk_manifest_*), drive
+    // `HostLost → Created` on a peer host via
+    // `evacuate_dead_source`. Without the flag, fall back to the
+    // legacy `HostLost → Idle` (user /resume) path. Either way, the
+    // no-state branch is `HostLost → Dead`.
+    //
+    // Failures of any query/transition are logged and skipped; the
+    // row stays at HostLost and a future reconcile pass (or operator
+    // action) can move it on.
+    let auto_evac = auto_evac_enabled();
     for (session_id, _) in &affected {
         let snapshot = match meta.latest_snapshot_for_session(*session_id).await {
             Ok(opt) => opt,
@@ -230,10 +261,66 @@ async fn evict_host(
                 continue;
             }
         };
-        let target = if snapshot.is_some() {
-            SessionState::Idle
-        } else {
-            SessionState::Dead
+
+        if auto_evac {
+            // Look up session row to read live_disk_manifest +
+            // image. Failure leaves the row at HostLost — operator
+            // can drive resolution.
+            let session = match meta.get_session(*session_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        %session_id,
+                        "get_session failed during auto-evac; leaving at HostLost",
+                    );
+                    continue;
+                }
+            };
+
+            match evacuate_dead_source(host_registry, meta, session, snapshot.clone()).await {
+                Ok(receipt) => {
+                    tracing::info!(
+                        %session_id,
+                        new_host = %receipt.new_host_id,
+                        new_sandbox = %receipt.new_sandbox_id,
+                        loss = receipt.loss.as_str(),
+                        "auto-evac succeeded; session rebound to peer host at Created",
+                    );
+                    emit_status_changed(
+                        meta,
+                        events,
+                        *session_id,
+                        SessionState::HostLost,
+                        SessionState::Created,
+                    )
+                    .await;
+                    continue;
+                }
+                Err(EvacError::NoRecoverableState) => {
+                    // Fall through to the HostLost → Dead branch.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %session_id,
+                        error = %e,
+                        "auto-evac failed; leaving session at HostLost",
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Legacy / no-recoverable-state path: HostLost → Idle (if
+        // snapshot exists and auto-evac is off) or HostLost → Dead.
+        // When auto-evac is on and we got here, it's because
+        // evacuate_dead_source returned NoRecoverableState — go
+        // straight to Dead, no point trying Idle (which would just
+        // strand the user with no /resume option either).
+        let target = match (auto_evac, snapshot.is_some()) {
+            (true, _) => SessionState::Dead, // evac said no state; Idle wouldn't help
+            (false, true) => SessionState::Idle,
+            (false, false) => SessionState::Dead,
         };
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
