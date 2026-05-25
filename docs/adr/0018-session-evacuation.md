@@ -1,23 +1,30 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
-Status: 2026-05-25 — **Proposed** (Phase 0). Multi-phase ADR; opens with
-the finalized design and a per-phase commit chain. Status flips to
-Accepted at the closing bookend once the chain has landed.
+Status: 2026-05-25 — **Accepted** as of commit chain below. Phase A
+(alive-source primitive) + Phase B (dead-source + NBD-loss auto
+triggers) + Phase C (target selection + admin endpoint + tests) all
+shipped. Discharges ADR 0015 §M4 and folds ADR 0017's M4.1
+follow-up.
 
-Supersedes nothing. Discharges ADR 0015 §M4 (session evacuation) and
-folds the M4.1 follow-up filed in ADR 0017 §"Out of scope" (FC NBD-loss
-recovery).
+Supersedes nothing. The auto-trigger paths are env-gated default-off
+pending the resume-from-Created follow-up; the admin endpoint ships
+default-on so operators can drive drains today.
 
-Phase chain (commit hashes filled in at the closing bookend):
+Phase chain:
 
-- **Phase 0** — this ADR in Proposed status. _(this commit)_
-- **Phase A** — evacuation primitive: `HostClient::evacuate` RPC, alive-source
-  graceful drain, target-side restore, atomic PG rebind.
-- **Phase B** — auto-triggers: dead-source path in `dead_host.rs` + FC
-  NBD-loss path in host-agent heartbeat.
-- **Phase C** — target-host selection policy, admin endpoint, Postgres
-  integration + e2e tests.
-- **ADR closing bookend** — as-built notes, divergences, flip to Accepted.
+- **Phase 0** — this ADR in Proposed status. (commit `aa37933`)
+- **Phase A** — `HostClient::evacuate` trait + types (commit `4fac78e`)
+  → orchestration in `evacuation::evacuate_to` (commit `95db896`).
+- **Phase B** — dead-source path in `dead_host.rs` via
+  `evacuate_dead_source` (commit `874e397`) → NBD-unhealthy heartbeat
+  field + monitor seam (commit `96f3cc7`) → coord-side
+  `nbd_loss_trigger::process_unhealthy` (commit `42e0030`).
+- **Phase C** — `ScheduleContext::exclude_host` ranking
+  (commit `e128e72`) → `POST /api/admin/sessions/:id/evacuate`
+  (commit `5b1352c`) → fmt+clippy sweep (commit `608a5a7`) →
+  Postgres integration (commit `f0202c3`) → e2e admin-shape test
+  (commit `74c9566`).
+- **ADR closing bookend** — as-built notes (this commit).
 
 ---
 
@@ -434,4 +441,168 @@ Per `[adr_bookends_substantive_work]` and `[separate_commits]`:
 
 ---
 
-_(Closing bookend will append "As-built notes" on the Accepted commit.)_
+---
+
+## As-built notes (2026-05-25)
+
+### Phase A — alive-source primitive
+
+The trait method `HostClient::evacuate` (commit `4fac78e`) shipped
+exactly as the design specified — default `Err(NotFound)` on all
+per-host impls; the orchestrator override never materialized
+because `HostRegistry::evacuate` would have needed `SharedState`
+access (start_agent / secrets / egress policy) that the trait can't
+carry. Instead the real orchestration lives in
+`engram-coordinator::evacuation::evacuate_to` (free function;
+commit `95db896`) — the trait method is a documented seam that
+keeps the ADR 0015 §M4 vocabulary alive.
+
+The state-machine sequence shipped as designed:
+`Active → HostLost → Created`. The legality table at
+`engram-core::types::session::can_transition_to`:124 already
+permitted `HostLost → Created` from M2's groundwork; no
+state-machine code changes were necessary in this chain.
+
+`evacuate_to` leaves the session at `Created` on the target host —
+the caller drives `start_agent` + → `Active`. The admin endpoint
+(commit `5b1352c`) accepts this contract, returning the receipt
+without finishing the resume dance. The /resume-from-Created
+follow-up (see open question below) closes the UX loop.
+
+### Phase B — dead-source + NBD-loss auto triggers
+
+`evacuate_dead_source` (commit `874e397`) is the dead-source
+equivalent of `evacuate_to`. Restores from existing artifacts:
+`pick_evac_disk_manifest(session.live_disk_manifest, snapshot.disk_manifest)`
+for the disk side, `snapshot.memory_manifest` for memory. Adopts the
+tiered loss policy from ADR 0016 §"What gets easier" verbatim —
+`EvacLoss::None` when both manifests present, `EvacLoss::Memory{reason:
+"source-dead-no-snapshot"}` for disk-only.
+
+The NBD-loss path (commits `96f3cc7` + `42e0030`) shipped a thinner
+shape than the design specified. The heartbeat field
+`nbd_unhealthy: Vec<SandboxId>` and the consumer
+`nbd_loss_trigger::process_unhealthy` are in place; the host-agent's
+runtime NBD-probe task that *populates* the field stayed out of
+scope this round. The `NbdHealthMonitor` (host-agent
+`heartbeat.rs`) is the test seam — the field will stay empty until a
+follow-up wires the per-slot probe extension of
+`disk_daemon/slot.rs::nbd_kernel_busy` into a runtime monitor.
+Trade-off: the trigger machinery ships end-to-end now (testable via
+admin injection); the actual NBD-degradation detector lands when
+production has a stuck-NBD incident to validate the probe shape
+against.
+
+Both auto-triggers (dead_host + nbd_loss) are env-gated default-off:
+`ENGRAM_DEAD_HOST_AUTO_EVAC=1` and `ENGRAM_NBD_AUTO_EVAC=1`. The
+"stuck at Created" UX wart blocks flipping these default-on; once
+the resume-from-Created path lands, the flags become operator-
+override-only.
+
+### Phase C — target selection + admin + tests
+
+`ScheduleContext::exclude_host: Option<HostId>` (commit `e128e72`)
+landed minimal: it filters the candidate set in `pick_for_session`'s
+three ranking arms. Same-zone preference and image-warm
+promotion (filter → ranking) — both named in the original scope
+decision — deferred. Same-zone needs zone tagging plumbed into
+`HostState` (heartbeats don't carry zone today); image-warm
+promotion provides no measurable value while the existing
+`required_image_digest` filter is a hard floor that prod fleets
+satisfy. Filed forward.
+
+The admin endpoint (commit `5b1352c`) ships only the alive-source
+variant (Active session). HostLost / Idle sessions return 409 — the
+operator drain story is "evacuate Active sessions". The dead-source
+admin variant is a future endpoint after the resume-from-Created
+follow-up.
+
+Tests:
+- Unit (commits 2, 3, 6): 14 evacuation tests + 2 host_registry
+  exclude_host tests. Mock HostClient + FakeMeta.
+- Postgres integration (commit `f0202c3`): 4 live-PG tests in
+  `admin_evac_live_pg.rs`. Wired into ci.yml's Postgres-gated
+  ignored lane next to `admin_chunk_gc_live_pg`.
+- E2E (commit `74c9566`): `e2e_evac_admin_endpoint_shape` in the
+  test-e2e-stack CI lane. Single-host integration fixture →
+  endpoint-shape coverage with a loud-warning skip for the full
+  2-host relocate. Filed forward.
+
+### Divergences from the design
+
+1. **`HostClient::evacuate` trait method shipped as documented
+   seam, not orchestrator dispatch.** The trait can't access
+   SharedState (secrets/egress/start_agent plumbing); the
+   orchestration lives in `evacuation::evacuate_to` as a free
+   function. The trait method's default `Err(NotFound)` makes it
+   a tombstone that keeps the ADR 0015 vocabulary discoverable.
+
+2. **NBD-probe runtime wiring deferred.** The trigger ships
+   end-to-end via the `NbdHealthMonitor` seam, but production-
+   driven probe population is a follow-up. The heartbeat field
+   stays empty until the probe lands.
+
+3. **Same-zone + image-warm scheduler refinements deferred.**
+   Only `exclude_host` lands in Phase C. The other Phase C
+   scope-decision-2 items are filed forward.
+
+4. **Admin endpoint covers alive-source only.** Dead-source
+   relocate via admin is a follow-up endpoint after
+   resume-from-Created lands.
+
+5. **e2e test covers endpoint shape only.** Full 2-host relocate
+   is a follow-up after integration-up.sh learns the two-host
+   topology.
+
+### Newly-filed follow-ups
+
+- **`/resume` from `Created`**: today the resume dispatcher in
+  `api/snapshot.rs:194-216` only routes `Idle`. Adding a Created
+  arm that drives `start_agent` + → Active closes the UX loop for
+  auto-evac'd sessions and unblocks default-on for both env flags.
+  Substantial — extract `finish_resume_to_active(state, session)`
+  from `resume_from_fc_snapshot` so it's reusable.
+- **Runtime NBD-probe task** in
+  `engram-host-agent::disk_daemon`. Per-slot tokio task probing
+  `nbd_kernel_busy` on 5s cadence; 3 consecutive failures →
+  `NbdHealthMonitor::insert(sandbox_id)`. Linux-only; dev-vm clippy.
+- **Same-zone scheduling preference**. Needs zone plumbed into
+  `HostState` (extend heartbeat to carry zone from
+  `HostMetadata.zone`, or read PG `HostRecord.cloud_metadata.zone`
+  on registry update).
+- **2-host integration-up.sh** + a full `e2e_evac_alive_source_full`
+  test that asserts disk-preserved-on-peer + session_id stable.
+- **Dead-source admin endpoint**. Operator-driven dead-source evac
+  (today only the dead_host.rs heartbeat-timeout path can fire it).
+- **Image-cache-warm scheduler ranking** (filter → ranking
+  promotion). No measurable value over the current hard-floor
+  filter; revisit when fleets see heterogeneous prefetch states.
+- **Continuous memory sync**. ADR 0018 §"Out of scope" already
+  filed this as a future ADR; memory RPO stays snapshot-bounded.
+
+### Dev-vm verification
+
+The local dev-vm (`engram-dev`) didn't exist at the time of this
+chain (no instance under that name in `cortex-internal-tooling`).
+`just check` workspace-wide passed (825 tests, 21 skipped) at the
+Phase C boundary; the Postgres integration tests run in CI's
+Postgres-gated lane; the e2e admin-shape test runs in
+test-e2e-stack. Full alive-source relocate against a 2-host
+fixture awaits the follow-up.
+
+### Closing notes
+
+The auto-trigger flags default off is the conservative ship —
+prod operators can flip `ENGRAM_DEAD_HOST_AUTO_EVAC=1` once a test
+environment validates the Created end-state UX. The admin endpoint
+ships default-on, giving operators the drain primitive without
+flag juggling. The end-to-end "session keeps running through a
+MIG roll" promise from ADR 0015 §M4 is closer but not delivered
+this round — that lands when the resume-from-Created follow-up
+completes the loop.
+
+The chain is intentionally split across small commits per
+`[separate_commits]` so reviewers can read each phase
+independently. The fmt+clippy sweep commit at the Phase B → Phase C
+boundary is a one-time catch-up for `[lint_before_commit]`
+discipline that slipped during the long chain.

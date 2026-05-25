@@ -345,7 +345,7 @@ Accepted and being implemented now; M2–M9 are Proposed.
 | M1 | `GuestService` — one in-VM RPC surface, one readiness signal | **Accepted + shipped** (commits `75ba2df` / `97de278` / `0d444e9` / `4b3f890`) |
 | M2 | `SessionState` — explicit, gated state machine | **Accepted + shipped** (commits `b0c8eca` / `0d928e4` / `aa215f8` / `d69d140` / `1734cb5` / `ee3b5a8` / `42649dd`) |
 | M3 | `HostRegistry` as a TTL'd cache of PG truth | **Accepted + shipped** (commits `6e74e71` / `7cdc3d9` / `7f1290f` / `ed9f889`) |
-| M4 | `Sandbox` as a content-addressed migratable value | Proposed |
+| M4 | `Sandbox` as a content-addressed migratable value | Accepted — ADR 0018 |
 | M5 | Host-image readiness as the warm/cold contract — retire the `templates` table | **Accepted + shipped** (commits `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`) |
 | M6 | Harness events as one typed stream on `GuestService` | Proposed |
 | M7 | FC drive references as content hashes via a `DriveResolver` trait | Proposed |
@@ -677,6 +677,15 @@ the routing surface across two types for no win.
 ---
 
 ### M4 — `Sandbox` as a migratable value
+
+> **2026-05-25**: M4 is its own ADR. See
+> [ADR 0018: Session evacuation](./0018-session-evacuation.md) for
+> the as-shipped design + commit chain. The summary below stays as
+> the original framing; ADR 0018 documents divergences (e.g. the
+> trait method shipped as a documented seam rather than the
+> orchestrator dispatch, the NBD-probe runtime wiring deferred to
+> a follow-up, auto-triggers env-gated default-off pending the
+> /resume-from-Created follow-up).
 
 **Problem.** Today a session is pinned to one host for life. Host
 dies → session dies. The snapshot/restore primitives are already
