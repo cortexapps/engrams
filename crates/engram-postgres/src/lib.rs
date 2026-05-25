@@ -1324,4 +1324,113 @@ impl MetadataStore for PostgresStore {
                 .map_err(db_err)?;
         Ok(row as u64)
     }
+
+    /// ADR 0016 Phase C: explicit barrier bump for non-flush manifest-
+    /// lineage writes (`enable_image`, `record_snapshot`). Phase B's
+    /// `update_live_disk_manifest` already bumps inline in its own
+    /// TX; this method lets callers that don't share that TX (or
+    /// don't want to refactor their existing TX boundary) tick the
+    /// generation in a one-shot statement after their own write
+    /// commits.
+    async fn bump_chunk_generation(&self) -> Result<(), MetaError> {
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0016 Phase C: pin-set source #3 — every session that has
+    /// published a live disk manifest. The partial index
+    /// `idx_sessions_live_disk_manifest` (migration 0034) covers the
+    /// predicate so the scan is bounded by live-manifest count, not
+    /// total session count.
+    async fn list_live_session_disk_manifest_ids(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT live_disk_manifest_id, live_disk_manifest_version
+               FROM sessions
+              WHERE live_disk_manifest_id IS NOT NULL
+                AND live_disk_manifest_version IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
+    /// ADR 0016 Phase C: idempotent candidate upsert. ON CONFLICT
+    /// refreshes `last_seen_at` only — `first_seen_at` is sticky so
+    /// the grace window starts when the candidate first appeared,
+    /// not when it was last re-seen.
+    async fn upsert_chunk_gc_candidate(&self, hash: [u8; 32]) -> Result<(), MetaError> {
+        sqlx::query(
+            "INSERT INTO chunk_gc_candidates (content_hash)
+             VALUES ($1)
+             ON CONFLICT (content_hash) DO UPDATE SET last_seen_at = now()",
+        )
+        .bind(hash.as_slice())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0016 Phase C promote-pass query.
+    async fn list_expired_gc_candidates(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<[u8; 32]>, MetaError> {
+        let rows = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT content_hash
+               FROM chunk_gc_candidates
+              WHERE first_seen_at < $1
+              ORDER BY first_seen_at
+              LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for bytes in rows {
+            if bytes.len() != 32 {
+                // A non-32-byte row is a data corruption — fail
+                // loud rather than silently truncate.
+                return Err(MetaError::Serialization(format!(
+                    "chunk_gc_candidates.content_hash has {} bytes, expected 32",
+                    bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            out.push(arr);
+        }
+        Ok(out)
+    }
+
+    /// ADR 0016 Phase C: batch-delete candidate rows. Empty input
+    /// is a no-op (skip the round-trip). PG handles the array via
+    /// `ANY($1::bytea[])`.
+    async fn delete_gc_candidates(&self, hashes: &[[u8; 32]]) -> Result<(), MetaError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let as_vecs: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
+        sqlx::query("DELETE FROM chunk_gc_candidates WHERE content_hash = ANY($1::bytea[])")
+            .bind(&as_vecs)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
 }

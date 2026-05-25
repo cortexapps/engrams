@@ -478,6 +478,70 @@ pub trait MetadataStore: Send + Sync {
     async fn chunk_generation(&self) -> Result<u64, MetaError> {
         Ok(0)
     }
+
+    /// ADR 0016 Phase C: bump `chunk_generation` independent of a
+    /// flush. Used by `enable_image` and `record_snapshot` writes
+    /// (commit 2 of the Phase C chain) to keep the barrier complete
+    /// across all manifest-lineage-producing paths, not just live
+    /// disk flushes. Default is a no-op so non-PG backends opt out
+    /// cleanly. PG override increments the single row.
+    async fn bump_chunk_generation(&self) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// ADR 0016 Phase C: enumerate every `(live_disk_manifest_id,
+    /// live_disk_manifest_version)` pair currently advertised by a
+    /// session row. One of the three pin-set sources unioned by the
+    /// GC sweep (the other two are `list_live_disk_manifest_ids` /
+    /// `list_live_memory_manifest_ids` over snapshots, and
+    /// enabled-image manifest resolution which lives in
+    /// `engram-chunk-store::gc`).
+    ///
+    /// Returns DISTINCT (id, version) tuples wrapped as `ManifestRef`.
+    /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
+    /// runs an indexed `WHERE live_disk_manifest_id IS NOT NULL`
+    /// query against the partial index added by migration 0034.
+    async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0016 Phase C: upsert a chunk into the GC candidate table.
+    /// Idempotent under `ON CONFLICT (content_hash) DO UPDATE SET
+    /// last_seen_at = now()` so re-seeing a candidate refreshes the
+    /// diagnostic timestamp without resetting `first_seen_at` (the
+    /// 24h grace window must not be extended by repeated sightings).
+    ///
+    /// `hash` is the raw sha256 digest (`ChunkHash::as_bytes()`
+    /// from `engram-chunk-store`). Trait stays primitive at the
+    /// boundary to avoid an `engram-core` → `engram-chunk-store`
+    /// dep cycle.
+    async fn upsert_chunk_gc_candidate(&self, _hash: [u8; 32]) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// ADR 0016 Phase C promote-pass query. Returns up to `limit`
+    /// candidate hashes whose `first_seen_at` predates `cutoff`,
+    /// ordered by `first_seen_at` so the oldest backlog drains
+    /// first. The caller deletes each from BlobStorage and then
+    /// passes the same hashes to [`delete_gc_candidates`].
+    ///
+    /// Batched (`limit` is required, not optional) so a single
+    /// sweep with a large backlog can't OOM the coord pod.
+    async fn list_expired_gc_candidates(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> Result<Vec<[u8; 32]>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0016 Phase C: batch-delete candidate rows after the
+    /// BlobStorage delete succeeded. Order doesn't matter; missing
+    /// rows are silently skipped (idempotent so a re-run on a
+    /// partial promote pass is safe).
+    async fn delete_gc_candidates(&self, _hashes: &[[u8; 32]]) -> Result<(), MetaError> {
+        Ok(())
+    }
 }
 
 /// Outcome of [`MetadataStore::update_live_disk_manifest`].
