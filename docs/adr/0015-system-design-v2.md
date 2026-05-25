@@ -349,7 +349,7 @@ Accepted and being implemented now; M2–M9 are Proposed.
 | M5 | Host-image readiness as the warm/cold contract — retire the `templates` table | **Accepted + shipped** (commits `d20e5da` / `18be1ad` / `6fb36e2` / `7ab8625`) |
 | M6 | Harness events as one typed stream on `GuestService` | Proposed |
 | M7 | FC drive references as content hashes via a `DriveResolver` trait | Proposed |
-| M8 | Coord ↔ host as one bidirectional trait (or accept the split as final) | Proposed, flagged |
+| M8 | Unified gRPC transport in both directions (retire HTTP/JSON host→coord) | Proposed |
 
 **Note on table evolution.** The original ADR had nine sections, with
 separate slots for "decouple ImageBundle from WarmTemplate" (M5) and
@@ -1074,26 +1074,125 @@ FC changes.
 
 ---
 
-### M8 — Coord ↔ host as one bidirectional trait (or accept the split)
+### M8 — Unified gRPC transport in both directions
 
 **Problem.** Per ADR 0013, host → coord is HTTP/JSON (heartbeat,
-events, auth resolution) and coord → host is gRPC. The split was
-made to keep coord pods stateless across restarts. Cost: lifecycle
-is fragmented across five HTTP endpoints + a gRPC service; heartbeat
-is a 5 s POST loop with no streaming; "host is going away" has no
-clean signal.
+harness events, idle-eviction-candidates, live-manifest publish,
+auth resolution) and coord → host is gRPC. The split was a
+historical accident, not a design: HTTP came first because it was
+the simplest thing that worked over the k8s LB; gRPC arrived later
+for the reverse direction (ADR 0011 / 0013). The split kept the
+coord pods stateless, which is load-bearing, but the transport
+asymmetry itself isn't. Cost today:
 
-**Abstraction.** A single bidirectional `HostChannel` trait (host
-opens a long-lived stream; coord serves reverse RPCs on it).
-Mirrors gRPC bidirectional streams' shape.
+- **Bespoke dispatch glue at every crossing.** Five HTTP handlers
+  on the coord side, each with its own request/response struct,
+  bearer-auth middleware, and JSON serde — sitting alongside the
+  gRPC service that handles the reverse direction. Adding a new
+  host→coord RPC means writing a route, a handler, a request type,
+  a response type, and a host-side `reqwest` helper. Adding a
+  coord→host RPC means one proto definition + two trait impls.
+- **Two error-handling regimes.** HTTP errors are status code +
+  body string; gRPC errors are typed status. Translating between
+  them at the boundary is bespoke per handler.
+- **Two wire-shape conventions.** Snake-case JSON on one side,
+  protobuf on the other. Hand-maintained TS types in the web app
+  have to track both.
 
-**Flagged.** This is a real tradeoff against the k8s LB ergonomics
-ADR 0013 was designed for. We may end up Rejecting this in favor of
-keeping the split and tightening the heartbeat protocol. The
-decision needs prod usage data we don't yet have (how often do coord
-pods restart in practice? does the 5 s heartbeat tick produce
-meaningful overhead at fleet scale?). Until that's measured, this
-section stays Proposed with low priority.
+**Abstraction.** Move host→coord onto **unary gRPC** alongside the
+existing coord→host service. Both lanes use the same transport,
+the same auth (mTLS or bearer-in-metadata), the same typed errors,
+the same proto-generated client/server. Coord pods stay stateless:
+unary gRPC load-balances over the GCP internal LB the same way
+HTTP does (HTTP/2 frames, no client affinity). No long-lived
+streams, no pod pinning — the structural property ADR 0013 was
+built on stays intact.
+
+**What it deletes.**
+
+- `crates/engram-host-agent/src/coord_client.rs::CoordClient`'s
+  `reqwest::Client` + bearer-header builders + `trim_ws_suffix` +
+  the per-endpoint JSON serializers. Replaced by a generated gRPC
+  client.
+- The host→coord HTTP handlers in
+  `crates/engram-coordinator/src/api/host_http.rs` (heartbeat,
+  harness_event, idle-eviction-candidates, live-manifest, auth
+  resolution). Replaced by methods on the existing host-facing
+  gRPC service.
+- The two-regime error translation at the host↔coord boundary.
+  One `tonic::Status` taxonomy across both lanes.
+- The hand-maintained JSON wire-shape types that exist solely for
+  this channel.
+
+**What it adds.**
+
+- New `HostToCoordService` proto, with one RPC per existing
+  host→coord HTTP endpoint. Same payload shapes (protobuf
+  equivalent of today's JSON).
+- One new gRPC server lane on coord, sharing the existing tonic
+  router. Same `require_bearer` equivalent via a `tonic`
+  interceptor.
+- A host-side `CoordClient` that wraps the generated gRPC client
+  with the per-RPC timeouts today's `reqwest::RequestBuilder`
+  applies (heartbeat 30s; live-manifest 120s; idle-eviction-
+  candidates 120s; per A.1.5a in ADR 0016).
+
+**Explicit non-goals.**
+
+- **No bidirectional streaming.** The "host opens a long-lived
+  stream, coord serves reverse RPCs on it" shape is rejected:
+  it would pin each host to one coord pod, break helm-deploy
+  drains, and move half-open detection into our code. Unary gRPC
+  both ways gets the transport-unification payoff without the
+  stateful-pod cost. (See "Why not bidirectional streaming"
+  below.)
+- **No heartbeat shape change.** Heartbeat stays a 5s unary call
+  per host, same payload. The fleet-scale overhead today is
+  trivial (single-digit req/s); optimizing it isn't M8's job.
+- **No web-app wire change.** The web app talks to coord's
+  *public* HTTP API, not the host↔coord channel. Untouched.
+
+**Why not bidirectional streaming.** A single bidi stream per host
+gets the lifecycle unification ("one channel, one signal for host-
+going-away") but:
+
+1. Each host becomes pinned to a specific coord pod for the life
+   of its stream. ADR 0013's stateless-pod property goes away.
+2. Pod rolls on helm-deploy require an explicit drain handshake;
+   today the LB handles it transparently.
+3. Half-open detection moves into application code (gRPC
+   keepalive + app-level health checks) — a new failure class.
+
+The unification payoff doesn't justify those costs. If a future
+operation genuinely needs push semantics (e.g. "drain
+immediately"), add one streaming RPC for that operation, not a
+stream for everything.
+
+**Migration shape.** Atomic cutover per the no-back-compat
+principle: drop the HTTP handlers + the `reqwest::Client` host
+client in the same PR that ships the gRPC equivalents. In-flight
+hosts and coord pods roll together via the existing deploy
+pipeline; no "speak both lanes during transition" code.
+
+**Open questions.**
+
+- Should host→coord and coord→host share one tonic server on the
+  host side (a single combined service definition) or stay as two
+  separate services on shared infrastructure? Lean toward separate
+  services with one shared interceptor stack — keeps the auth
+  asymmetry honest (host→coord uses bearer; coord→host today is
+  unauthenticated within the VPC).
+- Auth: stay with bearer-in-metadata, or move to mTLS? Bearer
+  matches today's setup and is enough; mTLS is a separate
+  hardening pass.
+- Sequencing relative to M4 (session evacuation). M4 doesn't
+  block on M8 and vice versa; pick by team bandwidth, not
+  dependency.
+
+**Expected net diff.** Modest LOC reduction (a few hundred lines
+of bespoke HTTP plumbing retired, replaced by generated gRPC stubs
+and slimmer handlers). The win is structural — one transport
+taxonomy across both lanes — not LOC.
 
 ---
 
@@ -1187,8 +1286,9 @@ not exist.
   (unified harness stream), M7 (DriveResolver). Each is its own
   ADR + multi-PR effort. Sequencing depends on which bugs surface
   first.
-- **Phase 8 (decide later):** M8. Decide after we have prod
-  observability on the channel-split cost.
+- **Phase 8 (transport hygiene):** M8 — unary gRPC in both
+  directions, retire HTTP/JSON host→coord. Pure transport
+  cleanup; no behavioural change. Sequencing independent of M4.
 
 Each phase ships its own implementation ADR. This document is the
 v2 direction summary, not the implementation plan for any single
