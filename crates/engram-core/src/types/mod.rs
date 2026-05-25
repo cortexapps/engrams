@@ -3,6 +3,7 @@
 
 pub mod cow_state;
 pub mod egress;
+pub mod evacuation;
 pub mod event;
 pub mod host;
 pub mod ids;
@@ -16,6 +17,7 @@ pub mod snapshot;
 
 pub use cow_state::*;
 pub use egress::*;
+pub use evacuation::*;
 pub use event::*;
 pub use host::*;
 pub use ids::*;

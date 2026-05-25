@@ -26,10 +26,11 @@ use crate::error::SandboxError;
 use crate::traits::sandbox::{HarnessDial, HarnessSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
+use crate::types::evacuation::EvacReceipt;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
-use crate::types::{SandboxId, SessionId};
+use crate::types::{HostId, SandboxId, SessionId};
 
 #[async_trait]
 pub trait HostClient: Send + Sync {
@@ -220,5 +221,31 @@ pub trait HostClient: Send + Sync {
         _id: SandboxId,
     ) -> Result<Option<crate::types::manifest::ManifestRef>, SandboxError> {
         Ok(None)
+    }
+
+    /// ADR 0018 Phase A: relocate `sandbox_id` to `target_host`. Turns
+    /// `Sandbox` into a host-fungible value per ADR 0015 §M4 — the
+    /// returned [`EvacReceipt`] carries a fresh `new_sandbox_id`
+    /// that supersedes the input id; the underlying `session_id`
+    /// (which the caller already knows) is the stable handle across
+    /// the evac.
+    ///
+    /// Source-side: snapshot the sandbox (memory + disk via the
+    /// existing `host.snapshot()` flow). Target-side: restore from
+    /// that snapshot. PG rebind drives `HostLost → Created → Active`
+    /// on the new host_id + new sandbox_id in one TX.
+    ///
+    /// Only the orchestrator impl ([`HostRegistry`] in
+    /// `engram-coordinator`) does real work — per-host clients
+    /// (`LocalHostClient`, `RemoteHostClient`) cannot meaningfully
+    /// relocate to a peer because they only know their own host. The
+    /// default returns `SandboxError::NotFound`, matching the pattern
+    /// `proxy_shell` and friends use for orchestrator-only methods.
+    async fn evacuate(
+        &self,
+        _sandbox_id: SandboxId,
+        _target_host: HostId,
+    ) -> Result<EvacReceipt, SandboxError> {
+        Err(SandboxError::NotFound)
     }
 }
