@@ -1,9 +1,9 @@
 # ADR 0016: COW observability and continuous disk sync
 
-Status: 2026-05-24 — **Proposed**, Phase A + Phase A.1 shipped
-(§A.1.1–§A.1.7; §A.1.8 reconsidered, not pursued). Phase B
-(continuous disk sync) and Phase C (chunk-GC pin-set redesign)
-remain pending; the ADR will flip to Accepted once Phase C ships.
+Status: 2026-05-25 — **Proposed**, Phase A + Phase A.1 + Phase B
+shipped (§A.1.1–§A.1.7 shipped; §A.1.8 reconsidered, not pursued).
+Phase C (chunk-GC pin-set redesign) opens with the design block
+below; the ADR will flip to Accepted once Phase C ships.
 Supersedes ADR 0015 M5 "Known regression — chunk-store GC deleted"
 (see `docs/adr/0015-system-design-v2.md` §"Known regression —
 chunk-store GC deleted") once Phase C lands.
@@ -28,7 +28,13 @@ M1.x annotations and ADR 0015's per-milestone commit lists):
   (2026-05-24)" for the planned design and §"Phase B as-built
   notes (2026-05-24)" for the shipped chain, divergences, and
   pitfalls.
-- **Phase C** — chunk-GC pin-set redesign (6 commits + ADR final pass). _(pending)_
+- **Phase C** — chunk-GC pin-set redesign. Design finalized
+  2026-05-25; 8-commit chain (Phase 0 opening + commits 1–6 for
+  the schema/code/admin surface + commit 6a for the e2e CI test
+  + commit 7 for the closing bookend that flips this ADR to
+  Accepted and rewrites ADR 0015 M5 §"Known regression" as a
+  pointer). See §"Phase C design (2026-05-25) — finalized
+  approach" for the implementation plan. _(in flight)_
 
 The ADR is updated at the end of each phase with what shipped, what
 diverged from this design, and any pitfalls future implementers should
@@ -1694,6 +1700,166 @@ counterpart firing the same primitive):
 - `POST /api/admin/chunk-gc/dry-run` — list what would be deleted.
 - `POST /api/admin/chunk-gc/sweep` — run one sweep immediately.
 - `GET /api/admin/chunk-gc/candidates` — read the candidate table.
+
+#### Phase C design (2026-05-25) — finalized approach
+
+Pre-implementation annotation, written before code lands so
+divergences can be captured at the closing bookend (matches Phase
+B's pattern; per `[adr_bookends_substantive_work]`).
+
+**Pin-set sources and resolvers.** Three live-manifest sources,
+unioned by a new `engram-chunk-store::gc::PinSet` type:
+
+1. `enabled_images` — `meta.list_enabled_images()` exists; each
+   `EnabledImage` row resolves to a chunked-disk `ManifestRef`
+   via the same parsing the host-agent's `image_prefetch.rs`
+   already performs. If that resolver is currently host-private,
+   lift it into `engram-chunk-store` so both consumers share it
+   (avoid a parallel copy).
+2. `sessions.live_disk_manifest_*` — new
+   `meta.list_live_session_disk_manifest_ids()` helper:
+   `SELECT DISTINCT live_disk_manifest_id, live_disk_manifest_version
+    FROM sessions WHERE live_disk_manifest_id IS NOT NULL`. The
+   `idx_sessions_live_disk_manifest` partial index from migration
+   0034 covers the predicate.
+3. `snapshots` — `meta.list_live_disk_manifest_ids()` +
+   `meta.list_live_memory_manifest_ids()` already exist (survived
+   the 2026-05-23 GC deletion; today consumed by
+   `reap_materialize_dir`).
+
+For each `ManifestRef`, `chunk_store.get_manifest(ref)` returns
+the manifest JSON; `manifest.chunks: Vec<ChunkRef>` folds into a
+`HashSet<ChunkHash>`. Cost per manifest: one blob GET of a ~10–50
+KB JSON. A fleet with 100 active sessions + 50 snapshots + 10
+enabled images is ~160 manifest fetches per sweep — sub-minute
+total bounded by a 16-permit semaphore.
+
+**Barrier coverage extension.** Phase B's `chunk_generation` bump
+fires only on `update_live_disk_manifest` writes. Two additional
+write paths produce manifest lineages and must also bump generation
+to keep the barrier complete:
+
+- `enable_image` / `materialize_disk_chunks` — manifests are
+  written to BlobStorage before the `enabled_images` row commits.
+  A sweep landing in that window would mark fresh chunks as
+  candidates.
+- `record_snapshot` — same shape: snapshot manifests are written
+  before the row commits.
+
+Both bumps land in commit 2 of the chain, in the same TX as the
+row insert. Discharges ADR 0015 M5 §"Design constraints" #1 (the
+live-set union catches every manifest lineage *and* the barrier
+catches mid-sweep races on lineages the union doesn't enumerate
+yet).
+
+**Sweep orchestrator.** New `engram-coordinator::chunk_gc`:
+
+```rust
+pub struct ChunkGcConfig {
+    pub enabled: bool,             // ENGRAM_CHUNK_GC_ENABLED, default false
+    pub interval: Duration,        // ENGRAM_CHUNK_GC_INTERVAL_SECS, default 3600
+    pub grace_period: Duration,    // ENGRAM_CHUNK_GC_GRACE_SECS, default 86400
+    pub max_restart_attempts: u32, // default 3 — bounded against continuous-flush livelock
+}
+
+pub enum SweepMode { DryRun, Full }
+pub async fn run_one_sweep(state: &SharedState, mode: SweepMode) -> SweepReport;
+pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig);
+```
+
+`run_one_sweep` body:
+1. `gen_before = meta.read_chunk_generation()`.
+2. `pin_set = PinSet::collect(meta, chunk_store)`.
+3. List `chunks/sha256/` via `blob.list_prefix`. Parse each key
+   back into a `ChunkHash`.
+4. For each chunk not in `pin_set`, if `mode == Full` upsert into
+   `chunk_gc_candidates` (INSERT … ON CONFLICT DO UPDATE
+   last_seen_at).
+5. `gen_after = meta.read_chunk_generation()`. If
+   `gen_after != gen_before` and `restart_count < max_restart`,
+   restart from step 1; otherwise `warn!` and accept (24h grace
+   absorbs false positives). The bound prevents a livelock where
+   continuous flush bumps the generation faster than a sweep over
+   the full chunk set can complete.
+6. Promote pass: query candidates older than `grace_period`,
+   delete from BlobStorage, delete candidate row. Paged
+   (`limit=10_000`) so a backlog can't block one sweep.
+
+**Sweep scope.** Only the `chunks/sha256/` prefix is walked. The
+`state/`, `sidecars/`, and `manifests/` prefixes are pinned
+implicitly (by living at different prefixes the sweep doesn't
+touch) and are filed as follow-ups if they ever show monotonic
+growth. The pin set itself is `HashSet<ChunkHash>` for the chunk
+sweep — adding blob-key prefixes later doesn't require schema
+changes, only an extended collector.
+
+**Admin endpoints + e2e CI.** Per
+`[explicit_admin_triggers_for_testability]`, the background sweep
+is the implicit trigger and admin endpoints fire the same
+primitive. Three new routes under `/api/admin/chunk-gc/*` follow
+the `reap_materialize_dir` pattern with `require_bearer`. Commit
+6a ships an end-to-end test in the existing test-e2e-stack CI lane
+(same lane as Phase B's `e2e_flush_now` /
+`e2e_resume_rejoins_chunked_disk_tracking`) that exercises all
+three admin endpoints against a full coord + host-agent +
+LocalBlobStorage stack. Load-bearing assertion: re-create a
+session on the same enabled image post-sweep and assert it boots
+— this is the regression catch for the M5 failure class.
+
+**Schema additions.** One new migration:
+
+```sql
+-- 0035_chunk_gc_candidates.sql
+CREATE TABLE chunk_gc_candidates (
+    content_hash  BYTEA       PRIMARY KEY,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_chunk_gc_candidates_first_seen
+    ON chunk_gc_candidates (first_seen_at);
+```
+
+Plus six new `MetadataStore` methods: `read_chunk_generation`,
+`bump_chunk_generation`, `list_live_session_disk_manifest_ids`,
+`upsert_chunk_gc_candidate`, `list_expired_gc_candidates`,
+`delete_gc_candidates`.
+
+**Commit chain (Phase 0 opening + commits 1–7):**
+
+| # | Title |
+|---|---|
+| 0 | docs(adr-0016): open Phase C — finalized design _(this commit)_ |
+| 1 | feat(meta): commit 1 — `chunk_gc_candidates` table + helpers |
+| 2 | feat(meta): commit 2 — bump `chunk_generation` on `enable_image` + `record_snapshot` writes |
+| 3 | feat(chunk-store): commit 3 — `PinSet` collection + manifest resolver |
+| 4 | feat(coord): commit 4 — `chunk_gc` sweep orchestrator + background loop |
+| 5 | feat(coord): commit 5 — chunk-gc admin endpoints |
+| 6 | test(coord): commit 6 — unit + Postgres integration tests |
+| 6a | test(coord): commit 6a — `e2e_chunk_gc` in test-e2e-stack lane |
+| 7 | docs(adr-0016+0015): close Phase C — Accepted |
+
+Commit 7 flips this ADR's status from Proposed → Accepted, lists
+the as-built commit hashes here, and rewrites ADR 0015 M5
+§"Known regression — chunk-store GC deleted" as a one-line pointer
+back to this section per the supersede promise.
+
+**Open engineering question to verify in commit 3.** Whether the
+`EnabledImage` → `ManifestRef` resolution path in
+`image_prefetch.rs` is already shaped to be called from
+non-host-agent code, or whether a small refactor is needed to
+expose it. If the latter, commit 3 includes the lift; if the
+former, it imports straight through.
+
+**Out of scope (filed as follow-ups, NOT in this milestone):**
+
+- **State / sidecar / manifest prefix sweeps.** Same shape; not
+  growing fast enough today to motivate.
+- **OCI tier-3 fallback wiring in the shared chunk store** (ADR
+  0015 M5 constraint #3). Independent of Phase C correctness;
+  useful prefetch resilience but its own work item.
+- **`BlobStorage::head` returning real `last_modified`.** Phase C
+  sidesteps this by tracking timestamps in PG. Worth doing for
+  other reasons but not Phase C scope.
 
 ### Why a separate ADR
 
