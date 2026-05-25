@@ -582,13 +582,29 @@ Tests:
 
 ### Dev-vm verification
 
-The local dev-vm (`engram-dev`) didn't exist at the time of this
-chain (no instance under that name in `cortex-internal-tooling`).
-`just check` workspace-wide passed (825 tests, 21 skipped) at the
-Phase C boundary; the Postgres integration tests run in CI's
-Postgres-gated lane; the e2e admin-shape test runs in
-test-e2e-stack. Full alive-source relocate against a 2-host
-fixture awaits the follow-up.
+Validated on `engram-dev` (project `cortex-test-1608327238078`,
+zone `us-west2-a`):
+
+- **Linux clippy** (`cargo clippy -p engram-coordinator
+  -p engram-host-agent --all-targets -- -D warnings`) clean after a
+  follow-up commit that fixed three issues macOS clippy didn't
+  flag: `redundant_closure` on
+  `unwrap_or_else(|| SandboxId::new())`, `unwrap_or_default` on the
+  same site under SandboxId's Default impl, and two test-scaffolding
+  PG FK / hostname-collision issues in `admin_evac_live_pg`.
+- **CI-shape Postgres-gated suite** (`cargo nextest run
+  -p engram-coordinator --test ha_listener --test
+  snapshot_disk_manifest_persistence --test chunk_gc_helpers_live_pg
+  --test admin_chunk_gc_live_pg --test admin_evac_live_pg
+  --run-ignored ignored-only --test-threads=1`): **17/17 pass**,
+  including all 4 new `admin_evac_live_pg` tests.
+- **Mac-side `just check`** workspace-wide passed (825 tests, 21
+  skipped) at the Phase C boundary.
+
+Full alive-source relocate against a 2-host integration fixture
+still awaits the follow-up (single-host `integration-up.sh` can't
+demonstrate the relocate step). The PG integration tests cover the
+same orchestration paths deterministically against real PG.
 
 ### Closing notes
 
