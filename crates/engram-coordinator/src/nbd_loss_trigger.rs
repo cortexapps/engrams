@@ -211,7 +211,10 @@ pub async fn process_unhealthy(
             }
             Err(EvacError::NoRecoverableState) => {
                 // No state to relocate. Drive to Dead.
-                if let Err(e) = meta.transition_session(session_id, SessionState::Dead).await {
+                if let Err(e) = meta
+                    .transition_session(session_id, SessionState::Dead)
+                    .await
+                {
                     tracing::warn!(
                         %session_id,
                         error = %e,

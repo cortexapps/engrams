@@ -93,8 +93,7 @@ mod tests {
             serde_json::json!({"kind": "memory", "reason": "source-dead-no-snapshot"})
         );
 
-        let back: EvacLoss =
-            serde_json::from_value(serde_json::json!({"kind": "none"})).unwrap();
+        let back: EvacLoss = serde_json::from_value(serde_json::json!({"kind": "none"})).unwrap();
         assert_eq!(back, EvacLoss::None);
     }
 

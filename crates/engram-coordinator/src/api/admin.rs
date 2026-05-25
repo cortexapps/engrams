@@ -431,8 +431,7 @@ pub async fn evacuate_session(
         }
         t
     } else {
-        let (image_repo, image_tag) =
-            engram_core::types::session::split_image_ref(&session.image);
+        let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
         // Image-ready filter: only consider hosts that have prefetched
         // the session's image. The session was created with a digest
         // gate; we re-resolve it here from enabled_images so the
@@ -455,17 +454,18 @@ pub async fn evacuate_session(
             required_image_digest: digest,
             exclude_host: Some(source_host),
         };
-        let (picked, _backend) = state
-            .host_registry
-            .pick_for_session(&ctx)
-            .map_err(|e| match e {
-                crate::host_registry::PickError::ImageNotReady(d) => {
-                    ApiError::Internal(format!("evac: image not ready on any peer: {d}"))
-                }
-                crate::host_registry::PickError::NoCapacity => {
-                    ApiError::Internal("evac: no peer host has capacity".into())
-                }
-            })?;
+        let (picked, _backend) =
+            state
+                .host_registry
+                .pick_for_session(&ctx)
+                .map_err(|e| match e {
+                    crate::host_registry::PickError::ImageNotReady(d) => {
+                        ApiError::Internal(format!("evac: image not ready on any peer: {d}"))
+                    }
+                    crate::host_registry::PickError::NoCapacity => {
+                        ApiError::Internal("evac: no peer host has capacity".into())
+                    }
+                })?;
         picked
     };
 

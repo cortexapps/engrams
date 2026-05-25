@@ -37,8 +37,12 @@ use crate::host_registry::{HostRegistry, PickError, ScheduleContext};
 /// failed for retry / telemetry decisions.
 #[derive(Debug)]
 pub enum EvacError {
-    TargetIsSource { target: HostId },
-    TargetNotRegistered { target: HostId },
+    TargetIsSource {
+        target: HostId,
+    },
+    TargetNotRegistered {
+        target: HostId,
+    },
     SourceLookup(SandboxError),
     SnapshotFailed(SandboxError),
     RestoreFailed(SandboxError),
@@ -67,7 +71,10 @@ impl std::fmt::Display for EvacError {
             Self::RestoreFailed(e) => write!(f, "target-side restore failed: {e}"),
             Self::Rebind(e) => write!(f, "PG rebind failed: {e}"),
             Self::NoRecoverableState => {
-                write!(f, "no snapshot or live disk manifest — session cannot be evacuated")
+                write!(
+                    f,
+                    "no snapshot or live disk manifest — session cannot be evacuated"
+                )
             }
             Self::NoTargetAvailable(e) => write!(f, "no host could accept the relocate: {e:?}"),
         }
@@ -146,11 +153,12 @@ pub async fn evacuate_to(
             target: target_host,
         });
     }
-    let target_backend = registry
-        .backend_of(target_host)
-        .ok_or(EvacError::TargetNotRegistered {
-            target: target_host,
-        })?;
+    let target_backend =
+        registry
+            .backend_of(target_host)
+            .ok_or(EvacError::TargetNotRegistered {
+                target: target_host,
+            })?;
 
     // 2. Source-side: snapshot. Captures memory + disk via the
     //    existing host.snapshot() flow. ADR 0016 Phase B's continuous
@@ -285,10 +293,10 @@ pub async fn evacuate_dead_source(
     let old_sandbox_id = session.sandbox_id;
 
     let disk_manifest = pick_evac_disk_manifest(
-        session.live_disk_manifest.clone(),
-        snapshot.as_ref().and_then(|s| s.disk_manifest.clone()),
+        session.live_disk_manifest,
+        snapshot.as_ref().and_then(|s| s.disk_manifest),
     );
-    let memory_manifest = snapshot.as_ref().and_then(|s| s.memory_manifest.clone());
+    let memory_manifest = snapshot.as_ref().and_then(|s| s.memory_manifest);
 
     if disk_manifest.is_none() && memory_manifest.is_none() {
         return Err(EvacError::NoRecoverableState);
@@ -456,7 +464,9 @@ mod tests {
         async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
             self.calls.lock().push(format!("snapshot:{id}"));
             if self.fail_snapshot.load(Ordering::SeqCst) > 0 {
-                return Err(SandboxError::Vm(Box::new(SimpleErr("snapshot failed".into()))));
+                return Err(SandboxError::Vm(Box::new(SimpleErr(
+                    "snapshot failed".into(),
+                ))));
             }
             Ok(SnapshotMetadata {
                 id: engram_core::SnapshotId::new(),
@@ -483,12 +493,19 @@ mod tests {
         async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
             self.calls.lock().push("restore".into());
             if self.fail_restore.load(Ordering::SeqCst) > 0 {
-                return Err(SandboxError::Vm(Box::new(SimpleErr("restore failed".into()))));
+                return Err(SandboxError::Vm(Box::new(SimpleErr(
+                    "restore failed".into(),
+                ))));
             }
-            Ok(self
-                .next_restore_id
-                .lock()
-                .unwrap_or_else(|| SandboxId::new()))
+            // FakeBackend tests always preload a restore id; the
+            // fallback is just defensive against a misconfigured test.
+            // Lifted out of unwrap_or_else / unwrap_or to dodge clippy's
+            // unwrap_or_default lint (Default would mint a nil UUID,
+            // which would mask test bugs vs. a fresh id flagging them).
+            Ok(match *self.next_restore_id.lock() {
+                Some(id) => id,
+                None => SandboxId::new(),
+            })
         }
         async fn start_agent(
             &self,
@@ -834,9 +851,15 @@ mod tests {
         registry.register(target_host, target_be.clone());
         registry.record_sandbox_owner(old_sandbox, source_host);
 
-        let receipt = evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, target_host)
-            .await
-            .expect("happy path should succeed");
+        let receipt = evacuate_to(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session_id,
+            old_sandbox,
+            target_host,
+        )
+        .await
+        .expect("happy path should succeed");
 
         assert_eq!(receipt.new_host_id, target_host);
         assert_eq!(receipt.new_sandbox_id, new_sandbox);
@@ -849,9 +872,7 @@ mod tests {
             "source should snapshot: {src_calls:?}",
         );
         assert!(
-            src_calls
-                .iter()
-                .any(|c| c.starts_with("commit_snapshot:")),
+            src_calls.iter().any(|c| c.starts_with("commit_snapshot:")),
             "source should commit_snapshot: {src_calls:?}",
         );
         assert!(
@@ -895,8 +916,14 @@ mod tests {
         registry.register(target_host, target_be.clone());
         registry.record_sandbox_owner(old_sandbox, source_host);
 
-        let result =
-            evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, target_host).await;
+        let result = evacuate_to(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session_id,
+            old_sandbox,
+            target_host,
+        )
+        .await;
         assert!(matches!(result, Err(EvacError::SnapshotFailed(_))));
 
         // No restore on target.
@@ -931,13 +958,22 @@ mod tests {
         registry.register(target_host, target_be.clone());
         registry.record_sandbox_owner(old_sandbox, source_host);
 
-        let result =
-            evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, target_host).await;
+        let result = evacuate_to(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session_id,
+            old_sandbox,
+            target_host,
+        )
+        .await;
         assert!(matches!(result, Err(EvacError::RestoreFailed(_))));
 
         // Source-side: snapshot ran, then abort_snapshot ran.
         let src = source_be.calls();
-        assert!(src.iter().any(|c| c.starts_with("abort_snapshot:")), "{src:?}");
+        assert!(
+            src.iter().any(|c| c.starts_with("abort_snapshot:")),
+            "{src:?}"
+        );
         // No destroy — the source still owns the sandbox.
         assert!(src.iter().all(|c| !c.starts_with("destroy:")), "{src:?}");
 
@@ -965,8 +1001,14 @@ mod tests {
         registry.register(source_host, source_be.clone());
         registry.record_sandbox_owner(old_sandbox, source_host);
 
-        let result =
-            evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, source_host).await;
+        let result = evacuate_to(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session_id,
+            old_sandbox,
+            source_host,
+        )
+        .await;
         assert!(matches!(result, Err(EvacError::TargetIsSource { .. })));
         assert!(source_be.calls().is_empty(), "no calls on source");
     }
@@ -989,8 +1031,14 @@ mod tests {
         registry.register(source_host, source_be.clone());
         registry.record_sandbox_owner(old_sandbox, source_host);
 
-        let result =
-            evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, bogus_target).await;
+        let result = evacuate_to(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session_id,
+            old_sandbox,
+            bogus_target,
+        )
+        .await;
         assert!(matches!(result, Err(EvacError::TargetNotRegistered { .. })));
         assert!(source_be.calls().is_empty(), "no calls on source");
     }
@@ -1195,34 +1243,22 @@ mod tests {
     fn pick_disk_prefers_live_only_when_newer_same_lineage() {
         let live = fake_manifest(0xAA, 5);
         let snap = fake_manifest(0xAA, 3);
-        assert_eq!(
-            pick_evac_disk_manifest(Some(live.clone()), Some(snap.clone())),
-            Some(live)
-        );
+        assert_eq!(pick_evac_disk_manifest(Some(live), Some(snap)), Some(live));
     }
 
     #[test]
     fn pick_disk_falls_back_to_snapshot_on_different_lineage() {
         let live = fake_manifest(0xAA, 99);
         let snap = fake_manifest(0xBB, 1);
-        assert_eq!(
-            pick_evac_disk_manifest(Some(live), Some(snap.clone())),
-            Some(snap),
-        );
+        assert_eq!(pick_evac_disk_manifest(Some(live), Some(snap)), Some(snap),);
     }
 
     #[test]
     fn pick_disk_handles_either_none() {
         let snap = fake_manifest(0xAA, 1);
-        assert_eq!(
-            pick_evac_disk_manifest(None, Some(snap.clone())),
-            Some(snap.clone())
-        );
+        assert_eq!(pick_evac_disk_manifest(None, Some(snap)), Some(snap));
         let live = fake_manifest(0xBB, 1);
-        assert_eq!(
-            pick_evac_disk_manifest(Some(live.clone()), None),
-            Some(live)
-        );
+        assert_eq!(pick_evac_disk_manifest(Some(live), None), Some(live));
         assert_eq!(pick_evac_disk_manifest(None, None), None);
     }
 
@@ -1258,10 +1294,15 @@ mod tests {
         // would return HostLost status and the resolver would error.
         registry.record_sandbox_owner(old_sandbox, source_host);
 
-        let receipt =
-            evacuate_to(&registry, &(meta.clone() as Arc<dyn MetadataStore>), session_id, old_sandbox, target_host)
-                .await
-                .expect("HostLost path should succeed via cache hit");
+        let receipt = evacuate_to(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session_id,
+            old_sandbox,
+            target_host,
+        )
+        .await
+        .expect("HostLost path should succeed via cache hit");
 
         assert_eq!(receipt.loss, EvacLoss::None);
 

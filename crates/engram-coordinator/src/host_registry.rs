@@ -1278,7 +1278,10 @@ mod tests {
             exclude_host: Some(source),
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
-        assert_eq!(picked, peer, "exclude_host must drop the source from candidates");
+        assert_eq!(
+            picked, peer,
+            "exclude_host must drop the source from candidates"
+        );
     }
 
     /// `exclude_host` with no other candidates → NoCapacity. The
