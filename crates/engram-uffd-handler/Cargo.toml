@@ -51,6 +51,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 # Linux-only: userfaultfd is a Linux kernel surface. The crate
 # itself doesn't gate by target_os; we do here so a workspace-wide

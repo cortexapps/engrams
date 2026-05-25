@@ -140,6 +140,15 @@ jobs:
           # already-compiled.
           shared-key: workspace-debug
 
+      # Install cargo-hakari from a prebuilt release (~1s) so we can
+      # `cargo hakari verify` below. The dev shell pulls this from
+      # nixpkgs; CI uses taiki-e/install-action to avoid a slow
+      # `cargo install` from source.
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+
       # `if: always()` so each gate runs regardless of which earlier
       # step failed — surfaces fmt + clippy + check failures together
       # in one CI run instead of forcing a fix-and-rerun loop. The job
@@ -154,6 +163,12 @@ jobs:
       - name: cargo check --workspace --all-targets
         if: always()
         run: cargo check --workspace --all-targets
+      # Catch dep additions that didn't regenerate workspace-hack.
+      # Run `just hakari` (or `cargo hakari generate`) locally and
+      # commit `workspace-hack/Cargo.toml` if this fails.
+      - name: cargo hakari verify
+        if: always()
+        run: cargo hakari verify
 
   test-linux:
     name: tests (linux)

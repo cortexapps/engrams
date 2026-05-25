@@ -30,6 +30,7 @@ members = [
     "crates/engram-storage-local",
     "crates/engram-storage-s3",
     "crates/engram-storage-gcs",
+    "workspace-hack",
 ]
 
 [workspace.package]

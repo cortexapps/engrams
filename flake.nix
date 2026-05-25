@@ -37,6 +37,11 @@
             cargo-nextest             # parallel test runner; `just check`
                                        # uses it for ~3-5× speedup over
                                        # `cargo test --workspace`.
+            cargo-hakari              # workspace-hack feature-unifier.
+                                       # See `workspace-hack/` and
+                                       # `.config/hakari.toml`. `cargo
+                                       # hakari verify` runs in CI to
+                                       # keep the union current.
             pkg-config
             openssl
             protobuf                # protoc, for tonic-build when grpc lands
