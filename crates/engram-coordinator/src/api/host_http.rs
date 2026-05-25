@@ -255,6 +255,12 @@ pub struct HeartbeatRequest {
     /// placement on `ready_images.contains(&digest)`.
     #[serde(default)]
     pub ready_images: Vec<ManifestDigest>,
+    /// ADR 0018 Phase B: sandbox IDs whose backing `/dev/nbdN` has
+    /// failed health probes. Coord's heartbeat handler (commit 5)
+    /// fires the evacuation primitive against each entry.
+    /// `#[serde(default)]` for back-compat with pre-Phase-B hosts.
+    #[serde(default)]
+    pub nbd_unhealthy: Vec<SandboxId>,
 }
 
 #[derive(Serialize)]
@@ -316,6 +322,18 @@ pub async fn heartbeat(
             host_id = %host_id,
             count = flipped.len(),
             "heartbeat reconcile flipped missing-sandbox sessions",
+        );
+    }
+
+    // ADR 0018 Phase B: placeholder NBD-unhealthy observability. Real
+    // evac trigger lands in commit 5; this log just confirms the
+    // field is flowing end-to-end so operators can validate the
+    // protocol upgrade independent of the trigger ship.
+    if !hb.nbd_unhealthy.is_empty() {
+        tracing::info!(
+            host_id = %host_id,
+            count = hb.nbd_unhealthy.len(),
+            "heartbeat reports nbd-unhealthy sandboxes (trigger wiring lands in commit 5)",
         );
     }
 

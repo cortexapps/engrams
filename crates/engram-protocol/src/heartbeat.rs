@@ -37,6 +37,19 @@ pub struct Heartbeat {
     /// the host-agent's `image_prefetch` supervisor.
     #[serde(default)]
     pub ready_images: Vec<ManifestDigest>,
+    /// ADR 0018 Phase B: sandbox IDs whose backing `/dev/nbdN` has
+    /// failed health probes for N consecutive checks (default 3 × 5s
+    /// = 15s of degraded I/O). Coord's per-heartbeat consumer fires
+    /// the evacuation primitive against each entry, relocating the
+    /// affected session to a peer host with `EvacLoss::Memory`
+    /// (the source disk is unreachable for a fresh memory snapshot).
+    ///
+    /// Empty in the common case. The probe lives in
+    /// `engram-host-agent::disk_daemon`; `#[serde(default)]` so
+    /// hosts running older builds (pre-Phase-B) interop cleanly
+    /// against this coord.
+    #[serde(default)]
+    pub nbd_unhealthy: Vec<SandboxId>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -131,6 +144,7 @@ mod tests {
             running_sandboxes: vec![SandboxId::new(), SandboxId::new()],
             draining: false,
             ready_images: Vec::new(),
+            nbd_unhealthy: Vec::new(),
         }
     }
 

@@ -375,6 +375,12 @@ pub struct HeartbeatRequest {
     /// `ready_images.contains(digest)`.
     #[serde(default)]
     pub ready_images: Vec<engram_protocol::heartbeat::ManifestDigest>,
+    /// ADR 0018 Phase B: sandbox IDs whose backing `/dev/nbdN` is
+    /// degraded. Coord-side trigger (commit 5) relocates each.
+    /// `#[serde(default)]` so older coords ignore the field on rolling
+    /// upgrade.
+    #[serde(default)]
+    pub nbd_unhealthy: Vec<engram_core::SandboxId>,
 }
 
 #[derive(Deserialize)]
