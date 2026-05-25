@@ -347,3 +347,139 @@ pub async fn flush_now(
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// ADR 0016 Phase C — chunk-GC admin endpoints
+// ---------------------------------------------------------------------
+//
+// Three routes mirror the `reap_materialize_dir` shape: explicit
+// triggers for the primitives the background sweep loop in
+// `chunk_gc.rs` drives implicitly. Tests + ops fire these without
+// waiting on the hourly cadence.
+
+#[derive(serde::Deserialize, Default)]
+pub struct ChunkGcSweepParams {
+    /// Override the grace period (seconds) for this sweep only.
+    /// Used by tests to knock 24h → 0 so candidates promote
+    /// immediately. Operators typically leave unset and trust the
+    /// configured default.
+    pub grace_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct ChunkGcSweepResult {
+    pub listed_chunks: usize,
+    pub malformed_keys: usize,
+    pub pin_set_size: usize,
+    pub candidates_marked: usize,
+    pub restart_count: u32,
+    pub restart_budget_exhausted: bool,
+    pub promoted_deletes: usize,
+    pub promote_delete_errors: usize,
+    /// Echoes the grace_secs used (whether from query override or
+    /// the config default). Diagnostic for the
+    /// "promoted_deletes=0, why?" investigation path.
+    pub grace_secs: u64,
+}
+
+impl From<(crate::chunk_gc::SweepReport, u64)> for ChunkGcSweepResult {
+    fn from(value: (crate::chunk_gc::SweepReport, u64)) -> Self {
+        let (r, grace_secs) = value;
+        Self {
+            listed_chunks: r.listed_chunks,
+            malformed_keys: r.malformed_keys,
+            pin_set_size: r.pin_set_size,
+            candidates_marked: r.candidates_marked,
+            restart_count: r.restart_count,
+            restart_budget_exhausted: r.restart_budget_exhausted,
+            promoted_deletes: r.promoted_deletes,
+            promote_delete_errors: r.promote_delete_errors,
+            grace_secs,
+        }
+    }
+}
+
+/// `POST /api/admin/chunk-gc/dry-run` — classify + count, no
+/// writes. Operator-safe to fire any time.
+pub async fn chunk_gc_dry_run(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
+) -> Result<Json<ChunkGcSweepResult>, ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = params.grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let grace_secs = cfg.grace_period.as_secs();
+    let report = crate::chunk_gc::run_one_sweep(&state, &cfg, crate::chunk_gc::SweepMode::DryRun)
+        .await
+        .map_err(|e| ApiError::Internal(format!("chunk-gc dry-run: {e}")))?;
+    Ok(Json((report, grace_secs).into()))
+}
+
+/// `POST /api/admin/chunk-gc/sweep` — full pipeline: candidate
+/// upserts + promote pass (BlobStorage deletes). Same primitive
+/// the background loop fires; the endpoint is the test seam plus
+/// the operator-driven path for "I want this to drain *now*."
+pub async fn chunk_gc_sweep(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
+) -> Result<Json<ChunkGcSweepResult>, ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = params.grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let grace_secs = cfg.grace_period.as_secs();
+    let report = crate::chunk_gc::run_one_sweep(&state, &cfg, crate::chunk_gc::SweepMode::Full)
+        .await
+        .map_err(|e| ApiError::Internal(format!("chunk-gc sweep: {e}")))?;
+    Ok(Json((report, grace_secs).into()))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ChunkGcCandidatesParams {
+    /// Max rows to return. Default 100, cap 10_000.
+    pub limit: Option<i64>,
+    /// Optional `first_seen_at` upper bound (RFC3339). When set,
+    /// only candidates older than this are returned — useful for
+    /// "what would the next promote pass delete?" inspection.
+    pub before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Serialize)]
+pub struct ChunkGcCandidateView {
+    /// Lowercase hex of the chunk's sha256.
+    pub content_hash: String,
+    pub first_seen_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+pub struct ChunkGcCandidatesResult {
+    pub candidates: Vec<ChunkGcCandidateView>,
+}
+
+/// `GET /api/admin/chunk-gc/candidates` — read the candidate
+/// table. Paged; default 100 rows, max 10_000. Oldest
+/// `first_seen_at` comes first so operators see the leading edge
+/// of the promote-pass queue.
+pub async fn chunk_gc_candidates(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcCandidatesParams>,
+) -> Result<Json<ChunkGcCandidatesResult>, ApiError> {
+    let limit = params.limit.unwrap_or(100).clamp(1, 10_000);
+    let rows = state
+        .services
+        .meta
+        .list_gc_candidates(limit, params.before)
+        .await
+        .map_err(|e| ApiError::Internal(format!("list_gc_candidates: {e}")))?;
+    let candidates = rows
+        .into_iter()
+        .map(|r| ChunkGcCandidateView {
+            content_hash: r.content_hash.iter().map(|b| format!("{b:02x}")).collect(),
+            first_seen_at: r.first_seen_at,
+            last_seen_at: r.last_seen_at,
+        })
+        .collect();
+    Ok(Json(ChunkGcCandidatesResult { candidates }))
+}

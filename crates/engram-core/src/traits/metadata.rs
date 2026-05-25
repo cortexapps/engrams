@@ -585,6 +585,30 @@ pub trait MetadataStore: Send + Sync {
     async fn delete_gc_candidates(&self, _hashes: &[[u8; 32]]) -> Result<(), MetaError> {
         Ok(())
     }
+
+    /// ADR 0016 Phase C: paged read of the candidate table for the
+    /// `GET /api/admin/chunk-gc/candidates` operator surface. When
+    /// `before` is `Some`, filters to rows where `first_seen_at <
+    /// before` (matches the promote-pass shape but exposed for
+    /// inspection). When `None`, returns everything up to `limit`.
+    /// Ordered by `first_seen_at` ascending so the oldest backlog
+    /// comes first.
+    async fn list_gc_candidates(
+        &self,
+        _limit: i64,
+        _before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<GcCandidateRow>, MetaError> {
+        Ok(Vec::new())
+    }
+}
+
+/// One row from [`MetadataStore::list_gc_candidates`]. Surfaced
+/// verbatim through the admin `GET /chunk-gc/candidates` endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcCandidateRow {
+    pub content_hash: [u8; 32],
+    pub first_seen_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Outcome of [`MetadataStore::update_live_disk_manifest`].

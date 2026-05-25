@@ -1536,6 +1536,73 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    /// ADR 0016 Phase C: paged read of the candidate table for the
+    /// admin GET endpoint. ORDER BY first_seen_at ASC matches the
+    /// promote-pass shape so operators see the oldest backlog
+    /// first.
+    async fn list_gc_candidates(
+        &self,
+        limit: i64,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<engram_core::traits::GcCandidateRow>, MetaError> {
+        let rows = if let Some(cutoff) = before {
+            sqlx::query_as::<
+                _,
+                (
+                    Vec<u8>,
+                    chrono::DateTime<chrono::Utc>,
+                    chrono::DateTime<chrono::Utc>,
+                ),
+            >(
+                "SELECT content_hash, first_seen_at, last_seen_at
+                   FROM chunk_gc_candidates
+                  WHERE first_seen_at < $1
+                  ORDER BY first_seen_at
+                  LIMIT $2",
+            )
+            .bind(cutoff)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        } else {
+            sqlx::query_as::<
+                _,
+                (
+                    Vec<u8>,
+                    chrono::DateTime<chrono::Utc>,
+                    chrono::DateTime<chrono::Utc>,
+                ),
+            >(
+                "SELECT content_hash, first_seen_at, last_seen_at
+                   FROM chunk_gc_candidates
+                  ORDER BY first_seen_at
+                  LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (bytes, first_seen_at, last_seen_at) in rows {
+            if bytes.len() != 32 {
+                return Err(MetaError::Serialization(format!(
+                    "chunk_gc_candidates.content_hash has {} bytes, expected 32",
+                    bytes.len()
+                )));
+            }
+            let mut content_hash = [0u8; 32];
+            content_hash.copy_from_slice(&bytes);
+            out.push(engram_core::traits::GcCandidateRow {
+                content_hash,
+                first_seen_at,
+                last_seen_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// ADR 0016 Phase C: batch-delete candidate rows. Empty input
     /// is a no-op (skip the round-trip). PG handles the array via
     /// `ANY($1::bytea[])`.

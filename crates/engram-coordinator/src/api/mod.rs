@@ -109,6 +109,19 @@ pub fn router(state: SharedState) -> Router {
         // an immediate flush + publish round-trip without sleeping a
         // 30s scheduler tick.
         .route("/api/admin/sessions/:id/flush-now", post(admin::flush_now))
+        // ADR 0016 Phase C commit 5: explicit admin triggers for the
+        // chunk-GC sweep + candidate-table inspection. The background
+        // loop is the implicit production driver
+        // (per [explicit_admin_triggers_for_testability]); these are
+        // the test seam + operator-driven counterparts. Both POSTs
+        // accept `?grace_secs=N` so the e2e test in commit 6a can
+        // knock the 24h grace down to 0 without env juggling.
+        .route("/api/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
+        .route("/api/admin/chunk-gc/sweep", post(admin::chunk_gc_sweep))
+        .route(
+            "/api/admin/chunk-gc/candidates",
+            get(admin::chunk_gc_candidates),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,
