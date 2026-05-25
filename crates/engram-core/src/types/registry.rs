@@ -189,6 +189,14 @@ pub struct EnabledImage {
     /// toml. Used to short-circuit refresh: if the registry's tag
     /// still resolves to the same digest, the row is already current.
     pub manifest_digest: String,
+    /// ADR 0016 Phase C: the bake's chunked-disk `ManifestRef`,
+    /// parsed from bundle.json at materialize-time. `None` for
+    /// harness-only images (no chunked-disk artifact). Phase C's
+    /// pin-set reads this directly to enumerate "the chunks every
+    /// enabled image points at"; without persistence, the coord
+    /// would have to re-pull bundle.json from OCI on every sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_manifest: Option<crate::types::manifest::ManifestRef>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,

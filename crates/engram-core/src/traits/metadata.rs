@@ -489,13 +489,25 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0016 Phase C: enumerate every chunked-disk `ManifestRef`
+    /// currently advertised by an `enabled_images` row. Pin-set
+    /// source #1: every enabled chunked image pins its base
+    /// manifest's chunks. Harness-only images (NULL `disk_manifest_*`
+    /// columns) drop out of the query naturally via the partial
+    /// index from migration 0036.
+    ///
+    /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
+    /// returns DISTINCT (id, version) tuples wrapped as `ManifestRef`.
+    async fn list_enabled_image_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// ADR 0016 Phase C: enumerate every `(live_disk_manifest_id,
     /// live_disk_manifest_version)` pair currently advertised by a
-    /// session row. One of the three pin-set sources unioned by the
-    /// GC sweep (the other two are `list_live_disk_manifest_ids` /
-    /// `list_live_memory_manifest_ids` over snapshots, and
-    /// enabled-image manifest resolution which lives in
-    /// `engram-chunk-store::gc`).
+    /// session row. Pin-set source #2 (the other two are
+    /// `list_enabled_image_disk_manifest_ids` and
+    /// `list_live_disk_manifest_ids` / `list_live_memory_manifest_ids`
+    /// over snapshots).
     ///
     /// Returns DISTINCT (id, version) tuples wrapped as `ManifestRef`.
     /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl

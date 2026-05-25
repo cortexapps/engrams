@@ -300,6 +300,7 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
         image_uri: image_uri.clone(),
         manifest_toml: "image = { uri = \"test\" }\n".into(),
         manifest_digest: format!("sha256:{:064x}", 0xdeadbeefu32),
+        disk_manifest: None,
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,
@@ -332,5 +333,93 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
     );
 
     // Cleanup so re-runs against the same DB stay independent.
+    meta.delete_enabled_image(&image_uri).await.expect("delete");
+}
+
+// ---- Commit 3a: enabled_images.disk_manifest_* round-trip + pin-set ----
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+
+    let image_uri = format!("phase-c-3a-disk-ref-test:warm-{}", Uuid::new_v4());
+    let mref = ManifestRef {
+        manifest_id: Uuid::new_v4(),
+        version: 13,
+    };
+
+    // Pre-write: pin-set source #1 must NOT contain our fresh ref.
+    let before = meta
+        .list_enabled_image_disk_manifest_ids()
+        .await
+        .expect("list before");
+    assert!(
+        !before.iter().any(|r| r.manifest_id == mref.manifest_id),
+        "fresh manifest id appeared before being written",
+    );
+
+    let image = EnabledImage {
+        id: Uuid::new_v4(),
+        image_uri: image_uri.clone(),
+        manifest_toml: "image = { uri = \"test\" }\n".into(),
+        manifest_digest: format!("sha256:{:064x}", 0xfeedfaceu32),
+        disk_manifest: Some(mref),
+        last_refreshed_at: Utc::now(),
+        created_at: Utc::now(),
+        updated_at: None,
+    };
+    meta.upsert_enabled_image(image.clone())
+        .await
+        .expect("upsert with disk_manifest");
+
+    // get_enabled_image must round-trip the disk_manifest field.
+    let fetched = meta
+        .get_enabled_image(&image_uri)
+        .await
+        .expect("get")
+        .expect("row must exist");
+    assert_eq!(
+        fetched.disk_manifest,
+        Some(mref),
+        "disk_manifest must round-trip through PG",
+    );
+
+    // Pin-set query picks it up.
+    let after = meta
+        .list_enabled_image_disk_manifest_ids()
+        .await
+        .expect("list after");
+    let hit = after
+        .iter()
+        .find(|r| r.manifest_id == mref.manifest_id)
+        .expect("disk_manifest not surfaced by pin-set query");
+    assert_eq!(
+        hit.version, mref.version,
+        "version must round-trip via the pin-set query",
+    );
+
+    // Harness-only re-upsert (disk_manifest = None) drops the row
+    // out of the pin set. This is the "image refresh dropped its
+    // chunked artifact" path — surfaces as None in PG, and the
+    // partial index excludes it from the pin-set scan.
+    let mut harness_only = image.clone();
+    harness_only.disk_manifest = None;
+    meta.upsert_enabled_image(harness_only)
+        .await
+        .expect("upsert harness-only");
+    let after_clear = meta
+        .list_enabled_image_disk_manifest_ids()
+        .await
+        .expect("list after clear");
+    assert!(
+        !after_clear
+            .iter()
+            .any(|r| r.manifest_id == mref.manifest_id),
+        "harness-only row must drop out of the pin-set query",
+    );
+
     meta.delete_enabled_image(&image_uri).await.expect("delete");
 }

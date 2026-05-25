@@ -1085,24 +1085,34 @@ impl MetadataStore for PostgresStore {
         // separate `materialize_disk_chunks` code BEFORE this
         // method is called; the window between materialize and
         // row-insert is what the barrier closes.
+        //
+        // Commit 3a additionally persists `disk_manifest_{id,version}`
+        // — the bake's ManifestRef, parsed from bundle.json — so the
+        // Phase C pin-set query is a pure PG SELECT (no OCI re-pull
+        // per sweep).
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         sqlx::query(
             r#"
             INSERT INTO enabled_images
                 (id, image_uri, manifest_toml, manifest_digest,
+                 disk_manifest_id, disk_manifest_version,
                  last_refreshed_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
             ON CONFLICT (image_uri) DO UPDATE SET
-                manifest_toml     = EXCLUDED.manifest_toml,
-                manifest_digest   = EXCLUDED.manifest_digest,
-                last_refreshed_at = EXCLUDED.last_refreshed_at,
-                updated_at        = NOW()
+                manifest_toml         = EXCLUDED.manifest_toml,
+                manifest_digest       = EXCLUDED.manifest_digest,
+                disk_manifest_id      = EXCLUDED.disk_manifest_id,
+                disk_manifest_version = EXCLUDED.disk_manifest_version,
+                last_refreshed_at     = EXCLUDED.last_refreshed_at,
+                updated_at            = NOW()
             "#,
         )
         .bind(image.id)
         .bind(&image.image_uri)
         .bind(&image.manifest_toml)
         .bind(&image.manifest_digest)
+        .bind(image.disk_manifest.map(|m| m.manifest_id))
+        .bind(image.disk_manifest.map(|m| m.version as i64))
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
         .execute(&mut *tx)
@@ -1120,6 +1130,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
+                   disk_manifest_id, disk_manifest_version,
                    last_refreshed_at, created_at, updated_at
               FROM enabled_images
              ORDER BY image_uri
@@ -1135,6 +1146,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
+                   disk_manifest_id, disk_manifest_version,
                    last_refreshed_at, created_at, updated_at
               FROM enabled_images
              WHERE image_uri = $1
@@ -1367,7 +1379,33 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// ADR 0016 Phase C: pin-set source #3 — every session that has
+    /// ADR 0016 Phase C: pin-set source #1 — every enabled image's
+    /// chunked-disk base manifest. The partial index
+    /// `idx_enabled_images_disk_manifest` (migration 0036) skips
+    /// harness-only rows (`disk_manifest_id IS NULL`) so the scan
+    /// is bounded by chunked-image count.
+    async fn list_enabled_image_disk_manifest_ids(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT disk_manifest_id, disk_manifest_version
+               FROM enabled_images
+              WHERE disk_manifest_id IS NOT NULL
+                AND disk_manifest_version IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
+    /// ADR 0016 Phase C: pin-set source #2 — every session that has
     /// published a live disk manifest. The partial index
     /// `idx_sessions_live_disk_manifest` (migration 0034) covers the
     /// predicate so the scan is bounded by live-manifest count, not

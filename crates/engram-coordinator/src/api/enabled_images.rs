@@ -69,8 +69,11 @@ pub async fn enable_image(
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    let (row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    materialize_disk_chunks(&state, &artifacts).await?;
+    let (mut row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
+    // ADR 0016 Phase C commit 3a: stamp the bake's ManifestRef on
+    // the row so the GC pin-set can read it back without re-pulling
+    // bundle.json from OCI on every sweep. `None` for harness-only.
+    row.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
     state
         .services
         .meta
@@ -118,7 +121,7 @@ pub async fn refresh_enabled_image(
     refreshed.created_at = existing.created_at;
     refreshed.updated_at = Some(Utc::now());
 
-    materialize_disk_chunks(&state, &artifacts).await?;
+    refreshed.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
     state
         .services
         .meta
@@ -186,6 +189,9 @@ async fn fetch_and_seal_manifest(
         image_uri: image_uri.to_string(),
         manifest_toml,
         manifest_digest: artifacts.manifest_digest.as_str().to_string(),
+        // Stamped by the caller after `materialize_disk_chunks`
+        // returns the bake's ManifestRef (or `None` for harness-only).
+        disk_manifest: None,
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
@@ -204,13 +210,16 @@ async fn fetch_and_seal_manifest(
 async fn materialize_disk_chunks(
     state: &SharedState,
     artifacts: &engram_oci::TemplateArtifacts,
-) -> Result<(), ApiError> {
+) -> Result<Option<engram_core::types::manifest::ManifestRef>, ApiError> {
     let (Some(boot), Some(blob_bytes), Some(bundle_json)) = (
         artifacts.disk_bootstrap_json.as_deref(),
         artifacts.disk_chunks_blob.as_deref(),
         artifacts.bundle_json.as_deref(),
     ) else {
-        return Ok(());
+        // Harness-only image: no chunked-disk artifact to materialize,
+        // no ManifestRef to stamp on the row. Pin-set will skip it
+        // via the partial index on `disk_manifest_id`.
+        return Ok(None);
     };
     let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(boot)
         .map_err(|e| ApiError::Internal(format!("parse disk bootstrap json: {e}")))?;
@@ -243,7 +252,7 @@ async fn materialize_disk_chunks(
         manifest = %manifest_ref,
         "materialized disk chunks into BlobStorage",
     );
-    Ok(())
+    Ok(Some(manifest_ref))
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`

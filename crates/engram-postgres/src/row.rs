@@ -187,11 +187,29 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     let last_refreshed_at: DateTime<Utc> = row.try_get("last_refreshed_at").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
+    // ADR 0016 Phase C: both-or-neither CHECK in migration 0036 keeps
+    // these coherent; tuple match unifies them into one Option.
+    let disk_manifest_id: Option<Uuid> = row.try_get("disk_manifest_id").map_err(col_err)?;
+    let disk_manifest_version: Option<i64> =
+        row.try_get("disk_manifest_version").map_err(col_err)?;
+    let disk_manifest = match (disk_manifest_id, disk_manifest_version) {
+        (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: id,
+            version: v as u64,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(MetaError::Serialization(
+                "enabled_images.disk_manifest_{id,version} CHECK violated — one side NULL".into(),
+            ));
+        }
+    };
     Ok(EnabledImage {
         id,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
         manifest_toml: row.try_get("manifest_toml").map_err(col_err)?,
         manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
+        disk_manifest,
         last_refreshed_at,
         created_at,
         updated_at,

@@ -583,6 +583,7 @@ fn seed_enabled(
             image_uri: uri.to_string(),
             manifest_toml: manifest_toml.to_string(),
             manifest_digest: digest.clone(),
+            disk_manifest: None,
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,
