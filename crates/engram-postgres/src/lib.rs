@@ -1379,6 +1379,59 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    /// ADR 0016 Phase C: pin-set source #3 — every recoverable
+    /// snapshot's chunked-disk `ManifestRef`. Filtered to
+    /// `recoverable=true`; the `idx_snapshots_disk_manifest`
+    /// partial index (migration 0018) plus the `recoverable` boolean
+    /// filter combine via PG's planner to scan only recoverable
+    /// chunked rows.
+    async fn list_recoverable_snapshot_disk_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT disk_manifest_id, disk_manifest_version
+               FROM snapshots
+              WHERE disk_manifest_id IS NOT NULL
+                AND disk_manifest_version IS NOT NULL
+                AND recoverable = TRUE",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
+    /// ADR 0016 Phase C: pin-set source #4 — memory-side mirror.
+    /// `idx_snapshots_memory_manifest` (migration 0019) +
+    /// `recoverable=TRUE` filter.
+    async fn list_recoverable_snapshot_memory_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT memory_manifest_id, memory_manifest_version
+               FROM snapshots
+              WHERE memory_manifest_id IS NOT NULL
+                AND memory_manifest_version IS NOT NULL
+                AND recoverable = TRUE",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
     /// ADR 0016 Phase C: pin-set source #1 — every enabled image's
     /// chunked-disk base manifest. The partial index
     /// `idx_enabled_images_disk_manifest` (migration 0036) skips

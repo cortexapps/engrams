@@ -43,6 +43,7 @@ pub mod bootstrap;
 pub mod cache;
 pub mod error;
 pub mod file;
+pub mod gc;
 pub mod manifest;
 pub mod resolver;
 pub mod snapshot_blob;
@@ -52,6 +53,7 @@ pub mod working_set;
 pub use bootstrap::{Bootstrap, BootstrapEntry, ParentBootstrap, BOOTSTRAP_SCHEMA_VERSION};
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
+pub use gc::{GcError, PinSet, DEFAULT_COLLECT_CONCURRENCY};
 pub use manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, ManifestRef, DEFAULT_DISK_CHUNK_SIZE,
     DEFAULT_MEMORY_CHUNK_SIZE,

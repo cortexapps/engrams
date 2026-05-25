@@ -314,6 +314,37 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// ADR 0016 Phase C: pin-set source #3 — every recoverable
+    /// snapshot's chunked-disk `ManifestRef` (id + version). Unlike
+    /// `list_live_disk_manifest_ids` (which returns Uuid-only for
+    /// the `reap_materialize_dir` reaper), the pin-set query needs
+    /// the version so `chunk_store.get_manifest` reads the exact
+    /// manifest that snapshot row depends on.
+    ///
+    /// Filtered to `recoverable=true` per the ADR's pin-set
+    /// definition: non-recoverable snapshot rows are informational
+    /// (bake-time / soft-evicted) and their chunks shouldn't keep
+    /// BlobStorage growing forever.
+    ///
+    /// Default `Ok(vec![])` keeps mocks quiet; PG override returns
+    /// DISTINCT (id, version) tuples wrapped as `ManifestRef`.
+    async fn list_recoverable_snapshot_disk_manifests(
+        &self,
+    ) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0016 Phase C: pin-set source #4 — every recoverable
+    /// snapshot's chunked-memory `ManifestRef` (id + version).
+    /// Memory-side mirror of [`list_recoverable_snapshot_disk_manifests`].
+    /// VZ snapshots (no chunked memory) drop out via the partial
+    /// index on `memory_manifest_id`.
+    async fn list_recoverable_snapshot_memory_manifests(
+        &self,
+    ) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     // ---- session event log ----
 
     /// Append an event to a session's persistent log. Returns the
