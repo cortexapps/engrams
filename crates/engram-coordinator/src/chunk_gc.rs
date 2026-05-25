@@ -25,10 +25,11 @@
 //! safety net), wakes every `ENGRAM_CHUNK_GC_INTERVAL_SECS` and
 //! calls `run_one_sweep(Full)`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use engram_chunk_store::{ChunkHash, GcError, PinSet};
+use engram_chunk_store::{ChunkHash, ChunkStore, GcError, PinSet};
 use engram_core::traits::{BlobStorage, MetadataStore};
 
 use crate::state::SharedState;
@@ -141,18 +142,38 @@ pub struct SweepReport {
     pub promote_delete_errors: usize,
 }
 
-/// Run one sweep cycle. Used by both the background loop and the
-/// admin endpoints (commit 5).
+/// Convenience wrapper that pulls `meta` / `blob` / `chunk_store`
+/// off the shared state. Background loop + admin handlers call this;
+/// integration tests in commit 6 call [`run_one_sweep_inner`]
+/// directly with their own service handles (no SharedState fixture
+/// needed).
 pub async fn run_one_sweep(
     state: &SharedState,
     cfg: &ChunkGcConfig,
     mode: SweepMode,
 ) -> Result<SweepReport, GcError> {
-    let mut report = SweepReport::default();
+    run_one_sweep_inner(
+        state.services.meta.clone(),
+        state.services.blob.clone(),
+        &state.services.chunk_store,
+        cfg,
+        mode,
+    )
+    .await
+}
 
-    let meta = state.services.meta.clone();
-    let blob = state.services.blob.clone();
-    let chunk_store = &state.services.chunk_store;
+/// Run one sweep cycle against a given set of services. The
+/// SharedState-taking [`run_one_sweep`] above wraps this for the
+/// production callers; tests bypass the wrapper to build the
+/// services they need from a real PG pool + LocalBlobStorage.
+pub async fn run_one_sweep_inner(
+    meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStorage>,
+    chunk_store: &ChunkStore,
+    cfg: &ChunkGcConfig,
+    mode: SweepMode,
+) -> Result<SweepReport, GcError> {
+    let mut report = SweepReport::default();
 
     // -------- barrier-bounded classification loop --------
     loop {
