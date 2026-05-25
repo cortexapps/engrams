@@ -250,6 +250,7 @@ jobs:
             --test snapshot_disk_manifest_persistence \
             --test chunk_gc_helpers_live_pg \
             --test admin_chunk_gc_live_pg \
+            --test admin_evac_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
