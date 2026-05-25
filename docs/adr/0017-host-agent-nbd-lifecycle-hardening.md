@@ -1,20 +1,23 @@
 # ADR 0017: Host-agent NBD lifecycle hardening on restart
 
-Status: 2026-05-24 — **Proposed**, scoped from ADR 0016 Phase B
-closing follow-ups (§"Newly-filed follow-ups"). Will flip to
-**Accepted** when the commit chain in §"Plan" lands.
+Status: 2026-05-24 — **Accepted** as of commit chain below. All three
+phases shipped; cross-restart NBD slot leakage no longer accumulates.
 
 Supersedes nothing; complements ADR 0016 (Phase B continuous sync)
 by closing the host-agent-restart story that ADR 0016 commit 7's
 rehydration left unfinished.
 
-Phase chain (filled in as commits land):
+Phase chain:
 
-- **Phase 0** — this ADR, in Proposed status. _(this commit)_
-- **Phase A** — destroy-path hang investigation + fix. _(pending)_
-- **Phase B** — NBD kernel-state cleanup on host-agent startup. _(pending)_
-- **Phase C** — `egress_sessions` → `session_bindings` rename. _(pending)_
-- **ADR closing bookend** — as-built notes, commit chain, divergences.
+- **Phase 0** — this ADR in Proposed status. (commit `a24b0ee`)
+- **Phase A** — destroy-path hang fix (NBD kernel-thread join
+  detached out of `Drop` → tokio worker no longer parks on kernel
+  cleanup). (commit `396bb38`)
+- **Phase B** — NBD kernel-state cleanup on host-agent startup.
+  (commit `1240915`)
+- **Phase C** — `egress_sessions` → `session_bindings` rename.
+  (commit `6dc0458`)
+- **ADR closing bookend** — as-built notes (this commit).
 
 ---
 
@@ -291,3 +294,109 @@ Commit chain (ADR bookends per `[adr_bookends_substantive_work]`):
   `JoinHandle::abort` waiting for an in-progress flush to
   yield, the fix is to switch to a `CancellationToken` so the
   flush can early-exit. Investigation in Phase A will tell.
+
+---
+
+## As-built notes (2026-05-24)
+
+### Phase A — `396bb38`
+
+Root cause confirmed by reading the `NbdHandle::Drop` body: the
+`kernel_thread.join()` happens *inline* on whatever tokio worker
+ran the destroy await. `NBD_DISCONNECT` is fast, but the kernel
+thread's actual exit can stall on inflight I/O — at which point
+the tokio worker is parked, and the host-agent stops servicing
+heartbeats. Eighteen seconds later coord reaps the host. Exactly
+the observed symptom.
+
+Fix shape: the cheap synchronous steps (`NBD_DISCONNECT`,
+`serve_task.abort()`) stay inline; the rest (`kernel_thread.join`,
+`NBD_CLEAR_SOCK`, fd close) move into a detached `std::thread::
+spawn`. `Drop` returns immediately, tokio workers keep servicing
+heartbeats, and the kernel cleanup runs out-of-band.
+
+Paired with Phase A's `nbd_kernel_busy` probe in
+`NbdSlotAllocator::acquire`: the slot is released to the pool the
+moment `Drop` returns, but a fast re-acquire on the same path
+would race the kernel's tear-down. The probe pokes
+`/sys/block/nbdN/pid` and rotates past slots whose kernel-side
+cleanup is still in flight, with a 500ms periodic re-probe wake
+source.
+
+### Phase B — `1240915`
+
+`recover_stuck_nbd_devices(paths)` ships in
+`disk_daemon/runtime.rs`, gated `cfg(target_os = "linux")` and
+exported from `disk_daemon::`. The host-agent's startup
+(`crates/engram-host-agent/src/main.rs:391`) calls it BEFORE
+`NbdSlotAllocator::from_paths` so the kernel state is cleaned
+before the pool is seeded.
+
+Open-question answer on `NBD_CLEAR_SOCK`: empirically (dev-vm
+2026-05-24), `NBD_DISCONNECT` + `NBD_CLEAR_SOCK` issued back-to-
+back is the right primitive. The first signals the kernel thread
+to exit; the second drops the kernel's reference to the bound
+socket so the device's `/sys/block/nbdN/pid` clears.
+
+Integration test in
+`crates/engram-host-agent/tests/nbd_startup_recovery.rs`:
+
+- `recovery_is_noop_for_unbound_devices` runs unconditionally
+  (covered by CI's `cargo nextest run --workspace`).
+- `recovery_clears_kernel_busy_device` is `#[ignore]`'d, gated on
+  `ENGRAM_NBD_STUCK_DEVICES`, and skips on insufficient device
+  perms. Prod host-agents grant the necessary R/W via the
+  Packer-installed udev rule.
+
+### Phase C — `6dc0458`
+
+Pure rename `egress_sessions → session_bindings` across the four
+host-agent files that reference it. No semantic change. The field
+doc comment now leads with both consumers (destroy + publisher)
+and notes the rename rationale so future readers don't have to
+mentally translate "egress" → "binding index."
+
+### Divergences from the design
+
+None substantive. The plan called for a one-shot startup probe +
+ioctl pair; that's exactly what shipped. The Phase A fix shape
+matched the design's "detach the NBD cleanup into a spawned task"
+prediction.
+
+The plan mentioned a possible `CancellationToken` rewrite for the
+FlushScheduler. That didn't end up necessary: the destroy hang
+turned out to be the `NbdHandle::Drop`'s kernel-thread join, not
+the FlushScheduler. The scheduler's existing `JoinHandle::abort`
+is correct — Phase A's investigation closed that open question
+without code changes to the scheduler.
+
+### Dev-vm verification
+
+- `cargo test -p engram-host-agent --lib` (122 tests) passes on
+  dev-vm after Phase B.
+- `recovery_is_noop_for_unbound_devices` passes.
+- `recovery_clears_kernel_busy_device` skips on dev-vm because
+  the test user (`nikhil_unni_cortex_io`) isn't in the `disk`
+  group; the prod host-agent user is.
+- `just check` (full workspace fmt + clippy + nextest) passes
+  locally after Phase C.
+
+### Newly-filed follow-ups
+
+- **FC-side NBD-loss recovery** stays in scope for M4.1 (already
+  out of scope in §"Out of scope"). Not regressed by this ADR.
+- **dev-vm test user in `disk` group.** The
+  `recovery_clears_kernel_busy_device` test is skip-on-perms,
+  which is the right behavior, but it'd be nice to actually
+  exercise the recovery path in the dev-vm test loop. Two
+  options: (a) udev rule on dev-vm matching the prod Packer
+  manifest, or (b) the test stages a stuck NBD device under root
+  before exercising recovery. Neither is urgent — the noop test
+  + prod runtime cover the primitive's behavior.
+
+### Pre-existing stuck devices on dev-vm
+
+As of 2026-05-24, dev-vm still has `/dev/nbd1..5` bound to dead
+PIDs `4203, 5562, 6911, 9093, 10683`. They'll be cleaned on the
+next host-agent startup (now that Phase B is wired). No manual
+intervention required.
