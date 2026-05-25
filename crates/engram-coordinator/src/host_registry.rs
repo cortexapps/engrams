@@ -493,7 +493,7 @@ impl HostRegistry {
     /// the host being gone) or 500 (which doesn't compose with the
     /// API layer's `From<SandboxError>` mapping). The error is
     /// logged at WARN.
-    async fn resolve_owner(
+    pub async fn resolve_owner(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<(HostId, Arc<dyn HostClient>), SandboxError> {

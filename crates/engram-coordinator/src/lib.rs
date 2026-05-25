@@ -16,6 +16,7 @@ pub mod config;
 pub mod cow_state;
 pub mod dead_host;
 pub mod error;
+pub mod evacuation;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_evictor;
