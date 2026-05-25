@@ -278,6 +278,145 @@ impl Drop for NbdHandle {
     }
 }
 
+/// ADR 0017 Phase B: probe each device in `paths` for stale
+/// kernel-side bindings (a populated `/sys/block/nbdN/pid` pointing
+/// at a process that's no longer alive — the usual aftermath of an
+/// ungraceful host-agent exit). For each, open the device + issue
+/// NBD_DISCONNECT and NBD_CLEAR_SOCK to force the kernel to release.
+/// Returns `(probed, recovered, still_stuck)`.
+///
+/// Best-effort: a recovery that doesn't clear the pid file is
+/// logged with `tracing::warn!` so prod ops sees how many devices
+/// can't be recovered automatically (operator fallback: reboot the
+/// host). The pool-acquire path's `nbd_kernel_busy` probe will
+/// continue to skip still-stuck devices, so they're structurally
+/// invisible until the kernel releases (often "never" without a
+/// reboot).
+///
+/// Called once at host-agent startup from the NbdSlotAllocator's
+/// construction site, BEFORE any new sandboxes attach. Each call
+/// emits a one-line `recovered N/M stale NBD devices` summary so
+/// ops can monitor cleanup accumulation across restarts.
+pub fn recover_stuck_nbd_devices(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
+    let mut probed = 0;
+    let mut recovered = 0;
+    let mut still_stuck = 0;
+    for path in paths {
+        match recover_one_stuck_device(path) {
+            Ok(NbdRecoveryOutcome::NotStuck) => {}
+            Ok(NbdRecoveryOutcome::Recovered) => {
+                probed += 1;
+                recovered += 1;
+            }
+            Ok(NbdRecoveryOutcome::StillStuck) => {
+                probed += 1;
+                still_stuck += 1;
+            }
+            Err(e) => {
+                probed += 1;
+                still_stuck += 1;
+                tracing::debug!(
+                    device = %path.display(),
+                    error = %e,
+                    "NBD recovery: error during probe; treating as still-stuck",
+                );
+            }
+        }
+    }
+    if probed > 0 {
+        tracing::warn!(
+            probed,
+            recovered,
+            still_stuck,
+            "NBD startup cleanup: recovered {recovered} stale NBD devices (of {probed} probed; {still_stuck} still stuck)",
+        );
+    }
+    (probed, recovered, still_stuck)
+}
+
+enum NbdRecoveryOutcome {
+    NotStuck,
+    Recovered,
+    StillStuck,
+}
+
+fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOutcome> {
+    // 1. Probe /sys/block/nbdN/pid. Empty / absent → device isn't bound; nothing to do.
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(NbdRecoveryOutcome::NotStuck);
+    };
+    let pid_path = format!("/sys/block/{name}/pid");
+    let bound_pid = match std::fs::read_to_string(&pid_path) {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Ok(NbdRecoveryOutcome::NotStuck),
+    };
+
+    tracing::warn!(
+        device = %path.display(),
+        bound_pid = %bound_pid,
+        "NBD recovery: device kernel-bound (possibly to a dead pid); attempting recovery via NBD_DISCONNECT + NBD_CLEAR_SOCK",
+    );
+
+    // 2. Open the device R/W to get a fd we can ioctl against.
+    let fd = OwnedFd::from(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?,
+    );
+    let raw = fd.as_raw_fd();
+
+    // 3. NBD_DISCONNECT signals the kernel to exit NBD_DO_IT.
+    let rc = unsafe { libc::ioctl(raw, NBD_DISCONNECT) };
+    if rc != 0 {
+        tracing::debug!(
+            device = %path.display(),
+            errno = io::Error::last_os_error().raw_os_error(),
+            "NBD_DISCONNECT in recovery returned non-zero (often harmless: kernel was already disconnected)",
+        );
+    }
+
+    // 4. NBD_CLEAR_SOCK clears the kernel's reference to whatever
+    //    socket the dead daemon registered. Load-bearing on devices
+    //    whose bound daemon died without disconnect: the kernel
+    //    holds onto the socket ref-count and won't release the
+    //    device until cleared.
+    let rc = unsafe { libc::ioctl(raw, NBD_CLEAR_SOCK) };
+    if rc != 0 {
+        tracing::debug!(
+            device = %path.display(),
+            errno = io::Error::last_os_error().raw_os_error(),
+            "NBD_CLEAR_SOCK in recovery returned non-zero",
+        );
+    }
+
+    // 5. Brief sleep so the kernel has a chance to release. Observed
+    //    100ms is sufficient on dev-vm; production may need more on
+    //    a heavily loaded host but this is a one-shot startup
+    //    operation so we don't iterate.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // 6. Re-probe pid file. Empty → recovered; non-empty → still
+    //    stuck (reboot likely required).
+    let final_pid = std::fs::read_to_string(&pid_path).unwrap_or_default();
+    if final_pid.trim().is_empty() {
+        tracing::info!(
+            device = %path.display(),
+            prior_pid = %bound_pid,
+            "NBD recovery: device released",
+        );
+        Ok(NbdRecoveryOutcome::Recovered)
+    } else {
+        tracing::warn!(
+            device = %path.display(),
+            prior_pid = %bound_pid,
+            post_recovery_pid = %final_pid.trim(),
+            "NBD recovery: device STILL bound after NBD_DISCONNECT + NBD_CLEAR_SOCK; operator may need to reboot the host to recover this slot",
+        );
+        Ok(NbdRecoveryOutcome::StillStuck)
+    }
+}
+
 /// Per-sandbox NBD state. Composes everything `PooledBackend`
 /// needs to track for a sandbox whose rootfs is served via NBD:
 /// the data plane (used for snapshot flush), the kernel-binding

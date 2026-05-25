@@ -235,8 +235,14 @@ mod tests {
     use std::time::Duration;
 
     fn paths(n: usize) -> Vec<PathBuf> {
+        // ADR 0017 Phase A: `nbd_kernel_busy` probes `/sys/block/nbdN/pid`
+        // on Linux. Using real `/dev/nbdN` device names would make these
+        // tests host-dependent — a stuck NBD binding on dev-vm hangs
+        // `acquire()` indefinitely. Sentinel paths beneath `/dev/` that
+        // don't shadow a `/sys/block/` entry probe as "not busy" (the
+        // ENOENT branch in `nbd_kernel_busy`).
         (0..n)
-            .map(|i| PathBuf::from(format!("/dev/nbd{i}")))
+            .map(|i| PathBuf::from(format!("/dev/test-fake-nbd-{i}")))
             .collect()
     }
 
@@ -275,7 +281,10 @@ mod tests {
             .await
             .expect("second acquire didn't wake within 1s")
             .expect("acquire task panicked");
-        assert!(matches!(second.path().to_str(), Some("/dev/nbd0")));
+        assert!(matches!(
+            second.path().to_str(),
+            Some("/dev/test-fake-nbd-0")
+        ));
     }
 
     #[tokio::test]
