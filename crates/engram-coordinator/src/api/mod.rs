@@ -109,6 +109,15 @@ pub fn router(state: SharedState) -> Router {
         // an immediate flush + publish round-trip without sleeping a
         // 30s scheduler tick.
         .route("/api/admin/sessions/:id/flush-now", post(admin::flush_now))
+        // ADR 0018 Phase C: explicit operator + test trigger for the
+        // alive-source evacuation primitive. Auto-triggers
+        // (dead_host.rs, nbd_loss_trigger) fire the same shape on
+        // host-loss / NBD-loss; this endpoint exposes the operator
+        // drain path.
+        .route(
+            "/api/admin/sessions/:id/evacuate",
+            post(admin::evacuate_session),
+        )
         // ADR 0016 Phase C commit 5: explicit admin triggers for the
         // chunk-GC sweep + candidate-table inspection. The background
         // loop is the implicit production driver

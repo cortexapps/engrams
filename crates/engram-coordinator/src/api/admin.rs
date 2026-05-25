@@ -349,6 +349,162 @@ pub async fn flush_now(
 }
 
 // ---------------------------------------------------------------------
+// ADR 0018 Phase C — session evacuation admin endpoint
+// ---------------------------------------------------------------------
+//
+// Explicit operator + test seam for the evacuation primitive. The
+// auto-triggers (dead_host.rs second-stage, nbd_loss_trigger) fire the
+// same primitive on heartbeat-loss / NBD-loss; this endpoint exposes
+// the alive-source variant for operator drains + e2e tests.
+
+#[derive(serde::Deserialize, Default)]
+pub struct EvacuateSessionRequest {
+    /// Caller-specified target host. `None` lets the scheduler pick
+    /// via `pick_for_session` with `exclude_host = session.host_id`.
+    #[serde(default)]
+    pub target_host: Option<engram_core::HostId>,
+}
+
+#[derive(Serialize)]
+pub struct EvacuateSessionResponse {
+    pub session_id: SessionId,
+    pub new_host_id: engram_core::HostId,
+    pub new_sandbox_id: engram_core::SandboxId,
+    pub loss: engram_core::types::evacuation::EvacLoss,
+}
+
+/// `POST /api/admin/sessions/:id/evacuate` — relocate `session_id`
+/// onto a peer host. Only the alive-source path (Active session,
+/// reachable backend) is supported here in commit 7; HostLost / Idle
+/// sessions return 409 with a pointer to the auto-trigger gate and
+/// the deferred /resume-from-Created path.
+///
+/// Request body: `EvacuateSessionRequest`. Omit `target_host` to let
+/// the scheduler pick (always excludes the source host).
+///
+/// Status codes:
+/// - 404 if the session row doesn't exist.
+/// - 409 if the session is not Active OR has no bound sandbox OR if
+///   the operator-supplied `target_host` is the source host.
+/// - 503 if no host can accept the relocate (no capacity or image
+///   not ready on any peer).
+/// - 200 with `EvacuateSessionResponse` on success. The session is
+///   at `Created` on the new host_id with new_sandbox_id bound;
+///   start_agent rebuild is the caller's next step (mirrors the
+///   resume_from_fc_snapshot dance) or the operator can `/resume`
+///   once the resume-from-Created path lands.
+pub async fn evacuate_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+    Json(req): Json<EvacuateSessionRequest>,
+) -> Result<Json<EvacuateSessionResponse>, ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+
+    // Alive-source preconditions: session must be Active with a
+    // bound sandbox + host.
+    if !matches!(session.status, engram_core::types::SessionState::Active) {
+        return Err(ApiError::Conflict(format!(
+            "evacuate only supported for Active sessions (got {})",
+            session.status.as_str(),
+        )));
+    }
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox",
+        )));
+    };
+    let Some(source_host) = session.host_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound host",
+        )));
+    };
+
+    // Resolve target. Operator override wins (with same-host guard).
+    // Scheduler fallback picks via the Phase C policy: exclude source
+    // host, otherwise capacity-fit. Same image-ready filter as
+    // create_session so we never relocate onto an image-cold host.
+    let target_host = if let Some(t) = req.target_host {
+        if t == source_host {
+            return Err(ApiError::Conflict(format!(
+                "target_host {t} is the source host — no-op evac",
+            )));
+        }
+        t
+    } else {
+        let (image_repo, image_tag) =
+            engram_core::types::session::split_image_ref(&session.image);
+        // Image-ready filter: only consider hosts that have prefetched
+        // the session's image. The session was created with a digest
+        // gate; we re-resolve it here from enabled_images so the
+        // scheduler can match it against ready_images sets.
+        let digest = match state.services.meta.get_enabled_image(&session.image).await {
+            Ok(Some(row)) => Some(engram_protocol::heartbeat::ManifestDigest::new(
+                row.manifest_digest,
+            )),
+            // If the image isn't enabled (deleted post-create), fall
+            // through with no readiness filter — picking on capacity
+            // alone is the operator's best-effort. Same fallback the
+            // resume path uses for non-enabled-images.
+            _ => None,
+        };
+        let ctx = crate::host_registry::ScheduleContext {
+            repo: image_repo,
+            image_version: image_tag,
+            prefer_snapshot_id: None,
+            memory_mib: None,
+            required_image_digest: digest,
+            exclude_host: Some(source_host),
+        };
+        let (picked, _backend) = state
+            .host_registry
+            .pick_for_session(&ctx)
+            .map_err(|e| match e {
+                crate::host_registry::PickError::ImageNotReady(d) => {
+                    ApiError::Internal(format!("evac: image not ready on any peer: {d}"))
+                }
+                crate::host_registry::PickError::NoCapacity => {
+                    ApiError::Internal("evac: no peer host has capacity".into())
+                }
+            })?;
+        picked
+    };
+
+    // Fire the alive-source primitive.
+    let receipt = crate::evacuation::evacuate_to(
+        &state.host_registry,
+        &state.services.meta,
+        session_id,
+        sandbox_id,
+        target_host,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::evacuation::EvacError::TargetIsSource { .. }
+        | crate::evacuation::EvacError::TargetNotRegistered { .. } => {
+            ApiError::Conflict(e.to_string())
+        }
+        crate::evacuation::EvacError::SourceLookup(_) => ApiError::Conflict(e.to_string()),
+        _ => ApiError::Internal(e.to_string()),
+    })?;
+
+    tracing::info!(
+        %session_id,
+        source_host = %source_host,
+        new_host = %receipt.new_host_id,
+        new_sandbox = %receipt.new_sandbox_id,
+        loss = receipt.loss.as_str(),
+        "admin evacuate: session relocated to peer; awaiting start_agent finish",
+    );
+
+    Ok(Json(EvacuateSessionResponse {
+        session_id,
+        new_host_id: receipt.new_host_id,
+        new_sandbox_id: receipt.new_sandbox_id,
+        loss: receipt.loss,
+    }))
+}
+
+// ---------------------------------------------------------------------
 // ADR 0016 Phase C — chunk-GC admin endpoints
 // ---------------------------------------------------------------------
 //
