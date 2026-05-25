@@ -1594,32 +1594,40 @@ prod-shape bug-fix commits surfaced only on dev-vm verification.
 5. Phase C follows; until it ships, `chunk_generation` is
    informational and BlobStorage growth stays monotonic.
 
-**Newly-filed follow-ups** (out of Phase B; documented for future
-work):
+**Newly-filed follow-ups** (out of Phase B; first three closed by
+ADR 0017 on 2026-05-24, fourth remains open):
 
-- **NBD device kernel-state cleanup on host-agent startup.** The
+- ✅ **NBD device kernel-state cleanup on host-agent startup.** The
   host-agent's NBD pool allocator should probe `/sys/block/nbdN/pid`
   on startup and force-disconnect any kernel-stale bindings before
   inserting devices into the pool. Without this, ungraceful prior
   exits accumulate stuck devices until reboot. Required for the
-  rehydration story to be operationally complete.
+  rehydration story to be operationally complete. _Closed by ADR
+  0017 Phase B — `recover_stuck_nbd_devices` ships in commit
+  `1240915` and runs unconditionally at host-agent startup._
 
-- **Host-agent destroy-path reliability.** Today's dev-vm
+- ✅ **Host-agent destroy-path reliability.** Today's dev-vm
   investigation showed the host-agent appears to hang after a
   FC SIGKILL during destroy, blocking subsequent gRPC calls.
   Suspected interaction with the FlushScheduler's
   `Arc<ChunkedDiskBackend>` + the NBD daemon's serve task.
-  Needs a focused investigation; not Phase B scope.
+  Needs a focused investigation; not Phase B scope. _Closed by ADR
+  0017 Phase A — root cause was `NbdHandle::Drop` joining the NBD
+  kernel thread on a tokio worker; commit `396bb38` detaches the
+  join into a `std::thread::spawn` so the destroy await returns
+  immediately and heartbeats keep flowing._
 
-- **Rename `egress_sessions`** to reflect its broader semantic as
+- ✅ **Rename `egress_sessions`** to reflect its broader semantic as
   the host's sandbox→session binding index (Phase B consumer +
-  Phase A egress consumer).
+  Phase A egress consumer). _Closed by ADR 0017 Phase C — renamed
+  to `session_bindings` in commit `6dc0458`._
 
 - **FC-side NBD-loss recovery.** If `/dev/nbdN` goes into the
   kernel-stuck state mid-sandbox, FC's I/O fails and the sandbox
   is wedged. Recovery would need either NBD reset (separate
   kernel work) or evac-to-snapshot triggered by a heartbeat-side
-  health check. Tracked for M4.1 / future evac milestone.
+  health check. Tracked for M4.1 / future evac milestone. (Still
+  open as of 2026-05-24; deliberately out of scope for ADR 0017.)
 
 **Phase B status**: design block above → as-built shipped here.
 The ADR overall stays **Proposed** until Phase C lands and flips
