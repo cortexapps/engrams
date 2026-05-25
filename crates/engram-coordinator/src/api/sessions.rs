@@ -634,6 +634,7 @@ async fn create_session_inner(
         required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
             &enabled.manifest_digest,
         )),
+        exclude_host: None,
     };
 
     // ADR 0015 M5: cold-create only, gated on host readiness. Sessions

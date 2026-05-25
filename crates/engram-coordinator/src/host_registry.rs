@@ -90,6 +90,14 @@ pub struct ScheduleContext<'a> {
     /// `None` skips the readiness filter — used by restore paths and
     /// anonymous flows that don't carry an `enabled_images` row.
     pub required_image_digest: Option<engram_protocol::heartbeat::ManifestDigest>,
+    /// ADR 0018 Phase C: when set, the picker excludes `exclude_host`
+    /// from the candidate pool. Used by the evacuation paths to
+    /// guarantee a relocate never targets the source host —
+    /// degenerate for dead-source (source is already unregistered)
+    /// but load-bearing for the NBD-loss path and operator-initiated
+    /// drain, where the source is still registered but should not be
+    /// reselected.
+    pub exclude_host: Option<HostId>,
 }
 
 /// Why `pick_for_session` couldn't place a session. Distinguishes
@@ -345,8 +353,12 @@ impl HostRegistry {
         ctx: &ScheduleContext<'_>,
     ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
         // Closure encoding "this host is a viable candidate".
-        // Non-draining + (no digest required OR ready for the digest).
-        let host_is_ready = |st: &HostState| {
+        // Non-draining + (no digest required OR ready for the digest)
+        // + not the excluded host (ADR 0018 Phase C evac guard).
+        let host_is_ready = |host_id: HostId, st: &HostState| {
+            if Some(host_id) == ctx.exclude_host {
+                return false;
+            }
             if st.draining {
                 return false;
             }
@@ -358,7 +370,7 @@ impl HostRegistry {
         let any_ready = self
             .hosts
             .iter()
-            .any(|e| host_is_ready(&e.value().state.read()));
+            .any(|e| host_is_ready(*e.key(), &e.value().state.read()));
         if !any_ready {
             return match ctx.required_image_digest.as_ref() {
                 Some(d) => Err(PickError::ImageNotReady(d.clone())),
@@ -370,7 +382,7 @@ impl HostRegistry {
         if let Some(target) = ctx.prefer_snapshot_id {
             for entry in self.hosts.iter() {
                 let st = entry.value().state.read();
-                if !host_is_ready(&st) {
+                if !host_is_ready(*entry.key(), &st) {
                     continue;
                 }
                 if st.local_snapshots.iter().any(|s| s.snapshot_id == target) {
@@ -385,7 +397,7 @@ impl HostRegistry {
         let mut best_cap: Option<(u64, HostId, Arc<dyn HostClient>)> = None;
         for entry in self.hosts.iter() {
             let st = entry.value().state.read();
-            if !host_is_ready(&st) {
+            if !host_is_ready(*entry.key(), &st) {
                 continue;
             }
             let free = st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
@@ -407,7 +419,7 @@ impl HostRegistry {
         // new hosts can take work without waiting a tick.
         self.hosts
             .iter()
-            .find(|e| host_is_ready(&e.value().state.read()))
+            .find(|e| host_is_ready(*e.key(), &e.value().state.read()))
             .map(|e| (*e.key(), e.value().backend.clone()))
             .ok_or(PickError::NoCapacity)
     }
@@ -1106,6 +1118,7 @@ mod tests {
             prefer_snapshot_id: Some(snap),
             memory_mib: None,
             required_image_digest: None,
+            exclude_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(
@@ -1157,6 +1170,7 @@ mod tests {
             prefer_snapshot_id: None,
             memory_mib: None,
             required_image_digest: None,
+            exclude_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_big, "larger free capacity wins");
@@ -1206,9 +1220,105 @@ mod tests {
             prefer_snapshot_id: None,
             memory_mib: None,
             required_image_digest: None,
+            exclude_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_ready);
+    }
+
+    /// ADR 0018 Phase C: `exclude_host` filters the candidate set.
+    /// Load-bearing for the NBD-loss evac trigger — the source host
+    /// is still registered + non-draining but should never be picked
+    /// as the relocate target.
+    #[test]
+    fn pick_for_session_excludes_named_host() {
+        let reg = stub_registry();
+        let (b1, _d1) = dummy_backend();
+        let (b2, _d2) = dummy_backend();
+        let source = HostId::new();
+        let peer = HostId::new();
+        reg.register(source, b1);
+        reg.register(peer, b2);
+
+        // Source has FAR more free capacity than peer; without the
+        // exclude_host filter, capacity-ranking would pick it.
+        reg.update_state(
+            source,
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: 64_000,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: Default::default(),
+            },
+        );
+        reg.update_state(
+            peer,
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: 1024,
+                    used_mib: 512,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: Default::default(),
+            },
+        );
+
+        let ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: None,
+            required_image_digest: None,
+            exclude_host: Some(source),
+        };
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, peer, "exclude_host must drop the source from candidates");
+    }
+
+    /// `exclude_host` with no other candidates → NoCapacity. The
+    /// evac caller (NBD-loss trigger) interprets this as
+    /// `NoTargetAvailable` and leaves the session at HostLost for a
+    /// later retry.
+    #[test]
+    fn pick_for_session_with_only_excluded_host_errors() {
+        let reg = stub_registry();
+        let (b1, _d1) = dummy_backend();
+        let lone = HostId::new();
+        reg.register(lone, b1);
+        reg.update_state(
+            lone,
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: 64_000,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: Default::default(),
+            },
+        );
+
+        let ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: None,
+            required_image_digest: None,
+            exclude_host: Some(lone),
+        };
+        let res = reg.pick_for_session(&ctx);
+        match res {
+            Err(PickError::NoCapacity) => {}
+            Err(other) => panic!("expected NoCapacity, got {other:?}"),
+            Ok(_) => panic!("expected an error when the only host is excluded"),
+        }
     }
 
     #[tokio::test]
@@ -1281,6 +1391,7 @@ mod tests {
             prefer_snapshot_id: None,
             memory_mib: None,
             required_image_digest: None,
+            exclude_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h);
@@ -1339,6 +1450,7 @@ mod tests {
             prefer_snapshot_id: None,
             memory_mib: None,
             required_image_digest: Some(digest),
+            exclude_host: None,
         };
         let (picked, _) = match reg.pick_for_session(&ctx) {
             Ok(v) => v,
@@ -1371,6 +1483,7 @@ mod tests {
             prefer_snapshot_id: None,
             memory_mib: None,
             required_image_digest: Some(digest.clone()),
+            exclude_host: None,
         };
         match reg.pick_for_session(&ctx) {
             Err(PickError::ImageNotReady(d)) => assert_eq!(d, digest),
@@ -1394,6 +1507,7 @@ mod tests {
             prefer_snapshot_id: None,
             memory_mib: None,
             required_image_digest: None,
+            exclude_host: None,
         };
         let (picked, _) = match reg.pick_for_session(&ctx) {
             Ok(v) => v,

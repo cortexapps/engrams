@@ -370,6 +370,7 @@ async fn resume_from_fc_snapshot(
         // no chunked-rootfs prefetch needed on the resume path. Snapshot
         // affinity already constrains to a host that has the bytes.
         required_image_digest: None,
+        exclude_host: None,
     };
     // ADR 0016 Phase B commit 6: pick the newer of
     // `session.live_disk_manifest` and `record.disk_manifest`.

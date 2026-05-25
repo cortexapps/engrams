@@ -347,9 +347,16 @@ pub async fn evacuate_dead_source(
         image_version: image_tag,
         prefer_snapshot_id: snapshot.as_ref().map(|s| s.id),
         memory_mib: None,
-        // Phase C extends this with image-warm + zone preferences.
-        // Today we accept any host that can take the work.
+        // Phase C target-selection: image-cache-warm preference is a
+        // future refinement (defer when we add zone tagging to
+        // HostState). Today we accept any host that can take the
+        // work, but never the source host (exclude_host) — set to
+        // the prior owner via `session.host_id` so the NBD-loss
+        // trigger doesn't relocate back onto the degraded host. For
+        // the dead-source path the source is already unregistered;
+        // exclude_host is defensive.
         required_image_digest: None,
+        exclude_host: session.host_id,
     };
 
     // Split pick + restore so picker errors and backend errors keep
