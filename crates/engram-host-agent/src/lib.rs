@@ -711,7 +711,7 @@ impl HostAgent {
 /// 3. `nbd_sandboxes` entry installed.
 /// 4. FlushScheduler spawned with the (session_id, sandbox_id)
 ///    pair. Continuous flush resumes immediately.
-/// 5. `egress_sessions` pre-populated so the publisher's
+/// 5. `session_bindings` pre-populated so the publisher's
 ///    sandbox→session lookup finds the binding on the first
 ///    post-rehydrate tick.
 ///

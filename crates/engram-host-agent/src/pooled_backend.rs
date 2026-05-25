@@ -92,17 +92,21 @@ pub struct PooledBackend {
     /// proxy registry and `destroy` unregisters. `None` is the
     /// "no egress filtering" path (dev or operator opt-out).
     egress: Option<Arc<HostEgress>>,
-    /// `sandbox_id → session_id` index so `destroy(sandbox_id)` can
-    /// call `Registry::unregister(session_id)`. Populated when a
-    /// policy frame arrives.
+    /// `sandbox_id → session_id` index, the host-agent's
+    /// canonical binding map. Two consumers:
     ///
-    /// ADR 0016 Phase B: wrapped in `Arc` so the
-    /// `LiveManifestPublisher`'s drain task can hold a clone for
-    /// the sandbox→session lookup at publish time. The lookup is
-    /// what lets warm-pool sandboxes (future) share the same
-    /// scheduler API — the publisher returns "skip" for any
-    /// sandbox not yet bound.
-    egress_sessions: Arc<DashMap<SandboxId, SessionId>>,
+    /// - ADR 0006: `destroy(sandbox_id)` resolves to a `session_id`
+    ///   for `Registry::unregister(session_id)`.
+    /// - ADR 0016 Phase B: the `LiveManifestPublisher`'s drain task
+    ///   holds a clone for the sandbox→session lookup at publish
+    ///   time; warm-pool sandboxes (future) share the same scheduler
+    ///   API — the publisher returns "skip" for any sandbox not yet
+    ///   bound to a session.
+    ///
+    /// Renamed from `egress_sessions` in ADR 0017 Phase C: the map
+    /// is no longer an egress-only concern. `Arc` wrapping lets the
+    /// publisher drain task and the destroy path share ownership.
+    session_bindings: Arc<DashMap<SandboxId, SessionId>>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
     /// the disk — chunks are fetched from `BlobStorage`, written to
@@ -196,7 +200,7 @@ impl PooledBackend {
             inner,
             image_cache: None,
             egress: None,
-            egress_sessions: Arc::new(DashMap::new()),
+            session_bindings: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
             chunk_cache: None,
@@ -227,12 +231,12 @@ impl PooledBackend {
 
     /// ADR 0016 Phase B commit 4: build a coord-bound publisher
     /// using the host-agent's `CoordClient` and the freshly-wrapped
-    /// `egress_sessions` map. The publisher spawns its own drain
+    /// `session_bindings` map. The publisher spawns its own drain
     /// task; the returned `LiveManifestPublisherHandle` is held
     /// inside PooledBackend so the task dies with us.
     ///
     /// Internal session resolver closes over a clone of
-    /// `self.egress_sessions` — that's the host-agent's
+    /// `self.session_bindings` — that's the host-agent's
     /// sandbox→session index, populated by `notify_session_policy`
     /// (start_agent) and cleared by `destroy`. A publish that
     /// arrives before `notify_session_policy` has populated the
@@ -245,10 +249,10 @@ impl PooledBackend {
         coord: crate::coord_client::CoordClient,
         host_id: engram_core::HostId,
     ) -> Self {
-        let egress_sessions = Arc::clone(&self.egress_sessions);
+        let session_bindings = Arc::clone(&self.session_bindings);
         let resolver: Arc<dyn crate::disk_daemon::SessionResolver> =
             Arc::new(move |sandbox_id: SandboxId| -> Option<SessionId> {
-                egress_sessions.get(&sandbox_id).map(|e| *e)
+                session_bindings.get(&sandbox_id).map(|e| *e)
             });
         let (publisher, handle) =
             crate::disk_daemon::CoordLiveManifestPublisher::spawn(coord, host_id, resolver);
@@ -1831,7 +1835,7 @@ impl SandboxBackend for PooledBackend {
         // brief window between the two, a closed-fail-by-default
         // registry would reject — which is the safe behavior.
         //
-        // ADR 0016 Phase B 4: the `egress_sessions.remove` MUST run
+        // ADR 0016 Phase B 4: the `session_bindings.remove` MUST run
         // regardless of whether an egress proxy is wired — Phase B's
         // LiveManifestPublisher resolves sandbox→session via this
         // map, and leaking a (destroyed) sandbox_id binding would
@@ -1840,7 +1844,7 @@ impl SandboxBackend for PooledBackend {
         // `notify_session_policy` fix (commit 5163366): both
         // population AND cleanup must be unconditional now that the
         // map is shared with the publisher.
-        let removed_session = self.egress_sessions.remove(&id).map(|(_, sid)| sid);
+        let removed_session = self.session_bindings.remove(&id).map(|(_, sid)| sid);
         if let Some(egress) = self.egress.as_ref() {
             if let Some(session_id) = removed_session {
                 egress.registry.unregister(session_id);
@@ -1891,7 +1895,7 @@ impl SandboxBackend for PooledBackend {
 
         // ADR 0016 Phase B commit 4: the host-side
         // LiveManifestPublisher's SessionResolver reads
-        // `egress_sessions` to map sandbox_id → session_id at
+        // `session_bindings` to map sandbox_id → session_id at
         // publish time. Phase A's design tied population to the
         // egress-proxy branch, which means hosts without a wired
         // proxy (the integration-up.sh dev stack, prod hosts with
@@ -1902,7 +1906,7 @@ impl SandboxBackend for PooledBackend {
         // Insert FIRST, unconditionally. The egress-proxy registration
         // below is still gated on `self.egress`; only the sandbox→
         // session bookkeeping is universal.
-        self.egress_sessions.insert(sandbox_id, session_id);
+        self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
             // No proxy attached — egress is unfiltered. The
@@ -2072,7 +2076,7 @@ impl PooledBackend {
     /// 4. Insert into `nbd_sandboxes` keyed by `sandbox_id`.
     /// 5. Install the FlushScheduler so continuous flush resumes
     ///    for the survivor.
-    /// 6. Pre-populate `egress_sessions[sandbox_id] = session_id`
+    /// 6. Pre-populate `session_bindings[sandbox_id] = session_id`
     ///    so the LiveManifestPublisher's resolver finds the
     ///    binding on the first post-rehydrate flush.
     ///
@@ -2128,12 +2132,12 @@ impl PooledBackend {
         );
         self.nbd_sandboxes.insert(sandbox_id, state);
 
-        // Pre-populate egress_sessions so the LiveManifestPublisher
+        // Pre-populate session_bindings so the LiveManifestPublisher
         // resolver finds the binding on the first post-rehydrate
         // flush. Without this, the scheduler would skip-publish
         // with "sandbox not bound" — same shape as the pre-commit-
         // 5163366 cold-create regression.
-        self.egress_sessions.insert(sandbox_id, session_id);
+        self.session_bindings.insert(sandbox_id, session_id);
 
         tracing::info!(
             %session_id,

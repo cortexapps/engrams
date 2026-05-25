@@ -19,7 +19,7 @@
 //!
 //! **Session lookup**: the publisher holds an `Arc<dyn
 //! SessionResolver>` (implemented over PooledBackend's
-//! `egress_sessions: Arc<DashMap<SandboxId, SessionId>>`). At drain
+//! `session_bindings: Arc<DashMap<SandboxId, SessionId>>`). At drain
 //! time, a sandbox without a session binding is skipped with a
 //! `debug!` — common for warm-pool sandboxes (future) and the small
 //! window between `inner.create()` and `start_agent()` on the
@@ -45,7 +45,7 @@ use crate::coord_client::{CoordClient, LiveManifestPublishOutcome, LiveManifestP
 use crate::disk_daemon::LiveManifestPublisher;
 
 /// Look up the session a sandbox is bound to. PooledBackend's
-/// `egress_sessions` is the production implementation; tests use a
+/// `session_bindings` is the production implementation; tests use a
 /// closure-backed mock.
 pub trait SessionResolver: Send + Sync {
     fn session_id_for(&self, sandbox_id: SandboxId) -> Option<SessionId>;
@@ -152,7 +152,7 @@ async fn drain_loop(
                 None => {
                     // Warm-pool sandboxes (future), or the small
                     // window between inner.create() and
-                    // start_agent() populating egress_sessions.
+                    // start_agent() populating session_bindings.
                     // The host-side flush still happened; the
                     // diagnostic surface sees `last_flush_unix_ms`
                     // tick. Just no coord publish.

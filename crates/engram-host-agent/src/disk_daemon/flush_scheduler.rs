@@ -140,7 +140,7 @@ impl FlushSchedulerConfig {
 ///
 /// **`sandbox_id`, not `session_id`**: the publisher is responsible
 /// for resolving the session binding (via the host-agent's
-/// `egress_sessions: DashMap<SandboxId, SessionId>` from ADR 0006
+/// `session_bindings: DashMap<SandboxId, SessionId>` from ADR 0006
 /// or any equivalent index) and short-circuiting the POST when the
 /// sandbox is unbound (e.g. warm-pool, post-`destroy` race). This
 /// shape lets warm-pool sandboxes share the same scheduler without
