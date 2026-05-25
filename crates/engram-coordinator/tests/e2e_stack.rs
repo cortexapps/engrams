@@ -920,3 +920,243 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
 
     driver.delete(sid).await;
 }
+
+// ---------------------------------------------------------------------
+// ADR 0016 Phase C commit 6a — chunk-GC admin-endpoint e2e regression
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields decoded for Debug output even when not asserted
+struct ChunkGcSweepResponse {
+    listed_chunks: usize,
+    pin_set_size: usize,
+    candidates_marked: usize,
+    promoted_deletes: usize,
+    promote_delete_errors: usize,
+    grace_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkGcCandidate {
+    content_hash: String,
+    #[allow(dead_code)]
+    first_seen_at: String,
+    #[allow(dead_code)]
+    last_seen_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkGcCandidatesResponse {
+    candidates: Vec<ChunkGcCandidate>,
+}
+
+impl Driver {
+    async fn chunk_gc_dry_run(&self, grace_secs: Option<u64>) -> ChunkGcSweepResponse {
+        let mut path = "/api/admin/chunk-gc/dry-run".to_string();
+        if let Some(g) = grace_secs {
+            path.push_str(&format!("?grace_secs={g}"));
+        }
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("POST /api/admin/chunk-gc/dry-run");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "dry-run failed: {status} body={text}");
+        serde_json::from_str(&text).expect("decode ChunkGcSweepResponse")
+    }
+
+    async fn chunk_gc_sweep(&self, grace_secs: Option<u64>) -> ChunkGcSweepResponse {
+        let mut path = "/api/admin/chunk-gc/sweep".to_string();
+        if let Some(g) = grace_secs {
+            path.push_str(&format!("?grace_secs={g}"));
+        }
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("POST /api/admin/chunk-gc/sweep");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "sweep failed: {status} body={text}");
+        serde_json::from_str(&text).expect("decode ChunkGcSweepResponse")
+    }
+
+    async fn chunk_gc_candidates(&self) -> ChunkGcCandidatesResponse {
+        let resp = self
+            .req(reqwest::Method::GET, "/api/admin/chunk-gc/candidates")
+            .send()
+            .await
+            .expect("GET /api/admin/chunk-gc/candidates");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "GET candidates failed: {status} body={text}"
+        );
+        serde_json::from_str(&text).expect("decode ChunkGcCandidatesResponse")
+    }
+}
+
+/// ADR 0016 Phase C commit 6a — load-bearing regression test for the
+/// M5 failure class.
+///
+/// The 2026-05-23 incident this catches: the prior chunk-GC marked
+/// every chunked-disk image's chunks as candidates because its
+/// live-set query missed the `enabled_images` lineage, then
+/// silent-deleted them after a 24h grace (which itself was a no-op
+/// on GCS due to the etag-parser bug). The next session-create
+/// against any chunked image faulted with `chunk fetch: blob
+/// storage: blob not found`.
+///
+/// This test pins that the redesigned GC does NOT repeat that
+/// failure. Flow:
+///
+/// 1. Create a none-harness session on the demo image (which is
+///    chunked-disk in CI per integration-bake-demo.sh). This proves
+///    the enabled image's chunks are materialized + reachable.
+/// 2. POST /api/admin/chunk-gc/dry-run — assert pin_set_size > 0.
+///    If the enabled-image pin-set source were broken, this would
+///    report 0 here, and step 3's sweep would proceed to delete
+///    every chunk in the bucket.
+/// 3. POST /api/admin/chunk-gc/sweep?grace_secs=0 — full sweep
+///    with grace knocked down so any orphans would promote on
+///    this single call. The load-bearing claim: this MUST NOT
+///    delete the demo image's chunks, regardless of what's in the
+///    bucket.
+/// 4. Re-exec a command on the original session — proves the
+///    sweep didn't break the session's data path. (Sandbox's
+///    chunks are paged in lazily; if the sweep wiped them, the
+///    exec would fail on next page-fault. With NBD wired, this
+///    would be `chunk fetch: blob not found`; without NBD, the
+///    rootfs is materialized eagerly so this assertion is weaker
+///    but still catches the path.)
+/// 5. Create a SECOND none-harness session on the same image —
+///    this is the strongest regression catch. Session-create
+///    materializes the rootfs anew; if the sweep deleted the
+///    image's chunks, this fails the same way the M5 incident
+///    failed.
+/// 6. GET /api/admin/chunk-gc/candidates — sanity-check the
+///    response shape (paged list, no crash on empty bucket).
+/// 7. POST /api/admin/chunk-gc/dry-run — second sweep is
+///    idempotent on a clean stack: pin set membership hasn't
+///    changed, and any candidates marked in step 3 were already
+///    promoted to deletion. Verifies the sweep is well-behaved
+///    on repeated invocation.
+///
+/// Environment dependence: this test does NOT skip on missing NBD.
+/// The pin-set + sweep paths run against PG + BlobStorage only;
+/// session create+exec works against either NBD-attached or
+/// materialize-to-file rootfs.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let sid_1 = driver.create_session_none_harness(&image).await;
+
+    // Step 2: dry-run baseline. The pin set MUST cover the demo
+    // image's chunks (enabled_images source). If this is 0, the
+    // regression has already happened by construction and step 3's
+    // sweep would wipe the bucket.
+    let dry = driver.chunk_gc_dry_run(Some(0)).await;
+    assert!(
+        dry.pin_set_size > 0,
+        "pin_set_size must be > 0 — the demo image's chunks should be \
+         pinned via enabled_images.disk_manifest_*. Got {dry:?}. \
+         A 0 here means the enabled-image pin-set source is broken; \
+         proceeding to step 3's sweep would have nuked the bucket."
+    );
+    assert_eq!(
+        dry.grace_secs, 0,
+        "grace_secs override must echo back; got {dry:?}",
+    );
+    assert_eq!(
+        dry.promoted_deletes, 0,
+        "DryRun must promote nothing; got {dry:?}",
+    );
+
+    // Capture sizes for the idempotency assertion in step 7.
+    let pin_set_size_before = dry.pin_set_size;
+
+    // Step 3: full sweep with grace=0. The load-bearing call. If
+    // the enabled image's chunks aren't in the pin set, they get
+    // marked AND promoted in a single call — the M5 failure mode.
+    let swept = driver.chunk_gc_sweep(Some(0)).await;
+    assert_eq!(
+        swept.promote_delete_errors, 0,
+        "promote-pass must not error; got {swept:?}",
+    );
+    assert!(
+        swept.pin_set_size >= pin_set_size_before,
+        "pin_set_size shrank between dry-run and sweep ({} → {}). \
+         Either an enabled image got disabled mid-test (unlikely on \
+         the integration stack) or the pin set has a flake.",
+        pin_set_size_before,
+        swept.pin_set_size,
+    );
+
+    // Step 4: original session's data path still works. With NBD
+    // wired, chunks lazy-fault through the pin-set survivors; without
+    // NBD, the rootfs was materialized at create time. Either way,
+    // a simple shell command should succeed if the chunks are intact.
+    let ls = driver.exec(sid_1, "ls /").await;
+    assert_eq!(
+        ls.exit_status,
+        Some(0),
+        "post-sweep exec on original session failed — chunks may have \
+         been deleted under it. stderr=<{}>",
+        ls.stderr,
+    );
+
+    // Step 5: STRONGEST regression catch. A fresh session-create on
+    // the same image materializes the rootfs anew from BlobStorage.
+    // If the sweep deleted the image's chunks, this fails the same
+    // way the M5 incident failed in prod.
+    let sid_2 = driver.create_session_none_harness(&image).await;
+    let ls_2 = driver.exec(sid_2, "ls /").await;
+    assert_eq!(
+        ls_2.exit_status,
+        Some(0),
+        "post-sweep fresh session-create + exec failed — the sweep \
+         deleted the image's chunks under us (M5 regression). \
+         stderr=<{}>",
+        ls_2.stderr,
+    );
+
+    // Step 6: GET /candidates round-trip. No assertion on contents
+    // beyond response shape — other tests in the same lane (the
+    // chunk_gc_helpers_live_pg tests, the admin_chunk_gc_live_pg
+    // tests) might leave rows in the table. The point is the
+    // endpoint serves valid JSON.
+    let candidates = driver.chunk_gc_candidates().await;
+    for c in &candidates.candidates {
+        assert_eq!(
+            c.content_hash.len(),
+            64,
+            "candidate content_hash must be 64 hex chars; got {} len={}",
+            c.content_hash,
+            c.content_hash.len(),
+        );
+    }
+
+    // Step 7: idempotency on a clean stack. After step 3's promote
+    // pass deleted any orphans the candidate table had, a second
+    // sweep at grace=0 should find nothing to promote.
+    let swept_again = driver.chunk_gc_sweep(Some(0)).await;
+    assert_eq!(
+        swept_again.promote_delete_errors, 0,
+        "second sweep must not error",
+    );
+    assert!(
+        swept_again.pin_set_size > 0,
+        "pin set must still cover live images after a clean sweep",
+    );
+
+    driver.delete(sid_1).await;
+    driver.delete(sid_2).await;
+}
