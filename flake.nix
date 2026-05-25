@@ -44,6 +44,16 @@
                                     # but harmless on macOS)
             nodejs_22               # web SPA dev server (`just web` -> vite)
             pnpm                    # workspace package manager for web/
+          ] ++ lib.optionals stdenv.isLinux [
+            # Parallel linker; wired in via the `shellHook` below
+            # (CARGO_TARGET_*_UNKNOWN_LINUX_GNU_RUSTFLAGS). Cuts
+            # incremental link time on this multi-binary workspace
+            # by 3–10× vs. GNU ld — engram ships ~10 binaries
+            # (coord/host-agent/agentd/uffd-handler/cli/...) so the
+            # savings compound on every edit-rebuild. macOS is not
+            # wired: Apple's ld is already fast and lld's Mach-O
+            # support is fragile.
+            mold
           ] ++ lib.optionals stdenv.isDarwin [
             libiconv                # required by some macOS-aarch64 crates
           ];
@@ -88,6 +98,19 @@
               done
             fi
             echo "engram dev shell — rustc $(rustc --version | awk '{print $2}'), just $(just --version | awk '{print $2}'), fc=system, CARGO_HOME=$CARGO_HOME"
+
+            # Linker selection for native Linux targets: tell rustc
+            # to pass `-fuse-ld=mold` to the C-compiler driver. gcc
+            # ≥12 (Ubuntu 22.04+) and clang ≥12 both honor this, and
+            # mold itself comes from the nix shell above. macOS skips
+            # this entirely — Apple's `ld` is fast and lld's Mach-O
+            # support is fragile. CI runners install mold via the
+            # `rui314/setup-mold` action; this hook only wires up the
+            # `nix develop` shell.
+            if [ "$(uname -s)" = "Linux" ]; then
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            fi
           '';
         };
 
