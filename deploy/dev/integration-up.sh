@@ -248,7 +248,18 @@ for _ in $(seq 1 60); do
     # `grep -o … | wc -l` counts occurrences (the JSON payload is
     # single-line, so `grep -c` only ever returns 0 or 1 and breaks
     # the multi-host wait).
-    REGISTERED=$(printf '%s' "$BODY" | grep -o '"hostname"' | wc -l | tr -d ' ')
+    #
+    # `{ grep || true; }` scopes the no-match fallback to the grep
+    # alone: without it, `set -o pipefail` propagates grep's exit-1
+    # (no matches) through the entire pipe and `set -e` exits the
+    # script on the FIRST iteration before hosts have a chance to
+    # heartbeat in. CI hit this when coord came up slightly faster
+    # than the first host-agent heartbeat — the initial /api/hosts
+    # returns `{"hosts":[]}`, grep matches nothing, pipe fails,
+    # script bails. `|| true` returns grep's stdout (empty) and
+    # exits 0; `wc -l` then reports 0 and we sleep + retry as
+    # intended.
+    REGISTERED=$({ printf '%s' "$BODY" | grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
     REGISTERED=${REGISTERED:-0}
     if [ "$REGISTERED" -ge "$EXPECTED_HOSTS" ] 2>/dev/null; then
         break
