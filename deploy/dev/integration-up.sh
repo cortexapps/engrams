@@ -85,7 +85,7 @@ fi
 # have NOPASSWD sudo, or this will block.
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_NBD_DEVICES,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY"
+    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_NBD_DEVICES,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY,ENGRAM_HOST_METRICS_ADDR"
     if ! sudo -n true 2>/dev/null; then
         echo "ERROR: passwordless sudo required for host-agent TAP creation." >&2
         echo "       Add an entry to /etc/sudoers.d/ allowing this user NOPASSWD." >&2
@@ -148,7 +148,63 @@ if [ -z "$NBD_DEVICES" ]; then
     echo "      (sudo modprobe nbd nbds_max=16) and rerun integration-up." >&2
 fi
 
-echo "==> start host-agent (dial 127.0.0.1:8090)"
+#
+# ADR 0018 M4: set ENGRAM_INTEG_TWO_HOSTS=1 to launch a second
+# host-agent on different ports + NBD slots + workdir. From coord's
+# perspective this is a 2-host cluster — the alive-source evac path
+# (`POST /api/admin/sessions/:id/evacuate`) actually relocates,
+# `dead_host.rs` has somewhere to restore onto, and the e2e test
+# script in scripts/dev-evac-test.sh can exercise the full loop.
+# Default single-host mode preserves the existing CI invariants.
+TWO_HOSTS="${ENGRAM_INTEG_TWO_HOSTS:-0}"
+
+# Split NBD devices between host A and B when TWO_HOSTS=1. Comma-
+# joined list with no spaces; takes the first half for A, second for B.
+# Scoped IFS so the comma-split is local — re-reset to default before
+# the seq loop or the loop would see one long newline-glued token.
+nbd_split_first_half() {
+    local devices="$1"
+    [ -z "$devices" ] && { echo ""; return; }
+    local arr=()
+    IFS=',' read -ra arr <<<"$devices"
+    local n=${#arr[@]}
+    [ "$n" -eq 0 ] && { echo ""; return; }
+    local half=$(( n / 2 ))
+    [ "$half" -lt 1 ] && half=1
+    local out=""
+    local i
+    for ((i=0; i<half; i++)); do
+        if [ -z "$out" ]; then out="${arr[$i]}"; else out="$out,${arr[$i]}"; fi
+    done
+    echo "$out"
+}
+nbd_split_second_half() {
+    local devices="$1"
+    [ -z "$devices" ] && { echo ""; return; }
+    local arr=()
+    IFS=',' read -ra arr <<<"$devices"
+    local n=${#arr[@]}
+    [ "$n" -lt 2 ] && { echo ""; return; }
+    local half=$(( n / 2 ))
+    [ "$half" -lt 1 ] && half=1
+    local out=""
+    local i
+    for ((i=half; i<n; i++)); do
+        if [ -z "$out" ]; then out="${arr[$i]}"; else out="$out,${arr[$i]}"; fi
+    done
+    echo "$out"
+}
+
+if [ "$TWO_HOSTS" = "1" ]; then
+    NBD_DEVICES_A=$(nbd_split_first_half "$NBD_DEVICES")
+    NBD_DEVICES_B=$(nbd_split_second_half "$NBD_DEVICES")
+    echo "==> TWO_HOSTS=1: NBD partition A=$NBD_DEVICES_A B=$NBD_DEVICES_B"
+else
+    NBD_DEVICES_A="$NBD_DEVICES"
+    NBD_DEVICES_B=""
+fi
+
+echo "==> start host-agent A (dial 127.0.0.1:8090, gRPC :9101)"
 ENGRAM_KERNEL_IMAGE_PATH="$KERNEL" \
 ENGRAM_SANDBOX_WORK_DIR="./var/host-sandboxes-integration" \
 ENGRAM_SANDBOX_BACKEND="firecracker" \
@@ -158,16 +214,43 @@ ENGRAM_COORDINATOR_ENDPOINT="http://127.0.0.1:8090" \
 ENGRAM_BLOB_BACKEND="gcs" \
 ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
 STORAGE_EMULATOR_HOST="http://localhost:4443" \
-ENGRAM_NBD_DEVICES="$NBD_DEVICES" \
+ENGRAM_NBD_DEVICES="$NBD_DEVICES_A" \
+ENGRAM_HOST_METRICS_ADDR="0.0.0.0:9100" \
 ENGRAM_EGRESS_PROXY_PORT="${ENGRAM_EGRESS_PROXY_PORT:-0}" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_host_agent::warm_pool=debug,engram_host_agent::pooled_backend=debug}" \
 nohup $SUDO "$INTEG_BIN_DIR/engram-host-agent" >"$INTEG_DIR/host-agent.log" 2>&1 &
 echo $! > "$INTEG_DIR/host-agent.pid"
 
-echo "==> wait for host registration"
-for _ in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:8090/api/hosts 2>/dev/null \
-        | grep -q '"hostname"'; then
+if [ "$TWO_HOSTS" = "1" ]; then
+    echo "==> start host-agent B (dial 127.0.0.1:8090, gRPC :9102)"
+    ENGRAM_KERNEL_IMAGE_PATH="$KERNEL" \
+    ENGRAM_SANDBOX_WORK_DIR="./var/host-sandboxes-integration-b" \
+    ENGRAM_SANDBOX_BACKEND="firecracker" \
+    ENGRAM_GRPC_LISTEN_ADDR="127.0.0.1:9102" \
+    ENGRAM_GRPC_ADVERTISE_ADDR="http://127.0.0.1:9102" \
+    ENGRAM_COORDINATOR_ENDPOINT="http://127.0.0.1:8090" \
+    ENGRAM_BLOB_BACKEND="gcs" \
+    ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
+    STORAGE_EMULATOR_HOST="http://localhost:4443" \
+    ENGRAM_NBD_DEVICES="$NBD_DEVICES_B" \
+    ENGRAM_HOST_METRICS_ADDR="0.0.0.0:9110" \
+    ENGRAM_EGRESS_PROXY_PORT="${ENGRAM_EGRESS_PROXY_PORT:-0}" \
+    RUST_LOG="${RUST_LOG:-info,engram=debug}" \
+    nohup $SUDO "$INTEG_BIN_DIR/engram-host-agent" >"$INTEG_DIR/host-agent-b.log" 2>&1 &
+    echo $! > "$INTEG_DIR/host-agent-b.pid"
+fi
+
+EXPECTED_HOSTS=1
+[ "$TWO_HOSTS" = "1" ] && EXPECTED_HOSTS=2
+echo "==> wait for $EXPECTED_HOSTS host registration(s)"
+for _ in $(seq 1 60); do
+    BODY=$(curl -fsS http://127.0.0.1:8090/api/hosts 2>/dev/null || true)
+    # `grep -o … | wc -l` counts occurrences (the JSON payload is
+    # single-line, so `grep -c` only ever returns 0 or 1 and breaks
+    # the multi-host wait).
+    REGISTERED=$(printf '%s' "$BODY" | grep -o '"hostname"' | wc -l | tr -d ' ')
+    REGISTERED=${REGISTERED:-0}
+    if [ "$REGISTERED" -ge "$EXPECTED_HOSTS" ] 2>/dev/null; then
         break
     fi
     sleep 1
@@ -209,8 +292,11 @@ fi
 
 echo ""
 echo "✓ integration stack up"
-echo "  coord:      http://127.0.0.1:8090  (PID $(cat $INTEG_DIR/coord.pid))"
-echo "  host-agent: 127.0.0.1:9101         (PID $(cat $INTEG_DIR/host-agent.pid))"
+echo "  coord:        http://127.0.0.1:8090  (PID $(cat $INTEG_DIR/coord.pid))"
+echo "  host-agent A: 127.0.0.1:9101         (PID $(cat $INTEG_DIR/host-agent.pid))"
+if [ "$TWO_HOSTS" = "1" ]; then
+    echo "  host-agent B: 127.0.0.1:9102         (PID $(cat $INTEG_DIR/host-agent-b.pid))"
+fi
 echo "  registry:   http://localhost:5001"
 echo "  fake-gcs:   http://localhost:4443"
 if [ -f "$INTEG_DIR/web.pid" ] && kill -0 "$(cat "$INTEG_DIR/web.pid")" 2>/dev/null; then

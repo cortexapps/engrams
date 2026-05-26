@@ -45,12 +45,14 @@ kill_by_pidfile() {
 # the parent reaps both cleanly. Best-effort.
 kill_by_pidfile "$INTEG_DIR/web.pid" "web"
 
-# host-agent first so it gets a chance to deregister with the coord.
-kill_by_pidfile "$INTEG_DIR/host-agent.pid" "host-agent"
-# integration-up.sh runs host-agent under sudo for CAP_NET_ADMIN; the
-# pidfile points at the sudo wrapper, and SIGTERM-on-sudo forwards to
-# the child. As a backstop (sudo may not forward SIGKILL) we
-# pkill the binary by name. Best-effort.
+# host-agents first so they get a chance to deregister with the coord.
+# ADR 0018 M4 TWO_HOSTS=1: there may be a second host-agent (host-agent-b).
+kill_by_pidfile "$INTEG_DIR/host-agent.pid" "host-agent A"
+kill_by_pidfile "$INTEG_DIR/host-agent-b.pid" "host-agent B"
+# integration-up.sh runs host-agent(s) under sudo for CAP_NET_ADMIN;
+# the pidfiles point at the sudo wrappers and SIGTERM-on-sudo forwards
+# to the children. As a backstop (sudo may not forward SIGKILL) we
+# pkill all engram-host-agent processes by name. Best-effort.
 sudo -n pkill -TERM engram-host-agent 2>/dev/null || true
 sleep 0.5
 sudo -n pkill -KILL engram-host-agent 2>/dev/null || true

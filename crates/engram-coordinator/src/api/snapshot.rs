@@ -203,14 +203,62 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
     //   any other status → 409.
     match session.status {
         SessionState::Idle => resume_from_idle(state, session).await,
+        // ADR 0018: an auto-evac'd session is left at `Created` on
+        // the new host with the VM restored but the harness stale
+        // (vsock to source's agentd is dead). `/resume` against
+        // `Created` finishes the harness rebuild via the shared
+        // `finish_resume_to_active` primitive. This is the path that
+        // closes the "session survives a MIG roll" loop —
+        // `dead_host.rs` rebinds + restores, the user (or an
+        // automated layer) hits `/resume` to bring it to Active.
+        SessionState::Created => resume_from_created(state, session).await,
         SessionState::Dead => Err(ApiError::Gone(
             "snapshot_invalidated: session is terminal; chunked manifests are gone or never existed".into(),
         )),
         other => Err(ApiError::Conflict(format!(
-            "session is {} — only Idle sessions can be resumed",
+            "session is {} — only Idle / Created sessions can be resumed",
             other.as_str()
         ))),
     }
+}
+
+/// ADR 0018 commit 10: finish bringing an auto-evac'd session back
+/// to Active. Preconditions: session at `Created` with `host_id` +
+/// `sandbox_id` already bound (the evac primitive did the bind +
+/// HostLost → Created drive). All this needs to do is run the harness
+/// rebuild + the Created → Active transition.
+async fn resume_from_created(
+    state: SharedState,
+    session: Session,
+) -> Result<SnapshotResponse, ApiError> {
+    let id = session.id;
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {id} is Created but has no bound sandbox — cannot resume",
+        )));
+    };
+    if session.host_id.is_none() {
+        return Err(ApiError::Conflict(format!(
+            "session {id} is Created but has no bound host — cannot resume",
+        )));
+    }
+    let outcome = finish_resume_to_active(&state, &session, sandbox_id).await?;
+    let note = match outcome {
+        FinishResumeOutcome::Active => "resumed from Created (auto-evac completion)",
+        FinishResumeOutcome::CreatedHarnessFailed => {
+            "resume attempted from Created; harness reattach failed — session still Created"
+        }
+    };
+    // No SnapshotResponse.snapshot_id — the session might've been
+    // relocated via live_disk_manifest-only path (no snapshot row
+    // backed the restore). The caller cares about session_id +
+    // note; size_bytes is unknown here.
+    Ok(SnapshotResponse {
+        session_id: id,
+        snapshot_id: None,
+        size_bytes: None,
+        note,
+    })
 }
 
 async fn resume_from_idle(
@@ -335,6 +383,153 @@ fn effective_resume_disk_manifest(
     }
 }
 
+/// Outcome of [`finish_resume_to_active`]. The session is either
+/// fully back at `Active` (`Active`) or the rebuilt VM is bound at
+/// `Created` because the harness rebuild failed (`CreatedHarnessFailed`).
+/// Callers map both to a 200 — `/exec` against `CreatedHarnessFailed`
+/// returns 409 with the honest state, the user can retry resume.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FinishResumeOutcome {
+    Active,
+    CreatedHarnessFailed,
+}
+
+/// ADR 0018 commit 10 — the "session is bound on a new host at
+/// `Created`, finish bringing it back to `Active`" primitive shared
+/// across every code path that drops a session into `Created` with a
+/// fresh sandbox bound:
+///
+/// - [`resume_from_fc_snapshot`] (user-initiated `/resume` from Idle).
+/// - [`crate::api::admin::evacuate_session`] (operator drain via the
+///   admin endpoint).
+/// - [`crate::dead_host::evict_host`] (auto-evac on heartbeat loss).
+/// - [`crate::nbd_loss_trigger::process_unhealthy`] (auto-evac on
+///   NBD degradation).
+/// - [`resume_from_created`] dispatcher arm (manual recovery of an
+///   auto-evac'd session).
+///
+/// Preconditions: the session row is at `Created` state, `host_id` +
+/// `sandbox_id` are bound to the target (caller's responsibility).
+///
+/// Steps:
+/// 1. Load the image's manifest bundle + per-request secrets to
+///    rebuild the launch env.
+/// 2. Resolve the harness AgentSpec. `harness=None` skips
+///    `start_agent` entirely.
+/// 3. Rebuild the SessionEgressPolicy for the new sandbox (fresh
+///    guest_ip from the restored VM).
+/// 4. Call `start_agent` — re-attaches the in-VM agentd's harness
+///    supervisor to the post-restore sandbox.
+/// 5. Transition `Created → Active` + emit `Resumed` + `StatusChanged`.
+///
+/// Failure modes are honest per ADR 0015 M2:
+/// - `start_agent` fails → session stays at `Created`, returns
+///   `CreatedHarnessFailed`. `/exec` / `/shell` / `/prompt` will return
+///   409 against this state until a follow-up `/resume` succeeds.
+/// - PG transition fails → returns `Err(ApiError)`.
+pub async fn finish_resume_to_active(
+    state: &SharedState,
+    session: &Session,
+    new_sandbox_id: SandboxId,
+) -> Result<FinishResumeOutcome, ApiError> {
+    let id = session.id;
+    // ADR 0016 §A.1.7: load the full bundle (manifest + SecretBundle
+    // + env-with-placeholders) once and reuse it both for the launch
+    // env below AND for the post-resume egress policy rebuild. Avoids
+    // a second SecretStore round-trip on the resume hot path.
+    let resume_bundle = match crate::api::sessions::resume_manifest_bundle(state, session).await {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "resume_manifest_bundle failed; resume continues without manifest env",
+            );
+            None
+        }
+    };
+    let mut resume_base_env = resume_bundle
+        .as_ref()
+        .map(|b| b.env.clone())
+        .unwrap_or_default();
+    match crate::api::sessions::load_session_secrets(state, id).await {
+        Ok(Some(overrides)) => {
+            for (k, v) in overrides {
+                resume_base_env.insert(k, v);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "load_session_secrets failed; resume continues without per-request overrides",
+            );
+        }
+    }
+    let agent_opt =
+        crate::api::sessions::resolve_harness(state, &session.harness, id, None, &resume_base_env)
+            .ok()
+            .flatten();
+    let mut start_agent_failed = false;
+    if let Some(agent) = agent_opt {
+        // Rebuild the SessionEgressPolicy for the new sandbox.
+        // Three failure modes fall back to the legacy placeholder so
+        // we never regress to "resume errors out": (a) the manifest
+        // bundle load failed above (already warn-logged); (b) the
+        // host has no guest IP for this sandbox (process backend,
+        // VZ in some configs — `build_resume_egress_policy` returns
+        // None); (c) the IP is unparseable.
+        let policy = match resume_bundle.as_ref() {
+            Some(b) => crate::api::sessions::build_resume_egress_policy(
+                state,
+                id,
+                new_sandbox_id,
+                &b.bundle,
+                &b.manifest,
+                &b.env,
+            )
+            .await
+            .unwrap_or_else(|| placeholder_egress_policy(id, new_sandbox_id)),
+            None => placeholder_egress_policy(id, new_sandbox_id),
+        };
+        if let Err(e) = state
+            .services
+            .host
+            .start_agent(new_sandbox_id, agent, policy)
+            .await
+        {
+            tracing::warn!(
+                session_id = %id,
+                sandbox_id = %new_sandbox_id,
+                error = %e,
+                "post-resume start_agent failed; leaving session at Created so /exec returns 409",
+            );
+            start_agent_failed = true;
+        }
+    }
+    if start_agent_failed {
+        return Ok(FinishResumeOutcome::CreatedHarnessFailed);
+    }
+    let prev_for_active = state
+        .services
+        .meta
+        .transition_session(id, SessionState::Active)
+        .await?;
+    let now = Utc::now();
+    state
+        .emit(
+            id,
+            SessionEvent::StatusChanged {
+                from: prev_for_active,
+                to: SessionState::Active,
+                at: now,
+            },
+        )
+        .await?;
+    Ok(FinishResumeOutcome::Active)
+}
+
 async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
@@ -450,11 +645,11 @@ async fn resume_from_fc_snapshot(
     };
     bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
     // ADR 0015 M2: resume re-runs the create-shape transitions on
-    // the new sandbox — Idle → Created (now that a host + sandbox are
-    // bound), then Created → Active after start_agent succeeds. This
-    // mirrors the create path so /exec, /shell, /prompt see "Active
-    // means agentd is reachable + harness is running" no matter
-    // whether the session is fresh or resumed.
+    // the new sandbox — Idle → Created (now that a host + sandbox
+    // are bound). [`finish_resume_to_active`] handles the rest
+    // (harness rebuild + → Active) so the same primitive is shared
+    // with evac (commits land in `dead_host.rs`, the admin endpoint,
+    // and the new `/resume from Created` arm).
     let now = Utc::now();
     let prev_for_created = state
         .services
@@ -471,161 +666,36 @@ async fn resume_from_fc_snapshot(
             },
         )
         .await?;
-    // Re-launch the per-session agent so the in-VM agentd's
-    // harness supervisor kill+respawns the harness for the restored
-    // sandbox. Without this, the post-resume VM has the pre-snapshot
-    // adapter still running with a half-open vsock — the host can't
-    // reach it (its UDS died with the original sandbox), and the
-    // adapter can't notice (vsock reads on a half-open connection
-    // block forever). A fresh SpawnHarness is the in-VM signal to
-    // start clean. Resume omits ENGRAM_INITIAL_PROMPT so the
-    // adapter goes straight to Idle and waits for the next user
-    // prompt instead of replaying the original kickoff.
-    //
-    // Build the resume base env in two layers, mirroring create:
-    //
-    //   1. manifest.env + manifest.[secrets.*] resolved fresh from
-    //      the deployment SecretStore. Re-resolving (vs. snapshotting
-    //      at create) means an operator-driven secret rotation lands
-    //      automatically on the next resume.
-    //   2. per-request `secrets` overrides (CLAUDE_CODE_OAUTH_TOKEN,
-    //      ANTHROPIC_API_KEY, etc.) decrypted from session_secrets.
-    //      These shadow any same-key value from layer 1 — matches
-    //      "the user explicitly typed a value at create" semantics.
-    //
-    // Both layers fail soft: a missing enabled_images row, transient
-    // SecretStore hiccup, or pre-fix session with no sealed row
-    // resume with a thinner env (the pre-fix status quo) instead of
-    // failing the whole resume.
-    // ADR 0016 §A.1.7: load the full bundle (manifest + SecretBundle
-    // + env-with-placeholders) once and reuse it both for the launch
-    // env below AND for the post-resume egress policy rebuild. Avoids
-    // a second SecretStore round-trip on the resume hot path.
-    let resume_bundle = match crate::api::sessions::resume_manifest_bundle(&state, &session).await {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "resume_manifest_bundle failed; resume continues without manifest env",
-            );
-            None
-        }
-    };
-    let mut resume_base_env = resume_bundle
-        .as_ref()
-        .map(|b| b.env.clone())
-        .unwrap_or_default();
-    match crate::api::sessions::load_session_secrets(&state, id).await {
-        Ok(Some(overrides)) => {
-            for (k, v) in overrides {
-                resume_base_env.insert(k, v);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "load_session_secrets failed; resume continues without per-request overrides",
-            );
-        }
-    }
-    let agent_opt =
-        crate::api::sessions::resolve_harness(&state, &session.harness, id, None, &resume_base_env)
-            .ok()
-            .flatten();
-    let mut start_agent_failed = false;
-    if let Some(agent) = agent_opt {
-        // ADR 0016 §A.1.7: rebuild the SessionEgressPolicy for the
-        // new sandbox. Before this fix, resume passed an
-        // `Ipv4Addr::UNSPECIFIED` placeholder policy — the host
-        // registered an entry under `0.0.0.0`, the actual restored
-        // guest IP (inherited from the snapshot) had no entry, and
-        // every DNS query from the resumed VM denied with
-        // `reason=UnknownGuest`. Validated 2026-05-24 on session
-        // 1edf09a3: harness retried for 3 minutes then emitted
-        // "API Error: Unable to connect to API (ConnectionRefused)".
-        //
-        // Three failure modes fall back to the legacy placeholder so
-        // we never regress to "resume errors out": (a) the manifest
-        // bundle load failed above (already warn-logged); (b) the
-        // host has no guest IP for this sandbox (process backend,
-        // VZ in some configs — `build_resume_egress_policy` returns
-        // None); (c) the IP is unparseable.
-        let policy = match resume_bundle.as_ref() {
-            Some(b) => crate::api::sessions::build_resume_egress_policy(
-                &state,
-                id,
-                new_sandbox_id,
-                &b.bundle,
-                &b.manifest,
-                &b.env,
-            )
-            .await
-            .unwrap_or_else(|| placeholder_egress_policy(id, new_sandbox_id)),
-            None => placeholder_egress_policy(id, new_sandbox_id),
-        };
-        if let Err(e) = state
-            .services
-            .host
-            .start_agent(new_sandbox_id, agent, policy)
-            .await
-        {
-            tracing::warn!(
-                session_id = %id,
-                sandbox_id = %new_sandbox_id,
-                error = %e,
-                "post-resume start_agent failed; leaving session at Created so /exec returns 409",
-            );
-            start_agent_failed = true;
-        }
-    }
-    if start_agent_failed {
-        // ADR 0015 M2 honesty: don't pretend the session is Active
-        // when agentd never re-attached. Leave at Created — next
-        // /exec/shell/prompt sees a 409 with the actual state instead
-        // of a vsock-not-reachable error. The user can re-issue
-        // /resume after fixing whatever broke the host's agentd.
-        return Ok(SnapshotResponse {
+    // Refresh the session row so finish_resume_to_active sees the
+    // freshly-bound host_id + sandbox_id (the caller might've raced
+    // a concurrent writer between bind_resumed_session and now).
+    let session_refreshed = state.services.meta.get_session(id).await?;
+    let outcome = finish_resume_to_active(&state, &session_refreshed, new_sandbox_id).await?;
+    match outcome {
+        FinishResumeOutcome::CreatedHarnessFailed => Ok(SnapshotResponse {
             session_id: id,
             snapshot_id: Some(record.id.to_string()),
             size_bytes: Some(record.size_bytes),
             note: "resumed; harness reattach failed — session left in Created",
-        });
+        }),
+        FinishResumeOutcome::Active => {
+            state
+                .emit(
+                    id,
+                    SessionEvent::Resumed {
+                        snapshot_id: record.id,
+                        at: Utc::now(),
+                    },
+                )
+                .await?;
+            Ok(SnapshotResponse {
+                session_id: id,
+                snapshot_id: Some(record.id.to_string()),
+                size_bytes: Some(record.size_bytes),
+                note: "resumed from snapshot",
+            })
+        }
     }
-    let prev_for_active = state
-        .services
-        .meta
-        .transition_session(id, SessionState::Active)
-        .await?;
-    let now = Utc::now();
-    state
-        .emit(
-            id,
-            SessionEvent::Resumed {
-                snapshot_id: record.id,
-                at: now,
-            },
-        )
-        .await?;
-    state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: prev_for_active,
-                to: SessionState::Active,
-                at: now,
-            },
-        )
-        .await?;
-
-    Ok(SnapshotResponse {
-        session_id: id,
-        snapshot_id: Some(record.id.to_string()),
-        size_bytes: Some(record.size_bytes),
-        note: "resumed from snapshot",
-    })
 }
 
 async fn bind_resumed_session(
@@ -660,13 +730,34 @@ async fn bind_resumed_session(
             "assign_session_sandbox on resume failed; live routing still works (in-memory only)",
         );
     }
+    bind_session_routing(state, id, sandbox_id).await;
+}
+
+/// ADR 0018 commit 10: coord-side session→sandbox cache update +
+/// host-agent-side `bind_session` RPC. Both are critical for
+/// post-relocate routing:
+///
+/// - `state.registry.bind(id, sandbox_id)` keeps `/exec` /
+///   `/shell` / `/prompt` handlers (which look up sandbox_id by
+///   session_id via this in-memory map) pointing at the new
+///   sandbox. Without it, the next /exec dispatches to the OLD
+///   sandbox_id, hits `host_for_sandbox` returning None (PG was
+///   rebound), and 404s.
+/// - `host.bind_session(id, sandbox_id)` registers the
+///   session→sandbox mapping on the target host-agent. This is
+///   what the in-VM adapter's vsock-accept path uses to route
+///   reconnects, and what the FlushScheduler's live-manifest
+///   publisher uses to attach session_id to the publish RPC.
+///
+/// Shared with `bind_resumed_session` (the /resume path); exposed
+/// `pub(crate)` so the admin evac endpoint and the dead_host.rs /
+/// nbd_loss_trigger auto-trigger paths can fire the same shape.
+pub(crate) async fn bind_session_routing(
+    state: &SharedState,
+    id: SessionId,
+    sandbox_id: SandboxId,
+) {
     state.registry.bind(id, sandbox_id);
-    // Critical for post-resume harness reconnect: the harness hub's
-    // session_to_sandbox map keys the FC vsock accept path. Without
-    // this, an in-VM adapter that re-dials after FC restore would
-    // hit `accept_via_session_lookup` → "no sandbox bound to this
-    // session_id" and bounce. The original `bind_session` from
-    // `create_session` pointed at the now-destroyed sandbox.
     state.services.host.bind_session(id, sandbox_id).await;
 }
 

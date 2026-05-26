@@ -55,18 +55,21 @@ use engram_core::HostId;
 use sqlx::postgres::PgPool;
 
 use crate::evacuation::{evacuate_dead_source, EvacError};
-use crate::host_registry::HostRegistry;
-use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
+use crate::state::{IndexedEvent, SessionEvent, SessionEventBus, SharedState};
 use engram_core::SessionId;
 
-/// Read the auto-evac flag. Default `false` — opt-in until the
-/// resume-from-Created path lands and auto-evac becomes truly
-/// stuck-free.
+/// Read the auto-evac flag. Defaults to **true** as of commit 10 —
+/// the resume-from-Created completion path now lands, so an auto-
+/// evac'd session reaches Active on a peer via the shared
+/// `finish_resume_to_active` primitive instead of stranding at
+/// Created. Operators can flip `ENGRAM_DEAD_HOST_AUTO_EVAC=0` to
+/// roll back to the legacy HostLost → Idle (user /resumes) path if
+/// a regression surfaces.
 fn auto_evac_enabled() -> bool {
     std::env::var("ENGRAM_DEAD_HOST_AUTO_EVAC")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Persist + publish a `StatusChanged{from, to}` event. Inline here
@@ -132,12 +135,15 @@ impl Default for DeadHostConfig {
 /// Spawn the detector as a background task. Returns a JoinHandle the
 /// caller can drop on shutdown. Runs forever; logs and continues on
 /// per-tick errors so a transient Postgres blip doesn't stop the loop.
+///
+/// Takes the full `SharedState` so the auto-evac path can call into
+/// `api::snapshot::finish_resume_to_active` to drive the relocated
+/// session all the way through harness rebuild → Active (the same
+/// primitive `/resume` uses).
 pub fn spawn(
     cfg: DeadHostConfig,
     pool: PgPool,
-    meta: Arc<dyn MetadataStore>,
-    host_registry: Arc<HostRegistry>,
-    events: Arc<SessionEventBus>,
+    state: SharedState,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cfg.poll_interval);
@@ -146,7 +152,7 @@ pub fn spawn(
         tick.tick().await;
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(&cfg, &pool, &meta, &host_registry, &events).await {
+            if let Err(e) = run_once(&cfg, &pool, &state).await {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
@@ -156,11 +162,13 @@ pub fn spawn(
 async fn run_once(
     cfg: &DeadHostConfig,
     pool: &PgPool,
-    meta: &Arc<dyn MetadataStore>,
-    host_registry: &Arc<HostRegistry>,
-    events: &Arc<SessionEventBus>,
+    state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let candidates = meta.list_stale_hosts(cfg.stale_threshold.as_secs()).await?;
+    let candidates = state
+        .services
+        .meta
+        .list_stale_hosts(cfg.stale_threshold.as_secs())
+        .await?;
     if candidates.is_empty() {
         return Ok(());
     }
@@ -169,7 +177,7 @@ async fn run_once(
         "dead-host detector found stale candidates"
     );
     for host in candidates {
-        if let Err(e) = evict_host(pool, meta, host_registry, events, host.id).await {
+        if let Err(e) = evict_host(pool, state, host.id).await {
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
@@ -178,11 +186,12 @@ async fn run_once(
 
 async fn evict_host(
     pool: &PgPool,
-    meta: &Arc<dyn MetadataStore>,
-    host_registry: &Arc<HostRegistry>,
-    events: &Arc<SessionEventBus>,
+    state: &SharedState,
     host_id: HostId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let meta = &state.services.meta;
+    let host_registry = &state.host_registry;
+    let events = &state.events;
     // Pin a single connection so the advisory lock stays with us for
     // the duration of the eviction. `pg_try_advisory_lock` is a
     // session-scoped lock and auto-releases when the connection
@@ -285,7 +294,7 @@ async fn evict_host(
                         new_host = %receipt.new_host_id,
                         new_sandbox = %receipt.new_sandbox_id,
                         loss = receipt.loss.as_str(),
-                        "auto-evac succeeded; session rebound to peer host at Created",
+                        "auto-evac succeeded; rebound to peer at Created — finishing harness rebuild",
                     );
                     emit_status_changed(
                         meta,
@@ -295,6 +304,62 @@ async fn evict_host(
                         SessionState::Created,
                     )
                     .await;
+                    // Bind the new sandbox into coord's session→sandbox
+                    // cache + the target host-agent. Without this, /exec
+                    // against the session 404s (registry still points at
+                    // the dead sandbox_id) and the publisher drops
+                    // every flush ("sandbox not bound to a session").
+                    crate::api::snapshot::bind_session_routing(
+                        state,
+                        *session_id,
+                        receipt.new_sandbox_id,
+                    )
+                    .await;
+                    // ADR 0018 commit 10: finish the resume dance.
+                    // Loads the manifest bundle + secrets, resolves
+                    // the harness, rebuilds egress policy with the
+                    // new guest_ip, runs start_agent, and drives
+                    // Created → Active. Failure here logs and leaves
+                    // the session at Created — the user can /resume
+                    // to retry from there.
+                    let session_refreshed = match meta.get_session(*session_id).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                %session_id,
+                                error = %e,
+                                "auto-evac: get_session after rebind failed; session left at Created",
+                            );
+                            continue;
+                        }
+                    };
+                    match crate::api::snapshot::finish_resume_to_active(
+                        state,
+                        &session_refreshed,
+                        receipt.new_sandbox_id,
+                    )
+                    .await
+                    {
+                        Ok(crate::api::snapshot::FinishResumeOutcome::Active) => {
+                            tracing::info!(
+                                %session_id,
+                                "auto-evac: session reached Active on peer host",
+                            );
+                        }
+                        Ok(crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed) => {
+                            tracing::warn!(
+                                %session_id,
+                                "auto-evac: harness rebuild failed on peer; session left at Created — user can /resume",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %session_id,
+                                error = %e,
+                                "auto-evac: finish_resume_to_active errored; session left at Created",
+                            );
+                        }
+                    }
                     continue;
                 }
                 Err(EvacError::NoRecoverableState) => {

@@ -338,14 +338,7 @@ pub async fn heartbeat(
             count = hb.nbd_unhealthy.len(),
             "heartbeat reports nbd-unhealthy sandboxes; dispatching trigger",
         );
-        crate::nbd_loss_trigger::process_unhealthy(
-            &state.services.meta,
-            &state.host_registry,
-            &state.events,
-            host_id,
-            &hb.nbd_unhealthy,
-        )
-        .await;
+        crate::nbd_loss_trigger::process_unhealthy(&state, host_id, &hb.nbd_unhealthy).await;
     }
 
     // Refresh in-memory scheduler view so the next session-create

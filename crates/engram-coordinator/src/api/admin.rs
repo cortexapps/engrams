@@ -469,7 +469,9 @@ pub async fn evacuate_session(
         picked
     };
 
-    // Fire the alive-source primitive.
+    // Fire the alive-source primitive. Leaves the session at
+    // `Created` on the new host with the rebuilt VM but a stale
+    // harness — the next step is the shared finish primitive.
     let receipt = crate::evacuation::evacuate_to(
         &state.host_registry,
         &state.services.meta,
@@ -487,13 +489,37 @@ pub async fn evacuate_session(
         _ => ApiError::Internal(e.to_string()),
     })?;
 
+    // Bind the new sandbox into coord's session→sandbox cache and
+    // the target host-agent's session_bindings map. Without these,
+    // /exec / /shell / /prompt against the session 404 (coord's
+    // registry still points at the old sandbox_id) and the
+    // FlushScheduler's live-manifest publisher drops every publish
+    // ("sandbox not bound to a session"). Symmetric with the /resume
+    // path's `bind_resumed_session`.
+    crate::api::snapshot::bind_session_routing(&state, session_id, receipt.new_sandbox_id).await;
+
+    // Finish the resume dance: rebuild harness + → Active. Without
+    // this the session would stay at Created with a stale harness and
+    // /exec would 409 — the original commit-7 footgun the closing
+    // bookend called out. The shared `finish_resume_to_active`
+    // primitive is the same code path /resume + dead_host.rs use, so
+    // the harness rebuild is uniform across triggers.
+    let session_refreshed = state.services.meta.get_session(session_id).await?;
+    let finish_outcome = crate::api::snapshot::finish_resume_to_active(
+        &state,
+        &session_refreshed,
+        receipt.new_sandbox_id,
+    )
+    .await?;
+
     tracing::info!(
         %session_id,
         source_host = %source_host,
         new_host = %receipt.new_host_id,
         new_sandbox = %receipt.new_sandbox_id,
         loss = receipt.loss.as_str(),
-        "admin evacuate: session relocated to peer; awaiting start_agent finish",
+        outcome = ?finish_outcome,
+        "admin evacuate: session relocated + harness rebuild dispatched",
     );
 
     Ok(Json(EvacuateSessionResponse {

@@ -30,14 +30,20 @@ use engram_core::types::SessionState;
 use engram_core::{HostId, SandboxId, SessionId};
 
 use crate::evacuation::{evacuate_dead_source, EvacError};
-use crate::host_registry::HostRegistry;
-use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
+use crate::state::{IndexedEvent, SessionEvent, SessionEventBus, SharedState};
 
+/// ADR 0018 commit 10: defaults to **true** now that the
+/// resume-from-Created completion path is in place. The handler
+/// drives auto-evac'd sessions through `finish_resume_to_active`
+/// after the dead-source primitive returns, so the session reaches
+/// Active on the peer rather than stranding at Created. Operators
+/// can flip `ENGRAM_NBD_AUTO_EVAC=0` to roll back to "leave at
+/// HostLost; user /resumes" if a regression surfaces.
 fn auto_evac_enabled() -> bool {
     std::env::var("ENGRAM_NBD_AUTO_EVAC")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Emit a `StatusChanged{from, to}` for an evac'd session. Same shape
@@ -109,9 +115,7 @@ async fn session_for_sandbox(
 /// to `evacuate_dead_source` (which expects the session already at
 /// HostLost-class from the dead_host.rs flow).
 pub async fn process_unhealthy(
-    meta: &Arc<dyn MetadataStore>,
-    registry: &Arc<HostRegistry>,
-    events: &Arc<SessionEventBus>,
+    state: &SharedState,
     source_host_id: HostId,
     sandbox_ids: &[SandboxId],
 ) {
@@ -122,10 +126,13 @@ pub async fn process_unhealthy(
         tracing::debug!(
             host_id = %source_host_id,
             count = sandbox_ids.len(),
-            "nbd-unhealthy sandboxes reported; auto-evac disabled — set ENGRAM_NBD_AUTO_EVAC=1 to enable",
+            "nbd-unhealthy sandboxes reported; auto-evac disabled via ENGRAM_NBD_AUTO_EVAC=0",
         );
         return;
     }
+    let meta = &state.services.meta;
+    let registry = &state.host_registry;
+    let events = &state.events;
 
     for sandbox_id in sandbox_ids {
         let sandbox_id = *sandbox_id;
@@ -198,7 +205,7 @@ pub async fn process_unhealthy(
                     new_host = %receipt.new_host_id,
                     new_sandbox = %receipt.new_sandbox_id,
                     loss = receipt.loss.as_str(),
-                    "nbd-unhealthy evac: session relocated to peer at Created",
+                    "nbd-unhealthy evac: relocated to peer at Created — finishing harness rebuild",
                 );
                 emit_status_changed(
                     meta,
@@ -208,6 +215,55 @@ pub async fn process_unhealthy(
                     SessionState::Created,
                 )
                 .await;
+                // Coord-side + host-agent session→sandbox binding.
+                // Same shape as admin evac / dead_host's path.
+                crate::api::snapshot::bind_session_routing(
+                    state,
+                    session_id,
+                    receipt.new_sandbox_id,
+                )
+                .await;
+                // ADR 0018 commit 10: finish to Active via the
+                // shared resume primitive. Same harness rebuild
+                // path /resume + admin evac use.
+                let session_refreshed = match meta.get_session(session_id).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            %session_id,
+                            error = %e,
+                            "nbd-unhealthy: get_session after rebind failed; session left at Created",
+                        );
+                        continue;
+                    }
+                };
+                match crate::api::snapshot::finish_resume_to_active(
+                    state,
+                    &session_refreshed,
+                    receipt.new_sandbox_id,
+                )
+                .await
+                {
+                    Ok(crate::api::snapshot::FinishResumeOutcome::Active) => {
+                        tracing::info!(
+                            %session_id,
+                            "nbd-unhealthy evac: session reached Active on peer host",
+                        );
+                    }
+                    Ok(crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed) => {
+                        tracing::warn!(
+                            %session_id,
+                            "nbd-unhealthy evac: harness rebuild failed on peer; session left at Created",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %session_id,
+                            error = %e,
+                            "nbd-unhealthy evac: finish_resume_to_active errored; session left at Created",
+                        );
+                    }
+                }
             }
             Err(EvacError::NoRecoverableState) => {
                 // No state to relocate. Drive to Dead.

@@ -184,6 +184,15 @@ integration-reset:
 integration-test:
     bash deploy/dev/integration-test.sh
 
+# ADR 0018 M4 e2e evacuation test. Run after
+# `ENGRAM_INTEG_TWO_HOSTS=1 just integration-up`. Creates a session,
+# writes a deterministic disk canary, evacuates via the admin
+# endpoint, asserts the session reaches Active on a different host
+# with the disk contents preserved. The gold-standard "M4 actually
+# works" check.
+integration-evac-test:
+    bash deploy/dev/integration-evac-test.sh
+
 # Persistent dev session — bakes + enables + creates a session and
 # leaves it running so you can poke at it with curl, wscat, or the
 # web UI. Idempotent: reuses an already-enabled image and an

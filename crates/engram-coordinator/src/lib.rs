@@ -177,16 +177,13 @@ pub async fn run_with_registry_and_local(
         Ok(pool) => Some(dead_host::spawn(
             dead_host::DeadHostConfig::default(),
             pool,
-            meta_for_listener,
-            state.host_registry.clone(),
-            state.events.clone(),
+            state.clone(),
         )),
         Err(e) => {
             tracing::warn!(error = %e, "dead-host detector disabled — couldn't open PgPool");
             None
         }
     };
-
     // ADR 0016 §A.1.5c: stale-lease reaper for the
     // `eviction_inflight` PG table. Any lease whose RAII Drop was
     // skipped (panic, OOM, pod terminated mid-pipeline) becomes
