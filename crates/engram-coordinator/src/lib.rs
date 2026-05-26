@@ -16,6 +16,7 @@ pub mod config;
 pub mod cow_state;
 pub mod dead_host;
 pub mod error;
+pub mod evac_resumer;
 pub mod evacuation;
 pub mod harness_paths;
 pub mod host_registry;
@@ -184,6 +185,15 @@ pub async fn run_with_registry_and_local(
             None
         }
     };
+    // ADR 0018 commit 12c: the evac-resumer scanner picks up sessions
+    // marked Evacuating (by the admin /drain, /evacuate, or
+    // dead_host.rs) and drives Evacuating → Created → Active on a
+    // peer host via the shared resume primitives. Without it,
+    // sessions transitioned to Evacuating just sit there. Doesn't
+    // require its own PgPool — it goes through MetadataStore.
+    let _evac_resumer =
+        evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
+
     // ADR 0016 §A.1.5c: stale-lease reaper for the
     // `eviction_inflight` PG table. Any lease whose RAII Drop was
     // skipped (panic, OOM, pod terminated mid-pipeline) becomes

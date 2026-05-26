@@ -1,0 +1,292 @@
+//! ADR 0018 commit 12c — Evacuating-session resumer.
+//!
+//! Background task that turns `Evacuating` sessions back into `Active`
+//! sessions on a peer host. Sibling to [`crate::dead_host`]: same
+//! polling shape, same shared-state surface, distinct entry point on
+//! the state machine.
+//!
+//! ## Flow
+//!
+//! 1. Tick: read `sessions WHERE status = 'evacuating'` (with
+//!    `evac_attempts`) via
+//!    [`MetadataStore::list_evacuating_sessions`].
+//! 2. For each candidate, if `evac_attempts >= max_attempts` →
+//!    `Evacuating → Idle` and stop trying (user can `/resume`).
+//! 3. Otherwise bump `evac_attempts` atomically, then run the
+//!    relocation pipeline:
+//!    - [`crate::evacuation::evacuate_dead_source`] picks a peer host,
+//!      restores from the session's `live_disk_manifest` and/or latest
+//!      snapshot, rebinds PG `(host_id, sandbox_id)`, transitions
+//!      `Evacuating → Created`.
+//!    - [`crate::api::snapshot::bind_session_routing`] updates the
+//!      in-memory registry + the target host-agent's session→sandbox
+//!      map.
+//!    - [`crate::api::snapshot::finish_resume_to_active`] runs the
+//!      harness rebuild + drives `Created → Active`.
+//! 4. On any error in the pipeline, the session is left at its current
+//!    state — Evacuating (retry next tick) or Created (a later scanner
+//!    tick re-picks it up via the operator-/exec-driven `/resume`
+//!    path). The pre-bump idempotency lives in
+//!    `evacuate_dead_source` (PG rebind is `assign_*` which tolerates
+//!    re-runs) and in `bind_session_routing` (DashMap insert).
+//!
+//! ## Why this pattern
+//!
+//! Per `[async_via_state_machine]` — drain is a multi-host, multi-step
+//! operation. Synchronous orchestration would couple the source
+//! handler to a known target and conflate retry domains; the
+//! state-machine+scanner shape decouples them. Source writes
+//! "session is ready to be continued"; scanner finds a healthy peer.
+//! Operator-initiated drain, dead-host detector, and (future)
+//! NBD-loss trigger all land in the same lane.
+//!
+//! The scanner is single-coord-pod safe because each per-session
+//! advance starts with `bump_evac_attempts` (atomic +1) followed by
+//! `evacuate_dead_source`'s pick + restore + rebind. Two coord pods
+//! racing on the same session would both observe `Evacuating`, both
+//! attempt restore, and the second's `transition_session(Created)`
+//! would see the row already at `Created` and surface `Conflict`.
+//! That's a harmless duplicate sandbox on the target (cleaned up by
+//! orphan reap) — same shape as the dead-host detector's existing
+//! advisory-lock race. Tightening with an advisory lock per session
+//! is a follow-up if duplicate-restore counts ever rise above zero.
+
+use std::time::Duration;
+
+use chrono::Utc;
+use engram_core::types::{Session, SessionState};
+
+use crate::api::snapshot::{bind_session_routing, finish_resume_to_active, FinishResumeOutcome};
+use crate::evacuation::{evacuate_dead_source, EvacError};
+use crate::state::{SessionEvent, SharedState};
+
+#[derive(Clone, Debug)]
+pub struct EvacResumerConfig {
+    /// How often to sweep for Evacuating sessions. The scanner picks
+    /// up new entries from operator drains, the dead-host detector,
+    /// and (future) NBD-loss triggers. Default 10s matches
+    /// `DeadHostConfig::poll_interval` so the two scanners share the
+    /// same operational cadence.
+    pub poll_interval: Duration,
+    /// Retry budget per session before falling back to `Idle`. At the
+    /// default 10s cadence, 20 attempts is ~3 minutes — long enough
+    /// to ride out a transient capacity / image-prefetch shortfall on
+    /// peer hosts during a rolling restart, short enough that a truly
+    /// stuck session surfaces to the user as `Idle` (manual /resume)
+    /// before they assume it's gone.
+    pub max_attempts: u32,
+}
+
+impl Default for EvacResumerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(10),
+            max_attempts: 20,
+        }
+    }
+}
+
+/// Spawn the resumer as a background task. Caller holds the JoinHandle
+/// for the process lifetime; dropping aborts the loop. Mirrors
+/// [`crate::dead_host::spawn`].
+pub fn spawn(cfg: EvacResumerConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(cfg.poll_interval);
+        // Skip the first immediate tick — coord just started, give
+        // hosts a beat to heartbeat in before we pick.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = run_once(&cfg, &state).await {
+                tracing::warn!(error = %e, "evac-resumer tick failed; will retry");
+            }
+        }
+    })
+}
+
+async fn run_once(
+    cfg: &EvacResumerConfig,
+    state: &SharedState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let candidates = state.services.meta.list_evacuating_sessions().await?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    tracing::debug!(
+        count = candidates.len(),
+        "evac-resumer found Evacuating sessions"
+    );
+    for (session, attempts) in candidates {
+        if let Err(e) = advance_one(cfg, state, session, attempts).await {
+            // Keep going — one wedged session shouldn't stall the
+            // sweep. The per-session log already carries `error =
+            // %e`; this is the loop-level swallow.
+            tracing::warn!(error = %e, "evac-resumer per-session advance failed");
+        }
+    }
+    Ok(())
+}
+
+async fn advance_one(
+    cfg: &EvacResumerConfig,
+    state: &SharedState,
+    session: Session,
+    attempts: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let session_id = session.id;
+    // Retry budget exhausted → fall back to Idle so the user can
+    // `/resume` manually. Idle is a legal target from Evacuating per
+    // the legality table; the row's snapshot lineage is already
+    // durable (it was captured before the pipeline marked the
+    // session Evacuating in `evict_session_to_state`), so /resume
+    // from Idle restores cleanly.
+    if attempts >= cfg.max_attempts {
+        match state
+            .services
+            .meta
+            .transition_session(session_id, SessionState::Idle)
+            .await
+        {
+            Ok(prev) => {
+                tracing::warn!(
+                    %session_id,
+                    attempts,
+                    max_attempts = cfg.max_attempts,
+                    "evac-resumer budget exhausted; session left at Idle for user /resume",
+                );
+                let _ = state
+                    .emit(
+                        session_id,
+                        SessionEvent::StatusChanged {
+                            from: prev,
+                            to: SessionState::Idle,
+                            at: Utc::now(),
+                        },
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %session_id,
+                    error = %e,
+                    "evac-resumer fallback transition Evacuating→Idle failed",
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Bump pre-pipeline. A pipeline failure leaves the counter
+    // incremented and the session at Evacuating — next tick retries
+    // until the budget runs out. Bumping post-success isn't needed
+    // because `transition_session(Evacuating)` resets the counter on
+    // every entry per migration 0037's CASE expression.
+    let new_attempts = state.services.meta.bump_evac_attempts(session_id).await?;
+    tracing::info!(
+        %session_id,
+        attempt = new_attempts,
+        max_attempts = cfg.max_attempts,
+        "evac-resumer: starting resume attempt",
+    );
+
+    run_resume_pipeline(state, session).await?;
+    Ok(())
+}
+
+async fn run_resume_pipeline(
+    state: &SharedState,
+    session: Session,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let session_id = session.id;
+    let snapshot = state
+        .services
+        .meta
+        .latest_snapshot_for_session(session_id)
+        .await?;
+
+    let receipt = evacuate_dead_source(
+        &state.host_registry,
+        &state.services.meta,
+        session.clone(),
+        snapshot,
+    )
+    .await
+    .map_err(|e: EvacError| {
+        // NoRecoverableState is structural — session has neither a
+        // live manifest nor a snapshot. No amount of retrying fixes
+        // this. Surface it as a one-shot fall-through to Dead by
+        // letting the budget loop run; eventually the max-attempts
+        // arm flips to Idle, then /resume sees no snapshot and
+        // transitions to Dead via the existing
+        // `transition_to_dead_if_no_snapshot` path. Could short-
+        // circuit here, but the indirection costs us little and
+        // keeps the scanner's recovery shape uniform.
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
+    tracing::info!(
+        %session_id,
+        new_host = %receipt.new_host_id,
+        new_sandbox = %receipt.new_sandbox_id,
+        loss = receipt.loss.as_str(),
+        "evac-resumer: rebound to peer at Created — finishing harness rebuild",
+    );
+
+    // StatusChanged{prev → Created} so SSE subscribers see the move.
+    // `evacuate_dead_source` already committed the transition to
+    // Created in PG, so we emit synthesized event with from=Evacuating.
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Evacuating,
+                to: SessionState::Created,
+                at: Utc::now(),
+            },
+        )
+        .await;
+
+    bind_session_routing(state, session_id, receipt.new_sandbox_id).await;
+
+    // Refresh the session row so finish_resume_to_active sees the
+    // freshly-bound host_id + sandbox_id.
+    let session_refreshed = state.services.meta.get_session(session_id).await?;
+    match finish_resume_to_active(state, &session_refreshed, receipt.new_sandbox_id).await {
+        Ok(FinishResumeOutcome::Active) => {
+            tracing::info!(
+                %session_id,
+                "evac-resumer: session reached Active on peer host",
+            );
+        }
+        Ok(FinishResumeOutcome::CreatedHarnessFailed) => {
+            tracing::warn!(
+                %session_id,
+                "evac-resumer: harness rebuild failed on peer; session left at Created — \
+                 user /resume retries from there. Scanner won't re-pick (status != Evacuating).",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "evac-resumer: finish_resume_to_active errored; session left at Created",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // The scanner's full loop exercises Postgres + HostRegistry +
+    // finish_resume_to_active; the per-step plumbing is unit-tested
+    // via the existing evacuation / api::snapshot tests. End-to-end
+    // coverage lives in:
+    //   - `admin_evac_live_pg` (commit 12i): operator-drain triggers
+    //     Evacuating, scanner picks it up, session reaches Active on
+    //     peer.
+    //   - `evac_resumer_budget_falls_back_to_idle` (commit 12i):
+    //     simulate 20 failed bumps, observe Evacuating → Idle
+    //     fallback.
+    //   - dev-vm integration-evac-test.sh: real two-host drain.
+}
