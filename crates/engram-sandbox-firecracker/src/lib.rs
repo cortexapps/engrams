@@ -2638,9 +2638,30 @@ impl SandboxBackend for FirecrackerBackend {
             net::teardown_netns(netns_setup, &self.net_allocator).await;
         }
 
-        // Vsock UDS lives at work_dir root; remove explicitly since
-        // it isn't inside the jail dir we wipe below.
-        let _ = tokio::fs::remove_file(&live.state.vsock_uds_path).await;
+        // ADR 0018 cross-host evac safety: do NOT unlink the base
+        // vsock UDS file at `live.state.vsock_uds_path` on destroy.
+        // FC's snapshot embeds the source sandbox's UDS path
+        // verbatim (`source_vsock_canonical` in the manifest), and
+        // `load_snapshot` re-binds that exact path on the receiving
+        // host. On shared-filesystem deployments (dev-vm running
+        // multiple host-agents, future co-located scheduler
+        // experiments) the source's destroy and the target's
+        // load-snapshot race on the same path; if destroy wins it
+        // unlinks the dentry while the target's FC is still bound,
+        // and host-side `connect(path)` then fails ENOENT even
+        // though the kernel binding survives via the FD. Leaving
+        // the file behind is safe: the per-port UDS files
+        // (`<base>_<port>`, host-agent's accept listeners) already
+        // orphan on destroy by the same logic, and `create_in_jail`
+        // does `remove_file` of any stale UDS before binding, so a
+        // future sandbox at the same UUID path picks up clean. In
+        // production deployments with separate filesystems per
+        // host the orphan is a 0-byte file on the source host
+        // only — bounded by sandbox creation rate.
+        //
+        // The per-sandbox jail dir + canonical symlinks below are
+        // still removed; those are deterministic per local sandbox
+        // and don't have the cross-host-path-coupling issue.
 
         // ADR 0014: canonical rootfs / harness symlinks at
         // `<work_dir>/{rootfs,harness}/<sandbox_id>.{dev,ext4}`
