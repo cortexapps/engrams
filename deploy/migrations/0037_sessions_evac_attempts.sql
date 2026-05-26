@@ -1,5 +1,37 @@
--- ADR 0018 commit 12b: per-session retry counter for the
--- `evac_resumer` background scanner.
+-- ADR 0018 commit 12b: extend the `sessions_status_check` CHECK
+-- constraint to allow the new `evacuating` variant, and add the
+-- per-session retry counter for the `evac_resumer` background
+-- scanner.
+--
+-- `evacuating` was added to the Rust SessionState enum but never to
+-- the DB CHECK constraint, so every transition_session(Evacuating)
+-- failed with `new row for relation "sessions" violates check
+-- constraint "sessions_status_check"`. Caught on dev-vm during
+-- e2e validation of the async evac path.
+--
+-- Drop + re-add in place (one transactional swap) matches the
+-- migration 0031 pattern that introduced created/guest_ready/host_lost.
+
+ALTER TABLE sessions
+    DROP CONSTRAINT IF EXISTS sessions_status_check;
+
+ALTER TABLE sessions
+    ADD CONSTRAINT sessions_status_check CHECK (
+        status IN (
+            'pending',
+            'created',
+            'guest_ready',
+            'active',
+            'idle',
+            'host_lost',
+            'evacuating',
+            'completed',
+            'failed',
+            'dead'
+        )
+    );
+
+-- Per-session retry counter (described above).
 --
 -- A session enters `evacuating` either via operator drain (admin
 -- /drain or /sessions/:id/evacuate) or the dead-host detector. The

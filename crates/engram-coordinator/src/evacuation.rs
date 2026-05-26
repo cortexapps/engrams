@@ -315,11 +315,22 @@ pub async fn evacuate_dead_source(
     let _ = reason; // structured-log placeholder; metric label lives on `loss.as_str()`.
 
     // Build the SnapshotMetadata. When we have a snapshot row, lift
-    // its fields verbatim (id, size, image_version, source_sandbox_id,
-    // blob keys). For the no-snapshot live-disk-only path, mint a
-    // zero metadata that the backend treats as "fresh boot from this
-    // disk manifest" (FC's chunked-restore path) — size_bytes=0 is
-    // honest, no blob keys to clean up.
+    // its fields verbatim (id, size, image_version, source_sandbox_id)
+    // and DERIVE the portable blob keys from the snapshot_id. The keys
+    // are deterministic functions of the id
+    // (`snapshots/<id>/{state.bin,sidecar.json}`), so we can rebuild
+    // them at restore time without needing dedicated columns on the
+    // snapshot row.
+    //
+    // ADR 0018 commit 12 (async evac): the source records the snapshot
+    // in PG before the scanner picks the session up, which loses the
+    // `state_blob_key` / `sidecar_blob_key` that
+    // `PooledBackend::snapshot` populated on the in-memory metadata.
+    // Deriving them here is the canonical fix — same shape as the
+    // matching `materialize_state_if_missing` helper that consumes
+    // them on the target. Without these, the target host's FC
+    // `restore()` errors with "manifest.json: No such file or
+    // directory" because nothing materialised the sidecar.
     let metadata = match snapshot.as_ref() {
         Some(s) => SnapshotMetadata {
             id: s.id,
@@ -329,8 +340,8 @@ pub async fn evacuate_dead_source(
             disk_manifest,
             memory_manifest,
             source_sandbox_id: None,
-            state_blob_key: None,
-            sidecar_blob_key: None,
+            state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(s.id)),
+            sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
             rootfs_blob_key: None,
             working_set_blob_key: None,
         },

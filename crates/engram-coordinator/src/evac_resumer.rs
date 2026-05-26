@@ -104,7 +104,10 @@ pub fn spawn(cfg: EvacResumerConfig, state: SharedState) -> tokio::task::JoinHan
     })
 }
 
-async fn run_once(
+/// Single scanner tick. `pub(crate)` so live-PG tests can drive the
+/// scanner deterministically without `tokio::spawn`-ing the loop.
+/// Production code uses [`spawn`] which calls this on a timer.
+pub(crate) async fn run_once(
     cfg: &EvacResumerConfig,
     state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
