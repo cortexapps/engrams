@@ -103,30 +103,100 @@ Phase chain (commits 0–11 already on `main`):
     them; the async path does via the PG round-trip); (3)
     `evac_resumer::run_once` is `pub(crate)` for the 12j tests.
 
-### Commit 12m (deferred) — disk-content fidelity fix
+### Commit 12m — pause-before-flush + NBD write/flush race + in-flight barrier
 
-`PooledBackend::snapshot` currently runs flush BEFORE inner pause:
+Landed as three commits (c6d65e5, d11c480, 5df7b1f):
 
-```rust
-// pooled_backend.rs:1473-1505
-let nbd_disk_manifest = entry.backend.flush().await?;   // 1) flush
-let mut metadata = self.inner.snapshot(id).await?;       // 2) pause+capture
-```
+  **12m.1** (`c6d65e5`) — trait change. `SandboxBackend::pause(id)`
+  + `resume(id)` with default `Ok(())` impls. FC overrides to
+  call `FirecrackerClient::pause/resume`. No behaviour change for
+  Process/VZ/mocks; they inherit the defaults.
 
-The dev-vm canary md5 diverges across the relocate because guest
-writes between steps 1 and 2 land in memory but not the published
-manifest. The fix:
+  **12m.2** (`d11c480`) — NBD daemon hardening. Two real bugs:
 
-1. Add `SandboxBackend::pause()` + `resume()` trait methods
-   (default `Ok(())`). FC implements both via `FirecrackerClient`.
-2. Reorder `PooledBackend::snapshot` to: `inner.pause()` →
-   `nbd.flush()` → `inner.snapshot()` (idempotent re-pause inside
-   FC's `create_snapshot` is harmless; existing test coverage on
-   FC pause/resume idempotency confirms).
+  1. `backend.write()` acquired the dirty lock in two phases
+     (ensure_dirty + a separate re-acquire to patch). Between
+     them, `flush()` could drain — making the subsequent
+     `dirty.get_mut(...).expect(...)` panic OR causing the
+     patched bytes to land in the NEXT version's dirty map after
+     flush published the current manifest. Refactored to fetch
+     the base bytes outside any lock, then take the dirty lock
+     ONCE for insert-if-missing + patch. Atomic w.r.t. flush.
 
-Deferred from this commit chain because the trait change ripples
-to every backend impl (Process, VZ, mocks in test crates).
-Tracked as a separate ADR follow-up.
+  2. The serve loop processes requests sequentially per
+     connection, but the host kernel's NBD client can still be
+     handing requests to our daemon after FC's vCPUs have paused
+     (virtio queue → kernel NBD → userspace daemon pipeline).
+     New `InFlightTracker` (atomic counter + tokio `Notify`):
+     serve loop grabs an `InFlightGuard` per request; drop
+     decrements and wakes any `wait_idle()` parker on the 1→0
+     edge. `ChunkedDiskBackend::wait_idle()` is the public
+     barrier.
+
+  **12m.3** (`5df7b1f`) — `PooledBackend::snapshot` reordering:
+
+  ```
+  inner.pause(id)         # vCPUs stop
+  nbd.wait_idle()         # pipeline drains
+  nbd.flush()             # disk captured at paused state
+  inner.snapshot(id)      # memory captured (idempotent re-pause,
+                          # capture, resume — VM back to running)
+  ```
+
+  Pre-12m: nbd.flush() ran with FC still executing, then
+  inner.snapshot() paused inside its own create_snapshot. Writes
+  between the flush and the internal pause landed in memory but
+  not in the published disk manifest.
+
+Validation: 23 NBD backend unit tests pass (incl. 3 new tracker
+tests). Dev-vm 2-host integration-evac-test.sh shows the new
+ordering ("chunked NBD disk flushed (post-pause)") and the
+session relocates successfully. Disk content **still does not
+match** across the cross-host relocate (md5 differs);
+investigation is in §"Commit 12m.4 (deferred)" below — the
+flush-vs-pause race that 12m structurally closes is provably not
+the cause, since same-host repeated reads on the source ARE
+stable.
+
+### Commit 12m.4 (deferred) — residual cross-host disk drift
+
+12m closed the flush-vs-pause race. But the canary md5 still
+differs between source and relocated target. Diagnostics so far:
+
+  - **Same-host bytes are stable.** Five consecutive reads of
+    the same file on the source return the same md5
+    (`dba96f6e…` across all five). So the source-side
+    disk + page cache pair is internally consistent.
+  - **Cross-host bytes drift.** After relocate, the md5 differs.
+    Subsequent reads on the target stabilize (5 consecutive
+    `12f1674a…`), but that value matches neither the source's
+    pre-evac md5 nor the page-cache-hit md5 captured right
+    after relocate. Three distinct values total:
+    `20226e84…` (source pre-evac), `ece03791…` (target first
+    read, page-cache hit), `12f1674a…` (target stable, post
+    page-cache-eviction reads from chunked disk).
+  - **The async flow itself works.** Session reaches Active on a
+    different host_id with the canary file present at the right
+    path with the right size; the scanner does pick up
+    Evacuating and drive to Active.
+
+Hypotheses to investigate next:
+
+  1. The memory snapshot's page cache and the chunked disk
+     manifest don't agree at restore time — possible if FC's
+     internal `create_snapshot` re-runs flush state in a way
+     that diverges from what our explicit `nbd.flush()` captured.
+  2. The chunked-disk restore on the target serves bytes from
+     a different manifest version than the snapshot's
+     `disk_manifest` field (possible if the post-snapshot live
+     publisher tick AFTER our flush left a v_N+1 manifest that
+     evacuate_dead_source picks up via `pick_evac_disk_manifest`).
+  3. Host-kernel page cache on the source between FC's emulator
+     and `/dev/nbdN` buffers writes the daemon never sees,
+     even after vCPU pause + virtio drain.
+
+Tracked as a separate follow-up; ADR 0018 stays "Accepted,
+with one known regression" until disk fidelity holds.
 
 ---
 
