@@ -310,6 +310,63 @@ impl HostRegistry {
         self.hosts.len()
     }
 
+    /// ADR 0018 commit 12d: mark a host non-schedulable. Flips the
+    /// in-memory `HostState.draining` flag, which
+    /// [`Self::pick_for_session`]'s `host_is_ready` closure already
+    /// uses to filter the host out of scheduling. PG-side
+    /// `hosts.status` is updated separately by the caller via
+    /// `MetadataStore::set_host_status(Draining)` — the in-memory and
+    /// PG sides are deliberately decoupled here so callers that only
+    /// hold a `HostRegistry` (tests, mock harnesses) don't pay for a
+    /// DB round-trip. The admin endpoint (`api::admin::cordon_host`)
+    /// pairs the two writes.
+    ///
+    /// Returns `true` if the host was registered and was flipped,
+    /// `false` if no entry exists (operator targeted an unregistered
+    /// host — caller surfaces 404).
+    pub fn cordon(&self, host_id: HostId) -> bool {
+        match self.hosts.get(&host_id) {
+            Some(entry) => {
+                entry.value().state.write().draining = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Inverse of [`Self::cordon`]. Returns the host to schedulable.
+    /// Heartbeat updates would overwrite `draining` on the next tick
+    /// anyway, but the explicit uncordon lets operators flip it
+    /// immediately without waiting for the host to re-report.
+    pub fn uncordon(&self, host_id: HostId) -> bool {
+        match self.hosts.get(&host_id) {
+            Some(entry) => {
+                entry.value().state.write().draining = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// ADR 0018 commit 12d: enumerate every sandbox owned by `host_id`
+    /// in the in-memory routing cache. Paired with PG-side
+    /// `list_active_sandbox_assignments_on_host` for the admin /drain
+    /// endpoint — PG is authoritative for "which sessions live here,"
+    /// but the in-memory map carries the SandboxId we feed to the
+    /// evict pipeline.
+    pub fn sandboxes_on_host(&self, host_id: HostId) -> Vec<SandboxId> {
+        self.sandbox_owner
+            .iter()
+            .filter_map(|e| {
+                if *e.value() == host_id {
+                    Some(*e.key())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Backend `Arc` for `host_id`, or `None` if not registered. Used
     /// by the ADR 0009 in-process reconcile driver (`reconcile::spawn_in_proc`)
     /// to call `backend.list()` on each tick. Cloning the trait
