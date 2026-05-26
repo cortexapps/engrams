@@ -656,6 +656,14 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
 /// payload). Sequential per session — kernel-side I/O concurrency
 /// is handled by the kernel, our serve loop just needs to keep up.
 async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStream) {
+    // ADR 0018 commit 12m: hold an `Arc<InFlightTracker>` clone for
+    // the lifetime of this connection. Each request handler scope
+    // grabs a guard (++count); drop on scope exit decrements and,
+    // on the 1→0 edge, wakes any `wait_idle()` parker. The snapshot
+    // pipeline calls `backend.wait_idle().await` after `inner.pause()`
+    // to drain the virtio→kernel-NBD→userspace pipeline before
+    // flushing.
+    let in_flight = backend.in_flight_tracker();
     loop {
         let mut header = [0u8; REQUEST_HEADER_LEN];
         match stream.read_exact(&mut header).await {
@@ -676,6 +684,15 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStrea
                 return;
             }
         };
+
+        // Disconnect short-circuits before we record an in-flight —
+        // it's just a sentinel to break the loop, nothing the
+        // barrier needs to wait on.
+        if matches!(req.command, NbdCommand::Disconnect) {
+            tracing::info!("NBD client requested disconnect");
+            return;
+        }
+        let _guard = in_flight.enter();
 
         match req.command {
             NbdCommand::Read => {
@@ -716,8 +733,10 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStrea
                 }
             }
             NbdCommand::Disconnect => {
-                tracing::info!("NBD client requested disconnect");
-                return;
+                // Handled above before `in_flight.enter()` to avoid
+                // recording a phantom in-flight on the tear-down
+                // request. This arm is unreachable in practice.
+                unreachable!("Disconnect handled before the in-flight guard")
             }
             NbdCommand::Flush => {
                 // Honour the FLUSH semantic at the wire level

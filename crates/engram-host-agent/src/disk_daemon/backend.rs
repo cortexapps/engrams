@@ -59,6 +59,11 @@ pub enum DiskBackendError {
         length: u64,
         total: u64,
     },
+    /// Internal invariant tripped (an "unreachable" branch fired).
+    /// Used by `write_chunk` to surface a logic bug without
+    /// panicking the daemon. Replied back to the NBD client as
+    /// EIO; the operator gets a structured warn-log.
+    InvariantViolation(String),
 }
 
 impl std::fmt::Display for DiskBackendError {
@@ -72,6 +77,7 @@ impl std::fmt::Display for DiskBackendError {
                 length,
                 total,
             } => write!(f, "NBD range {offset}+{length} exceeds total_bytes {total}"),
+            Self::InvariantViolation(m) => write!(f, "invariant violation: {m}"),
         }
     }
 }
@@ -188,6 +194,88 @@ pub struct ChunkedDiskBackend {
     /// any caller that doesn't run a scheduler against this backend).
     threshold_notify: Arc<Notify>,
     threshold_bytes: u64,
+    /// ADR 0018 commit 12m: in-flight request counter for the NBD
+    /// daemon's serve loop. Incremented on entering a write/read
+    /// handler, decremented (with a `Notify::notify_waiters` on the
+    /// 1→0 edge) on exit. `wait_idle()` parks on the notify until
+    /// the count reads 0, giving the snapshot pipeline a barrier
+    /// to drain in-flight virtio writes after FC has paused. Reads
+    /// participate too (cheap, and lets future barriers cover them).
+    in_flight: Arc<InFlightTracker>,
+}
+
+/// ADR 0018 commit 12m — see `ChunkedDiskBackend::in_flight`.
+pub(crate) struct InFlightTracker {
+    count: std::sync::atomic::AtomicUsize,
+    notify: Notify,
+}
+
+impl InFlightTracker {
+    fn new() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Increment + return a guard that decrements on drop. Use with
+    /// `let _guard = tracker.enter();` at the top of each NBD handler.
+    /// Only the Linux NBD daemon's `serve_loop` constructs guards;
+    /// on macOS the runtime module is cfg-gated out, so the `enter`
+    /// path is unreachable and the macOS clippy lane treats it as
+    /// dead. The `dead_code` allow keeps the API stable across
+    /// platforms — `wait_idle()` is still called from the
+    /// PooledBackend snapshot path on both platforms (returns
+    /// immediately when count is 0, which it always is on macOS
+    /// where no daemon runs).
+    #[allow(dead_code)]
+    pub(crate) fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        InFlightGuard {
+            tracker: self.clone(),
+        }
+    }
+
+    /// Park until in-flight count drops to 0. Spurious wakeups
+    /// (re-check the count) are handled by the inner loop. Returns
+    /// immediately when count is already 0.
+    pub(crate) async fn wait_idle(&self) {
+        loop {
+            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            // Subscribe BEFORE the next count check to avoid the
+            // classic "decrement-then-notify happens before we
+            // subscribe" race. Notify gives one permit on
+            // `notify_waiters`, so a subscribe-then-check loop
+            // is the canonical idle wait shape.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct InFlightGuard {
+    tracker: Arc<InFlightTracker>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let prev = self
+            .tracker
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        if prev == 1 {
+            // Last one out — wake any wait_idle parker.
+            self.tracker.notify.notify_waiters();
+        }
+    }
 }
 
 struct BackendState {
@@ -223,6 +311,7 @@ impl ChunkedDiskBackend {
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             threshold_bytes,
+            in_flight: Arc::new(InFlightTracker::new()),
         })
     }
 
@@ -248,7 +337,29 @@ impl ChunkedDiskBackend {
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             threshold_bytes,
+            in_flight: Arc::new(InFlightTracker::new()),
         })
+    }
+
+    /// ADR 0018 commit 12m: hand out a clone of the in-flight tracker
+    /// for the NBD daemon's `serve_loop` to record per-request
+    /// guards against. `Arc`-cloned so the daemon's spawned task
+    /// keeps a handle for the device's lifetime. The `dead_code`
+    /// allow covers macOS where the runtime is cfg-gated off;
+    /// `wait_idle()` below is the cross-platform accessor.
+    #[allow(dead_code)]
+    pub(crate) fn in_flight_tracker(&self) -> Arc<InFlightTracker> {
+        self.in_flight.clone()
+    }
+
+    /// ADR 0018 commit 12m: park until every NBD request currently
+    /// being handled has finished. The snapshot pipeline calls this
+    /// after `inner.pause()` and before `flush()` — pause stops the
+    /// guest's vCPUs, this drains the virtio → kernel-NBD →
+    /// userspace-daemon pipeline so flush sees the complete
+    /// just-quiesced disk state. No-op when nothing is in flight.
+    pub async fn wait_idle(&self) {
+        self.in_flight.wait_idle().await;
     }
 
     /// ADR 0016 Phase B accessor: hand out a clone of the threshold
@@ -356,6 +467,17 @@ impl ChunkedDiskBackend {
     /// Write `data` at `offset`. Idempotent on the same byte range
     /// — last writer wins. Materialises the affected chunks into
     /// the dirty buffer on first touch (copy from base, then patch).
+    ///
+    /// ADR 0018 commit 12m: insert + patch happen under a single
+    /// dirty-lock acquisition. The pre-commit-12m shape used three
+    /// acquisitions (ensure_dirty's two + a re-acquire to patch),
+    /// which let `flush()` interleave between the last insert and
+    /// the patch — `dirty.get_mut(...).expect(...)` could panic AND
+    /// the patched bytes could land in the dirty map after flush's
+    /// drain, missing the published manifest. The cross-host evac
+    /// canary md5 mismatch surfaced this. The fetch of base bytes
+    /// (the slow part) still happens outside any lock; only the
+    /// insert-if-missing + patch are inside the critical section.
     pub async fn write(&self, offset: u64, data: &[u8]) -> Result<(), DiskBackendError> {
         let length = data.len() as u64;
         if offset.saturating_add(length) > self.total_bytes {
@@ -379,19 +501,95 @@ impl ChunkedDiskBackend {
             let intra = (cursor - chunk_start) as usize;
             let take_u64 = std::cmp::min(end, chunk_end) - cursor;
             let take = take_u64 as usize;
-            // Materialise the chunk into the dirty map if it isn't
-            // already. We fetch the base bytes ONCE here regardless
-            // of where in the chunk this write lands.
             let chunk_len = (chunk_end - chunk_start) as usize;
-            self.ensure_dirty(chunk_idx, chunk_len).await?;
-            let mut dirty = self.dirty.lock().await;
-            let buf = dirty
-                .get_mut(&chunk_idx)
-                .expect("ensure_dirty just inserted");
-            buf[intra..intra + take].copy_from_slice(&data[src_off..src_off + take]);
-            drop(dirty);
+            self.write_chunk(chunk_idx, chunk_len, intra, &data[src_off..src_off + take])
+                .await?;
             cursor += take_u64;
             src_off += take;
+        }
+        Ok(())
+    }
+
+    /// Patch one chunk's dirty buffer in a single critical section.
+    /// If the chunk isn't in the dirty map yet, fetch its base bytes
+    /// OUTSIDE the lock (slow, network), then take the dirty lock
+    /// ONCE and either (a) insert the prefetched base and patch in
+    /// place, or (b) patch the existing entry that a racing writer
+    /// installed while we were fetching. Either way the patch lands
+    /// atomically w.r.t. `flush()`'s drain.
+    async fn write_chunk(
+        &self,
+        chunk_idx: usize,
+        chunk_len: usize,
+        intra: usize,
+        payload: &[u8],
+    ) -> Result<(), DiskBackendError> {
+        // Cheap pre-check: if the chunk is already in dirty, skip
+        // the base fetch entirely. Holding the dirty lock briefly
+        // here is fine — a HashMap::contains_key is constant-time.
+        let already_present = self.dirty.lock().await.contains_key(&chunk_idx);
+        let prefetched_base: Option<Vec<u8>> = if already_present {
+            None
+        } else {
+            // Fetch base bytes OUTSIDE the dirty lock. Another writer
+            // may insert the same chunk while we're awaiting the
+            // chunk-store fetch; we handle that under the lock below
+            // (the racing-writer branch).
+            let hash = self
+                .state
+                .lock()
+                .await
+                .base
+                .chunks
+                .get(chunk_idx)
+                .copied()
+                .flatten();
+            let base_bytes = match hash {
+                Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
+                None => Bytes::from(vec![0u8; chunk_len]),
+            };
+            Some(base_bytes.to_vec())
+        };
+
+        // Single critical section: ensure entry exists, patch in
+        // place. `flush()` either runs entirely before this lock
+        // acquisition (drains an old dirty map, ticks the manifest,
+        // we then dirty a fresh chunk against the new base) OR runs
+        // entirely after (our patch lands in the dirty map before
+        // the drain, gets included in the published manifest).
+        // There's no in-between state where flush sees half a write.
+        let crossed = {
+            let mut dirty = self.dirty.lock().await;
+            let before: u64 = dirty.values().map(|v| v.len() as u64).sum();
+            let inserted_len = match dirty.entry(chunk_idx) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut()[intra..intra + payload.len()].copy_from_slice(payload);
+                    0u64
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let mut buf = match prefetched_base {
+                        Some(b) => b,
+                        // Unreachable in practice: `already_present` was
+                        // false, so we definitely fetched a base above.
+                        // Bail out cleanly rather than panic if the
+                        // assumption ever changes.
+                        None => {
+                            return Err(DiskBackendError::InvariantViolation(
+                                "write_chunk: vacant entry with no prefetched base".into(),
+                            ))
+                        }
+                    };
+                    buf[intra..intra + payload.len()].copy_from_slice(payload);
+                    let len = buf.len() as u64;
+                    slot.insert(buf);
+                    len
+                }
+            };
+            let after = before + inserted_len;
+            before < self.threshold_bytes && after >= self.threshold_bytes
+        };
+        if crossed {
+            self.threshold_notify.notify_one();
         }
         Ok(())
     }
@@ -609,72 +807,12 @@ impl ChunkedDiskBackend {
         }
     }
 
-    /// Ensure the dirty buffer has a writeable copy of chunk `idx`.
-    /// If not, copy the base chunk's bytes in. Idempotent.
-    ///
-    /// ADR 0016 Phase B: when the insert grows the dirty buffer's
-    /// total resident bytes past `threshold_bytes` (monotonic
-    /// crossing under the dirty lock), poke the threshold `Notify`
-    /// so the flush scheduler can wake early. Crossing detection is
-    /// inside the same lock that the flush drain takes — two
-    /// concurrent writers can both observe "post-write total >
-    /// threshold" if they sum `dirty_bytes()` separately, but only
-    /// one observes the monotonic edge under the lock. `notify_one`
-    /// stores at most one permit, so a missed wake on a sustained
-    /// past-threshold buffer is fine: the next call to `notified()`
-    /// returns immediately, the scheduler drains everything in one
-    /// flush.
-    async fn ensure_dirty(
-        &self,
-        chunk_idx: usize,
-        chunk_len: usize,
-    ) -> Result<(), DiskBackendError> {
-        {
-            let dirty = self.dirty.lock().await;
-            if dirty.contains_key(&chunk_idx) {
-                return Ok(());
-            }
-        }
-        // Fetch the base bytes outside the dirty lock — the chunk
-        // store call is async and slow. Two concurrent writers to
-        // the same chunk may both perform the fetch; the second
-        // one's insert is a no-op. Content-addressing makes
-        // redundant fetches safe.
-        let hash = self
-            .state
-            .lock()
-            .await
-            .base
-            .chunks
-            .get(chunk_idx)
-            .copied()
-            .flatten();
-        let base_bytes = match hash {
-            Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
-            None => Bytes::from(vec![0u8; chunk_len]),
-        };
-        let crossed = {
-            let mut dirty = self.dirty.lock().await;
-            let before: u64 = dirty.values().map(|v| v.len() as u64).sum();
-            // `or_insert_with` is the idempotency guard: if a racing
-            // writer already inserted while we fetched, our bytes
-            // are dropped and the dirty buffer's size is unchanged.
-            let inserted_len = match dirty.entry(chunk_idx) {
-                std::collections::hash_map::Entry::Occupied(_) => 0u64,
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    let len = base_bytes.len() as u64;
-                    slot.insert(base_bytes.to_vec());
-                    len
-                }
-            };
-            let after = before + inserted_len;
-            before < self.threshold_bytes && after >= self.threshold_bytes
-        };
-        if crossed {
-            self.threshold_notify.notify_one();
-        }
-        Ok(())
-    }
+    // ensure_dirty was the pre-12m two-phase chunk materialization
+    // helper. Folded into `write_chunk` above, which combines the
+    // base-bytes fetch (outside the dirty lock) with a single-lock
+    // insert-and-patch (inside the lock). Kept the threshold-cross
+    // detection in the patch path so the flush scheduler still
+    // wakes on monotonic crossings.
 }
 
 #[cfg(test)]
@@ -1318,5 +1456,85 @@ mod tests {
             second.is_err(),
             "notify_one stores at most one permit; a second consumer must wait",
         );
+    }
+
+    /// ADR 0018 commit 12m: `InFlightTracker::wait_idle` must return
+    /// immediately when count is 0 (no requests outstanding).
+    #[tokio::test]
+    async fn in_flight_tracker_wait_idle_returns_immediately_when_empty() {
+        let tracker = Arc::new(InFlightTracker::new());
+        // 50 ms is generous; an idle wait_idle should be sub-µs.
+        let res =
+            tokio::time::timeout(std::time::Duration::from_millis(50), tracker.wait_idle()).await;
+        assert!(
+            res.is_ok(),
+            "wait_idle on empty tracker must return immediately"
+        );
+    }
+
+    /// `wait_idle` parks while at least one guard is live, wakes
+    /// when the last guard drops. Models the snapshot pipeline's
+    /// barrier semantic: pause → wait_idle → flush, where
+    /// in-flight writes registered via `enter()` must complete
+    /// before flush sees a quiesced dirty buffer.
+    #[tokio::test]
+    async fn in_flight_tracker_wait_idle_blocks_until_last_guard_drops() {
+        let tracker = Arc::new(InFlightTracker::new());
+        let g1 = tracker.enter();
+        let g2 = tracker.enter();
+
+        // wait_idle should NOT return while guards are held.
+        let waiter_tracker = tracker.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_tracker.wait_idle().await;
+        });
+        // Give the spawned task a beat to start waiting.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_idle returned with 2 guards live"
+        );
+
+        // Drop one guard — count is still > 0, waiter still parked.
+        drop(g1);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_idle returned with 1 guard live"
+        );
+
+        // Drop the last guard — waiter must unblock.
+        drop(g2);
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), waiter).await;
+        assert!(
+            res.is_ok(),
+            "wait_idle never returned after last guard dropped"
+        );
+    }
+
+    /// Multiple `wait_idle` callers all wake on the 1→0 edge.
+    /// `notify_waiters` is used (not `notify_one`) so any number
+    /// of parkers see the drain — important if a future caller
+    /// adds a second wait_idle path (admin diagnostic, e.g.).
+    #[tokio::test]
+    async fn in_flight_tracker_wait_idle_wakes_all_waiters() {
+        let tracker = Arc::new(InFlightTracker::new());
+        let g = tracker.enter();
+
+        let w1 = tokio::spawn({
+            let t = tracker.clone();
+            async move { t.wait_idle().await }
+        });
+        let w2 = tokio::spawn({
+            let t = tracker.clone();
+            async move { t.wait_idle().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        drop(g);
+
+        let r1 = tokio::time::timeout(std::time::Duration::from_millis(200), w1).await;
+        let r2 = tokio::time::timeout(std::time::Duration::from_millis(200), w2).await;
+        assert!(r1.is_ok() && r2.is_ok(), "both waiters must wake on drain");
     }
 }
