@@ -198,6 +198,79 @@ Hypotheses to investigate next:
 Tracked as a separate follow-up; ADR 0018 stays "Accepted,
 with one known regression" until disk fidelity holds.
 
+### Dev-vm stumbling blocks (12m.4 investigation, 2026-05-26)
+
+Two days of attempted disk-drift inspection on the GCP dev-vm hit
+hard environmental issues that prevented the planned tests
+(recognizable-pattern hex inspection + loopback-mount of the
+materialized rootfs). Documented here so the next attempt knows
+what to expect:
+
+  - **Disk pressure floor halts the host-agent.** `var/host-
+    sandboxes-integration*` accumulates ~30 GB of FC sandbox state
+    across test runs. Once the dev-vm's root FS drops below the
+    21 GB floor (`engram_host_agent: idle-evict paused: disk
+    pressure`), host-agent stops accepting new sandbox creates,
+    coord returns 503 "no host has capacity," and nothing runs.
+    `sudo rm -rf var/host-sandboxes-integration{,-b}` between runs
+    is the only stable workaround. The directories are scratch;
+    `integration-up.sh` recreates them. Not a code bug — a
+    deployment hygiene issue.
+
+  - **Stale `hosts` rows in PG poison the gRPC pool prewarm.**
+    Restarting just coord (without `docker compose down -v`)
+    leaves the prior run's `hosts.last_heartbeat_at` rows present.
+    Coord boots, calls `GrpcHostPool::warm` against every
+    historical host_id, all fail with `tcp connect error`, and
+    the pool entries linger as half-initialized. The fresh
+    host-agents that register later get NEW host_ids but the pool
+    state for those is fine — except subsequent gRPC operations
+    sometimes still return `http2 error` from the bad cached
+    state. Full `docker compose -f deploy/docker-compose.dev.yml
+    down -v` to wipe the PG volume is the only reliable reset.
+
+  - **`integration-bake-demo.sh` produces nondeterministic
+    digests.** Each invocation builds an image whose layer digests
+    differ from the previous bake (timestamps in the OCI manifest
+    or the layer contents). The host-agent's OCI image cache then
+    oscillates between "stale cached digest" and "expected digest"
+    every reconcile tick. Multiple `DELETE FROM enabled_images;`
+    + rebake cycles are needed to converge.
+
+  - **SSH session churn breaks tooling.** Many short-lived SSH
+    invocations (one per `bash .claude/skills/dev-vm/scripts/run.sh
+    …`) hit `gcloud ssh` rate limits intermittently — `ERROR:
+    (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code
+    [255]`. Using the lower-level `ssh.sh` (which reuses the
+    cached `gcloud compute config-ssh` host alias) is faster and
+    more reliable. The `portforward.sh` IAP tunnels didn't help —
+    they failed to bind localhost ports under the same load. For
+    future inspection work, a single SSH session into a `tmux`
+    multiplexer on the dev-vm + driving commands locally is
+    probably the right shape.
+
+  - **Pre-existing `start_agent` hang.** Independent of 12m: even
+    after a clean docker-compose-down + rm var + integration-up
+    + fresh bake + verified host registration + ready image,
+    `POST /sessions` hangs at the start_agent gRPC call. The FC
+    microVM boots successfully, FlushScheduler runs, manifests
+    publish — but the in-guest bootstrap apparently doesn't dial
+    back (no `start_agent` entry in host-agent.log, session
+    stays at `created` status indefinitely). **Reproduced on
+    binaries built from `c6ff7a6` (pre-12m), so this is NOT
+    introduced by commit 12m.** Likely a bad baked image or a
+    kernel/init mismatch on the dev-vm. Blocks any e2e dev-vm
+    verification of the evac flow.
+
+**Recommendation for 12m.4 investigation:** abandon the dev-vm
+path and validate against a staging deploy of the production
+GCP cluster (where the bake pipeline + host-agent images are
+known-good and managed by deployment automation, not local
+build artifacts). The full e2e shape — `kubectl drain`, watch
+sessions move, run a canary write/read across the relocate —
+is the same regardless of where it executes, and the prod path
+sidesteps every stumbling block above.
+
 ---
 
 ## Context
