@@ -76,11 +76,23 @@ devices clean). See §"Commit 12o" below.
 The earlier "12m.4 deferred — residual cross-host disk drift"
 investigation is **closed**: the drift was dev-vm-only.
 
+**Milestone complete.** With 12h merged (`6378ba1`, dead
+`evacuate_to` retired) the 12a–12o commit chain is done: the state
+machine + scanner + cordon orchestration is prod-validated, the
+chained-restore device-path correctness (12o) is fixed and verified
+in prod, and the synchronous alive-source dead code is gone. The
+items under §"Open questions" and §"Newly-filed follow-ups" are
+genuine future enhancements (Phase-C image-cache-warm ranking, the
+NBD-loss probe population, a multi-host drain fan-out wrapper) — none
+are M4 blockers. ADR 0018 is **closed**.
+
 Phase chain (commits 0–11 already on `main`):
 
 - **Phase 0** — this ADR in Proposed status. (commit `aa37933`)
 - **Phase A** — `HostClient::evacuate` trait + types (commit `4fac78e`)
   → orchestration in `evacuation::evacuate_to` (commit `95db896`).
+  *(Both retired in 12h: the async rework superseded the synchronous
+  alive-source primitive.)*
 - **Phase B** — dead-source path in `dead_host.rs` via
   `evacuate_dead_source` (commit `874e397`) → NBD-unhealthy heartbeat
   field + monitor seam (commit `96f3cc7`) → coord-side
@@ -131,9 +143,17 @@ Phase chain (commits 0–11 already on `main`):
   - **12i** (`d0844c0`) — `e2e_evac_admin_endpoint_shape` asserts the
     202 + `{status: "evacuating"}` body. `integration-evac-test.sh`
     polls for `Evacuating → Active` with disk-canary md5 preserved.
-  - **12h** (follow-up) — retire `evacuation::evacuate_to`; the
-    function has no production callers post-12e/f but tests still
-    exercise the type. Will land in a focused cleanup commit.
+  - **12h** (`6378ba1`) — retired the dead alive-source
+    `evacuation::evacuate_to`. Zero non-test callers since 12f
+    rewrote the admin endpoint to the state-machine shape. Removed
+    the function, its 6 unit tests + the alive-source live-PG test,
+    the 4 `EvacError` variants only it produced (`TargetIsSource`,
+    `TargetNotRegistered`, `SourceLookup`, `SnapshotFailed`), the
+    `calls` test-instrumentation the deleted ordering assertions
+    read, and the dead `HostClient::evacuate` trait method
+    (default-impl, never overridden). −545 net lines.
+    `evacuate_dead_source` is the sole remaining primitive — the
+    scanner's + NBD-loss trigger's resume path.
   - **12j** (`f7272ae`) — live-PG tests for the scanner primitives:
     migration 0037 schema pin, `list_evacuating_sessions` +
     `bump_evac_attempts` + counter-reset round-trip, cordon/uncordon
@@ -1154,6 +1174,17 @@ from ADR 0015 §M4 is *almost* delivered: state and orchestration
 arrive correctly, but the user-visible "next /exec works" step
 needs the FC vsock path remap. That gap is filed forward and is
 the single load-bearing follow-up.
+
+> **RESOLVED (superseded below).** The "single load-bearing
+> follow-up" — the FC cross-host vsock UDS path remap — was closed by
+> the `source_vsock_canonical` machinery (the snapshot records the
+> embedded UDS path; `restore_canonical_symlinks` recreates it on the
+> receiver) and completed for chained restores by commit 12o
+> (`f438aca`, which anchors `source_{rootfs,vsock}_canonical` to the
+> lineage's true device paths). Prod 2026-05-26: `/exec` on a
+> relocated session returns exit 0. The async rework + 12o sections
+> below are the current state; this Phase A–C narrative is retained
+> as the historical record of how the design evolved.
 
 The chain is intentionally split across small commits per
 `[separate_commits]` so reviewers can read each phase
