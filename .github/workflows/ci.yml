@@ -19,7 +19,7 @@ name: CI
 #   - test-firecracker: every `#[ignore]`'d FC integration test under
 #                       nested virt. Unprivileged set: boot, lifecycle,
 #                       snapshot, snapshot_uffd, exec_real_vm,
-#                       harness_loopback, multi_restore,
+#                       harness_loopback, multi_restore, restore_chain,
 #                       option_d_latency_bench, cross_host_restore.
 #                       ADR 0007 set: nbd_chunked_disk (Linux + nbd,
 #                       gated — see the step). (canonical_capture was
@@ -505,6 +505,7 @@ jobs:
             --test exec_real_vm \
             --test harness_loopback \
             --test multi_restore \
+            --test restore_chain \
             --test option_d_latency_bench \
             --test cross_host_restore \
             --run-ignored ignored-only \

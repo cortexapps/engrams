@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 /// on-disk JSON shape. The Phase 6 reattach pass refuses to read
 /// older or newer versions — operator must manually evict stale
 /// sandboxes before deploying a host-agent that bumped the version.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Marker for the `backend` discriminator. VZ may eventually share
 /// this format with a `"vz"` value and a different `firecracker`
@@ -92,6 +92,15 @@ pub struct FirecrackerProcessRecord {
     /// guest-initiated CONNECT). Recorded so reattach can confirm
     /// the kernel still has the bind, not just the FC process.
     pub vsock_uds_base: PathBuf,
+    /// The rootfs drive's `path_on_host` as embedded in this VM's
+    /// `state.bin` — the symmetric companion to `vsock_uds_base`. For
+    /// a cold-created sandbox it is `rootfs/<own_id>.dev`; for a
+    /// restored one it is the ancestor's path (restore never re-points
+    /// the root drive). Recorded so a reattached sandbox that is later
+    /// re-snapshotted stamps `source_rootfs_canonical` from the path FC
+    /// actually has open, not one recomputed off the live id (ADR 0018
+    /// commit 12o). Mirrors `SandboxState::rootfs_canonical`.
+    pub rootfs_canonical: PathBuf,
     /// FC vsock CID for this sandbox. Coordinator-side `harness_dial`
     /// reads it to wire the guest's harness-back-dial; reattach
     /// rehydrates the per-sandbox `next_cid` allocator state.
@@ -306,6 +315,7 @@ mod tests {
                 },
                 api_socket: PathBuf::from("/tmp/fc.sock"),
                 vsock_uds_base: PathBuf::from("/tmp/sb.vsock"),
+                rootfs_canonical: PathBuf::from("/tmp/rootfs/sb.dev"),
                 vsock_cid: 3,
             },
             network: None,

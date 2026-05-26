@@ -117,6 +117,19 @@ pub struct SandboxState {
     pub rootfs_path: PathBuf,
     pub vsock_cid: u32,
     pub vsock_uds_path: PathBuf,
+    /// The rootfs drive's `path_on_host` as FC actually has it open —
+    /// i.e. the absolute path embedded in this VM's `state.bin`. For a
+    /// cold-created sandbox this is `rootfs/<own_id>.dev`; for a
+    /// restored one it is the ANCESTOR's path (restore never re-points
+    /// the root drive — FC inherits the snapshot's embedded path). ADR
+    /// 0018 commit 12o: `snapshot()` stamps `source_rootfs_canonical`
+    /// from this, not from a path recomputed off the live id, so a
+    /// chained snapshot lineage records the path FC really opens. The
+    /// per-restore id is just a routing handle; device paths are
+    /// anchored to the lineage's original identity. Mirrors
+    /// `vsock_uds_path`, which is immutable post-load (PUT /vsock 400)
+    /// and so MUST carry the embedded path forward.
+    pub rootfs_canonical: PathBuf,
 }
 
 /// Reserved vsock port `engram-agentd` listens on inside the guest.
@@ -782,6 +795,12 @@ impl FirecrackerBackend {
             // field for future symmetry with create().
             vsock_cid: fc.vsock_cid,
             vsock_uds_path: fc.vsock_uds_base.clone(),
+            // Only cold-created sandboxes write an on-disk manifest, so
+            // a path-1 reattach only ever sees a cold lineage; the
+            // persisted `rootfs_canonical` is `rootfs/<id>.dev`. Carry
+            // it forward so a re-snapshot after restart still stamps
+            // the embedded path FC has open.
+            rootfs_canonical: fc.rootfs_canonical.clone(),
         };
         // Reattach: agentd was already up when the previous host-
         // agent generation tracked it, so the readiness watch starts
@@ -1351,6 +1370,10 @@ impl FirecrackerBackend {
             rootfs_path: rootfs,
             vsock_cid,
             vsock_uds_path,
+            // Cold create: FC opened the root drive at this sandbox's
+            // own id-keyed canonical (the `put_drive` above used it as
+            // `path_on_host`), so the embedded path == own id.
+            rootfs_canonical,
         };
         // ADR 0009 §4: spawn a supervisor that watches for unexpected
         // FC process exit (kernel OOM, segfault, manual kill) and
@@ -1382,6 +1405,7 @@ impl FirecrackerBackend {
                     },
                     api_socket: state.firecracker_socket.clone(),
                     vsock_uds_base: state.vsock_uds_path.clone(),
+                    rootfs_canonical: state.rootfs_canonical.clone(),
                     vsock_cid,
                 },
                 network: net_setup.map(|ns| sandbox_manifest::NetworkRecord {
@@ -1760,6 +1784,19 @@ impl FirecrackerBackend {
             rootfs_path,
             vsock_cid,
             vsock_uds_path,
+            // Restore inherits state.bin's embedded root-drive path —
+            // `load_snapshot` reopens the drive at whatever the
+            // snapshotting VM had, and we never re-point it. That path
+            // is `manifest.source_rootfs_canonical` (which
+            // `restore_canonical_symlinks` recreated → live backing).
+            // Carry it forward so a re-snapshot of THIS sandbox stamps
+            // the path FC actually has open, not one recomputed from
+            // the fresh live id. Fallback to the own-id canonical for
+            // legacy snapshots that predate the field.
+            rootfs_canonical: manifest
+                .source_rootfs_canonical
+                .clone()
+                .unwrap_or_else(|| paths::rootfs_canonical(&self.work_dir, sandbox_id)),
         };
         // ADR 0009 §4: supervisor watches restored FC + (optional)
         // UFFD handler. The UFFD handler is critical — if it dies
@@ -2358,7 +2395,7 @@ impl SandboxBackend for FirecrackerBackend {
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // Read sandbox state under the dashmap guard, drop guard before
         // any await so we don't hold the read lock across an HTTP call.
-        let (socket, spec, net_snapshot) = {
+        let (socket, spec, net_snapshot, live_rootfs_canonical, live_vsock_uds) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             // Cold-path sandboxes carry `net`; M1.16 warm-restored
             // sandboxes carry `netns` with the same TAP name + CIDR
@@ -2383,6 +2420,8 @@ impl SandboxBackend for FirecrackerBackend {
                 live.state.firecracker_socket.clone(),
                 live.state.spec.clone(),
                 net_snapshot,
+                live.state.rootfs_canonical.clone(),
+                live.state.vsock_uds_path.clone(),
             )
         };
 
@@ -2414,22 +2453,34 @@ impl SandboxBackend for FirecrackerBackend {
         let paths = api.create_snapshot(&dest).await?;
 
         let created_at = Utc::now();
+        // ADR 0018 commit 12o: stamp the canonical paths from what the
+        // LIVE sandbox actually has open (tracked in `SandboxState`),
+        // NOT recomputed from `id`. The two diverge after a restore: FC
+        // inherits the snapshot's embedded `path_on_host` and we never
+        // re-point the root drive, so a restored sandbox runs with its
+        // ANCESTOR's id-keyed path while `id` is a fresh routing handle.
+        // Recomputing off `id` stamped a path nobody recreates on the
+        // next restore → ENOENT (rootfs) / EADDRINUSE (vsock). Anchoring
+        // to the embedded path keeps the whole snapshot lineage
+        // consistent across arbitrarily many chained restores. Vsock
+        // can't be re-pointed (PUT /vsock 400 post-load), so this
+        // carry-forward is the ONLY correct option there — rootfs uses
+        // the same mechanism for uniformity.
         let source_rootfs_canonical = if spec.rootfs_source.is_some() {
-            Some(paths::rootfs_canonical(&self.work_dir, id))
+            Some(live_rootfs_canonical)
         } else {
             None
         };
+        // The harness drive IS re-pointed onto the live id's canonical
+        // at restore (`restore_canonical_symlinks` + `swap_harness_drive`
+        // PATCH /drives), so its embedded path tracks the live id and
+        // recomputing here is correct.
         let source_harness_canonical = if spec.harness_substrate.is_some() {
             Some(paths::harness_canonical(&self.work_dir, id))
         } else {
             None
         };
-        // The bake's vsock UDS lived at `<work_dir>/<sandbox_id>.vsock`
-        // (set in create_in_jail). FC's state.bin embeds that path; on
-        // restore FC recreates the UDS there. Stamp it so the receiver
-        // can dial the right path instead of guessing from its own
-        // work_dir.
-        let source_vsock_canonical = Some(self.work_dir.join(format!("{id}.vsock")));
+        let source_vsock_canonical = Some(live_vsock_uds);
         // ADR 0014 sec-hardening: `spec.env` carries session secrets
         // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, etc.) verbatim
         // — keeping them in the on-disk sidecar would leak them to

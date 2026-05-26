@@ -346,6 +346,7 @@ mod tests {
                 },
                 api_socket: tmp.path().join("nonexistent.sock"),
                 vsock_uds_base: tmp.path().join("nonexistent.vsock"),
+                rootfs_canonical: tmp.path().join("rootfs/nonexistent.dev"),
                 vsock_cid: 3,
             },
             network: None,

@@ -1,9 +1,11 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
 Status: 2026-05-26 — **Accepted, validated in production.** The
-async evac rework (commits 12a–12n) lands the state machine +
+async evac rework (commits 12a–12o) lands the state machine +
 scanner + cordon pattern and is proven end-to-end on the GKE
-prod cluster. The user-visible promise — "operator drains a host
+prod cluster. 12o (chained-restore device-path fix) is validated
+on the dev-vm `restore_chain` test; prod re-evac canary pending
+deploy. The user-visible promise — "operator drains a host
 / a host dies, the session moves to a peer and keeps working" —
 holds in prod with disk content bit-identical across the relocate.
 
@@ -50,14 +52,20 @@ sandbox now returns 202). Dead-host recovery was unaffected
 (it doesn't snapshot a dead source), which is why `3e692ab6`
 survived four rolls. See §"Commit 12n" below.
 
-**One edge case still open (commit 12o):** with 12n in place,
-re-evac gets past the snapshot but the scanner's *restore* of a
-twice-relocated sandbox fails FC `load_snapshot` (source-keyed
-rootfs backing file not materialized on the new target); the
-session falls back to `Idle` after the retry budget. This affects
-**only** back-to-back *operator* evac/drain of the same session
-— not dead-host recovery, not single operator-evac. The primary
-deploy-roll promise is unaffected. See §"Commit 12o (open)".
+**Prod-found + fixed (commit 12o):** with 12n in place, re-evac
+got past the snapshot but the scanner's *restore* of a
+twice-relocated sandbox failed FC `load_snapshot` on a stale
+device path. Root cause: `snapshot()` recomputed
+`source_rootfs_canonical` / `source_vsock_canonical` from the
+*live* sandbox id, but FC's `state.bin` embeds the path the drive
+was *configured* with — and restore never re-points those devices,
+so a restored sandbox runs with its ANCESTOR's id-keyed paths. The
+two diverged after the first restore. 12o stamps both canonicals
+from the paths the live sandbox actually has open (tracked in
+`SandboxState`), anchoring the whole snapshot lineage to its
+original device identity. Validated on the dev-vm by a new
+chained-lineage integration test (`restore_chain`, 3 hops, both
+devices clean). See §"Commit 12o" below.
 
 The earlier "12m.4 deferred — residual cross-host disk drift"
 investigation is **closed**: the drift was dev-vm-only.
@@ -263,7 +271,7 @@ errors at the snapshot — `POST /evacuate` returns 202 and the
 re-snapshot succeeds (session reaches Evacuating). The original
 "non-canonical jail layout" failure is gone.
 
-### Commit 12o (open) — restore of a twice-relocated sandbox
+### Commit 12o — restore of a twice-relocated sandbox
 
 Fixing 12n peeled the onion to the next layer. With 12n in place,
 re-evac gets past the snapshot, but the scanner's *restore* of the
@@ -323,39 +331,85 @@ of the restored sandbox — that recompute is what introduces the
 divergence. This is why `3e692ab6` survived four dead-host
 recoveries but a deliberate double operator-evac stalls.
 
-**Fix — Option B (normalize identity on restore), chosen:** make a
-restored sandbox truly equal to a cold-created one by re-pointing
-its rootfs drive to its *own* new-id canonical path on restore,
-mirroring what the harness drive already does. Mechanically:
+**Two candidate fixes were considered:**
 
-- Restore loads via `load_snapshot_paused` /
-  `load_snapshot_uffd_paused` (already in the client, used by the
-  M1.12 option-D harness path), then
-  `patch_drive("rootfs", rootfs_canonical(new_id))`, then resume.
-  12n already installs `rootfs/<new_id>.dev` → the live `/dev/nbdN`,
-  so the patch target exists.
-- After this the running drive is at `rootfs/<new_id>.dev`, so the
-  *next* snapshot's `state.bin` embeds the new id,
-  `source_rootfs_canonical` (= `rootfs_canonical(new_id)`) matches,
-  and ancestry is severed. Hop N == hop 1 for all N.
+- **Option B — normalize identity on restore.** Re-point the rootfs
+  drive to the new sandbox's *own* canonical path on restore
+  (`load_snapshot_paused` → `patch_drive("rootfs", …)` → resume),
+  mirroring the M1.12 harness drive. Every restore yields a
+  self-referential sandbox; the next snapshot embeds the new id and
+  ancestry is severed.
+- **Option A — record the true embedded path.** Stamp
+  `source_rootfs_canonical` from the path the live sandbox actually
+  has open, not one recomputed from the live id.
 
-Rejected alternative (Option A): record the *true* embedded path in
-`source_rootfs_canonical` rather than the computed one. Fixes the
-bug but welds the cold ancestor id into every descendant forever —
-keeps the smell. B removes the whole 12n/12o class.
+B was chosen first and **implemented + tested — then abandoned.**
+A new chained-lineage dev-vm test (`restore_chain`: cold → S1 →
+restore → S2 → restore → …, snapshotting the *restored* sandbox
+each hop) got past the rootfs ENOENT under B, then failed at hop 2
+on a **different device** with the identical divergence:
 
-**Residual risk to confirm during implementation:** FC must open
-the root block device on *resume*, not on *load*, for load-paused →
-patch → resume to work on the root drive (the harness path proves
-it for a non-root drive). To be validated on the dev-vm FC
-boot-test harness before wiring + end-to-end on prod via the
-re-evac canary.
+```
+VsockUnixBackend: Error binding to the host-side Unix socket:
+Address in use (os error 98)
+```
 
-**Net operational state until 12o ships:** the primary M4 promise —
+The vsock UDS has the same bug — `snapshot()` recomputed
+`source_vsock_canonical` from the live id too (`<work_dir>/<id>.vsock`),
+so after a restore the cleaned path and the embedded path diverge
+and FC's bind collides with the ancestor's still-live socket. **B
+cannot fix vsock**: FC's vsock state machine refuses any
+reconfiguration after load (PUT /vsock returns 400 both pre- and
+post-load, lib.rs:1737), so there is no "re-point the vsock device"
+move analogous to `patch_drive`. A B-rootfs + A-vsock hybrid would
+be two mechanisms for one bug.
+
+**Fix — Option A, for both devices (shipped):** the correct mental
+model is that *a snapshot lineage is one logical machine with
+stable device paths; the per-restore `sandbox_id` is just a routing
+handle.* Device paths should anchor to the lineage's original
+identity, not be renumbered every restore. `snapshot()` now stamps
+both `source_rootfs_canonical` and `source_vsock_canonical` from
+the paths the live sandbox actually has open, carried forward
+through `SandboxState`:
+
+- `SandboxState` gains a `rootfs_canonical` field (the symmetric
+  companion to the existing `vsock_uds_path`) = the rootfs drive's
+  embedded `path_on_host`. Cold-create sets it to the own-id
+  canonical; restore carries forward `manifest.source_rootfs_canonical`
+  (the path FC inherited and that `restore_canonical_symlinks`
+  recreates → live `/dev/nbdN`).
+- `snapshot()` reads `live.state.rootfs_canonical` and
+  `live.state.vsock_uds_path` instead of recomputing from `id`. The
+  harness drive is exempt — it IS re-pointed onto the live id on
+  restore (`swap_harness_drive`), so its embedded path tracks the
+  live id and the existing recompute stays correct.
+- The persisted `FirecrackerProcessRecord` gains a matching
+  `rootfs_canonical` (next to `vsock_uds_base`) so a reattached
+  sandbox re-snapshots against the right path; `SCHEMA_VERSION`
+  bumped 1→2. Only cold-created sandboxes write an on-disk manifest,
+  so reattach only ever sees a cold lineage; a prod deploy rolls the
+  MIG (fresh hosts, no v1 manifests on disk), so the version bump is
+  inert in practice — an in-place host-agent restart with v1
+  manifests would treat those sandboxes as missing (the standard
+  version-mismatch behavior), which reconcile already handles.
+
+The "welded ancestor id" cosmetic downside flagged against A is
+harmless: stable symlink / socket paths recreated per host, no
+runtime cost. A is the *only* viable fix for the immutable vsock
+device, and using it for rootfs too keeps one uniform mechanism.
+
+**Validation:** `restore_chain` (`#[ignore]`, Linux+KVM, wired into
+ci.yml's unprivileged FC test list) clears all 3 hops on the dev-vm
+— both the rootfs ENOENT and the vsock EADDRINUSE are gone. Prod
+re-evac canary (back-to-back operator-evac of one session) pending
+the 12o host-image roll.
+
+**Net operational state before 12o:** the primary M4 promise —
 session survives a host loss / deploy roll via dead-host recovery —
-is fully working in prod (proven 4×). Single operator-evac / drain
-works. The only gap is **back-to-back *operator* evac/drain of the
-same session**.
+was already fully working in prod (proven 4×). Single operator-evac
+/ drain worked. 12o closes the last gap: **back-to-back *operator*
+evac/drain of the same session.**
 
 ### Dev-vm stumbling blocks (12m.4 investigation, 2026-05-26)
 
