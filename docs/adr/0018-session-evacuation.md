@@ -1,18 +1,35 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
-Status: 2026-05-25 — **Accepted**. Commit chain 12a–12i lands the
-async evac rework on top of the original Phases A–C synchronous
-primitive. The user-visible promise — "operator runs `kubectl drain`
-on a host, every session moves to a peer, user keeps working" — is
-now end-to-end through the state machine + scanner pattern, with the
-flush-vs-pause race in `PooledBackend::snapshot` structurally
-eliminated by paus-before-flush ordering inherited from
-`evict_session_to_state`.
+Status: 2026-05-25 — **Accepted, with one known regression**. The
+async evac rework (commits 12a–12l + tests 12j) lands the state
+machine + scanner + cordon pattern. The user-visible orchestration
+promise — "operator drains a host, session moves to a peer, /exec
+keeps working" — is end-to-end:
 
-Validation: per-crate `cargo check` clean (core, postgres,
-coordinator), 113-test coord lib suite passes, 36-test core suite
-passes. Dev-vm 2-host e2e via `integration-evac-test.sh` (async
-shape) is the next live validation step.
+- 2-host dev-vm `integration-evac-test.sh` run: session transitions
+  Active → Evacuating → Created → Active on a different `host_id`.
+  `/api/admin/sessions/:id/evacuate` returns 202 immediately; the
+  scanner picks up Evacuating and drives the resume in ≤10s. Pre-
+  evac canary file exists post-evac at the same path with the
+  same size.
+- Live-PG tests (run in CI's existing Postgres-gated lane): three
+  new cases in `admin_evac_live_pg.rs` cover migration 0037 schema
+  shape, `list_evacuating_sessions`/`bump_evac_attempts`/counter-
+  reset round-trip, and `HostRegistry::cordon`/`uncordon`
+  filtering through `pick_for_session`.
+
+**Known regression**: cross-host disk content is NOT bit-identical
+yet. Dev-vm canary md5 differs between source and target. The ADR
+text below claimed the new pause-before-flush ordering would
+eliminate the race; investigation post-validation showed the
+ordering in `PooledBackend::snapshot` is still flush-first
+(`nbd.flush()` BEFORE `inner.snapshot()`'s internal pause). The
+race window — guest writes between flush and pause hitting
+memory but not the published manifest — is structurally unchanged.
+A pause-before-flush refactor of `PooledBackend::snapshot`
+(separate `pause()` trait method or splitting FC's create_snapshot
+into pause/capture/resume primitives) is required and lands in
+a follow-up commit. See §"Commit 12m (deferred)" below.
 
 Phase chain (commits 0–11 already on `main`):
 
@@ -72,6 +89,44 @@ Phase chain (commits 0–11 already on `main`):
   - **12h** (follow-up) — retire `evacuation::evacuate_to`; the
     function has no production callers post-12e/f but tests still
     exercise the type. Will land in a focused cleanup commit.
+  - **12j** (`f7272ae`) — live-PG tests for the scanner primitives:
+    migration 0037 schema pin, `list_evacuating_sessions` +
+    `bump_evac_attempts` + counter-reset round-trip, cordon/uncordon
+    picker integration. Runs in CI's existing Postgres-gated lane.
+  - **12l** (`cec2cc6`) — dev-vm-found bugfixes:
+    (1) migration 0037 also drops + re-adds `sessions_status_check`
+    to permit `evacuating` (commit 12a missed this; transitions
+    failed at the DB layer); (2) `evacuate_dead_source` derives
+    `state_blob_key` + `sidecar_blob_key` from the snapshot id so
+    the target host can materialize the FC sidecar from BlobStorage
+    on cross-host restore (the sync `evacuate_to` path didn't lose
+    them; the async path does via the PG round-trip); (3)
+    `evac_resumer::run_once` is `pub(crate)` for the 12j tests.
+
+### Commit 12m (deferred) — disk-content fidelity fix
+
+`PooledBackend::snapshot` currently runs flush BEFORE inner pause:
+
+```rust
+// pooled_backend.rs:1473-1505
+let nbd_disk_manifest = entry.backend.flush().await?;   // 1) flush
+let mut metadata = self.inner.snapshot(id).await?;       // 2) pause+capture
+```
+
+The dev-vm canary md5 diverges across the relocate because guest
+writes between steps 1 and 2 land in memory but not the published
+manifest. The fix:
+
+1. Add `SandboxBackend::pause()` + `resume()` trait methods
+   (default `Ok(())`). FC implements both via `FirecrackerClient`.
+2. Reorder `PooledBackend::snapshot` to: `inner.pause()` →
+   `nbd.flush()` → `inner.snapshot()` (idempotent re-pause inside
+   FC's `create_snapshot` is harmless; existing test coverage on
+   FC pause/resume idempotency confirms).
+
+Deferred from this commit chain because the trait change ripples
+to every backend impl (Process, VZ, mocks in test crates).
+Tracked as a separate ADR follow-up.
 
 ---
 
