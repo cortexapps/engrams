@@ -1609,6 +1609,7 @@ impl FirecrackerBackend {
         // process gets SIGKILLed before we propagate.
         if let Err(e) = restore_canonical_symlinks(
             &self.work_dir,
+            sandbox_id,
             manifest,
             self.config.stub_harness_path.as_deref(),
         )
@@ -1861,11 +1862,25 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 }
 
 /// ADR 0014: re-install the canonical rootfs + harness symlinks for
-/// a restored sandbox. The symlinks live under
-/// `<work_dir>/{rootfs,harness}/<source_sandbox_id>.{dev,ext4}` —
-/// keyed by the **source** sandbox_id because that's what
-/// `state.bin` embedded as `path_on_host`, not the new restored
-/// sandbox_id. Idempotent.
+/// a restored sandbox. Two symlinks per drive:
+///
+/// 1. **The new live sandbox's own canonical path**
+///    (`<work_dir>/{rootfs,harness}/<new_sandbox_id>.{dev,ext4}`),
+///    keyed by `new_sandbox_id`. This is the one a *future*
+///    `snapshot(new_sandbox_id)` asserts via
+///    `assert_rootfs_canonical` — without it, re-snapshotting (and
+///    therefore operator-evac / drain of) a restored sandbox fails
+///    with "rootfs canonical symlink missing". (ADR 0018 commit 12n:
+///    this was previously keyed off `manifest.sandbox_id`, the
+///    *source* id, so the new id's symlink never got created and
+///    re-evac of an already-evac'd session broke — caught in prod.)
+/// 2. **The source-id-keyed path** that `state.bin` embedded as
+///    `path_on_host` at snapshot time (`manifest.source_rootfs_canonical`
+///    / `manifest.source_harness_canonical`). FC's `load_snapshot`
+///    opens the drive at this exact absolute path, so it must exist
+///    on the receiver too.
+///
+/// Both point at the same `rootfs_target`. Idempotent.
 ///
 /// `stub_harness_override`, when `Some`, replaces `manifest.spec.
 /// harness_substrate` as the symlink target — used by warm-pool
@@ -1876,6 +1891,7 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 /// openable as a block device by `load_snapshot`.
 async fn restore_canonical_symlinks(
     work_dir: &Path,
+    new_sandbox_id: SandboxId,
     manifest: &FcSnapshotManifest,
     stub_harness_override: Option<&Path>,
 ) -> Result<(), SandboxError> {
@@ -1888,11 +1904,12 @@ async fn restore_canonical_symlinks(
         })?;
     }
     if let Some(rootfs_target) = manifest.spec.rootfs_source.as_ref() {
-        // Always create the host's own canonical-path symlink — it
-        // keeps the same-host idle-resume path identical to a
-        // freshly-snapshotted sandbox, and stays correct under our
-        // own naming convention.
-        let canonical = paths::rootfs_canonical(work_dir, manifest.sandbox_id);
+        // The host's own canonical-path symlink, keyed by the NEW
+        // live sandbox_id. This is what `snapshot(new_sandbox_id)`'s
+        // `assert_rootfs_canonical` checks, so a restored sandbox can
+        // be re-snapshotted (operator-evac / drain) just like a
+        // cold-created one.
+        let canonical = paths::rootfs_canonical(work_dir, new_sandbox_id);
         paths::install_symlink(&canonical, rootfs_target)
             .await
             .map_err(|e| {
@@ -1960,7 +1977,10 @@ async fn restore_canonical_symlinks(
         let harness_target: &Path = stub_harness_override
             .or(manifest_target)
             .ok_or_else(|| vm_err("no harness target available for symlink"))?;
-        let canonical = paths::harness_canonical(work_dir, manifest.sandbox_id);
+        // Keyed by the NEW live sandbox_id (see rootfs note above) so
+        // a re-snapshot of the restored sandbox finds the harness
+        // canonical path too.
+        let canonical = paths::harness_canonical(work_dir, new_sandbox_id);
         paths::install_symlink(&canonical, harness_target)
             .await
             .map_err(|e| {
