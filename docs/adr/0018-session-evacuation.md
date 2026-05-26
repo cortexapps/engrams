@@ -1,20 +1,18 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
-Status: 2026-05-26 — **Accepted, mid-rework**. Phases A–C of the
-original synchronous evac primitive shipped in `aa37933..d5aa0ea`
-(plus commits 10–11 in `cddeb7d` + `22dd2e9` closing the
-`finish_resume_to_active` loop and the FC vsock unlink fix).
-**Commit 12 is in progress**: rewriting the alive-source path from
-synchronous (`evacuate_to`) to async (Evacuating state + background
-scanner) per the design refinement at the end of this ADR.
-
-The original concrete deliverable — "operator runs `kubectl drain`
+Status: 2026-05-25 — **Accepted**. Commit chain 12a–12i lands the
+async evac rework on top of the original Phases A–C synchronous
+primitive. The user-visible promise — "operator runs `kubectl drain`
 on a host, every session moves to a peer, user keeps working" — is
-not fully delivered yet. Disk-content fidelity across cross-host
-restore was the last blocker; commit 12 fixes it by leaning on the
-FlushScheduler's published `live_disk_manifest_*` instead of a
-fresh in-snapshot flush, which closes the flush-vs-pause race
-inside `PooledBackend::snapshot`.
+now end-to-end through the state machine + scanner pattern, with the
+flush-vs-pause race in `PooledBackend::snapshot` structurally
+eliminated by paus-before-flush ordering inherited from
+`evict_session_to_state`.
+
+Validation: per-crate `cargo check` clean (core, postgres,
+coordinator), 113-test coord lib suite passes, 36-test core suite
+passes. Dev-vm 2-host e2e via `integration-evac-test.sh` (async
+shape) is the next live validation step.
 
 Phase chain (commits 0–11 already on `main`):
 
@@ -44,7 +42,36 @@ Phase chain (commits 0–11 already on `main`):
   the base UDS so the target's freshly-bound binding survives the
   source's destroy. Validated end-to-end on dev-vm: /exec works on
   the relocated session.
-- **Commit 12** (in progress) — see §"Commit 12 rework" below.
+- **Commit 12** — async rework (this is the load-bearing milestone):
+  - **12a** (`f1f60b6`) — `SessionState::Evacuating` variant + legality
+    table; `idle_evictor::evict_session_to_state(target)` parameterized
+    pipeline; `ensure_active` dispatches Evacuating like Idle.
+  - **12b** (`f780a7b`) — migration 0037 adds `sessions.evac_attempts`;
+    `MetadataStore::list_evacuating_sessions` + `bump_evac_attempts`
+    with PG impl + MiniMeta mirror. `transition_session(Evacuating)`
+    resets the counter atomically.
+  - **12c** (`00e578e`) — new `engram_coordinator::evac_resumer`
+    background scanner sibling to `dead_host.rs`. Polls Evacuating,
+    bumps attempts, calls `evacuate_dead_source` + `bind_session_routing`
+    + `finish_resume_to_active`. 20-attempt budget then falls back
+    to Idle. Spawned from `run_with_registry_and_local`.
+  - **12d** (`a7a9067`) — `HostRegistry::cordon(host_id) /
+    uncordon(host_id) / sandboxes_on_host(host_id)`. Cordon flips
+    `HostState.draining` which the existing picker already filters.
+  - **12e+12f** (`38a67ae`) — admin endpoints `cordon`, `uncordon`,
+    `drain` + rewrite of `evacuate_session` to async 202 shape.
+    `drain` parallel-evacs every Active session on a host via
+    `evict_session_to_state(Evacuating)`.
+  - **12g** (`a4df07f`) — `dead_host.rs` second-stage no longer
+    orchestrates relocate inline; routes `HostLost → Evacuating`
+    when recoverable state exists, `Dead` otherwise. The scanner is
+    the unified resume driver.
+  - **12i** (`d0844c0`) — `e2e_evac_admin_endpoint_shape` asserts the
+    202 + `{status: "evacuating"}` body. `integration-evac-test.sh`
+    polls for `Evacuating → Active` with disk-canary md5 preserved.
+  - **12h** (follow-up) — retire `evacuation::evacuate_to`; the
+    function has no production callers post-12e/f but tests still
+    exercise the type. Will land in a focused cleanup commit.
 
 ---
 
