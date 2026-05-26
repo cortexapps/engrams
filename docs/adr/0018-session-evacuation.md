@@ -1,35 +1,55 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
-Status: 2026-05-25 — **Accepted, with one known regression**. The
-async evac rework (commits 12a–12l + tests 12j) lands the state
-machine + scanner + cordon pattern. The user-visible orchestration
-promise — "operator drains a host, session moves to a peer, /exec
-keeps working" — is end-to-end:
+Status: 2026-05-26 — **Accepted, validated in production.** The
+async evac rework (commits 12a–12n) lands the state machine +
+scanner + cordon pattern and is proven end-to-end on the GKE
+prod cluster. The user-visible promise — "operator drains a host
+/ a host dies, the session moves to a peer and keeps working" —
+holds in prod with disk content bit-identical across the relocate.
 
-- 2-host dev-vm `integration-evac-test.sh` run: session transitions
-  Active → Evacuating → Created → Active on a different `host_id`.
-  `/api/admin/sessions/:id/evacuate` returns 202 immediately; the
-  scanner picks up Evacuating and drives the resume in ≤10s. Pre-
-  evac canary file exists post-evac at the same path with the
-  same size.
-- Live-PG tests (run in CI's existing Postgres-gated lane): three
-  new cases in `admin_evac_live_pg.rs` cover migration 0037 schema
+**Prod validation (2026-05-26, cluster `engrams` us-west2):**
+
+- **Dead-host recovery, unprompted:** a real user session
+  (`3e692ab6`) survived THREE consecutive MIG rolls during the
+  deploy. Each time its host VM was terminated, `dead_host`
+  flipped it HostLost→Evacuating and the scanner restored it on a
+  peer in ~24s, fully automatic. A freshly-created session with
+  no recoverable state correctly went `Dead` (the no-state branch).
+- **Operator evac** `POST /api/admin/sessions/:id/evacuate` →
+  202 `{status:"evacuating"}`, scanner resumed on a different
+  host, `/exec` post-evac returned exit 0.
+- **Cordon / uncordon** → picker excludes / restores the host.
+- **Drain** `POST /api/admin/hosts/:id/drain` (2 sessions) →
+  202 `{evacuating:[…], failures:[]}`, both relocated to the peer
+  in parallel, both reachable via `/exec`.
+- **Disk fidelity:** canary write → evac → read, md5 **identical**
+  across the relocate for BOTH a uniform 0xAB pattern AND a 512 KB
+  random-data file. The cross-host md5 mismatch seen on the dev-vm
+  did **not** reproduce in prod — it was an artifact of the broken
+  dev-vm environment (same env with the pre-existing `start_agent`
+  hang, stale host rows, nondeterministic bakes; see
+  §"Dev-vm stumbling blocks"). 12m's pause-before-flush ordering +
+  NBD in-flight barrier + write/flush atomicity fix is what makes
+  it hold.
+- Live-PG tests (CI Postgres-gated lane): migration 0037 schema
   shape, `list_evacuating_sessions`/`bump_evac_attempts`/counter-
-  reset round-trip, and `HostRegistry::cordon`/`uncordon`
-  filtering through `pick_for_session`.
+  reset round-trip, `HostRegistry::cordon`/`uncordon` picker
+  filtering.
 
-**Known regression**: cross-host disk content is NOT bit-identical
-yet. Dev-vm canary md5 differs between source and target. The ADR
-text below claimed the new pause-before-flush ordering would
-eliminate the race; investigation post-validation showed the
-ordering in `PooledBackend::snapshot` is still flush-first
-(`nbd.flush()` BEFORE `inner.snapshot()`'s internal pause). The
-race window — guest writes between flush and pause hitting
-memory but not the published manifest — is structurally unchanged.
-A pause-before-flush refactor of `PooledBackend::snapshot`
-(separate `pause()` trait method or splitting FC's create_snapshot
-into pause/capture/resume primitives) is required and lands in
-a follow-up commit. See §"Commit 12m (deferred)" below.
+**Prod-found + fixed (commit 12n):** re-evacuating an
+already-restored sandbox failed `assert_rootfs_canonical`.
+`restore()` mints a fresh sandbox_id but
+`restore_canonical_symlinks` keyed the host's-own canonical rootfs
++ harness symlinks off `manifest.sandbox_id` (the *source* id), so
+a later `snapshot(new_id)` couldn't find `rootfs/<new_id>.dev`.
+Surfaced only on the SECOND evac (the first lineage's source id ==
+the cold-create id, so the bug hid). Fix threads the new id into
+`restore_canonical_symlinks`. Dead-host recovery was unaffected
+(it doesn't snapshot a dead source), which is why `3e692ab6`
+survived all three rolls. See §"Commit 12n" below.
+
+The earlier "12m.4 deferred — residual cross-host disk drift"
+investigation is **closed**: the drift was dev-vm-only.
 
 Phase chain (commits 0–11 already on `main`):
 
@@ -158,45 +178,74 @@ flush-vs-pause race that 12m structurally closes is provably not
 the cause, since same-host repeated reads on the source ARE
 stable.
 
-### Commit 12m.4 (deferred) — residual cross-host disk drift
+### Commit 12m.4 — residual cross-host disk drift — CLOSED (dev-vm-only)
 
-12m closed the flush-vs-pause race. But the canary md5 still
-differs between source and relocated target. Diagnostics so far:
+12m closed the flush-vs-pause race. On the dev-vm, a canary md5
+still appeared to differ across the relocate, and this section
+tracked three hypotheses for a "residual drift" bug. **Prod
+validation (2026-05-26) closed the question: there is no drift.**
 
-  - **Same-host bytes are stable.** Five consecutive reads of
-    the same file on the source return the same md5
-    (`dba96f6e…` across all five). So the source-side
-    disk + page cache pair is internally consistent.
-  - **Cross-host bytes drift.** After relocate, the md5 differs.
-    Subsequent reads on the target stabilize (5 consecutive
-    `12f1674a…`), but that value matches neither the source's
-    pre-evac md5 nor the page-cache-hit md5 captured right
-    after relocate. Three distinct values total:
-    `20226e84…` (source pre-evac), `ece03791…` (target first
-    read, page-cache hit), `12f1674a…` (target stable, post
-    page-cache-eviction reads from chunked disk).
-  - **The async flow itself works.** Session reaches Active on a
-    different host_id with the canary file present at the right
-    path with the right size; the scanner does pick up
-    Evacuating and drive to Active.
+The dev-vm symptom was an artifact of that environment, not a
+code bug. On the prod GKE cluster, the canary write → evac → read
+test passed with **bit-identical md5** for both a uniform 0xAB
+pattern (`9b8596f4…` source == target) and a 512 KB random-data
+file (`5715c627…` source == target) — the random case being
+apples-to-apples with the dev-vm scenario that "failed." 12m's
+pause-before-flush ordering + NBD in-flight barrier + write/flush
+atomicity fix is what makes disk fidelity hold; once those run
+against a healthy host-agent + bake pipeline (which prod has and
+the dev-vm did not, per §"Dev-vm stumbling blocks"), bytes are
+preserved.
 
-Hypotheses to investigate next:
+The three hypotheses are moot — none described a real prod
+failure. Most likely the dev-vm "three distinct md5s" came from
+the same broken environment that hung `start_agent` and served
+nondeterministic bakes: a half-restored sandbox reading from an
+inconsistent local materialized rootfs. Not pursued further; prod
+is the source of truth and prod is correct.
 
-  1. The memory snapshot's page cache and the chunked disk
-     manifest don't agree at restore time — possible if FC's
-     internal `create_snapshot` re-runs flush state in a way
-     that diverges from what our explicit `nbd.flush()` captured.
-  2. The chunked-disk restore on the target serves bytes from
-     a different manifest version than the snapshot's
-     `disk_manifest` field (possible if the post-snapshot live
-     publisher tick AFTER our flush left a v_N+1 manifest that
-     evacuate_dead_source picks up via `pick_evac_disk_manifest`).
-  3. Host-kernel page cache on the source between FC's emulator
-     and `/dev/nbdN` buffers writes the daemon never sees,
-     even after vCPU pause + virtio drain.
+### Commit 12n — restore canonical symlink keyed on new sandbox_id
 
-Tracked as a separate follow-up; ADR 0018 stays "Accepted,
-with one known regression" until disk fidelity holds.
+Prod-found during 12m validation. Re-evacuating an
+already-restored sandbox failed:
+
+```
+evac pipeline: … snapshot error: non-canonical jail layout:
+rootfs canonical symlink missing at …/rootfs/<sandbox_id>.dev
+```
+
+`FirecrackerBackend::restore` mints a FRESH `sandbox_id` for the
+restored sandbox, but `restore_canonical_symlinks` installed the
+host's-own canonical rootfs + harness symlinks keyed off
+`manifest.sandbox_id` — the **source** id baked into the snapshot
+manifest, not the new live id. The restored sandbox runs (FC's
+`load_snapshot` opens the drive via the `source_rootfs_canonical`
+path, which is recreated), but the new id's canonical symlink
+never gets made. A later `snapshot(new_id)` — i.e. operator-evac
+or drain of the restored session — calls
+`assert_rootfs_canonical(new_id)`, looks for `rootfs/<new_id>.dev`,
+and fails.
+
+Why it hid until prod: on the FIRST snapshot lineage the source id
+equals the cold-create id, so `source_canonical == canonical` and
+the second-symlink branch collapsed — the one symlink that got
+made happened to be the right one. The bug only surfaces on the
+SECOND evac, when the live id diverges from the manifest's source
+id.
+
+Fix: thread the new `sandbox_id` into `restore_canonical_symlinks`
+and key the host's-own rootfs + harness symlinks off it. The
+`manifest.source_*` paths (what `state.bin` embeds, what
+`load_snapshot` opens) are unchanged — both symlinks now exist,
+pointing at the same target.
+
+**Impact:** back-to-back deploy rolls using `drain` — a session
+drained in roll N could not be drained again in roll N+1. The
+dead-host recovery path is unaffected (it restores from the last
+snapshot, never snapshots a dead source), which is why the real
+session `3e692ab6` survived three consecutive MIG rolls in the
+prod validation. Re-validation of the operator re-evac path on
+prod is a follow-up once 12n deploys.
 
 ### Dev-vm stumbling blocks (12m.4 investigation, 2026-05-26)
 
