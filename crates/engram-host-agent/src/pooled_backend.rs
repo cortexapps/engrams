@@ -1470,17 +1470,36 @@ impl SandboxBackend for PooledBackend {
             }
         }
 
-        // ADR 0007 Phase 4: if this sandbox is NBD-backed, flush
-        // its dirty disk chunks BEFORE we ask the inner FC backend
-        // to take its memory snapshot. The flush produces a new
-        // disk manifest version that we attach to
-        // `SnapshotMetadata.disk_manifest`; the snapshot row's
-        // chunked-disk pointer matches the bytes the kernel saw
-        // at quiesce time. Flushing AFTER FC's pause + memory
-        // capture would race the post-pause writes the guest
-        // might queue.
+        // ADR 0018 commit 12m: snapshot ordering is now
+        //   pause → wait_idle → flush → inner.snapshot
+        // where inner.snapshot's internal pause/capture/resume is
+        // a no-op pause (FC's PATCH /vm is idempotent) followed by
+        // the memory dump and a resume that brings the VM back
+        // running. This guarantees memory + disk capture happen at
+        // the same point in time: the explicit pause stops vCPUs,
+        // wait_idle drains any in-flight virtio writes through the
+        // NBD daemon, flush publishes the just-quiesced disk
+        // manifest, and inner.snapshot then captures the page cache
+        // (which now agrees with the published disk lineage).
+        //
+        // Pre-12m ordering was flush → inner.snapshot (FC's pause
+        // happened inside the inner call AFTER our flush). Writes
+        // queued between flush and pause landed in memory but not
+        // the published manifest — the cross-host evac canary md5
+        // mismatch on dev-vm validation was exactly this race.
+        self.inner
+            .pause(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
+
         #[cfg(target_os = "linux")]
         let nbd_disk_manifest = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            // Drain in-flight NBD requests so the upcoming flush
+            // sees a quiescent dirty buffer. With FC paused above,
+            // no new virtio writes are issued, and wait_idle returns
+            // once any already-in-flight requests have completed
+            // through backend.write().
+            entry.backend.wait_idle().await;
             let outcome = entry
                 .backend
                 .flush()
@@ -1491,7 +1510,7 @@ impl SandboxBackend for PooledBackend {
                 manifest = %outcome.manifest_ref,
                 chunks_flushed = outcome.chunks_flushed,
                 bytes_uploaded = outcome.bytes_uploaded,
-                "chunked NBD disk flushed",
+                "chunked NBD disk flushed (post-pause)",
             );
             Some(outcome.manifest_ref)
         } else {
@@ -1501,7 +1520,9 @@ impl SandboxBackend for PooledBackend {
         // ADR 0007 Phase 6: backend owns its staging dir; we look
         // it up via snapshot_path_for after the inner call so we
         // can read/patch the on-disk artifacts the inner backend
-        // wrote (memory.bin, manifest.json).
+        // wrote (memory.bin, manifest.json). inner.snapshot's
+        // pause-create-resume cycle is idempotent against our
+        // earlier pause and brings the VM back to running on exit.
         let mut metadata = self.inner.snapshot(id).await?;
         let dest = self.inner.snapshot_path_for(metadata.id);
 
@@ -1673,6 +1694,20 @@ impl SandboxBackend for PooledBackend {
 
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
         self.inner.snapshot_path_for(snapshot_id)
+    }
+
+    /// ADR 0018 commit 12m: forward pause to the wrapped backend.
+    /// PooledBackend doesn't have its own pause concept — it just
+    /// delegates to whatever VMM is underneath. Used by our own
+    /// `snapshot` above (pre-flush quiesce) and exposed on the
+    /// trait so external orchestration can call it directly.
+    async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.inner.pause(id).await
+    }
+
+    /// ADR 0018 commit 12m: forward resume. Symmetric with pause.
+    async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.inner.resume(id).await
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
