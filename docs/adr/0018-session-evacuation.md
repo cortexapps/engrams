@@ -4,8 +4,14 @@ Status: 2026-05-26 — **Accepted, validated in production.** The
 async evac rework (commits 12a–12o) lands the state machine +
 scanner + cordon pattern and is proven end-to-end on the GKE
 prod cluster. 12o (chained-restore device-path fix) is validated
-on the dev-vm `restore_chain` test; prod re-evac canary pending
-deploy. The user-visible promise — "operator drains a host
+on the dev-vm `restore_chain` test AND in prod (deploy `f438aca`,
+2026-05-26): a session driven through two chained
+snapshot→restore hops (idle-evict → resume → idle-evict → resume,
+where the 2nd snapshot is of an already-restored sandbox) resumed
+cleanly with disk content preserved across both hops — the exact
+pre-12o ENOENT/EADDRINUSE failure point, now clean (host log:
+`firecracker microVM restored from snapshot … from=…/6d8cb7f2`,
+no backend error). The user-visible promise — "operator drains a host
 / a host dies, the session moves to a peer and keeps working" —
 holds in prod with disk content bit-identical across the relocate.
 
@@ -401,9 +407,41 @@ device, and using it for rootfs too keeps one uniform mechanism.
 
 **Validation:** `restore_chain` (`#[ignore]`, Linux+KVM, wired into
 ci.yml's unprivileged FC test list) clears all 3 hops on the dev-vm
-— both the rootfs ENOENT and the vsock EADDRINUSE are gone. Prod
-re-evac canary (back-to-back operator-evac of one session) pending
-the 12o host-image roll.
+— both the rootfs ENOENT and the vsock EADDRINUSE are gone.
+**Confirmed in prod** (deploy `f438aca`, 2026-05-26): a canary
+session was driven through two chained snapshot→restore hops via
+idle-evict → resume → idle-evict → resume. The first resume
+restores a snapshot of the cold sandbox (hop 1, always worked); the
+*second* snapshot is taken of the already-restored sandbox and the
+second resume restores from it (the 12o path). Both resumes
+succeeded, a marker file written before the chain read back
+identical after both hops (exit 0), and the host log shows a clean
+`firecracker microVM restored from snapshot sandbox_id=b07cb87d …
+from=…/snapshots/6d8cb7f2 mode=File` with no `No such file` /
+`Address in use`. The idle-evict→resume cycle exercises the
+identical FC `snapshot()`/`restore()` device-path code as
+operator-evac; it was the deterministic prod driver because
+operator-evac of an *idle* session races the idle_evictor (see note
+below).
+
+**Test-methodology note (not a bug) — why idle→resume, not
+back-to-back operator-evac:** a first attempt drove validation via
+back-to-back `POST …/evacuate`. The bogus-key canary harness went
+`harness_idle` within the 30s host idle TTL, so the host idle_evictor
+grabbed the shared `eviction_inflight` lease first; the operator-evac
+logged `idle eviction skipped: pipeline already in flight` and the
+session resumed in place rather than relocating. This is *correct*
+behavior, not a gap: an idle session has `sandbox_id = NULL` — its
+sandbox was already snapshotted + destroyed on idle, so it is not
+pinned to any host and is resumable anywhere. There is nothing to
+evacuate. A session mid-idle-eviction leaves the host via the idle
+pipeline regardless of who wins the lease, which satisfies a drain's
+"get work off host X" intent either way. So operator-evac
+legitimately no-ops on an idle/idling session; the only conceivable
+nicety is ensuring `drain` doesn't *report* such a session as a
+failure (not observed). Operator-evac of an *active* session — the
+case that actually has a host-pinned sandbox to move — was validated
+in 12m.
 
 **Net operational state before 12o:** the primary M4 promise —
 session survives a host loss / deploy roll via dead-host recovery —
