@@ -1,24 +1,18 @@
 //! Live-Postgres integration tests for ADR 0018 session evacuation.
 //!
-//! Exercises both Phase A (`evacuate_to`, alive source) and Phase B
-//! (`evacuate_dead_source`, dead/degraded source) against a real PG +
-//! the in-memory HostRegistry + mock HostClient backends. The PG side
-//! is what these tests really exercise — the state-machine drive
-//! through `Active → HostLost → Created` and the rebind of
-//! `sessions.host_id` / `sessions.sandbox_id` via
-//! `assign_session_*` + `transition_session` must work against the
-//! real legality-table-enforcing implementation, not a mock.
+//! Exercises `evacuate_dead_source` (dead/degraded source) against a
+//! real PG + the in-memory HostRegistry + mock HostClient backends.
+//! The PG side is what these tests really exercise — the rebind of
+//! `sessions.host_id` / `sessions.sandbox_id` via the
+//! `assign_session_*` and `transition_session` calls must work
+//! against the real legality-table-enforcing implementation, not a
+//! mock.
 //!
 //! `#[ignore]`'d by default; requires Postgres at
 //! `ENGRAM_TEST_DATABASE_URL`. CI wires this into the
 //! Postgres-gated-ignored lane alongside `admin_chunk_gc_live_pg`.
 //!
 //! Coverage:
-//! - `evacuate_to_alive_source_drives_state_through_host_lost_to_created`
-//!   — happy path. Captures the load-bearing invariant: the legacy
-//!   `Active → HostLost → Created` graph is the only sequence that
-//!   gets through PG's `transition_session` legality check; any
-//!   regression to a direct `Active → Created` flip would fail.
 //! - `evacuate_dead_source_with_snapshot_uses_recorded_manifests`
 //!   — restores from a recorded snapshot's disk+memory manifests
 //!   when only the snapshot is available. Loss=None.
@@ -34,7 +28,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef as ChunkManifestRef};
-use engram_coordinator::evacuation::{evacuate_dead_source, evacuate_to, EvacError};
+use engram_coordinator::evacuation::{evacuate_dead_source, EvacError};
 use engram_coordinator::host_registry::HostRegistry;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore};
 use engram_core::types::evacuation::EvacLoss;
@@ -81,14 +75,13 @@ async fn rig() -> Option<TestRig> {
     })
 }
 
-/// FakeBackend: records calls + returns deterministic ids. Mirrors the
-/// shape used in evacuation.rs's unit tests but lifted here so the
-/// integration tests can register it against the real HostRegistry.
-/// Production HostClients require a host process to wire up; for the
+/// FakeBackend: returns deterministic ids. Mirrors the shape used in
+/// evacuation.rs's unit tests but lifted here so the integration tests
+/// can register it against the real HostRegistry. Production
+/// HostClients require a host process to wire up; for the
 /// PG-state-flow tests that's noise.
 #[derive(Default)]
 struct FakeBackend {
-    calls: Mutex<Vec<String>>,
     next_restore_id: Mutex<Option<SandboxId>>,
 }
 
@@ -99,19 +92,14 @@ impl FakeBackend {
     fn set_restore_id(&self, id: SandboxId) {
         *self.next_restore_id.lock() = Some(id);
     }
-    fn calls(&self) -> Vec<String> {
-        self.calls.lock().clone()
-    }
 }
 
 #[async_trait]
 impl HostClient for FakeBackend {
     async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        self.calls.lock().push("create".into());
         Ok(SandboxId::new())
     }
-    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.calls.lock().push(format!("destroy:{id}"));
+    async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -124,8 +112,7 @@ impl HostClient for FakeBackend {
     ) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }
-    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        self.calls.lock().push(format!("snapshot:{id}"));
+    async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         Ok(SnapshotMetadata {
             id: SnapshotId::new(),
             size_bytes: 1024,
@@ -140,16 +127,13 @@ impl HostClient for FakeBackend {
             working_set_blob_key: None,
         })
     }
-    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.calls.lock().push(format!("commit_snapshot:{id}"));
+    async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
         Ok(())
     }
-    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.calls.lock().push(format!("abort_snapshot:{id}"));
+    async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.calls.lock().push("restore".into());
         // Tests always preload an id; the fallback is defensive.
         // Match-based dispatch avoids clippy's unwrap_or_default lint
         // (Default for SandboxId would mint a nil UUID, masking
@@ -278,57 +262,6 @@ fn proto_to_core_manifest(r: ChunkManifestRef) -> ManifestRef {
         manifest_id: r.manifest_id,
         version: r.version,
     }
-}
-
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn evacuate_to_alive_source_drives_state_through_host_lost_to_created() {
-    let Some(rig) = rig().await else { return };
-    let meta = rig.meta.clone();
-    let registry = Arc::new(HostRegistry::new(meta.clone()));
-
-    let source_host = HostId::new();
-    let target_host = HostId::new();
-    let old_sandbox = SandboxId::new();
-    let new_sandbox = SandboxId::new();
-
-    let source_be = FakeBackend::new();
-    let target_be = FakeBackend::new();
-    target_be.set_restore_id(new_sandbox);
-    registry.register(source_host, source_be.clone());
-    registry.register(target_host, target_be.clone());
-    registry.record_sandbox_owner(old_sandbox, source_host);
-
-    let session_id = seed_active_session(&meta, source_host, old_sandbox).await;
-    ensure_host_row(&meta, target_host, "target").await;
-
-    let receipt = evacuate_to(&registry, &meta, session_id, old_sandbox, target_host)
-        .await
-        .expect("alive-source evac should succeed");
-    assert_eq!(receipt.new_host_id, target_host);
-    assert_eq!(receipt.new_sandbox_id, new_sandbox);
-    assert_eq!(receipt.loss, EvacLoss::None);
-
-    // Source side: snapshot + commit_snapshot + destroy in order.
-    let src_calls = source_be.calls();
-    assert!(
-        src_calls.iter().any(|c| c.starts_with("snapshot:")),
-        "snapshot not called: {src_calls:?}"
-    );
-    assert!(
-        src_calls.iter().any(|c| c.starts_with("destroy:")),
-        "destroy not called: {src_calls:?}"
-    );
-
-    // PG side: the load-bearing assertion. transition_session enforces
-    // the M2 legality table, so getting to Created here is only
-    // possible via Active → HostLost → Created (or via the implicit
-    // route the evac primitive takes). The status assertion catches
-    // any regression that tries Active → Created directly.
-    let session = meta.get_session(session_id).await.expect("get session");
-    assert_eq!(session.status, SessionState::Created);
-    assert_eq!(session.host_id, Some(target_host));
-    assert_eq!(session.sandbox_id, Some(new_sandbox));
 }
 
 #[tokio::test]
