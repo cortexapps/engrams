@@ -183,6 +183,34 @@ pub trait SandboxBackend: Send + Sync {
     /// coord persists to the `snapshots` row.
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
+    /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
+    /// Idempotent — calling on an already-paused VM is a no-op
+    /// success. Used by [`crate::traits::host_client`]-side
+    /// orchestration to flush disk + capture memory while the guest
+    /// is quiesced (closes the flush-vs-pause race that surfaced
+    /// during cross-host evac validation: bytes written by the
+    /// guest between flush and FC's internal pause landed in memory
+    /// but not in the published disk manifest).
+    ///
+    /// Default impl returns `Ok(())` for backends with no pause
+    /// concept (Process, mocks). FC overrides to call
+    /// `FirecrackerClient::pause()`.
+    async fn pause(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// ADR 0018 commit 12m: resume a paused VM. Symmetric companion
+    /// to [`Self::pause`]. Idempotent on an already-running VM.
+    ///
+    /// Most callers don't invoke `resume` directly — [`Self::snapshot`]'s
+    /// internal `create_snapshot` pause/capture/resume cycle resumes
+    /// the VM on return. `resume` is exposed for diagnostics +
+    /// orchestration paths that pause without taking a snapshot
+    /// (none today, but the symmetry keeps the trait surface honest).
+    async fn resume(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// Restore a sandbox from a previously-taken snapshot. ADR 0007
     /// Phase 6: takes the metadata directly (carrying the manifest
     /// refs + snapshot id) rather than a host-local path — the

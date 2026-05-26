@@ -2495,6 +2495,39 @@ impl SandboxBackend for FirecrackerBackend {
         self.snapshot_dir_for(snapshot_id)
     }
 
+    /// ADR 0018 commit 12m: pause the VM via FC's PATCH /vm
+    /// {state: Paused}. Idempotent on FC's side — re-pausing a
+    /// paused VM is a no-op success. Callers (PooledBackend) use
+    /// this to quiesce the guest before flushing the NBD-backed
+    /// disk, so memory + disk capture see the same point-in-time.
+    async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let socket = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .state
+            .firecracker_socket
+            .clone();
+        FirecrackerClient::new(&socket).pause().await
+    }
+
+    /// ADR 0018 commit 12m: symmetric companion to `pause`. Resume
+    /// the VM via PATCH /vm {state: Resumed}. Idempotent on FC's
+    /// side. Not currently invoked by PooledBackend (the
+    /// `snapshot` flow's internal resume returns the VM to running)
+    /// but exposed for orchestration paths that pause without
+    /// snapshotting.
+    async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let socket = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .state
+            .firecracker_socket
+            .clone();
+        FirecrackerClient::new(&socket).resume().await
+    }
+
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
