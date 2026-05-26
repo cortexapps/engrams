@@ -29,11 +29,53 @@ use crate::state::{SessionEvent, SharedState};
 /// `SharedState`; the loop above is just the driver. Multi-host
 /// production refactors the driver onto each host-agent and keeps
 /// this function as the canonical pipeline.
+///
+/// Backwards-compatible wrapper: transitions the session to `Idle`,
+/// matching the historical idle-eviction shape. Operator-driven
+/// drains (ADR 0018 commit 12) use [`evict_session_to_state`]
+/// directly with `target_state = Evacuating`.
 pub async fn evict_idle_session(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
 ) -> Result<(), EvictError> {
+    evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle).await
+}
+
+/// ADR 0018 commit 12: parameterized suspend pipeline. Same pause →
+/// flush → memory-snapshot → destroy sequence as the legacy
+/// `evict_idle_session`, but the terminal state-machine transition
+/// is configurable. `Idle` is the user-paused (manual /resume)
+/// shape; `Evacuating` is the operator-drain / host-loss shape
+/// where the coord-side `evac_resumer` background task will pick
+/// the session up and drive it through `Evacuating → Created →
+/// Active` on a peer host.
+///
+/// The non-target-state code paths (snapshot capture, registry
+/// unbind, sandbox destroy, event emission, snapshot commit) are
+/// IDENTICAL between the two — only the `transition_session`
+/// target and the resulting `StatusChanged` event payload differ.
+/// Sharing the pipeline guarantees both flows have the same
+/// recoverability invariants: snapshot is durable in BlobStorage
+/// before destroy, sandbox is force-flushed and paused before the
+/// memory dump, and the PG transition commits before the
+/// (best-effort) destroy so reconcile can't race the orphan path.
+pub async fn evict_session_to_state(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+    target_state: SessionState,
+) -> Result<(), EvictError> {
+    // The pipeline only knows about Idle and Evacuating as legal
+    // targets. Both share the "Active → captured-snapshot → suspended"
+    // semantic; any other target would skip half the steps and break
+    // the recovery invariants. Reject early with a clean error.
+    if !matches!(target_state, SessionState::Idle | SessionState::Evacuating) {
+        return Err(EvictError::Meta(format!(
+            "evict_session_to_state: target {target_state:?} not supported \
+             (only Idle and Evacuating)",
+        )));
+    }
     // ADR 0016 §A.1.5c: cross-replica re-entry guard backed by the
     // `eviction_inflight` PG table. Replaces A.1.5b's per-pod
     // DashMap. If two callers (different coord pods, operator
@@ -181,7 +223,7 @@ pub async fn evict_idle_session(
     let prev = match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Idle)
+        .transition_session(session_id, target_state)
         .await
     {
         Ok(prev) => prev,
@@ -232,7 +274,7 @@ pub async fn evict_idle_session(
             session_id,
             SessionEvent::StatusChanged {
                 from: prev,
-                to: SessionState::Idle,
+                to: target_state,
                 at: now,
             },
         )

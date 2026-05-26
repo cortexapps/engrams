@@ -51,6 +51,23 @@ pub enum SessionState {
     /// Until then the reconciler moves `HostLost → Idle` (if a
     /// snapshot exists) or `HostLost → Dead` (otherwise).
     HostLost,
+    /// ADR 0018 commit 12: session is mid-relocation. The source host
+    /// has paused FC, flushed dirty pages, captured a memory snapshot,
+    /// destroyed the local sandbox, and durably committed both memory
+    /// and disk manifests to BlobStorage. The coord-side
+    /// `evac_resumer` background task scans for sessions in this
+    /// state and drives `Evacuating → Created → Active` on a peer
+    /// host via the same `resume_session` machinery `/resume from
+    /// Idle` uses. After 20 failed peer-pick / restore attempts
+    /// (~3 min), falls back to `Idle` so a user `/resume` can drive
+    /// it forward by hand. Reached from `Active` (operator drain via
+    /// `POST /api/admin/sessions/:id/evacuate` or
+    /// `POST /api/admin/hosts/:id/drain`) or from `HostLost` (the
+    /// `dead_host.rs` second-stage routes through here instead of
+    /// the legacy `Idle` fall-through). Sandbox + host bindings are
+    /// nulled out same as `Idle` — the session is recoverable but
+    /// not running.
+    Evacuating,
     /// Terminal: create failed mid-flight (insert failed,
     /// `start_agent` failed, or scheduling collapsed after row
     /// insertion).
@@ -75,6 +92,7 @@ impl SessionState {
             Self::Active => "active",
             Self::Idle => "idle",
             Self::HostLost => "host_lost",
+            Self::Evacuating => "evacuating",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Dead => "dead",
@@ -88,18 +106,20 @@ impl SessionState {
         matches!(self, Self::Failed | Self::Completed | Self::Dead)
     }
 
-    /// Single source of truth for legal transitions. Per ADR 0015 M2:
+    /// Single source of truth for legal transitions. Per ADR 0015 M2
+    /// + ADR 0018 commit 12 (Evacuating):
     ///
     /// ```text
     /// Pending     -> Created | Failed
     /// Created     -> GuestReady | Active | Failed | HostLost
     /// GuestReady  -> Active | Failed | HostLost
-    /// Active      -> Idle | HostLost | Failed | Completed | Dead
+    /// Active      -> Idle | HostLost | Evacuating | Failed | Completed | Dead
     /// Idle        -> Created (resume) | Dead | Completed
-    /// HostLost    -> Created (M4 re-pick on peer host)
-    ///              | Idle (resume from snapshot)
-    ///              | Dead (no recoverable snapshot)
-    ///              | Completed (user delete)
+    /// HostLost    -> Created | Idle | Evacuating | Dead | Completed
+    /// Evacuating  -> Created (scanner resumes on peer)
+    ///              | Idle (scanner exhausted retries; user /resume)
+    ///              | Dead (terminal; chunks gone)
+    ///              | Completed (user delete mid-evac)
     /// Failed      -> (terminal)
     /// Completed   -> (terminal)
     /// Dead        -> (terminal)
@@ -119,9 +139,13 @@ impl SessionState {
             Pending => matches!(target, Created | Failed),
             Created => matches!(target, GuestReady | Active | Failed | HostLost),
             GuestReady => matches!(target, Active | Failed | HostLost),
-            Active => matches!(target, Idle | HostLost | Failed | Completed | Dead),
+            Active => matches!(
+                target,
+                Idle | HostLost | Evacuating | Failed | Completed | Dead
+            ),
             Idle => matches!(target, Created | Dead | Completed),
-            HostLost => matches!(target, Created | Idle | Dead | Completed),
+            HostLost => matches!(target, Created | Idle | Evacuating | Dead | Completed),
+            Evacuating => matches!(target, Created | Idle | Dead | Completed),
             Failed | Completed | Dead => false,
         }
     }
@@ -344,6 +368,7 @@ mod tests {
             (GuestReady, HostLost),
             (Active, Idle),
             (Active, HostLost),
+            (Active, Evacuating),
             (Active, Failed),
             (Active, Completed),
             (Active, Dead),
@@ -352,11 +377,17 @@ mod tests {
             (Idle, Completed),
             (HostLost, Created),
             (HostLost, Idle),
+            (HostLost, Evacuating),
             (HostLost, Dead),
             (HostLost, Completed),
+            (Evacuating, Created),
+            (Evacuating, Idle),
+            (Evacuating, Dead),
+            (Evacuating, Completed),
         ];
         let all_states = [
-            Pending, Created, GuestReady, Active, Idle, HostLost, Failed, Completed, Dead,
+            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Failed, Completed,
+            Dead,
         ];
         for &from in &all_states {
             for &to in &all_states {
@@ -381,7 +412,9 @@ mod tests {
         use SessionState::*;
         for terminal in [Failed, Completed, Dead] {
             assert!(terminal.is_terminal());
-            for target in [Pending, Created, GuestReady, Active, Idle, HostLost] {
+            for target in [
+                Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating,
+            ] {
                 assert_eq!(
                     terminal.try_transition_to(target),
                     Err(IllegalTransition {

@@ -1,16 +1,22 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
-Status: 2026-05-25 — **Accepted** as of commit chain below. Phase A
-(alive-source primitive) + Phase B (dead-source + NBD-loss auto
-triggers) + Phase C (target selection + admin endpoint + tests) all
-shipped. Discharges ADR 0015 §M4 and folds ADR 0017's M4.1
-follow-up.
+Status: 2026-05-26 — **Accepted, mid-rework**. Phases A–C of the
+original synchronous evac primitive shipped in `aa37933..d5aa0ea`
+(plus commits 10–11 in `cddeb7d` + `22dd2e9` closing the
+`finish_resume_to_active` loop and the FC vsock unlink fix).
+**Commit 12 is in progress**: rewriting the alive-source path from
+synchronous (`evacuate_to`) to async (Evacuating state + background
+scanner) per the design refinement at the end of this ADR.
 
-Supersedes nothing. The auto-trigger paths are env-gated default-off
-pending the resume-from-Created follow-up; the admin endpoint ships
-default-on so operators can drive drains today.
+The original concrete deliverable — "operator runs `kubectl drain`
+on a host, every session moves to a peer, user keeps working" — is
+not fully delivered yet. Disk-content fidelity across cross-host
+restore was the last blocker; commit 12 fixes it by leaning on the
+FlushScheduler's published `live_disk_manifest_*` instead of a
+fresh in-snapshot flush, which closes the flush-vs-pause race
+inside `PooledBackend::snapshot`.
 
-Phase chain:
+Phase chain (commits 0–11 already on `main`):
 
 - **Phase 0** — this ADR in Proposed status. (commit `aa37933`)
 - **Phase A** — `HostClient::evacuate` trait + types (commit `4fac78e`)
@@ -24,7 +30,21 @@ Phase chain:
   (commit `5b1352c`) → fmt+clippy sweep (commit `608a5a7`) →
   Postgres integration (commit `f0202c3`) → e2e admin-shape test
   (commit `74c9566`).
-- **ADR closing bookend** — as-built notes (this commit).
+- **ADR closing bookend** — as-built notes (commit `d5aa0ea`).
+- **Dev-vm fixes** — test scaffolding for live PG (commit `0fcd42c`)
+  + doc correction (commit `a29e1aa`).
+- **Commit 10** — `feat(coord): M4 actually works`
+  (commit `cddeb7d`). Extracts `finish_resume_to_active` from
+  `resume_from_fc_snapshot` and wires it from admin evac + auto
+  triggers. Adds `bind_session_routing` (coord cache +
+  host-agent session_bindings). Default-on flip for both env flags.
+- **Commit 11** — `fix(sandbox-firecracker): don't unlink vsock UDS
+  file on destroy` (commit `22dd2e9`). Cross-host evac safety
+  on shared filesystems; removes the destroy-side `remove_file` of
+  the base UDS so the target's freshly-bound binding survives the
+  source's destroy. Validated end-to-end on dev-vm: /exec works on
+  the relocated session.
+- **Commit 12** (in progress) — see §"Commit 12 rework" below.
 
 ---
 
@@ -664,3 +684,190 @@ The chain is intentionally split across small commits per
 independently. The fmt+clippy sweep commit at the Phase B → Phase C
 boundary is a one-time catch-up for `[lint_before_commit]`
 discipline that slipped during the long chain.
+
+---
+
+## Commit 12 rework — async evac via Evacuating state + scanner
+
+### Why we rewrote the alive-source path
+
+Commit 11 unblocked /exec post-evac, but the dev-vm e2e surfaced a
+**disk content mismatch** across cross-host evac: the canary file
+exists at the right path with the right size on the relocated
+session, but the bytes differ from what was written on the source.
+
+Root-cause analysis pointed at the flush-vs-pause ordering inside
+`PooledBackend::snapshot`. The existing alive-source evac primitive
+(`evacuation::evacuate_to`) does `source.snapshot()` which internally:
+
+1. Calls `chunked_disk.flush()` to push dirty bytes to BlobStorage.
+2. Calls FC `pause`.
+3. Calls FC `create_snapshot` for the memory.bin + state.bin.
+
+Between step 1 and step 2, the guest can queue more writes via the
+NBD daemon. The flush published manifest_v_N capturing dirty bytes
+up to step 1. The memory snapshot in step 3 captures the guest
+kernel's page cache, which has *newer* writes than manifest_v_N. On
+target restore, NBD serves manifest_v_N (older bytes); memory's
+view disagrees; reads via the page cache return memory's view until
+eviction, then NBD's older bytes.
+
+**The fix is structural**: stop having evac do its own flush. Lean
+on the FlushScheduler's continuous-sync publish (the same one
+`/resume from Idle` already trusts via `effective_resume_disk_manifest`),
+and require the snapshot path to take the memory dump *with FC
+already paused*. That order — pause → flush → snapshot — is what
+the user proposed in this session, and it matches the existing
+idle-eviction pipeline (`idle_evictor::evict_idle_session`) which
+does pause-then-snapshot under FC's `create_snapshot` API.
+
+### The async design (this is what commit 12 ships)
+
+Replace the synchronous `evacuate_to` (orchestrate snapshot +
+restore + rebind in one HTTP call) with an asynchronous flow split
+across the database:
+
+**Source-side primitive** (one host, one session):
+
+1. Pause FC
+2. Flush remaining dirty pages (one call into the chunked disk; FC
+   is paused, so no new writes)
+3. Save snapshot memory (`create_snapshot` → state.bin + memory.bin,
+   chunked to BlobStorage)
+4. Mark session as `Evacuating` in PG (status transition, sandbox_id
+   cleared, snapshot row recorded)
+5. Destroy local sandbox
+
+This is exactly what `idle_evictor::evict_idle_session` already does,
+but with the terminal transition going to `Evacuating` instead of
+`Idle`. Commit 12's first change: parameterize that pipeline. The
+existing function becomes a back-compat wrapper at
+`target_state = Idle`; the new shape is
+`evict_session_to_state(state, session_id, sandbox_id, target_state)`.
+
+**Coord-side scanner** (new `evac_resumer` background task):
+
+- Polls `sessions WHERE status = 'evacuating'` every ~10s.
+- For each, calls the same `resume_session` machinery `/resume from
+  Idle` uses today (which since commit 10 dispatches through
+  `finish_resume_to_active` for the harness rebuild step).
+- Tracks per-session retry attempts via a new
+  `sessions.evac_attempts INT` column.
+- After 20 attempts (~3 min), transitions `Evacuating → Idle` so a
+  user `/resume` can drive it forward by hand. The retry budget is
+  the "give up gracefully" boundary: a session that can't auto-
+  relocate falls back to user-paused — not a regression vs the
+  pre-M4 status quo.
+
+**Cordon** (new admin endpoints):
+
+- `POST /api/admin/hosts/:id/cordon` — sets `hosts.status =
+  'Draining'` in PG. The coord-side `HostRegistry`'s
+  `pick_for_session` already filters out draining hosts (the flag
+  was wired for host-agent self-reported drain; we now drive it
+  from coord-side admin too). Cordoned hosts cannot be picked as
+  new-session targets OR as evacuation-relocation targets — the
+  scanner naturally avoids them via the same filter.
+- `POST /api/admin/hosts/:id/uncordon` — reverses, status back to
+  `Ready`.
+- `POST /api/admin/hosts/:id/drain` — cordon + evict every Active
+  session on the host (each becomes Evacuating via
+  `evict_session_to_state(Evacuating)`). Returns the list of
+  session_ids that started evacuating. Operator polls `/sessions`
+  to see them flip to `Active` on peers, and once the host has zero
+  active sessions, it's safe to roll.
+
+**Rewritten admin endpoint**:
+`POST /api/admin/sessions/:id/evacuate` becomes async — calls
+`evict_session_to_state(Evacuating)` and returns immediately. The
+scanner picks up the work. The synchronous "block until Active on a
+peer" shape is retired; callers poll `/sessions/:id`.
+
+### State machine (already in tree as part of commit 12)
+
+Added `Evacuating` variant to `SessionState` with these transitions:
+
+```
+Active     → Evacuating | …existing…
+HostLost   → Evacuating | …existing…
+Evacuating → Created (scanner resumes on peer)
+           | Idle (scanner exhausted retries; user /resume)
+           | Dead (terminal; chunks gone)
+           | Completed (user delete mid-evac)
+```
+
+`legality_table_matches_adr` test updated; `terminal_states_reject_all_outgoing`
+includes the new variant.
+
+### What's still required to finish commit 12
+
+(In rough order; the state-machine + idle_evictor parameterization
+are already done as of writing.)
+
+1. **Migration** `0036_sessions_evac_attempts.sql` — add
+   `sessions.evac_attempts INT NOT NULL DEFAULT 0`.
+2. **`evac_resumer` module** — sibling to `dead_host.rs`. Background
+   task, polls `Evacuating`, invokes `resume_session` machinery,
+   bumps retry counter, falls back to `Idle` after threshold.
+3. **`HostRegistry` cordon plumbing** — make sure PG `Draining`
+   status flows into the in-memory `HostState.draining` flag (today
+   it's heartbeat-derived; add a PG-read path on registry update
+   so admin-driven cordon takes effect immediately, not waiting on
+   host-agent heartbeat). Add `pub fn cordon(host_id) /
+   uncordon(host_id)` on `HostRegistry` that writes PG +
+   updates in-memory.
+4. **Admin endpoints**: cordon, uncordon, drain. The drain handler
+   uses `list_active_sandbox_assignments_on_host` to enumerate and
+   parallelizes `evict_session_to_state(Evacuating)` calls (bounded
+   concurrency, ~8 in flight).
+5. **`resume_session` dispatcher** in `api/snapshot.rs` — extend
+   to handle `Evacuating` exactly like `Idle` (same code path).
+6. **`dead_host.rs`** — change the second-stage transition to route
+   `HostLost → Evacuating` (the scanner takes over) instead of
+   today's `HostLost → Idle`. Removes the `evacuate_dead_source`
+   plumbing entirely.
+7. **Retire `evacuation::evacuate_to`** and
+   `evacuation::evacuate_dead_source` — the new flow doesn't need
+   them. Keep `EvacReceipt` / `EvacLoss` types — `finish_resume_to_active`
+   returns the equivalent shape.
+8. **`POST /api/admin/sessions/:id/evacuate`** — rewrite to async
+   shape (return 202 with the new session state immediately).
+9. **Tests**:
+   - Update legality test (done).
+   - Update `admin_evac_live_pg`: assert
+     `evict_session_to_state(Evacuating)` leaves state at
+     `Evacuating`, then simulated scanner tick drives to `Active`.
+   - New test: scanner exhausts retries → `Evacuating → Idle`.
+   - New test: cordon excludes host from `pick_for_session`.
+10. **`integration-evac-test.sh`** — update to expect async flow
+    (poll `/sessions/:id` for `Evacuating → Active` rather than
+    synchronous evac response).
+
+### Why this design ends up being smaller code than what it replaces
+
+- One snapshot/restore pipeline (`evict_session_to_state` +
+  `resume_session`) serves both idle eviction and operator evac.
+- The scanner is the canonical resume driver — same role for
+  Evacuating sessions as the user is for Idle ones. No parallel
+  primitive.
+- `dead_host.rs` loses its `evacuate_dead_source` dispatch path;
+  it just flips state to Evacuating and the scanner does the rest.
+- The admin endpoint is ~30 lines vs the current ~150-line
+  evacuate_to + finish_resume_to_active orchestration.
+- `evacuation` module shrinks from ~600 lines (two primitives + 14
+  unit tests) to ~50 lines (just the EvacReceipt/EvacLoss types,
+  if even those are kept).
+
+### Why the disk-content bug goes away
+
+Once the source primitive is "pause then flush then snapshot," the
+flush-vs-pause race is structurally eliminated. The memory snapshot
+captures the page cache state with the kernel quiesced, AND the
+chunked-disk flush publishes manifest_v_N reflecting the same
+quiesced bytes. Target restore reads manifest_v_N; reads via the
+restored page cache + NBD agree. No content mismatch possible.
+
+This is the same invariant `idle_evictor::evict_idle_session` already
+relied on — that's why same-host `/resume from Idle` has worked
+forever without this class of bug. The async evac flow finally
+brings cross-host evac into the same regime.

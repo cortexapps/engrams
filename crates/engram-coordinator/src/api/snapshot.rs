@@ -165,7 +165,14 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
     let session = state.services.meta.get_session(id).await?;
     match session.status {
         SessionState::Active => Ok(()),
-        SessionState::Idle => {
+        SessionState::Idle | SessionState::Evacuating => {
+            // Both states are "snapshotted, sandbox destroyed, ready to
+            // resume." `Evacuating` differs from `Idle` only in
+            // intent (scanner-driven vs user-driven); the resume code
+            // path is the same. The `evac_resumer` (ADR 0018 commit 12)
+            // is the auto-driver for Evacuating; a synchronous
+            // /exec-triggered ensure_active beats it by inline-resuming
+            // here, which is fine — both end at Active.
             resume_session(state.clone(), id).await?;
             Ok(())
         }
