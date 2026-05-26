@@ -745,6 +745,12 @@ pub(crate) mod tests {
         /// `assign_session_sandbox(None)`) so tests can verify the
         /// barrier behaviour Phase C will rely on.
         pub(crate) chunk_generation: PlMutex<u64>,
+        /// ADR 0018 commit 12b: in-memory mirror of
+        /// `sessions.evac_attempts`. Reset to 0 when the session
+        /// transitions into Evacuating; bumped by
+        /// `bump_evac_attempts`; observed by the scanner via
+        /// `list_evacuating_sessions`.
+        pub(crate) evac_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
     }
 
     /// Alias so the `clippy::type_complexity` lint stays happy on
@@ -770,6 +776,7 @@ pub(crate) mod tests {
                 eviction_leases: PlMutex::new(std::collections::HashMap::new()),
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
                 chunk_generation: PlMutex::new(0),
+                evac_attempts: PlMutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -815,6 +822,14 @@ pub(crate) mod tests {
             prev.try_transition_to(target)
                 .map_err(|e| MetaError::Conflict(e.to_string()))?;
             s.status = target;
+            // ADR 0018 commit 12b: entering Evacuating resets the
+            // retry counter so a fresh drain starts the scanner's
+            // budget clean. Mirrors the PG `CASE WHEN $2 =
+            // 'evacuating' THEN 0` branch in
+            // `engram_postgres::transition_session`.
+            if matches!(target, engram_core::types::SessionState::Evacuating) {
+                self.evac_attempts.lock().insert(id, 0);
+            }
             Ok(prev)
         }
         async fn assign_session_host(
@@ -1099,6 +1114,28 @@ pub(crate) mod tests {
 
         async fn chunk_generation(&self) -> Result<u64, MetaError> {
             Ok(*self.chunk_generation.lock())
+        }
+
+        // ADR 0018 commit 12b: scanner support. MiniMeta carries one
+        // session, so the list-sweep is trivially "is it Evacuating?".
+        async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+            let s = self.session.lock().clone();
+            if matches!(s.status, engram_core::types::SessionState::Evacuating) {
+                let attempts = self.evac_attempts.lock().get(&s.id).copied().unwrap_or(0);
+                Ok(vec![(s, attempts)])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn bump_evac_attempts(
+            &self,
+            session_id: engram_core::SessionId,
+        ) -> Result<u32, MetaError> {
+            let mut map = self.evac_attempts.lock();
+            let entry = map.entry(session_id).or_insert(0);
+            *entry += 1;
+            Ok(*entry)
         }
     }
 

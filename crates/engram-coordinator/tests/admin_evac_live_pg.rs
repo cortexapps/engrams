@@ -178,11 +178,7 @@ impl HostClient for FakeBackend {
     }
     async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}
     async fn unbind_session(&self, _session_id: SessionId) {}
-    async fn send_prompt(
-        &self,
-        _sandbox_id: SandboxId,
-        _text: String,
-    ) -> Result<(), SandboxError> {
+    async fn send_prompt(&self, _sandbox_id: SandboxId, _text: String) -> Result<(), SandboxError> {
         unreachable!()
     }
     async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
@@ -270,7 +266,10 @@ async fn seed_manifest(store: &ChunkStore, kind: ManifestKind, label: &str) -> C
     let mut manifest = Manifest::empty(kind, bytes.len() as u64);
     manifest.chunks.push(ChunkRef { offset: 0, hash });
     let r = ChunkManifestRef::new();
-    store.put_manifest(r, &manifest).await.expect("put manifest");
+    store
+        .put_manifest(r, &manifest)
+        .await
+        .expect("put manifest");
     r
 }
 

@@ -600,6 +600,35 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<GcCandidateRow>, MetaError> {
         Ok(Vec::new())
     }
+
+    // ----------------------------------------------------------------
+    // ADR 0018 commit 12b — evac_resumer scanner support.
+    //
+    // The scanner polls `Evacuating` sessions, picks a peer host,
+    // and drives `Evacuating → Created → Active`. The retry counter
+    // is a side-car on the `sessions` row (column `evac_attempts`,
+    // migration 0037). The PG-backed `transition_session(Evacuating)`
+    // resets the counter to 0 in the same UPDATE so re-entry from a
+    // fresh drain starts fresh; bumps happen via `bump_evac_attempts`
+    // (atomic UPDATE ... RETURNING).
+    // ----------------------------------------------------------------
+
+    /// Sessions currently in `Evacuating`, paired with their current
+    /// `evac_attempts` count. The scanner uses this on every tick.
+    /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
+    /// runs an indexed `WHERE status = 'evacuating'` query.
+    async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically `evac_attempts = evac_attempts + 1 RETURNING
+    /// evac_attempts`. Scanner calls this before each resume attempt;
+    /// when the returned count exceeds the budget, scanner gives up
+    /// and falls back to Idle. Default returns 1 so test mocks can
+    /// observe the bump without persisting state.
+    async fn bump_evac_attempts(&self, _session_id: SessionId) -> Result<u32, MetaError> {
+        Ok(1)
+    }
 }
 
 /// One row from [`MetadataStore::list_gc_candidates`]. Surfaced

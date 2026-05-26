@@ -341,10 +341,18 @@ impl MetadataStore for PostgresStore {
             );
             MetaError::Conflict(e.to_string())
         })?;
+        // ADR 0018 commit 12b: entering Evacuating resets
+        // `evac_attempts` to 0 so a fresh drain (operator or
+        // dead-host detector) starts the scanner's retry budget
+        // clean. Folded into the same UPDATE that commits the state
+        // flip so the counter and the state are always consistent.
         sqlx::query(
             r#"
             UPDATE sessions
-               SET status = $2, last_active_at = NOW(), updated_at = NOW()
+               SET status = $2,
+                   last_active_at = NOW(),
+                   updated_at = NOW(),
+                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END
              WHERE id = $1
             "#,
         )
@@ -355,6 +363,59 @@ impl MetadataStore for PostgresStore {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(current)
+    }
+
+    /// ADR 0018 commit 12b: scanner sweep query. Indexed via the
+    /// partial `idx_sessions_evacuating` from migration 0037 so the
+    /// cost stays flat as the global session row count grows.
+    async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, status, host_id, sandbox_id,
+                   image_uri, harness,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   evac_attempts
+            FROM sessions
+            WHERE status = 'evacuating'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let session = row::session_from_row(r)?;
+            let attempts: i32 = r
+                .try_get("evac_attempts")
+                .map_err(|e| MetaError::Serialization(format!("evac_attempts: {e}")))?;
+            out.push((session, attempts.max(0) as u32));
+        }
+        Ok(out)
+    }
+
+    /// ADR 0018 commit 12b: atomic `+= 1 RETURNING`. Scanner calls
+    /// this before each resume attempt so the returned count is
+    /// the scanner's "this is my Nth try" view; when it crosses
+    /// the budget threshold, the scanner falls back to Idle.
+    async fn bump_evac_attempts(&self, session_id: SessionId) -> Result<u32, MetaError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET evac_attempts = evac_attempts + 1
+             WHERE id = $1
+             RETURNING evac_attempts
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let attempts: i32 = row
+            .try_get("evac_attempts")
+            .map_err(|e| MetaError::Serialization(format!("bump_evac_attempts: {e}")))?;
+        Ok(attempts.max(0) as u32)
     }
 
     async fn assign_session_host(
