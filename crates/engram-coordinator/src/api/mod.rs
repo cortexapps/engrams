@@ -113,11 +113,20 @@ pub fn router(state: SharedState) -> Router {
         // alive-source evacuation primitive. Auto-triggers
         // (dead_host.rs, nbd_loss_trigger) fire the same shape on
         // host-loss / NBD-loss; this endpoint exposes the operator
-        // drain path.
+        // drain path. Async shape (commit 12): returns 202 once the
+        // session is marked `Evacuating`; the `evac_resumer` scanner
+        // completes the resume on a peer.
         .route(
             "/api/admin/sessions/:id/evacuate",
             post(admin::evacuate_session),
         )
+        // ADR 0018 commit 12e: host-level operator drain. Cordon
+        // flips `HostState.draining` + PG `hosts.status = draining`
+        // so the picker excludes the host. Drain extends cordon by
+        // firing Evacuating for every Active session on the host.
+        .route("/api/admin/hosts/:id/cordon", post(admin::cordon_host))
+        .route("/api/admin/hosts/:id/uncordon", post(admin::uncordon_host))
+        .route("/api/admin/hosts/:id/drain", post(admin::drain_host))
         // ADR 0016 Phase C commit 5: explicit admin triggers for the
         // chunk-GC sweep + candidate-table inspection. The background
         // loop is the implicit production driver

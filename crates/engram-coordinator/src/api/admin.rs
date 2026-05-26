@@ -15,6 +15,7 @@
 //! (see ADR 0015 M5 "Known regression — chunk-store GC deleted").
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
 
@@ -349,59 +350,67 @@ pub async fn flush_now(
 }
 
 // ---------------------------------------------------------------------
-// ADR 0018 Phase C — session evacuation admin endpoint
+// ADR 0018 — session evacuation admin endpoints (async shape, commit 12)
 // ---------------------------------------------------------------------
 //
-// Explicit operator + test seam for the evacuation primitive. The
-// auto-triggers (dead_host.rs second-stage, nbd_loss_trigger) fire the
-// same primitive on heartbeat-loss / NBD-loss; this endpoint exposes
-// the alive-source variant for operator drains + e2e tests.
+// Commit 12 rewrote evac from a synchronous
+// snapshot→restore→rebind→harness-rebuild RPC into a state-machine
+// transition + background scanner. The admin surface mirrors that
+// split:
+//
+// - `POST /api/admin/sessions/:id/evacuate` — pause + flush + snapshot
+//   the source sandbox, mark the session `Evacuating`. Returns 202
+//   immediately. The `evac_resumer` scanner picks the session up on
+//   its next tick (≤10s default) and drives it to Active on a peer.
+// - `POST /api/admin/hosts/:id/cordon` / `uncordon` — flip the
+//   in-memory `HostState.draining` flag + PG `hosts.status` so the
+//   picker excludes the host.
+// - `POST /api/admin/hosts/:id/drain` — cordon + fire Evacuating on
+//   every Active session on the host in parallel. Returns 202 with
+//   the list of session_ids being evacuated.
+//
+// The pause-before-flush ordering is what unblocks cross-host disk
+// fidelity: `evict_session_to_state` runs Pause → Flush → Snapshot
+// → Destroy → transition_session, so the on-disk manifest the
+// scanner restores from is bit-identical to what the source saw at
+// pause time (no flush-vs-pause race; see ADR 0018 §"Commit 12
+// rework").
 
 #[derive(serde::Deserialize, Default)]
 pub struct EvacuateSessionRequest {
-    /// Caller-specified target host. `None` lets the scheduler pick
-    /// via `pick_for_session` with `exclude_host = session.host_id`.
+    /// Reserved for a future operator override. Today the scanner
+    /// picks any non-source host via the standard policy. Carried in
+    /// the type for forward-compat with the pre-rewrite shape; ignored
+    /// by the handler.
     #[serde(default)]
+    #[allow(dead_code)]
     pub target_host: Option<engram_core::HostId>,
 }
 
 #[derive(Serialize)]
 pub struct EvacuateSessionResponse {
     pub session_id: SessionId,
-    pub new_host_id: engram_core::HostId,
-    pub new_sandbox_id: engram_core::SandboxId,
-    pub loss: engram_core::types::evacuation::EvacLoss,
+    /// "evacuating" — the session is paused, snapshotted, and the
+    /// `evac_resumer` scanner will resume it on a peer within the
+    /// next sweep interval (≤10s default). Operators can subscribe
+    /// to `GET /sessions/:id/events` to watch the
+    /// `Evacuating → Created → Active` chain land.
+    pub status: &'static str,
 }
 
-/// `POST /api/admin/sessions/:id/evacuate` — relocate `session_id`
-/// onto a peer host. Only the alive-source path (Active session,
-/// reachable backend) is supported here in commit 7; HostLost / Idle
-/// sessions return 409 with a pointer to the auto-trigger gate and
-/// the deferred /resume-from-Created path.
+/// `POST /api/admin/sessions/:id/evacuate` — mark the session
+/// `Evacuating`. Pre: Active session with a bound sandbox. Post: the
+/// source sandbox is paused, flushed, snapshotted, and destroyed;
+/// PG row is at `Evacuating`; `evac_resumer` will resume on a peer.
 ///
-/// Request body: `EvacuateSessionRequest`. Omit `target_host` to let
-/// the scheduler pick (always excludes the source host).
-///
-/// Status codes:
-/// - 404 if the session row doesn't exist.
-/// - 409 if the session is not Active OR has no bound sandbox OR if
-///   the operator-supplied `target_host` is the source host.
-/// - 503 if no host can accept the relocate (no capacity or image
-///   not ready on any peer).
-/// - 200 with `EvacuateSessionResponse` on success. The session is
-///   at `Created` on the new host_id with new_sandbox_id bound;
-///   start_agent rebuild is the caller's next step (mirrors the
-///   resume_from_fc_snapshot dance) or the operator can `/resume`
-///   once the resume-from-Created path lands.
+/// Returns 202 Accepted; the scanner is the actual deliverable. Use
+/// the session events stream to observe the resume completing.
 pub async fn evacuate_session(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
-    Json(req): Json<EvacuateSessionRequest>,
-) -> Result<Json<EvacuateSessionResponse>, ApiError> {
+    Json(_req): Json<EvacuateSessionRequest>,
+) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
     let session = state.services.meta.get_session(session_id).await?;
-
-    // Alive-source preconditions: session must be Active with a
-    // bound sandbox + host.
     if !matches!(session.status, engram_core::types::SessionState::Active) {
         return Err(ApiError::Conflict(format!(
             "evacuate only supported for Active sessions (got {})",
@@ -413,121 +422,237 @@ pub async fn evacuate_session(
             "session {session_id} has no bound sandbox",
         )));
     };
-    let Some(source_host) = session.host_id else {
-        return Err(ApiError::Conflict(format!(
-            "session {session_id} has no bound host",
-        )));
-    };
 
-    // Resolve target. Operator override wins (with same-host guard).
-    // Scheduler fallback picks via the Phase C policy: exclude source
-    // host, otherwise capacity-fit. Same image-ready filter as
-    // create_session so we never relocate onto an image-cold host.
-    let target_host = if let Some(t) = req.target_host {
-        if t == source_host {
-            return Err(ApiError::Conflict(format!(
-                "target_host {t} is the source host — no-op evac",
-            )));
-        }
-        t
-    } else {
-        let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
-        // Image-ready filter: only consider hosts that have prefetched
-        // the session's image. The session was created with a digest
-        // gate; we re-resolve it here from enabled_images so the
-        // scheduler can match it against ready_images sets.
-        let digest = match state.services.meta.get_enabled_image(&session.image).await {
-            Ok(Some(row)) => Some(engram_protocol::heartbeat::ManifestDigest::new(
-                row.manifest_digest,
-            )),
-            // If the image isn't enabled (deleted post-create), fall
-            // through with no readiness filter — picking on capacity
-            // alone is the operator's best-effort. Same fallback the
-            // resume path uses for non-enabled-images.
-            _ => None,
-        };
-        let ctx = crate::host_registry::ScheduleContext {
-            repo: image_repo,
-            image_version: image_tag,
-            prefer_snapshot_id: None,
-            memory_mib: None,
-            required_image_digest: digest,
-            exclude_host: Some(source_host),
-        };
-        let (picked, _backend) =
-            state
-                .host_registry
-                .pick_for_session(&ctx)
-                .map_err(|e| match e {
-                    crate::host_registry::PickError::ImageNotReady(d) => {
-                        ApiError::Internal(format!("evac: image not ready on any peer: {d}"))
-                    }
-                    crate::host_registry::PickError::NoCapacity => {
-                        ApiError::Internal("evac: no peer host has capacity".into())
-                    }
-                })?;
-        picked
-    };
-
-    // Fire the alive-source primitive. Leaves the session at
-    // `Created` on the new host with the rebuilt VM but a stale
-    // harness — the next step is the shared finish primitive.
-    let receipt = crate::evacuation::evacuate_to(
-        &state.host_registry,
-        &state.services.meta,
+    // Fire the shared eviction pipeline with `target_state =
+    // Evacuating`. Same pause → flush → memory-snapshot → destroy →
+    // PG transition the legacy `evict_idle_session` uses for Idle
+    // suspends — the *only* difference is the terminal state, so
+    // both flows inherit the same recoverability invariants (snapshot
+    // durable in BlobStorage before destroy, PG state flips before
+    // host-side destroy).
+    crate::idle_evictor::evict_session_to_state(
+        &state,
         session_id,
         sandbox_id,
-        target_host,
+        engram_core::types::SessionState::Evacuating,
     )
     .await
-    .map_err(|e| match e {
-        crate::evacuation::EvacError::TargetIsSource { .. }
-        | crate::evacuation::EvacError::TargetNotRegistered { .. } => {
-            ApiError::Conflict(e.to_string())
-        }
-        crate::evacuation::EvacError::SourceLookup(_) => ApiError::Conflict(e.to_string()),
-        _ => ApiError::Internal(e.to_string()),
-    })?;
-
-    // Bind the new sandbox into coord's session→sandbox cache and
-    // the target host-agent's session_bindings map. Without these,
-    // /exec / /shell / /prompt against the session 404 (coord's
-    // registry still points at the old sandbox_id) and the
-    // FlushScheduler's live-manifest publisher drops every publish
-    // ("sandbox not bound to a session"). Symmetric with the /resume
-    // path's `bind_resumed_session`.
-    crate::api::snapshot::bind_session_routing(&state, session_id, receipt.new_sandbox_id).await;
-
-    // Finish the resume dance: rebuild harness + → Active. Without
-    // this the session would stay at Created with a stale harness and
-    // /exec would 409 — the original commit-7 footgun the closing
-    // bookend called out. The shared `finish_resume_to_active`
-    // primitive is the same code path /resume + dead_host.rs use, so
-    // the harness rebuild is uniform across triggers.
-    let session_refreshed = state.services.meta.get_session(session_id).await?;
-    let finish_outcome = crate::api::snapshot::finish_resume_to_active(
-        &state,
-        &session_refreshed,
-        receipt.new_sandbox_id,
-    )
-    .await?;
+    .map_err(|e| ApiError::Internal(format!("evac pipeline: {e}")))?;
 
     tracing::info!(
         %session_id,
-        source_host = %source_host,
-        new_host = %receipt.new_host_id,
-        new_sandbox = %receipt.new_sandbox_id,
-        loss = receipt.loss.as_str(),
-        outcome = ?finish_outcome,
-        "admin evacuate: session relocated + harness rebuild dispatched",
+        %sandbox_id,
+        "admin evacuate: session marked Evacuating; scanner will resume on peer",
     );
 
-    Ok(Json(EvacuateSessionResponse {
-        session_id,
-        new_host_id: receipt.new_host_id,
-        new_sandbox_id: receipt.new_sandbox_id,
-        loss: receipt.loss,
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EvacuateSessionResponse {
+            session_id,
+            status: "evacuating",
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// ADR 0018 commit 12e — host cordon / uncordon / drain
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct CordonResponse {
+    pub host_id: engram_core::HostId,
+    pub status: &'static str,
+}
+
+/// `POST /api/admin/hosts/:id/cordon` — mark a host non-schedulable.
+/// Flips `HostState.draining` so `pick_for_session` excludes it from
+/// new placements + evac targets. PG `hosts.status` is updated to
+/// `Draining` in the same call so a coord pod restart (or sibling
+/// pod) observes the cordon. No effect on already-bound sessions on
+/// this host — for that, the operator calls `/drain` (or evacs each
+/// session by hand).
+pub async fn cordon_host(
+    State(state): State<SharedState>,
+    Path(host_id): Path<engram_core::HostId>,
+) -> Result<Json<CordonResponse>, ApiError> {
+    if !state.host_registry.cordon(host_id) {
+        return Err(ApiError::NotFound(format!("host {host_id} not registered")));
+    }
+    if let Err(e) = state
+        .services
+        .meta
+        .set_host_status(host_id, engram_core::types::HostStatus::Draining)
+        .await
+    {
+        // In-memory flag flipped; PG write failed. Log + return ok —
+        // the picker already filters this host out via the in-memory
+        // flag. The heartbeat handler on the next tick will rewrite
+        // hosts.status from whatever the host reports (typically
+        // Ready), which would clobber the cordon. To prevent that
+        // requires a PG-anchored cordon (follow-up); for v1 of the
+        // drain story we accept the eventual-consistency risk and
+        // log loudly.
+        tracing::warn!(
+            %host_id, error = %e,
+            "cordon: in-memory flipped but set_host_status(Draining) failed; \
+             a heartbeat may reset hosts.status to Ready before scanner action",
+        );
+    }
+    tracing::info!(%host_id, "admin cordon: host marked non-schedulable");
+    Ok(Json(CordonResponse {
+        host_id,
+        status: "draining",
     }))
+}
+
+/// `POST /api/admin/hosts/:id/uncordon` — inverse of cordon. The
+/// host returns to the picker's view immediately.
+pub async fn uncordon_host(
+    State(state): State<SharedState>,
+    Path(host_id): Path<engram_core::HostId>,
+) -> Result<Json<CordonResponse>, ApiError> {
+    if !state.host_registry.uncordon(host_id) {
+        return Err(ApiError::NotFound(format!("host {host_id} not registered")));
+    }
+    if let Err(e) = state
+        .services
+        .meta
+        .set_host_status(host_id, engram_core::types::HostStatus::Ready)
+        .await
+    {
+        tracing::warn!(
+            %host_id, error = %e,
+            "uncordon: in-memory flipped but set_host_status(Ready) failed; \
+             next heartbeat will reconcile",
+        );
+    }
+    tracing::info!(%host_id, "admin uncordon: host returned to scheduling");
+    Ok(Json(CordonResponse {
+        host_id,
+        status: "ready",
+    }))
+}
+
+#[derive(Serialize)]
+pub struct DrainHostResponse {
+    pub host_id: engram_core::HostId,
+    pub evacuating: Vec<SessionId>,
+    pub failures: Vec<DrainFailure>,
+}
+
+#[derive(Serialize)]
+pub struct DrainFailure {
+    pub session_id: SessionId,
+    pub error: String,
+}
+
+/// `POST /api/admin/hosts/:id/drain` — cordon the host, then fire
+/// `evict_session_to_state(Evacuating)` for every Active session on
+/// it. Returns 202 with the per-session outcomes; the `evac_resumer`
+/// scanner is responsible for completing each transition to Active
+/// on a peer host.
+///
+/// Concurrency: each session's eviction is independent and runs in
+/// parallel — the source sandbox is paused on the source host
+/// concurrently across sessions. The eviction lease serialises
+/// per-session retries; two coord pods both running /drain on the
+/// same host will see one win per session, the other no-op via the
+/// lease guard.
+pub async fn drain_host(
+    State(state): State<SharedState>,
+    Path(host_id): Path<engram_core::HostId>,
+) -> Result<(StatusCode, Json<DrainHostResponse>), ApiError> {
+    if !state.host_registry.cordon(host_id) {
+        return Err(ApiError::NotFound(format!("host {host_id} not registered")));
+    }
+    if let Err(e) = state
+        .services
+        .meta
+        .set_host_status(host_id, engram_core::types::HostStatus::Draining)
+        .await
+    {
+        tracing::warn!(
+            %host_id, error = %e,
+            "drain: cordon PG write failed; continuing — in-memory flag is set",
+        );
+    }
+
+    // PG-authoritative list of sessions bound here. The in-memory
+    // `sandboxes_on_host` map is faster but can lag (post-restart
+    // rehydration window). For drain we use PG so a fresh coord pod
+    // can complete a drain initiated against a sibling.
+    let assignments = state
+        .services
+        .meta
+        .list_active_sandbox_assignments_on_host(host_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("drain: list sessions on host: {e}")))?;
+
+    if assignments.is_empty() {
+        tracing::info!(%host_id, "admin drain: host cordoned; no Active sessions to evacuate");
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(DrainHostResponse {
+                host_id,
+                evacuating: Vec::new(),
+                failures: Vec::new(),
+            }),
+        ));
+    }
+
+    // Fan out per-session evictions. JoinSet so we collect outcomes
+    // without giving up on the first error.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (session_id, sandbox_id) in &assignments {
+        let st = state.clone();
+        let sid = *session_id;
+        let sb = *sandbox_id;
+        tasks.spawn(async move {
+            let outcome = crate::idle_evictor::evict_session_to_state(
+                &st,
+                sid,
+                sb,
+                engram_core::types::SessionState::Evacuating,
+            )
+            .await;
+            (sid, outcome)
+        });
+    }
+
+    let mut evacuating: Vec<SessionId> = Vec::new();
+    let mut failures: Vec<DrainFailure> = Vec::new();
+    while let Some(join) = tasks.join_next().await {
+        match join {
+            Ok((sid, Ok(()))) => evacuating.push(sid),
+            Ok((sid, Err(e))) => {
+                tracing::warn!(%sid, %host_id, error = %e, "drain: per-session evict failed");
+                failures.push(DrainFailure {
+                    session_id: sid,
+                    error: e.to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(%host_id, error = %e, "drain: join error in per-session task");
+            }
+        }
+    }
+
+    tracing::info!(
+        %host_id,
+        evacuating = evacuating.len(),
+        failures = failures.len(),
+        total = assignments.len(),
+        "admin drain: per-session evac pipeline dispatched; scanner will resume each on a peer",
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DrainHostResponse {
+            host_id,
+            evacuating,
+            failures,
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------
