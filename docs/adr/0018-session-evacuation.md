@@ -1,6 +1,6 @@
 # ADR 0018: Session evacuation — `Sandbox` as a host-fungible value
 
-Status: 2026-05-26 — **Accepted, validated in production.** The
+Status: 2026-05-26 — **Accepted; follow-up fix 12p in progress.** The
 async evac rework (commits 12a–12o) lands the state machine +
 scanner + cordon pattern and is proven end-to-end on the GKE
 prod cluster. 12o (chained-restore device-path fix) is validated
@@ -14,6 +14,18 @@ pre-12o ENOENT/EADDRINUSE failure point, now clean (host log:
 no backend error). The user-visible promise — "operator drains a host
 / a host dies, the session moves to a peer and keeps working" —
 holds in prod with disk content bit-identical across the relocate.
+
+**12p (2026-05-26):** 12o turned out to be incomplete — it fixed the
+rootfs and vsock devices but left the **harness drive** on the
+recompute-from-live-id path under a false assumption that
+`swap_harness_drive` re-points it on every restore. A real cross-host
+idle-resume chain (`3e692ab6`) ENOENT'd on `harness/<cold-id>.ext4`.
+12p re-anchors the harness drive onto the live id on every resume
+(Option B, viable because the harness drive — unlike vsock — accepts
+`PATCH /drives` post-load), which also satisfies the operational
+requirement to always remount the harness across a relocate / network
+partition. See §"Commit 12p" below. Pre-12p sessions already
+snapshotted-from-restore are not recoverable by this change.
 
 **Prod validation (2026-05-26, cluster `engrams` us-west2):**
 
@@ -76,15 +88,18 @@ devices clean). See §"Commit 12o" below.
 The earlier "12m.4 deferred — residual cross-host disk drift"
 investigation is **closed**: the drift was dev-vm-only.
 
-**Milestone complete.** With 12h merged (`6378ba1`, dead
-`evacuate_to` retired) the 12a–12o commit chain is done: the state
-machine + scanner + cordon orchestration is prod-validated, the
-chained-restore device-path correctness (12o) is fixed and verified
-in prod, and the synchronous alive-source dead code is gone. The
+**Milestone complete; one correctness follow-up (12p) in flight.**
+With 12h merged (`6378ba1`, dead `evacuate_to` retired) the 12a–12o
+commit chain landed the state machine + scanner + cordon orchestration
+(prod-validated) and removed the synchronous alive-source dead code.
+12o fixed chained-restore device-path correctness for rootfs + vsock;
+12p extends the same correctness to the harness drive after a prod
+cross-host idle-resume chain surfaced the gap (see §"Commit 12p"). The
 items under §"Open questions" and §"Newly-filed follow-ups" are
 genuine future enhancements (Phase-C image-cache-warm ranking, the
 NBD-loss probe population, a multi-host drain fan-out wrapper) — none
-are M4 blockers. ADR 0018 is **closed**.
+are M4 blockers. ADR 0018 reopens only for the 12p chained-restore
+harness fix; everything else stays as-built.
 
 Phase chain (commits 0–11 already on `main`):
 
@@ -468,6 +483,99 @@ session survives a host loss / deploy roll via dead-host recovery —
 was already fully working in prod (proven 4×). Single operator-evac
 / drain worked. 12o closes the last gap: **back-to-back *operator*
 evac/drain of the same session.**
+
+### Commit 12p — the harness drive has the same bug (12o was incomplete)
+
+Prod-found 2026-05-26, hours after 12o deployed. A real idle session
+(`3e692ab6`) driven through chained idle-evict → resume hops across
+**different hosts** stalled on the second resume:
+
+```
+evac_resumer: target-side restore failed: … Firecracker PUT
+/snapshot/load -> 400: … Block: Virtio backend error: Error
+manipulating the backing file: No such file or directory (os error 2)
+/var/lib/engram/sandboxes/harness/a479c1a3-….ext4
+```
+
+Identical failure *shape* to the pre-12o rootfs ENOENT — one device
+over. 12o stamped `source_rootfs_canonical` and
+`source_vsock_canonical` from the live sandbox's actually-open paths
+(Option A), but **left the harness drive on the recompute-from-live-id
+path** (`snapshot()` `source_harness_canonical =
+harness_canonical(work_dir, id)`), justified by a comment asserting
+*"the harness drive IS re-pointed onto the live id at restore
+(`swap_harness_drive` PATCH /drives), so recomputing here is correct."*
+
+**That assumption was false on the resume paths.** `swap_harness_drive`
+is a `SandboxBackend`-only method (not on `HostClient`) with exactly
+one production call site — the warm-pool *lease* flow inside the
+host-agent. Warm pools were deleted (see `pooled_backend.rs` history),
+so in current prod `swap_harness_drive` has **no live caller at all**;
+the idle→active and evac/dead-host resume paths drive
+`HostClient::restore` and never re-point the harness. So the harness
+drive kept its **cold-create** embedded `path_on_host` across every
+restore, while each new snapshot recomputed `source_harness_canonical`
+from the fresh restored id — the two diverge after hop 1, exactly the
+leaky abstraction 12o described.
+
+**Traced against prod artifacts:** for `3e692ab6`, host log shows the
+cold sandbox was `a479c1a3` (`source_sandbox=a479c1a3
+snapshot_id=340e58a5`). Snapshot 2 (`d51f9981`, taken on a *different*
+host of the restored sandbox) recorded `source_harness_canonical`
+keyed to the restored id, but FC's `state.bin` still embedded
+`harness/a479c1a3.ext4` (the cold id, never re-pointed). The
+`evac_resumer`'s restore on the final host recreated the restored-id
+harness symlink (per the manifest) but **not** `harness/a479c1a3.ext4`
+→ ENOENT. Rootfs and vsock restored cleanly on the same hop — 12o's
+Option-A carry-forward genuinely holds cross-host; only the
+recompute-based harness drive failed.
+
+**Why 12o's prod canary missed it:** the §12o validation drove
+idle-evict→resume→idle-evict→resume but did not reproduce the harness
+divergence — the chained-lineage dev-vm gate (`restore_chain`) used
+`harness_substrate: None`, so it never attached a harness drive, and
+the prod canary's hops did not land on a host lacking the ancestor's
+harness symlink. The bug needs a genuinely cross-host chain *with* a
+harness substrate, which a real multi-host session lifecycle produces
+and the canary didn't.
+
+**Fix — Option B (re-anchor on restore), per the operational
+requirement that we *always* remount the harness on idle→active / evac
+resume.** Unlike the immutable vsock device (which forced 12o into
+Option A), the harness virtio-blk drive *can* be re-pointed post-load
+via `PATCH /drives` — that's what `swap_harness_drive` already did. So
+`restore()` now calls a shared `repoint_harness_drive` (pause →
+`patch_drive("harnesses", harness_canonical(live_id))` → resume) after
+a successful `load_snapshot`, gated on `harness_substrate.is_some()`
+exactly like `restore_canonical_symlinks` (which installed the
+`harness/<live_id>.ext4` symlink the PATCH targets). This makes the
+embedded `path_on_host` track the live id, so the existing
+`snapshot()` recompute becomes correct — the assumption 12o relied on
+is now actually true on every resume path, not just the
+(now-vestigial) warm-lease path. `swap_harness_drive` is refactored to
+share the same helper.
+
+This was chosen over extending 12o's Option-A carry-forward to the
+harness because re-mounting the harness fresh on every resume is
+**independently required for robustness**: across a relocate or a
+source-side network partition we want the harness drive re-attached to
+the receiving host's own backing path, not trusting a stale
+snapshot-embedded path. Option B delivers both the lineage-consistency
+fix and that re-attach in one mechanism.
+
+**Validation:** `restore_chain` now creates the sandbox *with* a
+harness substrate (16 MiB padded ext4) so all 3 chained hops exercise
+the harness drive; pre-12p this reproduces the prod ENOENT at hop 2,
+post-12p it clears. (`#[ignore]`, Linux+KVM, already wired into
+ci.yml's FC `--test` list.)
+
+**Not retroactive:** sessions already snapshotted-from-restore before
+12p (e.g. `3e692ab6` / snapshot `d51f9981`) have the wrong harness id
+baked into `state.bin` and the manifest. The re-point runs *after*
+`load_snapshot`, so it cannot rescue a load that fails on the embedded
+path — those pre-fix sessions stay unrecoverable by this change (left
+abandoned per the ops call on 2026-05-26). 12p prevents recurrence for
+all snapshots taken after it ships.
 
 ### Dev-vm stumbling blocks (12m.4 investigation, 2026-05-26)
 

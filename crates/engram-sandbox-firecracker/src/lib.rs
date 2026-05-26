@@ -1751,6 +1751,39 @@ impl FirecrackerBackend {
             }
         };
 
+        // ADR 0018 §12p: re-anchor the harness drive onto THIS restored
+        // sandbox's id. FC's `load_snapshot` just reopened the harness
+        // virtio-blk drive at the path `state.bin` embedded — the
+        // snapshot's ANCESTOR id, never this fresh restored id, and
+        // nothing re-points it. Left alone, the next `snapshot()`
+        // recomputes `source_harness_canonical` from the new live id
+        // (see the stamp below in `snapshot`) and diverges from the
+        // embedded path, so the FOLLOWING restore can't find the harness
+        // backing file ("No such file or directory
+        // harness/<ancestor>.ext4") — the harness-drive analog of the
+        // 12o rootfs/vsock bug, prod-found via session 3e692ab6 driven
+        // through two idle-evict→resume hops. Re-pointing here makes the
+        // embedded path track the live id (so the recompute stays
+        // correct), and re-attaches the harness fresh on every
+        // idle→active / evac resume — what we always want across a
+        // relocate or a source-side network partition. Gated on
+        // `harness_substrate` exactly like `restore_canonical_symlinks`,
+        // which installed the `harness/<id>.ext4` symlink this PATCH
+        // re-points the drive at. On failure, mirror the load-failure
+        // cleanup so we don't leak a half-wired sandbox.
+        if manifest.spec.harness_substrate.is_some() {
+            if let Err(e) = self.repoint_harness_drive(&api, sandbox_id).await {
+                if let Some(setup) = net_setup.as_ref() {
+                    net::teardown(setup, &self.net_allocator).await;
+                }
+                if let Some(setup) = netns_setup.as_ref() {
+                    net::teardown_netns(setup, &self.net_allocator).await;
+                }
+                drop(child);
+                return Err(e);
+            }
+        }
+
         // Carry the manifest's spec forward so SandboxState reflects
         // what the snapshot was taken from. rootfs_path mirrors what
         // the original VM had attached — Firecracker reopens that
@@ -1891,6 +1924,38 @@ impl FirecrackerBackend {
         _snap: Option<&FcNetSnapshot>,
     ) -> Result<Option<net::NetnsSetup>, SandboxError> {
         Ok(None)
+    }
+
+    /// Re-point the running VM's harness virtio-blk drive at `id`'s own
+    /// canonical symlink (`harness/<id>.ext4`) via pause → PATCH /drives
+    /// → resume (~30ms on FC). Shared by `swap_harness_drive` (warm-lease
+    /// swap to a freshly-installed session-harness target) and the
+    /// restore path (ADR 0018 §12p — re-anchor the harness onto the live
+    /// id so the snapshot lineage stays consistent across chained
+    /// restores). The caller MUST have installed the `harness/<id>.ext4`
+    /// symlink first: `swap_harness_drive` does so explicitly,
+    /// `restore_canonical_symlinks` does so on the restore path.
+    async fn repoint_harness_drive(
+        &self,
+        api: &FirecrackerClient,
+        id: SandboxId,
+    ) -> Result<(), SandboxError> {
+        let harness_canonical = paths::harness_canonical(&self.work_dir, id);
+        api.patch_vm_state(VmState::Paused).await?;
+        // ADR 0016 §A.1.2: same cancellation-safety story as
+        // create_snapshot — if our future is dropped between the
+        // pause above and the explicit resume below, async Drop
+        // can't run the resume. The guard's sync Drop spawns a
+        // detached resume task so the VM doesn't stay paused.
+        let mut guard = crate::client::ResumeOnDrop::arm(api.clone());
+        let patch_result = api.patch_drive("harnesses", &harness_canonical).await;
+        // Always try to resume so a partial failure doesn't leave
+        // the VM paused. The patch error (if any) wins.
+        let resume_result = api.patch_vm_state(VmState::Resumed).await;
+        guard.disarm();
+        patch_result?;
+        resume_result?;
+        Ok(())
     }
 }
 
@@ -2472,9 +2537,17 @@ impl SandboxBackend for FirecrackerBackend {
             None
         };
         // The harness drive IS re-pointed onto the live id's canonical
-        // at restore (`restore_canonical_symlinks` + `swap_harness_drive`
-        // PATCH /drives), so its embedded path tracks the live id and
-        // recomputing here is correct.
+        // at restore — `repoint_harness_drive` (PATCH /drives) runs on
+        // BOTH the warm-lease swap and every idle→active / evac resume
+        // (ADR 0018 §12p) — so its embedded `path_on_host` tracks the
+        // live id and recomputing here is correct. This was the
+        // assumption 12o relied on to exempt the harness drive; §12p
+        // made it true on the resume paths (it had only ever held on the
+        // warm-lease path), after a prod restore (session 3e692ab6)
+        // ENOENT'd on the ancestor harness path. Unlike rootfs/vsock,
+        // the harness drive CAN be re-pointed post-load, so Option B
+        // (re-anchor on restore) is viable here where it wasn't for the
+        // immutable vsock device.
         let source_harness_canonical = if spec.harness_substrate.is_some() {
             Some(paths::harness_canonical(&self.work_dir, id))
         } else {
@@ -2993,21 +3066,7 @@ impl SandboxBackend for FirecrackerBackend {
             ));
         }
         let api = FirecrackerClient::new(&api_sock);
-        api.patch_vm_state(VmState::Paused).await?;
-        // ADR 0016 §A.1.2: same cancellation-safety story as
-        // create_snapshot — if our future is dropped between the
-        // pause above and the explicit resume below, async Drop
-        // can't run the resume. The guard's sync Drop spawns a
-        // detached resume task so the VM doesn't stay paused.
-        let mut guard = crate::client::ResumeOnDrop::arm(api.clone());
-        let patch_result = api.patch_drive("harnesses", &harness_canonical).await;
-        // Always try to resume so a partial failure doesn't leave
-        // the VM paused. The patch error (if any) wins.
-        let resume_result = api.patch_vm_state(VmState::Resumed).await;
-        guard.disarm();
-        patch_result?;
-        resume_result?;
-        Ok(())
+        self.repoint_harness_drive(&api, id).await
     }
 
     async fn start_agent(

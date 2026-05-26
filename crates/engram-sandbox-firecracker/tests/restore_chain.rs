@@ -37,6 +37,16 @@
 //! (`source_{rootfs,vsock}_canonical`), identical for flat-file and
 //! NBD-backed rootfs.
 //!
+//! ADR 0018 §12p: the sandbox is created WITH a harness substrate so
+//! the chain also exercises the harness virtio-blk drive — the device
+//! 12o explicitly exempted (it assumed `swap_harness_drive` re-points
+//! the harness onto the live id on every restore, which only held on
+//! the warm-lease path, not the idle→active / evac resume path). Pre-
+//! §12p this test (which used `harness_substrate: None`) passed while
+//! prod ENOENT'd on `harness/<ancestor>.ext4`; with the substrate
+//! attached, hop 2's restore reproduces the prod failure unless
+//! `restore` re-anchors the harness drive onto the live id.
+//!
 //! Same gating as the other ignored FC integration tests (Linux +
 //! KVM + firecracker on PATH + fetched test artifacts).
 //!
@@ -80,6 +90,26 @@ async fn chained_restore_snapshot_lineage_holds() {
         .await
         .expect("clone rootfs into tempdir");
 
+    // ADR 0018 §12p: attach a harness substrate so the lineage
+    // exercises the harness virtio-blk drive. FC only needs to open it
+    // as a block device at `load_snapshot` time — a padded raw file is
+    // sufficient (the test's init never mounts it). Without this drive
+    // present the chain can't reproduce the prod harness-ENOENT.
+    let harness_substrate = work.path().join("harness.ext4");
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(&harness_substrate)
+            .await
+            .expect("create harness substrate");
+        f.write_all(b"ENGRAM-HARNESS-CHAIN")
+            .await
+            .expect("write sentinel");
+        f.set_len(16 * 1024 * 1024)
+            .await
+            .expect("pad harness to 16 MiB");
+        f.flush().await.expect("flush harness substrate");
+    }
+
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
@@ -96,7 +126,7 @@ async fn chained_restore_snapshot_lineage_holds() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: None,
+        harness_substrate: Some(harness_substrate.clone()),
         network: Default::default(),
     };
 
@@ -149,6 +179,12 @@ async fn chained_restore_snapshot_lineage_holds() {
         // has open (the ancestor's, carried forward via SandboxState),
         // so restore_canonical_symlinks recreates/cleans exactly those
         // and the next restore resolves cleanly for both devices.
+        //
+        // §12p adds the third device: the harness drive. `restore`
+        // re-anchors it onto the live id (PATCH /drives) so the embedded
+        // path tracks the live id and this snapshot's recomputed
+        // source_harness_canonical matches what the next hop's
+        // load_snapshot opens — no ENOENT on harness/<ancestor>.ext4.
         tokio::time::sleep(Duration::from_secs(2)).await;
         metadata = backend
             .snapshot(restored)

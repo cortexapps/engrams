@@ -267,11 +267,11 @@ pub async fn evacuate_dead_source(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use engram_core::{HostId, SandboxId, SessionId};
     use engram_core::traits::{HarnessDial, HostClient};
     use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
     use engram_core::types::session::{HarnessSpec, Session, SessionState};
     use engram_core::types::snapshot::SnapshotMetadata;
+    use engram_core::{HostId, SandboxId, SessionId};
     use parking_lot::Mutex as PlMutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
