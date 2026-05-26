@@ -545,10 +545,7 @@ async fn evac_attempts_primitives_round_trip() {
 
     // list reflects the latest bump.
     let candidates = meta.list_evacuating_sessions().await.unwrap();
-    let after_bump = candidates
-        .iter()
-        .find(|(s, _)| s.id == session_id)
-        .unwrap();
+    let after_bump = candidates.iter().find(|(s, _)| s.id == session_id).unwrap();
     assert_eq!(after_bump.1, 2, "list reads back the bumped count");
 
     // Transition out (Evacuating → Idle) — counter NOT reset (only
@@ -580,10 +577,7 @@ async fn evac_attempts_primitives_round_trip() {
         .expect("Active → Evacuating (second drain)");
 
     let candidates = meta.list_evacuating_sessions().await.unwrap();
-    let on_reentry = candidates
-        .iter()
-        .find(|(s, _)| s.id == session_id)
-        .unwrap();
+    let on_reentry = candidates.iter().find(|(s, _)| s.id == session_id).unwrap();
     assert_eq!(
         on_reentry.1, 0,
         "re-entry into Evacuating must reset evac_attempts to 0"
@@ -652,6 +646,12 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
     );
 
     // Unknown host id → false (admin endpoint maps to 404).
-    assert!(!registry.cordon(HostId::new()), "unknown host returns false");
-    assert!(!registry.uncordon(HostId::new()), "unknown host returns false");
+    assert!(
+        !registry.cordon(HostId::new()),
+        "unknown host returns false"
+    );
+    assert!(
+        !registry.uncordon(HostId::new()),
+        "unknown host returns false"
+    );
 }
