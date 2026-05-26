@@ -280,41 +280,82 @@ The scanner retries the full 20-attempt budget, then falls back to
 `Idle` (so the session is recoverable-by-hand, not lost — though
 `/resume` from Idle hits the same restore path).
 
-What's going on: the second snapshot (taken of the *restored*
-sandbox) records `source_rootfs_canonical = rootfs/<restored_id>.dev`
-— the canonical 12n correctly created for the restored sandbox.
-On the next cross-host restore, FC's `load_snapshot` opens the
-drive at that exact embedded path, which must be recreated +
-backed by a materialized rootfs on the new target. The disk
-lineage IS intact (both snapshots share `disk_manifest` 5ad53e36,
-`recoverable=true`), so the chunks are there — but the
-materialize-rootfs → patch-sidecar → `restore_canonical_symlinks`
-chain isn't producing a resolvable backing file at the
-`<restored_id>.dev` source path on the second hop.
+**Root cause (traced 2026-05-26 against the actual prod snapshot
+artifacts in GCS):** `source_rootfs_canonical` is computed from the
+*live* sandbox id at snapshot time, but the rootfs `path_on_host`
+baked into FC's opaque `state.bin` is whatever the drive was
+*configured* with — and restore never re-points the rootfs drive
+(only the harness drive gets a `patch_drive` on restore, at
+lib.rs:2952). So after the first restore the two diverge. Confirmed
+by fetching both sidecars + `state.bin` from GCS:
+
+| | cold `706a1c2f` (snap 216ffb37) | restored `61057473` (snap ce2d9024) |
+|---|---|---|
+| `state.bin` embedded rootfs path | `rootfs/706a1c2f.dev` | **`rootfs/706a1c2f.dev`** (grep: live id `61057473` 0×, ancestor `706a1c2f` 2×) |
+| sidecar `source_rootfs_canonical` | `rootfs/706a1c2f.dev` | `rootfs/61057473.dev` (recomputed) |
+| match? | ✅ | ❌ diverged |
+
+Hop 1 works because the cold sandbox's drive path == its computed
+canonical (same id). Hop 2 fails because `restore_canonical_symlinks`
+recreates the *computed* path (`61057473`) while FC's `load_snapshot`
+opens the *embedded* path (`706a1c2f`), which nobody recreated →
+ENOENT. The rootfs is NBD-backed: the `.dev` symlink is a per-host
+indirection to `/dev/nbdN`, and the disk lineage is intact (both
+snapshots share `disk_manifest` 5ad53e36, recoverable). The failure
+is purely the path-identity mismatch — not a missing materialize.
+
+This is a **leaky abstraction**: `source_rootfs_canonical` is
+derived from sandbox identity under a cold-create assumption ("the
+live sandbox's rootfs sits at its own id-keyed path") that restore
+silently violates. The cold ancestor's id gets welded into
+`state.bin` and rides the lineage forever, while the bookkeeping
+keeps computing "current live id" paths that drift after hop 1.
+12n (new-id symlink) was a correct fix one layer up; this is the
+layer below.
 
 **Why dead-host recovery doesn't hit this:** the dead-host path
 (`evacuate_dead_source` from a *dead* source) restores from the
 session's existing snapshot and never takes a fresh snapshot of a
-restored sandbox, so the embedded `path_on_host` stays anchored to
-an earlier lineage that materializes cleanly. The operator path
+restored sandbox, so `source_rootfs_canonical` is never recomputed
+away from the embedded path. The operator path
 (`evict_session_to_state` → `host.snapshot`) takes a NEW snapshot
-of the restored sandbox, which is what introduces the
-`<restored_id>.dev` source path the next restore can't satisfy.
-This is why `3e692ab6` survived four dead-host recoveries but a
-deliberate double operator-evac stalls.
+of the restored sandbox — that recompute is what introduces the
+divergence. This is why `3e692ab6` survived four dead-host
+recoveries but a deliberate double operator-evac stalls.
 
-**Net operational state:** the primary M4 promise —
-session survives a host loss / deploy roll via dead-host recovery
-— is fully working in prod. Single operator-evac / drain works.
-The remaining gap is **operator-evac/drain of a session that was
-*already* operator-evac'd once** (not dead-host-recovered) —
-back-to-back manual drains of the same session. Tracked as 12o;
-needs investigation into the materialize-rootfs path for the
-scanner's restore of a re-snapshotted sandbox (likely:
-`materialize_disk_if_missing` must also recreate the
-`source_rootfs_canonical` backing file, or `evacuate_dead_source`
-must pass the disk manifest through so the second-hop materialize
-runs).
+**Fix — Option B (normalize identity on restore), chosen:** make a
+restored sandbox truly equal to a cold-created one by re-pointing
+its rootfs drive to its *own* new-id canonical path on restore,
+mirroring what the harness drive already does. Mechanically:
+
+- Restore loads via `load_snapshot_paused` /
+  `load_snapshot_uffd_paused` (already in the client, used by the
+  M1.12 option-D harness path), then
+  `patch_drive("rootfs", rootfs_canonical(new_id))`, then resume.
+  12n already installs `rootfs/<new_id>.dev` → the live `/dev/nbdN`,
+  so the patch target exists.
+- After this the running drive is at `rootfs/<new_id>.dev`, so the
+  *next* snapshot's `state.bin` embeds the new id,
+  `source_rootfs_canonical` (= `rootfs_canonical(new_id)`) matches,
+  and ancestry is severed. Hop N == hop 1 for all N.
+
+Rejected alternative (Option A): record the *true* embedded path in
+`source_rootfs_canonical` rather than the computed one. Fixes the
+bug but welds the cold ancestor id into every descendant forever —
+keeps the smell. B removes the whole 12n/12o class.
+
+**Residual risk to confirm during implementation:** FC must open
+the root block device on *resume*, not on *load*, for load-paused →
+patch → resume to work on the root drive (the harness path proves
+it for a non-root drive). To be validated on the dev-vm FC
+boot-test harness before wiring + end-to-end on prod via the
+re-evac canary.
+
+**Net operational state until 12o ships:** the primary M4 promise —
+session survives a host loss / deploy roll via dead-host recovery —
+is fully working in prod (proven 4×). Single operator-evac / drain
+works. The only gap is **back-to-back *operator* evac/drain of the
+same session**.
 
 ### Dev-vm stumbling blocks (12m.4 investigation, 2026-05-26)
 
