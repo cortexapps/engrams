@@ -86,24 +86,33 @@ note "forcing flush so live_disk_manifest is published before evac"
 curl -fsS -X POST -H 'authorization: Bearer dev' "$COORD_URL/api/admin/sessions/$SESSION_ID/flush-now" \
     -d '{}' -H 'content-type: application/json' >/dev/null || die "flush-now failed"
 
-# --- step 4: evacuate -----------------------------------------------
-note "triggering admin evacuate"
-EVAC_RESP=$(curl -fsS -X POST -H 'authorization: Bearer dev' \
+# --- step 4: evacuate (async shape, ADR 0018 commit 12) -------------
+note "triggering admin evacuate (async — handler returns 202; scanner resumes on peer)"
+HTTP_RESP=$(curl -fsS -X POST -H 'authorization: Bearer dev' \
     -H 'content-type: application/json' -d '{}' \
+    -w '\n%{http_code}' \
     "$COORD_URL/api/admin/sessions/$SESSION_ID/evacuate")
-NEW_HOST=$(echo "$EVAC_RESP" | grep -o '"new_host_id":"[^"]*"' | cut -d'"' -f4)
-NEW_SANDBOX=$(echo "$EVAC_RESP" | grep -o '"new_sandbox_id":"[^"]*"' | cut -d'"' -f4)
-LOSS=$(echo "$EVAC_RESP" | grep -o '"loss":[^,}]*' | cut -d':' -f2-)
-[ -n "$NEW_HOST" ] || die "couldn't parse new_host_id from evac response: $EVAC_RESP"
-[ "$NEW_HOST" != "$HOST_BEFORE" ] || die "evac landed on source host — exclude_host regressed"
-ok "evac response: new_host=$NEW_HOST new_sandbox=$NEW_SANDBOX loss=$LOSS"
+HTTP_CODE=$(echo "$HTTP_RESP" | tail -1)
+EVAC_BODY=$(echo "$HTTP_RESP" | head -n -1)
+[ "$HTTP_CODE" = "202" ] || die "expected 202 Accepted, got $HTTP_CODE body=$EVAC_BODY"
+EVAC_STATUS=$(echo "$EVAC_BODY" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+[ "$EVAC_STATUS" = "evacuating" ] || die "expected status=evacuating, got '$EVAC_STATUS' body=$EVAC_BODY"
+ok "evac dispatched: scanner will resume on peer"
 
 # --- step 5: verify post-evac state ---------------------------------
-note "polling session state until Active on new host"
+# Async shape: poll until session leaves Evacuating and lands at
+# Active on a different host. Scanner cadence is ~10s; allow a
+# generous 120s budget for slow dev-vm + image-prefetch + harness
+# rebuild.
+note "polling session state until Active on new host (scanner-driven)"
 ACTIVE_AT=""
-for _ in $(seq 1 60); do
+SAW_EVACUATING=0
+for _ in $(seq 1 120); do
     SESSION_AFTER=$(curl -fsS "$COORD_URL/sessions/$SESSION_ID")
     STATUS_AFTER=$(echo "$SESSION_AFTER" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ "$STATUS_AFTER" = "evacuating" ]; then
+        SAW_EVACUATING=1
+    fi
     if [ "$STATUS_AFTER" = "active" ]; then
         ACTIVE_AT="$SESSION_AFTER"
         break
@@ -111,10 +120,11 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 [ -n "$ACTIVE_AT" ] || die "session never reached Active after evac"
+[ "$SAW_EVACUATING" = "1" ] || ok "(scanner moved through Evacuating faster than the poll cadence — fine)"
 HOST_AFTER=$(echo "$ACTIVE_AT" | grep -o '"host_id":"[^"]*"' | head -1 | cut -d'"' -f4)
 SANDBOX_AFTER=$(echo "$ACTIVE_AT" | grep -o '"sandbox_id":"[^"]*"' | head -1 | cut -d'"' -f4)
-[ "$HOST_AFTER" = "$NEW_HOST" ] || die "post-evac host_id=$HOST_AFTER doesn't match evac receipt new_host=$NEW_HOST"
-[ "$SANDBOX_AFTER" = "$NEW_SANDBOX" ] || die "post-evac sandbox_id=$SANDBOX_AFTER doesn't match evac receipt new_sandbox=$NEW_SANDBOX"
+[ "$HOST_AFTER" != "$HOST_BEFORE" ] || die "post-evac host_id=$HOST_AFTER same as source; scanner picked source (exclude_host regressed?)"
+[ "$SANDBOX_AFTER" != "$SANDBOX_BEFORE" ] || die "post-evac sandbox_id unchanged; relocate didn't actually mint a new sandbox"
 ok "post-evac: host=$HOST_AFTER sandbox=$SANDBOX_AFTER status=active"
 
 # --- step 6: verify disk preservation -------------------------------

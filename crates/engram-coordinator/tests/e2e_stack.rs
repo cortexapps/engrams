@@ -1172,28 +1172,28 @@ async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
 ///   - 404 on a non-existent session id.
 ///   - 409 on a session that's not yet Active (e.g. just-created,
 ///     still warming).
-///   - For an Active session: either the endpoint returns 200 with
-///     a sensible `new_host_id` distinct from the source (the
-///     2-host case) OR returns 5xx because no peer host exists
-///     (the 1-host case). The latter is a loud-warning skip.
+///   - For an Active session: returns 202 Accepted with
+///     `status="evacuating"`. The `evac_resumer` scanner (which
+///     runs in the same coord process) drives the session to
+///     Active on a peer in ≤10s.
 ///
 /// Pinned regressions:
-///   - Route registration in `api/mod.rs` (a typo in the path makes
-///     every call 404 instead of the 200/4xx the endpoint should
-///     produce).
-///   - Pre-flight checks (404 vs 409 vs 5xx mapping in
-///     `admin::evacuate_session`).
+///   - Route registration in `api/mod.rs` (a typo makes every call
+///     404 instead of 200/4xx).
+///   - Pre-flight checks (404 vs 409 vs 5xx) in
+///     `admin::evacuate_session`.
+///   - The async hand-off: the handler MUST return without
+///     synchronously running the relocate (legacy commit-7 shape).
 ///
 /// The full e2e — Active session × 2 hosts × disk-preserved-on-peer
-/// — is a follow-up after `integration-up.sh` learns a two-host shape.
+/// — runs in the dev-vm `integration-evac-test.sh`.
 #[tokio::test]
 #[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_evac_admin_endpoint_shape() {
     let driver = Driver::from_env();
     let image = Driver::image_uri();
 
-    // Case 1: 404 on a session that doesn't exist. UUID format is
-    // valid; the row just isn't there.
+    // Case 1: 404 on a session that doesn't exist.
     let bogus = SessionId::new();
     let path = format!("/api/admin/sessions/{bogus}/evacuate");
     let resp = driver
@@ -1210,10 +1210,9 @@ async fn e2e_evac_admin_endpoint_shape() {
         resp.text().await.unwrap_or_default(),
     );
 
-    // Case 2: live session — exercises the Active-state check + the
-    // target-pick path. The handler either returns 200 (2-host fixture)
-    // or 500 from NoCapacity (1-host fixture; the only registered host
-    // is the source, exclude_host filters it out).
+    // Case 2: live session — async shape (commit 12). Handler must
+    // return 202 immediately after marking the session Evacuating.
+    // The scanner picks it up from there.
     let sid = driver.create_session_none_harness(&image).await;
     let path = format!("/api/admin/sessions/{sid}/evacuate");
     let resp = driver
@@ -1224,42 +1223,21 @@ async fn e2e_evac_admin_endpoint_shape() {
         .expect("POST evacuate on live session");
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
-
-    if status == reqwest::StatusCode::OK {
-        // 2-host fixture path: assert response shape + that target
-        // host differs from source. (The actual disk-preserved
-        // assertion lives in the follow-up after integration-up.sh
-        // exposes per-host info.)
-        let body: Value = serde_json::from_str(&body_text).expect("decode EvacuateSessionResponse");
-        assert!(
-            body.get("new_host_id").is_some(),
-            "200 response must carry new_host_id; got {body:?}",
-        );
-        assert!(
-            body.get("new_sandbox_id").is_some(),
-            "200 response must carry new_sandbox_id; got {body:?}",
-        );
-        assert!(
-            body.get("loss").is_some(),
-            "200 response must carry loss; got {body:?}",
-        );
-    } else if status.is_server_error() {
-        // 1-host fixture path. The 5xx body should mention "no peer"
-        // or similar — load-bearing enough to catch if the error
-        // message regresses to a generic 500.
-        eprintln!(
-            "::warning title=ADR 0018 Phase C partial coverage::\
-             evac on session {sid} returned {status} body={body_text} — likely the \
-             1-host integration fixture. Full 2-host e2e is a follow-up; see ADR \
-             0018 §commit 8a deferral note."
-        );
-        assert!(
-            body_text.contains("no peer") || body_text.contains("capacity") || body_text.contains("image"),
-            "5xx body must explain the picker failure; got {body_text}",
-        );
-    } else {
-        panic!("unexpected evac response: {status} body={body_text}");
-    }
+    assert_eq!(
+        status,
+        reqwest::StatusCode::ACCEPTED,
+        "evacuate must return 202 on Active session (async shape); got {status} body={body_text}",
+    );
+    let body: Value = serde_json::from_str(&body_text).expect("decode EvacuateSessionResponse");
+    assert_eq!(
+        body.get("status").and_then(|v| v.as_str()),
+        Some("evacuating"),
+        "202 body.status must be \"evacuating\"; got {body:?}",
+    );
+    assert!(
+        body.get("session_id").is_some(),
+        "202 body must echo session_id; got {body:?}",
+    );
 
     driver.delete(sid).await;
 }
