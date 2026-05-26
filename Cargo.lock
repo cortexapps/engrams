@@ -792,6 +792,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -814,6 +815,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -834,6 +836,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -850,6 +853,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -864,6 +868,7 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -875,6 +880,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -930,6 +936,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -947,6 +954,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -960,6 +968,7 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -985,6 +994,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1001,6 +1011,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1016,6 +1027,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1029,6 +1041,7 @@ dependencies = [
  "serde",
  "tokio",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1079,6 +1092,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1105,6 +1119,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1125,6 +1140,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1143,6 +1159,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1157,6 +1174,7 @@ dependencies = [
  "sqlx",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1179,6 +1197,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1211,6 +1230,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1234,6 +1254,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1263,6 +1284,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1275,6 +1297,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1292,6 +1315,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1306,6 +1330,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1320,6 +1345,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1331,6 +1357,7 @@ dependencies = [
  "engram-core",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1342,6 +1369,7 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1363,6 +1391,7 @@ dependencies = [
  "tracing-subscriber",
  "userfaultfd",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -5424,6 +5453,81 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-core",
+ "base64 0.22.1",
+ "bitflags",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "crossbeam-utils",
+ "crypto-common",
+ "deranged",
+ "digest",
+ "either",
+ "errno",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-util",
+ "getrandom 0.2.17",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "idna",
+ "itertools",
+ "libc",
+ "log",
+ "memchr",
+ "nix 0.31.2",
+ "nom",
+ "num-traits",
+ "percent-encoding",
+ "phf_shared",
+ "prost",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "reqwest",
+ "ring",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2",
+ "slab",
+ "smallvec",
+ "socket2 0.6.3",
+ "sqlx-core",
+ "sqlx-postgres",
+ "syn 2.0.117",
+ "sync_wrapper",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "toml_datetime",
+ "toml_parser",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-core",
+ "uuid",
+ "winnow",
+ "zeroize",
 ]
 
 [[package]]

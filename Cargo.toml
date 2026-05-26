@@ -30,6 +30,7 @@ members = [
     "crates/engram-storage-local",
     "crates/engram-storage-s3",
     "crates/engram-storage-gcs",
+    "workspace-hack",
 ]
 
 [workspace.package]
@@ -155,3 +156,13 @@ hickory-proto = { version = "0.24", default-features = false, features = ["tokio
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Trim third-party debug info to line tables only. Our own crates keep
+# full debug info (jump-to-def in IDEs, locals in lldb) — workspace
+# members hit `[profile.dev]` directly, not this `package."*"`
+# override. The win is on macOS link, where dsymutil chews through
+# DWARF for serde/tokio/tonic/rustls/etc.; smaller `.o` files and a
+# much faster link step on every incremental rebuild. On Linux it
+# trims the embedded debug section but is a smaller relative win.
+[profile.dev.package."*"]
+debug = "line-tables-only"

@@ -20,6 +20,7 @@ tracing.workspace = true
 # the streaming download path returns a futures Stream natively, so
 # we don't have to re-buffer on the GET side.
 google-cloud-storage = { version = "0.24", default-features = false, features = ["rustls-tls", "auth"] }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -76,6 +76,7 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 uuid.workspace = true
 tempfile = "3"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 engram-harness-noop.workspace = true

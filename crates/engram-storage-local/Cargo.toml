@@ -17,6 +17,7 @@ futures.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

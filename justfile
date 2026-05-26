@@ -26,11 +26,22 @@ default:
 check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo hakari verify
     cargo nextest run --workspace
 
 # Auto-format the workspace.
 fmt:
     cargo fmt --all
+
+# Regenerate `workspace-hack/Cargo.toml` from the current dep
+# graph. Run after adding or removing a workspace dep so
+# `cargo hakari verify` (in `just check` and CI) stays green. The
+# workspace-hack crate unifies feature sets across members so
+# switching between `cargo test -p X` and `cargo build -p Y`
+# doesn't re-cook shared deps under different features.
+hakari:
+    cargo hakari generate
+    cargo hakari manage-deps --yes
 
 # Run all tests via nextest (faster). Pass extra args after `--`.
 test *ARGS:

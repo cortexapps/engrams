@@ -18,6 +18,7 @@ unsafe_code = "allow"
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 # vsock is a Linux-only kernel feature. Both transports compile only
 # on Linux; on macOS / other hosts the crate is an empty shell so the

@@ -29,3 +29,9 @@ rustflags = ["-C", "relocation-model=static"]
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
 rustflags = ["-C", "relocation-model=static"]
+
+# Native Linux linker (mold) is NOT wired here — it's exported by
+# `flake.nix` as `CARGO_TARGET_*_UNKNOWN_LINUX_GNU_{LINKER,RUSTFLAGS}`
+# only when you're inside `nix develop` (or the dev-vm, which uses
+# the same shell). Wiring it project-wide would break CI runners and
+# out-of-Nix dev boxes that don't have mold/clang on PATH.

@@ -121,6 +121,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
+      # Parallel linker — installs a prebuilt mold release (~1–2s)
+      # and (with the action's default `make-default: true`) points
+      # /usr/bin/ld at it so cargo's default cc→ld chain picks it up
+      # transparently. Cuts incremental link time 3–10× on this
+      # multi-binary workspace, net positive after install overhead.
+      # Skipped on cross-musl-linux (musl-gcc has its own bundled
+      # ld) and on test-e2e-stack (downloads prebuilt binaries, no
+      # native link step happens).
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           # Shared with test-linux + test-e2e-stack: all three build
@@ -129,6 +139,15 @@ jobs:
           # cache bucket and each subsequent job sees prior deps as
           # already-compiled.
           shared-key: workspace-debug
+
+      # Install cargo-hakari from a prebuilt release (~1s) so we can
+      # `cargo hakari verify` below. The dev shell pulls this from
+      # nixpkgs; CI uses taiki-e/install-action to avoid a slow
+      # `cargo install` from source.
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
 
       # `if: always()` so each gate runs regardless of which earlier
       # step failed — surfaces fmt + clippy + check failures together
@@ -144,6 +163,12 @@ jobs:
       - name: cargo check --workspace --all-targets
         if: always()
         run: cargo check --workspace --all-targets
+      # Catch dep additions that didn't regenerate workspace-hack.
+      # Run `just hakari` (or `cargo hakari generate`) locally and
+      # commit `workspace-hack/Cargo.toml` if this fails.
+      - name: cargo hakari verify
+        if: always()
+        run: cargo hakari verify
 
   test-linux:
     name: tests (linux)
@@ -189,6 +214,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           # Shared with lint + test-e2e-stack — see lint's cache step
@@ -366,6 +393,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
 
@@ -655,6 +684,11 @@ jobs:
       - name: Install musl tooling
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
 
+      # Parallel linker for the native-gnu portion (the musl agentd
+      # build uses musl-gcc's bundled ld and is unaffected).
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
@@ -796,6 +830,9 @@ jobs:
 
       - name: Install musl tooling
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
