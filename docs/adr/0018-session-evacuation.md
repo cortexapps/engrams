@@ -44,9 +44,20 @@ already-restored sandbox failed `assert_rootfs_canonical`.
 a later `snapshot(new_id)` couldn't find `rootfs/<new_id>.dev`.
 Surfaced only on the SECOND evac (the first lineage's source id ==
 the cold-create id, so the bug hid). Fix threads the new id into
-`restore_canonical_symlinks`. Dead-host recovery was unaffected
+`restore_canonical_symlinks`. 12n is **verified in prod**: the
+snapshot-side failure is gone (`POST /evacuate` of a restored
+sandbox now returns 202). Dead-host recovery was unaffected
 (it doesn't snapshot a dead source), which is why `3e692ab6`
-survived all three rolls. See §"Commit 12n" below.
+survived four rolls. See §"Commit 12n" below.
+
+**One edge case still open (commit 12o):** with 12n in place,
+re-evac gets past the snapshot but the scanner's *restore* of a
+twice-relocated sandbox fails FC `load_snapshot` (source-keyed
+rootfs backing file not materialized on the new target); the
+session falls back to `Idle` after the retry budget. This affects
+**only** back-to-back *operator* evac/drain of the same session
+— not dead-host recovery, not single operator-evac. The primary
+deploy-roll promise is unaffected. See §"Commit 12o (open)".
 
 The earlier "12m.4 deferred — residual cross-host disk drift"
 investigation is **closed**: the drift was dev-vm-only.
@@ -244,8 +255,66 @@ drained in roll N could not be drained again in roll N+1. The
 dead-host recovery path is unaffected (it restores from the last
 snapshot, never snapshots a dead source), which is why the real
 session `3e692ab6` survived three consecutive MIG rolls in the
-prod validation. Re-validation of the operator re-evac path on
-prod is a follow-up once 12n deploys.
+prod validation.
+
+**12n verified in prod (2026-05-26):** after the 12n host image
+rolled, operator-evac of an already-restored sandbox no longer
+errors at the snapshot — `POST /evacuate` returns 202 and the
+re-snapshot succeeds (session reaches Evacuating). The original
+"non-canonical jail layout" failure is gone.
+
+### Commit 12o (open) — restore of a twice-relocated sandbox
+
+Fixing 12n peeled the onion to the next layer. With 12n in place,
+re-evac gets past the snapshot, but the scanner's *restore* of the
+twice-relocated sandbox fails on the new target host:
+
+```
+Firecracker PUT /snapshot/load -> 400: … Failed to restore MMIO
+device: … Block: Virtio backend error: Error manipulating the
+backing file: No such file or directory (os error 2)
+/var/lib/engram/sandboxes/rootfs/<restored_sandbox_id>.dev
+```
+
+The scanner retries the full 20-attempt budget, then falls back to
+`Idle` (so the session is recoverable-by-hand, not lost — though
+`/resume` from Idle hits the same restore path).
+
+What's going on: the second snapshot (taken of the *restored*
+sandbox) records `source_rootfs_canonical = rootfs/<restored_id>.dev`
+— the canonical 12n correctly created for the restored sandbox.
+On the next cross-host restore, FC's `load_snapshot` opens the
+drive at that exact embedded path, which must be recreated +
+backed by a materialized rootfs on the new target. The disk
+lineage IS intact (both snapshots share `disk_manifest` 5ad53e36,
+`recoverable=true`), so the chunks are there — but the
+materialize-rootfs → patch-sidecar → `restore_canonical_symlinks`
+chain isn't producing a resolvable backing file at the
+`<restored_id>.dev` source path on the second hop.
+
+**Why dead-host recovery doesn't hit this:** the dead-host path
+(`evacuate_dead_source` from a *dead* source) restores from the
+session's existing snapshot and never takes a fresh snapshot of a
+restored sandbox, so the embedded `path_on_host` stays anchored to
+an earlier lineage that materializes cleanly. The operator path
+(`evict_session_to_state` → `host.snapshot`) takes a NEW snapshot
+of the restored sandbox, which is what introduces the
+`<restored_id>.dev` source path the next restore can't satisfy.
+This is why `3e692ab6` survived four dead-host recoveries but a
+deliberate double operator-evac stalls.
+
+**Net operational state:** the primary M4 promise —
+session survives a host loss / deploy roll via dead-host recovery
+— is fully working in prod. Single operator-evac / drain works.
+The remaining gap is **operator-evac/drain of a session that was
+*already* operator-evac'd once** (not dead-host-recovered) —
+back-to-back manual drains of the same session. Tracked as 12o;
+needs investigation into the materialize-rootfs path for the
+scanner's restore of a re-snapshotted sandbox (likely:
+`materialize_disk_if_missing` must also recreate the
+`source_rootfs_canonical` backing file, or `evacuate_dead_source`
+must pass the disk manifest through so the second-hop materialize
+runs).
 
 ### Dev-vm stumbling blocks (12m.4 investigation, 2026-05-26)
 
