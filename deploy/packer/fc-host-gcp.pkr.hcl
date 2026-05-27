@@ -78,6 +78,11 @@ variable "host_agent_gcs_url" {
   description = "gs:// URL of the pre-built static engram-host-agent binary."
 }
 
+variable "uffd_handler_gcs_url" {
+  type        = string
+  description = "gs:// URL of the pre-built static engram-uffd-handler binary (ADR 0020 Route B; co-located with firecracker for UFFD restore)."
+}
+
 variable "firecracker_version" {
   type        = string
   description = "Firecracker release tag to pin. v1.10.x is the production line."
@@ -178,6 +183,17 @@ build {
       "HOST_AGENT_GCS_URL=${var.host_agent_gcs_url}",
     ]
     script = "${path.root}/provisioners/install-host-agent.sh"
+  }
+
+  # 3a'. engram-uffd-handler (ADR 0020 Route B) — pulled from the
+  #      operator-provided GCS URL, co-located with firecracker. Also sets
+  #      vm.unprivileged_userfaultfd=1 so FC's UFFD restore works under the
+  #      jailer. Inert until ENGRAM_FC_RESTORE_MODE=uffd is set on host-agent.
+  provisioner "shell" {
+    environment_vars = [
+      "UFFD_HANDLER_GCS_URL=${var.uffd_handler_gcs_url}",
+    ]
+    script = "${path.root}/provisioners/install-uffd-handler.sh"
   }
 
   # 4a. Google Cloud Ops Agent. Ships engram-host-agent's systemd
