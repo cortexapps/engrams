@@ -34,6 +34,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
+use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+use engram_core::types::session::split_image_ref;
+use engram_core::types::snapshot::{BaseSnapshot, SnapshotRecord};
 use engram_core::types::{EnabledImage, EnabledImageSummary, ImageManifest};
 use engram_core::MetaError;
 use serde::{Deserialize, Serialize};
@@ -69,11 +72,16 @@ pub async fn enable_image(
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    let (mut row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
+    let (mut row, manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
     // ADR 0016 Phase C commit 3a: stamp the bake's ManifestRef on
     // the row so the GC pin-set can read it back without re-pulling
     // bundle.json from OCI on every sweep. `None` for harness-only.
     row.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
+    // ADR 0020 P1: an image is not enabled unless its per-image base
+    // snapshot was captured + recorded. This blocks on a host-side
+    // capture; on failure we return before writing the enabled_images
+    // row, so a failed snapshot leaves zero rows (no partial state).
+    capture_and_record_base_snapshot(&state, &row, &manifest).await?;
     state
         .services
         .meta
@@ -115,13 +123,16 @@ pub async fn refresh_enabled_image(
             ))
         })?;
 
-    let (mut refreshed, _manifest, artifacts) =
+    let (mut refreshed, manifest, artifacts) =
         fetch_and_seal_manifest(&state, &req.image_uri).await?;
     refreshed.id = existing.id;
     refreshed.created_at = existing.created_at;
     refreshed.updated_at = Some(Utc::now());
 
     refreshed.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
+    // ADR 0020 P1: a moved tag is new content — capture a fresh base
+    // snapshot for the new digest before the refreshed row goes live.
+    capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
     state
         .services
         .meta
@@ -253,6 +264,157 @@ async fn materialize_disk_chunks(
         "materialized disk chunks into BlobStorage",
     );
     Ok(Some(manifest_ref))
+}
+
+/// ADR 0020 P1: capture (or reuse) the per-image base snapshot and
+/// record its `snapshots` + `base_snapshots` rows. Called during
+/// enable/refresh BEFORE the `enabled_images` row is written, so a
+/// capture failure aborts the whole enable and leaves zero rows.
+///
+/// Idempotent: if a base snapshot already exists for this manifest
+/// digest, the image content is unchanged and we reuse it — no re-boot.
+///
+/// The capture runs on a prod host (so it inherits the host CPU's
+/// CPUID baseline; pair with `ENGRAM_FC_CPU_TEMPLATE=T2CL` for fleet
+/// portability — ADR 0020). The host attaches its local stub harness,
+/// boots to agentd-ready, snapshots (chunked memory + uploaded
+/// state/sidecar), and tears the capture VM down.
+async fn capture_and_record_base_snapshot(
+    state: &SharedState,
+    row: &EnabledImage,
+    manifest: &ImageManifest,
+) -> Result<(), ApiError> {
+    // Skip if this exact image content already has a base snapshot.
+    if state
+        .services
+        .meta
+        .get_base_snapshot_by_digest(&row.manifest_digest)
+        .await?
+        .is_some()
+    {
+        tracing::info!(
+            image_uri = %row.image_uri,
+            digest = %row.manifest_digest,
+            "base snapshot already recorded for this digest; reusing",
+        );
+        return Ok(());
+    }
+
+    let vcpus = manifest
+        .resources
+        .suggested_vcpus
+        .unwrap_or(crate::api::sessions::DEFAULT_VCPUS);
+    let memory_mib = manifest
+        .resources
+        .suggested_memory_mib
+        .unwrap_or(crate::api::sessions::DEFAULT_MEMORY_MIB);
+    let disk_gib = manifest
+        .resources
+        .suggested_disk_gib
+        .unwrap_or(crate::api::sessions::DEFAULT_DISK_GIB);
+
+    // Anonymous capture spec — no session env, no harness pack (the
+    // host substitutes its stub harness so the snapshot carries a
+    // harness drive slot for per-session swap at restore).
+    let spec = SandboxSpec {
+        image: row.image_uri.clone(),
+        rootfs_source: None,
+        image_uri: Some(row.image_uri.clone()),
+        harness_pack_uri: None,
+        cpu: CpuLimit { vcpus },
+        memory: MemoryLimit {
+            max_mib: memory_mib,
+        },
+        disk: DiskLimit { max_gib: disk_gib },
+        ttl: None,
+        env: manifest.env.clone(),
+        workdir: None,
+        harness_substrate: None,
+        network: manifest.network.clone(),
+    };
+
+    let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {
+        ApiError::Unavailable(
+            "no host is available to capture this image's base snapshot. \
+             Register a host and retry the enable."
+                .into(),
+        )
+    })?;
+
+    tracing::info!(
+        image_uri = %row.image_uri,
+        host_id = %host_id,
+        "capturing base snapshot for image enable",
+    );
+    let meta = host.build_base_snapshot(spec).await.map_err(|e| {
+        ApiError::Internal(format!(
+            "base snapshot capture for `{}` failed on host {host_id}: {e}",
+            row.image_uri
+        ))
+    })?;
+
+    // A base snapshot is only useful if its chunked manifests are
+    // durable in BlobStorage — verify before recording, so an
+    // unrecoverable capture aborts the enable rather than persisting a
+    // dead pointer.
+    let recoverable = crate::api::snapshot::verify_snapshot_recoverable(
+        state.services.blob.as_ref(),
+        meta.disk_manifest.as_ref(),
+        meta.memory_manifest.as_ref(),
+    )
+    .await;
+    if !recoverable {
+        return Err(ApiError::Internal(format!(
+            "base snapshot for `{}` was captured but its chunked manifests \
+             failed HEAD-verify in BlobStorage; not enabling",
+            row.image_uri
+        )));
+    }
+
+    let now = Utc::now();
+    // Record the snapshot row (session_id = NULL — a template artifact,
+    // not a session capture) then the digest → snapshot mapping. The
+    // enabled_images row is written by the caller only after this
+    // returns Ok, so the three rows go live together.
+    state
+        .services
+        .meta
+        .record_snapshot(SnapshotRecord {
+            id: meta.id,
+            session_id: None,
+            host_id: Some(host_id),
+            image_version: meta.image_version.clone(),
+            size_bytes: meta.size_bytes,
+            created_at: meta.created_at,
+            last_accessed_at: now,
+            disk_manifest: meta.disk_manifest,
+            memory_manifest: meta.memory_manifest,
+            recoverable,
+        })
+        .await?;
+
+    let (image_repo, image_tag) = split_image_ref(&row.image_uri);
+    state
+        .services
+        .meta
+        .upsert_base_snapshot(BaseSnapshot {
+            manifest_digest: row.manifest_digest.clone(),
+            snapshot_id: meta.id,
+            image_repo: image_repo.to_string(),
+            image_tag: image_tag.to_string(),
+            vcpus,
+            memory_mib,
+            created_at: now,
+        })
+        .await?;
+
+    tracing::info!(
+        image_uri = %row.image_uri,
+        snapshot_id = %meta.id,
+        size_bytes = meta.size_bytes,
+        "recorded base snapshot for image",
+    );
+    Ok(())
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`

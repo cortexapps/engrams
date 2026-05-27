@@ -16,9 +16,9 @@ use crate::state::{SessionEvent, SharedState};
 
 /// Default sandbox sizing for sessions created without explicit limits.
 /// Phase 1 numbers — will move to per-repo `engram.toml` config later.
-const DEFAULT_VCPUS: u32 = 2;
-const DEFAULT_MEMORY_MIB: u32 = 4096;
-const DEFAULT_DISK_GIB: u32 = 20;
+pub(crate) const DEFAULT_VCPUS: u32 = 2;
+pub(crate) const DEFAULT_MEMORY_MIB: u32 = 4096;
+pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 
 /// Inject resolved secrets into the sandbox env according to the
 /// manifest's `secret_mode`.

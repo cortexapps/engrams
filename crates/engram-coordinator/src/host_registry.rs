@@ -392,6 +392,16 @@ impl HostRegistry {
             .map(|e| (*e.key(), e.value().backend.clone()))
     }
 
+    /// ADR 0020 P1: pick any non-draining host to run a base-snapshot
+    /// capture on. Unlike session placement this is NOT gated on image
+    /// readiness — on first enable no host has prefetched the image yet,
+    /// so the capture host lazy-materializes the rootfs from BlobStorage
+    /// during its boot. Public wrapper over `pick_any` for the
+    /// enable-image handler.
+    pub fn pick_capture_host(&self) -> Option<(HostId, Arc<dyn HostClient>)> {
+        self.pick_any()
+    }
+
     /// Session scheduler. Inputs the per-host heartbeat state (capacity,
     /// local snapshots, draining, ready_images) and ranks:
     ///
