@@ -345,6 +345,22 @@ rootfs stage).
   still applies. Measure before/after via the Jaeger spans (wire
   `OTEL_EXPORTER_OTLP_ENDPOINT` → the dev Jaeger; the ad-hoc dev-vm coord launch
   didn't, which is why the ~13 s breakdown above came from the coord log).
+- **Route B VALIDATED on the dev-vm (2026-05-27).** Built `engram-uffd-handler`
+  with the chunk-native rewrite, relaunched mode=all coord with
+  `ENGRAM_FC_RESTORE_MODE=uffd` + `ENGRAM_FC_UFFD_HANDLER_BIN` + OTLP→Jaeger, and
+  restored the existing `demo:warm-3` base snapshot. End-to-end: `skipping
+  memory.bin materialization` → handler handshake (2 regions, 4 GiB) → `firecracker
+  microVM restored from snapshot mode=Uffd` → fault loop serves chunks on demand
+  (1→64) → session `active`, `kind:"restored"` → `exec` returns exit 0 (`Linux
+  5.10.223`, Debian 12.14). FC `resume vm` took **159 µs** (vs File mode's
+  multi-second eager read). Two non-bugs found en route: (a) the handler panicked
+  "no reactor running" because `engram_telemetry::init` (OTLP batch exporter spawns
+  a task) ran *before* the tokio runtime was built — fixed by moving init + the
+  listener inside `rt.block_on`; (b) a one-off `HostLost` that was just a stale
+  in-proc host entry after a ~9-min idle debugging gap (resolve_owner's
+  `entry_is_fresh` TTL), not a restore bug — reproduced green on a fresh coord with
+  an immediate create. Remaining before prod: packer deploy of the handler binary +
+  `/dev/userfaultfd` perms; prod measurement.
 - **2a.** ~~`runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
   targeted `MADV_WILLNEED`.~~ **Subsumed by Route B** — the chunk-native handler
   has no canonical mmap at all, so there is no `MAP_POPULATE` to drop. Lazy
