@@ -1,15 +1,53 @@
 # ADR 0020: Cold-boot via base-snapshot restore — 25 s → ~100 ms
 
-Status: 2026-05-27 — **Proposed.** ADR 0019 closed the measurement phase
-and ranked **H1 (restore-from-base)** as the lever. This ADR commits to the
-optimization: route every cold `POST /sessions` through the existing,
-prod-validated `restore()` path against a per-image base snapshot, then shave
-the ~1 s restore tail to ~100 ms. Phased P1–P5; each phase lands, is profiled
-on the dev-vm, deployed to prod, and **measured against the ADR 0019 trace
-spans before the next phase starts**. Flips to Accepted only after the final
-phase is prod-measured.
+Status: 2026-05-27 — **Blocked on ADR 0021 (FC block I/O via io_uring).**
+ADR 0019 closed the measurement phase and ranked **H1 (restore-from-base)**
+as the lever. This ADR commits to the optimization: route every cold
+`POST /sessions` through the existing, prod-validated `restore()` path
+against a per-image base snapshot, then shave the ~1 s restore tail to
+~100 ms. Phased P1–P5. **P1 is code-complete and green** (9 commits
+`85f7223`..`c481e3c`, `just check` 822 tests + dev-vm clippy), but end-to-end
+validation is **blocked**: the base-snapshot *capture* (and any FC boot on a
+slow-backed drive) can't complete its agentd handshake, root-caused to FC's
+Sync block io_engine starving the vsock device thread (see "Blocked on ADR
+0021" below). Resume once ADR 0021's Async-engine fix lands and the handshake
+works. Flips to Accepted only after the final phase is prod-measured.
 
 Phase: 1 (P1 = the lever). Commit chain recorded here as work lands.
+
+## Blocked on ADR 0021 (FC block I/O via io_uring)
+
+P1's code landed and is green, but the dev-vm e2e — enable an image (→
+`build_base_snapshot` capture) then create a session (→ restore) — cannot
+complete. **Root cause (kernel-stack-proven, 2026-05-27):** Firecracker runs
+*all* virtio devices (block, net, **vsock**) on a single device thread, and
+with the default **Sync block `io_engine`** that thread does blocking `read()`s.
+The capture VM's rootfs is `/dev/nbd0` (chunked-NBD), so each read goes
+kernel-NBD → the engram userspace daemon → chunk cache/blob (slow). Sampling
+the FC process mid-boot showed the device thread in **D-state** with stack
+`folio_wait_bit_common → filemap_read → blkdev_read_iter → vfs_read → read()`,
+syscall = `read` on fd → `/dev/nbd0`, 4 KiB. While blocked there it can't
+service the vsock queue → the guest agentd's `connect()` to the host ready
+port (1027) goes unanswered → **times out at 9 s** → `wait_agent_ready` fails.
+The whole boot is ~106 s for the same reason.
+
+Why prod survives: its rootfs reads are fast (warm NVMe; even cold it reads at
+16 MiB chunk granularity over GCS, ~84 ms × ~162, not 4 KiB × ~90k), so the
+device thread never blocks long enough to exceed the 9 s vsock timeout. So
+this is a **latent prod risk too** — ADR 0020's capture is always a cold boot,
+the most exposed case.
+
+The fix is **FC's Async (io_uring) block `io_engine`** on the NBD-backed drive,
+which keeps block I/O off the device thread so vsock is serviced promptly —
+specified in **ADR 0021**. ADR 0020's restore happy-path + latency measurement
+resume on prod once that lands. (Not a fix: bumping `/dev/nbd0` readahead to
+coalesce the 4 KiB reads — it only makes boot fast enough to *mask* the
+starvation; the architectural coupling remains. Fold readahead in later as a
+perf win, not as the fix.)
+
+What still remains in P1 after the unblock: **1d** per-fork identity reseed and
+**1e** per-snapshot restore serialization (both concurrency-only — they gate
+the prod push, not the first happy-path validation), then prod measurement.
 
 ## Context
 
