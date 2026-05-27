@@ -172,8 +172,15 @@ optimization phases, ordered by that data.
       `OTEL_EXPORTER_OTLP_ENDPOINT` defaulted through `just dev` (Tiltfile),
       `just integration-up` (dev-vm), and standalone `just trace-up`.
       OS-agnostic (bridge-mode ports work on macOS + Linux). `a0ce662`.
-- [ ] Drive a cold boot + a resume + a snapshot (FC integration harness on
-      the dev-vm, `test-firecracker`) with the endpoint set; capture traces.
+- [x] End-to-end pipeline proven (macOS, 2026-05-26): coordinator run with
+      `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`, a `POST /sessions`
+      emitted a `session.create` span (3.9ms) that landed in Jaeger and is
+      queryable via `/api/traces?service=engram-coordinator`. Confirms
+      engram-telemetry → OTLP/gRPC → Jaeger works.
+- [ ] Drive the *full* multi-process boot (coord + host-agent + FC) on the
+      dev-vm via `just integration-up` (jaeger + endpoint already wired) so
+      the cross-process `session.create → host.* → fc.* → uffd.run` trace
+      shows the actual phase breakdown; then the span→ms write-up.
 - [ ] Prod export (follow-up, deploy-repo `engrams-internal`): collector
       via Google Cloud Trace or a Tempo sidecar. Out of scope for this
       repo's PR.
