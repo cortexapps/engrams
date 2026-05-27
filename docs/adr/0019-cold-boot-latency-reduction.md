@@ -436,6 +436,28 @@ these OSS commits pushed/merged first), `otel.enabled: true` +
 ConfigMap from `deploy/otel/collector-gcp.yaml`, add the coord-GSA
 `cloudtrace.agent` binding, re-bake + tf-apply + helm-deploy.
 
+**Rollout incident + fix (2026-05-27, `2cb83dd`).** First prod deploy of the
+above took the coordinator down — every request 502'd, FC hosts couldn't
+register. Diagnosis (engrams-prod-ops): the coord *container* was healthy,
+but the otel sidecar CrashLoopBackOff'd (`exec /otelcol-contrib: no such
+file or directory`), leaving the pod `1/2`, so the Service dropped the coord
+from its backends. Two root causes:
+1. **Bad image** — otelcol-contrib `0.116.0` ships a dynamically-linked
+   binary on a distroless base missing the glibc loader. Pinned `0.111.0`
+   (verified it runs `--version` *and* `validate`s the config). Restored via
+   `helm rollback engrams 121`.
+2. **Readiness coupling** — a *regular* sidecar gates pod readiness, so a
+   crashing telemetry container took down the coord. Converted to a k8s
+   **native sidecar** (initContainer + `restartPolicy: Always`, no
+   readinessProbe) — runs for the pod's life but never gates coord
+   readiness. (GKE v1.35; native-sidecar GA since 1.29.)
+
+Lessons: (a) validate the collector image+config pre-deploy (the host
+`install-otelcol.sh` already runs `otelcol validate`; do the same for the
+sidecar image); (b) telemetry must never be able to fail the workload —
+native sidecar / `Before=` not `Requires=` on the host. The FC-host systemd
+collector was already decoupled (`Before=engram-host-agent.service`).
+
 (Lower-footprint alt for FC hosts: extend the existing GCP Ops Agent's OTLP
 receiver instead of a second binary — tidy on GCP but not provider-portable,
 so the dedicated `otelcol` stays the OSS primitive.)
