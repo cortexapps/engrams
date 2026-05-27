@@ -484,6 +484,7 @@ impl HostRegistry {
     /// Pick a host for `ctx`, then call `create` on that host's
     /// backend. Caller is responsible for `assign_session_host`. Used
     /// by `api::sessions::create_session` for session-aware scheduling.
+    #[tracing::instrument(name = "coord.create_for_session", skip_all)]
     pub async fn create_for_session(
         &self,
         ctx: &ScheduleContext<'_>,
@@ -500,6 +501,7 @@ impl HostRegistry {
     /// through to capacity-based pick. ADR 0007 Phase 6: takes a
     /// `SnapshotMetadata` directly (backends look up their own
     /// per-snapshot staging dir from the chunked manifest refs).
+    #[tracing::instrument(name = "coord.restore_for_session", skip_all)]
     pub async fn restore_for_session(
         &self,
         ctx: &ScheduleContext<'_>,

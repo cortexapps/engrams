@@ -434,6 +434,7 @@ pub enum FinishResumeOutcome {
 ///   `CreatedHarnessFailed`. `/exec` / `/shell` / `/prompt` will return
 ///   409 against this state until a follow-up `/resume` succeeds.
 /// - PG transition fails → returns `Err(ApiError)`.
+#[tracing::instrument(name = "coord.finish_resume_to_active", skip_all, fields(session_id = %session.id))]
 pub async fn finish_resume_to_active(
     state: &SharedState,
     session: &Session,
