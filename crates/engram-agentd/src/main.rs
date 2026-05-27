@@ -303,7 +303,10 @@ async fn run_transport(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match transport.dial(engram_agentd::ENGRAM_AGENTD_READY_PORT).await {
+        match transport
+            .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)
+            .await
+        {
             Ok(mut conn) => {
                 let ready = engram_agentd::AgentReady {
                     agent_version: agent_version.clone(),
