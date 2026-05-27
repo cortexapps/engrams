@@ -41,6 +41,7 @@ pub mod proxy_shell;
 pub mod resource;
 pub mod shutdown;
 pub mod snapshot;
+pub mod trace_scope;
 
 pub use config::HostAgentConfig;
 

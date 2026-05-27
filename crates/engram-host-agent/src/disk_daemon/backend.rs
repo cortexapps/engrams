@@ -202,6 +202,13 @@ pub struct ChunkedDiskBackend {
     /// to drain in-flight virtio writes after FC has paused. Reads
     /// participate too (cheap, and lets future barriers cover them).
     in_flight: Arc<InFlightTracker>,
+
+    /// ADR 0019: the lifecycle operation this sandbox's data plane is
+    /// currently serving (cold boot / resume / …), if any. When active,
+    /// `read_chunk` parents a `chunk.fetch` span on the operation so the
+    /// page-in shows up in that operation's trace. Default = inactive
+    /// (steady state → 0d metrics only).
+    operation_scope: crate::trace_scope::OperationScope,
 }
 
 /// ADR 0018 commit 12m — see `ChunkedDiskBackend::in_flight`.
@@ -312,6 +319,7 @@ impl ChunkedDiskBackend {
             threshold_notify: Arc::new(Notify::new()),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
+            operation_scope: crate::trace_scope::OperationScope::default(),
         })
     }
 
@@ -338,6 +346,7 @@ impl ChunkedDiskBackend {
             threshold_notify: Arc::new(Notify::new()),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
+            operation_scope: crate::trace_scope::OperationScope::default(),
         })
     }
 
@@ -624,7 +633,24 @@ impl ChunkedDiskBackend {
         drop(dirty_guard);
         for (chunk_idx, bytes) in drained {
             let size = bytes.len() as u64;
-            let hash = self.store.put_chunk(&bytes).await?;
+            // ADR 0019: under an active operation (snapshot for idle-evict /
+            // evacuate), span each dirty-chunk upload so the flush — the
+            // evac/evict critical-path cost — shows in the operation's trace.
+            let put = self.store.put_chunk(&bytes);
+            let hash = match self.operation_scope.current() {
+                Some(op) => {
+                    let span = op.span.in_scope(|| {
+                        tracing::info_span!(
+                            "chunk.flush",
+                            op = op.kind,
+                            chunk = chunk_idx,
+                            bytes = size,
+                        )
+                    });
+                    tracing::Instrument::instrument(put, span).await?
+                }
+                None => put.await?,
+            };
             new_chunks.push((chunk_idx, hash, size));
         }
 
@@ -801,10 +827,37 @@ impl ChunkedDiskBackend {
             .copied()
             .flatten();
         match hash {
-            Some(hash) => Ok(self.cache.get(hash, || self.store.get_chunk(hash)).await?),
+            // ADR 0019: when a lifecycle operation is active (e.g. cold
+            // boot), span this base-chunk fetch under it so the page-in
+            // shows in the operation's trace. Fast NVMe hits → short spans,
+            // GCS misses → long ones; inactive → no span (metrics only).
+            Some(hash) => {
+                let fut = self.cache.get(hash, || self.store.get_chunk(hash));
+                match self.operation_scope.current() {
+                    Some(op) => {
+                        let span = op.span.in_scope(|| {
+                            tracing::info_span!(
+                                "chunk.fetch",
+                                op = op.kind,
+                                chunk = chunk_idx,
+                                bytes = chunk_len,
+                            )
+                        });
+                        Ok(tracing::Instrument::instrument(fut, span).await?)
+                    }
+                    None => Ok(fut.await?),
+                }
+            }
             // Zero-filled hole — the manifest had no entry here.
             None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
         }
+    }
+
+    /// The operation scope for this sandbox's data plane (ADR 0019). The
+    /// host calls `begin`/`end` on it around lifecycle operations so
+    /// `read_chunk` page-ins attach to the operation's trace.
+    pub fn operation_scope(&self) -> &crate::trace_scope::OperationScope {
+        &self.operation_scope
     }
 
     // ensure_dirty was the pre-12m two-phase chunk materialization

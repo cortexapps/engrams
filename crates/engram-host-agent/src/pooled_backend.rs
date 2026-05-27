@@ -1406,6 +1406,11 @@ impl SandboxBackend for PooledBackend {
                     self.live_manifest_publisher.clone(),
                     self.flush_config.clone(),
                 );
+                // ADR 0019: open the cold-boot operation window. The guest's
+                // rootfs/substrate ext4-mount page-ins (served by this NBD
+                // backend) now attach `chunk.fetch` spans to the cold-boot
+                // trace until `start_agent` ends the window at agent_ready.
+                state.backend.operation_scope().begin("cold_boot");
                 self.nbd_sandboxes.insert(sandbox_id, state);
             }
             Ok(sandbox_id)
@@ -1500,11 +1505,16 @@ impl SandboxBackend for PooledBackend {
             // once any already-in-flight requests have completed
             // through backend.write().
             entry.backend.wait_idle().await;
-            let outcome = entry
-                .backend
-                .flush()
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd disk flush: {e}")))?;
+            // ADR 0019: scope the dirty-chunk flush — the idle-evict /
+            // evacuate critical-path cost — so each upload attaches a
+            // `chunk.flush` span to the snapshot op's trace. `kind="snapshot"`
+            // covers both flows; the coord parent trace distinguishes them.
+            // begin/end bracket only the flush so `end` runs on error too.
+            entry.backend.operation_scope().begin("snapshot");
+            let flush_result = entry.backend.flush().await;
+            entry.backend.operation_scope().end();
+            let outcome =
+                flush_result.map_err(|e| SandboxError::Snapshot(format!("nbd disk flush: {e}")))?;
             tracing::info!(
                 sandbox_id = %id,
                 manifest = %outcome.manifest_ref,
@@ -1858,6 +1868,13 @@ impl SandboxBackend for PooledBackend {
                 self.live_manifest_publisher.clone(),
                 self.flush_config.clone(),
             );
+            // ADR 0019: open the resume operation window — restore-time disk
+            // reads (load_snapshot + the resumed guest's working set) attach
+            // `chunk.fetch` spans to this trace. Covers idle→resume AND
+            // evac-dest; the coord parent trace distinguishes them. Closed by
+            // `start_agent` (finish_resume_to_active calls it). Memory page-in
+            // is the UFFD side, on the spawn-TRACEPARENT path.
+            state.backend.operation_scope().begin("resume");
             self.nbd_sandboxes.insert(new_id, state);
         }
         Ok(new_id)
@@ -1905,7 +1922,15 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
-        self.inner.start_agent(id, agent).await
+        let result = self.inner.start_agent(id, agent).await;
+        // ADR 0019: agent_ready has fired (or failed) — close the cold-boot
+        // operation window so steady-state session I/O falls back to
+        // metrics-only (no per-fetch spans for a running session).
+        #[cfg(target_os = "linux")]
+        if let Some(state) = self.nbd_sandboxes.get(&id) {
+            state.backend.operation_scope().end();
+        }
+        result
     }
 
     async fn swap_harness_drive(
