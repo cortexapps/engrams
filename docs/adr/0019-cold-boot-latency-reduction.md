@@ -27,10 +27,11 @@ Commit chain (Phase 0, on `main`, each compiles clean via
   `spawn_uffd_handler`; `TRACEPARENT` injected into the uffd-handler
   spawn and consumed as its `uffd.run` span parent. Verified clean by
   `cargo clippy --workspace --all-targets -- -D warnings` on the Linux dev-vm.
+- `3938109` — 0c: coord scheduling/resume spans (`create_for_session`,
+  `restore_for_session`, `finish_resume_to_active`).
 - _(pending)_ vsock traceparent hop to in-guest agentd; deeper 0c spans
-  (uffd `MAP_POPULATE`, agentd boot, coord `create_for_session`/
-  `restore_for_session`/`finish_resume_to_active`); 0d chunk-store/NBD
-  I/O spans; 0e dev-vm Jaeger collection + the span→ms write-up.
+  (uffd `MAP_POPULATE`, agentd boot); 0d chunk-store/NBD I/O spans;
+  0e dev-vm Jaeger collection + the span→ms write-up.
 
 ## Context
 
@@ -137,10 +138,9 @@ optimization phases, ordered by that data.
       0d covers the in-guest slice otherwise.
 
 ### 0c — Span the top-level operations
-- [~] coord: `session.create` root span on `create_session` done (the trace
-      root that seeds propagation). Still TODO: `create_for_session`/
-      `restore_for_session` (`host_registry.rs:~487,~503`),
-      `finish_resume_to_active` (`api/snapshot.rs:437`).
+- [x] coord: `session.create` root span on `create_session`, plus
+      `create_for_session`/`restore_for_session` (`host_registry.rs`) and
+      `finish_resume_to_active` (`api/snapshot.rs`, tagged session_id).
 - [~] host-agent: gRPC `create_sandbox`/`snapshot`/`restore`/`start_agent`
       handler spans done (incl. `start_agent` tagged `phase=agent_handshake`).
       Still TODO: `create_in_jail`,
