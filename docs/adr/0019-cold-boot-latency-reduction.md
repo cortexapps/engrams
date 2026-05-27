@@ -213,9 +213,57 @@ optimization phases, ordered by that data.
 - [ ] Kernel-level (dev-vm spike only): `blktrace`/`bpftrace` on the NVMe
       queue + `MAP_POPULATE` page-faults, under the `dev-vm` skill. Skip
       in prod (too heavy; user flagged not-worth-it if costly).
-- [ ] Kernel-level (dev-vm spike only): `blktrace`/`bpftrace` on the NVMe
-      queue + `MAP_POPULATE` page-faults, under the `dev-vm` skill. Skip
-      in prod (too heavy; user flagged not-worth-it if costly).
+
+## Operation-scoped data-plane tracing (`OperationScope`)
+
+The deep I/O that dominates these lifecycle operations (NBD chunk page-in,
+UFFD memory page-in, flush of dirty chunks) runs on **long-lived background
+tasks** (NBD `serve_loop`, the uffd-handler process, the flush scheduler)
+that outlive any single operation's call stack and serve a sandbox across
+its whole life. We want their spans in the *operation's* trace, but only
+during that operation's window — not flooding a running session's steady
+state.
+
+**Unifying observation:** cold boot, idle→resume, warm-launch, and
+evacuation are the same shape — a host-driven operation with a start/end.
+So the abstraction is one per-sandbox handle:
+
+```
+host op (cold_boot | resume | warm_launch | evacuate)
+  scope.begin(kind)  ─┐  opens an `op.<kind>` span, stored live in the scope
+   … in-process data-plane tasks read scope.current() and parent their
+     `chunk.fetch{tier,bytes,op}` spans on it (metrics-only when inactive)
+  scope.end()  ───────┘  on agent_ready / resumed / evac-done
+```
+
+- `OperationScope` = `Arc<ArcSwapOption<OpContext>>` (lock-free reads on the
+  NBD hot path). `OpContext { span, kind, verbosity }`. The `op.<kind>` span
+  is parented on the propagated session trace at `begin` and kept alive
+  across the operation's (possibly multi-RPC) window, so fetch spans nest
+  under it and land in the same trace.
+- **begin/end *is* the window** — no separate boolean flag; steady-state =
+  no active op = metrics-only (0d), so no flood.
+- **Two propagation primitives, reused:**
+  - *In-process* (NBD daemon, flush scheduler) → `OperationScope` (new).
+  - *Cross-process* (uffd-handler) → spawn-time `TRACEPARENT` (already built,
+    0b) — for resume the spawn is inside the operation, so UFFD spans attach
+    automatically.
+
+| operation | in-process (`OperationScope`) | cross-process (`TRACEPARENT`) |
+|---|---|---|
+| cold boot | NBD rootfs/substrate page-in | — |
+| idle→resume | NBD disk reads | UFFD memory page-in |
+| warm-launch (future) | NBD disk reads | UFFD memory page-in |
+| evacuate | flush (source) + NBD (dest) | UFFD (dest) |
+
+Verbosity is a field on `OpContext` (`gcs-misses-only` vs `all-fetches`),
+dialable per-operation or globally.
+
+Rollout:
+- [ ] Step 1: `OperationScope` + `chunk.fetch` span in the NBD `read` path
+      gated on it; wire cold-boot `begin/end` (the path we're profiling).
+- [ ] Step 2: thread `begin/end` through resume / snapshot / evacuate and
+      add flush-scheduler spans.
 
 ### 0e — Collect & write up
 - [x] Jaeger collector wired into the local dev stack (docker-compose
