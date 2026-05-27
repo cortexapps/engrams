@@ -259,11 +259,26 @@ host op (cold_boot | resume | warm_launch | evacuate)
 Verbosity is a field on `OpContext` (`gcs-misses-only` vs `all-fetches`),
 dialable per-operation or globally.
 
-Rollout:
-- [ ] Step 1: `OperationScope` + `chunk.fetch` span in the NBD `read` path
-      gated on it; wire cold-boot `begin/end` (the path we're profiling).
-- [ ] Step 2: thread `begin/end` through resume / snapshot / evacuate and
-      add flush-scheduler spans.
+**Host data-plane ops vs. user-facing flows.** The five lifecycle flows
+collapse to **three** host-side data-plane operations; the coord parent
+trace distinguishes the *why*:
+
+| host op (`kind`) | covers | data-plane span |
+|---|---|---|
+| `cold_boot` (create) | cold boot | `chunk.fetch` (rootfs/substrate page-in) |
+| `resume` (restore) | idle→resume **+** evac-dest / un-evac | `chunk.fetch` (restore disk reads) |
+| `snapshot` (snapshot) | resume→idle (idle evict) **+** evac-source | `chunk.flush` (dirty-chunk upload) |
+
+(Memory page-in on resume is the UFFD side, on the spawn-`TRACEPARENT` path.)
+
+Rollout (both in `2ed96be`, Linux-clippy-clean):
+- [x] Step 1: `OperationScope` (`trace_scope.rs`) + `chunk.fetch` span in the
+      NBD `read_chunk` path gated on it; cold-boot `begin` (`create`) / `end`
+      (`start_agent`).
+- [x] Step 2: `begin("resume")` (`restore`) reusing the `start_agent` end +
+      `chunk.fetch`; `begin("snapshot")`/`end` bracketing the flush in
+      `snapshot`, with a `chunk.flush` span per dirty-chunk upload. Covers
+      idle→resume, resume→idle, and evacuation/un-evacuation.
 
 ### 0e — Collect & write up
 - [x] Jaeger collector wired into the local dev stack (docker-compose
