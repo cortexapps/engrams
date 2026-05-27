@@ -274,12 +274,14 @@ async fn main() -> Result<(), HostAgentError> {
             // re-points the symlink at the session's real harness
             // ext4 at warm-lease.
             let stub_path = cli.work_dir.join(".stub-harness.ext4");
-            let stub_abs = ensure_stub_harness(&stub_path).await.map_err(|e| {
-                HostAgentError::Config(format!(
-                    "materialize stub harness at {}: {e}",
-                    stub_path.display()
-                ))
-            })?;
+            let stub_abs = engram_host_agent::ensure_stub_harness(&stub_path)
+                .await
+                .map_err(|e| {
+                    HostAgentError::Config(format!(
+                        "materialize stub harness at {}: {e}",
+                        stub_path.display()
+                    ))
+                })?;
             fc_cfg.stub_harness_path = Some(stub_abs);
             let fc = Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
@@ -460,30 +462,6 @@ async fn main() -> Result<(), HostAgentError> {
 /// receiver's harness symlinks resolve relative to their own parent
 /// directory (the bake's `/tmp/.tmpXXX/harness/`), so a relative
 /// `./var/...` target would dangle there.
-async fn ensure_stub_harness(path: &std::path::Path) -> Result<PathBuf, String> {
-    const STUB_SIZE_BYTES: u64 = 16 * 1024 * 1024;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir stub parent {}: {e}", parent.display()))?;
-    }
-    let needs_build = match tokio::fs::metadata(path).await {
-        Ok(meta) => meta.len() != STUB_SIZE_BYTES,
-        Err(_) => true,
-    };
-    if needs_build {
-        let scratch = tempfile::tempdir().map_err(|e| format!("stub tempdir: {e}"))?;
-        use engram_image_builder::{Ext4Packer, Mke2fsPacker};
-        Mke2fsPacker::default()
-            .pack(scratch.path(), path, STUB_SIZE_BYTES)
-            .await
-            .map_err(|e| format!("mke2fs stub harness: {e}"))?;
-    }
-    tokio::fs::canonicalize(path)
-        .await
-        .map_err(|e| format!("canonicalize stub harness {}: {e}", path.display()))
-}
-
 async fn build_host_egress(cli: &Cli) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {

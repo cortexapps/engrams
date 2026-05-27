@@ -45,6 +45,38 @@ pub mod trace_scope;
 
 pub use config::HostAgentConfig;
 
+/// ADR 0014 M1.12 / ADR 0020: materialize the host's 16 MiB empty ext4
+/// stub harness (idempotent — rebuilt only if missing or wrong-sized).
+/// Both the warm-pool restore path and ADR 0020's base-snapshot capture
+/// attach it as the harness drive; `swap_harness_drive` re-points it at
+/// the session's real harness at lease/restore time. Returned path is
+/// canonicalized so the FC drive symlink resolves. Lives in the lib so
+/// both the `engram-host-agent` (mode=host) and `engram-coordinator`
+/// (mode=all) binaries wire the same stub.
+pub async fn ensure_stub_harness(path: &std::path::Path) -> Result<PathBuf, String> {
+    const STUB_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("mkdir stub parent {}: {e}", parent.display()))?;
+    }
+    let needs_build = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len() != STUB_SIZE_BYTES,
+        Err(_) => true,
+    };
+    if needs_build {
+        let scratch = tempfile::tempdir().map_err(|e| format!("stub tempdir: {e}"))?;
+        use engram_image_builder::{Ext4Packer, Mke2fsPacker};
+        Mke2fsPacker::default()
+            .pack(scratch.path(), path, STUB_SIZE_BYTES)
+            .await
+            .map_err(|e| format!("mke2fs stub harness: {e}"))?;
+    }
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| format!("canonicalize stub harness {}: {e}", path.display()))
+}
+
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
     pub sandbox: Arc<dyn SandboxBackend>,

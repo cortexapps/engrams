@@ -383,6 +383,22 @@ async fn main() -> Result<(), CoordinatorError> {
                 // (`""` / `"none"` disables, anything else passes
                 // through verbatim).
                 fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
+                // ADR 0020: base-snapshot capture (build_base_snapshot)
+                // attaches a stub harness so the snapshot carries a
+                // harness drive slot for the per-session option-D swap.
+                // mode=all embeds the host, so wire the same stub the
+                // host-agent binary does.
+                let stub_path = cli.sandbox_work_dir.join(".stub-harness.ext4");
+                fc_cfg.stub_harness_path = Some(
+                    engram_host_agent::ensure_stub_harness(&stub_path)
+                        .await
+                        .map_err(|e| {
+                            CoordinatorError::Config(format!(
+                                "materialize stub harness at {}: {e}",
+                                stub_path.display()
+                            ))
+                        })?,
+                );
                 let fc = Arc::new(FirecrackerBackend::new(
                     cli.sandbox_work_dir.clone(),
                     fc_cfg,
