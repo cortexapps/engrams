@@ -1305,6 +1305,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.harness_dial()
     }
 
+    fn restore_memory_is_lazy(&self) -> bool {
+        self.inner.restore_memory_is_lazy()
+    }
+
     async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         // Phase 5+: resolve OCI image_uri / harness_pack_uri to local
         // cached paths before warm-pool key derivation. Both paths
@@ -1844,7 +1848,18 @@ impl SandboxBackend for PooledBackend {
             }
         }
 
-        if let Err(e) = self.materialize_memory_if_missing(&src).await {
+        // ADR 0020 Route B: when the backend serves memory lazily from
+        // chunks (UFFD), there is no memory.bin to rebuild — the handler
+        // faults chunks straight from the cache the prefetch above just
+        // warmed. Materializing the contiguous file would be pure
+        // overhead (the dominant restore cost we're removing). The
+        // prefetch still ran, so the cache is warm for the fault path.
+        if self.inner.restore_memory_is_lazy() {
+            tracing::debug!(
+                snapshot_id = %metadata.id,
+                "lazy memory restore (UFFD); skipping memory.bin materialization",
+            );
+        } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
             tracing::warn!(
                 error = %e,
                 src = %src.display(),

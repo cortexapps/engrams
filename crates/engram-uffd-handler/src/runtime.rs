@@ -2,36 +2,41 @@
 //! syscall and the upstream `userfaultfd` crate fails to compile on
 //! other targets.
 //!
-//! ADR 0007 chunked-memory shape (this revision):
+//! ADR 0020 Route B — chunk-native shape (this revision):
 //!
-//! - The handler mmaps the **canonical** memory snapshot (one file
-//!   per image, shared by every session of that image via the host
-//!   page cache) read-only with `MAP_PRIVATE | MAP_POPULATE`.
-//! - Per-fault, we consult a [`ChunkedMemoryBackend`] (see
-//!   [`crate::chunked`]) to decide whether the page serves from the
-//!   canonical mmap or from a session-divergent chunk.
-//! - On every fault we install a **full 512 KiB chunk** in one
-//!   `UFFDIO_COPY`, not just the faulting page. This amortises the
-//!   syscall + fault-handler cost across the chunk's 128 pages and
-//!   gets us cleanly under 100 ms for typical Python workloads
-//!   after the working-set trace warms.
+//! - There is **no `memory.bin` file and no canonical mmap.** Every
+//!   page fault is served from the chunk cache/store: we consult a
+//!   [`ChunkedMemoryBackend`] (see [`crate::chunked`]), `fetch_chunk`
+//!   the resolved hash, and `UFFDIO_COPY` it into the guest. Zero-
+//!   filled chunks install via `UFFDIO_ZEROPAGE` (no copy, kernel
+//!   shared zero page, COW on write).
+//! - On every fault we install a **full chunk** in one `UFFDIO_COPY`,
+//!   not just the faulting page. This amortises the syscall + fault-
+//!   handler cost across the chunk's pages and gets us cleanly under
+//!   100 ms for typical Python workloads after the working-set trace
+//!   warms.
 //! - On restore, if a [`WorkingSetTrace`] is supplied we prefault
 //!   every chunk in the trace (REAP-style) **before** vCPUs run.
-//! - As faults are served we record session-divergent chunk hashes
-//!   into a [`WorkingSetRecorder`] so the next restore on this host
-//!   can prefault them.
+//! - As faults are served we record observed chunk hashes into a
+//!   [`WorkingSetRecorder`] so the next restore on this host can
+//!   prefault them.
+//!
+//! Dropping the canonical mmap is what removes the `materialize`
+//! pass + the `MAP_POPULATE` eager read from the restore critical
+//! path (ADR 0020). Cross-session *guest-RAM* dedup is **not**
+//! provided by this revision (`UFFDIO_COPY` always installs a private
+//! page); the future packing milestone layers `UFFDIO_CONTINUE` over
+//! a shared per-image backing on top of this same resolution logic.
 //!
 //! `unsafe` blocks in this module are kernel-surface essentials
-//! (mmap, UFFDIO_COPY, fd ownership from SCM_RIGHTS, `Send`
-//! markers); each is annotated with a `// SAFETY:` comment.
+//! (UFFDIO_COPY / UFFDIO_ZEROPAGE, fd ownership from SCM_RIGHTS);
+//! each is annotated with a `// SAFETY:` comment.
 
 #![cfg(target_os = "linux")]
 
-use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::ptr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -199,17 +204,6 @@ fn locate_offset(
 pub struct Runtime {
     mappings: Vec<GuestRegionUffdMapping>,
     uffd: Uffd,
-    /// Read-only mmap of the canonical memory file. `MAP_PRIVATE`
-    /// means future writes (none in our path) would COW; in practice
-    /// the kernel shares the underlying page-cache pages across every
-    /// session of this image. `MAP_POPULATE` pre-faults the host
-    /// pages so we don't take our own page faults while servicing
-    /// the guest's.
-    canonical_ptr: *const u8,
-    canonical_size: usize,
-    /// Hold the canonical file open so the kernel doesn't drop our
-    /// mmap backing.
-    _canonical_file: File,
     backend: Arc<ChunkedMemoryBackend>,
     /// Tokio handle used by the (sync) fault loop to drive
     /// async chunk fetches via `Handle::block_on`. The fault loop
@@ -234,76 +228,27 @@ pub struct Runtime {
     trace_output: Option<PathBuf>,
 }
 
-// SAFETY: canonical_ptr is owned by this struct and only read; no
-// mutable aliasing or threading concerns. We never expose `&mut`
-// access to its bytes.
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
-
 impl Runtime {
-    /// Open `canonical_memory`, mmap it `PROT_READ | MAP_PRIVATE |
-    /// MAP_POPULATE`, then pair it with the chunked backend and the
-    /// UFFD the handshake gave us.
+    /// Pair the chunked backend with the UFFD the handshake gave us.
+    /// No `memory.bin` file is opened — every page is served from
+    /// chunks (ADR 0020 Route B).
     ///
     /// `recorder_window` controls how long the trace recorder stays
     /// open after construction. Pass `Duration::ZERO` to disable
     /// recording (useful for unit tests / one-shot replays).
     pub fn new(
-        canonical_memory: &Path,
         mappings: Vec<GuestRegionUffdMapping>,
         uffd: Uffd,
         backend: Arc<ChunkedMemoryBackend>,
         handle: TokioHandle,
         recorder_window: Duration,
     ) -> Result<Self, HandlerError> {
-        let file = File::open(canonical_memory).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("open canonical_memory {}: {e}", canonical_memory.display()),
-            )
-        })?;
-        let size = file.metadata()?.len() as usize;
-        if size as u64 != backend.total_bytes() {
-            return Err(HandlerError::MappingSizeMismatch {
-                mappings_total: size as u64,
-                manifest_total: backend.total_bytes(),
-            });
-        }
-
         let mappings_total: u64 = mappings.iter().map(|m| m.size as u64).sum();
         if mappings_total != backend.total_bytes() {
             return Err(HandlerError::MappingSizeMismatch {
                 mappings_total,
                 manifest_total: backend.total_bytes(),
             });
-        }
-
-        // SAFETY: file is a regular file we just opened, fd is valid,
-        // size matches its length. PROT_READ + MAP_PRIVATE means we
-        // can't accidentally write to the snapshot. MAP_POPULATE
-        // pre-faults the pages in our own address space so when we
-        // dereference `canonical_ptr` to fill a guest fault we don't
-        // block on a host-side page fault.
-        let raw = {
-            // ADR 0019: MAP_POPULATE synchronously faults the *entire*
-            // canonical memory file into our address space right here — a
-            // restore critical-path cost (H2: candidate to drop in favour of
-            // lazy fault + working-set prefetch). Span it so a restore trace
-            // shows the populate time distinct from the rest of restore.
-            let _span = tracing::info_span!("uffd.map_populate", bytes = size as u64).entered();
-            unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
-                    size,
-                    libc::PROT_READ,
-                    libc::MAP_PRIVATE | libc::MAP_POPULATE,
-                    file.as_raw_fd(),
-                    0,
-                )
-            }
-        };
-        if raw == libc::MAP_FAILED {
-            return Err(HandlerError::Io(std::io::Error::last_os_error()));
         }
 
         // `page_size` is whatever the registered region reported.
@@ -321,9 +266,6 @@ impl Runtime {
         Ok(Self {
             mappings,
             uffd,
-            canonical_ptr: raw as *const u8,
-            canonical_size: size,
-            _canonical_file: file,
             backend,
             handle,
             recorder,
@@ -465,16 +407,12 @@ impl Runtime {
         Ok(true)
     }
 
-    /// Install a canonical-resolved range: copy from our own
-    /// canonical mmap into the guest. Same semantics as
-    /// `install_chunk_at` but the source is `canonical_ptr +
-    /// canonical_offset` instead of a fetched `Bytes`.
-    fn install_canonical_at(
-        &self,
-        canonical_offset: u64,
-        byte_offset: u64,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
+    /// Install a zero-filled chunk: `UFFDIO_ZEROPAGE` over the
+    /// chunk-aligned range. Used for canonical chunks the manifest
+    /// omits (implicit zero pages). No copy — the kernel maps its
+    /// shared zero page, COW on the guest's first write. Same
+    /// idempotency + clamping discipline as `install_chunk_at`.
+    fn install_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
 
@@ -490,28 +428,16 @@ impl Runtime {
 
         let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
             .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
-
-        let canonical_end = canonical_offset + chunk_size;
-        let canonical_tail = if canonical_end > self.canonical_size as u64 {
-            self.canonical_size as u64 - canonical_offset
-        } else {
-            chunk_size
-        };
-        let install_len = std::cmp::min(canonical_tail, room_to_eom) as usize;
+        let install_len = std::cmp::min(chunk_size, room_to_eom) as usize;
         debug_assert!(install_len.is_multiple_of(self.page_size as usize));
-        debug_assert!(canonical_offset as usize + install_len <= self.canonical_size);
 
-        // SAFETY: `canonical_ptr + canonical_offset` is inside our
-        // mmap (bounds checked above). `host_va` is the guest range
-        // we have UFFD write access to.
+        // SAFETY: `host_va` is a guest-visible address in a UFFD-
+        // registered region we hold copy/zeropage access to. ZEROPAGE
+        // installs zero pages over the range + wakes blocked vCPUs
+        // atomically per page when `wake`.
         unsafe {
-            let src = self.canonical_ptr.add(canonical_offset as usize);
-            self.uffd.copy(
-                src as *const _,
-                host_va as *mut std::ffi::c_void,
-                install_len,
-                wake,
-            )?;
+            self.uffd
+                .zeropage(host_va as *mut std::ffi::c_void, install_len, wake)?;
         }
         Ok(true)
     }
@@ -577,24 +503,38 @@ impl Runtime {
             .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?
         {
             ResolvedPage::Canonical { canonical_offset } => {
-                // ADR 0014 M1.14: also record the canonical chunk
-                // hash. Without this, a fully-canonical snapshot
-                // (bake time, pre-divergence) produces an empty
-                // working-set trace and the warm-pool refill prefetch
-                // can't narrow at all.
-                if let Some(hash) = self.backend.canonical_chunk_hash(canonical_offset) {
-                    let mut r = self.recorder.lock().expect("recorder poisoned");
-                    if r.is_open() {
-                        r.observe(hash);
+                // Route B: "canonical" no longer means "in the mmap" —
+                // it means "fetch the canonical chunk hash from the
+                // store", or, when the manifest omits this offset, a
+                // zero-filled chunk we install via UFFDIO_ZEROPAGE.
+                match self.backend.canonical_chunk_hash(canonical_offset) {
+                    Some(hash) => {
+                        // ADR 0014 M1.14: record the canonical chunk
+                        // hash. Without this, a fully-canonical snapshot
+                        // (base snapshot, pre-divergence) produces an
+                        // empty working-set trace and the next restore's
+                        // prefetch can't narrow at all.
+                        {
+                            let mut r = self.recorder.lock().expect("recorder poisoned");
+                            if r.is_open() {
+                                r.observe(hash);
+                            }
+                        }
+                        let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                        let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
+                        if !installed {
+                            // Already installed: wake the vCPU since the
+                            // kernel may have queued the fault before our
+                            // earlier prefault landed.
+                            self.wake_page(page_aligned, page_size)?;
+                        }
                     }
-                }
-                let installed =
-                    self.install_canonical_at(canonical_offset, chunk_byte_offset, true)?;
-                if !installed {
-                    // Already installed: wake the vCPU since the
-                    // kernel may have queued the fault before our
-                    // earlier prefault landed.
-                    self.wake_page(page_aligned, page_size)?;
+                    None => {
+                        let installed = self.install_zero_at(chunk_byte_offset, true)?;
+                        if !installed {
+                            self.wake_page(page_aligned, page_size)?;
+                        }
+                    }
                 }
             }
             ResolvedPage::Chunk { hash } => {
@@ -647,17 +587,6 @@ impl Runtime {
     }
 }
 
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        // SAFETY: canonical_ptr was returned by libc::mmap on
-        // creation and we hold the only reference to it; munmap
-        // with the same size is the matching cleanup.
-        unsafe {
-            libc::munmap(self.canonical_ptr as *mut _, self.canonical_size);
-        }
-    }
-}
-
 /// One-shot run: bind the listener, accept Firecracker, handshake,
 /// optionally pre-fault from a trace, then loop until the UFFD
 /// closes. On clean exit, returns the recorded working-set trace
@@ -670,7 +599,6 @@ impl Drop for Runtime {
 /// open and treats our close as a protocol error).
 pub fn run_listener(
     listen: PathBuf,
-    canonical_memory: PathBuf,
     backend: Arc<ChunkedMemoryBackend>,
     handle: TokioHandle,
     prefault_trace: Option<WorkingSetTrace>,
@@ -694,14 +622,7 @@ pub fn run_listener(
         total_bytes = total,
         "handshake complete",
     );
-    let mut rt = Runtime::new(
-        &canonical_memory,
-        mappings,
-        uffd,
-        backend,
-        handle,
-        recorder_window,
-    )?;
+    let mut rt = Runtime::new(mappings, uffd, backend, handle, recorder_window)?;
     if let Some(path) = trace_output {
         rt.set_trace_output(path);
     }

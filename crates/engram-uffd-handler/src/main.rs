@@ -1,16 +1,15 @@
 //! `engram-uffd-handler` — page-fault handler binary.
 //!
-//! ADR 0007 chunked-memory shape. Per restore, FC connects to the
-//! handler's UDS, hands over the userfaultfd + JSON mappings, and
-//! the handler serves faults by resolving each fault offset against
-//! a [`ChunkedMemoryBackend`]: pages identical to the canonical
-//! base mmap serve from page cache; session-divergent pages fetch
-//! the relevant chunk from the chunk store.
+//! ADR 0020 Route B chunk-native shape. Per restore, FC connects to
+//! the handler's UDS, hands over the userfaultfd + JSON mappings, and
+//! the handler serves every fault by resolving its offset against a
+//! [`ChunkedMemoryBackend`] and `UFFDIO_COPY`-ing the resolved chunk
+//! from the chunk cache/store (zero-filled chunks via
+//! `UFFDIO_ZEROPAGE`). There is no `memory.bin` file.
 //!
 //! ```text
 //! engram-uffd-handler \
 //!   --listen /tmp/uffd.sock \
-//!   --canonical-memory /var/lib/engram/canonical/<image-id>.bin \
 //!   --canonical-manifest <uuid>@v<n> \
 //!   --session-manifest   <uuid>@v<n> \
 //!   [--prefault-trace canonical|<host-uuid>] \
@@ -121,7 +120,6 @@ mod linux {
 
     pub struct Args {
         pub listen: PathBuf,
-        pub canonical_memory: PathBuf,
         pub canonical_manifest: ManifestRef,
         pub session_manifest: ManifestRef,
         pub prefault_trace: Option<PrefaultTraceSpec>,
@@ -153,7 +151,6 @@ mod linux {
 
     pub fn parse_args() -> Result<Args, String> {
         let mut listen: Option<PathBuf> = None;
-        let mut canonical_memory: Option<PathBuf> = None;
         let mut canonical_manifest: Option<ManifestRef> = None;
         let mut session_manifest: Option<ManifestRef> = None;
         let mut prefault_trace: Option<PrefaultTraceSpec> = None;
@@ -172,12 +169,6 @@ mod linux {
                         argv.next()
                             .ok_or_else(|| "--listen requires a value".to_string())?,
                     ));
-                }
-                "--canonical-memory" => {
-                    canonical_memory =
-                        Some(PathBuf::from(argv.next().ok_or_else(|| {
-                            "--canonical-memory requires a value".to_string()
-                        })?));
                 }
                 "--canonical-manifest" => {
                     let v = argv
@@ -249,8 +240,6 @@ mod linux {
         }
 
         let listen = listen.ok_or_else(|| "--listen <sock> is required".to_string())?;
-        let canonical_memory =
-            canonical_memory.ok_or_else(|| "--canonical-memory <path> is required".to_string())?;
         let canonical_manifest = canonical_manifest
             .ok_or_else(|| "--canonical-manifest <uuid>@v<n> is required".to_string())?;
         let session_manifest = session_manifest
@@ -259,7 +248,6 @@ mod linux {
 
         Ok(Args {
             listen,
-            canonical_memory,
             canonical_manifest,
             session_manifest,
             prefault_trace,
@@ -363,13 +351,12 @@ mod linux {
         let result = tokio::task::spawn_blocking({
             let handle = handle.clone();
             let listen = args.listen.clone();
-            let canonical = args.canonical_memory.clone();
             let backend = backend.clone();
             let window = args.recorder_window;
             let trace_out = args.trace_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
-                    listen, canonical, backend, handle, prefault, window, trace_out,
+                    listen, backend, handle, prefault, window, trace_out,
                 )
             }
         })
@@ -492,7 +479,6 @@ mod linux {
 
     const HELP: &str = "engram-uffd-handler \\
   --listen <sock> \\
-  --canonical-memory <path> \\
   --canonical-manifest <uuid>@v<num> \\
   --session-manifest <uuid>@v<num> \\
   [--prefault-trace canonical|<host-uuid>] \\
@@ -501,11 +487,11 @@ mod linux {
   [--cache-budget-bytes <bytes>] \\
   [--recorder-window-ms <ms>]
 
-UFFD page-fault handler. Firecracker connects to <sock>, hands over
-the guest's UFFD, and the handler serves faults by resolving each
-offset against a chunked memory manifest. Pages identical to the
-canonical mmap serve from page cache; session-divergent pages fetch
-the chunk from the chunk store.
+UFFD page-fault handler (ADR 0020 Route B). Firecracker connects to
+<sock>, hands over the guest's UFFD, and the handler serves every
+fault by resolving its offset against a chunked memory manifest and
+copying the resolved chunk from the chunk cache/store (zero-filled
+chunks via UFFDIO_ZEROPAGE). No memory.bin file is read.
 
 ENGRAM_BLOB_BACKEND={local,gcs} (default local) picks the chunk
 store's blob backend. ENGRAM_GCS_BUCKET is required when gcs.";

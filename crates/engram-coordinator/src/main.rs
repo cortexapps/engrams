@@ -383,6 +383,22 @@ async fn main() -> Result<(), CoordinatorError> {
                 // (`""` / `"none"` disables, anything else passes
                 // through verbatim).
                 fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
+                // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips
+                // restore to the chunk-native UFFD handler (lazy memory,
+                // no memory.bin materialize). Defaults to File.
+                fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
+                // Point the UFFD handler at the SAME chunk cache the
+                // PooledBackend restore-prefetch warms (`local_path/
+                // chunk-cache`, wired below) so on-fault `cache.get`
+                // hits prefetched chunks. Cross-process dir sharing is
+                // safe (content-addressed, on-disk + hash-verified get).
+                fc_cfg.uffd_cache_root = Some(cli.local_path.join("chunk-cache"));
+                // Prod bakes `engram-uffd-handler` to /usr/local/bin (on
+                // PATH, the default). Dev/test override the path via
+                // ENGRAM_FC_UFFD_HANDLER_BIN (e.g. target/debug/...).
+                if let Ok(p) = std::env::var("ENGRAM_FC_UFFD_HANDLER_BIN") {
+                    fc_cfg.uffd_handler_bin = p.into();
+                }
                 // ADR 0020: base-snapshot capture (build_base_snapshot)
                 // attaches a stub harness so the snapshot carries a
                 // harness drive slot for the per-session option-D swap.

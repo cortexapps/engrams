@@ -305,6 +305,23 @@ pub fn cpu_template_from_env() -> Option<String> {
     }
 }
 
+/// ADR 0020 Route B: pick the restore memory backend from
+/// `ENGRAM_FC_RESTORE_MODE` (`uffd` | `file`). Defaults to `file`
+/// (the historical behaviour) when unset or unrecognised, so flipping
+/// to UFFD in production is an explicit, reversible env toggle. `uffd`
+/// requires `engram-uffd-handler` on PATH (or `uffd_handler_bin` set)
+/// and `/dev/userfaultfd` accessible to the host-agent.
+pub fn restore_mode_from_env() -> RestoreMode {
+    match std::env::var("ENGRAM_FC_RESTORE_MODE") {
+        Ok(s) if s.eq_ignore_ascii_case("uffd") => RestoreMode::Uffd,
+        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("file") => {
+            tracing::warn!(value = %s, "unrecognised ENGRAM_FC_RESTORE_MODE; defaulting to file");
+            RestoreMode::File
+        }
+        _ => RestoreMode::File,
+    }
+}
+
 /// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
 /// Distinct from `SandboxError` so the live-attach driver can
 /// distinguish "FC truly gone, fall through to path 2" from "operator
@@ -1055,7 +1072,6 @@ impl FirecrackerBackend {
     async fn spawn_uffd_handler(
         &self,
         uffd_uds: &Path,
-        canonical_memory: &Path,
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
         prefault_trace_host: Option<uuid::Uuid>,
@@ -1083,8 +1099,6 @@ impl FirecrackerBackend {
         let mut cmd = Command::new(&self.config.uffd_handler_bin);
         cmd.arg("--listen")
             .arg(uffd_uds)
-            .arg("--canonical-memory")
-            .arg(canonical_memory)
             .arg("--canonical-manifest")
             .arg(canonical_ref.to_string())
             .arg("--session-manifest")
@@ -1719,9 +1733,11 @@ impl FirecrackerBackend {
 
         // For UFFD restore, spawn the handler BEFORE PUT /snapshot/load
         // so it's listening when Firecracker connects. The handler
-        // takes ownership of the kernel UFFD via SCM_RIGHTS, mmaps
-        // memory.bin, and pages it in lazily. Either way the VM is
-        // running by the time `load_snapshot*` returns (resume_vm: true).
+        // takes ownership of the kernel UFFD via SCM_RIGHTS and serves
+        // every fault from the chunk cache/store (ADR 0020 Route B —
+        // no memory.bin, hence `materialize_memory_if_missing` is
+        // skipped upstream for Uffd). Either way the VM is running by
+        // the time `load_snapshot*` returns (resume_vm: true).
         let load_result: Result<Option<Child>, SandboxError> = match self.config.restore_mode {
             RestoreMode::File => api
                 .load_snapshot(&SnapshotPaths {
@@ -1758,9 +1774,10 @@ impl FirecrackerBackend {
                 };
                 // ADR 0015 M5: bake-time canonical capture was retired,
                 // so canonical_ref == session_ref unconditionally. The
-                // UFFD resolver returns `Canonical` for every fault and
-                // the local memory.bin mmap serves bytes; no chunk-store
-                // I/O on the restore-fault path.
+                // resolver returns `Canonical` for every fault; Route B
+                // serves those by fetching the canonical chunk hash
+                // from the chunk store (or UFFDIO_ZEROPAGE for omitted
+                // zero chunks) — no memory.bin.
                 let canonical_ref = session_ref;
                 let uffd_uds = jail_dir.join("uffd.sock");
                 let _ = tokio::fs::remove_file(&uffd_uds).await;
@@ -1777,7 +1794,6 @@ impl FirecrackerBackend {
                 match self
                     .spawn_uffd_handler(
                         &uffd_uds,
-                        &mem_path,
                         canonical_ref,
                         session_ref,
                         prefault_host,
@@ -3136,6 +3152,12 @@ impl SandboxBackend for FirecrackerBackend {
     /// `FirecrackerConfig.stub_harness_path` (`ENGRAM_STUB_HARNESS_PATH`).
     fn stub_harness_path(&self) -> Option<std::path::PathBuf> {
         self.config.stub_harness_path.clone()
+    }
+
+    fn restore_memory_is_lazy(&self) -> bool {
+        // ADR 0020 Route B: Uffd serves memory from chunks on fault,
+        // so no materialized memory.bin is needed on restore.
+        matches!(self.config.restore_mode, RestoreMode::Uffd)
     }
 
     /// ADR 0020 P1: block until agentd dials its ready port. Extracted

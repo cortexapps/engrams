@@ -266,6 +266,23 @@ async fn main() -> Result<(), HostAgentError> {
             // env var overrides (`""` / `"none"` for passthrough, any
             // other value for a custom template name).
             fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
+            // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips restore
+            // to the chunk-native UFFD handler (lazy memory, no memory.bin
+            // materialize). Defaults to File.
+            fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
+            // Point the UFFD handler at the SAME chunk cache the
+            // PooledBackend's restore-prefetch warms (`chunk-cache`,
+            // see below) — not the FC backend's separate default — so
+            // the handler's on-fault `cache.get` hits the chunks the
+            // prefetch already pulled local. ChunkCache.get's fast path
+            // is on-disk + hash-verified, so cross-process sharing of
+            // the dir is safe (content-addressed, idempotent writes).
+            fc_cfg.uffd_cache_root = Some(cli.work_dir.join("chunk-cache"));
+            // Prod bakes `engram-uffd-handler` to /usr/local/bin (on PATH,
+            // the default). Dev/test override via ENGRAM_FC_UFFD_HANDLER_BIN.
+            if let Ok(p) = std::env::var("ENGRAM_FC_UFFD_HANDLER_BIN") {
+                fc_cfg.uffd_handler_bin = p.into();
+            }
             // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
             // ext4 stub harness that warm-pool restore points the
             // harness symlink at. Content-identical to the one the

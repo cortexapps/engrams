@@ -243,6 +243,17 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0020 Route B: whether `restore` serves guest memory lazily
+    /// (UFFD, chunk-native) rather than from a materialized
+    /// `memory.bin`. When `true`, the wrapping `PooledBackend` skips
+    /// `materialize_memory_if_missing` on restore — the handler faults
+    /// chunks straight from the (prefetched) chunk cache, so rebuilding
+    /// the contiguous file would be pure overhead. Default `false`
+    /// (File mode: memory.bin is required before `load_snapshot`).
+    fn restore_memory_is_lazy(&self) -> bool {
+        false
+    }
+
     /// ADR 0020 P1: boot `spec` to agentd-ready with the stub harness
     /// attached (harness unmounted — the option-D capture point), take
     /// a portable FC snapshot (chunked memory + uploaded state/sidecar),
