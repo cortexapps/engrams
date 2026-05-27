@@ -132,38 +132,6 @@ pub struct SnapshotRecord {
     pub recoverable: bool,
 }
 
-/// ADR 0020 P1: the `canonical_snapshot` block in a bake's
-/// `bundle.json` (schema v3). The image-builder emits it after the
-/// bake-time FC capture; the coord's enable-image cascade
-/// (`POST /api/enabled-images`) parses it and, when present, inserts
-/// a `snapshots` row (session_id = NULL, recoverable = true) plus a
-/// `base_snapshots` row so the create path can restore from it.
-///
-/// The portable blob keys (state.bin / sidecar.json / working_set.json)
-/// are deterministic from `snapshot_id` (`snapshots/<id>/...`), so they
-/// are not carried here — the restore path recomputes them. The disk
-/// manifest is the bake's existing `disk_manifest` (already on the
-/// bundle); only the chunked-memory manifest produced by the capture is
-/// new, alongside the resource hints the scheduler needs.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CanonicalSnapshot {
-    pub snapshot_id: SnapshotId,
-    /// Chunked-memory manifest the bake-time capture produced from
-    /// `memory.bin`. Restore materializes it from BlobStorage.
-    pub memory_manifest: super::manifest::ManifestRef,
-    /// Total on-disk size of the captured artifacts (state.bin +
-    /// memory.bin + sidecar.json) — recorded on the `snapshots` row.
-    pub size_bytes: u64,
-    pub vcpus: u32,
-    pub memory_mib: u32,
-    /// True once the bake's synthetic profiling pass (ADR 0020 P2 /
-    /// ADR 0014 M1.14) has published a working-set trace at
-    /// `snapshots/<id>/working_set.json`. P1 leaves this false; the
-    /// restore path only points UFFD prefetch at the trace when set.
-    #[serde(default)]
-    pub working_set_available: bool,
-}
-
 /// ADR 0020 P1: a base snapshot row — maps an enabled image's
 /// `manifest_digest` to the bake-time snapshot the create path restores
 /// from. Built by the enable-image cascade from a bundle's

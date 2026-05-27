@@ -89,33 +89,64 @@ the prefetch, working-set, netns, and UFFD logic. Then close the ~1 s → ~100 m
 tail with lazy memory + bake-time prefetch trace, restore-setup parallelism,
 and a network-slot pool. Phases land and are measured one at a time.
 
+## CPU-family portability — capture on a prod host, pin T2CL
+
+Firecracker memory snapshots embed the capture host's CPUID/MSR state. Built-in
+FC CPU templates are **vendor-pinned** (`T2CL`/`T2`/`T2S`/`C3` Intel-only, `T2A`
+AMD-only); none bridge AMD↔Intel. Our CI bake runs on Blacksmith's **AMD** pool;
+prod FC hosts are **Intel Cascade Lake** (`n2-standard-8`, `min_cpu_platform =
+Intel Cascade Lake`). An AMD-baked snapshot restored on Intel already broke prod
+once (2026-05-21: glibc ifunc picked AMD-only AVX-512 → every `fork+exec`
+segfaulted at `RIP=0`). This is exactly why ADR 0015 M5 dropped snapshots from
+the bake artifact — and why ADR 0020, which reintroduces them, must solve it.
+
+**Decision: capture the base snapshot on a prod host, not in the CI bake.** The
+image-builder stays CPU-agnostic (docker build → ext4 → chunk). The FC capture
+runs on a real prod Intel host with `ENGRAM_FC_CPU_TEMPLATE=T2CL` set
+(`cpu_template_from_env`, already plumbed into `FirecrackerConfig`). Capturing on
+an Intel host is what lets us *use* `T2CL` at all (it failed on AMD), and T2CL
+masks to the Cascade-Lake baseline so the snapshot restores cleanly on every
+Intel-CL-or-newer host — `min_cpu_platform` is a floor, not a ceiling, so GCE may
+place a session on newer silicon; the template makes that irrelevant.
+
+**Enable is transactional over the capture (no partial state).** An image is not
+enabled unless its base snapshot was captured and recorded. The capture (a host
+RPC, ~15–30 s) runs *outside* any DB transaction; on success the coord opens one
+short PG transaction writing the `snapshots` + `base_snapshots` + `enabled_images`
+rows atomically. Capture failure ⇒ zero rows ⇒ image stays un-enabled, surfaced
+to the operator. This removes the "enabled but unsnapshottable" state entirely,
+so the create path can treat a base-snapshot hit as the norm (cold create stays
+as a defensive fallback for legacy / pre-0020 rows).
+
 ## Phase 1 — Route cold create through base-snapshot restore [15 s → ~1 s]
 
 The single highest-leverage step: it removes the kernel boot, both ext4 mounts,
 and 100 % of the 13.6 s serial page-in in one move.
 
-- **1a. Bake-time base snapshot per image** (`crates/engram-image-builder/`).
-  Port the canonical-capture flow from `patch_drive_swap.rs` into the builder:
-  boot the baked rootfs under FC with the **stub harness** attached (option-D
-  capture point — bootstrap on `accept()`, harness *unmounted*) → pause →
-  full FC snapshot (`SnapshotType::Full`, the only mode wired in `client.rs`)
-  → chunk `memory.bin` into the chunk store → upload `state.bin` + sidecar JSON
-  to `snapshots/<id>/{state.bin,sidecar.json}` → emit a `canonical_snapshot`
-  block in `bundle.json`. The bake **must** use the canonical `<work_dir>`
-  (`/var/lib/engram/sandboxes`) so the `state.bin`-embedded vsock/rootfs paths
-  match what `restore_canonical_symlinks` recreates on the receiver; fail-fast
-  at capture on non-conformant paths.
-- **1b. `base_snapshots` table + enable cascade.** New migration
+- **1a. Host-side base-snapshot capture** (`crates/engram-host-agent/`,
+  `crates/engram-sandbox-firecracker/`). A new host operation
+  `build_base_snapshot(image_uri, manifest_digest, vcpus, memory_mib)` composes
+  the existing `create` + `snapshot` machinery: materialize the rootfs (NBD from
+  the chunk store), boot a microVM under FC with the **stub harness** attached
+  and `cpu_template = T2CL` (option-D capture point — bootstrap on `accept()`,
+  harness *unmounted*) → pause → full FC snapshot (`SnapshotType::Full`) → chunk
+  `memory.bin` into the chunk store → upload `state.bin` + sidecar JSON to
+  `snapshots/<id>/{state.bin,sidecar.json}` → destroy the capture VM → return the
+  `SnapshotMetadata`. Reuses `FirecrackerBackend::snapshot` + `PooledBackend`'s
+  chunk/upload path; the only net-new is the create→pause→snapshot→destroy
+  orchestration with no session attached. Exposed coord→host over gRPC.
+- **1b. `base_snapshots` table + transactional enable.** Migration
   `deploy/migrations/0031_base_snapshots.sql`:
   `base_snapshots(manifest_digest TEXT PK, snapshot_id UUID → snapshots(id),
   image_repo, image_tag, vcpus, memory_mib, created_at)`. In
-  `crates/engram-coordinator/src/api/enabled_images.rs`: when the bundle carries
-  `canonical_snapshot`, insert a `snapshots` row (`session_id=NULL`, supported
-  since `0028`; `recoverable=true`) + a `base_snapshots` row in one PG
-  transaction. Idempotent on re-enable. This is ADR 0014's M1.11 cascade
-  retargeted from the dropped `templates` table to `base_snapshots`. Memory
-  chunks are already in BlobStorage from the bake, so first session is a GCS
-  pull (intra-VPC), not an OCI pull.
+  `crates/engram-coordinator/src/api/enabled_images.rs`: `enable_image` (and
+  `refresh_enabled_image`) pull/validate the manifest + materialize disk chunks
+  (existing), then call `build_base_snapshot` on a host **and block**; on success,
+  in one PG transaction, record the `snapshots` row (`session_id=NULL`, nullable
+  since `0028`; `recoverable=true` after HEAD-verify) + the `base_snapshots` row +
+  the `enabled_images` row. Capture failure aborts the whole enable. Memory chunks
+  are in BlobStorage from the capture, so first session is a GCS pull (intra-VPC),
+  not an OCI pull.
 - **1c. Branch the create path into restore** (`api/sessions.rs`,
   `create_session_inner` ~626–674). Look up `base_snapshots` by
   `enabled.manifest_digest`. On hit: build a `SnapshotMetadata` like
