@@ -186,6 +186,10 @@ message RestoreBaseForSessionRequest {
   // Absent for no-harness sessions (the stub harness stays attached).
   optional string harness_pack_uri = 2;
   optional string harness_name = 3;
+  // ADR 0020: per-session env (manifest env + resolved secrets +
+  // ENGRAM_SESSION_*) merged into the restored sandbox — the shared base
+  // snapshot can't carry per-session values.
+  map<string, string> session_env = 4;
 }
 
 // --- GuestIp ---

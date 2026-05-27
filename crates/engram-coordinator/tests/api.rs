@@ -40,6 +40,10 @@ use tower::ServiceExt;
 struct MockMetadataStore {
     sessions: Mutex<HashMap<SessionId, Session>>,
     snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
+    /// ADR 0020: snapshots keyed by id, for `get_snapshot` — covers both
+    /// session captures and template/base snapshots (session_id = None),
+    /// which the per-session `snapshots` map can't hold.
+    snapshots_by_id: Mutex<HashMap<engram_core::types::SnapshotId, SnapshotRecord>>,
     enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_event_idx: Mutex<HashMap<SessionId, i64>>,
@@ -255,12 +259,20 @@ impl MetadataStore for MockMetadataStore {
     }
 
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
-        // Template snapshots (session_id=None) skip the per-session
-        // mock; the real PG store keys by snapshot_id directly.
+        // Keyed-by-id mirror covers template snapshots (session_id=None)
+        // that the per-session map can't hold; `get_snapshot` reads it.
+        self.snapshots_by_id.lock().insert(snap.id, snap.clone());
         if let Some(sid) = snap.session_id {
             self.snapshots.lock().entry(sid).or_default().push(snap);
         }
         Ok(())
+    }
+
+    async fn get_snapshot(
+        &self,
+        id: engram_core::types::SnapshotId,
+    ) -> Result<Option<SnapshotRecord>, MetaError> {
+        Ok(self.snapshots_by_id.lock().get(&id).cloned())
     }
 
     async fn list_snapshots_for_session(
@@ -576,6 +588,27 @@ fn seed_enabled(
     uri.hash(&mut h);
     let digest = format!("sha256:{:08x}", h.finish());
     let now = chrono::Utc::now();
+    // ADR 0020: every enabled image has a base snapshot. Seed a template
+    // snapshot (session_id = None) and point the row at it, so the
+    // create→restore path resolves it via `get_snapshot`. ProcessBackend
+    // restore of a base snapshot with no captured artifact boots a fresh
+    // sandbox (see ProcessBackend::restore).
+    let base_snapshot_id = engram_core::types::SnapshotId::new();
+    store.snapshots_by_id.lock().insert(
+        base_snapshot_id,
+        SnapshotRecord {
+            id: base_snapshot_id,
+            session_id: None,
+            host_id: None,
+            image_version: uri.to_string(),
+            size_bytes: 0,
+            created_at: now,
+            last_accessed_at: now,
+            disk_manifest: None,
+            memory_manifest: None,
+            recoverable: true,
+        },
+    );
     store.enabled.lock().insert(
         uri.to_string(),
         engram_core::types::EnabledImage {
@@ -584,8 +617,7 @@ fn seed_enabled(
             manifest_toml: manifest_toml.to_string(),
             manifest_digest: digest.clone(),
             disk_manifest: None,
-            // In-memory mock store; no FK, so a placeholder id is fine.
-            base_snapshot_id: Some(engram_core::types::SnapshotId::new()),
+            base_snapshot_id: Some(base_snapshot_id),
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,

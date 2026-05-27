@@ -108,6 +108,7 @@ pub trait HostClient: Send + Sync {
         _metadata: SnapshotMetadata,
         _harness_pack_uri: Option<String>,
         _harness_name: Option<String>,
+        _session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `restore_base_for_session`".into(),

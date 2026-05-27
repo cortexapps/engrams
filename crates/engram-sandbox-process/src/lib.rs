@@ -122,6 +122,20 @@ impl SandboxBackend for ProcessBackend {
         Ok(id)
     }
 
+    async fn merge_session_env(
+        &self,
+        id: SandboxId,
+        env: HashMap<String, String>,
+    ) -> Result<(), SandboxError> {
+        // ADR 0020: a restored base snapshot's spec carries only the
+        // generic image env; merge the per-session env (manifest env +
+        // secrets + session id) so `exec_stream` (which reads
+        // `state.spec.env`) sees it, matching the cold-create contract.
+        let mut state = self.sandboxes.get_mut(&id).ok_or(SandboxError::NotFound)?;
+        state.spec.env.extend(env);
+        Ok(())
+    }
+
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
         let state = self
             .sandboxes
@@ -383,7 +397,39 @@ impl SandboxBackend for ProcessBackend {
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
-        let manifest_bytes = tokio::fs::read(src.join("manifest.json")).await?;
+        let manifest_bytes = match tokio::fs::read(src.join("manifest.json")).await {
+            Ok(b) => b,
+            // ADR 0020: a base (template) snapshot carries no captured
+            // process state — this backend's "process memory" isn't
+            // snapshotted, only a session capture writes fs.tar.gz +
+            // manifest.json. Restoring a base snapshot therefore means
+            // "boot a fresh sandbox for this image" (the FC backend
+            // materializes real artifacts from BlobStorage; ProcessBackend
+            // has none to materialize). A *corrupted* manifest still
+            // errors below — only a genuinely-absent one takes this path.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let id = SandboxId::new();
+                let cwd = self.cwd_for(id);
+                tokio::fs::create_dir_all(&cwd).await?;
+                let spec = SandboxSpec {
+                    image: metadata.image_version.clone(),
+                    rootfs_source: None,
+                    image_uri: None,
+                    harness_pack_uri: None,
+                    cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
+                    memory: engram_core::types::sandbox::MemoryLimit { max_mib: 0 },
+                    disk: engram_core::types::sandbox::DiskLimit { max_gib: 0 },
+                    ttl: None,
+                    env: HashMap::new(),
+                    workdir: None,
+                    harness_substrate: None,
+                    network: Default::default(),
+                };
+                self.sandboxes.insert(id, SandboxState { spec, cwd });
+                return Ok(id);
+            }
+            Err(e) => return Err(e.into()),
+        };
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
 

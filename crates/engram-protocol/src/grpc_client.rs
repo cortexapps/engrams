@@ -217,11 +217,13 @@ impl GrpcHostClient {
         metadata: SnapshotMetadata,
         harness_pack_uri: Option<String>,
         harness_name: Option<String>,
+        session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         let req = RestoreBaseForSessionRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             harness_pack_uri,
             harness_name,
+            session_env,
         };
         let resp = self
             .inner
@@ -743,8 +745,10 @@ impl HostClient for GrpcHostClient {
         metadata: SnapshotMetadata,
         harness_pack_uri: Option<String>,
         harness_name: Option<String>,
+        session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
-        Self::restore_base_for_session(self, metadata, harness_pack_uri, harness_name).await
+        Self::restore_base_for_session(self, metadata, harness_pack_uri, harness_name, session_env)
+            .await
     }
 
     async fn start_agent(

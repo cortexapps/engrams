@@ -156,6 +156,18 @@ and 100 % of the 13.6 s serial page-in in one move.
   (per-session harness late-bound via `swap_harness_drive`/`patch_drive`). On
   miss/error: fall through to the existing cold `create_for_session` with one
   `tracing::warn` — mandatory fallback for older images.
+- **1c′. Per-session env injection (restore-model consequence).** A base
+  snapshot is shared across all sessions of an image, so it can carry only the
+  *generic* manifest env — not per-session literal secrets or `ENGRAM_SESSION_*`.
+  In cold-create those rode `vm_spec.env` into the sandbox; on restore they must
+  be injected post-restore. `restore_base_for_session` takes the session's
+  `spec_env` and the host merges it into the restored sandbox
+  (`SandboxBackend::merge_session_env`). ProcessBackend merges into its spec env
+  (read by `exec`). **FC follow-up:** the FC guest is already running from the
+  snapshot, so its env can't be rewritten host-side — the harness gets session
+  env via `start_agent`'s `AgentSpec.env`; sandbox-wide exec-env injection on FC
+  restore needs an agentd-side merge (tracked separately, not P1-blocking since
+  the harness — the secret consumer — is covered).
 - **1d. Per-fork hazards (correctness gate).** Before harness spawn, reseed
   `/dev/urandom`, step the clock, regenerate `/etc/machine-id`. Every restore
   from one base shares baked entropy/identity; this is the most likely

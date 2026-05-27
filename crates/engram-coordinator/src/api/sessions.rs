@@ -624,6 +624,11 @@ async fn create_session_inner(
         memory_mib,
         harness_pack_uri,
         harness_name,
+        // Per-session sandbox env (manifest env + resolved secrets +
+        // ENGRAM_SESSION_*). The shared base snapshot can't carry it, so
+        // it's injected into the restored sandbox (cold-create baked it
+        // into vm_spec.env).
+        spec_env,
     )
     .await
     .map_err(|e| {
@@ -874,6 +879,7 @@ async fn create_session_inner(
 /// host, and runs the combined restore + harness-swap op. Any error
 /// bubbles to the caller, which falls back to a cold create — so this
 /// never fails a session, it only declines to fast-path it.
+#[allow(clippy::too_many_arguments)]
 async fn try_restore_base_snapshot(
     state: &SharedState,
     snapshot_id: engram_core::types::SnapshotId,
@@ -882,6 +888,7 @@ async fn try_restore_base_snapshot(
     memory_mib: u32,
     harness_pack_uri: Option<String>,
     harness_name: Option<String>,
+    session_env: HashMap<String, String>,
 ) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
     let record = state
         .services
@@ -933,7 +940,7 @@ async fn try_restore_base_snapshot(
     };
     state
         .host_registry
-        .restore_base_for_session(&ctx, metadata, harness_pack_uri, harness_name)
+        .restore_base_for_session(&ctx, metadata, harness_pack_uri, harness_name, session_env)
         .await
 }
 

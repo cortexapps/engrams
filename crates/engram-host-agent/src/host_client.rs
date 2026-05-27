@@ -119,9 +119,10 @@ impl HostClient for LocalHostClient {
         metadata: SnapshotMetadata,
         harness_pack_uri: Option<String>,
         harness_name: Option<String>,
+        session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         self.sandbox
-            .restore_base_for_session(metadata, harness_pack_uri, harness_name)
+            .restore_base_for_session(metadata, harness_pack_uri, harness_name, session_env)
             .await
     }
 

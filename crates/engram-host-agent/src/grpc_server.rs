@@ -239,7 +239,12 @@ impl HostService for HostServiceImpl {
             let metadata = decode_bincode(&inner.metadata_bincode, "SnapshotMetadata")?;
             let id = self
                 .inner
-                .restore_base_for_session(metadata, inner.harness_pack_uri, inner.harness_name)
+                .restore_base_for_session(
+                    metadata,
+                    inner.harness_pack_uri,
+                    inner.harness_name,
+                    inner.session_env,
+                )
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SandboxIdMessage {

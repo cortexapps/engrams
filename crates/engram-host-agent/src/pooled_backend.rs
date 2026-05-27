@@ -1995,11 +1995,19 @@ impl SandboxBackend for PooledBackend {
         metadata: SnapshotMetadata,
         harness_pack_uri: Option<String>,
         harness_name: Option<String>,
+        session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
         //    stub harness at /dev/vdb, bootstrap parked on accept().
         let id = self.restore(metadata).await?;
+
+        // Inject the per-session env (manifest env + secrets + session
+        // id). The base snapshot is shared, so per-session values can't
+        // be baked into it — in cold-create they rode vm_spec.env.
+        if !session_env.is_empty() {
+            self.inner.merge_session_env(id, session_env).await?;
+        }
 
         // 2. Late-bind the session harness (option D). For a real
         //    harness, materialize its ext4 in the image cache and swap

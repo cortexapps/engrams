@@ -262,6 +262,26 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0020 P1: merge per-session env (manifest env + resolved
+    /// literal secrets + ENGRAM_SESSION_* ) into a restored sandbox's
+    /// environment, so `exec` and the harness see it. A base snapshot is
+    /// shared across sessions and can't carry per-session secrets, so
+    /// they're injected here post-restore (in cold-create they rode
+    /// `vm_spec.env`). ProcessBackend merges into the sandbox's spec env.
+    ///
+    /// Default is a no-op. NOTE (FC follow-up): the FC guest is already
+    /// running from the snapshot, so its env can't be rewritten host-
+    /// side — the harness receives session env via `start_agent`'s
+    /// `AgentSpec.env`; sandbox-wide exec-env injection on FC restore
+    /// needs an agentd-side merge and is tracked separately.
+    async fn merge_session_env(
+        &self,
+        _id: SandboxId,
+        _env: std::collections::HashMap<String, String>,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0020 P1: restore a per-image base snapshot for a session and
     /// late-bind the session's harness (the option-D swap). The base
     /// snapshot was captured with a stub harness; this restores it
@@ -276,6 +296,7 @@ pub trait SandboxBackend: Send + Sync {
         _metadata: SnapshotMetadata,
         _harness_pack_uri: Option<String>,
         _harness_name: Option<String>,
+        _session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `restore_base_for_session` (needs the pooled chunk-store wrapper)".into(),
