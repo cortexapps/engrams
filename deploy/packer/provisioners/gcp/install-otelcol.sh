@@ -17,9 +17,14 @@
 
 set -euo pipefail
 
-# Pin a known-good contrib release. Bump deliberately (the config we ship is
-# stable across recent versions). arm64/amd64 picked from the host arch.
-OTELCOL_VERSION="${OTELCOL_VERSION:-0.116.0}"
+# Pin a VERIFIED-GOOD contrib release. NB: some releases (e.g. 0.116.0)
+# ship a dynamically-linked binary whose distroless container image lacks
+# the glibc loader — that breaks the k8s sidecar with `exec: no such file
+# or directory`. The .deb installs onto Ubuntu (which has the loader) so the
+# host path is less exposed, but we pin the same known-good version
+# everywhere. 0.111.0 is verified to run (`otelcol-contrib --version`).
+# Bump deliberately and re-verify both the .deb and the container image.
+OTELCOL_VERSION="${OTELCOL_VERSION:-0.111.0}"
 arch="$(dpkg --print-architecture)" # amd64 | arm64
 deb="otelcol-contrib_${OTELCOL_VERSION}_linux_${arch}.deb"
 url="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/${deb}"

@@ -48,6 +48,37 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      {{- if and .Values.otel.enabled .Values.otel.collector.enabled }}
+      # ADR 0019: OTel Collector as a k8s NATIVE sidecar (init container with
+      # restartPolicy: Always). It starts before the coordinator and runs for
+      # the pod's lifetime, receiving OTLP on localhost:4317 and forwarding to
+      # Cloud Trace (googlecloud exporter; ADC via the pod's Workload-Identity
+      # SA + roles/cloudtrace.agent). Crucially it has NO readinessProbe, so —
+      # unlike a regular sidecar — it does NOT gate the pod's Ready condition:
+      # a crashing collector can never pull the coordinator out of the Service
+      # (the 2026-05-27 incident). Config from an existing ConfigMap (key
+      # config.yaml), created from deploy/otel/collector-gcp.yaml.
+      initContainers:
+        - name: otel-collector
+          image: {{ .Values.otel.collector.image | quote }}
+          restartPolicy: Always
+          args: ["--config", "/etc/otelcol/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otelcol
+              readOnly: true
+          resources:
+            {{- toYaml .Values.otel.collector.resources | nindent 12 }}
+      {{- end }}
       containers:
         - name: coordinator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -110,31 +141,6 @@ spec:
             {{- toYaml .Values.probes.readiness | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-        {{- if and .Values.otel.enabled .Values.otel.collector.enabled }}
-        # ADR 0019: per-pod OTel Collector sidecar — receives OTLP from the
-        # coordinator on localhost:4317 and forwards traces to Cloud Trace
-        # (googlecloud exporter, ADC via the pod's Workload-Identity SA, which
-        # needs roles/cloudtrace.agent). Config from an existing ConfigMap
-        # (key config.yaml), created from deploy/otel/collector-gcp.yaml.
-        - name: otel-collector
-          image: {{ .Values.otel.collector.image | quote }}
-          args: ["--config", "/etc/otelcol/config.yaml"]
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          ports:
-            - name: otlp-grpc
-              containerPort: 4317
-              protocol: TCP
-          volumeMounts:
-            - name: otel-config
-              mountPath: /etc/otelcol
-              readOnly: true
-          resources:
-            {{- toYaml .Values.otel.collector.resources | nindent 12 }}
-        {{- end }}
         {{- with .Values.extraContainers }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -146,7 +152,7 @@ spec:
         {{- if and .Values.otel.enabled .Values.otel.collector.enabled }}
         - name: otel-config
           configMap:
-            name: {{ required "otel.collector.configMap is required when the otel collector sidecar is enabled" .Values.otel.collector.configMap }}
+            name: {{ required "otel.collector.configMap is required when the otel collector is enabled" .Values.otel.collector.configMap }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
