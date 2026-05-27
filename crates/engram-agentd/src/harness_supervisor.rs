@@ -48,6 +48,11 @@ impl HarnessSupervisor {
     /// call was a readiness probe (empty argv) — in which case we
     /// don't kill any in-flight child either, matching bootstrap's
     /// "ignore empty argv" branch.
+    ///
+    /// ADR 0019 0c: `agentd.spawn_harness` span — the in-guest tail of the
+    /// host's `fc.spawn_harness`, covering the optional harness-drive mount
+    /// (ext4, possibly NBD-backed → page-in) + the child fork/exec.
+    #[tracing::instrument(name = "agentd.spawn_harness", skip_all)]
     pub async fn spawn(&self, req: SpawnHarnessRequest) -> std::io::Result<Option<u32>> {
         if req.argv.is_empty() {
             tracing::debug!("SpawnHarness with empty argv — readiness probe; no spawn");
