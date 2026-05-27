@@ -392,6 +392,79 @@ Implications:
   committing to Phase 1 — but the **ordering** (agent_handshake ≫ everything)
   is unlikely to change.
 
+## Prod tracing rollout (GCP) — collector + the guest spans it un-swallows
+
+OSS owns the deploy primitives (`deploy/terraform/gcp/modules/*`,
+`deploy/helm/engram`, `deploy/packer/fc-host-gcp.pkr.hcl`); engrams-internal
+sources them by git-ref and supplies values. So GCP tracing config lives in
+**OSS, GCP-out-of-the-box**, and internal just flips it on.
+
+**Pattern — local collector next to every emitter** (all reached at
+`localhost:4317`, all running one `googlecloud`-exporter config):
+
+| emitter | collector | endpoint |
+|---|---|---|
+| host-agent (GCE) | `otelcol` systemd unit baked into the FC image | `localhost:4317` |
+| guest agentd (microVM) | the host's collector, via its TAP gateway | `<gateway-ip>:4317` |
+| coordinator (GKE) | `otelcol` sidecar in the pod | `localhost:4317` |
+
+Each: OTLP/gRPC `:4317` → batch → **`googlecloud`** exporter → Cloud Trace,
+authing via its own SA (FC-host instance SA / coord WI SA, each
+`roles/cloudtrace.agent`). Uniform, no cross-VPC networking, and the guest
+hop falls out for free (guest → gateway → host collector).
+
+**Provider pluggability:** the only provider-specific knob is the exporter.
+`deploy/otel/collector-gcp.yaml` uses `googlecloud`; a future
+`collector-aws.yaml` swaps `awsxray`. Mirrors the existing
+`provisioners/gcp/` split (`install-ops-agent.sh`).
+
+**OSS file plan:**
+- `deploy/otel/collector-gcp.yaml` — the one collector config.
+- `deploy/packer/provisioners/gcp/install-otelcol.sh` + `systemd/otelcol.service`
+  — bake the collector into the GCP FC image (after the Ops Agent).
+- `fc-host-mig` module: an `otel_*` var → startup-script sets
+  `OTEL_EXPORTER_OTLP_ENDPOINT` + `ENGRAM_GUEST_OTEL_ENDPOINT`; grant the
+  host SA `roles/cloudtrace.agent`.
+- helm chart: an `otel:` values block + (when enabled) an `otelcol` sidecar
+  in the coord deployment + `OTEL_EXPORTER_OTLP_ENDPOINT`; coord GSA gets
+  `roles/cloudtrace.agent`.
+
+engrams-internal then: bump the ref, `otel.enabled: true`, add the coord-GSA
+`cloudtrace.agent` binding, re-bake + tf-apply + helm-deploy.
+
+(Lower-footprint alt for FC hosts: extend the existing GCP Ops Agent's OTLP
+receiver instead of a second binary — tidy on GCP but not provider-portable,
+so the dedicated `otelcol` stays the OSS primitive.)
+
+### Guest spans currently swallowed
+
+Two in-guest spans exist in code but never reach a backend today:
+
+| span | site | carries |
+|---|---|---|
+| `agentd.run` | `engram-agentd` main (`f2239db`/`0dfa783`) | `boot_elapsed_s` (/proc/uptime at agentd start), rooted on cmdline `engram_traceparent` |
+| `agentd.spawn_harness` | `HarnessSupervisor::spawn` (`5bd7984`) | in-guest harness-drive mount + fork/exec |
+
+Plus markers that land *outside* the trace: the `engram-init: mark`
+{kernel_to_init, fs_mounts_done, ca_staged, exec_agentd} console lines and
+agentd's `boot_elapsed_s` log — all to the per-sandbox `firecracker.log`
+(SSH-only, not Cloud Logging).
+
+**Two independent causes, both must be fixed to un-swallow the spans:**
+1. **No guest OTLP path** — `engram_otel` cmdline unset (no
+   `ENGRAM_GUEST_OTEL_ENDPOINT`), so agentd's OTLP layer is a no-op. The
+   collector rollout above fixes this (guest → `<gateway>:4317`).
+2. **Stale bake** — the integration bake ran an old agentd/shim without
+   these spans/marks compiled in. Needs the image pipeline to rebuild
+   agentd from branch source (prod-canary prerequisite).
+
+**Even un-swallowed, the kernel/ext4-mount internals stay non-span:** they're
+pre-userspace / in the `/bin/sh` shim, so they surface as the
+`boot_elapsed_s` *number* + the `firecracker.log` marks, and as the
+`chunk.fetch` spans (host-side, no guest export) that show the page-in
+*driving* the mount. Putting the marks *in* the trace later = host-agent
+tailing `firecracker.log` and re-emitting them as span events.
+
 ## Candidate optimizations (hypotheses — ranked by Phase 0 data)
 
 Largest-expected-leverage first. Derived from the E2B comparison and the
