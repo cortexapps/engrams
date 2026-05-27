@@ -36,14 +36,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
-
-    // Held for the lifetime of `main`; declared before the runtime so it
-    // drops *after* the runtime, flushing pending OTLP spans on shutdown
-    // (ADR 0019). OTLP is inert unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
-    let _telemetry = engram_telemetry::init(engram_telemetry::Config {
-        service_name: "engram-uffd-handler",
-        default_filter: "info",
-    });
+    use tracing::Instrument;
 
     let args = match linux::parse_args() {
         Ok(a) => a,
@@ -64,23 +57,36 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // ADR 0019: root this process's spans on the host-agent's restore span,
-    // whose `traceparent` the FC backend handed us via the env. No-op when
-    // unset (OTLP off) or malformed.
-    use tracing::Instrument;
-    let span = tracing::info_span!("uffd.run");
-    if let Ok(tp) = std::env::var("TRACEPARENT") {
-        engram_telemetry::set_parent_from_traceparent(&span, &tp);
-    }
+    // Run telemetry init + the listener *inside* the runtime. The OTLP batch
+    // exporter `engram_telemetry::init` builds spawns a background task and so
+    // must be constructed from a runtime context (otherwise hyper-util panics
+    // "there is no reactor running"); and the guard's shutdown-flush on drop
+    // needs the runtime still alive. The guard is the last thing to drop in
+    // the async block, so the flush runs while the runtime is up. OTLP is
+    // inert unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+    rt.block_on(async move {
+        let _telemetry = engram_telemetry::init(engram_telemetry::Config {
+            service_name: "engram-uffd-handler",
+            default_filter: "info",
+        });
 
-    let handle = rt.handle().clone();
-    match rt.block_on(linux::run(args, handle).instrument(span)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("engram-uffd-handler: {e}");
-            ExitCode::from(1)
+        // ADR 0019: root this process's spans on the host-agent's restore
+        // span, whose `traceparent` the FC backend handed us via the env.
+        // No-op when unset (OTLP off) or malformed.
+        let span = tracing::info_span!("uffd.run");
+        if let Ok(tp) = std::env::var("TRACEPARENT") {
+            engram_telemetry::set_parent_from_traceparent(&span, &tp);
         }
-    }
+
+        let handle = tokio::runtime::Handle::current();
+        match linux::run(args, handle).instrument(span).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("engram-uffd-handler: {e}");
+                ExitCode::from(1)
+            }
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
