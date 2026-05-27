@@ -429,7 +429,11 @@ hop falls out for free (guest → gateway → host collector).
   in the coord deployment + `OTEL_EXPORTER_OTLP_ENDPOINT`; coord GSA gets
   `roles/cloudtrace.agent`.
 
-engrams-internal then: bump the ref, `otel.enabled: true`, add the coord-GSA
+OSS implementation shipped in `41185f6` (helm renders enabled+disabled +
+lints; tf/packer fmt clean). engrams-internal then: bump the OSS ref (needs
+these OSS commits pushed/merged first), `otel.enabled: true` +
+`otel.collector.configMap` in `values/engrams.yaml`, create the otelcol
+ConfigMap from `deploy/otel/collector-gcp.yaml`, add the coord-GSA
 `cloudtrace.agent` binding, re-bake + tf-apply + helm-deploy.
 
 (Lower-footprint alt for FC hosts: extend the existing GCP Ops Agent's OTLP
