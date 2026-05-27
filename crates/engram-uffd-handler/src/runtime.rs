@@ -284,15 +284,23 @@ impl Runtime {
         // pre-faults the pages in our own address space so when we
         // dereference `canonical_ptr` to fill a guest fault we don't
         // block on a host-side page fault.
-        let raw = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_POPULATE,
-                file.as_raw_fd(),
-                0,
-            )
+        let raw = {
+            // ADR 0019: MAP_POPULATE synchronously faults the *entire*
+            // canonical memory file into our address space right here — a
+            // restore critical-path cost (H2: candidate to drop in favour of
+            // lazy fault + working-set prefetch). Span it so a restore trace
+            // shows the populate time distinct from the rest of restore.
+            let _span = tracing::info_span!("uffd.map_populate", bytes = size as u64).entered();
+            unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    size,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_POPULATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            }
         };
         if raw == libc::MAP_FAILED {
             return Err(HandlerError::Io(std::io::Error::last_os_error()));
