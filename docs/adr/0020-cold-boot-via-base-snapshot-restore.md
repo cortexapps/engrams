@@ -71,16 +71,28 @@ not the fix. No ADR 0021 / io_uring effort is being pursued.)
 snapshot recorded) → `POST /sessions` → `kind:"restored"` Active in ~13 s →
 `exec` in the restored guest returns `exit 0` (`Linux … Debian 12`,
 `restored-and-alive`). So capture (1a/1b), transactional enable, and
-create→restore with option-D harness handling (1c) all work on real FC. The
-~13 s is File-mode + cold-local-blob latency, NOT representative — prod
-File-mode-from-warm-NVMe is ~1 s, and the path to ~100 ms is P2 (enable UFFD +
-working-set prefetch).
+create→restore with option-D harness handling (1c) all work on real FC.
+
+**Measured restore breakdown (dev-vm coord log, the ~13 s):** memory.bin
+materialization from 237 chunks ≈ **6.4 s** (rebuilding the full 4 GiB file);
+File-mode `load_snapshot` eager read ≈ **0.64 s** (fast — memory.bin was just
+written, page-cached); agent handshake 15 ms. So the dominant cost is **rebuilding
+a 4 GiB memory.bin from chunks** (`materialize_memory_if_missing`, which runs
+*unconditionally* in `PooledBackend::restore`), NOT the eager load. (Earlier
+numbers in this ADR speculated "~1 s prod / cold-blob" — that was wrong and
+conflated two paths: ADR 0019's measured ~1 s is *warm same-host idle→resume*,
+where memory.bin is already on local disk and there's no materialize. A
+*base-snapshot* restore is cross-host/first-touch and pays the materialize
+everywhere, prod included. The dev-vm disk is the boot PD, not a separate local
+NVMe, but the chunks are local — the cost is the reconstruction, not blob
+coldness.)
 
 What still remains in P1: **1d** per-fork identity reseed and **1e** per-snapshot
 restore serialization (both concurrency-only — they gate the prod push, not the
-happy-path validation), then prod measurement. The restore-latency optimization
-(UFFD + prefetch) is P2 — and P2.0 below records that UFFD must first be *enabled*
-(it's currently unwired in the binaries).
+happy-path validation), then prod measurement.
+
+The restore-latency win (eliminating the ~6.4 s materialize) is the **UFFD
+milestone — see below; deliberately scoped as its own effort, not P1/P2 inline.**
 
 ## Context
 
@@ -257,24 +269,24 @@ rootfs stage).
 
 ## Phase 2 — Lazy memory + bake-time working-set prefetch [~1 s → ~300–400 ms]
 
-- **2.0 (prerequisite, discovered 2026-05-27): enable `RestoreMode::Uffd`.**
-  The binaries currently run the **default `RestoreMode::File`** — neither
-  `engram-coordinator` nor `engram-host-agent` main sets `restore_mode`, no
-  CLI/env overrides it, and `engram-uffd-handler` isn't deployed by packer. So
-  the chunked-memory UFFD path (load_snapshot_uffd, spawn_uffd_handler,
-  canonical mmap, prefault traces — all implemented + tested) is **dead in
-  production**: every restore eager-reads the whole `memory.bin` synchronously
-  on FC's device thread. File mode survives in prod because warm-NVMe reads of a
-  multi-GiB memory.bin finish in ~1 s, but it can't reach ~100 ms (you can't
-  eager-read 4 GiB that fast) — so P2/P3's targets require flipping to UFFD
-  first: wire `fc_cfg.restore_mode = Uffd` in both mains, build + deploy
-  `engram-uffd-handler` (packer provisioner), confirm `/dev/userfaultfd` perms.
-  The 2a/2b/2c items below (MAP_POPULATE, prefault traces) only bite once UFFD
-  is the live path. (This also surfaced as the dev-vm restore false-failing:
-  File-mode eager read of a 4 GiB cold-blob memory.bin tripped the FC client's
-  10 s `load_snapshot` timeout — fixed by giving the restore load 60 s like the
-  symmetric `create_snapshot` already had; restore now validated end-to-end on
-  the dev-vm, ~13 s File-mode/cold-blob, exec confirmed working.)
+- **DEDICATED MILESTONE — "actually use UFFD" (discovered 2026-05-27, deferred).**
+  The biggest restore win, carved out as its own effort (not done inline here).
+  **Discovery:** the binaries run the **default `RestoreMode::File`** — neither
+  `engram-coordinator` nor `engram-host-agent` main sets `restore_mode`, nothing
+  overrides it, and `engram-uffd-handler` isn't deployed by packer. So the
+  chunked-memory UFFD path (load_snapshot_uffd, spawn_uffd_handler, canonical
+  mmap, prefault traces — all implemented + tested) is **dead in production**;
+  every restore rebuilds the full memory.bin and eager-loads it. **Why it's a
+  milestone, not a flag:** it requires (1) `fc_cfg.restore_mode = Uffd` in both
+  mains; (2) build + deploy `engram-uffd-handler` (packer provisioner) +
+  `/dev/userfaultfd` perms; (3) crucially, make `PooledBackend::restore` **skip**
+  `materialize_memory_if_missing` for UFFD so the handler serves pages from
+  chunks on fault — otherwise the ~6.4 s 4 GiB rebuild (the dominant measured
+  cost) is still paid and UFFD only saves the ~0.6 s eager load; (4) the
+  MAP_POPULATE + prefault-trace work in 2a/2b below, which only matter once UFFD
+  is live. Measure before/after via the Jaeger spans (wire
+  `OTEL_EXPORTER_OTLP_ENDPOINT` → the dev Jaeger; the ad-hoc dev-vm coord launch
+  didn't, which is why the ~13 s breakdown above came from the coord log).
 - **2a.** `runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
   targeted `MADV_WILLNEED` over the working-set pages (E2B's two-phase
   fetch→copy). The `uffd.map_populate` span already measures this.
