@@ -66,9 +66,21 @@ slow-read window instead of giving up at 9 s:
 makes boot fast enough to *mask* the starvation; fold it in later as a perf win,
 not the fix. No ADR 0021 / io_uring effort is being pursued.)
 
+**P1 happy-path validated end-to-end on the dev-vm (2026-05-27):** enable
+`localhost:5001/demo:warm-3` → `build_base_snapshot` capture (HTTP 201, base
+snapshot recorded) → `POST /sessions` → `kind:"restored"` Active in ~13 s →
+`exec` in the restored guest returns `exit 0` (`Linux … Debian 12`,
+`restored-and-alive`). So capture (1a/1b), transactional enable, and
+create→restore with option-D harness handling (1c) all work on real FC. The
+~13 s is File-mode + cold-local-blob latency, NOT representative — prod
+File-mode-from-warm-NVMe is ~1 s, and the path to ~100 ms is P2 (enable UFFD +
+working-set prefetch).
+
 What still remains in P1: **1d** per-fork identity reseed and **1e** per-snapshot
 restore serialization (both concurrency-only — they gate the prod push, not the
-first happy-path validation), then prod measurement.
+happy-path validation), then prod measurement. The restore-latency optimization
+(UFFD + prefetch) is P2 — and P2.0 below records that UFFD must first be *enabled*
+(it's currently unwired in the binaries).
 
 ## Context
 
@@ -245,6 +257,24 @@ rootfs stage).
 
 ## Phase 2 — Lazy memory + bake-time working-set prefetch [~1 s → ~300–400 ms]
 
+- **2.0 (prerequisite, discovered 2026-05-27): enable `RestoreMode::Uffd`.**
+  The binaries currently run the **default `RestoreMode::File`** — neither
+  `engram-coordinator` nor `engram-host-agent` main sets `restore_mode`, no
+  CLI/env overrides it, and `engram-uffd-handler` isn't deployed by packer. So
+  the chunked-memory UFFD path (load_snapshot_uffd, spawn_uffd_handler,
+  canonical mmap, prefault traces — all implemented + tested) is **dead in
+  production**: every restore eager-reads the whole `memory.bin` synchronously
+  on FC's device thread. File mode survives in prod because warm-NVMe reads of a
+  multi-GiB memory.bin finish in ~1 s, but it can't reach ~100 ms (you can't
+  eager-read 4 GiB that fast) — so P2/P3's targets require flipping to UFFD
+  first: wire `fc_cfg.restore_mode = Uffd` in both mains, build + deploy
+  `engram-uffd-handler` (packer provisioner), confirm `/dev/userfaultfd` perms.
+  The 2a/2b/2c items below (MAP_POPULATE, prefault traces) only bite once UFFD
+  is the live path. (This also surfaced as the dev-vm restore false-failing:
+  File-mode eager read of a 4 GiB cold-blob memory.bin tripped the FC client's
+  10 s `load_snapshot` timeout — fixed by giving the restore load 60 s like the
+  symmetric `create_snapshot` already had; restore now validated end-to-end on
+  the dev-vm, ~13 s File-mode/cold-blob, exec confirmed working.)
 - **2a.** `runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
   targeted `MADV_WILLNEED` over the working-set pages (E2B's two-phase
   fetch→copy). The `uffd.map_populate` span already measures this.

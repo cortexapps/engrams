@@ -1706,7 +1706,16 @@ impl FirecrackerBackend {
         // get `None` here and keep restoring netless.
         let net_setup: Option<net::NetSetup> = None;
 
-        let api = FirecrackerClient::new(&socket);
+        // `PUT /snapshot/load` in File mode reads the entire memory.bin
+        // synchronously before resuming — the symmetric cost to
+        // `create_snapshot` (which already uses 60s here for the same
+        // reason). The default 10s client timeout fits a tiny VM but
+        // trips on a multi-GiB one (a 4 GiB base snapshot false-failed
+        // with "PUT /snapshot/load timed out after 10s" on a cold
+        // chunk-materialized memory.bin). Give the load the same 60s.
+        // (UFFD mode returns immediately — pages fault lazily — so this
+        // ceiling only bites File mode; tune up for huge VMs.)
+        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
 
         // For UFFD restore, spawn the handler BEFORE PUT /snapshot/load
         // so it's listening when Firecracker connects. The handler
