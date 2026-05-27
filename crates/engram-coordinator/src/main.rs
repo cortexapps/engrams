@@ -188,8 +188,7 @@ fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
 /// exported to that collector; otherwise OTLP is inert.
 ///
 /// The returned guard must be held for the lifetime of `main` so spans
-/// flush on shutdown.
-#[must_use]
+/// flush on shutdown (`TelemetryGuard` is itself `#[must_use]`).
 fn init_tracing() -> engram_telemetry::TelemetryGuard {
     engram_telemetry::init(engram_telemetry::Config {
         service_name: "engram-coordinator",
