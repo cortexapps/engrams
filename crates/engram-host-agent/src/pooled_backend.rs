@@ -1200,8 +1200,8 @@ async fn materialize_chunked_rootfs(
 /// default 512 KiB memory chunk size. Sparse / all-zero blocks
 /// are omitted from the manifest (the chunk_file primitive already
 /// short-circuits them); on restore the resolver treats absent
-/// chunk entries as "use canonical mmap at that offset" so zero
-/// pages cost zero chunks + zero bytes of object storage.
+/// chunk entries as zero-fill (UFFDIO_ZEROPAGE) so zero pages cost
+/// zero chunks + zero bytes of object storage.
 async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,

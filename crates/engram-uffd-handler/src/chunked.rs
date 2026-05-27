@@ -1,49 +1,50 @@
-//! ADR 0007 chunked-memory backend for the UFFD handler.
+//! ADR 0007 / ADR 0020 chunked-memory backend for the UFFD handler.
 //!
-//! The classic UFFD-from-file flow served every page fault by
-//! pointer-arithmetic into a single `memory.bin` mmap. The chunked
-//! flow keeps that mmap (now of the **canonical** memory snapshot —
-//! shared across every session that boots from the same image) but
-//! adds a second resolution path: when the session's memory
-//! manifest says a chunk *differs* from canonical, we fetch the
-//! session-specific bytes from the chunk store and `UFFDIO_COPY`
-//! those instead.
+//! Per page fault the handler asks this backend which bytes back a
+//! given guest offset. ADR 0020 **Route B** serves *every* page from
+//! chunks — there is no `memory.bin` mmap (the retired model
+//! pointer-arithmetic'd into a single canonical mmap). The resolver
+//! maps a chunk-aligned offset to one of:
 //!
-//! Why this matters for production:
+//! - a **session-divergent chunk hash** the session manifest places
+//!   there (written-over state) — fetch + `UFFDIO_COPY`; or
+//! - the **canonical** chunk at that offset (the common case for a
+//!   freshly-resumed session) — the runtime resolves its hash via
+//!   [`ChunkedMemoryBackend::canonical_chunk_hash`] and fetches it,
+//!   or installs a zero page (`UFFDIO_ZEROPAGE`) when the manifest
+//!   omits the offset (implicit zero-fill).
 //!
-//! - **Cross-VM memory dedup is free.** The canonical mmap's pages
-//!   live once in the host page cache regardless of how many
-//!   sessions reference them. 1000 Python sessions of a 4 GiB image
-//!   reservation cost 4 GiB canonical + per-session deltas, not
-//!   4 TiB.
-//! - **No userspace page hashing.** Hardware-enforced via
-//!   `MAP_PRIVATE`; sessions only allocate private host pages when
-//!   they write. Avoids the KSM-style cross-tenant side-channel
-//!   surface AWS + Aurora DSQL explicitly steer away from.
-//! - **Cross-host portable.** Move a session's chunks to a fresh
-//!   host (or boot a fresh host from scratch) and the chunked
-//!   delta resolves the same — no `memory.bin` file to ship.
+//! Why chunk-native (vs the retired `memory.bin` mmap):
+//!
+//! - **No materialize.** Restore never rebuilds a contiguous 4 GiB
+//!   file; the handler faults chunks straight from the (prefetched)
+//!   local chunk cache. That rebuild was the dominant restore cost
+//!   ADR 0020 removes.
+//! - **Cross-host portable.** Move a session's chunks to a fresh host
+//!   (or boot a fresh host) and resolution is identical — no
+//!   `memory.bin` file to ship.
+//!
+//! **Dedup caveat:** `UFFDIO_COPY` installs a *private* guest page,
+//! so this revision does not share guest RAM across sessions of an
+//! image (the source chunk-cache files are shared in the host page
+//! cache, but each guest copies). True guest-RAM packing is a future
+//! `UFFDIO_CONTINUE` milestone layered on this same resolver — see
+//! ADR 0020.
 //!
 //! What's in this module:
 //!
-//! - [`ChunkedMemoryBackend`] — the data plane. Mmaps canonical
-//!   memory; carries the canonical + session manifests; serves
-//!   page-fault resolution against a [`ChunkStore`] (via a
-//!   [`ChunkCache`] for repeat-fetch amortisation).
-//! - [`ResolvedPage`] — what the resolver returns. `Canonical` =
-//!   we have the bytes in the canonical mmap already; `Chunk` =
-//!   fetch from the store. Returned types-only so the syscall
-//!   path stays out of the unit-testable surface.
+//! - [`ChunkedMemoryBackend`] — the data plane: carries the canonical
+//!   and session manifests, resolves an offset, and fetches chunks
+//!   via a [`ChunkCache`] over a [`ChunkStore`].
+//! - [`ResolvedPage`] — what the resolver returns. Types-only so the
+//!   syscall path stays out of the unit-testable surface.
 //!
 //! What's NOT in this module:
 //!
-//! - The UFFD event loop. That's in `runtime.rs` and consumes this
-//!   backend.
+//! - The UFFD event loop + the actual `UFFDIO_COPY`/`UFFDIO_ZEROPAGE`
+//!   (incl. the full-chunk-per-fault install policy). That's in
+//!   `runtime.rs` and consumes this backend.
 //! - Working-set trace recording. That's in `working_set.rs`.
-//! - The fault-aligned chunk copy. Calling code copies an entire
-//!   512 KiB chunk into the guest in one `UFFDIO_COPY` so subsequent
-//!   accesses within the chunk don't fault — that policy lives in
-//!   the runtime, not here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -52,21 +53,22 @@ use bytes::Bytes;
 use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore, Manifest, ManifestKind};
 use engram_core::traits::BlobStorage;
 
-/// What the per-fault resolver returns. The `Canonical` arm tells
-/// the runtime "you already have these bytes in the canonical mmap;
-/// copy them" — no chunk store I/O. The `Chunk` arm names a chunk
-/// to fetch.
-///
-/// The discrimination is the data plane of the whole optimisation:
-/// pages that match canonical (the common case for a session that
-/// just started running) cost a single pointer comparison + a
-/// memcpy from page cache; pages that differ (the session's
-/// written-over state) cost one chunk fetch.
+/// What the per-fault resolver returns. Both arms ultimately serve a
+/// chunk (Route B has no mmap); the discrimination is *which* hash:
+/// - `Chunk` — the session manifest's own hash at this offset
+///   (diverged / written-over state).
+/// - `Canonical` — the page matches canonical here; the runtime
+///   resolves the canonical hash via
+///   [`ChunkedMemoryBackend::canonical_chunk_hash`] and fetches it,
+///   or zero-fills (`UFFDIO_ZEROPAGE`) when the manifest omits the
+///   offset. For a base snapshot (session == canonical) every page
+///   resolves to `Canonical`.
 #[derive(Clone, Debug)]
 pub enum ResolvedPage {
-    /// Page matches canonical at the given chunk-aligned byte
-    /// offset. The runtime can `UFFDIO_COPY` from
-    /// `canonical_ptr + offset` directly.
+    /// Page matches canonical at the given chunk-aligned byte offset.
+    /// The runtime looks up the canonical chunk hash at this offset
+    /// and fetches + `UFFDIO_COPY`s it, or `UFFDIO_ZEROPAGE`s when no
+    /// chunk is recorded (zero-fill).
     Canonical { canonical_offset: u64 },
     /// Page diverges from canonical. The named chunk is what to
     /// fetch from the store + copy into the guest. The runtime
@@ -255,8 +257,9 @@ impl ChunkedMemoryBackend {
     }
 
     /// Resolve the chunk-aligned region containing `byte_offset`
-    /// into either "the canonical mmap has the right bytes" or
-    /// "fetch this chunk." Pure data-plane; no I/O.
+    /// into either "matches canonical here" (runtime resolves the
+    /// canonical hash / zero-fills) or "fetch this session-divergent
+    /// chunk." Pure data-plane; no I/O.
     ///
     /// Returns `None` when the offset is past `total_bytes`. The
     /// runtime treats that as a programming bug — FC's mappings
@@ -278,10 +281,9 @@ impl ChunkedMemoryBackend {
             // differ; canonical may be None for zero pages while
             // session has explicit content).
             (_, Some(s)) => ResolvedPage::Chunk { hash: s },
-            // Session says "zero-filled here." Canonical's same
-            // offset is also zero → canonical mmap already has
-            // zeros for us. canonical_offset points at the right
-            // run of bytes.
+            // Session says "zero-filled here." Resolve as canonical;
+            // the runtime finds no chunk hash at this offset and
+            // installs a zero page (UFFDIO_ZEROPAGE).
             (_, None) => ResolvedPage::Canonical {
                 canonical_offset: chunk_offset,
             },
@@ -382,7 +384,7 @@ mod tests {
     fn resolves_canonical_match_to_canonical_offset() {
         // Both canonical and session agree on chunk 0. The
         // resolver returns `Canonical { canonical_offset: 0 }`
-        // — runtime copies from the canonical mmap.
+        // — runtime fetches the canonical chunk hash at that offset.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let (cache, store, _dir) = make_cache_and_store();
@@ -434,9 +436,9 @@ mod tests {
 
     #[test]
     fn resolves_zero_filled_chunk_to_canonical() {
-        // Session manifest omits chunk 1 (zero-filled). The
-        // canonical mmap at offset 512 already has zeros — no
-        // chunk fetch needed.
+        // Session manifest omits chunk 1 (zero-filled). Resolves as
+        // canonical; the runtime zero-fills (UFFDIO_ZEROPAGE) since
+        // no chunk hash is recorded at that offset.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
         let (cache, store, _dir) = make_cache_and_store();
@@ -464,9 +466,9 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![]);
         let session = synth_manifest(1024, 256, vec![]);
         let (cache, store, _dir) = make_cache_and_store();
-        // `ChunkedMemoryBackend` doesn't impl Debug (the underlying
-        // mmap pointer would be misleading), so we can't use
-        // `unwrap_err`. Match by hand.
+        // `ChunkedMemoryBackend` doesn't impl Debug (its ChunkStore /
+        // ChunkCache don't), so we can't use `unwrap_err`. Match by
+        // hand.
         match ChunkedMemoryBackend::new(&canonical, &session, cache, store) {
             Ok(_) => panic!("chunk_size mismatch must reject"),
             Err(e) => assert!(format!("{e}").contains("chunk_size")),

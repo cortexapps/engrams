@@ -1,20 +1,18 @@
 //! Userfaultfd page-fault handler for Firecracker UFFD-backed
 //! snapshot restore.
 //!
-//! ADR 0007 chunked-memory shape — the handler no longer reads a
-//! single `memory.bin` file. It mmaps the **canonical** memory
-//! snapshot (one file per image on this host, shared via the host
-//! page cache across every session of that image) and consults a
-//! per-session memory manifest to decide whether each fault serves
-//! from the canonical mmap or from a session-divergent chunk in
-//! the chunk store.
+//! ADR 0020 Route B chunk-native shape — the handler reads **no**
+//! `memory.bin` file and holds no mmap. It consults the canonical +
+//! per-session memory manifests and serves every fault from the chunk
+//! cache/store: a session-divergent hash, the canonical chunk hash at
+//! that offset, or a zero page (`UFFDIO_ZEROPAGE`) for offsets the
+//! manifest omits.
 //!
 //! Usage from the host:
 //!
 //! ```text
 //!   engram-uffd-handler \
 //!     --listen /tmp/uffd-handler.sock \
-//!     --canonical-memory /var/lib/engram/canonical/<image-id>.bin \
 //!     --canonical-manifest <uuid>:<version> \
 //!     --session-manifest   <uuid>:<version>
 //!
@@ -31,12 +29,12 @@
 //! Layout of this crate:
 //!
 //! - [`proto`] — Firecracker handshake wire format.
-//! - [`chunked`] — data-plane resolver: per-fault, "is this page
-//!   in canonical or do we need to fetch?" Pure Rust, unit-testable
-//!   without a UFFD.
+//! - [`chunked`] — data-plane resolver: per-fault, "which chunk hash
+//!   backs this offset (or is it zero-fill)?" Pure Rust,
+//!   unit-testable without a UFFD.
 //! - `runtime` (Linux-only) — UFFD event loop that consumes a
 //!   [`chunked::ChunkedMemoryBackend`] and serves faults via
-//!   `UFFDIO_COPY`.
+//!   `UFFDIO_COPY` / `UFFDIO_ZEROPAGE`.
 
 pub mod chunked;
 pub mod proto;

@@ -25,9 +25,11 @@ pub struct GuestRegionUffdMapping {
     pub base_host_virt_addr: u64,
     /// Region length in bytes.
     pub size: usize,
-    /// Offset into `memory.bin` where this region's pages live. We
-    /// `mmap` the whole file once, so the handler does pointer math
-    /// `mmap_base + offset + intra_region_offset` to find the source.
+    /// Byte offset into the snapshot's linear memory image where this
+    /// region's pages live. The handler maps a faulting address back
+    /// to `offset + intra_region_offset`, then resolves which chunk
+    /// backs that byte offset (ADR 0020 Route B — no `memory.bin`
+    /// mmap; the chunk is fetched + `UFFDIO_COPY`'d).
     pub offset: u64,
     /// Page size for this region in BYTES, despite the misleading
     /// wire-field name. FC v1.10 renamed this from `page_size` to

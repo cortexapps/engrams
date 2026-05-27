@@ -1054,14 +1054,14 @@ impl FirecrackerBackend {
         Ok((socket, child))
     }
 
-    /// Spawn `engram-uffd-handler` in ADR 0007 chunked mode and
-    /// wait until it's listening on `uffd_uds`. `canonical_memory`
-    /// is the local file the handler mmaps for canonical-resolved
-    /// pages; `canonical_ref` + `session_ref` identify the
-    /// manifests it reads from the chunk store. `prefault_trace_host`
-    /// optionally points at a host's prior working-set recording for
-    /// REAP-style replay; `publish_trace_host` names the host the
-    /// recorder publishes the new trace under on clean shutdown.
+    /// Spawn `engram-uffd-handler` in ADR 0020 chunk-native mode and
+    /// wait until it's listening on `uffd_uds`. `canonical_ref` +
+    /// `session_ref` identify the manifests it reads from the chunk
+    /// store; it serves every fault from chunks (no `memory.bin`).
+    /// `prefault_trace_host` optionally points at a host's prior
+    /// working-set recording for REAP-style replay; `publish_trace_host`
+    /// names the host the recorder publishes the new trace under on
+    /// clean shutdown.
     ///
     /// Stdout/stderr go into the jail dir's `uffd-handler.log` so a
     /// snapshot-restore failure has a recoverable diagnostic.
@@ -1128,7 +1128,7 @@ impl FirecrackerBackend {
             cmd.arg("--blob-root").arg(path);
         }
         // ADR 0019: hand the handler our current span's W3C traceparent so
-        // its process-root span (and the MAP_POPULATE / fault-serving spans
+        // its process-root span (and the fault-serving spans
         // under it) stitch onto this restore's trace. Inert when OTLP is off
         // (`current_traceparent` returns `None`).
         if let Some(tp) = engram_telemetry::current_traceparent() {
