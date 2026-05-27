@@ -22,6 +22,8 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use futures::Stream;
 use std::pin::Pin;
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
 use tonic::transport::Channel;
 
 use crate::grpc::host_service_client::HostServiceClient;
@@ -36,12 +38,31 @@ use crate::grpc::{
 
 use crate::wire::{WireExecRequest, WireReapStats};
 
+/// Per-request interceptor that injects the current span's W3C
+/// `traceparent` into the outbound gRPC metadata, so the host-agent can
+/// stitch its spans onto the coord's trace (ADR 0019). Zero-sized and
+/// `Clone`, so it composes into the tonic client type cleanly. No-op when
+/// OTLP is disabled (`current_traceparent` returns `None`).
+#[derive(Clone, Copy, Default)]
+pub struct TraceparentInjector;
+
+impl Interceptor for TraceparentInjector {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(tp) = engram_telemetry::current_traceparent() {
+            if let Ok(val) = tp.parse() {
+                req.metadata_mut().insert("traceparent", val);
+            }
+        }
+        Ok(req)
+    }
+}
+
 /// Coord-side client wrapping a `tonic::transport::Channel` to one
 /// host. Cheap to clone (tonic clients hold an `Arc<Channel>`
 /// internally); one instance per host is the steady-state shape.
 #[derive(Clone)]
 pub struct GrpcHostClient {
-    inner: HostServiceClient<Channel>,
+    inner: HostServiceClient<InterceptedService<Channel, TraceparentInjector>>,
 }
 
 impl GrpcHostClient {
@@ -50,9 +71,12 @@ impl GrpcHostClient {
     /// TCP+H2 connection — so we want exactly one instance per
     /// host. Callers go through `GrpcHostPool::dispatch` which
     /// hands out a clone of the pool's entry.
+    ///
+    /// Every RPC carries the caller's `traceparent` via
+    /// [`TraceparentInjector`] (ADR 0019 distributed tracing).
     pub fn new(channel: Channel) -> Self {
         Self {
-            inner: HostServiceClient::new(channel),
+            inner: HostServiceClient::with_interceptor(channel, TraceparentInjector),
         }
     }
 

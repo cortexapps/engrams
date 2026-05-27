@@ -35,6 +35,21 @@ use futures::Stream;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
+
+/// Link a handler span to the caller's distributed trace (ADR 0019) by
+/// reading the W3C `traceparent` the coord's [`TraceparentInjector`] put
+/// in the request metadata. No-op when absent (OTLP disabled, or a caller
+/// that doesn't propagate).
+fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
+    if let Some(tp) = req
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
+        engram_telemetry::set_parent_from_traceparent(span, tp);
+    }
+}
 
 /// Concrete `HostService` impl. Holds the in-proc
 /// `Arc<dyn HostClient>` (typically a `LocalHostClient` wrapping
@@ -94,11 +109,17 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
-        let sandbox_id = self.inner.create(spec).await.map_err(sandbox_to_status)?;
-        Ok(Response::new(CreateSandboxResponse {
-            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
-        }))
+        let span = tracing::info_span!("host.create_sandbox");
+        link_remote_parent(&span, &req);
+        async move {
+            let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
+            let sandbox_id = self.inner.create(spec).await.map_err(sandbox_to_status)?;
+            Ok(Response::new(CreateSandboxResponse {
+                sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn destroy_sandbox(
@@ -127,11 +148,17 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<SandboxIdMessage>,
     ) -> Result<Response<SnapshotResponse>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        let metadata = self.inner.snapshot(id).await.map_err(sandbox_to_status)?;
-        Ok(Response::new(SnapshotResponse {
-            metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
-        }))
+        let span = tracing::info_span!("host.snapshot");
+        link_remote_parent(&span, &req);
+        async move {
+            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let metadata = self.inner.snapshot(id).await.map_err(sandbox_to_status)?;
+            Ok(Response::new(SnapshotResponse {
+                metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn commit_snapshot(
@@ -162,15 +189,21 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<RestoreRequest>,
     ) -> Result<Response<SandboxIdMessage>, Status> {
-        let metadata = decode_bincode(&req.into_inner().metadata_bincode, "SnapshotMetadata")?;
-        let id = self
-            .inner
-            .restore(metadata)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        }))
+        let span = tracing::info_span!("host.restore");
+        link_remote_parent(&span, &req);
+        async move {
+            let metadata = decode_bincode(&req.into_inner().metadata_bincode, "SnapshotMetadata")?;
+            let id = self
+                .inner
+                .restore(metadata)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(SandboxIdMessage {
+                uuid: id.as_uuid().as_bytes().to_vec(),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn guest_ip(
@@ -230,30 +263,39 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<StartAgentRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let r = req.into_inner();
-        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
-        let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
-        let phase_start = std::time::Instant::now();
-        let result = self
-            .inner
-            .start_agent(sandbox_id, agent, policy)
-            .await
-            .map_err(sandbox_to_status);
-        let outcome = if result.is_ok() {
-            "success"
-        } else {
-            "fc_error"
-        };
-        metrics::histogram!(
-            crate::metrics::SANDBOX_BOOT_SECONDS,
-            "phase" => "agent_handshake",
-            "outcome" => outcome,
-            "kind" => "cold",
-        )
-        .record(phase_start.elapsed().as_secs_f64());
-        result?;
-        Ok(Response::new(Empty {}))
+        // `agent_handshake` is the suspected dominant cold-boot phase
+        // (in-VM kernel boot + ext4 mount + NBD page-in + agentd dial);
+        // this span makes it visible in the end-to-end trace (ADR 0019).
+        let span = tracing::info_span!("host.start_agent", phase = "agent_handshake");
+        link_remote_parent(&span, &req);
+        async move {
+            let r = req.into_inner();
+            let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+            let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
+            let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
+            let phase_start = std::time::Instant::now();
+            let result = self
+                .inner
+                .start_agent(sandbox_id, agent, policy)
+                .await
+                .map_err(sandbox_to_status);
+            let outcome = if result.is_ok() {
+                "success"
+            } else {
+                "fc_error"
+            };
+            metrics::histogram!(
+                crate::metrics::SANDBOX_BOOT_SECONDS,
+                "phase" => "agent_handshake",
+                "outcome" => outcome,
+                "kind" => "cold",
+            )
+            .record(phase_start.elapsed().as_secs_f64());
+            result?;
+            Ok(Response::new(Empty {}))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn apply_egress_policy(

@@ -322,6 +322,13 @@ pub struct CreateSessionResponse {
     pub kind: &'static str,
 }
 
+// Root span of the cold-boot distributed trace (ADR 0019). Every
+// downstream gRPC call to a host inherits this span's `traceparent` via
+// `TraceparentInjector`, so the coord → host-agent → firecracker →
+// uffd-handler timeline stitches into one trace. Inert (no export) unless
+// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, but the span is always created so
+// propagation works the moment a collector is wired up.
+#[tracing::instrument(name = "session.create", skip_all)]
 pub async fn create_session(
     state: State<SharedState>,
     req: Json<CreateSessionRequest>,

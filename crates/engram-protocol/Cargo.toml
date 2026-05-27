@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 engram-core.workspace = true
+engram-telemetry.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 bincode.workspace = true
