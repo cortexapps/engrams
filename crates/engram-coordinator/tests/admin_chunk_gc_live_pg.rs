@@ -108,14 +108,17 @@ async fn wipe_pin_set_state(pg: &engram_postgres::PostgresStore) {
         .execute(pool)
         .await
         .expect("wipe chunk_gc_candidates");
-    sqlx::query("DELETE FROM snapshots")
-        .execute(pool)
-        .await
-        .expect("wipe snapshots");
+    // ADR 0020 P1: `enabled_images.base_snapshot_id` is a NOT NULL FK
+    // into `snapshots`, so clear the referencing table FIRST or the
+    // snapshots delete trips the FK constraint.
     sqlx::query("DELETE FROM enabled_images")
         .execute(pool)
         .await
         .expect("wipe enabled_images");
+    sqlx::query("DELETE FROM snapshots")
+        .execute(pool)
+        .await
+        .expect("wipe snapshots");
     sqlx::query(
         "UPDATE sessions
             SET sandbox_id                 = NULL,
