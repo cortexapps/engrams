@@ -42,88 +42,33 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      images: ${{ steps.filter.outputs.images }}
-      host_image: ${{ steps.filter.outputs.host_image }}
-      tf_or_helm: ${{ steps.filter.outputs.tf_or_helm }}
+      images: ${{ steps.lanes.outputs.images }}
+      host_image: ${{ steps.lanes.outputs.host_image }}
+      tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
     steps:
       - uses: actions/checkout@v6
-      - id: filter
-        uses: dorny/paths-filter@v3
         with:
-          # Three filters drive the downstream fan-out into
-          # engrams-internal:
-          # - `images`: container rebake (coord / host-agent / web).
-          #   Gates this workflow's own bake job + the
-          #   `engrams-changed` dispatch that triggers helm-deploy.
-          # - `host_image`: FC host GCE image rebake. Gates the new
-          #   `engrams-host-changed` dispatch that triggers
-          #   bake-fc-host-image in engrams-internal.
-          # - `tf_or_helm`: TF / helm module changes that don't
-          #   need a container or host-image rebake. Gates the new
-          #   `engrams-tf-changed` dispatch that triggers
-          #   tf-apply directly. Without this filter, every OSS
-          #   push fanned tf-apply in parallel with bake-fc-host,
-          #   wasting a ~5min run against the stale image.
-          # paths-filter supports `!` negation — host-side bake
-          # tools (engram-cli, engram-image-builder) ship in no
-          # deployed binary, so excluding them stops a CLI-only or
-          # image-builder-only commit from triggering the entire
-          # container-bake + FC-host-rebake + helm-deploy + TF-apply
-          # fan-out. engram-agentd is baked *into the demo image*
-          # (which has its own manual bake workflow), so it doesn't
-          # affect coord/web/host-agent container images either.
-          # (ADR 0015 M1 collapsed engram-bootstrap into agentd; the
-          # standalone crate is gone, so it doesn't need its own
-          # negation here.) engram-harness-* belongs to
-          # bake-harness-claude's lane, which has its own narrow
-          # filters.
-          filters: |
-            images:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'crates/**'
-              - '!crates/engram-cli/**'
-              - '!crates/engram-image-builder/**'
-              - '!crates/engram-agentd/**'
-              - '!crates/engram-harness-claude/**'
-              - '!crates/engram-harness-noop/**'
-              - '!crates/engram-harness-proto/**'
-              - 'docker/**'
-              - 'deploy/migrations/**'
-              - 'web/**'
-              - '.github/workflows/bake-images.yml'
-            host_image:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'crates/**'
-              - '!crates/engram-cli/**'
-              - '!crates/engram-image-builder/**'
-              - '!crates/engram-agentd/**'
-              - '!crates/engram-harness-claude/**'
-              - '!crates/engram-harness-noop/**'
-              - '!crates/engram-harness-proto/**'
-              # Coord-only crates: not in engram-host-agent's dep
-              # tree. Changes here don't alter the host-agent
-              # binary that bakes into the FC host GCE image, so
-              # there's no point in firing the ~15 min FC-host
-              # bake + ~3 min MIG roll on a coord-only commit.
-              # Verified via `Cargo.toml` of engram-host-agent and
-              # its transitive deps: none of these crates are
-              # reachable from engram-host-agent. (Coord IS itself
-              # a consumer of engram-host-agent's LocalHostClient
-              # in mode=all, but the dependency edge is one-way.)
-              # Observed bloat: each commit to engram-coordinator
-              # was forcing the FC roll cycle on 2026-05-20.
-              - '!crates/engram-coordinator/**'
-              - '!crates/engram-postgres/**'
-              - '!crates/engram-cloud-gcp/**'
-              - '!crates/engram-cloud-mock/**'
-              - '!crates/engram-secrets-dev/**'
-              - 'deploy/packer/**'
-              - 'rust-toolchain.toml'
-            tf_or_helm:
-              - 'deploy/terraform/**'
-              - 'deploy/helm/**'
+          # Full history so the detector can diff github.event.before..sha.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # Decide deploy lanes from the cargo dependency graph, not a
+      # hand-maintained path denylist. detect-rebake-lanes.py computes each
+      # artifact's binary RELEASE-dep closure (dev-deps excluded — they
+      # don't ship) and trips a lane iff a changed crate is in that closure.
+      # This can't silently drift the way `crates/** minus !denylist` did:
+      # that list wrongly excluded engram-postgres / engram-agentd /
+      # engram-image-builder / engram-harness-proto, all of which bake into
+      # the FC-host binaries — a change to them never rebaked the host.
+      #   images     = closure(coordinator, host-agent) + web/docker/migrations
+      #   host_image = closure(host-agent, uffd-handler) + deploy/packer + toolchain
+      #   tf_or_helm = deploy/terraform + deploy/helm
+      # Containers and the FC host image are decoupled: a uffd-handler change
+      # rebakes the host image only; a coord change rebakes containers only.
+      - id: lanes
+        run: |
+          python3 .github/scripts/detect-rebake-lanes.py \
+            --base "${{ github.event.before }}" \
+            --head "${{ github.sha }}"
 
   bake:
     needs: detect
