@@ -3101,6 +3101,50 @@ impl SandboxBackend for FirecrackerBackend {
         self.repoint_harness_drive(&api, id).await
     }
 
+    /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
+    /// capture attaches as `/dev/vdb` so the snapshot carries a harness
+    /// drive slot to re-point per session at restore. From
+    /// `FirecrackerConfig.stub_harness_path` (`ENGRAM_STUB_HARNESS_PATH`).
+    fn stub_harness_path(&self) -> Option<std::path::PathBuf> {
+        self.config.stub_harness_path.clone()
+    }
+
+    /// ADR 0020 P1: block until agentd dials its ready port. Extracted
+    /// from `start_agent`'s step 1 so the base-snapshot capture can
+    /// reach a quiescent guest without spawning a session harness.
+    #[tracing::instrument(name = "fc.wait_agent_ready", skip_all, fields(sandbox_id = %id))]
+    async fn wait_agent_ready(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let mut agent_ready = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.agent_ready.clone()
+        };
+        // Generous deadline (180 s): the dev-vm's fake-gcs path can
+        // stretch chunked-NBD page-ins to ~2-3 min on a cold cache;
+        // prod is ~15-20 s. Failure means agentd never came up.
+        let wait_deadline = Duration::from_secs(180);
+        if !*agent_ready.borrow() {
+            tracing::Instrument::instrument(
+                tokio::time::timeout(wait_deadline, agent_ready.wait_for(|v| *v)),
+                tracing::info_span!("fc.await_agent_ready", phase = "agent_handshake"),
+            )
+            .await
+            .map_err(|_| {
+                SandboxError::Vm(
+                    format!(
+                        "agentd did not dial ready port within {}s — guest never bound \
+                         ENGRAM_AGENTD_PORT (kernel panic? engram-init hang?)",
+                        wait_deadline.as_secs()
+                    )
+                    .into(),
+                )
+            })?
+            .map_err(|e| {
+                SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
+            })?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(name = "fc.start_agent", skip_all, fields(sandbox_id = %id))]
     async fn start_agent(
         &self,
@@ -3126,46 +3170,18 @@ impl SandboxBackend for FirecrackerBackend {
         // running when the snapshot was captured. Steps 2-3 run
         // immediately on those paths.
         let phase_start = std::time::Instant::now();
-        let (vsock_uds_path, mut agent_ready, has_harness) = {
+        // Step 1: wait for agentd's startup dial (ADR 0019: the dominant
+        // cold-boot phase — guest kernel boot + ext4 mount + chunked-NBD
+        // page-in + ready-port dial). Shared with the base-snapshot
+        // capture via `wait_agent_ready`.
+        self.wait_agent_ready(id).await?;
+        let (vsock_uds_path, has_harness) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             (
                 live.state.vsock_uds_path.clone(),
-                live.agent_ready.clone(),
                 live.state.spec.harness_substrate.is_some(),
             )
         };
-
-        // Wait for agentd's startup dial. Deadline is generous
-        // (180 s) because the dev-vm's fake-gcs-server path can
-        // stretch chunked-NBD page-ins to ~2-3 min on a fresh chunk
-        // cache. Prod is ~15-20 s. Failure here means agentd never
-        // came up — a real bug, surfaced loudly rather than papered
-        // over.
-        let wait_deadline = Duration::from_secs(180);
-        if !*agent_ready.borrow() {
-            // ADR 0019: this is the dominant cold-boot phase — the host
-            // blocking on the guest to finish kernel boot + ext4 mount +
-            // chunked-NBD page-in and dial its ready port. Its own span so
-            // the trace separates "waiting for the guest" from harness spawn.
-            tracing::Instrument::instrument(
-                tokio::time::timeout(wait_deadline, agent_ready.wait_for(|v| *v)),
-                tracing::info_span!("fc.await_agent_ready", phase = "agent_handshake"),
-            )
-            .await
-            .map_err(|_| {
-                SandboxError::Vm(
-                    format!(
-                        "agentd did not dial ready port within {}s — guest never bound \
-                             ENGRAM_AGENTD_PORT (kernel panic? engram-init hang?)",
-                        wait_deadline.as_secs()
-                    )
-                    .into(),
-                )
-            })?
-            .map_err(|e| {
-                SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
-            })?;
-        }
 
         let (harness_dev, harness_mount) = if has_harness {
             (

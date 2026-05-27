@@ -1933,6 +1933,62 @@ impl SandboxBackend for PooledBackend {
         result
     }
 
+    #[tracing::instrument(name = "host.build_base_snapshot", skip_all)]
+    async fn build_base_snapshot(
+        &self,
+        mut spec: SandboxSpec,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        // ADR 0020 P1. Attach the host-local stub harness so the captured
+        // snapshot carries a harness drive slot that `swap_harness_drive`
+        // re-points per session at restore (the option-D mechanism). We
+        // want a *stub*, not a session harness, so clear `harness_pack_uri`
+        // — that keeps `create`'s harness-cache-resolve branch from
+        // overwriting `harness_substrate` with a real pack.
+        let stub = self.inner.stub_harness_path().ok_or_else(|| {
+            SandboxError::InvalidSpec(
+                "base-snapshot capture needs a stub harness ext4 \
+                 (set ENGRAM_STUB_HARNESS_PATH on the host)"
+                    .into(),
+            )
+        })?;
+        spec.harness_pack_uri = None;
+        spec.harness_substrate = Some(stub);
+
+        // Boot the capture VM (opens the cold_boot operation scope on Linux).
+        let id = self.create(spec).await?;
+
+        // Drive the capture to a snapshot, then ALWAYS tear the VM down —
+        // a capture VM has no session and must not linger.
+        let captured = async {
+            // Wait for the guest to reach agentd-ready (bootstrap on
+            // accept(), harness unmounted — the option-D capture point).
+            self.inner.wait_agent_ready(id).await?;
+            // Close the cold-boot window (mirrors `start_agent`) before the
+            // snapshot flush opens its own `snapshot` operation scope.
+            #[cfg(target_os = "linux")]
+            if let Some(state) = self.nbd_sandboxes.get(&id) {
+                state.backend.operation_scope().end();
+            }
+            // Capture: pause → flush disk → chunk memory + upload
+            // state.bin/sidecar to BlobStorage. This is the portable
+            // artifact `create_session` restores from.
+            self.snapshot(id).await
+        }
+        .await;
+
+        // Best-effort teardown: a destroy failure must not mask a
+        // successful capture (the metadata is already durable in
+        // BlobStorage); the host reconcile pass GCs any leak.
+        if let Err(e) = self.destroy(id).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                error = %e,
+                "base-snapshot capture: destroy of capture VM failed; reconcile will GC",
+            );
+        }
+        captured
+    }
+
     async fn swap_harness_drive(
         &self,
         id: SandboxId,

@@ -29,7 +29,8 @@ use tonic::transport::Channel;
 use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest, Empty,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
+    CreateSandboxRequest, Empty,
     ExecStartRequest, GuestIpResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
     ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
@@ -193,6 +194,23 @@ impl GrpcHostClient {
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
         decode_sandbox_id(&resp.uuid)
+    }
+
+    pub async fn build_base_snapshot(
+        &self,
+        spec: SandboxSpec,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let req = BuildBaseSnapshotRequest {
+            spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
+        };
+        let resp = self
+            .inner
+            .clone()
+            .build_base_snapshot(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
     }
 
     pub async fn guest_ip(&self, id: SandboxId) -> Option<String> {
@@ -691,6 +709,13 @@ impl HostClient for GrpcHostClient {
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         Self::restore(self, metadata).await
+    }
+
+    async fn build_base_snapshot(
+        &self,
+        spec: SandboxSpec,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Self::build_base_snapshot(self, spec).await
     }
 
     async fn start_agent(

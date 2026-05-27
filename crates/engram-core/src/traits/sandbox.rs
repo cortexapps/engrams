@@ -218,6 +218,50 @@ pub trait SandboxBackend: Send + Sync {
     /// rehydrates from chunks if local files are missing.
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
 
+    /// ADR 0020 P1: block until the guest's agentd has dialled its
+    /// ready port — i.e. the kernel booted, the rootfs mounted, and
+    /// bootstrap/agentd reached `accept()`. This is the same wait
+    /// [`Self::start_agent`] does before spawning a harness, exposed
+    /// standalone so the base-snapshot capture can reach a quiescent
+    /// guest *without* binding a session harness. Default errors —
+    /// only the FC backend (which owns the per-sandbox `agent_ready`
+    /// watch) implements it.
+    async fn wait_agent_ready(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `wait_agent_ready` (FC-only)".into(),
+        ))
+    }
+
+    /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
+    /// capture attaches as the harness drive (so the captured snapshot
+    /// carries a harness drive slot that `swap_harness_drive` can
+    /// re-point per session at restore time). `None` when no stub is
+    /// configured — `build_base_snapshot` then fails fast. Only the FC
+    /// backend (which holds `FirecrackerConfig.stub_harness_path`)
+    /// returns a path.
+    fn stub_harness_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// ADR 0020 P1: boot `spec` to agentd-ready with the stub harness
+    /// attached (harness unmounted — the option-D capture point), take
+    /// a portable FC snapshot (chunked memory + uploaded state/sidecar),
+    /// tear the capture VM down, and return the snapshot's metadata. The
+    /// coord calls this on a host during `POST /api/enabled-images`;
+    /// `create_session` later restores from the resulting snapshot.
+    ///
+    /// Implemented on `PooledBackend` (which owns the chunk-store +
+    /// state/sidecar upload that make the snapshot portable). Default
+    /// errors so non-pooled backends opt out cleanly.
+    async fn build_base_snapshot(
+        &self,
+        _spec: SandboxSpec,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),
+        ))
+    }
+
     /// Local-host path where the backend writes/reads snapshot
     /// artifacts for `snapshot_id`. Used by `PooledBackend` to
     /// chunk `memory.bin` after `snapshot()` returns and to

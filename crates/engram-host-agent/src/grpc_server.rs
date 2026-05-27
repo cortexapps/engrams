@@ -23,7 +23,8 @@ use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CowStateAllResponse, CowStateResponse,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
+    BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse,
     CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest,
     GuestIpResponse, ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
     ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
@@ -200,6 +201,27 @@ impl HostService for HostServiceImpl {
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SandboxIdMessage {
                 uuid: id.as_uuid().as_bytes().to_vec(),
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn build_base_snapshot(
+        &self,
+        req: Request<BuildBaseSnapshotRequest>,
+    ) -> Result<Response<BuildBaseSnapshotResponse>, Status> {
+        let span = tracing::info_span!("host.build_base_snapshot");
+        link_remote_parent(&span, &req);
+        async move {
+            let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
+            let metadata = self
+                .inner
+                .build_base_snapshot(spec)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(BuildBaseSnapshotResponse {
+                metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             }))
         }
         .instrument(span)

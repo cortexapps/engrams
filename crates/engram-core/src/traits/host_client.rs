@@ -84,6 +84,21 @@ pub trait HostClient: Send + Sync {
     }
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
 
+    /// ADR 0020 P1: boot the image to agentd-ready, snapshot it, tear
+    /// the capture VM down, and return the portable snapshot metadata.
+    /// Called by the coord during `POST /api/enabled-images` to produce
+    /// the per-image base snapshot `create_session` restores from.
+    /// Default errors so mocks / non-FC hosts opt out; the local +
+    /// gRPC clients delegate to the backend's `build_base_snapshot`.
+    async fn build_base_snapshot(
+        &self,
+        _spec: SandboxSpec,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `build_base_snapshot`".into(),
+        ))
+    }
+
     /// ADR 0013: bundle the egress policy with the agent spawn so the
     /// host applies the policy to its egress proxy registry BEFORE
     /// starting the agent process. Atomic by construction —

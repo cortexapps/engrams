@@ -107,6 +107,13 @@ impl HostClient for LocalHostClient {
         self.sandbox.restore(metadata).await
     }
 
+    async fn build_base_snapshot(
+        &self,
+        spec: SandboxSpec,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        self.sandbox.build_base_snapshot(spec).await
+    }
+
     async fn start_agent(
         &self,
         id: SandboxId,

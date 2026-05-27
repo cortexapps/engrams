@@ -37,6 +37,14 @@ service HostService {
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
 
+  // ADR 0020 P1: boot the image to agentd-ready with a stub harness,
+  // take a portable FC snapshot (chunked memory + uploaded
+  // state/sidecar), tear the capture VM down, and return the
+  // snapshot's metadata. The coord calls this during
+  // POST /api/enabled-images to produce the per-image base snapshot
+  // that CreateSession later restores from.
+  rpc BuildBaseSnapshot(BuildBaseSnapshotRequest) returns (BuildBaseSnapshotResponse);
+
   // ---- harness routing ----
   rpc BindHarnessSession(BindHarnessSessionRequest) returns (Empty);
   rpc UnbindHarnessSession(UnbindHarnessSessionRequest) returns (Empty);
@@ -150,6 +158,16 @@ message SnapshotResponse {
 // --- Restore ---
 
 message RestoreRequest {
+  // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
+  bytes metadata_bincode = 1;
+}
+message BuildBaseSnapshotRequest {
+  // bincode-encoded `engram_core::types::sandbox::SandboxSpec` — the
+  // image to boot + capture. The host substitutes its local stub
+  // harness for the harness drive; harness_pack_uri is ignored.
+  bytes spec_bincode = 1;
+}
+message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
   bytes metadata_bincode = 1;
 }
