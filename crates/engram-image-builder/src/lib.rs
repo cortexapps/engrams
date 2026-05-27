@@ -185,6 +185,16 @@ const DEFAULT_INIT_SHIM: &str = r#"#!/bin/sh
 # engram-agentd.
 set -e
 mount -t proc  proc /proc 2>/dev/null || true
+# ADR 0019: cheap boot-phase timing markers. /proc/uptime's first field is
+# seconds since kernel boot, so each value is cumulative kernel-relative
+# time and the deltas between marks are phase durations. Emitted to the
+# guest console (lands in the host's per-sandbox firecracker.log); a
+# follow-up can have host-agent forward `engram-init: mark` lines into
+# Cloud Logging. Until then they're a dev-vm spike aid (read over SSH).
+mark() { echo "engram-init: mark $1 uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo '?')" >&2; }
+# ~kernel boot + rootfs ext4 mount (the chunked-NBD page-in window) up to
+# the first userspace instruction.
+mark kernel_to_init
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true
 # devpts is required for PTY allocation (`forkpty` / `posix_openpt`).
@@ -193,6 +203,7 @@ mount -t devtmpfs dev /dev 2>/dev/null || true
 # nodes to materialise here. Standard Linux init does this.
 mkdir -p /dev/pts 2>/dev/null || true
 mount -t devpts devpts /dev/pts 2>/dev/null || true
+mark fs_mounts_done
 # DNS for userspace. The kernel handled IP+routes via `ip=dhcp` (see
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
 # we do it here. 192.168.64.1 is the VZ NAT gateway, which Apple's
@@ -252,6 +263,7 @@ if [ -b /dev/vdb ]; then
     fi
     rmdir /run/engram/.ca-stage 2>/dev/null || true
 fi
+mark ca_staged
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
@@ -300,6 +312,7 @@ fi
 # to ~150ms (fresh spawn). Worth it because the boot cost was paid
 # on every session create, and only a tiny fraction of sessions
 # actually use the SHELL tab.
+mark exec_agentd
 exec /sbin/engram-agentd --port __VSOCK_PORT__
 "#;
 

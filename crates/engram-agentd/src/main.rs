@@ -49,9 +49,20 @@ fn main() -> ExitCode {
     // `engram_traceparent`). Its start offset in the trace reveals how long
     // the guest spent in kernel boot + ext4 mount + chunked-NBD page-in
     // before agentd ran — the bulk of the `agent_handshake` wait (ADR 0019).
-    let span = tracing::info_span!("agentd.run");
+    let span = tracing::info_span!("agentd.run", boot_elapsed_s = tracing::field::Empty);
     if let Some(tp) = kernel_cmdline_value("engram_traceparent") {
         engram_telemetry::set_parent_from_traceparent(&span, &tp);
+    }
+    // Record the pre-agentd boot duration on the span (and log it), so the
+    // cold-boot trace separates "guest booting before agentd ran" (kernel +
+    // ext4 mount + page-in) from agentd's own startup. The shim's
+    // `engram-init: mark` console lines split this further (firecracker.log).
+    if let Some(secs) = boot_uptime_secs() {
+        span.record("boot_elapsed_s", secs);
+        tracing::info!(
+            boot_elapsed_s = secs,
+            "agentd starting (pre-agentd boot window)"
+        );
     }
 
     let args = match parse_args() {
@@ -185,6 +196,18 @@ fn kernel_cmdline_value(key: &str) -> Option<String> {
 
 fn token_from_kernel_cmdline() -> Option<String> {
     kernel_cmdline_value("engram_token")
+}
+
+/// Seconds since kernel boot (`/proc/uptime` field 1), Linux only. At
+/// agentd's start this is ≈ the whole pre-agentd cold-boot window (kernel
+/// boot + rootfs ext4 mount + chunked-NBD page-in + engram-init), which the
+/// host can't observe from outside the VM (ADR 0019).
+fn boot_uptime_secs() -> Option<f64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    raw.split_ascii_whitespace().next()?.parse::<f64>().ok()
 }
 
 async fn run(args: Args) -> std::io::Result<()> {
