@@ -1044,6 +1044,7 @@ impl FirecrackerBackend {
     /// Returns the live `Child` so the caller can hold it for the
     /// VM's lifetime.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
     async fn spawn_uffd_handler(
         &self,
         uffd_uds: &Path,
@@ -1105,6 +1106,13 @@ impl FirecrackerBackend {
         if let Some(path) = self.config.uffd_blob_root.as_ref() {
             cmd.arg("--blob-root").arg(path);
         }
+        // ADR 0019: hand the handler our current span's W3C traceparent so
+        // its process-root span (and the MAP_POPULATE / fault-serving spans
+        // under it) stitch onto this restore's trace. Inert when OTLP is off
+        // (`current_traceparent` returns `None`).
+        if let Some(tp) = engram_telemetry::current_traceparent() {
+            cmd.env("TRACEPARENT", tp);
+        }
 
         let mut child = cmd
             .stdout(Stdio::from(log))
@@ -1133,6 +1141,7 @@ impl FirecrackerBackend {
     /// so the outer `create` can do unconditional cleanup on failure.
     /// On any error, the spawned firecracker `Child` is dropped (and
     /// SIGKILL'd via `kill_on_drop`), and the jail dir is removed.
+    #[tracing::instrument(name = "fc.create_in_jail", skip_all, fields(sandbox_id = %sandbox_id))]
     async fn create_in_jail(
         &self,
         sandbox_id: SandboxId,
@@ -1199,6 +1208,7 @@ impl FirecrackerBackend {
     /// teardown-on-error without the early-return ergonomics
     /// getting tangled.
     #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(name = "fc.create_in_jail_after_net", skip_all, fields(sandbox_id = %sandbox_id))]
     async fn create_in_jail_after_net(
         &self,
         sandbox_id: SandboxId,
@@ -1569,6 +1579,7 @@ impl FirecrackerBackend {
     /// Stand up a fresh Firecracker process and load `snapshot_dir`'s
     /// `state.bin`/`memory.bin` into it. Symmetric with `create_in_jail`
     /// — same outer cleanup contract on error.
+    #[tracing::instrument(name = "fc.restore_in_jail", skip_all, fields(sandbox_id = %sandbox_id))]
     async fn restore_in_jail(
         &self,
         sandbox_id: SandboxId,

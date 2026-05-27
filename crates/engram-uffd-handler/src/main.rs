@@ -65,8 +65,17 @@ fn main() -> std::process::ExitCode {
         }
     };
 
+    // ADR 0019: root this process's spans on the host-agent's restore span,
+    // whose `traceparent` the FC backend handed us via the env. No-op when
+    // unset (OTLP off) or malformed.
+    use tracing::Instrument;
+    let span = tracing::info_span!("uffd.run");
+    if let Ok(tp) = std::env::var("TRACEPARENT") {
+        engram_telemetry::set_parent_from_traceparent(&span, &tp);
+    }
+
     let handle = rt.handle().clone();
-    match rt.block_on(linux::run(args, handle)) {
+    match rt.block_on(linux::run(args, handle).instrument(span)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("engram-uffd-handler: {e}");

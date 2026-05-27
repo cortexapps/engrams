@@ -1219,6 +1219,7 @@ dependencies = [
  "engram-harness-proto",
  "engram-image-builder",
  "engram-storage-local",
+ "engram-telemetry",
  "futures",
  "libc",
  "metrics",
