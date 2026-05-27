@@ -184,18 +184,27 @@ optimization phases, ordered by that data.
       firecracker.log (`0dfa783`) — it's a /bin/sh shim so it can't carry
       Rust spans. TODO: harness-spawn-handler span; forward the shim marks
       from firecracker.log into Cloud Logging (host-agent tail+re-emit).
-- [ ] uffd-handler: `MAP_POPULATE` (`runtime.rs:~292`), time-to-first-fault,
-      working-set fault tail (restore path; not on the cold-create critical path).
+- [x] uffd-handler: `uffd.map_populate` span around the canonical-memory
+      mmap (`a8b4b41`) — restore-path critical cost (H2). TODO:
+      time-to-first-fault + working-set fault tail.
 - [~] `restore_in_jail` / `PooledBackend::restore` *internal* sub-steps
       (netns, FC spawn, symlink, socket-wait, materialize, NBD attach) —
       function-level spans exist; finer sub-step spans deferred.
 
 ### 0d — NVMe / disk I/O visibility
-- [ ] In-process spans (cheap, default-on) around I/O wrappers already on
-      the path — chunk-store cache `get`/`prefetch_chunks_parallel`
-      (`engram-chunk-store/src/cache.rs`), blob fetch, `disk_daemon` NBD
-      reads (`engram-host-agent/src/disk_daemon/`). Record bytes + tier
-      (nvme/blob/canonical-mmap) as span attributes.
+- **Decision: metrics, not per-op spans.** The chunked-NBD page-in during
+  ext4 mount is thousands of small reads per boot — per-read spans would
+  flood the trace and obscure the structure. And the page-in *window* is
+  already captured by the pre-agentd markers (`kernel_to_init` +
+  `boot_elapsed_s`, `0dfa783`). So the right 0d primitive is **aggregate
+  counters/histograms** (chunks fetched, bytes, nvme-hit vs blob-miss,
+  fetch latency) on the chunk-store/`disk_daemon` path — high-frequency I/O
+  belongs in Prometheus, correlated by time with the trace. (The chunk
+  cache already tags a `tier` label.)
+- [ ] Add the per-sandbox page-in counters/histograms (follow-up; not spans).
+- [ ] Kernel-level (dev-vm spike only): `blktrace`/`bpftrace` on the NVMe
+      queue + `MAP_POPULATE` page-faults, under the `dev-vm` skill. Skip
+      in prod (too heavy; user flagged not-worth-it if costly).
 - [ ] Kernel-level (dev-vm spike only): `blktrace`/`bpftrace` on the NVMe
       queue + `MAP_POPULATE` page-faults, under the `dev-vm` skill. Skip
       in prod (too heavy; user flagged not-worth-it if costly).
