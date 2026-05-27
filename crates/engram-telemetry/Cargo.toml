@@ -1,0 +1,19 @@
+[package]
+name = "engram-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared tracing + OpenTelemetry init for Engram binaries. ADR 0019."
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

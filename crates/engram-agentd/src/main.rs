@@ -26,12 +26,13 @@ use std::process::ExitCode;
 use engram_agentd::serve_connection;
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Held for the lifetime of `main`; declared before the runtime so it
+    // drops *after* the runtime, flushing pending OTLP spans on shutdown
+    // (ADR 0019). OTLP is inert unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+    let _telemetry = engram_telemetry::init(engram_telemetry::Config {
+        service_name: "engram-agentd",
+        default_filter: "info",
+    });
 
     let args = match parse_args() {
         Ok(a) => a,

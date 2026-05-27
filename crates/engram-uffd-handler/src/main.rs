@@ -38,12 +38,13 @@ fn main() -> std::process::ExitCode {
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Held for the lifetime of `main`; declared before the runtime so it
+    // drops *after* the runtime, flushing pending OTLP spans on shutdown
+    // (ADR 0019). OTLP is inert unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+    let _telemetry = engram_telemetry::init(engram_telemetry::Config {
+        service_name: "engram-uffd-handler",
+        default_filter: "info",
+    });
 
     let args = match linux::parse_args() {
         Ok(a) => a,

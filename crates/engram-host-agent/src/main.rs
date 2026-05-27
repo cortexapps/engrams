@@ -178,7 +178,9 @@ fn parse_ca_source_choice(s: &str) -> Result<CaSourceChoice, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), HostAgentError> {
-    init_tracing();
+    // Held for the lifetime of `main`; its `Drop` flushes pending OTLP
+    // spans on shutdown (ADR 0019).
+    let _telemetry = init_tracing();
 
     let cli = Cli::parse();
 
@@ -604,25 +606,23 @@ async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Op
     }
 }
 
-/// Initialise the global tracing subscriber.
+/// Initialise the global tracing subscriber (+ optional OpenTelemetry
+/// OTLP export; ADR 0019).
 ///
 /// Honors `ENGRAM_LOG_FORMAT` (`pretty`, the default, or `json` for
 /// production Cloud Logging ingestion). Falls back to `RUST_LOG` for
 /// the filter, then to `info,engram=debug` as a sensible local
-/// default.
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,engram=debug"));
-    let json = matches!(
-        std::env::var("ENGRAM_LOG_FORMAT").as_deref(),
-        Ok("json") | Ok("JSON")
-    );
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    if json {
-        builder.json().init();
-    } else {
-        builder.init();
-    }
+/// default. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, spans are also
+/// exported to that collector; otherwise OTLP is inert.
+///
+/// The returned guard must be held for the lifetime of `main` so spans
+/// flush on shutdown.
+#[must_use]
+fn init_tracing() -> engram_telemetry::TelemetryGuard {
+    engram_telemetry::init(engram_telemetry::Config {
+        service_name: "engram-host-agent",
+        default_filter: "info,engram=debug",
+    })
 }
 
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`

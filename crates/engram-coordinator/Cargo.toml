@@ -57,6 +57,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+engram-telemetry.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 toml.workspace = true

@@ -72,6 +72,7 @@ reqwest.workspace = true
 nix = { version = "0.31", default-features = false, features = ["fs", "sched"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+engram-telemetry.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 uuid.workspace = true
