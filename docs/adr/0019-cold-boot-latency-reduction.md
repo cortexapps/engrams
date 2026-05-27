@@ -1,14 +1,18 @@
 # ADR 0019: Cold-boot latency reduction — measure first, then optimize
 
-Status: 2026-05-26 — **Proposed.** Investigation done; Phase 0
-(distributed-tracing instrumentation) not yet started. This ADR is
-authored before code per our ADR-bookend practice; it will be updated
-between phases with the measured breakdown and divergences, and flipped
-to Accepted once the Phase 0 deliverable (a span→ms table) lands and the
-optimization order is chosen from real data.
+Status: 2026-05-27 — **Accepted.** Phase 0 (distributed-tracing
+instrumentation) is complete and **prod-validated**: a real cold-boot
+`POST /sessions` produced a full 173-span cross-process trace in **Google
+Cloud Trace** (coord → host-agent), via the per-host/per-pod otelcol
+collectors shipped here. The measured span→ms breakdown (below, "Phase 0
+result #3 — prod") confirms the cold boot is dominated by chunked-NBD
+rootfs page-in + a (currently unspanned) `image_resolve`/`materialize`
+gap on cold-cache hosts — ranking **H1 (restore-from-base)** as the lever,
+with H2 (drop the serial on-demand page-in) as the cheaper independent win.
+Phases 1+ remain hypotheses; this ADR closes the *measurement* phase.
 
-Phase: 0 (instrument + profile). Phases 1+ are *hypotheses* below, to be
-confirmed and ordered by Phase 0 data — not committed work.
+Phase: 0 (instrument + profile) — **done**. The Phase 1+ optimizations
+below are now backed by prod data; pursuing them is follow-up work.
 
 Commit chain (Phase 0, on `main`, each compiles clean via
 `cargo check --workspace`):
@@ -53,9 +57,18 @@ Commit chain (Phase 0, on `main`, each compiles clean via
 - `1319c76` — 0d: chunk-cache page-in metrics (`engram_chunk_cache_bytes_total`,
   `engram_chunk_fetch_seconds`) — aggregate page-in volume + slow-tier latency.
 - `5bd7984` — 0c: `agentd.spawn_harness` span (in-guest harness mount + exec).
-- _(pending)_ host-agent forwarding of `engram-init: mark` lines into Cloud
-  Logging; prod canary (guest-span export wiring + real magnitudes). The
-  instrumentation itself is complete and Linux-clippy-clean.
+- `2ed96be` — `OperationScope`: operation-scoped data-plane tracing
+  (`chunk.fetch`/`chunk.flush` for cold_boot/resume/snapshot).
+- `41185f6` — deploy: GCP otelcol collector (per-host systemd + coord sidecar).
+- `2cb83dd` — fix: collector image (0.111.0) + native sidecar, after the
+  prod rollout incident (see "Prod tracing rollout").
+- **Phase 0 closed (2026-05-27):** deployed to prod; a real cold-boot trace
+  landed in Cloud Trace (see "Phase 0 result #3"). All commits on `main`.
+
+Deferred follow-ups (not blocking Phase 0): the `image_resolve`/`materialize`
+spans (the ~7.5s unspanned gap prod surfaced); guest `agentd` spans (per-
+sandbox TAP-gateway endpoint + agentd image rebuild); host-agent forwarding
+of `engram-init: mark` lines into Cloud Logging; a warm-host comparison trace.
 
 ## Context
 
@@ -490,6 +503,43 @@ pre-userspace / in the `/bin/sh` shim, so they surface as the
 `chunk.fetch` spans (host-side, no guest export) that show the page-in
 *driving* the mount. Putting the marks *in* the trace later = host-agent
 tailing `firecracker.log` and re-emitting them as span events.
+
+## Phase 0 result #3 — PROD validation via Cloud Trace (2026-05-27)
+
+After the rollout + incident fix, a real prod cold-boot (`POST /sessions`,
+Claude harness, freshly-rolled host so cold OCI + cold chunk cache) produced
+a **173-span** trace in Google Cloud Trace (`1773e08a…`), confirming the full
+pipeline end-to-end: coord + host-agent → local otelcol → `googlecloud`
+exporter → Cloud Trace, authed by each component's SA (`roles/cloudtrace.agent`).
+
+Breakdown (~24s total; the worst-case freshly-rolled host):
+
+| phase | dur | spanned |
+|---|---|---|
+| `host.create_sandbox` → `fc.create_in_jail` **gap** | **~7.5s** | ❌ `image_resolve` + `materialize` (histogram-only) |
+| `fc.create_in_jail` (+ after_net) | ~0.16s | ✅ |
+| `fc.await_agent_ready` | **~15s** | ✅ |
+| └ **162 × `chunk.fetch` @ ~84ms** ≈ 13.6s | rootfs/substrate page-in | ✅ |
+| `fc.spawn_harness` | ~1s | ✅ |
+
+**Findings (now from prod, not dev-vm):**
+- **The chunked-NBD rootfs page-in dominates the in-VM wait** — 162 serial
+  on-demand `chunk.fetch`s (~84ms each on prod GCS, vs ~800ms on the dev-vm
+  fake-gcs) ≈ 13.6s of the ~15s `await_agent_ready`. Strictly serial, no
+  prefetch. → **H1** (restore-from-base skips it entirely) is the lever;
+  **H2/prefetch-or-parallelize the page-in** is the cheaper independent win.
+- **A ~7.5s unspanned gap** (`image_resolve` + `materialize`) on cold-cache
+  hosts — the first thing to instrument next (it's a third of this boot and
+  invisible in the trace today; spans go at the existing histogram
+  boundaries in `pooled_backend.rs`).
+- **Warm-host caveat:** this was the cold-cache worst case. A warm host has
+  ~0 `image_resolve`/`materialize` and NVMe-hit `chunk.fetch`s, landing
+  nearer the ~15s prod cold-boot baseline. A warm-host trace for the
+  comparison is a cheap follow-up.
+
+Net: the measurement phase delivered — we can now follow a prod cold boot
+span-by-span down to the per-chunk page-in, and the optimization order is
+chosen from real data (H1 ≫ H2 ≫ the rest).
 
 ## Candidate optimizations (hypotheses — ranked by Phase 0 data)
 
