@@ -29,9 +29,12 @@ Commit chain (Phase 0, on `main`, each compiles clean via
   `cargo clippy --workspace --all-targets -- -D warnings` on the Linux dev-vm.
 - `3938109` — 0c: coord scheduling/resume spans (`create_for_session`,
   `restore_for_session`, `finish_resume_to_active`).
+- `a0ce662` — 0e infra: Jaeger collector in the dev docker-compose, wired
+  into `just dev` (Tiltfile), `just integration-up` (dev-vm), and
+  `just trace-up`; OS-agnostic bridge-mode ports. Verified on macOS.
 - _(pending)_ vsock traceparent hop to in-guest agentd; deeper 0c spans
   (uffd `MAP_POPULATE`, agentd boot); 0d chunk-store/NBD I/O spans;
-  0e dev-vm Jaeger collection + the span→ms write-up.
+  0e: drive a real boot/resume/snapshot and capture the span→ms write-up.
 
 ## Context
 
@@ -164,9 +167,13 @@ optimization phases, ordered by that data.
       in prod (too heavy; user flagged not-worth-it if costly).
 
 ### 0e — Collect & write up
-- [ ] Dev-vm: run Jaeger/Tempo locally; drive a cold boot + a resume + a
-      snapshot under the FC integration harness (already in CI on
-      Blacksmith, `test-firecracker`).
+- [x] Jaeger collector wired into the local dev stack (docker-compose
+      `jaeger` service: OTLP/gRPC :4317, HTTP :4318, UI :16686), with
+      `OTEL_EXPORTER_OTLP_ENDPOINT` defaulted through `just dev` (Tiltfile),
+      `just integration-up` (dev-vm), and standalone `just trace-up`.
+      OS-agnostic (bridge-mode ports work on macOS + Linux). `a0ce662`.
+- [ ] Drive a cold boot + a resume + a snapshot (FC integration harness on
+      the dev-vm, `test-firecracker`) with the endpoint set; capture traces.
 - [ ] Prod export (follow-up, deploy-repo `engrams-internal`): collector
       via Google Cloud Trace or a Tempo sidecar. Out of scope for this
       repo's PR.
