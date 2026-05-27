@@ -177,10 +177,16 @@ optimization phases, ordered by that data.
       emitted a `session.create` span (3.9ms) that landed in Jaeger and is
       queryable via `/api/traces?service=engram-coordinator`. Confirms
       engram-telemetry → OTLP/gRPC → Jaeger works.
-- [ ] Drive the *full* multi-process boot (coord + host-agent + FC) on the
-      dev-vm via `just integration-up` (jaeger + endpoint already wired) so
-      the cross-process `session.create → host.* → fc.* → uffd.run` trace
-      shows the actual phase breakdown; then the span→ms write-up.
+- [x] Drove the full multi-process cold boot on the dev-vm (2026-05-27): a
+      real FC microVM booted via `POST /sessions`; the trace stitched
+      `session.create → coord.create_for_session → host.create_sandbox →
+      fc.create_in_jail → fc.create_in_jail_after_net → host.start_agent`
+      across the gRPC hop. Breakdown in "Phase 0 first result" above:
+      `agent_handshake` is ~98% of cold boot. (Cold create, so no `uffd.run`
+      — that's the restore path.)
+- [ ] Break `agent_handshake` into sub-spans (kernel boot / ext4 mount /
+      NBD page-in / agentd dial) + a prod canary for real magnitudes, before
+      ranking Phase 1.
 - [ ] Prod export (follow-up, deploy-repo `engrams-internal`): collector
       via Google Cloud Trace or a Tempo sidecar. Out of scope for this
       repo's PR.
@@ -188,6 +194,45 @@ optimization phases, ordered by that data.
       measured ms → serial-or-overlappable → optimizable? → expected
       leverage. **Stop and review with the user before Phase 1.** Update
       this ADR with the breakdown and flip to Accepted.
+
+## Phase 0 first result — cross-process cold-boot trace (dev-vm, 2026-05-27)
+
+First end-to-end trace captured: `just integration-up && just integration-test`
+on the dev-vm with Jaeger, a real `POST /sessions` cold-create booting a
+Firecracker microVM. The trace stitches coord → host-agent across the gRPC
+`traceparent` hop (both services present under one trace id), confirming 0b
+propagation end-to-end. Span breakdown (`kind=cold`):
+
+| offset | dur | service | span |
+|---|---|---|---|
+| +0ms | **142,846ms** | coordinator | `session.create` (total) |
+| +2ms | 2,631ms | coordinator | `coord.create_for_session` |
+| +4ms | 2,628ms | host-agent | `host.create_sandbox` |
+| +15ms | 2,616ms | host-agent | `fc.create_in_jail` |
+| +40ms | 2,592ms | host-agent | `fc.create_in_jail_after_net` |
+| **+2,649ms** | **140,189ms** | host-agent | `host.start_agent` (agent_handshake) |
+
+**Finding: `agent_handshake` is ~98% of cold boot** (140.2s of 142.8s);
+host-side VM creation/config is only ~2.6s. This confirms the prod-ops
+hypothesis — the cold path is dominated by *in-VM kernel boot + ext4 mount +
+chunked-NBD page-in + agentd dial*, not host-side VM setup. The dev-vm's
+absolute 143s magnifies prod's ~15s (single nested-virt box, chunked-NBD
+page-in from fake-gcs over the bridge), but the **shape** is what ranks the
+hypotheses.
+
+Implications:
+- **H1 (restore-from-base) is the top lever** — a snapshot restore skips
+  kernel boot + ext4 mount + cold page-in entirely, attacking the 140s
+  directly. This is consistent with prod's ~1s warm-resume vs ~15s cold.
+- `agent_handshake` is still a **single black-box span**. Breaking it into
+  kernel-boot / ext4-mount / first-NBD-page-in / agentd-dial sub-spans
+  (remaining 0c: agentd boot spans + 0d NBD I/O spans) is the next
+  instrumentation step before we can rank H2 (prefetch/MAP_POPULATE — a
+  restore-path cost, not exercised by this cold create) vs in-VM costs.
+- Caveat: dev-vm numbers are not prod numbers. A prod canary (one enabled
+  image, OTLP → a prod collector) is needed for the real magnitudes before
+  committing to Phase 1 — but the **ordering** (agent_handshake ≫ everything)
+  is unlikely to change.
 
 ## Candidate optimizations (hypotheses — ranked by Phase 0 data)
 
