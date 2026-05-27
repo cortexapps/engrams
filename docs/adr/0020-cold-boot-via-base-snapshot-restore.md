@@ -269,27 +269,86 @@ rootfs stage).
 
 ## Phase 2 — Lazy memory + bake-time working-set prefetch [~1 s → ~300–400 ms]
 
-- **DEDICATED MILESTONE — "actually use UFFD" (discovered 2026-05-27, deferred).**
-  The biggest restore win, carved out as its own effort (not done inline here).
-  **Discovery:** the binaries run the **default `RestoreMode::File`** — neither
-  `engram-coordinator` nor `engram-host-agent` main sets `restore_mode`, nothing
-  overrides it, and `engram-uffd-handler` isn't deployed by packer. So the
-  chunked-memory UFFD path (load_snapshot_uffd, spawn_uffd_handler, canonical
-  mmap, prefault traces — all implemented + tested) is **dead in production**;
-  every restore rebuilds the full memory.bin and eager-loads it. **Why it's a
-  milestone, not a flag:** it requires (1) `fc_cfg.restore_mode = Uffd` in both
+- **DEDICATED MILESTONE — chunk-native UFFD ("Route B"), decided 2026-05-27.**
+  The biggest restore win, carved out as its own effort. **Discovery:** the
+  binaries run the **default `RestoreMode::File`** — neither `engram-coordinator`
+  nor `engram-host-agent` main sets `restore_mode`, nothing overrides it, and
+  `engram-uffd-handler` isn't deployed by packer. So the chunked-memory UFFD path
+  (load_snapshot_uffd, spawn_uffd_handler, canonical mmap, prefault traces — all
+  implemented + tested) is **dead in production**; every restore rebuilds the full
+  memory.bin and eager-loads it.
+
+  **Corrected cost model (2026-05-27).** Earlier notes overstated this as "copy
+  4 GiB three times." `materialize_to_file_cached` writes a **sparse** file
+  (`set_len` + seek-past-zeros, `chunk-store/src/file.rs:160`) and the captured
+  base manifest is only **237 × 512 KiB ≈ 118 MiB** of non-zero chunks (a freshly-
+  booted idle Debian — most of the 4 GiB is zero). So prefetch + materialize move
+  ~118 MiB, not 4 GiB; File-mode `load_snapshot` was ~0.64 s only because the zero
+  regions are sparse holes that fault to zero pages without disk reads. The dev-vm
+  ~13 s is ~118 MiB + 237 small-file ops on a slow boot PD, amplified.
+
+  **Why current UFFD also wins nothing.** `runtime.rs:~287` mmaps the materialized
+  `memory.bin` with `MAP_PRIVATE | MAP_POPULATE` and serves canonical-resolved
+  faults from that mmap — so even in UFFD mode we'd still materialize **and**
+  eager-fault the whole file. For a *base* snapshot, `canonical_ref ==
+  session_ref` so *every* fault resolves `Canonical` → the chunk-fetch path is
+  dead. Flipping `restore_mode = Uffd` as-is = File cost + an extra process.
+
+  **Decision — Route B (chunk-native): drop `memory.bin` entirely.** The handler
+  serves **every** fault from the chunk cache/store (`fetch_chunk` + `UFFDIO_COPY`)
+  and zero-filled chunks via `UFFDIO_ZEROPAGE`; there is no canonical mmap and no
+  materialize step. FC resumes immediately and the ~118 MiB working set streams
+  from the warm local cache (optionally prefaulted from a working-set trace). This
+  is **strictly cheaper than today's File mode** and the simplest end-state — it
+  matches the "no `memory.bin` file to ship" portability claim already in the
+  `chunked.rs` docstring.
+
+  **Why not "Route A" (keep memory.bin, just drop MAP_POPULATE).** Considered and
+  rejected. Its only claimed advantage was cross-session memory dedup — but
+  `UFFDIO_COPY` (used by *both* routes) always installs a **private** page, so
+  guest RAM is never shared in either route. Route A's "dedup" is only the *source*
+  `memory.bin` page cache being shared across handlers, which Route B gets for free
+  via the shared chunk-cache files. So Route A trades away nothing real and keeps
+  the materialize pass. (The `chunked.rs` docstring's "1000 sessions cost 4 GiB +
+  deltas" claim is aspirational — it refers to source-side page-cache sharing, not
+  guest-RAM dedup, which neither route delivers.)
+
+  **FUTURE IMPROVEMENT — true packing via `UFFDIO_CONTINUE` (not in this
+  milestone).** The *only* way to get both fast lazy boot **and** real guest-RAM
+  dedup is minor-fault handling over a **shared per-image backing** (memfd/tmpfs or
+  hugetlbfs): register guest RAM UFFD in **MINOR** mode, maintain one shared
+  canonical backing per image (populated lazily from chunks — first faulter fills
+  a shared page), and serve canonical faults with `UFFDIO_CONTINUE` (installs a PTE
+  pointing at the *already-present shared page* — no copy, COW on write); divergent
+  writes still `UFFDIO_COPY` to private pages. This is how dense snapshot-restore
+  systems pack many same-image sandboxes per host. **Why deferred, not built now:**
+  (1) stock Firecracker (we run v1.10.1) backs guest RAM as anonymous-private and
+  registers MISSING-mode — `CONTINUE` needs FC to back guest RAM with a shared
+  memfd, which must be **verified to exist in our FC build** before promising it;
+  (2) host kernel needs the shmem/hugetlbfs minor-fault feature (5.13/5.14+);
+  (3) the handler becomes **stateful per-image** (shared-backing lifecycle,
+  refcounting, eviction) — more moving parts on a reliability-critical path. Route
+  B is the clean substrate for this upgrade: the per-page resolution logic is
+  identical, only the install primitive (`UFFDIO_COPY` → `UFFDIO_CONTINUE`) and the
+  backing change. Gate the upgrade on (a) measured host-density pressure and
+  (b) confirmed FC minor-fault support — don't build the stateful path up front.
+
+  **Route B scope:** (1) `fc_cfg.restore_mode = Uffd` from an env knob in both
   mains; (2) build + deploy `engram-uffd-handler` (packer provisioner) +
-  `/dev/userfaultfd` perms; (3) crucially, make `PooledBackend::restore` **skip**
-  `materialize_memory_if_missing` for UFFD so the handler serves pages from
-  chunks on fault — otherwise the ~6.4 s 4 GiB rebuild (the dominant measured
-  cost) is still paid and UFFD only saves the ~0.6 s eager load; (4) the
-  MAP_POPULATE + prefault-trace work in 2a/2b below, which only matter once UFFD
-  is live. Measure before/after via the Jaeger spans (wire
+  `/dev/userfaultfd` perms, co-located with `firecracker` on the FC host (it
+  receives the UFFD fd via SCM_RIGHTS over a same-host UDS); (3) rewrite the
+  handler's canonical-serve path to fetch chunks + `UFFDIO_ZEROPAGE` instead of the
+  `memory.bin` mmap, and drop the `--canonical-memory` arg; (4) make
+  `PooledBackend::restore` **skip** `materialize_memory_if_missing` for UFFD (keep
+  the prefetch — it warms the cache the handler faults against); (5) the
+  MAP_POPULATE drop is subsumed (no mmap at all); prefault-trace work in 2b below
+  still applies. Measure before/after via the Jaeger spans (wire
   `OTEL_EXPORTER_OTLP_ENDPOINT` → the dev Jaeger; the ad-hoc dev-vm coord launch
   didn't, which is why the ~13 s breakdown above came from the coord log).
-- **2a.** `runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
-  targeted `MADV_WILLNEED` over the working-set pages (E2B's two-phase
-  fetch→copy). The `uffd.map_populate` span already measures this.
+- **2a.** ~~`runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
+  targeted `MADV_WILLNEED`.~~ **Subsumed by Route B** — the chunk-native handler
+  has no canonical mmap at all, so there is no `MAP_POPULATE` to drop. Lazy
+  fault-in is inherent; the `uffd.map_populate` span is removed with the mmap.
 - **2b.** `engram-image-builder`: after 1a's capture, restore with
   `WorkingSetRecorder` active, run the **synthetic mount+exec** (push
   `BootstrapLaunch{argv=/bin/true, harness_dev=/dev/vdb}` so the kernel touches
