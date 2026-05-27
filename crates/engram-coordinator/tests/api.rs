@@ -584,6 +584,8 @@ fn seed_enabled(
             manifest_toml: manifest_toml.to_string(),
             manifest_digest: digest.clone(),
             disk_manifest: None,
+            // In-memory mock store; no FK, so a placeholder id is fine.
+            base_snapshot_id: Some(engram_core::types::SnapshotId::new()),
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,

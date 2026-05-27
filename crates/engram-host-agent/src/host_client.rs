@@ -114,6 +114,17 @@ impl HostClient for LocalHostClient {
         self.sandbox.build_base_snapshot(spec).await
     }
 
+    async fn restore_base_for_session(
+        &self,
+        metadata: SnapshotMetadata,
+        harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
+    ) -> Result<SandboxId, SandboxError> {
+        self.sandbox
+            .restore_base_for_session(metadata, harness_pack_uri, harness_name)
+            .await
+    }
+
     async fn start_agent(
         &self,
         id: SandboxId,

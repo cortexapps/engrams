@@ -1989,6 +1989,47 @@ impl SandboxBackend for PooledBackend {
         captured
     }
 
+    #[tracing::instrument(name = "host.restore_base_for_session", skip_all)]
+    async fn restore_base_for_session(
+        &self,
+        metadata: SnapshotMetadata,
+        harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
+    ) -> Result<SandboxId, SandboxError> {
+        // 1. Restore the base snapshot (cross-host materialize +
+        //    load_snapshot). The VM comes up running with the bake-time
+        //    stub harness at /dev/vdb, bootstrap parked on accept().
+        let id = self.restore(metadata).await?;
+
+        // 2. Late-bind the session harness (option D). For a real
+        //    harness, materialize its ext4 in the image cache and swap
+        //    the stub drive for it (pause → patch_drive → resume, with
+        //    virtio-blk cache invalidation handled by swap_harness_drive).
+        //    For a no-harness session there's nothing to bind — the stub
+        //    stays and start_agent skips SpawnHarness.
+        if let (Some(uri), Some(name)) = (harness_pack_uri, harness_name) {
+            let Some(cache) = self.image_cache.as_ref() else {
+                return Err(SandboxError::InvalidSpec(
+                    "restore_base_for_session needs an image cache to materialize the session harness"
+                        .into(),
+                ));
+            };
+            // ADR 0006: stamp the host egress CA into the substrate so
+            // the guest trust store accepts the MITM proxy's leaves.
+            let host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.as_str());
+            let cached = cache
+                .ensure_harness_ext4(&uri, &name, host_ca_pem)
+                .await
+                .map_err(|e| {
+                    SandboxError::InvalidSpec(format!(
+                        "materialize session harness {uri} for base restore: {e}"
+                    ))
+                })?;
+            self.inner.swap_harness_drive(id, cached.ext4_path).await?;
+        }
+        Ok(id)
+    }
+
     async fn swap_harness_drive(
         &self,
         id: SandboxId,

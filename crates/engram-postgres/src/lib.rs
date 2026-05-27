@@ -861,71 +861,6 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::snapshot_from_row(&r)).transpose()
     }
 
-    async fn upsert_base_snapshot(
-        &self,
-        base: engram_core::types::snapshot::BaseSnapshot,
-    ) -> Result<(), MetaError> {
-        // ADR 0020 P1. The caller records the referenced `snapshots`
-        // row first (FK). Idempotent on re-enable / rebake: the same
-        // digest re-points at the new snapshot + resource hints.
-        sqlx::query(
-            r#"
-            INSERT INTO base_snapshots
-                (manifest_digest, snapshot_id, image_repo, image_tag,
-                 vcpus, memory_mib, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (manifest_digest) DO UPDATE SET
-                snapshot_id = EXCLUDED.snapshot_id,
-                image_repo  = EXCLUDED.image_repo,
-                image_tag   = EXCLUDED.image_tag,
-                vcpus       = EXCLUDED.vcpus,
-                memory_mib  = EXCLUDED.memory_mib,
-                created_at  = EXCLUDED.created_at
-            "#,
-        )
-        .bind(&base.manifest_digest)
-        .bind(base.snapshot_id.as_uuid())
-        .bind(&base.image_repo)
-        .bind(&base.image_tag)
-        .bind(base.vcpus as i32)
-        .bind(base.memory_mib as i32)
-        .bind(base.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn get_base_snapshot_by_digest(
-        &self,
-        manifest_digest: &str,
-    ) -> Result<Option<engram_core::types::snapshot::BaseSnapshot>, MetaError> {
-        let row = sqlx::query(
-            r#"
-            SELECT manifest_digest, snapshot_id, image_repo, image_tag,
-                   vcpus, memory_mib, created_at
-            FROM base_snapshots WHERE manifest_digest = $1
-            "#,
-        )
-        .bind(manifest_digest)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let Some(row) = row else { return Ok(None) };
-        let snapshot_id: Uuid = row.try_get("snapshot_id").map_err(db_err)?;
-        let vcpus: i32 = row.try_get("vcpus").map_err(db_err)?;
-        let memory_mib: i32 = row.try_get("memory_mib").map_err(db_err)?;
-        Ok(Some(engram_core::types::snapshot::BaseSnapshot {
-            manifest_digest: row.try_get("manifest_digest").map_err(db_err)?,
-            snapshot_id: engram_core::types::SnapshotId(snapshot_id),
-            image_repo: row.try_get("image_repo").map_err(db_err)?,
-            image_tag: row.try_get("image_tag").map_err(db_err)?,
-            vcpus: vcpus.max(0) as u32,
-            memory_mib: memory_mib.max(0) as u32,
-            created_at: row.try_get("created_at").map_err(db_err)?,
-        }))
-    }
-
     async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
         // The `idx_snapshots_disk_manifest` partial index (migration
         // 0018) makes this a fast scan over rows that actually have
@@ -1221,14 +1156,15 @@ impl MetadataStore for PostgresStore {
             r#"
             INSERT INTO enabled_images
                 (id, image_uri, manifest_toml, manifest_digest,
-                 disk_manifest_id, disk_manifest_version,
+                 disk_manifest_id, disk_manifest_version, base_snapshot_id,
                  last_refreshed_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
             ON CONFLICT (image_uri) DO UPDATE SET
                 manifest_toml         = EXCLUDED.manifest_toml,
                 manifest_digest       = EXCLUDED.manifest_digest,
                 disk_manifest_id      = EXCLUDED.disk_manifest_id,
                 disk_manifest_version = EXCLUDED.disk_manifest_version,
+                base_snapshot_id      = EXCLUDED.base_snapshot_id,
                 last_refreshed_at     = EXCLUDED.last_refreshed_at,
                 updated_at            = NOW()
             "#,
@@ -1239,6 +1175,7 @@ impl MetadataStore for PostgresStore {
         .bind(&image.manifest_digest)
         .bind(image.disk_manifest.map(|m| m.manifest_id))
         .bind(image.disk_manifest.map(|m| m.version as i64))
+        .bind(image.base_snapshot_id.map(|s| s.as_uuid()))
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
         .execute(&mut *tx)
@@ -1256,7 +1193,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
-                   disk_manifest_id, disk_manifest_version,
+                   disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    last_refreshed_at, created_at, updated_at
               FROM enabled_images
              ORDER BY image_uri
@@ -1272,7 +1209,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
-                   disk_manifest_id, disk_manifest_version,
+                   disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    last_refreshed_at, created_at, updated_at
               FROM enabled_images
              WHERE image_uri = $1

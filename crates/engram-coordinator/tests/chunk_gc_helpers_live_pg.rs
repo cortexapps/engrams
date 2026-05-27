@@ -42,6 +42,29 @@ async fn connect() -> Option<Arc<dyn MetadataStore>> {
     Some(Arc::new(store))
 }
 
+/// ADR 0020: `enabled_images.base_snapshot_id` is NOT NULL with an FK to
+/// `snapshots(id)` (migration 0038). Seed a throwaway template snapshot
+/// (session_id = NULL, allowed since 0028) so these fixtures can insert
+/// an enabled image without depending on the capture pipeline.
+async fn seed_base_snapshot(meta: &Arc<dyn MetadataStore>) -> SnapshotId {
+    let id = SnapshotId::new();
+    meta.record_snapshot(SnapshotRecord {
+        id,
+        session_id: None,
+        host_id: None,
+        image_version: "base-snapshot-fixture".into(),
+        size_bytes: 0,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: true,
+    })
+    .await
+    .expect("seed base snapshot");
+    id
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn chunk_gc_candidate_upsert_list_delete_round_trip() {
@@ -301,6 +324,7 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
         manifest_toml: "image = { uri = \"test\" }\n".into(),
         manifest_digest: format!("sha256:{:064x}", 0xdeadbeefu32),
         disk_manifest: None,
+        base_snapshot_id: Some(seed_base_snapshot(&meta).await),
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,
@@ -367,6 +391,7 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
         manifest_toml: "image = { uri = \"test\" }\n".into(),
         manifest_digest: format!("sha256:{:064x}", 0xfeedfaceu32),
         disk_manifest: Some(mref),
+        base_snapshot_id: Some(seed_base_snapshot(&meta).await),
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,

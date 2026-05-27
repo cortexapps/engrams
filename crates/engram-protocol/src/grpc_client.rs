@@ -30,11 +30,10 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
-    CreateSandboxRequest, Empty,
-    ExecStartRequest, GuestIpResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
-    ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, ProxyShellBinary,
+    ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest,
+    SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -211,6 +210,27 @@ impl GrpcHostClient {
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
         decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+    }
+
+    pub async fn restore_base_for_session(
+        &self,
+        metadata: SnapshotMetadata,
+        harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
+    ) -> Result<SandboxId, SandboxError> {
+        let req = RestoreBaseForSessionRequest {
+            metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+            harness_pack_uri,
+            harness_name,
+        };
+        let resp = self
+            .inner
+            .clone()
+            .restore_base_for_session(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        decode_sandbox_id(&resp.uuid)
     }
 
     pub async fn guest_ip(&self, id: SandboxId) -> Option<String> {
@@ -716,6 +736,15 @@ impl HostClient for GrpcHostClient {
         spec: SandboxSpec,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Self::build_base_snapshot(self, spec).await
+    }
+
+    async fn restore_base_for_session(
+        &self,
+        metadata: SnapshotMetadata,
+        harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
+    ) -> Result<SandboxId, SandboxError> {
+        Self::restore_base_for_session(self, metadata, harness_pack_uri, harness_name).await
     }
 
     async fn start_agent(

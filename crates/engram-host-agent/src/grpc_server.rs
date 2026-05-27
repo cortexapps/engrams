@@ -24,11 +24,11 @@ use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer}
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
-    BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse,
-    CreateSandboxRequest, CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest,
-    GuestIpResponse, ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
-    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
+    CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
+    ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
     SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
@@ -222,6 +222,28 @@ impl HostService for HostServiceImpl {
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(BuildBaseSnapshotResponse {
                 metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn restore_base_for_session(
+        &self,
+        req: Request<RestoreBaseForSessionRequest>,
+    ) -> Result<Response<SandboxIdMessage>, Status> {
+        let span = tracing::info_span!("host.restore_base_for_session");
+        link_remote_parent(&span, &req);
+        async move {
+            let inner = req.into_inner();
+            let metadata = decode_bincode(&inner.metadata_bincode, "SnapshotMetadata")?;
+            let id = self
+                .inner
+                .restore_base_for_session(metadata, inner.harness_pack_uri, inner.harness_name)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(SandboxIdMessage {
+                uuid: id.as_uuid().as_bytes().to_vec(),
             }))
         }
         .instrument(span)

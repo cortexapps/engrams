@@ -204,12 +204,17 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
             ));
         }
     };
+    // ADR 0020 P1: NOT NULL in the DB (migration 0038); Option here only
+    // mirrors disk_manifest's build-then-stamp shape — a persisted row
+    // always has it.
+    let base_snapshot_id: Option<Uuid> = row.try_get("base_snapshot_id").map_err(col_err)?;
     Ok(EnabledImage {
         id,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
         manifest_toml: row.try_get("manifest_toml").map_err(col_err)?,
         manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
         disk_manifest,
+        base_snapshot_id: base_snapshot_id.map(engram_core::types::SnapshotId),
         last_refreshed_at,
         created_at,
         updated_at,

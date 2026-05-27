@@ -197,6 +197,14 @@ pub struct EnabledImage {
     /// would have to re-pull bundle.json from OCI on every sweep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_manifest: Option<crate::types::manifest::ManifestRef>,
+    /// ADR 0020 P1: the per-image base snapshot the create path restores
+    /// from. The DB column is `NOT NULL` (an image is enabled IFF it has a
+    /// base snapshot — migration 0038); this is `Option` only to mirror
+    /// `disk_manifest`'s build-then-stamp flow (the enable handler captures
+    /// the snapshot, then stamps this before the upsert). A persisted row
+    /// always carries `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_snapshot_id: Option<crate::types::ids::SnapshotId>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,

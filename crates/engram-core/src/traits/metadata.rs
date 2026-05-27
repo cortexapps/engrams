@@ -291,38 +291,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    // ---- base snapshots (ADR 0020 P1) ----
-    //
-    // Per-image bake-time FC snapshots the create path restores from
-    // instead of cold-booting. Keyed by an enabled image's
-    // `manifest_digest`. The enable-image cascade writes a `snapshots`
-    // row (session_id = NULL) + a `base_snapshots` row in one txn;
-    // `create_session_inner` looks one up per `POST /sessions`.
-
-    /// Insert or replace the base snapshot for `manifest_digest`. The
-    /// caller is responsible for having recorded the referenced
-    /// `snapshots` row first (FK). Idempotent on re-enable / rebake:
-    /// re-inserting the same digest updates the snapshot pointer +
-    /// resource hints. Default `Ok(())` keeps mocks quiet — the real
-    /// query lives in `engram-postgres`.
-    async fn upsert_base_snapshot(
-        &self,
-        _base: crate::types::snapshot::BaseSnapshot,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    /// Look up the base snapshot for an image manifest digest. Returns
-    /// `None` when no bake-time snapshot is registered for the digest —
-    /// the create path then falls back to a cold create. Default
-    /// `Ok(None)` so non-DB impls opt out cleanly.
-    async fn get_base_snapshot_by_digest(
-        &self,
-        _manifest_digest: &str,
-    ) -> Result<Option<crate::types::snapshot::BaseSnapshot>, MetaError> {
-        Ok(None)
-    }
-
     /// Enumerate every disk `manifest_id` referenced by a live
     /// snapshot row. Today's sole caller is `reap_materialize_dir`,
     /// which uses the result as the "do not delete" filter when

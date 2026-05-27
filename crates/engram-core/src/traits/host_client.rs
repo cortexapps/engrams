@@ -99,6 +99,21 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
+    /// ADR 0020 P1: restore a per-image base snapshot for a session,
+    /// late-binding the session harness via the option-D swap. Called
+    /// by `create_session` on a base-snapshot hit. Default errors so
+    /// mocks / non-FC hosts opt out.
+    async fn restore_base_for_session(
+        &self,
+        _metadata: SnapshotMetadata,
+        _harness_pack_uri: Option<String>,
+        _harness_name: Option<String>,
+    ) -> Result<SandboxId, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `restore_base_for_session`".into(),
+        ))
+    }
+
     /// ADR 0013: bundle the egress policy with the agent spawn so the
     /// host applies the policy to its egress proxy registry BEFORE
     /// starting the agent process. Atomic by construction —

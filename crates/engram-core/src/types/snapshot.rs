@@ -131,19 +131,3 @@ pub struct SnapshotRecord {
     #[serde(default)]
     pub recoverable: bool,
 }
-
-/// ADR 0020 P1: a base snapshot row — maps an enabled image's
-/// `manifest_digest` to the bake-time snapshot the create path restores
-/// from. Built by the enable-image cascade from a bundle's
-/// [`CanonicalSnapshot`]; looked up by `create_session_inner` on every
-/// `POST /sessions` (hit → restore, miss → cold create).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BaseSnapshot {
-    pub manifest_digest: String,
-    pub snapshot_id: SnapshotId,
-    pub image_repo: String,
-    pub image_tag: String,
-    pub vcpus: u32,
-    pub memory_mib: u32,
-    pub created_at: DateTime<Utc>,
-}

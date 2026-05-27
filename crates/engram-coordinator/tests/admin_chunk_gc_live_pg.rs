@@ -181,6 +181,24 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
     // ---- enabled image with chunked-disk manifest ----
     let img_disk = seed_manifest(&rig.chunk_store, &[b"img-a", b"img-b"], ManifestKind::Disk).await;
     let image_uri = format!("phase-c-pin-test:warm-{}", Uuid::new_v4());
+    // ADR 0020: enabled_images.base_snapshot_id is NOT NULL + FK to
+    // snapshots(id) (migration 0038); seed a throwaway template snapshot.
+    let base_snap = SnapshotId::new();
+    rig.meta
+        .record_snapshot(SnapshotRecord {
+            id: base_snap,
+            session_id: None,
+            host_id: None,
+            image_version: "base-snapshot-fixture".into(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            disk_manifest: None,
+            memory_manifest: None,
+            recoverable: true,
+        })
+        .await
+        .expect("seed base snapshot");
     rig.meta
         .upsert_enabled_image(EnabledImage {
             id: Uuid::new_v4(),
@@ -188,6 +206,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             manifest_toml: "image = { uri = \"phase-c\" }\n".into(),
             manifest_digest: format!("sha256:{:064x}", 1u32),
             disk_manifest: Some(img_disk),
+            base_snapshot_id: Some(base_snap),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,
@@ -310,6 +329,24 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
     )
     .await;
     let image_uri = format!("phase-c-promote-test:warm-{}", Uuid::new_v4());
+    // ADR 0020: enabled_images.base_snapshot_id is NOT NULL + FK to
+    // snapshots(id) (migration 0038); seed a throwaway template snapshot.
+    let base_snap = SnapshotId::new();
+    rig.meta
+        .record_snapshot(SnapshotRecord {
+            id: base_snap,
+            session_id: None,
+            host_id: None,
+            image_version: "base-snapshot-fixture".into(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            disk_manifest: None,
+            memory_manifest: None,
+            recoverable: true,
+        })
+        .await
+        .expect("seed base snapshot");
     rig.meta
         .upsert_enabled_image(EnabledImage {
             id: Uuid::new_v4(),
@@ -317,6 +354,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             manifest_toml: "image = { uri = \"phase-c\" }\n".into(),
             manifest_digest: format!("sha256:{:064x}", 2u32),
             disk_manifest: Some(pinned_mref),
+            base_snapshot_id: Some(base_snap),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,

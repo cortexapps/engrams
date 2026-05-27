@@ -4,7 +4,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
-use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec as VmSpec};
 use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef};
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionState};
 use engram_core::SessionId;
@@ -587,91 +586,64 @@ async fn create_session_inner(
     let spec_env_for_proxy = spec_env.clone();
     let network_for_proxy = network.clone();
 
-    // The image URI is the host-agent's pull target. The rootfs is
-    // pulled from the registry on first use and cached locally; there's
-    // no filesystem-resident "rootfs_source" anymore. The harness pack
-    // — when one is requested — flows through the same OCI puller and
-    // gets assembled into a per-session substrate by the host-agent.
-    let vm_spec = VmSpec {
-        image: image_uri.clone(),
-        rootfs_source: None,
-        image_uri: Some(image_uri.clone()),
-        harness_pack_uri: harness_pack_uri.clone(),
-        cpu: CpuLimit {
-            vcpus: manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS),
-        },
-        memory: MemoryLimit {
-            max_mib: manifest
-                .resources
-                .suggested_memory_mib
-                .unwrap_or(DEFAULT_MEMORY_MIB),
-        },
-        disk: DiskLimit {
-            max_gib: manifest
-                .resources
-                .suggested_disk_gib
-                .unwrap_or(DEFAULT_DISK_GIB),
-        },
-        ttl: None,
-        env: spec_env,
-        workdir: None,
-        harness_substrate: None,
-        network,
-        // ADR 0007 Phase 5: PooledBackend populates this from the
-        // image bundle after the image-cache resolve, so we leave
-        // it None at session-create. Sessions whose bundle carries
-        // a canonical pick up the canonical mmap at restore time.
-    };
-
-    // -------- 5. Schedule + create the sandbox --------
+    // -------- 5. Schedule: restore from the image's base snapshot --------
     //
-    // No row exists yet. If scheduling fails the caller gets a 503
-    // and Postgres is untouched; a retry can succeed once capacity
-    // recovers. See TODO at the SessionId mint for the eventual
-    // self-healing reconciler design that would persist Pending and
-    // retry in the background instead.
-    let ctx = ScheduleContext {
-        repo: &image_repo,
-        image_version: &image_tag,
-        prefer_snapshot_id: None,
-        memory_mib: Some(vm_spec.memory.max_mib),
-        // ADR 0015 M5: gate placement on hosts that have prefetched
-        // this image. `enabled.manifest_digest` is the same digest
-        // hosts include in their heartbeat's `ready_images`.
-        required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
-            &enabled.manifest_digest,
-        )),
-        exclude_host: None,
-    };
+    // ADR 0020: every enabled image has a base snapshot — enable is
+    // transactional (an image can't be enabled without capturing one).
+    // So session create ALWAYS restores; there is no cold-boot path here.
+    // The single cold boot in the whole system is the capture itself
+    // (`build_base_snapshot`, run once per image at enable). No row
+    // exists yet; a restore failure returns 503 with Postgres untouched,
+    // so a retry can succeed once capacity recovers.
+    // The NOT NULL FK (migration 0038) guarantees a persisted enabled
+    // image carries a base snapshot; `Option` here is only the
+    // build-then-stamp artifact. `None` would mean a pre-0020 row the
+    // migration should have cleared — surface loudly, don't cold-boot.
+    let base_snapshot_id = enabled.base_snapshot_id.ok_or_else(|| {
+        ApiError::Internal(format!(
+            "enabled image `{}` has no base snapshot — re-enable it \
+             (POST /api/enabled-images) to capture one",
+            req.image
+        ))
+    })?;
+    let memory_mib = manifest
+        .resources
+        .suggested_memory_mib
+        .unwrap_or(DEFAULT_MEMORY_MIB);
 
-    // ADR 0015 M5: cold-create only, gated on host readiness. Sessions
-    // land on a host whose latest heartbeat reported the manifest
-    // digest above in `ready_images`. No ready host → 503
-    // `image_not_ready` (distinct from "no capacity").
-    let (host_id, sandbox_id) = match state.host_registry.create_for_session(&ctx, vm_spec).await {
-        Ok((host_id, id)) => (host_id, id),
-        Err(e) => {
-            tracing::warn!(
-                image_uri = %req.image,
-                error = %e,
-                "session create rejected at scheduling; returning 503, no row persisted",
-            );
-            return Err(match e {
-                engram_core::SandboxError::ImageNotReady(digest) => ApiError::Unavailable(format!(
-                    "image `{}` (digest {digest}) has not been prefetched by any host yet. \
-                     Hosts diff `enabled_images` against their local NVMe chunk cache on each \
-                     heartbeat (~5s) and prefetch missing images; retry shortly. \
-                     If this persists, check BlobStorage egress and host-agent logs for \
-                     `image prefetch` lines.",
-                    req.image
-                )),
-                other => ApiError::Unavailable(format!(
-                    "no host has capacity for this session right now: {other}. \
-                     Retry shortly; capacity-fit recovers as hosts register or sessions drain."
-                )),
-            });
-        }
+    let harness_name = if let HarnessSpec::Builtin { name } = &req.harness {
+        Some(name.clone())
+    } else {
+        None
     };
+    let (host_id, sandbox_id) = try_restore_base_snapshot(
+        &state,
+        base_snapshot_id,
+        &image_repo,
+        &image_tag,
+        memory_mib,
+        harness_pack_uri,
+        harness_name,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            image_uri = %req.image,
+            snapshot_id = %base_snapshot_id,
+            error = %e,
+            "base-snapshot restore failed at scheduling; returning 503, no row persisted",
+        );
+        match e {
+            engram_core::SandboxError::ImageNotReady(d) => ApiError::Unavailable(format!(
+                "image `{}` (digest {d}) is not ready on any host yet; retry shortly",
+                req.image
+            )),
+            other => ApiError::Unavailable(format!(
+                "no host could restore this session's base snapshot right now: {other}. \
+                 Retry shortly; capacity recovers as hosts register or sessions drain."
+            )),
+        }
+    })?;
 
     // Atomic insert: row exists only once we have host_id + sandbox_id
     // bound. If THIS step fails, the sandbox is already running and
@@ -889,9 +861,80 @@ async fn create_session_inner(
             session_id,
             status: SessionState::Active.as_str(),
             image_version: image_tag,
-            kind: "cold",
+            // ADR 0020: every session is a base-snapshot restore now.
+            kind: "restored",
         }),
     ))
+}
+
+/// ADR 0020 P1: attempt to restore a session from the image's base
+/// snapshot, late-binding the session harness. Builds the
+/// `SnapshotMetadata` from the base snapshot's `snapshots` row (the
+/// portable blob keys are deterministic from `snapshot_id`), picks a
+/// host, and runs the combined restore + harness-swap op. Any error
+/// bubbles to the caller, which falls back to a cold create — so this
+/// never fails a session, it only declines to fast-path it.
+async fn try_restore_base_snapshot(
+    state: &SharedState,
+    snapshot_id: engram_core::types::SnapshotId,
+    image_repo: &str,
+    image_tag: &str,
+    memory_mib: u32,
+    harness_pack_uri: Option<String>,
+    harness_name: Option<String>,
+) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
+    let record = state
+        .services
+        .meta
+        .get_snapshot(snapshot_id)
+        .await
+        .map_err(|e| {
+            engram_core::SandboxError::Snapshot(format!(
+                "get_snapshot {snapshot_id} for base restore: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            engram_core::SandboxError::Snapshot(format!(
+                "enabled image references base snapshot {snapshot_id} but its snapshots row is gone"
+            ))
+        })?;
+    // The state.bin / sidecar.json blob keys are deterministic from the
+    // snapshot id (`snapshots/<id>/...`); the disk + memory chunked
+    // manifests come off the snapshots row. Together this is the full
+    // portable metadata the host's cross-host restore path consumes.
+    let metadata = engram_core::types::snapshot::SnapshotMetadata {
+        id: snapshot_id,
+        size_bytes: record.size_bytes,
+        created_at: record.created_at,
+        image_version: record.image_version,
+        disk_manifest: record.disk_manifest,
+        memory_manifest: record.memory_manifest,
+        source_sandbox_id: None,
+        state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
+            snapshot_id,
+        )),
+        sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(
+            snapshot_id,
+        )),
+        rootfs_blob_key: None,
+        // P1 leaves working-set prefetch off; P2 (ADR 0020) publishes the
+        // bake-time trace and points UFFD prefetch at it.
+        working_set_blob_key: None,
+    };
+    let ctx = ScheduleContext {
+        repo: image_repo,
+        image_version: image_tag,
+        prefer_snapshot_id: Some(snapshot_id),
+        memory_mib: Some(memory_mib),
+        // Base-snapshot chunks are pulled from BlobStorage on demand by
+        // the restore path; no host needs to have prefetched the image.
+        required_image_digest: None,
+        exclude_host: None,
+    };
+    state
+        .host_registry
+        .restore_base_for_session(&ctx, metadata, harness_pack_uri, harness_name)
+        .await
 }
 
 pub async fn get_session(

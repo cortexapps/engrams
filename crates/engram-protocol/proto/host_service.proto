@@ -45,6 +45,13 @@ service HostService {
   // that CreateSession later restores from.
   rpc BuildBaseSnapshot(BuildBaseSnapshotRequest) returns (BuildBaseSnapshotResponse);
 
+  // ADR 0020 P1: restore a per-image base snapshot for a session and
+  // late-bind the session's harness via the option-D drive swap (the
+  // base snapshot was captured with a stub harness). Returns the
+  // bound sandbox id, like Restore. CreateSession calls this on a
+  // base-snapshot hit instead of CreateSandbox.
+  rpc RestoreBaseForSession(RestoreBaseForSessionRequest) returns (SandboxIdMessage);
+
   // ---- harness routing ----
   rpc BindHarnessSession(BindHarnessSessionRequest) returns (Empty);
   rpc UnbindHarnessSession(UnbindHarnessSessionRequest) returns (Empty);
@@ -170,6 +177,15 @@ message BuildBaseSnapshotRequest {
 message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
   bytes metadata_bincode = 1;
+}
+message RestoreBaseForSessionRequest {
+  // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`
+  // for the per-image base snapshot.
+  bytes metadata_bincode = 1;
+  // The session's resolved harness pack OCI URI + canonical name.
+  // Absent for no-harness sessions (the stub harness stays attached).
+  optional string harness_pack_uri = 2;
+  optional string harness_name = 3;
 }
 
 // --- GuestIp ---

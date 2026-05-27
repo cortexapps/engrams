@@ -491,26 +491,12 @@ impl HostRegistry {
             .ok_or(PickError::NoCapacity)
     }
 
-    /// Pick a host for `ctx`, then call `create` on that host's
-    /// backend. Caller is responsible for `assign_session_host`. Used
-    /// by `api::sessions::create_session` for session-aware scheduling.
-    #[tracing::instrument(name = "coord.create_for_session", skip_all)]
-    pub async fn create_for_session(
-        &self,
-        ctx: &ScheduleContext<'_>,
-        spec: SandboxSpec,
-    ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self.pick_for_session(ctx)?;
-        let sandbox_id = backend.create(spec).await?;
-        self.sandbox_owner.insert(sandbox_id, host_id);
-        Ok((host_id, sandbox_id))
-    }
-
-    /// Same as `create_for_session` but for restoring from a snapshot.
-    /// Routes to the host carrying `snapshot_id` if any; else falls
-    /// through to capacity-based pick. ADR 0007 Phase 6: takes a
-    /// `SnapshotMetadata` directly (backends look up their own
-    /// per-snapshot staging dir from the chunked manifest refs).
+    /// Pick a host for `ctx`, then `restore` from `metadata` on that
+    /// host's backend. Routes to the host carrying the snapshot if any;
+    /// else falls through to capacity-based pick. ADR 0007 Phase 6: takes
+    /// a `SnapshotMetadata` directly (backends look up their own
+    /// per-snapshot staging dir from the chunked manifest refs). Caller
+    /// is responsible for `assign_session_host`.
     #[tracing::instrument(name = "coord.restore_for_session", skip_all)]
     pub async fn restore_for_session(
         &self,
@@ -519,6 +505,27 @@ impl HostRegistry {
     ) -> Result<(HostId, SandboxId), SandboxError> {
         let (host_id, backend) = self.pick_for_session(ctx)?;
         let sandbox_id = backend.restore(metadata).await?;
+        self.sandbox_owner.insert(sandbox_id, host_id);
+        Ok((host_id, sandbox_id))
+    }
+
+    /// ADR 0020 P1: restore a per-image base snapshot for a fresh
+    /// session, late-binding the session harness (option-D swap). Like
+    /// `restore_for_session` but the picked host runs the combined
+    /// restore + harness-swap op so `create_session` can route a cold
+    /// create through restore instead of a fresh kernel boot.
+    #[tracing::instrument(name = "coord.restore_base_for_session", skip_all)]
+    pub async fn restore_base_for_session(
+        &self,
+        ctx: &ScheduleContext<'_>,
+        metadata: SnapshotMetadata,
+        harness_pack_uri: Option<String>,
+        harness_name: Option<String>,
+    ) -> Result<(HostId, SandboxId), SandboxError> {
+        let (host_id, backend) = self.pick_for_session(ctx)?;
+        let sandbox_id = backend
+            .restore_base_for_session(metadata, harness_pack_uri, harness_name)
+            .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
     }

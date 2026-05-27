@@ -35,8 +35,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-use engram_core::types::session::split_image_ref;
-use engram_core::types::snapshot::{BaseSnapshot, SnapshotRecord};
+use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{EnabledImage, EnabledImageSummary, ImageManifest};
 use engram_core::MetaError;
 use serde::{Deserialize, Serialize};
@@ -80,8 +79,10 @@ pub async fn enable_image(
     // ADR 0020 P1: an image is not enabled unless its per-image base
     // snapshot was captured + recorded. This blocks on a host-side
     // capture; on failure we return before writing the enabled_images
-    // row, so a failed snapshot leaves zero rows (no partial state).
-    capture_and_record_base_snapshot(&state, &row, &manifest).await?;
+    // row, so a failed snapshot leaves zero rows (the NOT NULL FK on
+    // base_snapshot_id makes that a schema invariant, not just a
+    // convention).
+    row.base_snapshot_id = Some(capture_and_record_base_snapshot(&state, &row, &manifest).await?);
     state
         .services
         .meta
@@ -132,7 +133,8 @@ pub async fn refresh_enabled_image(
     refreshed.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
     // ADR 0020 P1: a moved tag is new content — capture a fresh base
     // snapshot for the new digest before the refreshed row goes live.
-    capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
+    refreshed.base_snapshot_id =
+        Some(capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?);
     state
         .services
         .meta
@@ -203,6 +205,10 @@ async fn fetch_and_seal_manifest(
         // Stamped by the caller after `materialize_disk_chunks`
         // returns the bake's ManifestRef (or `None` for harness-only).
         disk_manifest: None,
+        // Stamped by the caller after `capture_and_record_base_snapshot`.
+        // The DB column is NOT NULL, so the upsert only succeeds once
+        // this is set — enforcing "enabled iff base snapshot exists".
+        base_snapshot_id: None,
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
@@ -266,13 +272,15 @@ async fn materialize_disk_chunks(
     Ok(Some(manifest_ref))
 }
 
-/// ADR 0020 P1: capture (or reuse) the per-image base snapshot and
-/// record its `snapshots` + `base_snapshots` rows. Called during
-/// enable/refresh BEFORE the `enabled_images` row is written, so a
-/// capture failure aborts the whole enable and leaves zero rows.
+/// ADR 0020 P1: capture (or reuse) the per-image base snapshot, record
+/// its `snapshots` row, and return the snapshot id. The caller stamps it
+/// onto the enabled_images row's NOT NULL `base_snapshot_id` and upserts
+/// only after this succeeds — so a capture failure aborts the whole
+/// enable and leaves zero rows (the FK makes "enabled iff base snapshot"
+/// a schema invariant).
 ///
-/// Idempotent: if a base snapshot already exists for this manifest
-/// digest, the image content is unchanged and we reuse it — no re-boot.
+/// Idempotent: if the image is already enabled at the same content
+/// digest with a base snapshot, reuse it — no re-boot.
 ///
 /// The capture runs on a prod host (so it inherits the host CPU's
 /// CPUID baseline; pair with `ENGRAM_FC_CPU_TEMPLATE=T2CL` for fleet
@@ -283,21 +291,27 @@ async fn capture_and_record_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
     manifest: &ImageManifest,
-) -> Result<(), ApiError> {
-    // Skip if this exact image content already has a base snapshot.
-    if state
+) -> Result<engram_core::types::SnapshotId, ApiError> {
+    // Idempotency: if this image is already enabled at the same content
+    // digest and carries a base snapshot, reuse it — re-enabling
+    // shouldn't re-boot a capture VM.
+    if let Some(existing) = state
         .services
         .meta
-        .get_base_snapshot_by_digest(&row.manifest_digest)
+        .get_enabled_image(&row.image_uri)
         .await?
-        .is_some()
     {
-        tracing::info!(
-            image_uri = %row.image_uri,
-            digest = %row.manifest_digest,
-            "base snapshot already recorded for this digest; reusing",
-        );
-        return Ok(());
+        if existing.manifest_digest == row.manifest_digest {
+            if let Some(id) = existing.base_snapshot_id {
+                tracing::info!(
+                    image_uri = %row.image_uri,
+                    digest = %row.manifest_digest,
+                    snapshot_id = %id,
+                    "base snapshot already recorded for this digest; reusing",
+                );
+                return Ok(id);
+            }
+        }
     }
 
     let vcpus = manifest
@@ -373,9 +387,9 @@ async fn capture_and_record_base_snapshot(
 
     let now = Utc::now();
     // Record the snapshot row (session_id = NULL — a template artifact,
-    // not a session capture) then the digest → snapshot mapping. The
-    // enabled_images row is written by the caller only after this
-    // returns Ok, so the three rows go live together.
+    // not a session capture). The caller stamps the returned id onto the
+    // enabled_images row's NOT NULL base_snapshot_id and upserts it only
+    // after this succeeds, so the rows go live together.
     state
         .services
         .meta
@@ -393,28 +407,13 @@ async fn capture_and_record_base_snapshot(
         })
         .await?;
 
-    let (image_repo, image_tag) = split_image_ref(&row.image_uri);
-    state
-        .services
-        .meta
-        .upsert_base_snapshot(BaseSnapshot {
-            manifest_digest: row.manifest_digest.clone(),
-            snapshot_id: meta.id,
-            image_repo: image_repo.to_string(),
-            image_tag: image_tag.to_string(),
-            vcpus,
-            memory_mib,
-            created_at: now,
-        })
-        .await?;
-
     tracing::info!(
         image_uri = %row.image_uri,
         snapshot_id = %meta.id,
         size_bytes = meta.size_bytes,
         "recorded base snapshot for image",
     );
-    Ok(())
+    Ok(meta.id)
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`

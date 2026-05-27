@@ -262,6 +262,26 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0020 P1: restore a per-image base snapshot for a session and
+    /// late-bind the session's harness (the option-D swap). The base
+    /// snapshot was captured with a stub harness; this restores it
+    /// (running VM, stub at /dev/vdb), materializes the session's
+    /// harness ext4, and `swap_harness_drive`s the stub for it — so the
+    /// subsequent `start_agent`'s `SpawnHarness` mounts the real harness.
+    /// `harness_pack_uri`/`harness_name` are `None` for no-harness
+    /// sessions (the stub stays; `start_agent` skips the spawn).
+    /// Implemented on `PooledBackend` (it owns the harness image cache).
+    async fn restore_base_for_session(
+        &self,
+        _metadata: SnapshotMetadata,
+        _harness_pack_uri: Option<String>,
+        _harness_name: Option<String>,
+    ) -> Result<SandboxId, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `restore_base_for_session` (needs the pooled chunk-store wrapper)".into(),
+        ))
+    }
+
     /// Local-host path where the backend writes/reads snapshot
     /// artifacts for `snapshot_id`. Used by `PooledBackend` to
     /// chunk `memory.bin` after `snapshot()` returns and to
