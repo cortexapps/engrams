@@ -192,6 +192,15 @@ impl ChunkCache {
                     "tier" => "nvme",
                 )
                 .increment(1);
+                // ADR 0019 0d: bytes served per tier. With the hit counter
+                // this gives page-in volume + the nvme/blob split — the
+                // aggregate view of chunked-NBD page-in during ext4 mount
+                // (per-read spans would flood the trace; this is the metric).
+                metrics::counter!(
+                    "engram_chunk_cache_bytes_total",
+                    "tier" => "nvme",
+                )
+                .increment(bytes.len() as u64);
                 return Ok(bytes);
             }
             // Mismatch: drop the local copy and fall through to
@@ -216,7 +225,17 @@ impl ChunkCache {
         };
 
         if do_fetch {
+            // ADR 0019 0d: time the remote fetch — the cold-cache page-in
+            // cost that stretches cold boot (the slow tier). Histogram +
+            // the bytes counter below quantify "how much of the boot is
+            // blob page-in" without per-read trace spam.
+            let fetch_start = std::time::Instant::now();
             let result = fetch().await;
+            metrics::histogram!(
+                "engram_chunk_fetch_seconds",
+                "tier" => "blobstorage",
+            )
+            .record(fetch_start.elapsed().as_secs_f64());
             // Persist + drain waiters under a single lock acquisition.
             let waiters = {
                 let mut inflight = self.inner.inflight.lock();
@@ -224,6 +243,11 @@ impl ChunkCache {
             };
             if let Ok(bytes) = result.as_ref() {
                 let _ = self.write_local(hash, bytes).await;
+                metrics::counter!(
+                    "engram_chunk_cache_bytes_total",
+                    "tier" => "blobstorage",
+                )
+                .increment(bytes.len() as u64);
             }
             // Notify waiters. Send-failure (their rx dropped)
             // is benign.
