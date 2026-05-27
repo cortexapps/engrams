@@ -49,10 +49,13 @@ Commit chain (Phase 0, on `main`, each compiles clean via
   `boot_elapsed_s` (/proc/uptime at start) on `agentd.run`. Splits the
   agent_handshake black box into "guest booting before agentd" vs agentd
   startup. Compiles (`cargo check`).
-- _(pending)_ uffd `MAP_POPULATE` span (restore path); 0d chunk-store/NBD
-  I/O spans; host-agent forwarding of `engram-init: mark` lines into Cloud
-  Logging; final Linux clippy pass; prod canary (guest-span export + real
-  magnitudes).
+- `a8b4b41` — 0c: `uffd.map_populate` span (restore critical path, H2).
+- `1319c76` — 0d: chunk-cache page-in metrics (`engram_chunk_cache_bytes_total`,
+  `engram_chunk_fetch_seconds`) — aggregate page-in volume + slow-tier latency.
+- `5bd7984` — 0c: `agentd.spawn_harness` span (in-guest harness mount + exec).
+- _(pending)_ host-agent forwarding of `engram-init: mark` lines into Cloud
+  Logging; prod canary (guest-span export wiring + real magnitudes). The
+  instrumentation itself is complete and Linux-clippy-clean.
 
 ## Context
 
@@ -182,8 +185,9 @@ optimization phases, ordered by that data.
       the pre-agentd window. engram-init shim emits `engram-init: mark`
       phase markers (kernel_to_init/fs_mounts_done/ca_staged/exec_agentd) to
       firecracker.log (`0dfa783`) — it's a /bin/sh shim so it can't carry
-      Rust spans. TODO: harness-spawn-handler span; forward the shim marks
-      from firecracker.log into Cloud Logging (host-agent tail+re-emit).
+      Rust spans. `agentd.spawn_harness` span on the harness mount+exec
+      (`5bd7984`). TODO: forward the shim marks from firecracker.log into
+      Cloud Logging (host-agent tail+re-emit).
 - [x] uffd-handler: `uffd.map_populate` span around the canonical-memory
       mmap (`a8b4b41`) — restore-path critical cost (H2). TODO:
       time-to-first-fault + working-set fault tail.
@@ -201,7 +205,11 @@ optimization phases, ordered by that data.
   fetch latency) on the chunk-store/`disk_daemon` path — high-frequency I/O
   belongs in Prometheus, correlated by time with the trace. (The chunk
   cache already tags a `tier` label.)
-- [ ] Add the per-sandbox page-in counters/histograms (follow-up; not spans).
+- [x] Chunk-cache page-in metrics: `engram_chunk_cache_bytes_total{tier}`
+      (bytes served) + `engram_chunk_fetch_seconds{tier=blobstorage}` (remote
+      fetch latency — the cold-cache cost) alongside the existing
+      `engram_chunk_cache_hits_total{tier}`. Gives page-in volume + nvme/blob
+      split + slow-tier latency without per-read trace spam.
 - [ ] Kernel-level (dev-vm spike only): `blktrace`/`bpftrace` on the NVMe
       queue + `MAP_POPULATE` page-faults, under the `dev-vm` skill. Skip
       in prod (too heavy; user flagged not-worth-it if costly).
