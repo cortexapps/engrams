@@ -32,9 +32,20 @@ Commit chain (Phase 0, on `main`, each compiles clean via
 - `a0ce662` — 0e infra: Jaeger collector in the dev docker-compose, wired
   into `just dev` (Tiltfile), `just integration-up` (dev-vm), and
   `just trace-up`; OS-agnostic bridge-mode ports. Verified on macOS.
-- _(pending)_ vsock traceparent hop to in-guest agentd; deeper 0c spans
-  (uffd `MAP_POPULATE`, agentd boot); 0d chunk-store/NBD I/O spans;
-  0e: drive a real boot/resume/snapshot and capture the span→ms write-up.
+- `f2ef14e` — 0e first result: full cross-process cold-boot trace on the
+  dev-vm (coord → host-agent stitched via the gRPC hop). Finding:
+  `agent_handshake` ≈ 98% of cold boot. (doc; data in "Phase 0 first result")
+- `2367c6b` — 0b/0c host side: decompose `start_agent` into
+  `fc.await_agent_ready` + `fc.spawn_harness`; propagate trace context into
+  the guest via kernel cmdline (`engram_traceparent`/`engram_otel` on
+  `boot_args`); `FirecrackerConfig.guest_otel_endpoint`
+  (`ENGRAM_GUEST_OTEL_ENDPOINT`). Compiles (`cargo check`).
+- `f2239db` — 0b/0c guest side: agentd reads the cmdline values
+  (`kernel_cmdline_value`), adopts the OTLP endpoint, roots its `agentd.run`
+  span on the propagated parent. Compiles (`cargo check`).
+- _(pending)_ deeper 0c (uffd `MAP_POPULATE`, engram-init kernel/ext4-mount
+  markers); 0d chunk-store/NBD I/O spans; final Linux clippy pass; prod
+  canary to validate guest-span export + capture real magnitudes.
 
 ## Context
 
@@ -135,26 +146,39 @@ optimization phases, ordered by that data.
 - [x] host-agent → uffd-handler (spawn): `TRACEPARENT` env injected at the
       uffd spawn site; uffd-handler roots its `uffd.run` span on it. (FC
       itself isn't instrumented, so no env hop there.)
-- [ ] host-agent → in-guest agentd (vsock): carry `traceparent` in the
-      existing `WireHandshake` first frame (`engram-agentd/src/main.rs:~75`).
-      Trickiest hop (crosses the VM boundary); make optional if awkward —
-      0d covers the in-guest slice otherwise.
+- [x] host-agent → in-guest agentd (`2367c6b` host inject, `f2239db` agentd
+      consume): propagated via the **kernel cmdline** (not vsock — agentd
+      already parses `/proc/cmdline` for `engram_token`, so it's the proven
+      channel). On cold boot the host appends
+      `engram_traceparent=<tp>` and `engram_otel=<endpoint>` to
+      `BootSource.boot_args` (`create_in_jail_after_net`); agentd reads both
+      via `kernel_cmdline_value`, sets `OTEL_EXPORTER_OTLP_ENDPOINT`, and
+      roots its `agentd.run` span on the parent. The span's start offset in
+      the trace reveals the pre-agentd boot time (kernel + ext4 mount +
+      page-in). Cold-boot only (restore reuses the snapshot's cmdline).
+      **Caveat:** in-guest OTLP export needs a guest-reachable collector —
+      `guest_otel_endpoint` (`ENGRAM_GUEST_OTEL_ENDPOINT`) is operator-set
+      and defaults off, because the guest reaches the host only via its
+      per-sandbox TAP gateway (no fixed dev address). Validated on the prod
+      canary, where the collector is a stable endpoint.
 
 ### 0c — Span the top-level operations
 - [x] coord: `session.create` root span on `create_session`, plus
       `create_for_session`/`restore_for_session` (`host_registry.rs`) and
       `finish_resume_to_active` (`api/snapshot.rs`, tagged session_id).
-- [~] host-agent: gRPC `create_sandbox`/`snapshot`/`restore`/`start_agent`
-      handler spans done (incl. `start_agent` tagged `phase=agent_handshake`).
-      Still TODO: `create_in_jail`,
-      `restore_in_jail` (`lib.rs:~1572`) sub-steps (netns provision,
-      FC spawn, symlink, uffd-handler spawn, socket-wait,
-      `load_snapshot_uffd`), `PooledBackend::restore` pre-steps
-      (`pooled_backend.rs:~1713`: prefetch_memory_chunks,
-      materialize_state/disk/memory, NBD attach).
+- [x] host-agent: gRPC handler spans (`9ea424c`); FC
+      `create_in_jail`/`create_in_jail_after_net`/`restore_in_jail`/
+      `spawn_uffd_handler` spans (`0e6b33e`); `start_agent` decomposed into
+      `fc.await_agent_ready` + `fc.spawn_harness` (`2367c6b`).
+- [~] agentd: `agentd.run` boot span rooted on the propagated trace
+      (`f2239db`) — its start offset isolates pre-agentd boot. Still TODO:
+      finer in-guest markers (ext4 mount, harness-spawn handler) and
+      engram-init for the kernel-boot vs ext4-mount split.
 - [ ] uffd-handler: `MAP_POPULATE` (`runtime.rs:~292`), time-to-first-fault,
-      working-set fault tail.
-- [ ] agentd: boot-to-ready, ext4 mount, first harness spawn.
+      working-set fault tail (restore path; not on the cold-create critical path).
+- [~] `restore_in_jail` / `PooledBackend::restore` *internal* sub-steps
+      (netns, FC spawn, symlink, socket-wait, materialize, NBD attach) —
+      function-level spans exist; finer sub-step spans deferred.
 
 ### 0d — NVMe / disk I/O visibility
 - [ ] In-process spans (cheap, default-on) around I/O wrappers already on
