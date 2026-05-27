@@ -1516,36 +1516,56 @@ impl FirecrackerBackend {
         })?;
         let (tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            match listener.accept().await {
-                Ok((mut stream, _peer)) => {
-                    match engram_agentd::read_msg::<_, engram_agentd::AgentReady>(&mut stream).await
-                    {
-                        Ok(ready) => {
-                            tracing::info!(
-                                %sandbox_id,
-                                agent_version = %ready.agent_version,
-                                "agentd ready",
-                            );
-                            // Drop in case the sender side is gone —
-                            // sandbox already destroyed before agentd
-                            // got to dial. Harmless.
-                            let _ = tx.send(true);
+            // ADR 0020: keep accepting until we read a valid AgentReady, rather
+            // than giving up after the first connection. On a slow cold boot the
+            // guest's vsock connect can time out (FC's single device thread
+            // starved by the rootfs read storm) and close before writing the
+            // frame; agentd then re-dials, so we must re-accept. Looping also
+            // keeps the watch sender alive across failed reads — otherwise the
+            // first failure drops `tx`, the channel closes, and `wait_agent_ready`
+            // returns "channel closed" instead of waiting its full deadline.
+            // Bounded just past `wait_agent_ready`'s 180s so the task + UDS
+            // listener can't outlive a destroyed sandbox.
+            let listen = async {
+                loop {
+                    match listener.accept().await {
+                        Ok((mut stream, _peer)) => {
+                            match engram_agentd::read_msg::<_, engram_agentd::AgentReady>(
+                                &mut stream,
+                            )
+                            .await
+                            {
+                                Ok(ready) => {
+                                    tracing::info!(
+                                        %sandbox_id,
+                                        agent_version = %ready.agent_version,
+                                        "agentd ready",
+                                    );
+                                    let _ = tx.send(true);
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        %sandbox_id,
+                                        error = %e,
+                                        "agent-ready read failed; re-accepting (guest likely \
+                                         re-dialing under slow-boot I/O)",
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                %sandbox_id,
-                                error = %e,
-                                "agent-ready frame read failed; start_agent will block until \
-                                 deadline. Sandbox is likely broken (agentd dialed but didn't \
-                                 write a parseable AgentReady)."
-                            );
+                            tracing::debug!(error = %e, %sandbox_id, "agent-ready accept failed; re-accepting");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
+                    // Sandbox destroyed (all receivers dropped) → stop.
+                    if tx.is_closed() {
+                        return;
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, %sandbox_id, "agent-ready UDS accept ended");
-                }
-            }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(190), listen).await;
         });
         Ok(rx)
     }

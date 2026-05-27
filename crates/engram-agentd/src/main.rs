@@ -287,35 +287,62 @@ async fn run_transport(
     // restored sandbox where the host's listener path has already
     // been GC'd. Log loudly; don't die.
     let agent_version = env!("CARGO_PKG_VERSION").to_string();
-    match transport
-        .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)
-        .await
-    {
-        Ok(mut conn) => {
-            let ready = engram_agentd::AgentReady { agent_version };
-            if let Err(e) = engram_agentd::write_msg(&mut conn, &ready).await {
-                tracing::warn!(
-                    error = %e,
-                    port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
-                    "AgentReady write failed; host will block on start_agent",
-                );
-            } else {
-                tracing::info!(
-                    port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
-                    "AgentReady frame written to host",
-                );
+    // ADR 0020: retry the ready dial instead of giving up after one attempt.
+    // On a cold boot whose rootfs is a slow-backed drive (chunked-NBD), FC runs
+    // all virtio devices — including vsock — on a single device thread, and with
+    // the default Sync block io_engine that thread blocks in `read()` during the
+    // rootfs page-in storm. While it's blocked it can't service the vsock queue,
+    // so a guest→host connect can sit unanswered past the kernel's ~9s vsock
+    // connect timeout. Retrying waits out the slow-read window: once the device
+    // thread drains (the guest's own pages are in), a re-dial connects and the
+    // frame lands. The host's `wait_agent_ready` (180s) + its now-looping ready
+    // listener cover this window. On a fast boot the first dial succeeds, so this
+    // costs nothing; restored sandboxes don't re-run this path at all (the host
+    // pre-sets agent_ready), so the restore tail is untouched.
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match transport.dial(engram_agentd::ENGRAM_AGENTD_READY_PORT).await {
+            Ok(mut conn) => {
+                let ready = engram_agentd::AgentReady {
+                    agent_version: agent_version.clone(),
+                };
+                match engram_agentd::write_msg(&mut conn, &ready).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                            attempt,
+                            "AgentReady frame written to host",
+                        );
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut conn).await;
+                        break;
+                    }
+                    Err(e) => tracing::debug!(
+                        error = %e,
+                        attempt,
+                        "AgentReady write failed; will re-dial",
+                    ),
+                }
             }
-            let _ = tokio::io::AsyncWriteExt::shutdown(&mut conn).await;
-        }
-        Err(e) => {
-            tracing::warn!(
+            Err(e) => tracing::debug!(
                 error = %e,
+                attempt,
                 port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
-                "ready-port dial failed; host start_agent will block until its deadline. \
-                 Likely cause: snapshot restore (no host listener bound for this sandbox), \
-                 or host misconfigured. Proceeding to serve RPCs anyway.",
-            );
+                "ready-port dial failed; will re-dial (likely FC vsock starved by slow rootfs I/O on a cold boot)",
+            ),
         }
+        if std::time::Instant::now() >= ready_deadline {
+            tracing::warn!(
+                attempt,
+                port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                "ready-port handshake did not complete within deadline; host start_agent will \
+                 block until its own deadline. Proceeding to serve RPCs anyway (may be a restored \
+                 sandbox with no host listener, or a genuinely broken transport).",
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());

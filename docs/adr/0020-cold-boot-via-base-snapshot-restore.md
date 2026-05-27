@@ -1,53 +1,74 @@
 # ADR 0020: Cold-boot via base-snapshot restore — 25 s → ~100 ms
 
-Status: 2026-05-27 — **Blocked on ADR 0021 (FC block I/O via io_uring).**
-ADR 0019 closed the measurement phase and ranked **H1 (restore-from-base)**
-as the lever. This ADR commits to the optimization: route every cold
-`POST /sessions` through the existing, prod-validated `restore()` path
-against a per-image base snapshot, then shave the ~1 s restore tail to
-~100 ms. Phased P1–P5. **P1 is code-complete and green** (9 commits
-`85f7223`..`c481e3c`, `just check` 822 tests + dev-vm clippy), but end-to-end
-validation is **blocked**: the base-snapshot *capture* (and any FC boot on a
-slow-backed drive) can't complete its agentd handshake, root-caused to FC's
-Sync block io_engine starving the vsock device thread (see "Blocked on ADR
-0021" below). Resume once ADR 0021's Async-engine fix lands and the handshake
-works. Flips to Accepted only after the final phase is prod-measured.
+Status: 2026-05-27 — **Proposed (P1 in progress).** ADR 0019 closed the
+measurement phase and ranked **H1 (restore-from-base)** as the lever. This ADR
+commits to the optimization: route every cold `POST /sessions` through the
+existing, prod-validated `restore()` path against a per-image base snapshot,
+then shave the ~1 s restore tail to ~100 ms. Phased P1–P5. **P1 is code-complete
+and green** (9 commits `85f7223`..`c481e3c`, `just check` 822 tests + dev-vm
+clippy). The dev-vm e2e was briefly blocked on a slow-cold-boot vsock handshake
+issue (FC device-thread starvation) — **resolved by a capture-scoped handshake
+retry, NOT io_uring** (see below; validating on the dev-vm). Flips to Accepted
+only after the final phase is prod-measured.
 
 Phase: 1 (P1 = the lever). Commit chain recorded here as work lands.
 
-## Blocked on ADR 0021 (FC block I/O via io_uring)
+## The slow-cold-boot vsock handshake — root cause + resolution (not io_uring)
 
-P1's code landed and is green, but the dev-vm e2e — enable an image (→
-`build_base_snapshot` capture) then create a session (→ restore) — cannot
-complete. **Root cause (kernel-stack-proven, 2026-05-27):** Firecracker runs
-*all* virtio devices (block, net, **vsock**) on a single device thread, and
-with the default **Sync block `io_engine`** that thread does blocking `read()`s.
-The capture VM's rootfs is `/dev/nbd0` (chunked-NBD), so each read goes
-kernel-NBD → the engram userspace daemon → chunk cache/blob (slow). Sampling
-the FC process mid-boot showed the device thread in **D-state** with stack
-`folio_wait_bit_common → filemap_read → blkdev_read_iter → vfs_read → read()`,
-syscall = `read` on fd → `/dev/nbd0`, 4 KiB. While blocked there it can't
-service the vsock queue → the guest agentd's `connect()` to the host ready
-port (1027) goes unanswered → **times out at 9 s** → `wait_agent_ready` fails.
-The whole boot is ~106 s for the same reason.
+P1's code landed green, but the first dev-vm e2e (enable → `build_base_snapshot`
+capture → create → restore) couldn't complete its agentd handshake.
 
-Why prod survives: its rootfs reads are fast (warm NVMe; even cold it reads at
-16 MiB chunk granularity over GCS, ~84 ms × ~162, not 4 KiB × ~90k), so the
-device thread never blocks long enough to exceed the 9 s vsock timeout. So
-this is a **latent prod risk too** — ADR 0020's capture is always a cold boot,
-the most exposed case.
+**Root cause (kernel-stack-proven, 2026-05-27):** Firecracker runs *all* virtio
+devices (block, net, **vsock**) on a single device thread, and with the default
+**Sync block `io_engine`** that thread does blocking `read()`s. The capture VM's
+rootfs is `/dev/nbd0` (chunked-NBD), so each read goes kernel-NBD → the engram
+userspace daemon → chunk cache/blob (slow). Sampling the FC process mid-boot
+showed the device thread in **D-state** with stack `folio_wait_bit_common →
+filemap_read → blkdev_read_iter → vfs_read → read()`, syscall = `read` on
+fd → `/dev/nbd0`, 4 KiB. While blocked there it can't service the vsock queue →
+the guest agentd's `connect()` to the host ready port (1027) goes unanswered →
+times out at the kernel's ~9 s vsock connect timeout → the handshake fails. The
+whole capture boot is ~106 s for the same reason. (Prod survives because its
+rootfs reads are fast — warm NVMe; even cold it reads at 16 MiB chunk
+granularity over GCS, ~84 ms × ~162, not 4 KiB × ~90k — so the device thread
+never blocks past the 9 s timeout.)
 
-The fix is **FC's Async (io_uring) block `io_engine`** on the NBD-backed drive,
-which keeps block I/O off the device thread so vsock is serviced promptly —
-specified in **ADR 0021**. ADR 0020's restore happy-path + latency measurement
-resume on prod once that lands. (Not a fix: bumping `/dev/nbd0` readahead to
-coalesce the 4 KiB reads — it only makes boot fast enough to *mask* the
-starvation; the architectural coupling remains. Fold readahead in later as a
-perf win, not as the fix.)
+**Why not io_uring (decided 2026-05-27 after an investigation pass):**
+- Engram adopting io_uring for its *own* I/O doesn't pay: GCS is network-bound
+  (io_uring saves µs against ~84 ms RTTs); chunk-cache/NBD reads are already
+  async at 16 MiB granularity → bandwidth-bound, io_uring's per-op win is noise;
+  the UFFD bottleneck is the single-threaded fault loop, not syscalls. And the
+  162-sequential-fetch is a *concurrency* problem (the guest's ext4 mount demands
+  chunks one-at-a-time) — addressed by working-set prefetch + restore-from-
+  snapshot, which io_uring wouldn't touch.
+- FC's *global* Async (io_uring) block engine **does** fix the starvation, but
+  it's FC-labeled developer-preview (not for production) and — critically — its
+  ~110 ms device-creation cost likely bakes into `state.bin` (restore never
+  re-issues `put_drive`; `io_engine` is immutable post-load, un-`patch_drive`-
+  able), so it would re-pay on **every restore** — taxing the exact path we're
+  driving to ~100 ms. Hypothesis, but enough to avoid flipping it globally.
 
-What still remains in P1 after the unblock: **1d** per-fork identity reseed and
-**1e** per-snapshot restore serialization (both concurrency-only — they gate
-the prod push, not the first happy-path validation), then prod measurement.
+**Resolution — capture-scoped handshake robustness, restore stays on Sync.**
+The starvation only bites the one-time *capture* cold boot (and any slow cold
+boot); the restore path has no ext4 page-in (memory via UFFD) and pre-sets
+`agent_ready`, so it's untouched. The handshake is made to wait out the
+slow-read window instead of giving up at 9 s:
+- **agentd retries** the ready-port dial in a bounded loop
+  (`crates/engram-agentd/src/main.rs`) — once its own pages are resident and the
+  read storm subsides, a re-dial connects. On a fast boot the first dial wins, so
+  it costs nothing; restored sandboxes never re-run this path.
+- The **host ready listener loops** (`spawn_agent_ready_listener` in
+  `crates/engram-sandbox-firecracker/src/lib.rs`) — re-accepts across failed
+  reads and keeps the `agent_ready` watch sender alive, so `wait_agent_ready`
+  waits its full 180 s instead of returning "channel closed" on the first miss.
+
+(Rejected: bumping `/dev/nbd0` readahead to coalesce the 4 KiB reads — it only
+makes boot fast enough to *mask* the starvation; fold it in later as a perf win,
+not the fix. No ADR 0021 / io_uring effort is being pursued.)
+
+What still remains in P1: **1d** per-fork identity reseed and **1e** per-snapshot
+restore serialization (both concurrency-only — they gate the prod push, not the
+first happy-path validation), then prod measurement.
 
 ## Context
 
