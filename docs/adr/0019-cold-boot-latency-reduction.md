@@ -246,6 +246,50 @@ optimization phases, ordered by that data.
       leverage. **Stop and review with the user before Phase 1.** Update
       this ADR with the breakdown and flip to Accepted.
 
+## Phase 0 result #2 — itemized cold-boot breakdown (dev-vm, 2026-05-27)
+
+With the decomposed spans (`await_agent_ready`/`spawn_harness`) + the guest
+kernel timestamps (firecracker.log) + agentd's wall-clock logs, the
+cold-boot is now attributed. The host trace's `engram_traceparent` matched
+the value injected into the guest kernel cmdline — propagation into the VM
+confirmed. (dev-vm, **cold** fake-gcs chunk cache.)
+
+| phase | dur | source |
+|---|---|---|
+| `fc.create_in_jail*` (host VM setup + FC config) | ~2.6s | trace |
+| **`fc.await_agent_ready`** | **~129s (97%)** | trace |
+| ├─ kernel boot + rootfs `/dev/vda` ext4 mount (chunked-NBD page-in) | ~24s | kernel `[1.3→25.1]s` |
+| ├─ `engram-init` shim — esp. `/dev/vdb` (harness substrate) ext4 mount + CA staging (NBD page-in) | ~97s (inferred) | init `[+25.9]` → agentd first log |
+| └─ agentd startup (→ bind RPC, dial ready) | ~6s | agentd logs |
+| `fc.spawn_harness` | ~0.8s | trace |
+
+**Finding: cold boot is dominated by chunked-NBD page-in during ext4
+mounts** — of *both* the rootfs (`/dev/vda`) *and* the harness substrate
+(`/dev/vdb`, which the shim mounts only to copy the egress CA). On a cold
+chunk cache each mount blocks on remote chunk fetches.
+
+Implications:
+- **H1 (restore-from-base) confirmed as THE lever** — a snapshot resume
+  skips kernel boot, both ext4 mounts, and all page-in (matches prod's ~1s
+  warm-resume vs ~15s cold).
+- **Secondary independent win:** the `engram-init` `/dev/vdb` CA-staging
+  mount appears to be the single largest sub-cost here. Baking the egress
+  CA into the rootfs (eliminating the `/dev/vdb` mount on cold boot) could
+  cut a large chunk without H1.
+
+Caveats:
+- dev-vm **cold fake-gcs cache** massively inflates the page-in (~97s for
+  the substrate); prod has a warm local NVMe chunk cache → seconds. The
+  **ordering** (NBD page-in dominates) holds; absolute numbers are dev-vm
+  artifacts. **Prod canary needed for real magnitudes.**
+- The ~97s shim attribution is **inferred** (cross-clock arithmetic + the
+  shim's known steps). The `engram-init: mark` console markers + agentd
+  `boot_elapsed_s` would confirm it directly — but the **bake used a stale
+  agentd/shim** (didn't pick up this branch's source), so they didn't emit.
+  Fixing the image pipeline to rebuild agentd/shim from source is a required
+  follow-up before the prod canary (the prod guest must carry the
+  instrumented agentd for guest-side spans).
+
 ## Phase 0 first result — cross-process cold-boot trace (dev-vm, 2026-05-27)
 
 First end-to-end trace captured: `just integration-up && just integration-test`
