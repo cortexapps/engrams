@@ -3190,9 +3190,16 @@ impl SandboxBackend for FirecrackerBackend {
                 engram_agentd::write_msg(&mut conn, &req)
                     .await
                     .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
-                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                let resp = engram_agentd::read_msg(&mut conn).await.map_err(|e| {
                     SandboxError::Vm(format!("read SpawnHarness response: {e}").into())
-                })
+                })?;
+                // Pin the block's error type to SandboxError. Without this the
+                // inference is ambiguous (connect/write yield SandboxError, the
+                // raw read_msg yields io::Error) and resolves differently under
+                // `-p coord -p host-agent` unification vs `--workspace` — which
+                // is why single-crate check + workspace clippy passed but the
+                // integration `-p` build failed.
+                Ok::<_, SandboxError>(resp)
             },
             tracing::info_span!("fc.spawn_harness"),
         )
