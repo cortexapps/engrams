@@ -239,6 +239,14 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // ADR 0019: a guest-reachable OTLP collector endpoint (e.g. the
+            // TAP gateway IP : the collector's port). When set, cold-boot
+            // boot_args carry `engram_otel=<this>` so the in-guest agentd
+            // exports its boot spans into the host's cold-boot trace. Unset
+            // (the default) leaves in-guest tracing off.
+            fc_cfg.guest_otel_endpoint = std::env::var("ENGRAM_GUEST_OTEL_ENDPOINT")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             // When the egress proxy is enabled, plumb the matching
             // TCP/443 port into the FC config so iptables installs
             // the REDIRECT rule (and the matching default-deny on

@@ -179,6 +179,12 @@ pub struct FirecrackerConfig {
     /// "no PCI bus, triple-fault reboot, panic immediately" combo for
     /// micro-VMs.
     pub default_boot_args: String,
+    /// ADR 0019: optional OTLP collector endpoint reachable *from inside
+    /// the guest* (e.g. `http://<tap-gateway-ip>:4317`). When set, cold-boot
+    /// `boot_args` carry `engram_otel=<this>` so the in-guest agentd exports
+    /// its boot spans to the same trace as the host. `None` = no in-guest
+    /// export (the default; restore reuses the snapshot's embedded cmdline).
+    pub guest_otel_endpoint: Option<String>,
     /// `firecracker` binary on PATH or absolute path. Override for
     /// testing or when a different build is required.
     pub firecracker_bin: PathBuf,
@@ -397,6 +403,7 @@ impl FirecrackerConfig {
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
                 .into(),
+            guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
@@ -1243,7 +1250,7 @@ impl FirecrackerBackend {
         // CONFIG_IP_PNP brings up eth0 with the guest's static
         // address before init runs. Skipped when networking is
         // disabled — the guest boots without an eth0.
-        let boot_args = match net_setup {
+        let mut boot_args = match net_setup {
             Some(setup) => format!(
                 "{} {}",
                 self.config.default_boot_args.trim_end(),
@@ -1251,6 +1258,20 @@ impl FirecrackerBackend {
             ),
             None => self.config.default_boot_args.clone(),
         };
+        // ADR 0019: propagate this cold-boot's trace context (+ a
+        // guest-reachable OTLP collector) into the guest via the kernel
+        // cmdline, so in-guest agentd roots its boot spans on this trace.
+        // agentd parses these from /proc/cmdline (same channel as
+        // `engram_token`). Only meaningful on cold boot — restore reuses the
+        // snapshot's embedded cmdline. Inert when OTLP is off / no active span.
+        if let Some(tp) = engram_telemetry::current_traceparent() {
+            boot_args.push_str(" engram_traceparent=");
+            boot_args.push_str(&tp);
+        }
+        if let Some(ep) = self.config.guest_otel_endpoint.as_deref() {
+            boot_args.push_str(" engram_otel=");
+            boot_args.push_str(ep);
+        }
         api.put_boot_source(&BootSource {
             kernel_image_path: self.config.kernel_image_path.to_string_lossy().into_owned(),
             boot_args,
@@ -3080,6 +3101,7 @@ impl SandboxBackend for FirecrackerBackend {
         self.repoint_harness_drive(&api, id).await
     }
 
+    #[tracing::instrument(name = "fc.start_agent", skip_all, fields(sandbox_id = %id))]
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -3121,21 +3143,28 @@ impl SandboxBackend for FirecrackerBackend {
         // over.
         let wait_deadline = Duration::from_secs(180);
         if !*agent_ready.borrow() {
-            tokio::time::timeout(wait_deadline, agent_ready.wait_for(|v| *v))
-                .await
-                .map_err(|_| {
-                    SandboxError::Vm(
-                        format!(
-                            "agentd did not dial ready port within {}s — guest never bound \
+            // ADR 0019: this is the dominant cold-boot phase — the host
+            // blocking on the guest to finish kernel boot + ext4 mount +
+            // chunked-NBD page-in and dial its ready port. Its own span so
+            // the trace separates "waiting for the guest" from harness spawn.
+            tracing::Instrument::instrument(
+                tokio::time::timeout(wait_deadline, agent_ready.wait_for(|v| *v)),
+                tracing::info_span!("fc.await_agent_ready", phase = "agent_handshake"),
+            )
+            .await
+            .map_err(|_| {
+                SandboxError::Vm(
+                    format!(
+                        "agentd did not dial ready port within {}s — guest never bound \
                              ENGRAM_AGENTD_PORT (kernel panic? engram-init hang?)",
-                            wait_deadline.as_secs()
-                        )
-                        .into(),
+                        wait_deadline.as_secs()
                     )
-                })?
-                .map_err(|e| {
-                    SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
-                })?;
+                    .into(),
+                )
+            })?
+            .map_err(|e| {
+                SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
+            })?;
         }
 
         let (harness_dev, harness_mount) = if has_harness {
@@ -3153,13 +3182,21 @@ impl SandboxBackend for FirecrackerBackend {
             harness_mount,
         });
 
-        let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
-        engram_agentd::write_msg(&mut conn, &req)
-            .await
-            .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
-        let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-            .await
-            .map_err(|e| SandboxError::Vm(format!("read SpawnHarness response: {e}").into()))?;
+        // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.
+        // Separate span so the (usually fast) spawn is distinct from the wait.
+        let resp: engram_agentd::WireResponse = tracing::Instrument::instrument(
+            async {
+                let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
+                engram_agentd::write_msg(&mut conn, &req)
+                    .await
+                    .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(format!("read SpawnHarness response: {e}").into())
+                })
+            },
+            tracing::info_span!("fc.spawn_harness"),
+        )
+        .await?;
         match resp {
             engram_agentd::WireResponse::HarnessSpawned { pid } => {
                 let elapsed = phase_start.elapsed().as_secs_f64();
@@ -3199,6 +3236,7 @@ mod tests {
         let cfg = FirecrackerConfig {
             kernel_image_path: dir.path().join("nonexistent-vmlinux"),
             default_boot_args: "console=ttyS0".into(),
+            guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: RestoreMode::File,

@@ -265,6 +265,7 @@ mod tests {
         let cfg = FirecrackerConfig {
             kernel_image_path: work_dir.join("nonexistent-vmlinux"),
             default_boot_args: "console=ttyS0".into(),
+            guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
