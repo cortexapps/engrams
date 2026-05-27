@@ -43,9 +43,16 @@ Commit chain (Phase 0, on `main`, each compiles clean via
 - `f2239db` — 0b/0c guest side: agentd reads the cmdline values
   (`kernel_cmdline_value`), adopts the OTLP endpoint, roots its `agentd.run`
   span on the propagated parent. Compiles (`cargo check`).
-- _(pending)_ deeper 0c (uffd `MAP_POPULATE`, engram-init kernel/ext4-mount
-  markers); 0d chunk-store/NBD I/O spans; final Linux clippy pass; prod
-  canary to validate guest-span export + capture real magnitudes.
+- `0dfa783` — 0c pre-agentd window: engram-init shim emits `engram-init:
+  mark <phase> uptime=<s>` (kernel_to_init / fs_mounts_done / ca_staged /
+  exec_agentd) to the console/firecracker.log; agentd records
+  `boot_elapsed_s` (/proc/uptime at start) on `agentd.run`. Splits the
+  agent_handshake black box into "guest booting before agentd" vs agentd
+  startup. Compiles (`cargo check`).
+- _(pending)_ uffd `MAP_POPULATE` span (restore path); 0d chunk-store/NBD
+  I/O spans; host-agent forwarding of `engram-init: mark` lines into Cloud
+  Logging; final Linux clippy pass; prod canary (guest-span export + real
+  magnitudes).
 
 ## Context
 
@@ -170,10 +177,13 @@ optimization phases, ordered by that data.
       `create_in_jail`/`create_in_jail_after_net`/`restore_in_jail`/
       `spawn_uffd_handler` spans (`0e6b33e`); `start_agent` decomposed into
       `fc.await_agent_ready` + `fc.spawn_harness` (`2367c6b`).
-- [~] agentd: `agentd.run` boot span rooted on the propagated trace
-      (`f2239db`) — its start offset isolates pre-agentd boot. Still TODO:
-      finer in-guest markers (ext4 mount, harness-spawn handler) and
-      engram-init for the kernel-boot vs ext4-mount split.
+- [x] agentd: `agentd.run` boot span rooted on the propagated trace
+      (`f2239db`) + `boot_elapsed_s` from /proc/uptime (`0dfa783`) isolating
+      the pre-agentd window. engram-init shim emits `engram-init: mark`
+      phase markers (kernel_to_init/fs_mounts_done/ca_staged/exec_agentd) to
+      firecracker.log (`0dfa783`) — it's a /bin/sh shim so it can't carry
+      Rust spans. TODO: harness-spawn-handler span; forward the shim marks
+      from firecracker.log into Cloud Logging (host-agent tail+re-emit).
 - [ ] uffd-handler: `MAP_POPULATE` (`runtime.rs:~292`), time-to-first-fault,
       working-set fault tail (restore path; not on the cold-create critical path).
 - [~] `restore_in_jail` / `PooledBackend::restore` *internal* sub-steps
