@@ -109,6 +109,24 @@ variable "warm_pool_size" {
   default     = 2
 }
 
+variable "restore_mode" {
+  type        = string
+  description = <<-EOT
+    FC snapshot restore backend (ADR 0020). `uffd` (default) is the
+    chunk-native lazy restore: the host-agent spawns engram-uffd-handler,
+    which serves guest memory from chunks on fault — no memory.bin
+    materialize, instant resume. Requires the handler baked onto the host
+    image (deploy/packer does this) + vm.unprivileged_userfaultfd=1 (same).
+    `file` is the legacy eager memory.bin read; set it to roll back if a
+    host image predates the handler bake.
+  EOT
+  default     = "uffd"
+  validation {
+    condition     = contains(["uffd", "file"], var.restore_mode)
+    error_message = "restore_mode must be \"uffd\" or \"file\"."
+  }
+}
+
 variable "warm_pool_disabled" {
   type        = bool
   description = <<-EOT
