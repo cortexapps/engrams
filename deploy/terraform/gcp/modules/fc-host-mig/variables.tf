@@ -264,3 +264,19 @@ variable "distribution_policy_target_shape" {
     of total fleet capacity.
   DESC
 }
+
+variable "otel_collector_endpoint" {
+  type        = string
+  default     = "http://localhost:4317"
+  description = <<-DESC
+    OTLP/gRPC endpoint the host-agent exports traces to (ADR 0019). Defaults
+    to the per-host otelcol baked into the GCP image (localhost:4317), which
+    forwards to Cloud Trace via the googlecloud exporter. Set to "" to
+    disable host-agent tracing (leaves OTEL_EXPORTER_OTLP_ENDPOINT unset, so
+    engram-telemetry is a no-op).
+
+    NOTE: this is only the host-agent -> local-collector hop. In-guest agentd
+    export needs the per-sandbox TAP gateway (not a fixed endpoint) plus the
+    agentd image rebuild — a follow-up, not wired here.
+  DESC
+}

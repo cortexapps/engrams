@@ -1,0 +1,57 @@
+# Engram OpenTelemetry Collector config — GCP (ADR 0019).
+#
+# One config, deployed two ways:
+#   • FC hosts (GCE): an `otelcol` systemd unit baked into the image by
+#     deploy/packer/provisioners/gcp/install-otelcol.sh.
+#   • Coordinator (GKE): an `otelcol` sidecar in the coord pod (helm chart,
+#     mounted from a ConfigMap).
+#
+# Receives OTLP from the local emitters and exports traces to Google Cloud
+# Trace via the `googlecloud` exporter (otelcol-contrib). The only
+# provider-specific piece is the exporter — an AWS variant swaps in
+# `awsxray` (deploy/otel/collector-aws.yaml, future).
+#
+# Auth: the `googlecloud` exporter uses ADC — the FC-host instance SA
+# (metadata server) or the coord Workload-Identity SA, each granted
+# roles/cloudtrace.agent. The GCP project is auto-detected from ADC.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # 0.0.0.0 so the in-guest agentd can reach the host's collector at
+        # its TAP gateway IP (`<gateway>:4317`), and host-agent at localhost.
+        # In the coord sidecar this is pod-local. NOTE: on FC hosts this is
+        # reachable by the (untrusted) guest, which could forge/spam spans —
+        # acceptable for the canary; revisit with a per-sandbox restriction
+        # or a guest auth token before broad rollout.
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bound collector memory so a fleet-wide cold-boot span storm can't OOM a
+  # host alongside Firecracker. Drops/refuses over the soft limit.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  googlecloud:
+    # project + creds via ADC (instance SA / WI SA). Default endpoint is
+    # cloudtrace.googleapis.com.
+    trace: {}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [googlecloud]
+  telemetry:
+    logs:
+      level: warn

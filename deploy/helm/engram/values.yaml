@@ -187,6 +187,33 @@ extraEnv: []
 # Optional ConfigMap key/value pairs mounted as env vars on the coord.
 extraConfig: {}
 
+# Distributed tracing (ADR 0019). When enabled, the coordinator exports
+# OTLP/gRPC to a collector at `endpoint` (default: the in-pod sidecar below),
+# which forwards traces to the cloud's trace backend. Disabled by default;
+# a GCP overlay sets enabled=true + collector.configMap. engram-telemetry is
+# a no-op whenever `endpoint` resolves to unset.
+otel:
+  enabled: false
+  # OTLP/gRPC endpoint the coordinator exports to. Default = the sidecar.
+  endpoint: "http://localhost:4317"
+  collector:
+    # Run an otelcol sidecar in the coord pod (the GKE analogue of the FC
+    # hosts' per-host systemd collector). Set false to export to an external
+    # collector via `endpoint` instead.
+    enabled: true
+    # otelcol-contrib (the `googlecloud` exporter is contrib-only).
+    image: "otel/opentelemetry-collector-contrib:0.116.0"
+    # Name of an existing ConfigMap with key `config.yaml`, created from
+    # deploy/otel/collector-gcp.yaml. Required when collector.enabled.
+    configMap: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 192Mi
+
 # Probes — defaults aligned with the coord's /healthz handler.
 probes:
   liveness:

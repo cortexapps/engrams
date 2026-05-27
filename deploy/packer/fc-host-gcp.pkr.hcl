@@ -192,6 +192,25 @@ build {
     script         = "${path.root}/provisioners/gcp/install-ops-agent.sh"
   }
 
+  # 3b. OpenTelemetry Collector (ADR 0019) — local trace collector. Receives
+  #     OTLP on :4317 from host-agent (localhost) + in-guest agentd (TAP
+  #     gateway) and ships traces to Cloud Trace via the googlecloud
+  #     exporter. GCP-specific (config under deploy/otel/, installer under
+  #     provisioners/gcp/); other clouds get their own exporter variant.
+  #     Stage the shared config + the systemd unit, then install.
+  provisioner "file" {
+    source      = "${path.root}/../otel/collector-gcp.yaml"
+    destination = "/tmp/collector-gcp.yaml"
+  }
+  provisioner "file" {
+    source      = "${path.root}/provisioners/systemd/otelcol.service"
+    destination = "/tmp/otelcol.service"
+  }
+  provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
+    script         = "${path.root}/provisioners/gcp/install-otelcol.sh"
+  }
+
   # 4. systemd unit + drain hook.
   provisioner "file" {
     source      = "${path.root}/provisioners/systemd/engram-host-agent.service"

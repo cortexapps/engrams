@@ -77,6 +77,15 @@ resource "google_project_iam_member" "metric_writer" {
   member  = "serviceAccount:${google_service_account.fc_host.email}"
 }
 
+# ADR 0019: the per-host otelcol (baked into the image) exports traces to
+# Cloud Trace authing as this instance SA. Granted only when tracing is on.
+resource "google_project_iam_member" "cloudtrace_agent" {
+  count   = var.otel_collector_endpoint == "" ? 0 : 1
+  project = var.project_id
+  role    = "roles/cloudtrace.agent"
+  member  = "serviceAccount:${google_service_account.fc_host.email}"
+}
+
 # The host needs read+write on the chunks bucket. Grant that
 # directly at the caller — bind `${instance_sa_email}` (this
 # module's output) to `roles/storage.objectAdmin` on the bucket.
@@ -180,6 +189,7 @@ ${var.egress_ca_gcp_cert_secret == "" ? "" : "ENGRAM_EGRESS_CA_GCP_CERT_SECRET=$
 ${var.egress_ca_gcp_key_secret == "" ? "" : "ENGRAM_EGRESS_CA_GCP_KEY_SECRET=${var.egress_ca_gcp_key_secret}"}
 ${var.nbd_slots > 0 ? "ENGRAM_NBD_DEVICES=${join(",", [for i in range(var.nbd_slots) : "/dev/nbd${i}"])}" : ""}
 ${var.chunk_cache_budget_bytes > 0 ? "ENGRAM_CHUNK_CACHE_BUDGET_BYTES=${var.chunk_cache_budget_bytes}" : ""}
+${var.otel_collector_endpoint == "" ? "" : "OTEL_EXPORTER_OTLP_ENDPOINT=${var.otel_collector_endpoint}"}
 EOF
       systemctl daemon-reload
       systemctl restart engram-host-agent.service
