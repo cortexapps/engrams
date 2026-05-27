@@ -26,13 +26,33 @@ use std::process::ExitCode;
 use engram_agentd::serve_connection;
 
 fn main() -> ExitCode {
+    // ADR 0019: the host injects the OTLP collector endpoint + parent trace
+    // context into the kernel cmdline on cold boot (BootSource.boot_args).
+    // Adopt the endpoint into the env *before* telemetry init so the guest
+    // exports to the same Jaeger/collector as the host. Set before the
+    // runtime/threads start, so the env write is safe.
+    if let Some(ep) = kernel_cmdline_value("engram_otel") {
+        if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
+            std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", ep);
+        }
+    }
+
     // Held for the lifetime of `main`; declared before the runtime so it
-    // drops *after* the runtime, flushing pending OTLP spans on shutdown
-    // (ADR 0019). OTLP is inert unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+    // drops *after* the runtime, flushing pending OTLP spans on shutdown.
+    // OTLP is inert unless `OTEL_EXPORTER_OTLP_ENDPOINT` ends up set.
     let _telemetry = engram_telemetry::init(engram_telemetry::Config {
         service_name: "engram-agentd",
         default_filter: "info",
     });
+
+    // Root span parented on the host's cold-boot trace (if propagated via
+    // `engram_traceparent`). Its start offset in the trace reveals how long
+    // the guest spent in kernel boot + ext4 mount + chunked-NBD page-in
+    // before agentd ran — the bulk of the `agent_handshake` wait (ADR 0019).
+    let span = tracing::info_span!("agentd.run");
+    if let Some(tp) = kernel_cmdline_value("engram_traceparent") {
+        engram_telemetry::set_parent_from_traceparent(&span, &tp);
+    }
 
     let args = match parse_args() {
         Ok(a) => a,
@@ -53,7 +73,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match rt.block_on(run(args)) {
+    match rt.block_on(tracing::Instrument::instrument(run(args), span)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("engram-agentd: {e}");
@@ -147,19 +167,24 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args { listen, token })
 }
 
-/// Read `/proc/cmdline` (Linux only) and pull the value of an
-/// `engram_token=<T>` token-arg if present. Whitespace-delimited per
-/// the kernel's own parser. Returns `None` on non-Linux, on read
-/// failure, or if the arg isn't there. The host injects this via
-/// Firecracker's `BootSource.boot_args` so production guests don't
-/// need an explicit `--token` CLI arg.
-fn token_from_kernel_cmdline() -> Option<String> {
+/// Read `/proc/cmdline` (Linux only) and pull the value of a `<key>=<v>`
+/// kernel arg. Whitespace-delimited per the kernel's own parser. Returns
+/// `None` on non-Linux, on read failure, or if the arg isn't there. The
+/// host injects these via Firecracker's `BootSource.boot_args` so
+/// production guests don't need explicit CLI args. Used for
+/// `engram_token`, and (ADR 0019) `engram_otel` / `engram_traceparent`.
+fn kernel_cmdline_value(key: &str) -> Option<String> {
     if !cfg!(target_os = "linux") {
         return None;
     }
+    let prefix = format!("{key}=");
     let raw = std::fs::read_to_string("/proc/cmdline").ok()?;
     raw.split_ascii_whitespace()
-        .find_map(|part| part.strip_prefix("engram_token=").map(|t| t.to_string()))
+        .find_map(|part| part.strip_prefix(prefix.as_str()).map(|t| t.to_string()))
+}
+
+fn token_from_kernel_cmdline() -> Option<String> {
+    kernel_cmdline_value("engram_token")
 }
 
 async fn run(args: Args) -> std::io::Result<()> {
