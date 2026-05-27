@@ -37,8 +37,11 @@ fi
 INTEG_DIR="./var/integration"
 mkdir -p "$INTEG_DIR"
 
-echo "==> docker compose: postgres + fake-gcs-server + registry"
-docker compose -f deploy/docker-compose.dev.yml up -d postgres fake-gcs-server registry
+echo "==> docker compose: postgres + fake-gcs-server + registry + jaeger"
+# jaeger (ADR 0019) comes up here, BEFORE the host-agent writes its
+# iptables rules, so its bridge-mode published ports don't collide with
+# the host-agent's DNAT chains (same ordering reason as the others).
+docker compose -f deploy/docker-compose.dev.yml up -d postgres fake-gcs-server registry jaeger
 
 echo "==> wait for postgres health"
 for _ in $(seq 1 30); do
@@ -85,7 +88,7 @@ fi
 # have NOPASSWD sudo, or this will block.
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_NBD_DEVICES,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY,ENGRAM_HOST_METRICS_ADDR"
+    SUDO="sudo -n --preserve-env=PATH,RUST_LOG,DATABASE_URL,ENGRAM_KERNEL_IMAGE_PATH,ENGRAM_SANDBOX_WORK_DIR,ENGRAM_SANDBOX_BACKEND,ENGRAM_GRPC_LISTEN_ADDR,ENGRAM_GRPC_ADVERTISE_ADDR,ENGRAM_COORDINATOR_ENDPOINT,ENGRAM_BLOB_BACKEND,ENGRAM_GCS_BUCKET,STORAGE_EMULATOR_HOST,ENGRAM_NBD_DEVICES,ENGRAM_EGRESS_PROXY_PORT,ENGRAM_KEK_MASTER_KEY,ENGRAM_HOST_METRICS_ADDR,OTEL_EXPORTER_OTLP_ENDPOINT"
     if ! sudo -n true 2>/dev/null; then
         echo "ERROR: passwordless sudo required for host-agent TAP creation." >&2
         echo "       Add an entry to /etc/sudoers.d/ allowing this user NOPASSWD." >&2
@@ -111,6 +114,7 @@ ENGRAM_LOCAL_PATH="./var/engram-integration" \
 ENGRAM_BLOB_BACKEND="gcs" \
 ENGRAM_GCS_BUCKET="${ENGRAM_GCS_BUCKET:-engram-snapshots-test}" \
 STORAGE_EMULATOR_HOST="http://localhost:4443" \
+OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_coordinator::api::enabled_images=trace}" \
 nohup "$INTEG_BIN_DIR/engram-coordinator" >"$INTEG_DIR/coord.log" 2>&1 &
 echo $! > "$INTEG_DIR/coord.pid"
@@ -217,6 +221,7 @@ STORAGE_EMULATOR_HOST="http://localhost:4443" \
 ENGRAM_NBD_DEVICES="$NBD_DEVICES_A" \
 ENGRAM_HOST_METRICS_ADDR="0.0.0.0:9100" \
 ENGRAM_EGRESS_PROXY_PORT="${ENGRAM_EGRESS_PROXY_PORT:-0}" \
+OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}" \
 RUST_LOG="${RUST_LOG:-info,engram=debug,engram_host_agent::warm_pool=debug,engram_host_agent::pooled_backend=debug}" \
 nohup $SUDO "$INTEG_BIN_DIR/engram-host-agent" >"$INTEG_DIR/host-agent.log" 2>&1 &
 echo $! > "$INTEG_DIR/host-agent.pid"
@@ -235,6 +240,7 @@ if [ "$TWO_HOSTS" = "1" ]; then
     ENGRAM_NBD_DEVICES="$NBD_DEVICES_B" \
     ENGRAM_HOST_METRICS_ADDR="0.0.0.0:9110" \
     ENGRAM_EGRESS_PROXY_PORT="${ENGRAM_EGRESS_PROXY_PORT:-0}" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}" \
     RUST_LOG="${RUST_LOG:-info,engram=debug}" \
     nohup $SUDO "$INTEG_BIN_DIR/engram-host-agent" >"$INTEG_DIR/host-agent-b.log" 2>&1 &
     echo $! > "$INTEG_DIR/host-agent-b.pid"

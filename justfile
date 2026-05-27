@@ -73,6 +73,18 @@ registry-up:
 registry-down:
     docker compose -f deploy/docker-compose.dev.yml stop registry
 
+# Bring up Jaeger for ADR 0019 cold-boot tracing. UI at
+# http://localhost:16686; OTLP/gRPC collector on :4317. Export
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 to make the
+# binaries emit spans (`just dev` / `just integration-up` set it for
+# you). Works the same on macOS and the Linux dev-vm.
+trace-up:
+    docker compose -f deploy/docker-compose.dev.yml up -d jaeger
+    @echo "Jaeger UI → http://localhost:16686  (OTLP/gRPC on :4317)"
+
+trace-down:
+    docker compose -f deploy/docker-compose.dev.yml stop jaeger
+
 # Generate a 32-byte master key (KEK) for envelope-encrypted
 # registry credentials and write it into `.env` for direnv/`just`
 # to pick up. Idempotent: if `.env` already has ENGRAM_KEK_MASTER_KEY

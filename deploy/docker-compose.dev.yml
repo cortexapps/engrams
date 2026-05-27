@@ -88,6 +88,34 @@ services:
       -public-host localhost:4443
       -data /data
 
+  # Jaeger all-in-one — OTLP trace collector + UI for ADR 0019 cold-boot
+  # tracing. The engram binaries export here when
+  # `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` is set
+  # (engram-telemetry uses OTLP/gRPC); inert otherwise. `just dev` and
+  # `just integration-up` wire that env for you.
+  #
+  # Bridge-mode published ports work identically on macOS (Docker
+  # Desktop) and the Linux dev-vm, so this is the one OS-agnostic shape.
+  # On Linux there's the same ordering caveat as postgres/registry: this
+  # must come up BEFORE engram-host-agent writes its iptables rules, or
+  # docker's DNAT for the published ports collides with the host-agent's
+  # FORWARD/PREROUTING entries (see the fake-gcs-server note above). Both
+  # `just dev` (no host-agent iptables on mac) and `just integration-up`
+  # (compose services start before the host-agent) satisfy this.
+  #
+  # Trace storage is in-memory (no volume) — fine for dev; a restart
+  # drops collected traces, which is what we want between runs.
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    restart: unless-stopped
+    environment:
+      # all-in-one >=1.35 gates the OTLP receivers behind this flag.
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # web UI → http://localhost:16686
+      - "4317:4317"     # OTLP gRPC — engram-telemetry's exporter target
+      - "4318:4318"     # OTLP HTTP — for any other OTLP tooling
+
 volumes:
   engram-pg-data:
   engram-registry-data:

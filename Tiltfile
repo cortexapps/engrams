@@ -117,6 +117,12 @@ dc_resource('registry',
 dc_resource('fake-gcs-server',
     labels=['infra'],
     links=['http://localhost:4443/storage/v1/b'])
+# Jaeger — OTLP trace collector + UI for ADR 0019 cold-boot tracing.
+# coord (+ host-agent in split mode) export here via
+# OTEL_EXPORTER_OTLP_ENDPOINT, defaulted below.
+dc_resource('jaeger',
+    labels=['infra'],
+    links=[link('http://localhost:16686', 'jaeger UI')])
 
 # ----------------------------------------------------------------
 # Setup one-shots: KEK + GCS bucket seed + (Mac only) codesign.
@@ -169,6 +175,12 @@ local_resource('seed-buckets',
 # delivery, and the OCI → BlobStorage materialization end-to-end.
 dev_split = env_or('ENGRAM_DEV_SPLIT', '') in ('1', 'true', 'yes')
 
+# ADR 0019: default the OTLP export target to the local Jaeger (dc above).
+# Both coord and host-agent honor it; engram-telemetry is inert if it ever
+# points nowhere, so a stale value never breaks startup. Override in .env
+# to ship spans elsewhere (or to '' to disable export entirely).
+otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
+
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
@@ -188,6 +200,7 @@ coord_env = {
     'ENGRAM_BLOB_BACKEND': 'gcs' if dev_split else env_or('ENGRAM_BLOB_BACKEND', 'local'),
     'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
     'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
+    'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
     'RUST_LOG': 'info,engram=debug',
 }
 
@@ -212,7 +225,7 @@ else:
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    resource_deps=['postgres', 'registry', 'fake-gcs-server', 'seed-buckets', 'bootstrap'],
+    resource_deps=['postgres', 'registry', 'fake-gcs-server', 'jaeger', 'seed-buckets', 'bootstrap'],
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
@@ -270,6 +283,9 @@ if dev_split:
         'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
         # Egress proxy off in dev — set non-zero to enable.
         'ENGRAM_EGRESS_PROXY_PORT': '0',
+        # ADR 0019: same OTLP target as the coord, so the host-side
+        # restore/boot spans land in the same Jaeger trace.
+        'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
         'RUST_LOG': 'info,engram=debug',
     }
     if 'Darwin' in uname_str:
