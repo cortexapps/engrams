@@ -20,9 +20,17 @@ Commit chain (Phase 0, on `main`, each compiles clean via
   client interceptor + host-side `link_remote_parent` extraction;
   `session.create` root span and host `create_sandbox`/`snapshot`/
   `restore`/`start_agent` handler spans.
-- _(pending)_ 0b spawn-env + vsock propagation; deeper 0c spans
-  (`restore_in_jail` sub-steps, uffd `MAP_POPULATE`, agentd); 0d I/O
-  spans; 0e dev-vm collection + write-up.
+- `416b3b0` — fix: drop redundant `#[must_use]` on `init_tracing`
+  (clippy `double_must_use`, caught by dev-vm Linux clippy; folds into 0a).
+- `0e6b33e` — 0b (uffd spawn-env hop) + 0c (FC spans): spans on
+  `create_in_jail`/`create_in_jail_after_net`/`restore_in_jail`/
+  `spawn_uffd_handler`; `TRACEPARENT` injected into the uffd-handler
+  spawn and consumed as its `uffd.run` span parent. Verified clean by
+  `cargo clippy --workspace --all-targets -- -D warnings` on the Linux dev-vm.
+- _(pending)_ vsock traceparent hop to in-guest agentd; deeper 0c spans
+  (uffd `MAP_POPULATE`, agentd boot, coord `create_for_session`/
+  `restore_for_session`/`finish_resume_to_active`); 0d chunk-store/NBD
+  I/O spans; 0e dev-vm Jaeger collection + the span→ms write-up.
 
 ## Context
 
@@ -120,10 +128,9 @@ optimization phases, ordered by that data.
       `link_remote_parent` and parents the handler span
       (`engram-host-agent/src/grpc_server.rs`). Helpers
       `engram_telemetry::current_traceparent` / `set_parent_from_traceparent`.
-- [ ] host-agent → firecracker / uffd-handler (spawn): pass `TRACEPARENT`
-      env var (or `--traceparent` flag) at the spawn sites
-      (`lib.rs:~965` FC, `~1047` uffd-handler); child parses as root-span
-      parent.
+- [x] host-agent → uffd-handler (spawn): `TRACEPARENT` env injected at the
+      uffd spawn site; uffd-handler roots its `uffd.run` span on it. (FC
+      itself isn't instrumented, so no env hop there.)
 - [ ] host-agent → in-guest agentd (vsock): carry `traceparent` in the
       existing `WireHandshake` first frame (`engram-agentd/src/main.rs:~75`).
       Trickiest hop (crosses the VM boundary); make optional if awkward —
