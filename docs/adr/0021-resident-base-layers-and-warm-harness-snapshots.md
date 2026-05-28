@@ -371,9 +371,26 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       `tests/baked_harness_loopback.rs` bakes an image with `engram-harness-noop`
       COPY'd into `/opt/noop/harness`, boots it on real Firecracker, and drives
       the attach + RunStarted handshake. Verified on the dev VM (24.69 s). CI's
-      unprivileged-FC step picks it up. The `proxy_e2e` / `e2e_harness` /
-      `e2e_shell` rewrites (TLS-proxy chain + real Claude end-to-end) remain
-      coverage gaps — both require their own fixture rebuild.
+      unprivileged-FC step picks it up.
+- [x] **Resurrect deleted e2e tests against the baked-harness model**
+      *(cbf3ea6, 3eab5b9, 2c4f9e7)*: all four tests dropped in P1.5b+c are back —
+      `proxy_e2e` + `restore_chain` in `engram-sandbox-firecracker`,
+      `e2e_shell` + `e2e_harness` in `engram-host-agent`. The harness pack now
+      travels in `/opt/engram/harness/` inside the rootfs (matching the bake-time
+      `inject_builtin_harness` shape); the per-host egress-proxy CA flows in via
+      `AgentSpec.host_ca_pem` → `InstallHostCa` vsock RPC instead of the retired
+      `.engram-host/ca.pem` substrate smuggle. Wired into ci.yml under
+      unprivileged FC (`restore_chain`), root FC (`proxy_e2e`), and a new
+      true-e2e step (`e2e_shell`, `e2e_harness`). Cold paths all green on the
+      dev VM (24–39 s each).
+- [ ] **FC vsock UDS settle-window regression** *(bd55c0c — bandage)*: with
+      option-D retired, FC's `PUT /snapshot/load` returns before its vsock UDS
+      reliably accepts the first host→guest CONNECT; pre-P1 the option-D
+      pause+resume cycle hid this. Current bandage:
+      `connect_fc_vsock` retries ECONNREFUSED for ~5 s. Real fix (explicit FC
+      readiness barrier post-load_snapshot) is pending and blocks P2 — prod
+      coord drives sessions through this exact warm-restore + vsock pattern.
+      Surfaced by `e2e_harness_warm_via_pooled_backend`.
 
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
