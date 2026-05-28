@@ -440,7 +440,13 @@ impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
             packer: Mke2fsPacker::default(),
             chunk_store,
             oci: None,
-            catalog: BuiltinCatalog::default_catalog(),
+            // Default catalog + env-driven overrides. CI lanes that
+            // publish a just-built harness artifact to a local
+            // registry export `ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=…`
+            // before invoking the baker; production leaves the env
+            // unset and falls through to the GHCR repos hardcoded in
+            // `default_catalog`. See `with_overrides_from_env`.
+            catalog: BuiltinCatalog::default_catalog().with_overrides_from_env(),
         }
     }
 }
