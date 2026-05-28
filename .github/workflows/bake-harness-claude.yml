@@ -73,11 +73,11 @@ jobs:
       - name: Install musl-tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
 
-      - name: Build engram-harness-claude (musl) + engram-cli (host)
+      - name: Build engram-harness-claude (musl) + engram-publish-builtin-harness (host)
         run: |
           cargo build --release --target x86_64-unknown-linux-musl \
             -p engram-harness-claude
-          cargo build --release -p engram-cli
+          cargo build --release -p engram-publish-builtin-harness
 
       - name: Download Claude Code CLI (Linux x64)
         id: claude_cli
@@ -128,19 +128,18 @@ jobs:
           STAGE: ${{ steps.stage.outputs.dir }}
           TAG: ghcr.io/${{ github.repository }}/harness-claude:${{ env.HARNESS_VERSION }}-${{ env.HARNESS_PLATFORM }}
         run: |
-          # `engram-cli harness push` invokes
-          # `engram_oci::OciClient::push_harness` — a generic
-          # one-tar.gz-layer OCI push that doesn't care what's
-          # inside. The CLI command is retired in ADR 0021 P1 (along
-          # with the rest of the standalone harness subsystem); P1
-          # ships a replacement publish surface this workflow will
-          # switch to. Until then it's the working primitive.
+          # ADR 0021 P1.7: `engram-publish-builtin-harness` is the
+          # CI-only replacement for the retired `engram-cli harness
+          # push` subcommand. Both call the same underlying
+          # `engram_oci::OciClient::push_harness` primitive, so the
+          # wire shape (one tar.gz layer at our media type) is
+          # identical — only the front-end retires.
           #
           # Tag shape is the catalog's expected format:
           # `<repo>:<version>-<platform-suffix>`. No `:latest` /
           # `:main` / SHA aliases — the ADR's reproducibility rule
           # is "one explicit version, baker records the digest."
-          ./target/release/engram-cli harness push \
+          ./target/release/engram-publish-builtin-harness \
             --from "$STAGE" \
             --to "$TAG"
           echo "Published $TAG"

@@ -57,13 +57,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RegistryCmd,
     },
-    /// Manage harness packs registered with the coordinator. Pack
-    /// bytes live in a Docker registry; this surface manages the
-    /// `(name, registry_uri)` index that sessions select by.
-    Harness {
-        #[command(subcommand)]
-        cmd: HarnessCmd,
-    },
+    // ADR 0021 P1.5a/P1.7 retired the `Harness` subcommand entirely.
+    // Built-in harness publish moved to the `engram-publish-builtin-
+    // harness` crate (CI-only); the `/api/harnesses` registry was
+    // deleted with the rest of the standalone subsystem.
     /// Admin operations — explicit triggers for primitives whose
     /// production driver is implicit (disk-pressure detector etc.).
     /// Auth-gated behind the same bearer token as the rest of the
@@ -219,31 +216,10 @@ enum RegistryCmd {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum HarnessCmd {
-    /// Tar+gzip a local pack directory and push it as a one-layer OCI
-    /// artifact. Pure registry-side work — no Postgres, no coordinator
-    /// API call. Used today by `bake-harness-claude.yml` to publish
-    /// the built-in claude harness artifact (ADR 0021 P0 catalog).
-    ///
-    /// ADR 0021 P1.7 will move this to a standalone
-    /// `engram-publish-builtin-harness` binary; until then this CLI
-    /// subcommand stays so the CI workflow doesn't break.
-    Push {
-        /// Local directory containing the artifact contents (binary +
-        /// any bundled sidecars + `artifact.toml`).
-        #[arg(long)]
-        from: PathBuf,
-        /// Destination OCI URI, e.g.
-        /// `ghcr.io/cortexapps/engrams/harness-claude:v0.1.0-linux-x86_64`.
-        #[arg(long)]
-        to: String,
-    },
-    // ADR 0021 P1.5a retired `Add` / `List` / `Rm` — the
-    // `/api/harnesses` registry doesn't exist anymore (the harness is
-    // an image property baked at image-bake time, not a deployment-
-    // wide name-to-URI table).
-}
+// ADR 0021 P1.7 retired `HarnessCmd` entirely. The built-in harness
+// publish primitive lives in `crates/engram-publish-builtin-harness`
+// (CI-only); user-facing `engram harness {add,list,rm}` retired with
+// the `/api/harnesses` registry in P1.5a.
 
 // `Build` has many optional path fields (rootfs source, agent
 // injection, bootstrap injection, canonical-capture kernel + FC
@@ -497,11 +473,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             RegistryCmd::List => registry_list(&client, &cli.endpoint, cli.json).await,
             RegistryCmd::Rm { host } => registry_rm(&client, &cli.endpoint, host).await,
         },
-        Cmd::Harness { cmd } => match cmd {
-            // ADR 0021 P1.5a: only `Push` remains; the rest were tied
-            // to the now-retired `/api/harnesses` registry.
-            HarnessCmd::Push { from, to } => harness_push(from, to).await,
-        },
+        // ADR 0021 P1.7 retired the `Cmd::Harness` arm.
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Flush { id } => admin_flush(&client, &cli.endpoint, id, cli.json).await,
             AdminCmd::FlushIdle => admin_flush_idle(&client, &cli.endpoint, cli.json).await,
@@ -1305,43 +1277,10 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
     Ok(())
 }
 
-// ---- harness subcommands ----------------------------------------------
-
-/// Tar+gzip a local pack directory and push it as an OCI artifact.
-/// Pure registry-side work — no API call, no Postgres write. Mirrors
-/// the `engram image build --push` shape so bake-and-register stay
-/// independent operations.
-///
-/// Anonymous push works for `localhost:5001` and public registries.
-/// For authenticated registries the user pre-runs `docker login` (or
-/// pushes via `oras`) — wiring `engram harness push` through the
-/// coordinator's encrypted creds resolver lands when that's
-/// genuinely needed.
-async fn harness_push(from: &Path, to: &str) -> Result<(), CliError> {
-    // Auth via the standard docker config — run `docker login`
-    // upstream (locally via the docker CLI, in CI via
-    // `docker/login-action@v3` or equivalent). No docker config =
-    // anonymous push, which works for `localhost:5001` and public
-    // registries.
-    let oci =
-        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
-    tracing::info!(uri = %to, dir = %from.display(), "pushing harness pack");
-    let digest = oci
-        .push_harness(to, from)
-        .await
-        .map_err(|e| CliError::Other(format!("oci push: {e}")))?;
-    println!("✓ pushed {to}");
-    println!("  digest: {}", digest.as_str());
-    println!();
-    println!("  register it with the coordinator:");
-    println!("    engram harness add --name <name> --registry-uri {to}");
-    println!("  or in the dashboard:");
-    println!("    http://localhost:5173/settings/harnesses");
-    Ok(())
-}
-
-// ADR 0021 P1.5a retired `harness_add` / `harness_list` / `harness_rm`
-// with the rest of the `/api/harnesses` registry.
+// ADR 0021 P1.5a + P1.7 retired the entire `engram harness ...`
+// surface — the publish primitive moved to its own CI-only crate
+// (`engram-publish-builtin-harness`); the registry-CRUD subcommands
+// (add/list/rm) went with the `/api/harnesses` endpoint.
 
 // ---- enabled-images subcommands ---------------------------------------
 

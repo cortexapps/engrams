@@ -217,13 +217,8 @@ impl GrpcHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
-        // ADR 0021 P1.5: the wire still carries the retired
-        // harness_pack_uri / harness_name fields; we always send
-        // None. They retire from the proto in a follow-up.
         let req = RestoreBaseForSessionRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
-            harness_pack_uri: None,
-            harness_name: None,
             session_env,
         };
         let resp = self
