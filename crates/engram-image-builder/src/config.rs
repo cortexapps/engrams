@@ -105,6 +105,15 @@ impl EngramRepoConfig {
         let manifest = value
             .try_into::<ImageManifest>()
             .map_err(|e| BuildError::Config(format!("manifest fields: {e}")))?;
+        // A `[harness]` table is author-facing; enforce the shape rules
+        // (builtin xor name/exec, absolute exec, no baker-only fields)
+        // here so a malformed block fails the bake up front rather than
+        // shipping an image that can't launch its agent.
+        if let Some(harness) = &manifest.harness {
+            harness
+                .validate_source()
+                .map_err(|e| BuildError::Config(format!("[harness]: {e}")))?;
+        }
         Ok(Self { manifest, build })
     }
 
@@ -229,12 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_engram_toml_rejects_stale_harness_block() {
-        // `[[harness]]` was retired when harness binaries moved to a
-        // host-side directory mounted into every sandbox via
-        // virtio-fs. ImageManifest's `deny_unknown_fields` catches
-        // a stale engram.toml that still carries the block, failing
-        // at parse rather than silently shipping an inert image.
+    fn parse_engram_toml_rejects_stale_harness_array_block() {
+        // ADR 0021 baked exactly one harness per image, so `harness`
+        // is a singular table, not an array. The pre-0021
+        // `[[harness]]` array-of-tables shape fails to deserialize
+        // into the singular field, surfacing stale engram.toml files
+        // at bake rather than silently shipping an inert image. The
+        // accepted singular form is exercised below.
         let res = EngramRepoConfig::parse(
             r#"
             name = "claude-oauth"
@@ -244,7 +254,83 @@ mod tests {
             guest_path = "/sbin/engram-harness-claude"
             "#,
         );
-        assert!(res.is_err(), "stale [[harness]] block must be rejected");
+        assert!(
+            res.is_err(),
+            "stale [[harness]] array block must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_engram_toml_accepts_builtin_harness() {
+        let cfg = EngramRepoConfig::parse(
+            r#"
+            name = "demo-claude"
+
+            [harness]
+            builtin = "claude"
+            "#,
+        )
+        .unwrap();
+        let h = cfg.manifest.harness.expect("harness parsed");
+        assert_eq!(h.builtin.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn parse_engram_toml_accepts_custom_harness() {
+        let cfg = EngramRepoConfig::parse(
+            r#"
+            name = "my-img"
+
+            [harness]
+            name = "my-agent"
+            exec = "/opt/my-agent/harness"
+            args = ["--serve"]
+            "#,
+        )
+        .unwrap();
+        let h = cfg.manifest.harness.expect("harness parsed");
+        assert_eq!(h.exec.as_deref(), Some("/opt/my-agent/harness"));
+        assert_eq!(h.args, vec!["--serve"]);
+    }
+
+    #[test]
+    fn parse_engram_toml_rejects_ambiguous_harness_shape() {
+        // builtin + exec together — validate_source must reject at
+        // bake time so a confused engram.toml doesn't ship.
+        let res = EngramRepoConfig::parse(
+            r#"
+            name = "x"
+
+            [harness]
+            builtin = "claude"
+            exec = "/opt/x/harness"
+            "#,
+        );
+        let err = res.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("[harness]"),
+            "error must point at [harness]: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_engram_toml_rejects_baker_only_version_in_source() {
+        // `version` is set by the baker, not the author — source
+        // engram.toml must fail-fast if it carries one.
+        let res = EngramRepoConfig::parse(
+            r#"
+            name = "x"
+
+            [harness]
+            builtin = "claude"
+            version = "1.2.3"
+            "#,
+        );
+        assert!(
+            res.is_err(),
+            "baker-only `version` in source must be rejected"
+        );
     }
 
     #[test]
