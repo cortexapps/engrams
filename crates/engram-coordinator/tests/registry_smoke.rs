@@ -39,7 +39,7 @@ use axum::http::{Method, Request, StatusCode};
 use engram_cloud_mock::MockCloud;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
-use engram_core::types::registry::{HarnessPack, RegistryAuthSpec, RegistryCredential};
+use engram_core::types::registry::{RegistryAuthSpec, RegistryCredential};
 use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
@@ -60,7 +60,7 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct MockMetadataStore {
     registries: Mutex<HashMap<String, RegistryCredential>>,
-    harness_packs: Mutex<HashMap<String, HarnessPack>>,
+    // ADR 0021 P1.5a: harness_packs field retired with the registry.
     enabled_images: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
 }
 
@@ -194,24 +194,7 @@ impl MetadataStore for MockMetadataStore {
     }
 
     // -- harness packs: tracked.
-    async fn upsert_harness_pack(&self, pack: HarnessPack) -> Result<(), MetaError> {
-        self.harness_packs.lock().insert(pack.name.clone(), pack);
-        Ok(())
-    }
-    async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError> {
-        let mut v: Vec<_> = self.harness_packs.lock().values().cloned().collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(v)
-    }
-    async fn get_harness_pack(&self, name: &str) -> Result<Option<HarnessPack>, MetaError> {
-        Ok(self.harness_packs.lock().get(name).cloned())
-    }
-    async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError> {
-        match self.harness_packs.lock().remove(name) {
-            Some(_) => Ok(()),
-            None => Err(MetaError::NotFound),
-        }
-    }
+    // ADR 0021 P1.5a: harness-pack mock fns retired with the registry.
     async fn upsert_enabled_image(
         &self,
         ei: engram_core::types::EnabledImage,
@@ -591,95 +574,13 @@ async fn delete_registry_round_trip() {
 }
 
 // ---------------------------------------------------------------------
-// /api/harnesses
+// /api/harnesses tests retired with the registry — ADR 0021 P1.5a.
+// The four HTTP smoke tests (add/list/reject-empty/delete) tested an
+// endpoint that no longer exists; deleted rather than rewritten
+// because there is no per-deployment harness registry to exercise.
+// The /api/registries tests below stay — registries (Docker creds)
+// are orthogonal and unaffected.
 // ---------------------------------------------------------------------
-
-#[tokio::test]
-async fn add_harness_pack_round_trip() {
-    let (app, meta) = build_app();
-    let body = json!({
-        "name": "claude",
-        "registry_uri": "gcr.io/cortex/harness-claude:v1.2",
-        "description": "Anthropic Claude Code adapter",
-    });
-    let (status, resp) = send(&app, Method::POST, "/api/harnesses", Some(body)).await;
-    assert_eq!(status, StatusCode::CREATED, "{status}: {resp}");
-    assert_eq!(resp["name"], "claude");
-    assert_eq!(resp["registry_uri"], "gcr.io/cortex/harness-claude:v1.2");
-
-    let stored = meta.get_harness_pack("claude").await.unwrap().unwrap();
-    assert_eq!(stored.name, "claude");
-    assert_eq!(stored.registry_uri, "gcr.io/cortex/harness-claude:v1.2");
-    assert_eq!(
-        stored.description.as_deref(),
-        Some("Anthropic Claude Code adapter")
-    );
-}
-
-#[tokio::test]
-async fn list_harnesses_returns_registry_packs() {
-    // Empty Postgres harness_packs = empty list. Adding one row makes
-    // it appear with its registry_uri intact. Stage B2 dropped the
-    // legacy host-resident scan; Postgres is now the only source.
-    let (app, _) = build_app();
-    let (status, resp) = send(&app, Method::GET, "/api/harnesses", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp.as_array().unwrap().len(), 0);
-
-    let _ = send(
-        &app,
-        Method::POST,
-        "/api/harnesses",
-        Some(json!({
-            "name": "noop",
-            "registry_uri": "ghcr.io/cortex/harness-noop:v0.3",
-        })),
-    )
-    .await;
-
-    let (_, resp) = send(&app, Method::GET, "/api/harnesses", None).await;
-    let harnesses = resp.as_array().unwrap();
-    assert_eq!(harnesses.len(), 1);
-    assert_eq!(harnesses[0]["name"], "noop");
-    assert_eq!(
-        harnesses[0]["registry_uri"],
-        "ghcr.io/cortex/harness-noop:v0.3"
-    );
-}
-
-#[tokio::test]
-async fn add_harness_rejects_empty_fields() {
-    let (app, _) = build_app();
-    for bad in [
-        json!({"name": "", "registry_uri": "gcr.io/x:v1"}),
-        json!({"name": "claude", "registry_uri": ""}),
-    ] {
-        let (status, resp) = send(&app, Method::POST, "/api/harnesses", Some(bad.clone())).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "expected 400 for {bad}, got {status}: {resp}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn delete_harness_round_trip() {
-    let (app, _) = build_app();
-    let _ = send(
-        &app,
-        Method::POST,
-        "/api/harnesses",
-        Some(json!({"name": "claude", "registry_uri": "gcr.io/x:v1"})),
-    )
-    .await;
-
-    let (status, _) = send(&app, Method::DELETE, "/api/harnesses/claude", None).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    let (status, _) = send(&app, Method::DELETE, "/api/harnesses/claude", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
 
 #[tokio::test]
 async fn upsert_replaces_in_place_for_same_host() {

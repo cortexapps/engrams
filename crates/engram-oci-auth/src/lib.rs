@@ -179,7 +179,7 @@ impl RegistryAuthResolver for PgAuthResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::types::registry::{HarnessPack, RegistryCredential};
+    use engram_core::types::registry::RegistryCredential;
     use engram_core::types::{
         HostRecord, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
     };
@@ -330,18 +330,7 @@ mod tests {
             *self.cred.lock() = None;
             Ok(())
         }
-        async fn upsert_harness_pack(&self, _: HarnessPack) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError> {
-            Ok(vec![])
-        }
-        async fn get_harness_pack(&self, _: &str) -> Result<Option<HarnessPack>, MetaError> {
-            Ok(None)
-        }
-        async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
-            Ok(())
-        }
+        // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
         async fn upsert_enabled_image(
             &self,
             _: engram_core::types::EnabledImage,

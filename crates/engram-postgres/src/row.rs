@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
 use engram_core::types::{
-    EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
+    EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
     RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
@@ -244,19 +244,8 @@ pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, Me
     })
 }
 
-pub(crate) fn harness_pack_from_row(row: &PgRow) -> Result<HarnessPack, MetaError> {
-    let id: Uuid = row.try_get("id").map_err(col_err)?;
-    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
-    let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
-    Ok(HarnessPack {
-        id,
-        name: row.try_get("name").map_err(col_err)?,
-        registry_uri: row.try_get("registry_uri").map_err(col_err)?,
-        description: row.try_get("description").map_err(col_err)?,
-        created_at,
-        updated_at,
-    })
-}
+// ADR 0021 P1.5a retired `harness_pack_from_row` with the rest of
+// the harness-packs registry.
 
 pub(crate) fn parse_session_state_for_lib(s: &str) -> Result<SessionState, MetaError> {
     parse_session_state(s)

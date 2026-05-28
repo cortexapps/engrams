@@ -133,17 +133,10 @@ impl From<RegistryCredential> for RegistryCredentialSummary {
     }
 }
 
-/// One row in `harness_packs`. Pointer-only — actual pack bytes live
-/// in the registry at `registry_uri`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HarnessPack {
-    pub id: Uuid,
-    pub name: String,
-    pub registry_uri: String,
-    pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: Option<DateTime<Utc>>,
-}
+// ADR 0021 P1.5a retired `HarnessPack` + the `harness_packs` Postgres
+// table — harnesses live in image rootfses now (built-ins injected by
+// the baker from the catalog, custom by the author's Dockerfile), so
+// there's no deployment-wide harness registry to model.
 
 /// One row in `session_secrets`: the per-request `secrets` map a
 /// dashboard / CLI client supplied at session-create time, sealed

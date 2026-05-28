@@ -221,47 +221,28 @@ enum RegistryCmd {
 
 #[derive(Subcommand, Debug)]
 enum HarnessCmd {
-    /// Tar+gzip a local pack directory and push it as an OCI artifact
-    /// to the registry. Pure registry-side work — no Postgres write,
-    /// no coordinator API call. Symmetric with `engram image build
-    /// --push`. After the push, register the pack with the
-    /// coordinator via `engram harness add` (or the dashboard's
-    /// Settings → Harnesses panel).
+    /// Tar+gzip a local pack directory and push it as a one-layer OCI
+    /// artifact. Pure registry-side work — no Postgres, no coordinator
+    /// API call. Used today by `bake-harness-claude.yml` to publish
+    /// the built-in claude harness artifact (ADR 0021 P0 catalog).
+    ///
+    /// ADR 0021 P1.7 will move this to a standalone
+    /// `engram-publish-builtin-harness` binary; until then this CLI
+    /// subcommand stays so the CI workflow doesn't break.
     Push {
-        /// Local directory containing the pack: at least an
-        /// executable `harness` entry-point, plus any sidecars the
-        /// wrapper exec's at runtime (bundled CLI binaries, etc.).
+        /// Local directory containing the artifact contents (binary +
+        /// any bundled sidecars + `artifact.toml`).
         #[arg(long)]
         from: PathBuf,
         /// Destination OCI URI, e.g.
-        /// `localhost:5001/cortex/harness-claude:v1` or
-        /// `gcr.io/cortex/harness-claude:v1.2`.
+        /// `ghcr.io/cortexapps/engrams/harness-claude:v0.1.0-linux-x86_64`.
         #[arg(long)]
         to: String,
     },
-    /// Register an already-pushed harness pack with the coordinator.
-    /// POSTs to `/api/harnesses`; this is the only path that writes a
-    /// `harness_packs` row.
-    ///
-    /// Re-registering the same name updates the URI in place.
-    Add {
-        /// Logical harness name sessions select by (e.g. `claude`,
-        /// `noop`). Must be unique.
-        #[arg(long)]
-        name: String,
-        /// Already-pushed OCI URI, e.g. `gcr.io/cortex/harness-claude:v1.2`.
-        #[arg(long)]
-        registry_uri: String,
-        /// Optional one-line description for the dashboard dropdown.
-        #[arg(long)]
-        description: Option<String>,
-    },
-    /// List registered harness packs.
-    List,
-    /// Remove a harness-pack registration. Does not delete the
-    /// artifact in the registry — only un-registers it from the
-    /// coordinator.
-    Rm { name: String },
+    // ADR 0021 P1.5a retired `Add` / `List` / `Rm` — the
+    // `/api/harnesses` registry doesn't exist anymore (the harness is
+    // an image property baked at image-bake time, not a deployment-
+    // wide name-to-URI table).
 }
 
 // `Build` has many optional path fields (rootfs source, agent
@@ -517,24 +498,9 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             RegistryCmd::Rm { host } => registry_rm(&client, &cli.endpoint, host).await,
         },
         Cmd::Harness { cmd } => match cmd {
+            // ADR 0021 P1.5a: only `Push` remains; the rest were tied
+            // to the now-retired `/api/harnesses` registry.
             HarnessCmd::Push { from, to } => harness_push(from, to).await,
-            HarnessCmd::Add {
-                name,
-                registry_uri,
-                description,
-            } => {
-                harness_add(
-                    &client,
-                    &cli.endpoint,
-                    name,
-                    registry_uri,
-                    description.as_deref(),
-                    cli.json,
-                )
-                .await
-            }
-            HarnessCmd::List => harness_list(&client, &cli.endpoint, cli.json).await,
-            HarnessCmd::Rm { name } => harness_rm(&client, &cli.endpoint, name).await,
         },
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Flush { id } => admin_flush(&client, &cli.endpoint, id, cli.json).await,
@@ -1374,88 +1340,8 @@ async fn harness_push(from: &Path, to: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn harness_add(
-    client: &reqwest::Client,
-    endpoint: &str,
-    name: &str,
-    registry_uri: &str,
-    description: Option<&str>,
-    json: bool,
-) -> Result<(), CliError> {
-    let mut body = serde_json::json!({
-        "name": name,
-        "registry_uri": registry_uri,
-    });
-    if let Some(d) = description {
-        body["description"] = serde_json::Value::String(d.into());
-    }
-    let resp = client
-        .post(format!("{endpoint}/api/harnesses"))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await?;
-    let status = resp.status();
-    let resp_body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), resp_body));
-    }
-    if json {
-        println!("{resp_body}");
-    } else {
-        let v: Value = serde_json::from_str(&resp_body)
-            .map_err(|e| CliError::Other(format!("invalid JSON from server: {e}")))?;
-        println!(
-            "added: name={} registry_uri={}",
-            v["name"].as_str().unwrap_or(""),
-            v["registry_uri"].as_str().unwrap_or(""),
-        );
-    }
-    Ok(())
-}
-
-async fn harness_list(
-    client: &reqwest::Client,
-    endpoint: &str,
-    json: bool,
-) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/harnesses")).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
-        return Ok(());
-    }
-    let empty = Vec::new();
-    let harnesses = body.as_array().unwrap_or(&empty);
-    if harnesses.is_empty() {
-        println!("(no harnesses registered)");
-        return Ok(());
-    }
-    println!("{:<24}  {:<60}  DESCRIPTION", "NAME", "REGISTRY_URI");
-    for h in harnesses {
-        let uri = h["registry_uri"].as_str().unwrap_or("(host-resident)");
-        println!(
-            "{:<24}  {:<60}  {}",
-            h["name"].as_str().unwrap_or(""),
-            uri,
-            h["description"].as_str().unwrap_or(""),
-        );
-    }
-    Ok(())
-}
-
-async fn harness_rm(client: &reqwest::Client, endpoint: &str, name: &str) -> Result<(), CliError> {
-    let resp = client
-        .delete(format!("{endpoint}/api/harnesses/{}", urlencode(name)))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    println!("removed");
-    Ok(())
-}
+// ADR 0021 P1.5a retired `harness_add` / `harness_list` / `harness_rm`
+// with the rest of the `/api/harnesses` registry.
 
 // ---- enabled-images subcommands ---------------------------------------
 

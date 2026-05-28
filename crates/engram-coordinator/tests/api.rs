@@ -358,24 +358,7 @@ impl MetadataStore for MockMetadataStore {
     async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn upsert_harness_pack(
-        &self,
-        _: engram_core::types::HarnessPack,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_harness_packs(&self) -> Result<Vec<engram_core::types::HarnessPack>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn get_harness_pack(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::HarnessPack>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
+    // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
     async fn upsert_enabled_image(
         &self,
         ei: engram_core::types::EnabledImage,
