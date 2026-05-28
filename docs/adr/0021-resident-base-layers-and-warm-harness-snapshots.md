@@ -383,23 +383,26 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       unprivileged FC (`restore_chain`), root FC (`proxy_e2e`), and a new
       true-e2e step (`e2e_shell`, `e2e_harness`). Cold paths all green on the
       dev VM (24–39 s each).
-- [x] **Warm-restore vsock ECONNREFUSED — root-caused, not a vsock issue**
-      *(1dfbb20)*: original hypothesis ("FC vsock UDS needs a settle window
-      after `load_snapshot`") was wrong. Empirical chain (`ls -la` + `ss -lx`
-      in root and per-VM netns + `lsof` + `ps` + full `firecracker.log`)
-      showed the UDS file exists with no process holding it, FC in zombie
-      state, FC log ending `Vmm is stopping. exit_code=0` exactly ~911 ms
-      after `load_snapshot` returned — i.e. the guest kernel rebooted via
-      `panic=1 reboot=k` → `KVM_EXIT_SHUTDOWN` → FC clean exit. Cause: the
-      test's cold path `pooled.create → wait_for_guest_ip → snapshot` had no
-      settle window; `wait_for_guest_ip` on the netns code path returns the
-      SNAT IP immediately (no actual handshake with the guest), so the
-      snapshot captured agentd mid-`bind(AF_VSOCK)` and the resumed kernel
-      came up with a half-initialised vsock driver. Fix: 2 s settle before
-      snapshot (mirrors `e2e_shell_warm`'s long-standing pattern). The
-      `connect_fc_vsock` retry bandage from `bd55c0c` was reverted to
-      one-shot. Prod is unaffected — the prod bake flow settles agentd well
-      past `accept()` before snapshot. P2 unblocked.
+- [x] **Warm-restore vsock ECONNREFUSED — backend-level fix, not just a test
+      tweak** *(1dfbb20 then a50dbd6)*: original hypothesis ("FC vsock UDS
+      needs a settle window after `load_snapshot`") was wrong. Empirical chain
+      (`ls -la` + `ss -lx` in root and per-VM netns + `lsof` + `ps` + full
+      `firecracker.log`) showed the UDS file exists with no process holding
+      it, FC in zombie state, FC log ending `Vmm is stopping. exit_code=0`
+      exactly ~911 ms after `load_snapshot` returned — i.e. the guest kernel
+      rebooted via `panic=1 reboot=k` → `KVM_EXIT_SHUTDOWN` → FC clean exit.
+      Cause: `PooledBackend.snapshot` (ADR 0018 12m) calls `inner.pause` →
+      flush → `inner.snapshot` → resume. If the guest is still in early boot
+      at the pre-pause, agentd hasn't completed `bind(AF_VSOCK)` and the
+      snapshot captures a half-initialised vsock driver. First test-side fix
+      added a 2 s sleep before `snapshot`; second commit moved the gate into
+      `PooledBackend.snapshot` itself via `inner.wait_agent_ready` *before*
+      the pre-flush pause, so every caller is protected. The `connect_fc_vsock`
+      retry bandage from `bd55c0c` was reverted to one-shot. Prod paths
+      reachable without the gate: SIGTERM-during-cold-boot (`shutdown.rs`
+      checkpoints all live sandboxes after a 5 s drain) and any future
+      coord-driven `snapshot(id)` fired shortly after create.
+      P2 unblocked.
 
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
