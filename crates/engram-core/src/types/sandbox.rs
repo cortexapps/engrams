@@ -79,7 +79,17 @@ pub struct AgentSpec {
     /// and before `SpawnHarness`, replacing the pre-0021 path where the
     /// CA rode in on the harness drive. `None` skips the install — used
     /// by tests, dev backends, and any deploy without egress proxying.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// **Wire format note**: this field intentionally does NOT carry
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`. AgentSpec
+    /// crosses the coord ↔ host-agent gRPC boundary as bincode (see
+    /// `engram-protocol/src/grpc_client.rs::start_agent`), and bincode
+    /// is positional — skipping a field on encode breaks the decoder
+    /// with "unexpected end of file" because it has no field names to
+    /// look up. The `#[serde(default)]` covers the legacy-snapshot
+    /// JSON path (manifest read of older sidecars that pre-date this
+    /// field).
+    #[serde(default)]
     pub host_ca_pem: Option<String>,
 }
 
@@ -188,6 +198,40 @@ pub struct ExecRusage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the bincode/serde footgun PR #40 ran into:
+    /// `AgentSpec` crosses the coord ↔ host-agent gRPC boundary as
+    /// bincode, and bincode is positional — any field marked
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` makes the
+    /// encoder emit a shorter buffer when that field is `None`, and
+    /// the decoder hits "unexpected end of file" when it tries to
+    /// read the missing tag. The test pins the round-trip for both
+    /// `None` and `Some` host_ca_pem so a future "let's clean up the
+    /// JSON shape" change can't silently break the wire.
+    #[test]
+    fn agent_spec_bincode_roundtrips_with_none_and_some_host_ca_pem() {
+        let none = AgentSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
+            env: HashMap::from_iter([("FOO".into(), "bar".into())]),
+            host_ca_pem: None,
+        };
+        let bytes = bincode::serialize(&none).expect("bincode encode None");
+        let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode None");
+        assert_eq!(back.argv, none.argv);
+        assert_eq!(back.env, none.env);
+        assert!(back.host_ca_pem.is_none());
+
+        let some = AgentSpec {
+            argv: vec!["/opt/engram/harness/harness".into()],
+            env: HashMap::new(),
+            host_ca_pem: Some(
+                "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into(),
+            ),
+        };
+        let bytes = bincode::serialize(&some).expect("bincode encode Some");
+        let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode Some");
+        assert_eq!(back.host_ca_pem, some.host_ca_pem);
+    }
 
     #[test]
     fn exec_event_terminal_only_on_exit() {
