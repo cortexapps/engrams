@@ -333,8 +333,10 @@ authors target `engram-harness-proto` directly):
 
 **P1 — Harnesses baked into templates; retire the standalone harness subsystem.**
 Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechanism.)
-- [ ] agentd launches the baked harness from the **rootfs path** (no drive mount, no
-      NBD); `SpawnHarnessRequest` drops `harness_dev`/`harness_mount`.
+- [x] agentd launches the baked harness from the **rootfs path** (no drive mount, no
+      NBD); `SpawnHarnessRequest` drops `harness_dev`/`harness_mount`. *(95a4a63;
+      legacy drive `inject_egress_proxy_ca` + `mount_harness` deleted; the
+      CaCertInstaller paths feed the child's TLS env vars now.)*
 - [x] Re-home the egress-proxy CA cert off the (removed) harness drive → vsock/agentd
       RPC into the guest trust store. *(60bfa89 P1.1: `InstallHostCa` RPC +
       cacerts installer; f328566 P1.2: FC backend calls it post-readiness;
