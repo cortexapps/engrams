@@ -15,8 +15,18 @@ harness-upload subsystem — harnesses are baked into templates.** It supersedes
 0020's P2 (memory working-set prefetch is now low-value) and reframes P3/P4. **ADR
 0020 is marked Blocked on this ADR.**
 
-Design/direction document; phasing is sketched at the end and each phase lands with
-its own prod validation per ADR 0020's ship loop.
+Design/direction document; phasing is at the end as a **living checklist** — each
+item is crossed off as it lands, and each phase carries its own prod validation per
+ADR 0020's ship loop.
+
+**DX decisions locked 2026-05-27** (drive Decision §1 and the P0/P1 phasing below):
+one harness per image, baked at bake time (or none); built-ins opt in via a
+declarative `[harness]` block in `engram.toml` and the baker downloads a published
+per-platform harness artifact (x86_64-linux first) and injects it; custom harnesses
+are COPY'd into the rootfs by the author's own Dockerfile and declared in
+`engram.toml`; the per-session harness *selection* is retired — which harness an
+image runs is an image property, and the session API keeps only a mode choice
+(run the baked harness vs. boot a pure dev VM).
 
 ## Context — what the prod profile told us
 
@@ -65,36 +75,76 @@ model sidesteps it entirely — see below.
 
 ## Decision
 
-### 1. An image is a self-contained *template*; harnesses are baked in
+### 1. An image is a self-contained *template*; exactly one harness is baked in (or none)
 
 Drop the standalone "upload a harness" feature. An image is baked as a complete
 **template = OS + tools + (optionally) one agent**, decided **at image-bake time**.
+**One harness per image** — this keeps the warm snapshot (§3) coherent and the boot
+profiling clean.
 
-- **Out-of-the-box**: engram ships curated templates — `debian+claude`,
-  `+opencode`, `+codex`, … — each pre-baked, warm-snapshotted, and resident. The DX
-  is "sessions come with these agents, ready in ~hundreds of ms."
-- **Custom**: bake your own template with your agent (the `engram-harness` SDK for
-  the protocol adapter + the existing `engram image build`). The (image, agent)
-  binding is fixed at bake time.
-- **Harness-less templates are first-class** (answer to "just a dev machine"): a
-  template with no agent is captured at **OS-ready** — exactly today's base snapshot
-  (ADR 0020 P1). `harness: none` already exists (`HarnessSpec::None` → boot the VM,
-  drive via shell / `engram exec`). Same restore mechanism, it just captures
-  "whatever is idle" — OS-only or OS+agent.
+**The author surface — a singular `[harness]` table in `engram.toml`.** (The old
+`[[harness]]` *array* was retired and is still rejected by `deny_unknown_fields`
+tests; this singular table is the new, expected shape. Its resolved launch contract
+is rendered into the image's `manifest.toml`, the single source of truth coord /
+host-agent / agentd / warm-capture all read.)
+
+```toml
+# Built-in: the baker downloads the published per-platform artifact + injects it.
+[harness]
+builtin = "claude"               # one of the curated names
+
+# — or — Custom: the author's own Dockerfile already COPY'd the binary in.
+[harness]
+name = "my-agent"
+exec = "/opt/my-agent/harness"   # path inside the rootfs
+args = ["--serve"]               # optional
+
+# — or — omit [harness] entirely → harness-less image (pure dev VM).
+```
+
+- **Out-of-the-box (built-ins)**: engram ships curated harnesses — `claude`, later
+  `opencode`/`codex`. `builtin = "claude"` makes `engram image build` resolve and
+  **download a published, version-pinned, per-platform harness artifact**
+  (x86_64-linux first) and inject it into the rootfs at the canonical path
+  `/opt/engram/harness/` (binary + any bundled runtime, e.g. the `claude` CLI). The
+  artifact is the *bake input* that replaces the old runtime OCI pack; the engram CI
+  pipeline that builds it lives on, repurposed. The DX is "sessions come with these
+  agents, ready in ~hundreds of ms."
+- **Custom**: author builds their adapter against the `engram-harness` SDK, **COPYs
+  the binary (+ runtime) into the rootfs in their own Dockerfile**, and declares
+  `[harness] name/exec/args`. The baker validates `exec` exists and records the
+  contract. Docker-native, handles multi-file runtimes, no separate upload surface.
+- **Harness-less templates are first-class** (answer to "just a dev machine"): omit
+  `[harness]`; the template is captured at **OS-ready** — exactly today's base
+  snapshot (ADR 0020 P1). Same restore mechanism; capture is "whatever is idle"
+  (OS-only or OS+agent).
+
+**The per-session harness *selection* is retired.** Which harness an image runs is an
+image property, so `HarnessSpec::{None, Builtin{name}}` on the session goes away
+(coord no longer resolves a name → pack URI). The session-create API keeps only a
+**mode**: `SessionMode::{Agent, DevVm}` — run the baked harness, or boot the image as
+a pure dev VM (shell only). A `DevVm` session of a harnessed template restores the
+**same** warm snapshot and simply doesn't drive the resident agent (an idle process
+in RAM is harmless), so no separate boot path is needed.
 
 This is the proven **template model** (E2B, Modal): build a template that includes
 your agent, snapshot it, restore it per session. It retires an entire subsystem —
-the `harness_packs` registry, `engram harness add/push`, harness OCI artifacts, the
-harness ext4 **substrate + NBD path** (the ~2 s serial `chunk.fetch` — gone, the
+the `harness_packs` registry, `engram harness add/push/list/rm`, harness OCI packs,
+the harness ext4 **substrate + NBD path** (the ~2 s serial `chunk.fetch` — gone, the
 agent is just in the rootfs), and the **option-D `swap_harness_drive`** machinery at
 restore. The protocol **adapter** (the irreducible per-agent translation, today's
-824-line `engram-harness-claude`) is still needed and still authored against the
-`engram-harness` SDK — but it ships *inside the template*, not as a separate pack.
+824-line `engram-harness-claude`) is still needed — now formalized behind a real
+`engram-harness` **SDK crate** (none exists today; only `engram-harness-proto` wire
+types) — but it ships *inside the template*, not as a separate pack.
+
+**One migration detail to carry:** the egress-proxy CA cert is delivered today via
+the harness *drive* (`<harness_mount>/.engram-host/ca.pem`). With the drive gone, the
+per-host/per-session cert must reach the guest trust store another way (vsock/agentd
+RPC). Tracked in P1.
 
 Tradeoff named honestly: you lose runtime "any image × any agent" mixing. But that
-flexibility *was* the source of the coherence hazard above, agents are co-designed
-with their environment in practice, and you can still bake multi-agent templates
-(only the warmed one gets warm-start). Good trade for a bounded catalog.
+flexibility *was* the source of the coherence hazard above, and agents are
+co-designed with their environment in practice. Good trade for a bounded catalog.
 
 ### 2. Resident base layers (GCS off the boot path)
 
@@ -238,21 +288,63 @@ remaining per-session cost is the COW delta + the first-prompt workspace scan.
   content dedup); the `UFFDIO_CONTINUE`/FC unknown (gates only runtime-dedup); and the
   persistent-agent dependency for warm snapshots to pay off.
 
-## Phasing (sketch — each lands + is prod-measured before the next)
+## Phasing (living checklist — each lands + is prod-measured before the next)
 
-- **P1 — Harnesses baked into templates; retire the standalone harness subsystem.**
-  Bake the agent into the image; drop the harness pack/registry/substrate/NBD/option-D
-  swap. Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel
-  mechanism.)
-- **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
-  gate). GCS off the boot path; retire the boot-path prefetch.
-- **P3 — Warm snapshots per template** (capture at the agent-`idle` signal; restore
-  into a ready agent), *gated on* moving the agent to a persistent model and the
-  open-question-2 measurement (cheap-boot-vs-snapshot). Removes the ~7–9 s.
-- **P4 — Runtime RAM dedup** (`UFFDIO_CONTINUE` + shared per-template backing) — gated
-  on the FC spike (open question 1). Density, not latency.
-- **P0 (parallel) — `engram-harness` SDK + a great `engram image build` DX** for
-  baking agent templates (first- and third-party share one pipeline).
+Cross items off (`[x]`) as they land, with the commit SHA where useful.
+
+**P0 — `engram-harness` SDK + a great `engram image build` DX** (first- and
+third-party share one pipeline):
+- [ ] New crate `crates/engram-harness` — ergonomic SDK over `engram-harness-proto`:
+      attach handshake, event-emit helpers, command loop, one-call `signal_ready()`
+      (`Idle`, which doubles as the warm-capture trigger). Port `engram-harness-noop`
+      to it.
+- [ ] Singular `[harness]` table on `ImageManifest` + parse/validate in the baker's
+      `engram.toml` reader (mutual-exclusion of `builtin` vs `name`/`exec`; replace
+      the stale-`[[harness]]`-rejection tests with singular-form tests).
+- [ ] Baker injects the built-in artifact / validates the custom `exec`; renders the
+      launch contract into `manifest.toml`.
+- [ ] Publish pipeline: rework `bake-harness-claude.yml` to emit a per-platform
+      built-in artifact (x86_64-linux) + a resolver the baker calls.
+- [ ] CLI + a worked `deploy/demo/` `+claude` example.
+
+**P1 — Harnesses baked into templates; retire the standalone harness subsystem.**
+Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechanism.)
+- [ ] agentd launches the baked harness from the **rootfs path** (no drive mount, no
+      NBD); `SpawnHarnessRequest` drops `harness_dev`/`harness_mount`.
+- [ ] Re-home the egress-proxy CA cert off the (removed) harness drive → vsock/agentd
+      RPC into the guest trust store.
+- [ ] `HarnessSpec` → `SessionMode::{Agent, DevVm}`; coord reads the harness from the
+      image manifest, not the session.
+- [ ] Delete: `harness_packs` table (+ drop migration), coord `/api/harnesses`, CLI
+      `harness add/push/list/rm`, registry types, host-agent
+      `ensure_harness`/`ensure_harness_ext4`, `SandboxSpec.harness_substrate`/
+      `harness_pack_uri`, and option-D `swap_harness_drive` (+ `option_d_*` tests).
+- [ ] FC integration tests (`harness_loopback`, `e2e_harness`) green against the
+      baked-in harness and wired into `ci.yml`'s `--test` list.
+
+**P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
+gate). GCS off the boot path; retire the boot-path prefetch.
+- [ ] Pin enabled-template chunks (+ warm snapshot) on NVMe; transactional
+      stage-on-enable; host not `Ready` until its working set is staged.
+- [ ] Retire the boot-path prefetch / working-set machinery (ADR 0014 M1.13/M1.14).
+
+**P3 — Warm snapshots per template** (capture at the agent-`idle` signal; restore
+into a ready agent). Removes the ~7–9 s. The big payoff.
+- [ ] Move the agent to a **persistent model** (claude server/SDK mode; emits `Idle`)
+      — supersedes the child-per-prompt `claude --print` loop.
+- [ ] Open-question-2 measurement first: persistent-agent + cheap in-process warm
+      start under ~1 s? If yes, skip VM warm snapshots.
+- [ ] If not: capture the warm memory snapshot at `Idle` (incl. running agent);
+      restore into a ready agent; per-session COW on top.
+
+**P4 — Runtime RAM dedup** (`UFFDIO_CONTINUE` + shared per-template backing) — gated
+on the FC spike (open question 1). Density, not latency.
+- [ ] FC spike: shared memfd + MINOR-mode on our FC build.
+- [ ] If viable: shared per-template backing → K sessions cost `base + K×dirty`.
+
+**Cross-cutting — storage refcount/GC** (open question 5): residency + COW divergence
+is only sound with a correct GC (currently regressed — chunk-GC pulled May 2026).
+- [ ] Design GC in as first-class, not bolt-on (`engram-chunk-store/src/gc.rs`).
 
 ## References
 
