@@ -525,12 +525,11 @@ jobs:
       # their `require_root()` SKIP path — leaving the gap silent.
       - name: Firecracker `#[ignore]` tests (unprivileged)
         run: |
-          # ADR 0021 P1.5 deleted `harness_loopback`, `restore_chain`,
-          # and `option_d_latency_bench` along with the harness-
-          # substrate subsystem they exercised. P1.6 added
-          # `baked_harness_loopback` as the baked-in replacement for
-          # `harness_loopback` (the others are coverage gaps tracked
-          # in the ADR).
+          # ADR 0021 P1.6: `baked_harness_loopback` replaced the
+          # retired `harness_loopback`. `restore_chain` and
+          # `option_d_latency_bench` were also deleted with the
+          # substrate subsystem; `restore_chain` came back (baked-in
+          # variant) in the P1.6 e2e resurrection.
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --test boot \
@@ -541,6 +540,7 @@ jobs:
             --test baked_harness_loopback \
             --test multi_restore \
             --test cross_host_restore \
+            --test restore_chain \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -603,11 +603,13 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain, proxy_e2e)
         run: |
-          # ADR 0021 P1.5 deleted `proxy_e2e` + `option_d_warm_lease`
-          # with the harness-substrate subsystem; P1.6 reintroduces a
-          # baked-in proxy e2e.
+          # ADR 0021 P1.6: `proxy_e2e` came back in the e2e
+          # resurrection — baked-in harness path, CA delivered via
+          # `InstallHostCa` vsock RPC instead of the retired
+          # `.engram-host/ca.pem` substrate file. `option_d_warm_lease`
+          # stays deleted (it was specifically about option-D).
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
@@ -615,6 +617,7 @@ jobs:
             --test patch_drive_swap \
             --test netns_isolation \
             --test warm_proxy_chain \
+            --test proxy_e2e \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -631,11 +634,21 @@ jobs:
       # cache as the steps above. Net new runtime ~80s for the
       # harness pair + ~70s for the shell pair, well within the
       # existing FC job budget.
-      # ADR 0021 P1.5 deleted the true-e2e step (e2e_shell + e2e_harness)
-      # along with the harness-substrate subsystem they baked into.
-      # P1.6 reintroduces baked-in-harness versions; until those land
-      # there's no e2e harness coverage in CI (the unit + lifecycle
-      # tests above still run).
+      # True-e2e tests (engram-host-agent crate): real bake + real
+      # FC microVM + PooledBackend + real proxy + (for harness)
+      # real Claude CLI + real api.anthropic.com 401 round-trip.
+      # Resurrected for ADR 0021 P1.6 against the baked-in harness
+      # model — the harness pack travels in /opt/engram/harness/
+      # inside the rootfs, the CA via `InstallHostCa` vsock RPC.
+      - name: True-e2e tests (root — e2e_shell, e2e_harness)
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test e2e_shell \
+            --test e2e_harness \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
         # Run after either success or failure so cache write doesn't
         # trip on root-owned files.
       - name: Restore ownership after sudo tests
