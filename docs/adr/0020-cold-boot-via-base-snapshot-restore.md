@@ -1,15 +1,24 @@
 # ADR 0020: Cold-boot via base-snapshot restore — 25 s → ~100 ms
 
-Status: 2026-05-27 — **Proposed (P1 in progress).** ADR 0019 closed the
-measurement phase and ranked **H1 (restore-from-base)** as the lever. This ADR
-commits to the optimization: route every cold `POST /sessions` through the
-existing, prod-validated `restore()` path against a per-image base snapshot,
-then shave the ~1 s restore tail to ~100 ms. Phased P1–P5. **P1 is code-complete
-and green** (9 commits `85f7223`..`c481e3c`, `just check` 822 tests + dev-vm
-clippy). The dev-vm e2e was briefly blocked on a slow-cold-boot vsock handshake
-issue (FC device-thread starvation) — **resolved by a capture-scoped handshake
-retry, NOT io_uring** (see below; validating on the dev-vm). Flips to Accepted
-only after the final phase is prod-measured.
+Status: 2026-05-27 — **P1 + chunk-native UFFD SHIPPED to prod; remaining phases
+BLOCKED on [ADR 0021](0021-resident-base-layers-and-warm-harness-snapshots.md).**
+ADR 0019 ranked **H1 (restore-from-base)** as the lever; this ADR routed every
+cold `POST /sessions` through `restore()` against a per-image base snapshot
+(P1) and made restore chunk-native via UFFD (Route B), both shipped + prod-
+profiled (see the "Route B SHIPPED + PROFILED on prod" note below). **That
+profile is what blocks the rest:** with UFFD live, the bottleneck moved off
+everything P2–P5 targets — guest-memory restore is cheap, the dominant costs are
+now the harness substrate bind (serial GCS `chunk.fetch`) and the agent's own
+in-guest startup. ADR 0021 captures the from-scratch model that attacks those
+(resident templates + per-template warm snapshots, with harnesses baked into
+image templates rather than uploaded) and **supersedes P2 / reframes P3–P4**. P5 (concurrent restores) stands
+on its own. This ADR does not flip to Accepted independently; its remaining work
+is folded into ADR 0021's phasing.
+
+*(Original framing, retained for history: commit to restore-from-base, then
+shave the ~1 s restore tail to ~100 ms; phased P1–P5; P1 code-complete + green —
+`just check` 822 tests + dev-vm clippy; the dev-vm vsock-handshake stall was
+resolved by a capture-scoped handshake retry, NOT io_uring, see below.)*
 
 Phase: 1 (P1 = the lever). Commit chain recorded here as work lands.
 
