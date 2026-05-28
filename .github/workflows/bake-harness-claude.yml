@@ -1,16 +1,20 @@
 name: Bake Claude harness pack
 
-# Builds the `claude` harness pack (engram-harness-claude binary +
-# the matching bundled Claude Code CLI) and pushes it to
-# `ghcr.io/cortexapps/engrams/harness-claude` as a chunked OCI
-# artifact. Mirrors `just bake-harness claude` locally, with two
-# differences: targets only `x86_64-unknown-linux-musl` (FC guests;
-# arm64 covered by the local Mac flow), and pushes to GHCR with
-# auth from `docker/login-action`.
+# ADR 0021: this workflow publishes the *built-in claude harness
+# artifact* the image baker pulls during `engram image build` when an
+# image's `engram.toml` carries `[harness] builtin = "claude"`. The
+# artifact is a single-layer OCI blob — its layer is the contents of
+# `/opt/engram/harness/` (binary + bundled `claude` CLI +
+# `artifact.toml` descriptor) — that the baker extracts directly into
+# the image's rootfs. There is no host-side "harness pack" anymore.
 #
-# Only the `claude` harness is published from CI — the `noop`
-# harness exists for tests and dev smoke; operators don't need it
-# in a registry.
+# Versioning model: one explicit tag per (version, platform), no
+# rolling aliases. Authors pin `version = "..."` in `engram.toml`;
+# the baker records the resolved sha256 digest in `manifest.toml`,
+# so a bake is reproducible even if the tag itself ever mutates.
+#
+# Today: x86_64-linux only (FC guests). arm64 lands once we publish
+# those tags + extend `engram_image_builder::harness::Platform`.
 
 on:
   push:
@@ -36,6 +40,14 @@ permissions:
 concurrency:
   group: bake-harness-claude-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Single source of truth for the published artifact version. Bump
+  # when shipping a new built-in claude harness build. Image authors
+  # must update `[harness] version = "..."` in `engram.toml` to
+  # match (the baker enforces the pin).
+  HARNESS_VERSION: v0.1.0
+  HARNESS_PLATFORM: linux-x86_64
 
 jobs:
   bake:
@@ -67,10 +79,6 @@ jobs:
             -p engram-harness-claude
           cargo build --release -p engram-cli
 
-      # The Claude harness bundles Anthropic's `claude` CLI alongside
-      # the engram-harness-claude binary. `just bake-harness claude`
-      # downloads the matching version from
-      # `downloads.claude.ai/claude-code-releases`; we mirror that.
       - name: Download Claude Code CLI (Linux x64)
         id: claude_cli
         run: |
@@ -82,13 +90,30 @@ jobs:
           /tmp/claude --version || true
           echo "version=$CLAUDE_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Stage harness pack contents
+      - name: Stage built-in harness artifact contents
         id: stage
+        env:
+          HARNESS_VERSION: ${{ env.HARNESS_VERSION }}
+          CLAUDE_VERSION: ${{ steps.claude_cli.outputs.version }}
         run: |
+          # The staged directory IS the contents of /opt/engram/harness/
+          # the baker will extract on the image side: the entry-point
+          # binary at `harness`, the bundled `claude` CLI alongside,
+          # and an `artifact.toml` descriptor the baker reads to fill
+          # the rendered HarnessManifest. No nested directories — the
+          # tarball extracts straight into the rootfs subdir.
           STAGE=$(mktemp -d)
           cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
           cp -p /tmp/claude "$STAGE/claude"
+          cat > "$STAGE/artifact.toml" <<EOF
+          name = "claude"
+          version = "${HARNESS_VERSION}"
+          entry = "harness"
+          description = "Anthropic Claude Code, bundled with engram-harness-claude ${HARNESS_VERSION}. Built on top of claude CLI ${CLAUDE_VERSION}."
+          EOF
           ls -la "$STAGE"
+          echo "--- artifact.toml ---"
+          cat "$STAGE/artifact.toml"
           echo "dir=$STAGE" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -98,57 +123,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags
-        id: tags
-        env:
-          SHA: ${{ github.sha }}
-        run: |
-          BASE="ghcr.io/${{ github.repository }}/harness-claude"
-          SHORT="${SHA:0:7}"
-          # engram-cli harness push pushes to a single URI per call,
-          # so we push once at the SHA tag and then alias `:latest`
-          # and `:main` (on push to main) via a docker pull/tag/push
-          # afterwards. The chunked manifest is identical; only the
-          # tag references change.
-          echo "primary=$BASE:$SHA" >> "$GITHUB_OUTPUT"
-          echo "short=$BASE:$SHORT" >> "$GITHUB_OUTPUT"
-          {
-            echo "extra_tags<<EOF"
-            echo "$BASE:$SHORT"
-            if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-              echo "$BASE:main"
-              echo "$BASE:latest"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Push harness pack to GHCR
+      - name: Push built-in harness artifact to GHCR
         env:
           STAGE: ${{ steps.stage.outputs.dir }}
-          PRIMARY: ${{ steps.tags.outputs.primary }}
+          TAG: ghcr.io/${{ github.repository }}/harness-claude:${{ env.HARNESS_VERSION }}-${{ env.HARNESS_PLATFORM }}
         run: |
-          # DockerConfigResolver picks up the creds docker/login-action
-          # wrote into ~/.docker/config.json.
+          # `engram-cli harness push` invokes
+          # `engram_oci::OciClient::push_harness` — a generic
+          # one-tar.gz-layer OCI push that doesn't care what's
+          # inside. The CLI command is retired in ADR 0021 P1 (along
+          # with the rest of the standalone harness subsystem); P1
+          # ships a replacement publish surface this workflow will
+          # switch to. Until then it's the working primitive.
+          #
+          # Tag shape is the catalog's expected format:
+          # `<repo>:<version>-<platform-suffix>`. No `:latest` /
+          # `:main` / SHA aliases — the ADR's reproducibility rule
+          # is "one explicit version, baker records the digest."
           ./target/release/engram-cli harness push \
             --from "$STAGE" \
-            --to "$PRIMARY"
-
-      - name: Mirror primary tag to alias tags
-        if: steps.tags.outputs.extra_tags != ''
-        env:
-          PRIMARY: ${{ steps.tags.outputs.primary }}
-          EXTRA_TAGS: ${{ steps.tags.outputs.extra_tags }}
-        run: |
-          # crane is the cleanest tool for cross-tag aliasing without
-          # pulling layers locally. `docker pull && tag && push`
-          # would also work but transfers chunks unnecessarily.
-          curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
-            | sudo tar -xzf - -C /usr/local/bin crane
-          crane auth login ghcr.io \
-            -u "${{ github.actor }}" \
-            -p "${{ secrets.GITHUB_TOKEN }}"
-          while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            echo "Mirroring $PRIMARY -> $tag"
-            crane copy "$PRIMARY" "$tag"
-          done <<< "$EXTRA_TAGS"
+            --to "$TAG"
+          echo "Published $TAG"

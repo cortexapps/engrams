@@ -322,8 +322,11 @@ authors target `engram-harness-proto` directly):
       *(d157e87, 32bcddf)*
 - [x] Baker injects the built-in artifact / validates the custom `exec`; renders the
       launch contract into `manifest.toml`. *(1d73837)*
-- [ ] Publish pipeline: rework `bake-harness-claude.yml` to emit a per-platform
-      built-in artifact (x86_64-linux) + a resolver the baker calls.
+- [x] Publish pipeline: `bake-harness-claude.yml` emits a per-platform built-in
+      artifact (`:v0.1.0-linux-x86_64`) with the new layer shape (rootfs subtree +
+      `artifact.toml`); the baker's catalog resolver consumes it. *(this commit)*
+      Still uses the about-to-be-retired `engram-cli harness push` for the OCI push
+      itself — P1 swaps in the replacement publish surface.
 - [ ] CLI ergonomics for `[harness]` (next pass; the bake itself already works
       through `engram image build`).
 - [x] A worked `deploy/demo-claude/` example. *(this commit)*
@@ -340,6 +343,11 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       `harness add/push/list/rm`, registry types, host-agent
       `ensure_harness`/`ensure_harness_ext4`, `SandboxSpec.harness_substrate`/
       `harness_pack_uri`, and option-D `swap_harness_drive` (+ `option_d_*` tests).
+- [ ] **Publish-surface handoff**: P0's `bake-harness-claude.yml` calls `engram-cli
+      harness push` for the OCI push. That CLI subcommand is retired in this phase;
+      introduce a replacement (e.g. `engram-cli builtin-harness publish` or a
+      standalone publisher binary) and switch the workflow in the same pass so the
+      CI doesn't break between commits.
 - [ ] FC integration tests (`harness_loopback`, `e2e_harness`) green against the
       baked-in harness and wired into `ci.yml`'s `--test` list.
 
