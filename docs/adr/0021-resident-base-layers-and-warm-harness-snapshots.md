@@ -349,14 +349,15 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       four `MetadataStore` trait methods + postgres impls, coord `/api/harnesses`
       surface, CLI `harness add`/`list`/`rm` subcommands. `engram harness push`
       survives (CI still uses it; retires with the publish-surface handoff below).
-- [ ] **Subsystem deletion P1.5b — substrate plumbing** *(pending)*: drop
-      `SandboxSpec.harness_substrate` + `harness_pack_uri`, delete host-agent
-      `ensure_harness`/`ensure_harness_ext4` in `image_cache.rs`, prune the
-      now-`None`-only paths in `pooled_backend.rs`.
-- [ ] **Subsystem deletion P1.5c — option-D `swap_harness_drive`** *(pending)*:
-      delete the FC swap path + the `option_d_warm_lease` / `option_d_latency_bench`
-      tests that exercised it; `harness_loopback` / `proxy_e2e` get rewritten to
-      use a baked-in harness rather than a `Some(substrate_path)`.
+- [x] **Subsystem deletion P1.5b+c** *(2117891, −3478 / +93 net)*: dropped
+      `SandboxSpec.harness_substrate` + `harness_pack_uri`, `Sandbox::swap_harness_drive`,
+      `restore_base_for_session`'s `harness_pack_uri`/`harness_name` params, host-agent
+      `ImageCache::ensure_harness*` (+ types + helpers), FC's
+      `repoint_harness_drive` + substrate canonical-symlink machinery, VZ's
+      substrate virtio-blk attach. Substrate-dependent tests deleted
+      (`option_d_*`, `harness_loopback`, `proxy_e2e`, `restore_chain`,
+      `e2e_harness`, `e2e_shell`); CI workflow updated. P1.6 reintroduces
+      baked-in-harness coverage.
 - [ ] **Publish-surface handoff**: P0's `bake-harness-claude.yml` calls `engram-cli
       harness push` for the OCI push. That CLI subcommand is retired in this phase;
       introduce a replacement (e.g. `engram-cli builtin-harness publish` or a
