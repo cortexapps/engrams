@@ -237,7 +237,14 @@ async fn noop_harness_round_trips_three_tool_calls_on_real_fc() {
     env.insert("ENGRAM_NOOP_INTERVAL_MS".into(), "10".into());
     env.insert("ENGRAM_NOOP_TOOL_CALL_DURATION_MS".into(), "10".into());
     if let Err(e) = backend
-        .start_agent(sandbox_id, AgentSpec { argv, env })
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv,
+                env,
+                host_ca_pem: None,
+            },
+        )
         .await
     {
         // Without this dump, a start_agent timeout looks like

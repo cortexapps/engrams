@@ -3226,12 +3226,65 @@ impl SandboxBackend for FirecrackerBackend {
         // page-in + ready-port dial). Shared with the base-snapshot
         // capture via `wait_agent_ready`.
         self.wait_agent_ready(id).await?;
-        let (vsock_uds_path, has_harness) = {
+        let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            (
-                live.state.vsock_uds_path.clone(),
-                live.state.spec.harness_substrate.is_some(),
-            )
+            live.state.vsock_uds_path.clone()
+        };
+
+        // ADR 0021 P1.2: deliver the per-host egress-proxy CA via
+        // `InstallHostCa` over vsock as soon as agentd is reachable,
+        // before any harness spawn. Replaces the pre-0021 path where
+        // the CA rode in on the harness drive. Idempotent — agentd's
+        // `last_pem` cache makes a resume-with-same-cert a zero-I/O
+        // hot path, and an empty PEM is a server-side no-op. The
+        // legacy drive-based install in
+        // `engram_agentd::harness_supervisor::inject_egress_proxy_ca`
+        // remains in place until P1.5 retires the drive.
+        if let Some(pem) = agent.host_ca_pem.as_deref() {
+            if !pem.is_empty() {
+                let req = engram_agentd::WireRequest::InstallHostCa(
+                    engram_agentd::InstallHostCaRequest {
+                        cert_pem: pem.to_string(),
+                    },
+                );
+                let resp: engram_agentd::WireResponse = tracing::Instrument::instrument(
+                    async {
+                        let mut conn =
+                            Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
+                        engram_agentd::write_msg(&mut conn, &req)
+                            .await
+                            .map_err(|e| {
+                                SandboxError::Vm(format!("write InstallHostCa: {e}").into())
+                            })?;
+                        let resp = engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                            SandboxError::Vm(format!("read InstallHostCa response: {e}").into())
+                        })?;
+                        Ok::<_, SandboxError>(resp)
+                    },
+                    tracing::info_span!("fc.install_host_ca"),
+                )
+                .await?;
+                match resp {
+                    engram_agentd::WireResponse::InstallHostCaAck { changed } => {
+                        tracing::debug!(sandbox_id = %id, changed, "host CA install ack");
+                    }
+                    engram_agentd::WireResponse::Error { kind, message } => {
+                        return Err(SandboxError::Vm(
+                            format!("InstallHostCa rejected ({kind}): {message}").into(),
+                        ));
+                    }
+                    other => {
+                        return Err(SandboxError::Vm(
+                            format!("InstallHostCa: unexpected response: {other:?}").into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let has_harness = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.spec.harness_substrate.is_some()
         };
 
         let (harness_dev, harness_mount) = if has_harness {

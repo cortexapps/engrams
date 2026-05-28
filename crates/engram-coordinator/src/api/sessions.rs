@@ -758,6 +758,9 @@ async fn create_session_inner(
     let agent = agent_for_session.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
         argv: Vec::new(),
         env: std::collections::HashMap::new(),
+        // Host-agent fills `host_ca_pem` in from its local egress
+        // state (ADR 0021 P1.2). Coord leaves it None.
+        host_ca_pem: None,
     });
     let policy = egress_policy.unwrap_or_else(|| {
         // No guest IP yet → synthesize an unspecified-IP policy.
@@ -1124,7 +1127,11 @@ pub(crate) fn resolve_harness(
             ]
         }
     };
-    Ok(Some(engram_core::types::sandbox::AgentSpec { argv, env }))
+    Ok(Some(engram_core::types::sandbox::AgentSpec {
+        argv,
+        env,
+        host_ca_pem: None,
+    }))
 }
 
 #[cfg(test)]

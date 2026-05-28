@@ -454,7 +454,14 @@ async fn drive_harness(
         "/run/engram/harnesses/claude:/usr/local/bin:/usr/bin:/bin".into(),
     );
     pooled
-        .start_agent(sandbox_id, AgentSpec { argv, env })
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv,
+                env,
+                host_ca_pem: None,
+            },
+        )
         .await
         .expect("start_agent");
 

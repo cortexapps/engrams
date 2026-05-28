@@ -1936,7 +1936,18 @@ impl SandboxBackend for PooledBackend {
         result
     }
 
-    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
+    async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
+        // ADR 0021 P1.2: only the host-agent knows the per-host egress-
+        // proxy CA, so it stamps the PEM onto the AgentSpec right
+        // before the backend sees it. The FC backend uses this in its
+        // `InstallHostCa` round-trip to agentd (post-readiness,
+        // pre-SpawnHarness). Coord-supplied specs always arrive with
+        // `host_ca_pem = None`; the host-agent fills it in here. The
+        // legacy drive-based delivery still runs in parallel until
+        // P1.5 retires the harness drive.
+        if agent.host_ca_pem.is_none() {
+            agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
+        }
         let result = self.inner.start_agent(id, agent).await;
         // ADR 0019: agent_ready has fired (or failed) — close the cold-boot
         // operation window so steady-state session I/O falls back to

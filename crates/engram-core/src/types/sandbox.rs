@@ -85,6 +85,16 @@ pub struct AgentSpec {
     /// without polluting the sandbox-wide env.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Per-host egress-proxy CA cert in PEM form (ADR 0021 P1).
+    /// Populated by the host-agent *after* receiving the spec from
+    /// coord, immediately before handing it to the sandbox backend —
+    /// only the host knows its own CA. The Firecracker backend pushes
+    /// this via `InstallHostCa` over vsock right after `wait_agent_ready`
+    /// and before `SpawnHarness`, replacing the pre-0021 path where the
+    /// CA rode in on the harness drive. `None` skips the install — used
+    /// by tests, dev backends, and any deploy without egress proxying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ca_pem: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
