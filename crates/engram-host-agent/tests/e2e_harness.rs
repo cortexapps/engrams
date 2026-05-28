@@ -628,9 +628,19 @@ async fn e2e_harness_warm_via_pooled_backend() {
         network: Default::default(),
     };
 
-    // Cold create → wait → snapshot → destroy → restore (warm netns path).
+    // Cold create → wait → settle → snapshot → destroy → restore.
+    // The settle is load-bearing: `wait_for_guest_ip` returns the
+    // netns SNAT IP immediately (no actual handshake with the guest),
+    // so without the settle we'd snapshot agentd mid-startup —
+    // post-fork, pre-bind, with the kernel vsock driver in a half-
+    // initialised state that doesn't resume cleanly (FC re-exits
+    // ~1 s after `load_snapshot` with `Vmm is stopping`). Two seconds
+    // is the same window `e2e_shell_warm` uses; it's empirically
+    // enough for agentd to have written `AgentReady` and entered
+    // `accept()` steady state before the snapshot captures it.
     let cold_id = pooled.create(spec).await.expect("create");
     let _ = wait_for_guest_ip(&pooled, cold_id, Duration::from_secs(30)).await;
+    sleep(Duration::from_secs(2)).await;
     let metadata = pooled.snapshot(cold_id).await.expect("snapshot");
     pooled.destroy(cold_id).await.expect("destroy cold");
 
