@@ -1,0 +1,32 @@
+name = "demo-claude"
+description = "Canonical workspace image with the built-in Claude harness baked in (ADR 0021). Identical to deploy/demo/ aside from the [harness] block: the baker pulls the published harness-claude OCI artifact from GHCR and injects it into the rootfs at /opt/engram/harness/. Sessions of this image boot straight into a ready Claude agent."
+
+# Built-in harness, ADR 0021. The baker resolves (builtin, version) via
+# its hardcoded catalog -> a GHCR OCI artifact
+# (ghcr.io/cortexapps/engrams/harness-claude:<version>-linux-x86_64),
+# pulls the single tar.gz layer, and extracts it into the rootfs at
+# /opt/engram/harness/. The resolved launch contract — name, exec,
+# args, and the version pinned as "<tag>@<sha256-digest>" — is
+# rendered into manifest.toml, so the coordinator and agentd both
+# read one source of truth.
+#
+# version is required: there are no rolling defaults. Bump it
+# explicitly when you want to track a newer harness build.
+[harness]
+builtin = "claude"
+version = "v0.1.0-placeholder"
+
+# Image-level secrets the *workspace* needs (e.g. NPM_TOKEN for
+# npm install, GITHUB_TOKEN for git push). Harness credentials
+# (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) ride one layer above
+# and the web form asks for them at session-create time.
+
+[network]
+default = "deny"
+allow_hosts = [
+    "registry.npmjs.org",
+    "github.com",
+    "api.github.com",
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+]

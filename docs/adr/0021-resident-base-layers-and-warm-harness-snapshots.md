@@ -320,11 +320,13 @@ authors target `engram-harness-proto` directly):
       `engram.toml` reader (mutual-exclusion of `builtin` vs `name`/`exec`; replace
       the stale-`[[harness]]`-rejection tests with singular-form tests).
       *(d157e87, 32bcddf)*
-- [ ] Baker injects the built-in artifact / validates the custom `exec`; renders the
-      launch contract into `manifest.toml`.
+- [x] Baker injects the built-in artifact / validates the custom `exec`; renders the
+      launch contract into `manifest.toml`. *(1d73837)*
 - [ ] Publish pipeline: rework `bake-harness-claude.yml` to emit a per-platform
       built-in artifact (x86_64-linux) + a resolver the baker calls.
-- [ ] CLI + a worked `deploy/demo/` `+claude` example.
+- [ ] CLI ergonomics for `[harness]` (next pass; the bake itself already works
+      through `engram image build`).
+- [x] A worked `deploy/demo-claude/` example. *(this commit)*
 
 **P1 — Harnesses baked into templates; retire the standalone harness subsystem.**
 Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechanism.)
