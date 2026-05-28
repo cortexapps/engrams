@@ -118,10 +118,14 @@ args = ["--serve"]               # optional
   artifact is the *bake input* that replaces the old runtime OCI pack; the engram CI
   pipeline that builds it lives on, repurposed. The DX is "sessions come with these
   agents, ready in ~hundreds of ms."
-- **Custom**: author builds their adapter against the `engram-harness` SDK, **COPYs
-  the binary (+ runtime) into the rootfs in their own Dockerfile**, and declares
-  `[harness] name/exec/args`. The baker validates `exec` exists and records the
-  contract. Docker-native, handles multi-file runtimes, no separate upload surface.
+- **Custom**: author builds a harness binary against `engram-harness-proto` (the
+  wire types — frame format, attach handshake, the event/command enums) directly,
+  **COPYs the binary (+ any runtime) into the rootfs in their own Dockerfile**, and
+  declares `[harness] name/exec/args`. The baker validates `exec` exists and records
+  the contract. Docker-native, handles multi-file runtimes, no separate upload
+  surface. **No SDK wrapper**: the contract is just "a binary that speaks the proto
+  on vsock, plus how to launch it" — anything beyond that would be opinion the
+  author may not want to inherit.
 - **Harness-less templates are first-class** (answer to "just a dev machine"): omit
   `[harness]`; the template is captured at **OS-ready** — exactly today's base
   snapshot (ADR 0020 P1). Same restore mechanism; capture is "whatever is idle"
@@ -141,9 +145,11 @@ the `harness_packs` registry, `engram harness add/push/list/rm`, harness OCI pac
 the harness ext4 **substrate + NBD path** (the ~2 s serial `chunk.fetch` — gone, the
 agent is just in the rootfs), and the **option-D `swap_harness_drive`** machinery at
 restore. The protocol **adapter** (the irreducible per-agent translation, today's
-824-line `engram-harness-claude`) is still needed — now formalized behind a real
-`engram-harness` **SDK crate** (none exists today; only `engram-harness-proto` wire
-types) — but it ships *inside the template*, not as a separate pack.
+824-line `engram-harness-claude`) is still needed and still authored directly
+against the existing `engram-harness-proto` wire crate — but it ships *inside the
+template*, not as a separate pack. We deliberately **do not ship an SDK wrapper**
+above the proto: the surface authors care about is "a binary + how to launch it,"
+and any ergonomic layer above the wire is opinion they may not want.
 
 **One migration detail to carry:** the egress-proxy CA cert is delivered today via
 the harness *drive* (`<harness_mount>/.engram-host/ca.pem`). With the drive gone, the
@@ -290,8 +296,9 @@ remaining per-session cost is the COW delta + the first-prompt workspace scan.
 - **Retires** the boot-path prefetch/working-set machinery **and** the standalone
   harness subsystem (registry, add/push, OCI packs, substrate NBD, option-D swap).
 - **New build surface**: residency staging + warmup gate + per-template warm-snapshot
-  capture + the `engram-harness` SDK (adapter authoring, baked into templates).
-  Net boot-path code is expected to *shrink*.
+  capture + the built-in harness artifact publish pipeline (custom harness authors
+  stay on the existing `engram-harness-proto` wire crate; no SDK wrapper). Net
+  boot-path code is expected to *shrink*.
 - **Risk**: storage amplification at large catalog (mitigated by per-pool pinning +
   content dedup); the `UFFDIO_CONTINUE`/FC unknown (gates only runtime-dedup); and the
   persistent-agent dependency for warm snapshots to pay off.
@@ -300,12 +307,8 @@ remaining per-session cost is the COW delta + the first-prompt workspace scan.
 
 Cross items off (`[x]`) as they land, with the commit SHA where useful.
 
-**P0 — `engram-harness` SDK + a great `engram image build` DX** (first- and
-third-party share one pipeline):
-- [ ] New crate `crates/engram-harness` — ergonomic SDK over `engram-harness-proto`:
-      attach handshake, event-emit helpers, command loop, one-call `signal_ready()`
-      (`Idle`, which doubles as the warm-capture trigger). Port `engram-harness-noop`
-      to it.
+**P0 — `[harness]` DX + built-in artifact pipeline** (no SDK wrapper; custom
+authors target `engram-harness-proto` directly):
 - [x] Singular `[harness]` table on `ImageManifest` + parse/validate in the baker's
       `engram.toml` reader (mutual-exclusion of `builtin` vs `name`/`exec`; replace
       the stale-`[[harness]]`-rejection tests with singular-form tests).
