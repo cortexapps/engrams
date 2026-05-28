@@ -1430,6 +1430,39 @@ impl SandboxBackend for PooledBackend {
             }
         }
 
+        // ADR 0021 P1.6 follow-up: gate snapshot on agentd readiness.
+        //
+        // The pre-flush pause below freezes vCPUs. If the guest is still
+        // in early boot (kernel → engram-init → agentd start) at that
+        // moment, the snapshot captures a half-initialised kernel — in
+        // particular, agentd may not have completed `bind(AF_VSOCK)` —
+        // and the resumed kernel comes up with a half-initialised vsock
+        // driver. `panic=1 reboot=k` then trips `KVM_EXIT_SHUTDOWN`
+        // ~1 s after `load_snapshot` returns; every subsequent
+        // host→guest dial fails ECONNREFUSED.
+        //
+        // Reachable in prod via:
+        //   1. SIGTERM-during-cold-boot. `shutdown.rs` checkpoints all
+        //      sandboxes from `backend.list()` after a 5 s drain — a
+        //      sandbox still booting at SIGTERM gets snapshotted mid-
+        //      bind without this gate.
+        //   2. coord-driven `snapshot(id)` fired quickly after create
+        //      (any fast-rebake / probe path).
+        //
+        // `wait_agent_ready` blocks until agentd has dialled the host's
+        // ready port (port 1027) — proving the guest's vsock stack is
+        // operational end-to-end. On warm-restored sandboxes the watch
+        // is pre-set true (FC's `restore_in_jail`), so this is a no-op
+        // for warm re-snapshot paths. The FC backend is the only one
+        // with the per-sandbox agent_ready watch; non-FC backends
+        // (Process, future) return `InvalidSpec` from the default trait
+        // impl, which we treat as "no readiness concept here, proceed."
+        match self.inner.wait_agent_ready(id).await {
+            Ok(()) => {}
+            Err(SandboxError::InvalidSpec(_)) => {}
+            Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
+        }
+
         // ADR 0018 commit 12m: snapshot ordering is now
         //   pause → wait_idle → flush → inner.snapshot
         // where inner.snapshot's internal pause/capture/resume is
