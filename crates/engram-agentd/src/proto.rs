@@ -225,6 +225,21 @@ pub enum WireRequest {
     /// Replies [`WireResponse::HarnessSpawned`] on success or
     /// [`WireResponse::Error`] if the mount or spawn fails.
     SpawnHarness(SpawnHarnessRequest),
+    /// Install the per-host egress-proxy CA into the guest's TLS
+    /// trust store (ADR 0021 P1). Called by the host once per VM
+    /// boot **and** once per resume — the cert is per-host, so a
+    /// session that moves to a different host gets a fresh PEM.
+    ///
+    /// Replaces the pre-0021 delivery path where the CA rode in on
+    /// the harness drive (`<harness_mount>/.engram-host/ca.pem`).
+    /// Once the drive is retired (P1.5), this RPC is the sole path.
+    ///
+    /// Idempotent: the agent caches the last installed PEM and
+    /// replies `InstallHostCaAck { changed: false }` on no-op
+    /// resume. Replies `InstallHostCaAck { changed: true }` on a
+    /// fresh / rotated cert, or [`WireResponse::Error`] if the
+    /// guest filesystem write fails.
+    InstallHostCa(InstallHostCaRequest),
 }
 
 /// Body of [`WireRequest::SpawnHarness`].
@@ -247,6 +262,17 @@ pub struct SpawnHarnessRequest {
     /// `/run/engram/harnesses`.
     #[serde(default)]
     pub harness_mount: Option<String>,
+}
+
+/// Body of [`WireRequest::InstallHostCa`]. ADR 0021 P1 reference:
+/// [`reference_e2b_ca_cert_pattern`] in user memory captures the
+/// E2B `cacerts.go` install model this mirrors.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallHostCaRequest {
+    /// PEM-encoded CA bundle to add to the guest's trust store.
+    /// Empty string is treated as a no-op (`changed: false`) to
+    /// keep the host's call-site branchless.
+    pub cert_pem: String,
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.
@@ -281,6 +307,13 @@ pub enum WireResponse {
     /// otherwise yielded no child (no-op case).
     HarnessSpawned {
         pid: Option<u32>,
+    },
+    /// Reply to [`WireRequest::InstallHostCa`]. `changed` is `true`
+    /// when the agent wrote new bytes (first install or rotation),
+    /// `false` when the PEM matched the one already installed
+    /// (zero-I/O resume hot path).
+    InstallHostCaAck {
+        changed: bool,
     },
     /// Anything the agent couldn't fulfil. `message` is a short
     /// human-readable reason; `kind` mirrors the std `io::ErrorKind`

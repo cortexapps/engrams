@@ -226,9 +226,16 @@ async fn run(args: Args) -> std::io::Result<()> {
     // connection finds (and kills) the current child before
     // launching the new one.
     let supervisor = engram_agentd::HarnessSupervisor::new();
+    // ADR 0021 P1.1: one CA-cert installer for the agent's lifetime.
+    // The `last_pem` cache that makes resume-with-same-cert a
+    // zero-I/O hot path only works if every InstallHostCa RPC hits
+    // the same installer, regardless of which connection it lands on.
+    let cacerts = std::sync::Arc::new(engram_agentd::CaCertInstaller::new(
+        engram_agentd::CaCertPaths::default_linux(),
+    ));
     match args.listen {
-        Listen::Unix(path) => run_unix(path, token, supervisor).await,
-        Listen::Transport(port) => run_transport(port, token, supervisor).await,
+        Listen::Unix(path) => run_unix(path, token, supervisor, cacerts).await,
+        Listen::Transport(port) => run_transport(port, token, supervisor, cacerts).await,
     }
 }
 
@@ -236,6 +243,7 @@ async fn run_unix(
     listen_path: PathBuf,
     token: Option<String>,
     supervisor: std::sync::Arc<engram_agentd::HarnessSupervisor>,
+    cacerts: std::sync::Arc<engram_agentd::CaCertInstaller>,
 ) -> std::io::Result<()> {
     use tokio::net::UnixListener;
     if listen_path.exists() {
@@ -248,7 +256,12 @@ async fn run_unix(
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _addr)) => spawn_serve(stream, token.clone(), supervisor.clone()),
+                Ok((stream, _addr)) => spawn_serve(
+                    stream,
+                    token.clone(),
+                    supervisor.clone(),
+                    cacerts.clone(),
+                ),
                 Err(e) => tracing::warn!(error = %e, "accept failed"),
             },
             _ = &mut shutdown => {
@@ -268,6 +281,7 @@ async fn run_transport(
     port: u32,
     token: Option<String>,
     supervisor: std::sync::Arc<engram_agentd::HarnessSupervisor>,
+    cacerts: std::sync::Arc<engram_agentd::CaCertInstaller>,
 ) -> std::io::Result<()> {
     let transport = engram_transport::from_env()?;
     let mut listener = transport.listen(port).await?;
@@ -352,7 +366,12 @@ async fn run_transport(
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok(stream) => spawn_serve(stream, token.clone(), supervisor.clone()),
+                Ok(stream) => spawn_serve(
+                    stream,
+                    token.clone(),
+                    supervisor.clone(),
+                    cacerts.clone(),
+                ),
                 Err(e) => tracing::warn!(error = %e, "transport accept failed"),
             },
             _ = &mut shutdown => {
@@ -369,11 +388,12 @@ fn spawn_serve<S>(
     stream: S,
     token: Option<String>,
     supervisor: std::sync::Arc<engram_agentd::HarnessSupervisor>,
+    cacerts: std::sync::Arc<engram_agentd::CaCertInstaller>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        if let Err(e) = serve_connection(stream, token, supervisor).await {
+        if let Err(e) = serve_connection(stream, token, supervisor, cacerts).await {
             tracing::warn!(error = %e, "connection ended with error");
         }
     });
