@@ -527,8 +527,10 @@ jobs:
         run: |
           # ADR 0021 P1.5 deleted `harness_loopback`, `restore_chain`,
           # and `option_d_latency_bench` along with the harness-
-          # substrate subsystem they exercised. P1.6 will reintroduce
-          # baked-in-harness equivalents.
+          # substrate subsystem they exercised. P1.6 added
+          # `baked_harness_loopback` as the baked-in replacement for
+          # `harness_loopback` (the others are coverage gaps tracked
+          # in the ADR).
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --test boot \
@@ -536,6 +538,7 @@ jobs:
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
+            --test baked_harness_loopback \
             --test multi_restore \
             --test cross_host_restore \
             --run-ignored ignored-only \
