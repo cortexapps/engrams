@@ -1321,6 +1321,23 @@ jobs:
           name: harness-claude-artifact
           path: var/harness-claude-stage
 
+      - name: Restore +x on staged binaries
+        run: |
+          # actions/upload-artifact@v4 zips the staged directory and
+          # actions/download-artifact@v4 unzips it — the ZIP format
+          # only carries Unix mode bits as a non-standard extension
+          # that some unzip implementations drop. Without this, the
+          # baker happily packs the harness into the rootfs as
+          # mode 0644, FC boots fine, and agentd's `SpawnHarness`
+          # blows up with `Permission denied (os error 13)` when it
+          # tries to exec /opt/engram/harness/harness.
+          #
+          # Belt-and-braces fix: re-set +x on both binaries before
+          # we hand the staged dir to `engram-publish-builtin-harness`.
+          # The artifact.toml descriptor stays at the default 0644.
+          chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
+          ls -la var/harness-claude-stage/
+
       - name: Republish harness-claude to local registry + export catalog override
         env:
           LOCAL_REPO: localhost:5001/cortexapps/engrams/harness-claude
