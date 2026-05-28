@@ -4,8 +4,12 @@
 //! `[harness] builtin = "<name>" version = "<v>"`.
 //!
 //! Replaces the retired `engram-cli harness push` subcommand
-//! (ADR 0021 P1.5a deleted the rest of the harness CLI surface; this
-//! binary is what the `bake-harness-claude.yml` workflow now calls).
+//! (ADR 0021 P1.5a deleted the rest of the harness CLI surface).
+//! Called from the `bake-harness-claude-artifact` job in
+//! `.github/workflows/ci.yml` — on push-to-main to publish the
+//! production GHCR tag, and from the `test-e2e-stack` job to
+//! republish a downloaded workflow artifact into the integration
+//! lane's local registry (localhost:5001).
 //!
 //! Usage:
 //!

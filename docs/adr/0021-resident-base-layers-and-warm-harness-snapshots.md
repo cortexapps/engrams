@@ -322,9 +322,11 @@ authors target `engram-harness-proto` directly):
       *(d157e87, 32bcddf)*
 - [x] Baker injects the built-in artifact / validates the custom `exec`; renders the
       launch contract into `manifest.toml`. *(1d73837)*
-- [x] Publish pipeline: `bake-harness-claude.yml` emits a per-platform built-in
-      artifact (`:v0.1.0-linux-x86_64`) with the new layer shape (rootfs subtree +
-      `artifact.toml`); the baker's catalog resolver consumes it. *(this commit)*
+- [x] Publish pipeline: per-platform built-in artifact
+      (`:v0.1.0-linux-x86_64`) with the new layer shape (rootfs subtree +
+      `artifact.toml`); the baker's catalog resolver consumes it. *(this commit;
+      originally in `bake-harness-claude.yml`, later folded into ci.yml's
+      `bake-harness-claude-artifact` job — see P0 follow-up below.)*
       Still uses the about-to-be-retired `engram-cli harness push` for the OCI push
       itself — P1 swaps in the replacement publish surface.
 - [ ] CLI ergonomics for `[harness]` (next pass; the bake itself already works
@@ -403,6 +405,24 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       checkpoints all live sandboxes after a 5 s drain) and any future
       coord-driven `snapshot(id)` fired shortly after create.
       P2 unblocked.
+- [x] **CI catch-22 on built-in harness publishing — structural fix**: the
+      old `bake-harness-claude.yml` workflow only fired on push-to-main with
+      path triggers, so a PR that bumped `HARNESS_VERSION` (or that just
+      needed the artifact to exist for the first time) had no way to publish
+      `:<version>-<platform>` before its own e2e_stack lane consumed it. Also
+      meant PRs that changed the harness binary without bumping the version
+      silently tested the *previous* GHCR tag.
+      Fix: folded the bake into `ci.yml` as a job that always runs on every
+      PR + push, uploads the staged artifact as a GitHub Actions workflow
+      artifact, and only publishes to GHCR on push-to-main. Added an env
+      override (`ENGRAM_BUILTIN_HARNESS_<NAME>_REPO`) on the in-baker
+      `BuiltinCatalog` so the `test-e2e-stack` lane can download the
+      workflow artifact, re-publish to `localhost:5001`, and have the
+      baker resolve `[harness] builtin = "claude"` against that local
+      registry. Production `bake-demo-image` on push-to-main keeps the
+      default catalog → still pulls from GHCR. PR-built binaries never
+      reach a production-consumed GHCR namespace. Closed
+      `.github/workflows/bake-harness-claude.yml` (folded entirely).
 
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
