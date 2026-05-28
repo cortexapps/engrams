@@ -3282,24 +3282,14 @@ impl SandboxBackend for FirecrackerBackend {
             }
         }
 
-        let has_harness = {
-            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.spec.harness_substrate.is_some()
-        };
-
-        let (harness_dev, harness_mount) = if has_harness {
-            (
-                Some("/dev/vdb".to_string()),
-                Some("/run/engram/harnesses".to_string()),
-            )
-        } else {
-            (None, None)
-        };
+        // ADR 0021 P1.4: no harness drive — argv points at a path
+        // inside the rootfs (the image manifest's `[harness] exec`).
+        // The `harness_substrate` / `harness_pack_uri` plumbing on
+        // SandboxSpec stays (always-None on the new coord path)
+        // until P1.5 retires it together with option-D.
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
-            harness_dev,
-            harness_mount,
         });
 
         // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.

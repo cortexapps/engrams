@@ -339,8 +339,9 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       RPC into the guest trust store. *(60bfa89 P1.1: `InstallHostCa` RPC +
       cacerts installer; f328566 P1.2: FC backend calls it post-readiness;
       legacy drive path stays parallel until the drive itself is retired.)*
-- [ ] `HarnessSpec` → `SessionMode::{Agent, DevVm}`; coord reads the harness from the
-      image manifest, not the session.
+- [x] `HarnessSpec` → `SessionMode::{Agent, DevVm}`; coord reads the harness from the
+      image manifest, not the session. *(cbe7f36; migration 0039 swaps
+      `sessions.harness` JSONB for `sessions.mode` TEXT.)*
 - [ ] Delete: `harness_packs` table (+ drop migration), coord `/api/harnesses`, CLI
       `harness add/push/list/rm`, registry types, host-agent
       `ensure_harness`/`ensure_harness_ext4`, `SandboxSpec.harness_substrate`/

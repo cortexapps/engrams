@@ -210,20 +210,22 @@ pub enum WireRequest {
     /// launching the new one — the host uses that for clean
     /// re-attach after FC snapshot/restore.
     ///
-    /// Optionally mounts `harness_dev` at `harness_mount` (read-only
-    /// ext4) before exec'ing argv. Used by the warm-pool option-D
-    /// flow where the harness substrate is hot-swapped via FC
-    /// `PATCH /drives` and bootstrap-side mount makes the new
-    /// device visible to the harness.
+    /// ADR 0021 P1.4: argv points at a path inside the rootfs (the
+    /// image's `[harness] exec`, typically `/opt/engram/harness/...`).
+    /// No drive mount; agentd just exec's argv. The CA the harness
+    /// trusts is installed via `InstallHostCa` (called by the host
+    /// post-readiness, pre-SpawnHarness), and agentd points the
+    /// child's `SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS` / friends at
+    /// the canonical install paths.
     ///
     /// Empty argv is a **readiness probe**: the agent skips the
     /// spawn and replies `HarnessSpawned { pid: None }` — useful
     /// for callers that want to confirm agentd is reachable on
-    /// vsock without launching anything (the no-harness cold-start
+    /// vsock without launching anything (the no-harness / dev-VM
     /// path).
     ///
     /// Replies [`WireResponse::HarnessSpawned`] on success or
-    /// [`WireResponse::Error`] if the mount or spawn fails.
+    /// [`WireResponse::Error`] if the spawn fails.
     SpawnHarness(SpawnHarnessRequest),
     /// Install the per-host egress-proxy CA into the guest's TLS
     /// trust store (ADR 0021 P1). Called by the host once per VM
@@ -242,7 +244,9 @@ pub enum WireRequest {
     InstallHostCa(InstallHostCaRequest),
 }
 
-/// Body of [`WireRequest::SpawnHarness`].
+/// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
+/// pre-0021 `harness_dev` / `harness_mount` fields — the harness
+/// binary lives in the rootfs now, agentd just exec's `argv`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnHarnessRequest {
     /// argv to exec as the harness child. Empty = readiness probe;
@@ -253,15 +257,6 @@ pub struct SpawnHarnessRequest {
     /// keys take this value).
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// Block device to mount before spawning. `None` skips the
-    /// mount. Typical value `/dev/vdb` for the harness substrate.
-    #[serde(default)]
-    pub harness_dev: Option<String>,
-    /// Where to mount `harness_dev`. Required when `harness_dev`
-    /// is `Some`; ignored otherwise. Typical value
-    /// `/run/engram/harnesses`.
-    #[serde(default)]
-    pub harness_mount: Option<String>,
 }
 
 /// Body of [`WireRequest::InstallHostCa`]. ADR 0021 P1 reference:
