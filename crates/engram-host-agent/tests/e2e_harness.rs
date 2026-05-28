@@ -667,3 +667,153 @@ async fn e2e_harness_warm_via_pooled_backend() {
     pooled.destroy(warm_id).await.expect("destroy warm");
     cleanup_host_state();
 }
+
+/// ADR 0021 P1.6: `SessionMode::DevVm` against a HARNESSED image. The
+/// `/opt/engram/harness/harness` binary (+ `claude` CLI) is baked into
+/// the rootfs exactly like `e2e_harness_cold`, but the coord
+/// resolution path (`resolve_harness`) returns `None` and passes an
+/// **empty-argv** `AgentSpec` to `start_agent`. agentd's
+/// `SpawnHarness` handler hits the dedicated readiness-probe branch
+/// (`harness_supervisor.rs::spawn`: `if req.argv.is_empty() { return
+/// Ok(None) }`) and never execs the harness binary, even though it's
+/// sitting right there in the rootfs.
+///
+/// The coord-level shape is covered by
+/// `engram-coordinator/tests/api.rs::create_session_dev_vm_mode_skips_harness_on_harnessed_image`
+/// against a mock backend. This is the real-FC counterpart — it
+/// proves the whole chain (cold create → `wait_agent_ready` →
+/// `InstallHostCa` → empty-argv `SpawnHarness` → Active) survives a
+/// real microVM with no harness child running.
+///
+/// Assertions:
+///   1. `start_agent` with empty argv returns `Ok(())` — no spawn
+///      failure even though the rootfs has a (would-be-executable)
+///      harness binary at `/opt/engram/harness/harness`.
+///   2. The harness sink is never invoked — no `HarnessEvent` ever
+///      arrives, because agentd didn't spawn the wrapper, so the
+///      wrapper never dialled back over vsock.
+///   3. The sandbox is genuinely usable as a dev VM after the
+///      readiness probe: an in-VM `exec` over vsock round-trips
+///      cleanly (proves agentd is alive on the same connection that
+///      a SHELL-tab open would use).
+///   4. Destroy is clean (no zombie child to reap, no leaked UDS).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + FC + Docker + sudo"]
+async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_root() {
+        return;
+    }
+    cleanup_host_state();
+
+    let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
+    let (proxy_port, ca_pem, _registry) = spawn_real_proxy().await;
+    // Same rootfs as `e2e_harness_cold` — harness binary is COPY'd in
+    // at `/opt/engram/harness/harness`. If start_agent ignored the
+    // empty argv and still tried to spawn, the test would surface that
+    // as either a spawn failure or a sink event below.
+    let rootfs_path =
+        bake_harness_rootfs("engram-e2e-harness-devvm", &harness_bin, &claude_bin).await;
+
+    let work = tempfile::tempdir().expect("work");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = Some("10.200.0.0".parse().unwrap());
+    cfg.egress_proxy_port = Some(proxy_port);
+    let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    fc.host_startup().await.expect("host_startup");
+    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+
+    let (sink, captured) = capture_sink();
+    fc.set_harness_sink(sink);
+
+    let spec = SandboxSpec {
+        image: "engram-e2e-harness-devvm".into(),
+        rootfs_source: Some(rootfs_path),
+        image_uri: None,
+        cpu: CpuLimit { vcpus: 2 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+    };
+    let sandbox_id = pooled.create(spec).await.expect("create");
+    let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+
+    // The DevVm-mode AgentSpec: empty argv (resolve_harness → None),
+    // empty env, host_ca_pem still delivered (the dev VM can still
+    // outbound through the proxy if the operator wants). This is
+    // exactly what coord builds in `sessions.rs:739-745` when
+    // `agent_for_session` is None.
+    pooled
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv: Vec::new(),
+                env: HashMap::new(),
+                host_ca_pem: Some(ca_pem.clone()),
+            },
+        )
+        .await
+        .expect("start_agent with empty argv (readiness probe)");
+
+    // Give any (incorrectly-spawned) harness a moment to land an
+    // event in the sink. 1 s is generous — the harness wrapper's
+    // own startup ends with a vsock dial; if a wrong impl path
+    // execed it, RunStarted (or at minimum the attach handshake)
+    // would arrive within ~100 ms. Anything longer is just margin.
+    sleep(Duration::from_secs(1)).await;
+    let events = captured.lock().clone();
+    assert!(
+        events.is_empty(),
+        "DevVm mode must not spawn the harness — got events: {events:?}",
+    );
+
+    // Prove agentd is reachable on the *same* vsock path that
+    // start_agent used. `exec` is a `WireRequest::Exec` over
+    // ENGRAM_AGENTD_PORT — same connect path as InstallHostCa /
+    // SpawnHarness. Success here means the dev VM is fully usable
+    // for shell-tab / ad-hoc commands without a harness driving it.
+    let exec_handle = pooled
+        .exec(
+            sandbox_id,
+            engram_core::types::sandbox::ExecRequest {
+                command: vec!["/bin/sh".into(), "-c".into(), "echo dev-vm-ok".into()],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: None,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .await
+        .expect("exec via agentd over vsock");
+    let stdout = String::from_utf8_lossy(&exec_handle.stdout);
+    assert!(
+        stdout.contains("dev-vm-ok"),
+        "exec stdout missing marker: {stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&exec_handle.stderr),
+    );
+    assert_eq!(
+        exec_handle.exit_status,
+        Some(0),
+        "exec exit_status: {:?} stderr={:?}",
+        exec_handle.exit_status,
+        String::from_utf8_lossy(&exec_handle.stderr),
+    );
+
+    // Sanity: still no harness events after the exec round-trip —
+    // catches any accidental SpawnHarness fallback that might fire
+    // on the second vsock dial.
+    let events_after_exec = captured.lock().clone();
+    assert!(
+        events_after_exec.is_empty(),
+        "harness sink received events after dev-VM exec — empty argv probe leaked into a real spawn: {events_after_exec:?}",
+    );
+
+    pooled.destroy(sandbox_id).await.expect("destroy");
+    cleanup_host_state();
+}
