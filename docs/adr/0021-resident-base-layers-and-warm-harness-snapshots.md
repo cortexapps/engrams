@@ -363,15 +363,17 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       subcommand surface deleted entirely; `RestoreBaseForSessionRequest`'s
       `harness_pack_uri` / `harness_name` fields retired from the proto (numbers
       reserved).
-- [x] **Coord-level test of the baked-harness path**: a `mode = dev_vm` session
-      against a harnessed image goes Active without spawning the harness — locks
-      the new SessionMode behavior in `tests/api.rs::
-      create_session_dev_vm_mode_skips_harness_on_harnessed_image`. (Full FC
-      integration coverage of the `mode = agent` path — the rewrites of the
-      deleted `harness_loopback` / `proxy_e2e` / `e2e_harness` — is follow-up
-      work: those need a real noop-harness musl binary + bake fixture, and the
-      coord-mock test can't reach the HostTcp dial without binding a listener
-      from inside `TestFixture`. Track separately.)
+- [x] **Coord-level test of the baked-harness path** *(d4d777e)*: a
+      `mode = dev_vm` session against a harnessed image goes Active without
+      spawning the harness — `tests/api.rs::
+      create_session_dev_vm_mode_skips_harness_on_harnessed_image`.
+- [x] **Real-FC baked-harness loopback test** *(7990a25)*:
+      `tests/baked_harness_loopback.rs` bakes an image with `engram-harness-noop`
+      COPY'd into `/opt/noop/harness`, boots it on real Firecracker, and drives
+      the attach + RunStarted handshake. Verified on the dev VM (24.69 s). CI's
+      unprivileged-FC step picks it up. The `proxy_e2e` / `e2e_harness` /
+      `e2e_shell` rewrites (TLS-proxy chain + real Claude end-to-end) remain
+      coverage gaps — both require their own fixture rebuild.
 
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
