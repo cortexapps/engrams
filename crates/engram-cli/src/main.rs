@@ -1123,7 +1123,16 @@ async fn image_build(
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
         std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let builder = Builder::new(docker, chunk_store);
+    // One OCI client for both built-in harness pulls (during `build`,
+    // when `engram.toml` carries `[harness] builtin = ...`) and the
+    // optional registry push afterwards. Auth resolves from the
+    // standard docker config — `docker login <registry>` upstream,
+    // or any docker/login-action equivalent in CI; with no config the
+    // resolver returns no creds and pull/push fall through to
+    // anonymous (matches public/local-registry behaviour).
+    let oci =
+        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
+    let builder = Builder::new(docker, chunk_store).with_oci(oci);
     let outcome = builder
         .build(&req)
         .await
@@ -1140,18 +1149,9 @@ async fn image_build(
     // NOT touch Postgres — once pushed, the image is reachable to
     // engram by URI alone. The auth resolver wired into the host-
     // agent's OCI client handles credential lookup at pull time.
-    //
-    // Push auth comes from the standard docker config — run
-    // `docker login <registry>` upstream and the creds get picked
-    // up. With no docker config the resolver returns no creds and
-    // the push falls through to anonymous (works for
-    // `localhost:5001` and public registries).
     if let Some(target) = push {
-        let oci = engram_oci::OciClient::new(std::sync::Arc::new(
-            engram_oci::DockerConfigResolver::new(),
-        ));
         let push = builder
-            .push_to_registry(&oci, &req, &outcome, target)
+            .push_to_registry(&req, &outcome, target)
             .await
             .map_err(|e| CliError::Other(format!("push: {e}")))?;
         println!(

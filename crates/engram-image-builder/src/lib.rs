@@ -28,6 +28,7 @@ pub mod blob;
 pub mod config;
 pub mod docker;
 pub mod ext4;
+pub mod harness;
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,7 @@ use engram_core::types::ImageManifest;
 pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
 pub use ext4::{recommended_size, Ext4Error, Ext4Packer, Mke2fsPacker};
+pub use harness::{BuiltinCatalog, Platform};
 
 /// Output format the baker should produce.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -416,16 +418,29 @@ pub struct Builder<D: DockerRunner, P: Ext4Packer = Mke2fsPacker> {
     docker: D,
     packer: P,
     chunk_store: engram_chunk_store::ChunkStore,
+    /// OCI client for built-in harness pulls (ADR 0021) and registry
+    /// pushes. Optional so tests that exercise only the local bake
+    /// pipeline don't have to construct one; absence is surfaced as a
+    /// clear error when an operation actually needs it.
+    oci: Option<engram_oci::OciClient>,
+    /// Built-in harness catalog used when `engram.toml` carries
+    /// `[harness] builtin = "..."`. Defaulted to
+    /// [`BuiltinCatalog::default_catalog`]; tests can override.
+    catalog: BuiltinCatalog,
 }
 
 impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
-    /// Default constructor: real `mke2fs` packer for `Format::Ext4`
-    /// + caller-supplied chunk store.
+    /// Default constructor: real `mke2fs` packer for `Format::Ext4`,
+    /// caller-supplied chunk store. Call [`Self::with_oci`] afterwards
+    /// to attach the OCI client needed for built-in harness pulls and
+    /// registry pushes.
     pub fn new(docker: D, chunk_store: engram_chunk_store::ChunkStore) -> Self {
         Self {
             docker,
             packer: Mke2fsPacker::default(),
             chunk_store,
+            oci: None,
+            catalog: BuiltinCatalog::default_catalog(),
         }
     }
 }
@@ -438,7 +453,26 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             docker,
             packer,
             chunk_store,
+            oci: None,
+            catalog: BuiltinCatalog::default_catalog(),
         }
+    }
+
+    /// Attach the OCI client. Required for [`Self::push_to_registry`]
+    /// (image push) and for any bake whose `engram.toml` declares a
+    /// built-in harness (the baker pulls + extracts the published
+    /// artifact). Returns `self` so it composes with
+    /// `Builder::new(...).with_oci(...)`.
+    pub fn with_oci(mut self, oci: engram_oci::OciClient) -> Self {
+        self.oci = Some(oci);
+        self
+    }
+
+    /// Override the built-in harness catalog. Test-facing — production
+    /// uses [`BuiltinCatalog::default_catalog`] (wired by `Builder::new`).
+    pub fn with_catalog(mut self, catalog: BuiltinCatalog) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// Run a single bake. Steps:
@@ -551,13 +585,36 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // Optional: inject engram-agentd + bootstrap + an init shim
         // before we pack to ext4. Done after docker export so the
         // rootfs the user described in their Dockerfile is the base;
-        // we just overlay our agent / bootstrap on top. Harness
-        // binaries are NOT baked here — they live host-side in
-        // `cfg.harnesses_dir` and are mounted into every sandbox
-        // via virtio-fs at `/run/engram/harnesses`.
-        let effective_manifest = cfg.to_manifest();
+        // we just overlay our agent / bootstrap on top.
+        //
+        // Harness (ADR 0021): exactly one harness baked per image, or
+        // none. Built-ins come from the OCI catalog and are injected
+        // here; custom harnesses ride in via the author's Dockerfile
+        // and we only validate that `exec` is actually on disk.
+        let mut effective_manifest = cfg.to_manifest();
         if let Some(injection) = &req.agent_injection {
             inject_agent(&rootfs_dir, injection).await?;
+        }
+        if let Some(source_harness) = effective_manifest.harness.clone() {
+            if source_harness.builtin.is_some() {
+                let oci = self.oci.as_ref().ok_or_else(|| {
+                    BuildError::Config(
+                        "[harness] builtin = \"...\" requires an OCI client — call Builder::with_oci(...)"
+                            .into(),
+                    )
+                })?;
+                let resolved = harness::inject_builtin_harness(
+                    &rootfs_dir,
+                    oci,
+                    &self.catalog,
+                    &source_harness,
+                    harness::Platform::LinuxX86_64,
+                )
+                .await?;
+                effective_manifest.harness = Some(resolved);
+            } else {
+                harness::validate_custom_harness(&rootfs_dir, &effective_manifest).await?;
+            }
         }
 
         let manifest_path = image_dir.join("manifest.toml");
@@ -750,11 +807,15 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     /// flow tidy.
     pub async fn push_to_registry(
         &self,
-        oci: &engram_oci::OciClient,
         req: &BuildRequest,
         outcome: &BuildOutcome,
         registry_uri: &str,
     ) -> Result<RegistryPush, BuildError> {
+        let oci = self.oci.as_ref().ok_or_else(|| {
+            BuildError::Config(
+                "push_to_registry: no OCI client attached — call Builder::with_oci(...)".into(),
+            )
+        })?;
         // Only Ext4 outputs are pushable today — the Directory format
         // is fundamentally a per-host materialization (file ownership,
         // overlayfs whiteouts) that doesn't survive a tar+pull. The
