@@ -361,6 +361,52 @@ rootfs stage).
   `entry_is_fresh` TTL), not a restore bug — reproduced green on a fresh coord with
   an immediate create. Remaining before prod: packer deploy of the handler binary +
   `/dev/userfaultfd` perms; prod measurement.
+- **Route B SHIPPED + PROFILED on prod (2026-05-27).** Deployed end-to-end: OSS
+  push → bake-images `detect` (now a cargo-dep-graph lane detector, replacing a
+  drifted path denylist) → `engrams-host-changed` → FC-host bake (host-agent +
+  uffd-handler musl; needed `linux-libc-dev` + `CFLAGS_*` so `userfaultfd-sys`'
+  C shim finds `<linux/types.h>`) → `fc-host-baked` → tf-apply → MIG rolled to a
+  handler-baked image with `ENGRAM_FC_RESTORE_MODE=uffd` (now the `fc-host-mig`
+  TF default; `vm.unprivileged_userfaultfd=1` baked by packer). Host
+  `engrams-fc-rq3b` confirmed `restored from snapshot mode=Uffd`, agent handshake
+  68 ms.
+
+  **Prod Claude Code session profile (bogus key → Anthropic 401), cold (1st on a
+  freshly-rolled host) vs warm (2nd):**
+
+  | phase | cold | warm |
+  |---|---|---|
+  | enable image = base-snapshot capture (one-time) | ~70 s | — |
+  | POST → Active (UFFD restore + harness ext4 bind) | ~11 s | ~4.5 s |
+  | Active → Claude Code `run_started` (node/JS startup) | 7.2 s | 9.1 s |
+  | `run_started` → "Invalid API key" (Anthropic 401 RTT) | 0.22 s | 0.24 s |
+  | end-to-end (POST → auth error) | ~18 s | ~13.9 s |
+
+  **Key finding — the bottleneck moved off everything UFFD touches.** UFFD restore
+  is cheap (~3–4 s cold, faster warm) and the Anthropic round-trip is negligible
+  (~0.2 s). The two dominant terms are the **harness ext4 bind** (warms well:
+  11 s→4.5 s as chunks + the harness pack cache locally) and **Claude Code's own
+  node/JS cold startup (~7–9 s), which does NOT warm** (CPU-bound interpreter boot
+  inside the guest; it drifted *up* on the warm run). Prod NVMe also confirmed the
+  dev-vm's ~104 s node startup was slow-PD pathology, not a real cost.
+
+  **Implication for the roadmap (supersedes P2's framing as the next lever).** The
+  base snapshot is captured with a **stub harness** (option-D), so the restored VM
+  has no agent process — every session cold-starts node. The highest-leverage next
+  step is a **per-harness "warm" snapshot**: capture *after* the harness (e.g.
+  Claude Code) has booted to idle, so restore lands in a ready-node state and the
+  ~7–9 s vanishes. This is a larger milestone than P2/P3 but is squarely where the
+  prod data points. P2's memory working-set prefetch is now low-value (memory
+  restore is already cheap); the working-set idea is better spent on the **harness
+  substrate + node/JS pages**.
+
+  **Telemetry gap (blocks finer profiling).** Cloud Trace had **0 traces in 2 h** —
+  the coord pod has no otelcol collector sidecar (it exports OTLP to `localhost:4317`
+  with nothing listening; spans silently dropped), the residue of the 2026-05-27
+  collector-sidecar incident (see [[telemetry_must_not_gate_workload]]). The
+  cold/warm figures above came from host journald + the conversation log; the
+  finer restore sub-span split (`prefetch` vs `load_snapshot` vs fault-serving, +
+  the handler `uffd.run` spans) needs the collector restored as a native sidecar.
 - **2a.** ~~`runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
   targeted `MADV_WILLNEED`.~~ **Subsumed by Route B** — the chunk-native handler
   has no canonical mmap at all, so there is no `MAP_POPULATE` to drop. Lazy
