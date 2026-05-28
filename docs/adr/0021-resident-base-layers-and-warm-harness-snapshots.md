@@ -28,6 +28,14 @@ are COPY'd into the rootfs by the author's own Dockerfile and declared in
 image runs is an image property, and the session API keeps only a mode choice
 (run the baked harness vs. boot a pure dev VM).
 
+**No backwards compatibility.** This is a clean break, not a migration. We delete the
+standalone harness subsystem outright — no compat shims, no dual-read of old
+`harness_packs`/`HarnessSpec`, no support for pre-0021 images or session requests.
+Enabled images and any in-flight sessions are re-baked / re-created against the new
+model; the deploy is a cutover. (engram is pre-1.0 and operator-curated, so there's
+no external contract to preserve — carrying compat would just bloat the very code
+paths this ADR retires.)
+
 ## Context — what the prod profile told us
 
 ADR 0020's prod run (Claude Code session, bogus key → Anthropic 401), cold (first

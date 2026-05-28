@@ -1181,6 +1181,7 @@ mod tests {
             },
             resources: Default::default(),
             secret_mode: SecretMode::Broker,
+            harness: None,
         };
 
         // Bundle: one resolved secret; the schema's allow_hosts must
@@ -1260,6 +1261,7 @@ mod tests {
             network: NetworkPolicy::default(),
             resources: Default::default(),
             secret_mode: SecretMode::Broker,
+            harness: None,
         };
 
         let mut bundle_inner = HashMap::new();
