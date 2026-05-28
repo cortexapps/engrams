@@ -3,16 +3,14 @@ import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { createSession } from '../api';
 import { useEnabledImages } from '../hooks/useEnabledImages';
-import { useHarnesses } from '../hooks/useHarnesses';
 import { SectionHead } from './HostManifest';
-import type { HarnessSpec } from '../types';
+import type { SessionMode } from '../types';
 
 // "New session" form rendered inline on the Overview page, between the
 // HostManifest and the SessionManifest. ADR 0005 retired the
-// workspace axis: the bake image's `/workspace` is the workspace.
-// Two axes left — image + harness.
-
-type HarnessKind = 'none' | 'builtin';
+// workspace axis; ADR 0021 P1.3 retired the per-session harness
+// *selection* — the harness is baked into the image at image-bake
+// time. Two axes left: image + mode.
 
 export interface NewSessionFormProps {
   onCancel: () => void;
@@ -21,15 +19,14 @@ export interface NewSessionFormProps {
 
 export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   const { data: images, isLoading, error: loadError } = useEnabledImages(true);
-  const { data: harnesses } = useHarnesses(true);
   const qc = useQueryClient();
 
   // ---- IMAGE ----
   // Stage D: image is a flat OCI URI. The picker shows the operator-
   // curated `enabled_images` set; whatever URI the user selects flows
-  // straight to `POST /sessions { image: "<uri>" }`. Manifest data
-  // (name, description) is read off the cached row so we don't refetch
-  // the registry per render.
+  // straight to `POST /sessions { image: "<uri>" }`. The manifest's
+  // `harness_name` (lifted server-side from `[harness] name = ...`)
+  // tells us whether the image has a baked agent and which one.
   const [selectedUri, setSelectedUri] = useState<string>('');
   const selected = images?.find((img) => img.image_uri === selectedUri);
   useEffect(() => {
@@ -38,48 +35,35 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     }
   }, [images, selectedUri]);
 
-  // ---- HARNESS ----
-  const [harnessKind, setHarnessKind] = useState<HarnessKind>('none');
-  const [harnessName, setHarnessName] = useState<string>('');
+  // ---- MODE ----
+  // `agent`: drive the image's baked harness (default).
+  // `dev_vm`: shell-only — even on a harnessed image, leave the agent
+  //            resident-but-undriven.
+  // For a harness-less image both modes look the same (no harness to
+  // drive); we still send `mode` for wire uniformity.
+  const [mode, setMode] = useState<SessionMode>('agent');
 
-  // Clear any prior submit error when the image changes — the
-  // selection itself is the corrective action; we don't want a stale
-  // "image X failed" still on screen for a different image. Harness
-  // selection (and its credentials) is NOT reset — harnesses live
-  // above images, deployment-wide via the registry-backed harness
-  // packs, so a session's harness choice survives image swaps.
-  useEffect(() => {
-    setError(null);
-  }, [selectedUri]);
+  // Image-driven derived state.
+  const harnessName = selected?.harness_name ?? null;
+  const hasHarness = harnessName !== null;
+  const isClaude = harnessName === 'claude';
+  // Prompt is meaningful only when the session will actually drive
+  // an agent. dev-VM mode + harness-less images both make prompt
+  // a no-op.
+  const promptMeaningful = hasHarness && mode === 'agent';
 
-  // If the host registry no longer offers the chosen harness (operator
-  // removed a binary), drop back to none.
-  useEffect(() => {
-    if (
-      harnessKind === 'builtin' &&
-      harnesses &&
-      !harnesses.some((h) => h.name === harnessName)
-    ) {
-      setHarnessKind('none');
-      setHarnessName('');
-    }
-  }, [harnesses, harnessKind, harnessName]);
-
-  // ---- PROMPT (only meaningful when harness != none) ----
+  // ---- PROMPT ----
   const [prompt, setPrompt] = useState('');
 
   // ---- CREDENTIALS ----
-  // Stage D: the dashboard no longer surfaces image-declared secrets.
-  // The manifest lives server-side on the `enabled_images` row; if an
-  // image needs literal-mode secrets, they're supplied at the deploy
-  // layer (env / KMS / Vault), not pasted in the browser. The form
-  // still surfaces harness-level credentials — today only the Claude
-  // OAuth/API key, which is genuinely a per-session human input.
+  // ADR 0021 P1.3+: the dashboard surfaces per-session credentials
+  // only when the image actually has the harness that needs them.
+  // Today that's only the Claude harness (`harness_name = "claude"`),
+  // which needs either an OAuth token (long-lived, from `claude
+  // setup-token`) or an API key (sk-ant-...).
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Claude auth UX (hard-coded; see comment in the JSX section).
-  // The dropdown picks which env-var name the value gets sent under.
   const [claudeAuthMethod, setClaudeAuthMethod] = useState<'oauth' | 'api_key'>(
     'oauth',
   );
@@ -89,14 +73,18 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
       ? 'CLAUDE_CODE_OAUTH_TOKEN'
       : 'ANTHROPIC_API_KEY';
 
-  // Claude harness needs *some* token to authenticate; if the user
-  // picked it but didn't paste one, can't submit.
+  // Claude needs *some* token to authenticate; the picker only
+  // surfaces (and only blocks submit) on Claude images in agent mode.
   const claudeTokenMissing =
-    harnessKind === 'builtin' &&
-    harnessName === 'claude' &&
-    claudeToken.trim().length === 0;
+    isClaude && mode === 'agent' && claudeToken.trim().length === 0;
 
   const canSubmit = !!selected && !submitting && !claudeTokenMissing;
+
+  // Wipe any prior submit error when the image changes — the
+  // selection itself is the corrective action.
+  useEffect(() => {
+    setError(null);
+  }, [selectedUri]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -104,24 +92,21 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     setSubmitting(true);
     setError(null);
     try {
-      const harness: HarnessSpec =
-        harnessKind === 'none' || !harnessName
-          ? { kind: 'none' }
-          : { kind: 'builtin', name: harnessName };
-      const promptValue =
-        harness.kind === 'none' ? undefined : prompt.trim() || undefined;
+      const promptValue = promptMeaningful ? prompt.trim() || undefined : undefined;
 
-      // Harness-level credentials (today: just the claude token, one
-      // of OAuth or API key per `claudeAuthMethod`). Image-declared
-      // secrets flow through the deploy layer post-Stage-D, not the
-      // dashboard.
+      // Harness-level credentials surface only for the image's actual
+      // baked harness. Today: just Claude (one of OAuth or API key
+      // per `claudeAuthMethod`). Image-declared `[secrets.*]` flow
+      // through the deploy layer post-Stage-D, not the dashboard.
       const mergedSecrets: Record<string, string> = {};
-      if (harnessKind === 'builtin' && harnessName === 'claude') {
+      if (isClaude && mode === 'agent') {
         mergedSecrets[claudeTokenName] = claudeToken;
       }
       const res = await createSession({
         image: selected.image_uri,
-        harness,
+        // Omit `mode` on the default (`agent`) so the wire stays
+        // minimal; coord defaults to Agent server-side.
+        mode: mode === 'dev_vm' ? 'dev_vm' : undefined,
         prompt: promptValue,
         secrets:
           Object.keys(mergedSecrets).length > 0 ? mergedSecrets : undefined,
@@ -221,44 +206,34 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
                   {selected.manifest_description}
                 </p>
               )}
+              <p
+                className="font-display italic text-[0.85rem] -mt-1"
+                style={{ color: 'var(--color-ink-quiet)' }}
+              >
+                {harnessName
+                  ? `baked harness: ${harnessName}`
+                  : 'no baked harness — shell-only image'}
+              </p>
             </div>
 
-            {/* HARNESS */}
+            {/* MODE */}
             <div className="space-y-3">
-              <SubHead>HARNESS</SubHead>
-              <Field label="agent">
+              <SubHead>MODE</SubHead>
+              <Field label="mode">
                 <select
-                  value={harnessKind === 'none' ? '__none__' : harnessName}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (v === '__none__') {
-                      setHarnessKind('none');
-                      setHarnessName('');
-                    } else {
-                      setHarnessKind('builtin');
-                      setHarnessName(v);
-                    }
-                  }}
+                  value={mode}
+                  onChange={(e) => setMode(e.target.value as SessionMode)}
                   className="ledger-input font-display"
                 >
-                  <option value="__none__">none</option>
-                  {harnesses?.map((h) => (
-                    <option key={h.name} value={h.name}>
-                      builtin: {h.name}
-                      {h.description ? ` — ${h.description}` : ''}
-                    </option>
-                  ))}
+                  <option value="agent">
+                    agent — drive the image's baked harness
+                  </option>
+                  <option value="dev_vm">
+                    dev VM — shell-only, harness (if any) stays undriven
+                  </option>
                 </select>
               </Field>
-              {harnesses && harnesses.length === 0 && (
-                <p
-                  className="font-display italic text-[0.85rem] -mt-1"
-                  style={{ color: 'var(--color-ink-quiet)' }}
-                >
-                  no harnesses registered on this host; sessions run as plain shells
-                </p>
-              )}
-              {harnessKind === 'builtin' && (
+              {promptMeaningful && (
                 <Field label="prompt">
                   <textarea
                     value={prompt}
@@ -273,14 +248,13 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
             </div>
 
             {/* HARNESS-LEVEL CREDENTIALS — hard-coded UX for the
-                `claude` harness today. Long-term these should come
-                from the harness pack itself, but for v1 we have one
-                special case: claude needs either an OAuth token
-                (long-lived, from `claude setup-token`) or an API
-                key (sk-ant-...). The dropdown picks the env-var
-                name; whichever's chosen lands as a literal env var
-                injected into the harness process. */}
-            {harnessKind === 'builtin' && harnessName === 'claude' && (
+                claude harness. Surfaces only when the *image* has a
+                baked claude harness AND mode is agent (dev-VM
+                doesn't drive the harness, so the credential is
+                inert). Long-term these credential schemas should
+                live alongside the built-in harness artifact and the
+                form learns them from there. */}
+            {isClaude && mode === 'agent' && (
               <div className="pt-2 space-y-3">
                 <p
                   className="font-mono smallcaps text-[0.65rem]"

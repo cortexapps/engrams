@@ -4,7 +4,7 @@ import { UserChip } from './components/UserChip';
 import { Overview } from './pages/Overview';
 import { SessionDetail } from './pages/SessionDetail';
 import { Settings } from './pages/Settings';
-import { HarnessesPanel } from './components/settings/HarnessesPanel';
+// ADR 0021 P1.5a retired the Harnesses settings panel + its route.
 import { ImagesPanel } from './components/settings/ImagesPanel';
 import { ProfilePanel } from './components/settings/ProfilePanel';
 import { RegistriesPanel } from './components/settings/RegistriesPanel';
@@ -34,7 +34,6 @@ export function App() {
             <Route index element={<Navigate to="images" replace />} />
             <Route path="images" element={<ImagesPanel />} />
             <Route path="registries" element={<RegistriesPanel />} />
-            <Route path="harnesses" element={<HarnessesPanel />} />
             <Route path="profile" element={<ProfilePanel />} />
           </Route>
         </Routes>

@@ -1,12 +1,8 @@
 import type {
-  AddHarnessPackRequest,
   AddRegistryRequest,
   AddRegistryResponse,
   CreateSessionResponse,
   EnabledImageSummary,
-  HarnessDescriptor,
-  HarnessPackSummary,
-  HarnessSpec,
   HostCowStateResponse,
   ImageRef,
   ListEnabledImagesResponse,
@@ -15,6 +11,7 @@ import type {
   ListSessionsResponse,
   Session,
   SessionCowStateResponse,
+  SessionMode,
 } from './types';
 
 // Same-origin in dev (Vite proxy → :8090). In a hosted prod build,
@@ -87,13 +84,16 @@ export const fetchHostCowState = (hostId: string) =>
 export const fetchSessionCowState = (sessionId: string) =>
   getJSON<SessionCowStateResponse>(`/sessions/${sessionId}/cow-state`);
 
-export const fetchHarnesses = () =>
-  getJSON<HarnessDescriptor[]>('/api/harnesses');
+// ADR 0021 P1.5a retired `fetchHarnesses` + the `/api/harnesses`
+// endpoint. The harness (if any) is an image property baked at
+// bake time and surfaced as `EnabledImageSummary.harness_name`.
 
 export interface CreateSessionInput {
   image: ImageRef;
-  /** Defaults to `{ kind: "none" }` server-side. */
-  harness?: HarnessSpec;
+  /** Defaults to `"agent"` server-side; pass `"dev_vm"` to leave a
+   * harnessed image's agent resident-but-undriven and use the
+   * session as a shell-only dev VM. */
+  mode?: SessionMode;
   user_id?: string;
   prompt?: string;
   /** Map of env-var name → value. Honored only for SecretMode::Literal images. */
@@ -120,21 +120,8 @@ export const addRegistry = (req: AddRegistryRequest) =>
 export const deleteRegistry = (host: string) =>
   deleteEmpty(`/api/registries/${encodeURIComponent(host)}`);
 
-// ---- Settings · Harness packs ------------------------------------------
-//
-// `fetchHarnessPacks` and `fetchHarnesses` hit the same URL today —
-// the response shape is the same, the difference is the *intent*: the
-// session-create form picks names ("show me everything I can attach"),
-// the settings panel CRUDs registry rows ("show me what I've registered").
-// They diverge if we ever split read endpoints.
-export const fetchHarnessPacks = () =>
-  getJSON<HarnessPackSummary[]>('/api/harnesses');
-
-export const addHarnessPack = (req: AddHarnessPackRequest) =>
-  postJSON<HarnessPackSummary>('/api/harnesses', req);
-
-export const deleteHarnessPack = (name: string) =>
-  deleteEmpty(`/api/harnesses/${encodeURIComponent(name)}`);
+// ADR 0021 P1.5a retired `fetchHarnessPacks` / `addHarnessPack` /
+// `deleteHarnessPack` with the rest of the `/api/harnesses` surface.
 
 // ---- Settings · Enabled images ----------------------------------------
 //
