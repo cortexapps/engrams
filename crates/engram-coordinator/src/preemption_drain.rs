@@ -371,14 +371,12 @@ mod tests {
             image: "drain-test".into(),
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         }
     }

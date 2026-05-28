@@ -203,14 +203,12 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         image: "fc-nbd-test".into(),
         rootfs_source: Some(nbd_device.clone()),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: None,
         network: Default::default(),
     };
 

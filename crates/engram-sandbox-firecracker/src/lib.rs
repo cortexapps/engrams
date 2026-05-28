@@ -1331,33 +1331,9 @@ impl FirecrackerBackend {
         .await?;
 
         // Harness substrate: read-only ext4 image of the host's
-        // `cfg.harnesses_dir`, attached as the second virtio-blk
-        // drive (`/dev/vdb`). agentd's harness supervisor mounts it
-        // at `/run/engram/harnesses` on SpawnHarness so it can exec
-        // `/run/engram/harnesses/<name>/harness`. None when the
-        // host's harness registry is empty.
-        if let Some(substrate_path) = spec.harness_substrate.as_ref() {
-            let harness_canonical = paths::harness_canonical(&self.work_dir, sandbox_id);
-            paths::install_symlink(&harness_canonical, substrate_path)
-                .await
-                .map_err(|e| {
-                    SandboxError::Vm(
-                        format!(
-                            "install harness canonical symlink {} -> {}: {e}",
-                            harness_canonical.display(),
-                            substrate_path.display()
-                        )
-                        .into(),
-                    )
-                })?;
-            api.put_drive(&DriveConfig {
-                drive_id: "harnesses".into(),
-                path_on_host: harness_canonical.to_string_lossy().into_owned(),
-                is_root_device: false,
-                is_read_only: true,
-            })
-            .await?;
-        }
+        // ADR 0021 P1.5: no second virtio-blk for the harness — the
+        // harness binary travels in the rootfs at the manifest-
+        // declared `[harness] exec` path.
 
         // virtio-net: bind FC to the TAP we provisioned above. The
         // TAP already has the host-side gateway IP and is admin-up,
@@ -1841,25 +1817,9 @@ impl FirecrackerBackend {
         // 12o rootfs/vsock bug, prod-found via session 3e692ab6 driven
         // through two idle-evict→resume hops. Re-pointing here makes the
         // embedded path track the live id (so the recompute stays
-        // correct), and re-attaches the harness fresh on every
-        // idle→active / evac resume — what we always want across a
-        // relocate or a source-side network partition. Gated on
-        // `harness_substrate` exactly like `restore_canonical_symlinks`,
-        // which installed the `harness/<id>.ext4` symlink this PATCH
-        // re-points the drive at. On failure, mirror the load-failure
-        // cleanup so we don't leak a half-wired sandbox.
-        if manifest.spec.harness_substrate.is_some() {
-            if let Err(e) = self.repoint_harness_drive(&api, sandbox_id).await {
-                if let Some(setup) = net_setup.as_ref() {
-                    net::teardown(setup, &self.net_allocator).await;
-                }
-                if let Some(setup) = netns_setup.as_ref() {
-                    net::teardown_netns(setup, &self.net_allocator).await;
-                }
-                drop(child);
-                return Err(e);
-            }
-        }
+        // ADR 0021 P1.5: no harness drive to repoint — the harness
+        // travels in the rootfs now. The repoint_harness_drive PATCH
+        // path can also retire once nothing else gates on it.
 
         // Carry the manifest's spec forward so SandboxState reflects
         // what the snapshot was taken from. rootfs_path mirrors what
@@ -2003,37 +1963,7 @@ impl FirecrackerBackend {
         Ok(None)
     }
 
-    /// Re-point the running VM's harness virtio-blk drive at `id`'s own
-    /// canonical symlink (`harness/<id>.ext4`) via pause → PATCH /drives
-    /// → resume (~30ms on FC). Shared by `swap_harness_drive` (warm-lease
-    /// swap to a freshly-installed session-harness target) and the
-    /// restore path (ADR 0018 §12p — re-anchor the harness onto the live
-    /// id so the snapshot lineage stays consistent across chained
-    /// restores). The caller MUST have installed the `harness/<id>.ext4`
-    /// symlink first: `swap_harness_drive` does so explicitly,
-    /// `restore_canonical_symlinks` does so on the restore path.
-    async fn repoint_harness_drive(
-        &self,
-        api: &FirecrackerClient,
-        id: SandboxId,
-    ) -> Result<(), SandboxError> {
-        let harness_canonical = paths::harness_canonical(&self.work_dir, id);
-        api.patch_vm_state(VmState::Paused).await?;
-        // ADR 0016 §A.1.2: same cancellation-safety story as
-        // create_snapshot — if our future is dropped between the
-        // pause above and the explicit resume below, async Drop
-        // can't run the resume. The guard's sync Drop spawns a
-        // detached resume task so the VM doesn't stay paused.
-        let mut guard = crate::client::ResumeOnDrop::arm(api.clone());
-        let patch_result = api.patch_drive("harnesses", &harness_canonical).await;
-        // Always try to resume so a partial failure doesn't leave
-        // the VM paused. The patch error (if any) wins.
-        let resume_result = api.patch_vm_state(VmState::Resumed).await;
-        guard.disarm();
-        patch_result?;
-        resume_result?;
-        Ok(())
-    }
+    // ADR 0021 P1.5: `repoint_harness_drive` retired with option-D.
 }
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
@@ -2146,51 +2076,11 @@ async fn restore_canonical_symlinks(
         // bind. Best-effort remove; missing file is fine.
         let _ = tokio::fs::remove_file(source_vsock).await;
     }
-    if manifest.spec.harness_substrate.is_some() {
-        // Pick the symlink target: a host-local stub when supplied
-        // (the cross-host warm-pool case), otherwise fall back to
-        // whatever the manifest names (legacy / same-host resume).
-        // If neither is available we'd dangle the symlink, so bail
-        // explicitly with a diagnostic.
-        let manifest_target = manifest.spec.harness_substrate.as_deref();
-        let harness_target: &Path = stub_harness_override
-            .or(manifest_target)
-            .ok_or_else(|| vm_err("no harness target available for symlink"))?;
-        // Keyed by the NEW live sandbox_id (see rootfs note above) so
-        // a re-snapshot of the restored sandbox finds the harness
-        // canonical path too.
-        let canonical = paths::harness_canonical(work_dir, new_sandbox_id);
-        paths::install_symlink(&canonical, harness_target)
-            .await
-            .map_err(|e| {
-                vm_err(format!(
-                    "restore harness canonical symlink {} -> {}: {e}",
-                    canonical.display(),
-                    harness_target.display()
-                ))
-            })?;
-        if let Some(source_canonical) = manifest.source_harness_canonical.as_ref() {
-            if source_canonical != &canonical {
-                if let Some(parent) = source_canonical.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                        vm_err(format!(
-                            "create source harness canonical parent {}: {e}",
-                            parent.display()
-                        ))
-                    })?;
-                }
-                paths::install_symlink(source_canonical, harness_target)
-                    .await
-                    .map_err(|e| {
-                        vm_err(format!(
-                            "restore source harness canonical symlink {} -> {}: {e}",
-                            source_canonical.display(),
-                            harness_target.display()
-                        ))
-                    })?;
-            }
-        }
-    }
+    // ADR 0021 P1.5: no harness canonical symlink to restore — the
+    // harness binary lives in the rootfs at the manifest-declared
+    // `[harness] exec` path, so there's nothing for the host to
+    // re-point.
+    let _ = (stub_harness_override, new_sandbox_id, work_dir);
     Ok(())
 }
 
@@ -2617,19 +2507,8 @@ impl SandboxBackend for FirecrackerBackend {
         // at restore — `repoint_harness_drive` (PATCH /drives) runs on
         // BOTH the warm-lease swap and every idle→active / evac resume
         // (ADR 0018 §12p) — so its embedded `path_on_host` tracks the
-        // live id and recomputing here is correct. This was the
-        // assumption 12o relied on to exempt the harness drive; §12p
-        // made it true on the resume paths (it had only ever held on the
-        // warm-lease path), after a prod restore (session 3e692ab6)
-        // ENOENT'd on the ancestor harness path. Unlike rootfs/vsock,
-        // the harness drive CAN be re-pointed post-load, so Option B
-        // (re-anchor on restore) is viable here where it wasn't for the
-        // immutable vsock device.
-        let source_harness_canonical = if spec.harness_substrate.is_some() {
-            Some(paths::harness_canonical(&self.work_dir, id))
-        } else {
-            None
-        };
+        // ADR 0021 P1.5: harness drive retired — nothing to anchor.
+        let source_harness_canonical: Option<PathBuf> = None;
         let source_vsock_canonical = Some(live_vsock_uds);
         // ADR 0014 sec-hardening: `spec.env` carries session secrets
         // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, etc.) verbatim
@@ -3106,45 +2985,9 @@ impl SandboxBackend for FirecrackerBackend {
             .map_err(|_| SandboxError::Vm("start_shell: timed out waiting for agentd".into()))?
     }
 
-    /// ADR 0014 M1.12: brief pause → `PATCH /drives` → resume on
-    /// the harness virtio-blk drive. Warm-pool lease path uses
-    /// this to swap the bake-time stub harness for the session's
-    /// chosen harness ext4 just before `start_agent` dials
-    /// bootstrap. ~30ms wall-clock on FC.
-    async fn swap_harness_drive(
-        &self,
-        id: SandboxId,
-        new_path: std::path::PathBuf,
-    ) -> Result<(), SandboxError> {
-        let api_sock = {
-            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.firecracker_socket.clone()
-        };
-        // Re-install the canonical symlink so state.bin's embedded
-        // path resolves on the next guest read. The session's
-        // harness ext4 lives in the host's image_cache; we point
-        // the canonical path at it. Canonicalize first — `new_path`
-        // is constructed from work_dir which is typically relative
-        // (`./var/...`), and the symlink itself lives elsewhere, so
-        // a relative target would dangle when FC follows it.
-        let abs_new_path = tokio::fs::canonicalize(&new_path).await.map_err(|e| {
-            SandboxError::Vm(
-                format!(
-                    "canonicalize session harness {} for swap: {e}",
-                    new_path.display()
-                )
-                .into(),
-            )
-        })?;
-        let harness_canonical = paths::harness_canonical(&self.work_dir, id);
-        if let Err(e) = paths::install_symlink(&harness_canonical, &abs_new_path).await {
-            return Err(SandboxError::Vm(
-                format!("install harness symlink for swap: {e}").into(),
-            ));
-        }
-        let api = FirecrackerClient::new(&api_sock);
-        self.repoint_harness_drive(&api, id).await
-    }
+    // ADR 0021 P1.5: `swap_harness_drive` retired with the rest of
+    // option-D. The harness lives in the rootfs now, so there's no
+    // host file backing a virtio-blk drive to swap.
 
     /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
     /// capture attaches as `/dev/vdb` so the snapshot carries a harness
@@ -3375,14 +3218,12 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 256 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         }
     }

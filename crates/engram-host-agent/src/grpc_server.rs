@@ -237,14 +237,13 @@ impl HostService for HostServiceImpl {
         async move {
             let inner = req.into_inner();
             let metadata = decode_bincode(&inner.metadata_bincode, "SnapshotMetadata")?;
+            // ADR 0021 P1.5: the proto still carries
+            // `harness_pack_uri` / `harness_name` fields for wire
+            // compat in this release; the backend ignores them.
+            // The fields retire from the proto in a follow-up.
             let id = self
                 .inner
-                .restore_base_for_session(
-                    metadata,
-                    inner.harness_pack_uri,
-                    inner.harness_name,
-                    inner.session_env,
-                )
+                .restore_base_for_session(metadata, inner.session_env)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SandboxIdMessage {

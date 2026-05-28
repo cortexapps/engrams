@@ -525,6 +525,10 @@ jobs:
       # their `require_root()` SKIP path — leaving the gap silent.
       - name: Firecracker `#[ignore]` tests (unprivileged)
         run: |
+          # ADR 0021 P1.5 deleted `harness_loopback`, `restore_chain`,
+          # and `option_d_latency_bench` along with the harness-
+          # substrate subsystem they exercised. P1.6 will reintroduce
+          # baked-in-harness equivalents.
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --test boot \
@@ -532,10 +536,7 @@ jobs:
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
-            --test harness_loopback \
             --test multi_restore \
-            --test restore_chain \
-            --test option_d_latency_bench \
             --test cross_host_restore \
             --run-ignored ignored-only \
             --no-fail-fast \
@@ -599,15 +600,16 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e, snapshot_net, patch_drive_swap, option_d_warm_lease, netns_isolation, warm_proxy_chain)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain)
         run: |
+          # ADR 0021 P1.5 deleted `proxy_e2e` + `option_d_warm_lease`
+          # with the harness-substrate subsystem; P1.6 reintroduces a
+          # baked-in proxy e2e.
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
-            --test proxy_e2e \
             --test snapshot_net \
             --test patch_drive_swap \
-            --test option_d_warm_lease \
             --test netns_isolation \
             --test warm_proxy_chain \
             --run-ignored ignored-only \
@@ -626,15 +628,11 @@ jobs:
       # cache as the steps above. Net new runtime ~80s for the
       # harness pair + ~70s for the shell pair, well within the
       # existing FC job budget.
-      - name: True-e2e tests (root — e2e_shell, e2e_harness)
-        run: |
-          sudo -E env "PATH=$PATH" cargo nextest run \
-            -p engram-host-agent \
-            --test e2e_shell \
-            --test e2e_harness \
-            --run-ignored ignored-only \
-            --no-fail-fast \
-            --test-threads=1
+      # ADR 0021 P1.5 deleted the true-e2e step (e2e_shell + e2e_harness)
+      # along with the harness-substrate subsystem they baked into.
+      # P1.6 reintroduces baked-in-harness versions; until those land
+      # there's no e2e harness coverage in CI (the unit + lifecycle
+      # tests above still run).
         # Run after either success or failure so cache write doesn't
         # trip on root-owned files.
       - name: Restore ownership after sudo tests

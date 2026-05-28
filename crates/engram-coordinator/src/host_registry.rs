@@ -515,18 +515,15 @@ impl HostRegistry {
     /// restore + harness-swap op so `create_session` can route a cold
     /// create through restore instead of a fresh kernel boot.
     #[tracing::instrument(name = "coord.restore_base_for_session", skip_all)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn restore_base_for_session(
         &self,
         ctx: &ScheduleContext<'_>,
         metadata: SnapshotMetadata,
-        harness_pack_uri: Option<String>,
-        harness_name: Option<String>,
         session_env: std::collections::HashMap<String, String>,
     ) -> Result<(HostId, SandboxId), SandboxError> {
         let (host_id, backend) = self.pick_for_session(ctx)?;
         let sandbox_id = backend
-            .restore_base_for_session(metadata, harness_pack_uri, harness_name, session_env)
+            .restore_base_for_session(metadata, session_env)
             .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
@@ -1046,14 +1043,12 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         }
     }

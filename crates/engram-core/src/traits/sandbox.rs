@@ -74,32 +74,10 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0014 M1.12 (option D): atomically swap the host file
-    /// backing the sandbox's harness virtio-blk drive. Used by
-    /// the warm-pool lease path so per-session harness selection
-    /// is decoupled from the bake-time template snapshot.
-    ///
-    /// Implementation contract: pause the VM, `PATCH /drives` on
-    /// the harness drive id to point at `new_path`, then resume.
-    /// The pause is brief (~30 ms on FC); the resume's
-    /// virtio-blk queue-kick invalidates the guest kernel's page
-    /// cache for the device, so the next read returns the new
-    /// file's bytes (verified by
-    /// `engram-sandbox-firecracker/tests/patch_drive_swap.rs`).
-    ///
-    /// Default: unimplemented. Backends that don't host the
-    /// warm pool (VZ, Process) inherit the default — only FC
-    /// implements the option-D path.
-    async fn swap_harness_drive(
-        &self,
-        _id: SandboxId,
-        _new_path: std::path::PathBuf,
-    ) -> Result<(), SandboxError> {
-        Err(SandboxError::InvalidSpec(
-            "this backend doesn't support `swap_harness_drive` (option D is FC-only for now)"
-                .into(),
-        ))
-    }
+    // ADR 0021 P1.5: `swap_harness_drive` retired. Per-session
+    // harness mounting via virtio-blk PATCH /drives is gone — the
+    // harness lives in the rootfs at the manifest-declared exec path,
+    // so there's no host file to swap.
 
     /// Register a sink that will receive inbound harness connections
     /// (one stream per guest dial). Backends that route the harness
@@ -294,19 +272,14 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// ADR 0020 P1: restore a per-image base snapshot for a session and
-    /// late-bind the session's harness (the option-D swap). The base
-    /// snapshot was captured with a stub harness; this restores it
-    /// (running VM, stub at /dev/vdb), materializes the session's
-    /// harness ext4, and `swap_harness_drive`s the stub for it — so the
-    /// subsequent `start_agent`'s `SpawnHarness` mounts the real harness.
-    /// `harness_pack_uri`/`harness_name` are `None` for no-harness
-    /// sessions (the stub stays; `start_agent` skips the spawn).
-    /// Implemented on `PooledBackend` (it owns the harness image cache).
+    /// ADR 0020 P1: restore the image's shared base snapshot for a
+    /// new session and inject the per-session env. ADR 0021 P1.5
+    /// retired the option-D substrate-swap stage that used to ride
+    /// here — the harness lives in the rootfs now and arrives with
+    /// the snapshot itself. Implemented on `PooledBackend`.
     async fn restore_base_for_session(
         &self,
         _metadata: SnapshotMetadata,
-        _harness_pack_uri: Option<String>,
-        _harness_name: Option<String>,
         _session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(

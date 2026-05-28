@@ -57,14 +57,12 @@ async fn snapshot_then_restore_round_trips_microvm() {
         image: "fc-snapshot-test".into(),
         rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: None,
         network: Default::default(),
     };
 

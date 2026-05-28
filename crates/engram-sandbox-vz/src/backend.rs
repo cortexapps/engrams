@@ -337,13 +337,12 @@ impl SandboxBackend for VzBackend {
             "vz: cloned bake rootfs to per-sandbox path"
         );
 
-        let mut vm_cfg = VmConfig::new(
+        let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
             memory_mib,
             vcpus,
         );
-        vm_cfg.harness_substrate = spec.harness_substrate.clone();
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
@@ -627,13 +626,12 @@ impl SandboxBackend for VzBackend {
         // containerization framework uses it. agentd's harness-
         // supervisor pattern + Claude's `--resume` hand off
         // conversation continuity across the boot.
-        let mut vm_cfg = VmConfig::new(
+        let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
             memory_mib,
             vcpus,
         );
-        vm_cfg.harness_substrate = manifest.spec.harness_substrate.clone();
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
         if let Err(e) = vm.start().await {
             let _ = tokio::fs::remove_file(&rootfs_path).await;

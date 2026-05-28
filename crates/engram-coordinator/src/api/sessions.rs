@@ -415,15 +415,10 @@ async fn create_session_inner(
         ))
     })?;
 
-    // ADR 0021 P1.3: per-session harness selection is gone. The
-    // harness — if any — is an image property baked at image-bake
-    // time and recorded in `manifest.harness`. The old harness_packs
-    // registry lookup happens at no point in the new path; we just
-    // carry the image-manifest's resolved launch contract down to the
-    // backend. The legacy `harness_pack_uri` plumbing on SandboxSpec
-    // stays in place (always `None`) until P1.5 retires it along
-    // with the rest of the standalone harness subsystem.
-    let harness_pack_uri: Option<String> = None;
+    // ADR 0021 P1.5b retired the `harness_pack_uri` plumbing
+    // entirely — the harness travels in the rootfs now, so there's
+    // no registry URI to thread.
+    //
     // Pre-flight gate: a session that asked for `mode = Agent` against
     // a harness-less image is fine (it boots as if dev-VM), but we
     // surface a 400 only when an image's `[harness]` block is
@@ -604,21 +599,12 @@ async fn create_session_inner(
         .suggested_memory_mib
         .unwrap_or(DEFAULT_MEMORY_MIB);
 
-    // ADR 0021 P1.3: harness name comes from the resolved image
-    // manifest; the session no longer selects.
-    let harness_name = manifest
-        .harness
-        .as_ref()
-        .and_then(|h| h.name.clone())
-        .filter(|_| !req.mode.is_dev_vm());
     let (host_id, sandbox_id) = try_restore_base_snapshot(
         &state,
         base_snapshot_id,
         &image_repo,
         &image_tag,
         memory_mib,
-        harness_pack_uri,
-        harness_name,
         // Per-session sandbox env (manifest env + resolved secrets +
         // ENGRAM_SESSION_*). The shared base snapshot can't carry it, so
         // it's injected into the restored sandbox (cold-create baked it
@@ -877,15 +863,12 @@ async fn create_session_inner(
 /// host, and runs the combined restore + harness-swap op. Any error
 /// bubbles to the caller, which falls back to a cold create — so this
 /// never fails a session, it only declines to fast-path it.
-#[allow(clippy::too_many_arguments)]
 async fn try_restore_base_snapshot(
     state: &SharedState,
     snapshot_id: engram_core::types::SnapshotId,
     image_repo: &str,
     image_tag: &str,
     memory_mib: u32,
-    harness_pack_uri: Option<String>,
-    harness_name: Option<String>,
     session_env: HashMap<String, String>,
 ) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
     let record = state
@@ -938,7 +921,7 @@ async fn try_restore_base_snapshot(
     };
     state
         .host_registry
-        .restore_base_for_session(&ctx, metadata, harness_pack_uri, harness_name, session_env)
+        .restore_base_for_session(&ctx, metadata, session_env)
         .await
 }
 

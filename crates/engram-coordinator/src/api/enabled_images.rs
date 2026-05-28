@@ -334,7 +334,6 @@ async fn capture_and_record_base_snapshot(
         image: row.image_uri.clone(),
         rootfs_source: None,
         image_uri: Some(row.image_uri.clone()),
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus },
         memory: MemoryLimit {
             max_mib: memory_mib,
@@ -343,7 +342,6 @@ async fn capture_and_record_base_snapshot(
         ttl: None,
         env: manifest.env.clone(),
         workdir: None,
-        harness_substrate: None,
         network: manifest.network.clone(),
     };
 

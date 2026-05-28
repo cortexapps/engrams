@@ -99,15 +99,15 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
-    /// ADR 0020 P1: restore a per-image base snapshot for a session,
-    /// late-binding the session harness via the option-D swap. Called
-    /// by `create_session` on a base-snapshot hit. Default errors so
-    /// mocks / non-FC hosts opt out.
+    /// ADR 0020 P1: restore a per-image base snapshot for a session
+    /// and inject the per-session env. Called by `create_session` on a
+    /// base-snapshot hit. ADR 0021 P1.5 retired the option-D
+    /// substrate-swap stage that used to follow the restore — the
+    /// harness lives in the rootfs now. Default errors so mocks /
+    /// non-FC hosts opt out.
     async fn restore_base_for_session(
         &self,
         _metadata: SnapshotMetadata,
-        _harness_pack_uri: Option<String>,
-        _harness_name: Option<String>,
         _session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(
