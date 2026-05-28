@@ -268,11 +268,50 @@ mod tests {
 
             [harness]
             builtin = "claude"
+            version = "v1.2.3"
             "#,
         )
         .unwrap();
         let h = cfg.manifest.harness.expect("harness parsed");
         assert_eq!(h.builtin.as_deref(), Some("claude"));
+        assert_eq!(h.version.as_deref(), Some("v1.2.3"));
+    }
+
+    #[test]
+    fn parse_engram_toml_rejects_builtin_without_version() {
+        // Built-ins must pin a version explicitly — no rolling defaults.
+        let res = EngramRepoConfig::parse(
+            r#"
+            name = "demo-claude"
+
+            [harness]
+            builtin = "claude"
+            "#,
+        );
+        let err = format!("{:?}", res.unwrap_err());
+        assert!(
+            err.contains("version"),
+            "error must mention the missing version pin: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_engram_toml_rejects_custom_with_version() {
+        // `version` is only meaningful for built-ins.
+        let res = EngramRepoConfig::parse(
+            r#"
+            name = "x"
+
+            [harness]
+            name = "my-agent"
+            exec = "/opt/my-agent/harness"
+            version = "v0.1.0"
+            "#,
+        );
+        assert!(
+            res.is_err(),
+            "custom harness must not carry a version field"
+        );
     }
 
     #[test]
@@ -311,25 +350,6 @@ mod tests {
         assert!(
             msg.contains("[harness]"),
             "error must point at [harness]: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_engram_toml_rejects_baker_only_version_in_source() {
-        // `version` is set by the baker, not the author — source
-        // engram.toml must fail-fast if it carries one.
-        let res = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-
-            [harness]
-            builtin = "claude"
-            version = "1.2.3"
-            "#,
-        );
-        assert!(
-            res.is_err(),
-            "baker-only `version` in source must be rejected"
         );
     }
 

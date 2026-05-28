@@ -98,10 +98,13 @@ host-agent / agentd / warm-capture all read.)
 
 ```toml
 # Built-in: the baker downloads the published per-platform artifact + injects it.
+# Both `builtin` and `version` are required — no rolling defaults, reproducible bakes.
 [harness]
-builtin = "claude"               # one of the curated names
+builtin = "claude"
+version = "v1.2.3"               # explicit pin → GHCR OCI digest
 
 # — or — Custom: the author's own Dockerfile already COPY'd the binary in.
+# No `version` (the binary is whatever the author put in their rootfs).
 [harness]
 name = "my-agent"
 exec = "/opt/my-agent/harness"   # path inside the rootfs
@@ -111,13 +114,17 @@ args = ["--serve"]               # optional
 ```
 
 - **Out-of-the-box (built-ins)**: engram ships curated harnesses — `claude`, later
-  `opencode`/`codex`. `builtin = "claude"` makes `engram image build` resolve and
-  **download a published, version-pinned, per-platform harness artifact**
-  (x86_64-linux first) and inject it into the rootfs at the canonical path
-  `/opt/engram/harness/` (binary + any bundled runtime, e.g. the `claude` CLI). The
-  artifact is the *bake input* that replaces the old runtime OCI pack; the engram CI
-  pipeline that builds it lives on, repurposed. The DX is "sessions come with these
-  agents, ready in ~hundreds of ms."
+  `opencode`/`codex` — as **GHCR OCI artifacts** (one tar.gz layer per
+  `(name, version, platform)`, e.g.
+  `ghcr.io/cortexapps/engrams/harness-claude:v1.2.3-linux-x86_64`). `engram image
+  build` resolves `(builtin, version)` via a hardcoded catalog in the CLI, pulls the
+  layer via the existing `engram-oci` client, and injects the contents into the
+  rootfs at the canonical path `/opt/engram/harness/` (binary + any bundled runtime,
+  e.g. the `claude` CLI). The author **must pin the version explicitly** in
+  `engram.toml` — no rolling defaults — so a given `engram.toml` bakes to a
+  deterministic artifact digest, which the baker also records in the rendered
+  manifest. The artifact is the *bake input* that replaces the old runtime OCI pack;
+  the CI publish pipeline lives on, repurposed.
 - **Custom**: author builds a harness binary against `engram-harness-proto` (the
   wire types — frame format, attach handshake, the event/command enums) directly,
   **COPYs the binary (+ any runtime) into the rootfs in their own Dockerfile**, and

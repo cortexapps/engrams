@@ -95,16 +95,27 @@ pub struct HarnessManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
 
-    /// Resolved built-in artifact version (rendered manifest only —
-    /// omitted in source form). Pins what the baker injected.
+    /// Built-in artifact version. **Required** in source `engram.toml`
+    /// when `builtin` is set — the explicit pin that resolves to a
+    /// GHCR OCI digest. Must be omitted for custom harnesses (the
+    /// binary is whatever the author COPY'd into their rootfs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
 impl HarnessManifest {
-    /// Validate a *source-authored* `[harness]` table: exactly one of
-    /// the built-in form (`builtin`) or the custom form (`name` +
-    /// `exec`). `version` is baker-set and must not appear in source.
+    /// Validate a *source-authored* `[harness]` table. The shape rules:
+    ///
+    /// - Built-in: `builtin = "..."` **and** `version = "..."` together
+    ///   (no `name`/`exec`/`args`). Version pinning is required for
+    ///   reproducible bakes — the engram-CLI catalog resolves
+    ///   `(builtin, version)` to a GHCR OCI artifact at that exact
+    ///   digest.
+    /// - Custom: `name` + absolute `exec` (and optional `args`). `version`
+    ///   is meaningless for a custom harness — the binary is whatever
+    ///   the author's Dockerfile COPY'd in — so it must be omitted.
+    ///
+    /// `builtin` and `name`/`exec` are mutually exclusive.
     pub fn validate_source(&self) -> Result<(), String> {
         match (&self.builtin, &self.name, &self.exec) {
             (Some(b), None, None) => {
@@ -117,7 +128,13 @@ impl HarnessManifest {
                             .into(),
                     );
                 }
-                Ok(())
+                match self.version.as_deref().map(str::trim) {
+                    Some("") | None => Err(
+                        "[harness] builtin requires an explicit `version = \"...\"` pin (no rolling defaults — reproducible bakes)"
+                            .into(),
+                    ),
+                    Some(_) => Ok(()),
+                }
             }
             (None, Some(name), Some(exec)) => {
                 if name.trim().is_empty() {
@@ -127,6 +144,12 @@ impl HarnessManifest {
                     return Err(format!(
                         "[harness] exec must be an absolute rootfs path, got {exec:?}"
                     ));
+                }
+                if self.version.is_some() {
+                    return Err(
+                        "[harness] version is only meaningful with builtin; a custom harness ships the binary the author chose"
+                            .into(),
+                    );
                 }
                 Ok(())
             }
@@ -139,13 +162,6 @@ impl HarnessManifest {
                     .into(),
             ),
         }
-        .and_then(|()| {
-            if self.version.is_some() {
-                Err("[harness] version is set by the baker, not in source engram.toml".into())
-            } else {
-                Ok(())
-            }
-        })
     }
 
     /// True once the harness is fully resolved to a launchable form
@@ -345,12 +361,15 @@ mod tests {
 
             [harness]
             builtin = "claude"
+            version = "v1.2.3"
         "#;
         let m: ImageManifest = toml::from_str(src).unwrap();
         let h = m.harness.expect("harness table parsed");
         assert_eq!(h.builtin.as_deref(), Some("claude"));
+        assert_eq!(h.version.as_deref(), Some("v1.2.3"));
         assert!(h.exec.is_none(), "builtin source form has no exec yet");
-        h.validate_source().expect("builtin form is valid source");
+        h.validate_source()
+            .expect("builtin + version is valid source");
         assert!(!h.is_launchable(), "unresolved builtin isn't launchable");
     }
 
@@ -398,20 +417,43 @@ mod tests {
         };
         assert!(rel.validate_source().is_err(), "exec must be absolute");
 
-        // version is baker-only.
-        let versioned = HarnessManifest {
+        // builtin without version: rejected (explicit pin required).
+        let no_version = HarnessManifest {
             builtin: Some("claude".into()),
-            version: Some("1.2.3".into()),
             ..Default::default()
         };
         assert!(
-            versioned.validate_source().is_err(),
-            "version not allowed in source"
+            no_version.validate_source().is_err(),
+            "builtin requires explicit version pin"
+        );
+
+        // builtin with empty version: same rejection.
+        let empty_version = HarnessManifest {
+            builtin: Some("claude".into()),
+            version: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(
+            empty_version.validate_source().is_err(),
+            "blank version is not a pin"
+        );
+
+        // custom + version: rejected (version only applies to built-ins).
+        let custom_versioned = HarnessManifest {
+            name: Some("my-agent".into()),
+            exec: Some("/opt/x/harness".into()),
+            version: Some("v1.0.0".into()),
+            ..Default::default()
+        };
+        assert!(
+            custom_versioned.validate_source().is_err(),
+            "version not allowed with custom harness"
         );
 
         // builtin with args is rejected (baker owns argv).
         let builtin_args = HarnessManifest {
             builtin: Some("claude".into()),
+            version: Some("v1.2.3".into()),
             args: vec!["--serve".into()],
             ..Default::default()
         };
@@ -419,6 +461,28 @@ mod tests {
             builtin_args.validate_source().is_err(),
             "args not allowed with builtin"
         );
+    }
+
+    #[test]
+    fn harness_validate_source_accepts_canonical_forms() {
+        // Built-in + version: valid.
+        let builtin = HarnessManifest {
+            builtin: Some("claude".into()),
+            version: Some("v1.2.3".into()),
+            ..Default::default()
+        };
+        builtin
+            .validate_source()
+            .expect("builtin + version is valid");
+
+        // Custom: name + absolute exec (+ optional args), no version.
+        let custom = HarnessManifest {
+            name: Some("my-agent".into()),
+            exec: Some("/opt/my-agent/harness".into()),
+            args: vec!["--serve".into()],
+            ..Default::default()
+        };
+        custom.validate_source().expect("custom form is valid");
     }
 
     #[test]
