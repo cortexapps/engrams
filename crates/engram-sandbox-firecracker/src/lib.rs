@@ -924,21 +924,51 @@ impl FirecrackerBackend {
 
     /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
     /// read back `OK <peer>\n`, and return the resulting stream now
-    /// directly connected to the guest's listener on `port`. One-shot:
-    /// callers that need to race the boot window are wrong — by ADR
-    /// 0015 M1, the boot window is closed before any host-side
-    /// dial-out by waiting on the per-sandbox `agent_ready` watch
-    /// (filled when agentd dials the host's ready port).
+    /// directly connected to the guest's listener on `port`.
+    ///
+    /// ADR 0015 M1 closes the cold-boot race via the per-sandbox
+    /// `agent_ready` watch (filled when agentd dials the host's
+    /// ready port). The warm-restore path is different: `restore`
+    /// pre-sets `agent_ready=true` from the snapshot's invariant,
+    /// but FC's vsock UDS can take a brief moment to start accepting
+    /// after `PUT /snapshot/load` returns. To accommodate that
+    /// without making cold paths slower, retry ECONNREFUSED on the
+    /// initial connect for up to ~2 s — well under the test deadlines
+    /// but long enough that a sandwich of InstallHostCa + SpawnHarness
+    /// right after restore doesn't lose to FC's UDS hand-off.
     async fn connect_fc_vsock(
         vsock_uds_path: &Path,
         port: u32,
     ) -> Result<UnixStream, SandboxError> {
-        let mut conn = UnixStream::connect(vsock_uds_path).await.map_err(|e| {
-            vm_err(format!(
-                "connect to FC vsock UDS {}: {e}",
-                vsock_uds_path.display()
-            ))
-        })?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut attempts: u32 = 0;
+        let mut conn = loop {
+            attempts += 1;
+            match UnixStream::connect(vsock_uds_path).await {
+                Ok(c) => {
+                    if attempts > 1 {
+                        tracing::debug!(
+                            vsock_uds = %vsock_uds_path.display(),
+                            attempts,
+                            "FC vsock UDS accepted after retry"
+                        );
+                    }
+                    break c;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    return Err(vm_err(format!(
+                        "connect to FC vsock UDS {} after {attempts} attempts: {e}",
+                        vsock_uds_path.display()
+                    )));
+                }
+            }
+        };
 
         conn.write_all(format!("CONNECT {port}\n").as_bytes())
             .await
