@@ -210,24 +210,43 @@ pub enum WireRequest {
     /// launching the new one — the host uses that for clean
     /// re-attach after FC snapshot/restore.
     ///
-    /// Optionally mounts `harness_dev` at `harness_mount` (read-only
-    /// ext4) before exec'ing argv. Used by the warm-pool option-D
-    /// flow where the harness substrate is hot-swapped via FC
-    /// `PATCH /drives` and bootstrap-side mount makes the new
-    /// device visible to the harness.
+    /// ADR 0021 P1.4: argv points at a path inside the rootfs (the
+    /// image's `[harness] exec`, typically `/opt/engram/harness/...`).
+    /// No drive mount; agentd just exec's argv. The CA the harness
+    /// trusts is installed via `InstallHostCa` (called by the host
+    /// post-readiness, pre-SpawnHarness), and agentd points the
+    /// child's `SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS` / friends at
+    /// the canonical install paths.
     ///
     /// Empty argv is a **readiness probe**: the agent skips the
     /// spawn and replies `HarnessSpawned { pid: None }` — useful
     /// for callers that want to confirm agentd is reachable on
-    /// vsock without launching anything (the no-harness cold-start
+    /// vsock without launching anything (the no-harness / dev-VM
     /// path).
     ///
     /// Replies [`WireResponse::HarnessSpawned`] on success or
-    /// [`WireResponse::Error`] if the mount or spawn fails.
+    /// [`WireResponse::Error`] if the spawn fails.
     SpawnHarness(SpawnHarnessRequest),
+    /// Install the per-host egress-proxy CA into the guest's TLS
+    /// trust store (ADR 0021 P1). Called by the host once per VM
+    /// boot **and** once per resume — the cert is per-host, so a
+    /// session that moves to a different host gets a fresh PEM.
+    ///
+    /// Replaces the pre-0021 delivery path where the CA rode in on
+    /// the harness drive (`<harness_mount>/.engram-host/ca.pem`).
+    /// Once the drive is retired (P1.5), this RPC is the sole path.
+    ///
+    /// Idempotent: the agent caches the last installed PEM and
+    /// replies `InstallHostCaAck { changed: false }` on no-op
+    /// resume. Replies `InstallHostCaAck { changed: true }` on a
+    /// fresh / rotated cert, or [`WireResponse::Error`] if the
+    /// guest filesystem write fails.
+    InstallHostCa(InstallHostCaRequest),
 }
 
-/// Body of [`WireRequest::SpawnHarness`].
+/// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
+/// pre-0021 `harness_dev` / `harness_mount` fields — the harness
+/// binary lives in the rootfs now, agentd just exec's `argv`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnHarnessRequest {
     /// argv to exec as the harness child. Empty = readiness probe;
@@ -238,15 +257,17 @@ pub struct SpawnHarnessRequest {
     /// keys take this value).
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// Block device to mount before spawning. `None` skips the
-    /// mount. Typical value `/dev/vdb` for the harness substrate.
-    #[serde(default)]
-    pub harness_dev: Option<String>,
-    /// Where to mount `harness_dev`. Required when `harness_dev`
-    /// is `Some`; ignored otherwise. Typical value
-    /// `/run/engram/harnesses`.
-    #[serde(default)]
-    pub harness_mount: Option<String>,
+}
+
+/// Body of [`WireRequest::InstallHostCa`]. ADR 0021 P1 reference:
+/// [`reference_e2b_ca_cert_pattern`] in user memory captures the
+/// E2B `cacerts.go` install model this mirrors.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallHostCaRequest {
+    /// PEM-encoded CA bundle to add to the guest's trust store.
+    /// Empty string is treated as a no-op (`changed: false`) to
+    /// keep the host's call-site branchless.
+    pub cert_pem: String,
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.
@@ -281,6 +302,13 @@ pub enum WireResponse {
     /// otherwise yielded no child (no-op case).
     HarnessSpawned {
         pid: Option<u32>,
+    },
+    /// Reply to [`WireRequest::InstallHostCa`]. `changed` is `true`
+    /// when the agent wrote new bytes (first install or rotation),
+    /// `false` when the PEM matched the one already installed
+    /// (zero-I/O resume hot path).
+    InstallHostCaAck {
+        changed: bool,
     },
     /// Anything the agent couldn't fulfil. `message` is a short
     /// human-readable reason; `kind` mirrors the std `io::ErrorKind`

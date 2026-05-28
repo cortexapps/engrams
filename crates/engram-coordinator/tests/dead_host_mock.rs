@@ -38,7 +38,7 @@ impl MetadataStore for MiniMeta {
                 sandbox_id: None,
                 created_at: Utc::now(),
                 image: spec.image,
-                harness: spec.harness,
+                mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
             },
@@ -62,7 +62,7 @@ impl MetadataStore for MiniMeta {
                 sandbox_id: Some(sandbox_id),
                 created_at: Utc::now(),
                 image: spec.image,
-                harness: spec.harness,
+                mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
             },
@@ -201,24 +201,7 @@ impl MetadataStore for MiniMeta {
     async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn upsert_harness_pack(
-        &self,
-        _: engram_core::types::HarnessPack,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_harness_packs(&self) -> Result<Vec<engram_core::types::HarnessPack>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn get_harness_pack(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::HarnessPack>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
+    // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
     async fn upsert_enabled_image(
         &self,
         _: engram_core::types::EnabledImage,
@@ -257,11 +240,11 @@ impl MetadataStore for MiniMeta {
 }
 
 async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> SessionId {
-    use engram_core::types::session::HarnessSpec;
+    use engram_core::types::session::SessionMode;
     let id = meta
         .create_session(SessionSpec {
             image: "localhost:5001/demo:warm-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await

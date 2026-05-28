@@ -1,15 +1,24 @@
 # ADR 0020: Cold-boot via base-snapshot restore — 25 s → ~100 ms
 
-Status: 2026-05-27 — **Proposed (P1 in progress).** ADR 0019 closed the
-measurement phase and ranked **H1 (restore-from-base)** as the lever. This ADR
-commits to the optimization: route every cold `POST /sessions` through the
-existing, prod-validated `restore()` path against a per-image base snapshot,
-then shave the ~1 s restore tail to ~100 ms. Phased P1–P5. **P1 is code-complete
-and green** (9 commits `85f7223`..`c481e3c`, `just check` 822 tests + dev-vm
-clippy). The dev-vm e2e was briefly blocked on a slow-cold-boot vsock handshake
-issue (FC device-thread starvation) — **resolved by a capture-scoped handshake
-retry, NOT io_uring** (see below; validating on the dev-vm). Flips to Accepted
-only after the final phase is prod-measured.
+Status: 2026-05-27 — **P1 + chunk-native UFFD SHIPPED to prod; remaining phases
+BLOCKED on [ADR 0021](0021-resident-base-layers-and-warm-harness-snapshots.md).**
+ADR 0019 ranked **H1 (restore-from-base)** as the lever; this ADR routed every
+cold `POST /sessions` through `restore()` against a per-image base snapshot
+(P1) and made restore chunk-native via UFFD (Route B), both shipped + prod-
+profiled (see the "Route B SHIPPED + PROFILED on prod" note below). **That
+profile is what blocks the rest:** with UFFD live, the bottleneck moved off
+everything P2–P5 targets — guest-memory restore is cheap, the dominant costs are
+now the harness substrate bind (serial GCS `chunk.fetch`) and the agent's own
+in-guest startup. ADR 0021 captures the from-scratch model that attacks those
+(resident templates + per-template warm snapshots, with harnesses baked into
+image templates rather than uploaded) and **supersedes P2 / reframes P3–P4**. P5 (concurrent restores) stands
+on its own. This ADR does not flip to Accepted independently; its remaining work
+is folded into ADR 0021's phasing.
+
+*(Original framing, retained for history: commit to restore-from-base, then
+shave the ~1 s restore tail to ~100 ms; phased P1–P5; P1 code-complete + green —
+`just check` 822 tests + dev-vm clippy; the dev-vm vsock-handshake stall was
+resolved by a capture-scoped handshake retry, NOT io_uring, see below.)*
 
 Phase: 1 (P1 = the lever). Commit chain recorded here as work lands.
 
@@ -361,6 +370,52 @@ rootfs stage).
   `entry_is_fresh` TTL), not a restore bug — reproduced green on a fresh coord with
   an immediate create. Remaining before prod: packer deploy of the handler binary +
   `/dev/userfaultfd` perms; prod measurement.
+- **Route B SHIPPED + PROFILED on prod (2026-05-27).** Deployed end-to-end: OSS
+  push → bake-images `detect` (now a cargo-dep-graph lane detector, replacing a
+  drifted path denylist) → `engrams-host-changed` → FC-host bake (host-agent +
+  uffd-handler musl; needed `linux-libc-dev` + `CFLAGS_*` so `userfaultfd-sys`'
+  C shim finds `<linux/types.h>`) → `fc-host-baked` → tf-apply → MIG rolled to a
+  handler-baked image with `ENGRAM_FC_RESTORE_MODE=uffd` (now the `fc-host-mig`
+  TF default; `vm.unprivileged_userfaultfd=1` baked by packer). Host
+  `engrams-fc-rq3b` confirmed `restored from snapshot mode=Uffd`, agent handshake
+  68 ms.
+
+  **Prod Claude Code session profile (bogus key → Anthropic 401), cold (1st on a
+  freshly-rolled host) vs warm (2nd):**
+
+  | phase | cold | warm |
+  |---|---|---|
+  | enable image = base-snapshot capture (one-time) | ~70 s | — |
+  | POST → Active (UFFD restore + harness ext4 bind) | ~11 s | ~4.5 s |
+  | Active → Claude Code `run_started` (node/JS startup) | 7.2 s | 9.1 s |
+  | `run_started` → "Invalid API key" (Anthropic 401 RTT) | 0.22 s | 0.24 s |
+  | end-to-end (POST → auth error) | ~18 s | ~13.9 s |
+
+  **Key finding — the bottleneck moved off everything UFFD touches.** UFFD restore
+  is cheap (~3–4 s cold, faster warm) and the Anthropic round-trip is negligible
+  (~0.2 s). The two dominant terms are the **harness ext4 bind** (warms well:
+  11 s→4.5 s as chunks + the harness pack cache locally) and **Claude Code's own
+  node/JS cold startup (~7–9 s), which does NOT warm** (CPU-bound interpreter boot
+  inside the guest; it drifted *up* on the warm run). Prod NVMe also confirmed the
+  dev-vm's ~104 s node startup was slow-PD pathology, not a real cost.
+
+  **Implication for the roadmap (supersedes P2's framing as the next lever).** The
+  base snapshot is captured with a **stub harness** (option-D), so the restored VM
+  has no agent process — every session cold-starts node. The highest-leverage next
+  step is a **per-harness "warm" snapshot**: capture *after* the harness (e.g.
+  Claude Code) has booted to idle, so restore lands in a ready-node state and the
+  ~7–9 s vanishes. This is a larger milestone than P2/P3 but is squarely where the
+  prod data points. P2's memory working-set prefetch is now low-value (memory
+  restore is already cheap); the working-set idea is better spent on the **harness
+  substrate + node/JS pages**.
+
+  **Telemetry gap (blocks finer profiling).** Cloud Trace had **0 traces in 2 h** —
+  the coord pod has no otelcol collector sidecar (it exports OTLP to `localhost:4317`
+  with nothing listening; spans silently dropped), the residue of the 2026-05-27
+  collector-sidecar incident (see [[telemetry_must_not_gate_workload]]). The
+  cold/warm figures above came from host journald + the conversation log; the
+  finer restore sub-span split (`prefetch` vs `load_snapshot` vs fault-serving, +
+  the handler `uffd.run` spans) needs the collector restored as a native sidecar.
 - **2a.** ~~`runtime.rs:~288`: `MAP_PRIVATE | MAP_POPULATE` → `MAP_PRIVATE` +
   targeted `MADV_WILLNEED`.~~ **Subsumed by Route B** — the chunk-native handler
   has no canonical mmap at all, so there is no `MAP_POPULATE` to drop. Lazy

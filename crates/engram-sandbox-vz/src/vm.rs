@@ -39,11 +39,8 @@ pub(crate) struct VmConfig {
     /// Linux kernel command line. Default points root at /dev/vda
     /// (the first virtio-block device) and routes the console to hvc0.
     pub kernel_cmdline: String,
-    /// Optional read-only ext4 image attached as the second
-    /// virtio-blk drive (`/dev/vdb`). The init shim mounts it at
-    /// `/run/engram/harnesses`. Same wire as the FC backend so the
-    /// production code path is exercised in dev.
-    pub harness_substrate: Option<std::path::PathBuf>,
+    // ADR 0021 P1.5: harness drive retired — the harness lives in
+    // the rootfs at `[harness] exec`. No second virtio-blk to attach.
 }
 
 impl VmConfig {
@@ -88,7 +85,6 @@ impl VmConfig {
             kernel_cmdline: "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw \
                              quiet init=/sbin/engram-init ip=dhcp"
                 .into(),
-            harness_substrate: None,
         }
     }
 }
@@ -441,22 +437,8 @@ fn build_configuration(
         );
         storage.push(Retained::cast_unchecked(block_dev));
 
-        if let Some(substrate_path) = cfg.harness_substrate.as_ref() {
-            let substrate_url = nsurl_for_path(substrate_path);
-            let sub_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-                VZDiskImageStorageDeviceAttachment::alloc(),
-                &substrate_url,
-                true,
-            )
-            .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
-            let sub_attachment_super: Retained<objc2_virtualization::VZStorageDeviceAttachment> =
-                Retained::cast_unchecked(sub_attachment);
-            let sub_block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
-                VZVirtioBlockDeviceConfiguration::alloc(),
-                &sub_attachment_super,
-            );
-            storage.push(Retained::cast_unchecked(sub_block_dev));
-        }
+        // ADR 0021 P1.5: no harness virtio-blk to attach — the
+        // harness binary lives in the rootfs.
 
         let storage_array: Retained<NSArray<VZStorageDeviceConfiguration>> =
             NSArray::from_retained_slice(&storage);

@@ -95,6 +95,18 @@ env:
   RUSTFLAGS: -D warnings
   SQLX_OFFLINE: "true"
 
+  # ADR 0021 P0: single source of truth for the built-in claude
+  # harness artifact's tag. Used by:
+  #   - `bake-harness-claude-artifact` (publishes to GHCR on
+  #     push-to-main; uploads as workflow artifact on every run)
+  #   - `test-e2e-stack` (downloads the artifact, re-publishes to
+  #     localhost:5001, points the baker at it via env)
+  # Bump in lockstep with `[harness] version = "..."` in
+  # `deploy/demo-claude/engram.toml` so the catalog override
+  # resolves to a tag the local registry actually serves.
+  HARNESS_VERSION: v0.1.0
+  HARNESS_PLATFORM: linux-x86_64
+
 jobs:
   lint:
     name: fmt + clippy + check
@@ -525,6 +537,11 @@ jobs:
       # their `require_root()` SKIP path — leaving the gap silent.
       - name: Firecracker `#[ignore]` tests (unprivileged)
         run: |
+          # ADR 0021 P1.6: `baked_harness_loopback` replaced the
+          # retired `harness_loopback`. `restore_chain` and
+          # `option_d_latency_bench` were also deleted with the
+          # substrate subsystem; `restore_chain` came back (baked-in
+          # variant) in the P1.6 e2e resurrection.
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --test boot \
@@ -532,11 +549,10 @@ jobs:
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
-            --test harness_loopback \
+            --test baked_harness_loopback \
             --test multi_restore \
-            --test restore_chain \
-            --test option_d_latency_bench \
             --test cross_host_restore \
+            --test restore_chain \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -599,17 +615,21 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, proxy_e2e, snapshot_net, patch_drive_swap, option_d_warm_lease, netns_isolation, warm_proxy_chain)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain, proxy_e2e)
         run: |
+          # ADR 0021 P1.6: `proxy_e2e` came back in the e2e
+          # resurrection — baked-in harness path, CA delivered via
+          # `InstallHostCa` vsock RPC instead of the retired
+          # `.engram-host/ca.pem` substrate file. `option_d_warm_lease`
+          # stays deleted (it was specifically about option-D).
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
-            --test proxy_e2e \
             --test snapshot_net \
             --test patch_drive_swap \
-            --test option_d_warm_lease \
             --test netns_isolation \
             --test warm_proxy_chain \
+            --test proxy_e2e \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -626,6 +646,12 @@ jobs:
       # cache as the steps above. Net new runtime ~80s for the
       # harness pair + ~70s for the shell pair, well within the
       # existing FC job budget.
+      # True-e2e tests (engram-host-agent crate): real bake + real
+      # FC microVM + PooledBackend + real proxy + (for harness)
+      # real Claude CLI + real api.anthropic.com 401 round-trip.
+      # Resurrected for ADR 0021 P1.6 against the baked-in harness
+      # model — the harness pack travels in /opt/engram/harness/
+      # inside the rootfs, the CA via `InstallHostCa` vsock RPC.
       - name: True-e2e tests (root — e2e_shell, e2e_harness)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
@@ -643,23 +669,214 @@ jobs:
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
 
   # ------------------------------------------------------------------
+  # ------------------------------------------------------------------
+  # Built-in Claude harness artifact bake (ADR 0021 P0).
+  #
+  # Folds the prior standalone `bake-harness-claude.yml` workflow
+  # into ci.yml so every PR + push-to-main produces the exact
+  # artifact it tests against — closing a structural catch-22 where
+  # a PR that bumps `HARNESS_VERSION` had no way to publish the new
+  # tag before its own e2e_stack lane consumed it.
+  #
+  # Two consumers:
+  #   - **`bake-demo-image` matrix + production** (push-to-main only):
+  #     pull from `ghcr.io/cortexapps/engrams/harness-claude:<version>-
+  #     <platform>`. This job publishes that tag on push-to-main and
+  #     skips the push on PRs.
+  #   - **`test-e2e-stack` (every PR + push)**: download the workflow
+  #     artifact this job uploads, re-publish to localhost:5001, point
+  #     the baker at it via `ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO`. The
+  #     catalog override (`engram-image-builder::BuiltinCatalog::
+  #     with_overrides_from_env`) makes the in-baker resolution swap
+  #     transparently — same tag suffix, different repo.
+  #
+  # Why a workflow artifact (not "PR pushes to a per-PR GHCR tag"):
+  # workflow artifacts auto-expire, never write to a shared registry
+  # namespace, and can't accidentally leak a half-baked PR's binary
+  # into a tag prod's bake might pull. The trade-off (one extra
+  # ~30-60 s job per PR) is worth the elimination of all four
+  # failure modes the catch-22 created.
+  # ------------------------------------------------------------------
+  bake-harness-claude-artifact:
+    name: bake harness-claude artifact
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # `packages: write` only used on push-to-main. The PR path
+      # uploads as a workflow artifact and never touches GHCR.
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+          target: x86_64-unknown-linux-musl
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+
+      - name: Install musl-tools
+        run: sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Shares with bake-demo-image matrix (same musl + host
+          # release deps) so the second job warms instantly off the
+          # first's deps.
+          shared-key: release-musl-bake
+
+      - name: Build engram-harness-claude (musl) + engram-publish-builtin-harness (host)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p engram-harness-claude
+          cargo build --release -p engram-publish-builtin-harness
+
+      - name: Download Claude Code CLI (Linux x64)
+        id: claude_cli
+        run: |
+          CLAUDE_VERSION=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)
+          curl -fsSL --retry 3 \
+            "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
+            -o /tmp/claude
+          chmod +x /tmp/claude
+          /tmp/claude --version || true
+          echo "version=$CLAUDE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Stage harness artifact contents
+        id: stage
+        env:
+          CLAUDE_VERSION: ${{ steps.claude_cli.outputs.version }}
+        run: |
+          # Stage into a known, repo-relative path so upload-artifact
+          # has a stable input. The staged directory IS the contents
+          # of /opt/engram/harness/ the baker will extract on the
+          # image side: entry binary at `harness`, bundled `claude`
+          # CLI alongside, and an `artifact.toml` descriptor.
+          STAGE="$PWD/var/harness-claude-stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
+          cp -p /tmp/claude "$STAGE/claude"
+          cat > "$STAGE/artifact.toml" <<EOF
+          name = "claude"
+          version = "${HARNESS_VERSION}"
+          entry = "harness"
+          description = "Anthropic Claude Code, bundled with engram-harness-claude ${HARNESS_VERSION}. Built on top of claude CLI ${CLAUDE_VERSION}."
+          EOF
+          ls -la "$STAGE"
+          echo "dir=$STAGE" >> "$GITHUB_OUTPUT"
+
+      # PR + merge_group: upload as a workflow artifact for downstream
+      # consumers (test-e2e-stack downloads + re-publishes locally).
+      # Always runs so the artifact exists regardless of whether the
+      # GHCR push below ran.
+      - name: Upload staged harness as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-claude-artifact
+          path: ${{ steps.stage.outputs.dir }}
+          # PR-scoped freshness — workflow artifacts auto-expire
+          # after the configured retention (90 d default), so this
+          # never accumulates indefinitely.
+          if-no-files-found: error
+          retention-days: 7
+          # Three files (binary + binary + 200-byte toml); leave
+          # compression default.
+
+      # Push-to-main only: also publish to the production GHCR tag
+      # so downstream bakes (bake-demo-image matrix, prod-side
+      # demo-claude consumers, future ones) see the same artifact.
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push harness-claude artifact to GHCR (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          STAGE: ${{ steps.stage.outputs.dir }}
+          TAG: ghcr.io/${{ github.repository }}/harness-claude:${{ env.HARNESS_VERSION }}-${{ env.HARNESS_PLATFORM }}
+        run: |
+          # ADR 0021 P1.7: `engram-publish-builtin-harness` replaces
+          # the retired `engram-cli harness push`. Same underlying
+          # `engram_oci::OciClient::push_harness` primitive; same
+          # wire shape (one tar.gz layer at our media type). The tag
+          # is the catalog's expected format `<repo>:<version>-
+          # <platform>` — no `:latest` / `:main` / SHA aliases, per
+          # the ADR's "one explicit version, baker records the
+          # digest" rule.
+          ./target/release/engram-publish-builtin-harness \
+            --from "$STAGE" \
+            --to "$TAG"
+          echo "Published $TAG"
+
+      - name: Summarize
+        if: always()
+        env:
+          PUSH_RAN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          echo "## harness-claude bake" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- version: \`${HARNESS_VERSION}-${HARNESS_PLATFORM}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- uploaded as workflow artifact: \`harness-claude-artifact\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$PUSH_RAN" = "true" ]; then
+            echo "- pushed to: \`ghcr.io/${{ github.repository }}/harness-claude:${HARNESS_VERSION}-${HARNESS_PLATFORM}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- GHCR push: skipped (PR / non-main)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # Demo image bake — relocated from
   # engrams-internal/.github/workflows/bake-demo-image.yml so the
   # production demo image and the e2e test image come from one
   # publish path. Push-to-main only (PRs don't need to push; the
-  # e2e lane bakes its own image locally for test isolation). After
-  # this commit lands and one push-to-main produces the OSS-namespace
-  # image, delete bake-demo-image.yml from the engrams-internal repo
-  # and repoint its helm values at ghcr.io/cortexapps/engrams/demo.
+  # e2e lane bakes its own image locally for test isolation).
+  #
+  # Matrix over two variants (ADR 0021):
+  #   - `demo`         — harness-neutral starter image. Sessions
+  #                       default to `SessionMode::Agent` but the image
+  #                       has no `[harness]` block, so `resolve_harness`
+  #                       returns None and the session boots as a
+  #                       dev VM (empty-argv readiness probe). Useful
+  #                       as a base for custom-harness authors who
+  #                       bring their own binary, and for shell-only
+  #                       workloads.
+  #   - `demo-claude`  — same OS + tooling, plus `[harness] builtin
+  #                       = "claude"` in `engram.toml`. The baker
+  #                       pulls `ghcr.io/cortexapps/engrams/harness-
+  #                       claude:<version>-linux-x86_64` (published by
+  #                       the `bake-harness-claude-artifact` job above
+  #                       on push-to-main) and injects it into the
+  #                       rootfs at `/opt/engram/harness/`. Prod
+  #                       deploys point here for the default
+  #                       Claude-backed session.
+  #
+  # Each variant publishes its own image:
+  #   `ghcr.io/cortexapps/engrams/<variant>:warm-<sha>` (plus the
+  #   `:warm-<short>`, `:main`, `:latest` aliases).
   # ------------------------------------------------------------------
   bake-demo-image:
-    name: bake demo image
+    name: bake ${{ matrix.variant }} image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
       contents: read
+      # `packages: write` is needed for the push; `packages: read`
+      # is needed because the `demo-claude` bake pulls the
+      # harness-claude artifact from GHCR. `write` implies `read`.
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [demo, demo-claude]
     steps:
       - uses: actions/checkout@v6
 
@@ -696,7 +913,10 @@ jobs:
           # binaries (engram-cli + others) AND musl-target release
           # agentd. The release+musl dep graph is sizeable and very
           # stable across commits — the shared cache saves ~1-2min
-          # on whichever job runs second.
+          # on whichever job runs second. Both matrix legs share the
+          # same key because their cargo build inputs are identical
+          # (the demo-claude variant differs only in `engram.toml`,
+          # which engram-cli reads at bake time — not a compile input).
           shared-key: release-musl-bake
 
       - name: Build engram-cli + static-musl agentd
@@ -709,11 +929,11 @@ jobs:
           # engram-cli runs on the host to drive the bake + push.
           cargo build --release -p engram-cli
 
-      - name: Stage demo source
+      - name: Stage ${{ matrix.variant }} source
         run: |
-          mkdir -p var/demo
-          cp deploy/demo/Dockerfile  var/demo/
-          cp deploy/demo/engram.toml var/demo/
+          mkdir -p var/${{ matrix.variant }}
+          cp deploy/${{ matrix.variant }}/Dockerfile  var/${{ matrix.variant }}/
+          cp deploy/${{ matrix.variant }}/engram.toml var/${{ matrix.variant }}/
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -726,8 +946,9 @@ jobs:
         id: tags
         env:
           SHA: ${{ github.sha }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          BASE="ghcr.io/${{ github.repository }}/demo"
+          BASE="ghcr.io/${{ github.repository }}/$VARIANT"
           SHORT="${SHA:0:7}"
           # `engram-cli image build --push` pushes to a single URI per
           # call; we push once to the SHA-tagged variant and then
@@ -741,13 +962,15 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Bake + push demo image
+      - name: Bake + push ${{ matrix.variant }} image
         env:
           # engram-cli's tracing subscriber defaults to `warn`. Bump
           # to `info` for the image-builder crate so the bake log
-          # surfaces the chunked-rootfs push progress.
-          RUST_LOG: info,engram_image_builder=info
+          # surfaces the chunked-rootfs push progress AND (for
+          # demo-claude) the harness-artifact pull from GHCR.
+          RUST_LOG: info,engram_image_builder=info,engram_oci=info
           PUSH_URI: ${{ steps.tags.outputs.primary }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           echo "Building + pushing $PUSH_URI"
           # Binary follows the cargo package name (`engram-cli`); the
@@ -760,11 +983,11 @@ jobs:
           # of the chunked rootfs from BlobStorage on enable-image,
           # not by a bake-time memory snapshot.
           ./target/release/engram-cli image build \
-              --repo "${{ github.repository }}/demo" \
+              --repo "${{ github.repository }}/$VARIANT" \
               --tag "warm-${{ github.sha }}" \
-              --source var/demo \
+              --source "var/$VARIANT" \
               --format ext4 \
-              --images-dir var/engram/images \
+              --images-dir "var/engram/images-$VARIANT" \
               --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
               --push "$PUSH_URI"
           echo "Pushed: $PUSH_URI"
@@ -775,8 +998,10 @@ jobs:
           EXTRA_TAGS: ${{ steps.tags.outputs.extra_tags }}
         run: |
           # crane copies tags without re-uploading layers — saves
-          # bandwidth vs `docker pull && tag && push`. Same pattern
-          # bake-harness-claude.yml uses.
+          # bandwidth vs `docker pull && tag && push`. (The harness
+          # bake intentionally doesn't mirror to `:main` / `:latest`
+          # aliases — it sticks to the pinned `<version>-<platform>`
+          # tag per ADR 0021's reproducibility rule.)
           curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
             | sudo tar -xzf - -C /usr/local/bin crane
           crane auth login ghcr.io \
@@ -792,11 +1017,12 @@ jobs:
         if: always()
         env:
           SHA: ${{ github.sha }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          echo "## Demo image bake" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ${VARIANT} image bake" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- engrams SHA: \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- pushed: \`ghcr.io/${{ github.repository }}/demo:warm-$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- pushed: \`ghcr.io/${{ github.repository }}/$VARIANT:warm-$SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------------------
   # Build the release binaries the e2e lane consumes. Separated so the
@@ -843,10 +1069,15 @@ jobs:
 
       - name: Build host binaries (release)
         run: |
+          # `engram-publish-builtin-harness` is added so the
+          # downstream `test-e2e-stack` job can republish the
+          # `harness-claude` workflow artifact into the integration
+          # registry without a separate cargo build (ADR 0021 P0).
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
-              -p engram-cli
+              -p engram-cli \
+              -p engram-publish-builtin-harness
 
       - name: Build musl agentd (release)
         run: |
@@ -861,6 +1092,7 @@ jobs:
             target/release/engram-coordinator
             target/release/engram-host-agent
             target/release/engram-cli
+            target/release/engram-publish-builtin-harness
             target/x86_64-unknown-linux-musl/release/engram-agentd
           retention-days: 1
           if-no-files-found: error
@@ -868,8 +1100,13 @@ jobs:
   # ------------------------------------------------------------------
   # True end-to-end against the prod-shape stack. Brings up postgres
   # + fake-gcs + local registry + real coord + real host-agent + real
-  # Firecracker; bakes the demo image locally; pulls the published
-  # Claude harness pack; runs the three flows in `e2e_stack.rs`.
+  # Firecracker. The `demo-claude` bake pulls its `harness-claude`
+  # artifact from the **local registry** (localhost:5001) which this
+  # lane populates from the workflow artifact uploaded by
+  # `bake-harness-claude-artifact`. The catalog override
+  # (`ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO`) makes the in-baker
+  # resolution swap transparently — same tag suffix, different repo.
+  # Runs the three flows in `e2e_stack.rs`.
   #
   # DAG dep on the cheap gates only (lint, test-linux, web,
   # cross-musl-linux) plus the artifacts producer. `test-firecracker`
@@ -887,16 +1124,26 @@ jobs:
       - web
       - cross-musl-linux
       - artifacts-e2e-stack
+      # ADR 0021 P0: this lane bakes `deploy/demo-claude/`, which
+      # resolves `[harness] builtin = "claude"` through the catalog.
+      # The job below provides the harness artifact as a workflow
+      # artifact (uploaded on every run regardless of branch). The
+      # `Pull harness-claude artifact + republish locally` step
+      # downloads it and points the baker at localhost via
+      # `ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO`, so the in-PR binary is
+      # what gets tested rather than whatever tag GHCR happens to
+      # serve.
+      - bake-harness-claude-artifact
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
-    # `contents: read` for the checkout; `packages: read` so this
-    # job's GITHUB_TOKEN can pull ghcr.io/cortexapps/engrams/
-    # harness-claude:main (and ghcr.io/cortexapps/engrams/demo:main
-    # once that's published). The token is wired through to the
-    # coord's `registry_credentials` table via `engram-cli registry
-    # add` below — host-agent then asks coord per ADR 0013's
-    # HttpAuthResolver path; never writes creds to docker config or
-    # disk.
+    # `contents: read` for the checkout; `packages: read` because the
+    # host-agent (via coord's HttpAuthResolver, ADR 0013) reads sealed
+    # creds from PG seeded by `engram-cli registry add` below — that
+    # path still uses GHCR for the demo image's chunked OCI layers if
+    # the integration test expands. The *baker* never pulls from GHCR
+    # in this lane: the harness artifact comes from a workflow-artifact
+    # download + local re-publish (see "Pull harness-claude artifact"
+    # below), and the catalog override redirects the resolution there.
     permissions:
       contents: read
       packages: read
@@ -1003,9 +1250,9 @@ jobs:
 
       - name: Mark e2e binaries executable
         run: |
-          chmod +x target/release/engram-{coordinator,host-agent,cli}
+          chmod +x target/release/engram-{coordinator,host-agent,cli,publish-builtin-harness}
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,cli} \
+          ls -l target/release/engram-{coordinator,host-agent,cli,publish-builtin-harness} \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
       # integration-up.sh boots: postgres + fake-gcs + registry via
@@ -1048,30 +1295,90 @@ jobs:
               --username "${{ github.actor }}" \
               --password-stdin
 
+      # ADR 0021 P0: pull the harness-claude artifact built by the
+      # upstream `bake-harness-claude-artifact` job, re-publish to
+      # the integration test's local registry (the `registry:2`
+      # container `integration-up.sh` brought up on port 5001), and
+      # let the catalog override route the demo-claude bake to it.
+      #
+      # Why this shape (vs pulling from GHCR):
+      # - Tests THIS PR's harness binary, not whatever tag main
+      #   happened to publish last.
+      # - Closes the catch-22 where a PR that bumps HARNESS_VERSION
+      #   couldn't bake because the new tag didn't exist in GHCR yet.
+      # - Never publishes a PR-built binary to a production-consumed
+      #   GHCR namespace.
+      - name: Pull harness-claude artifact + republish locally
+        env:
+          LOCAL_REPO: localhost:5001/cortexapps/engrams/harness-claude
+        run: |
+          mkdir -p var/harness-claude-stage
+        # ↑ ensure target exists for download-artifact's path: arg.
+
+      - name: Download harness-claude workflow artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-claude-artifact
+          path: var/harness-claude-stage
+
+      - name: Restore +x on staged binaries
+        run: |
+          # actions/upload-artifact@v4 zips the staged directory and
+          # actions/download-artifact@v4 unzips it — the ZIP format
+          # only carries Unix mode bits as a non-standard extension
+          # that some unzip implementations drop. Without this, the
+          # baker happily packs the harness into the rootfs as
+          # mode 0644, FC boots fine, and agentd's `SpawnHarness`
+          # blows up with `Permission denied (os error 13)` when it
+          # tries to exec /opt/engram/harness/harness.
+          #
+          # Belt-and-braces fix: re-set +x on both binaries before
+          # we hand the staged dir to `engram-publish-builtin-harness`.
+          # The artifact.toml descriptor stays at the default 0644.
+          chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
+          ls -la var/harness-claude-stage/
+
+      - name: Republish harness-claude to local registry + export catalog override
+        env:
+          LOCAL_REPO: localhost:5001/cortexapps/engrams/harness-claude
+        run: |
+          TAG="${LOCAL_REPO}:${HARNESS_VERSION}-${HARNESS_PLATFORM}"
+          echo "Republishing harness-claude to $TAG"
+          # `engram-publish-builtin-harness` was downloaded with the
+          # other e2e binaries in the Download e2e binaries step
+          # above.
+          ./target/release/engram-publish-builtin-harness \
+            --from var/harness-claude-stage \
+            --to "$TAG"
+          # Catalog override: the in-baker
+          # `engram-image-builder::BuiltinCatalog::with_overrides_from_env`
+          # picks this up and redirects `[harness] builtin = "claude"`
+          # resolution to the local registry. Exported via $GITHUB_ENV
+          # so subsequent steps (the bake) inherit it.
+          echo "ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}" >> "$GITHUB_ENV"
+          echo "Catalog override set: ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}"
+
       - name: Bake demo image + capture URI
         run: |
           IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
           echo "    baked image: $IMAGE_URI"
           echo "ENGRAM_E2E_IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
 
-      - name: Register Claude harness pack (prod image)
-        run: |
-          # Pulls ghcr.io/cortexapps/engrams/harness-claude:main —
-          # published by bake-harness-claude.yml on every push to main.
-          # The host-agent's prefetch supervisor pulls it on first
-          # session use (a few seconds; cached on the runner for
-          # subsequent tests).
-          ./target/release/engram-cli \
-              --endpoint http://localhost:8090 \
-              harness add \
-              --name claude \
-              --registry-uri ghcr.io/cortexapps/engrams/harness-claude:main
+      # ADR 0021 P1.5 retired `engram-cli harness add` and the
+      # entire `harness_packs` registry. The Claude harness now
+      # rides inside the baked image at /opt/engram/harness/ — the
+      # `integration-bake-demo.sh` step above baked `demo-claude/`
+      # which pulls the published harness-claude artifact from GHCR
+      # at bake time and injects it into the rootfs. No separate
+      # registration step is needed; the harness contract lives in
+      # `manifest.toml` and coord reads it from there.
 
       - name: Run e2e_stack tests
         env:
           ENGRAM_E2E_COORD_URL: http://127.0.0.1:8090
-          ENGRAM_E2E_HARNESS_NAME: claude
-          # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step.
+          # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
+          # points at the just-baked `demo-claude` image whose
+          # manifest.toml carries the resolved Claude harness contract.
         run: |
           cargo nextest run \
               -p engram-coordinator \

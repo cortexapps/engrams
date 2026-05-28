@@ -5,7 +5,7 @@ use crate::types::event::PersistedEvent;
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
-use crate::types::registry::{EnabledImage, HarnessPack, RegistryCredential, SessionSecrets};
+use crate::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
 use crate::types::session::{Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
 
@@ -394,12 +394,10 @@ pub trait MetadataStore: Send + Sync {
 
     async fn delete_registry_credential(&self, registry_host: &str) -> Result<(), MetaError>;
 
-    // ---- harness packs (Phase 5) ----
-
-    async fn upsert_harness_pack(&self, pack: HarnessPack) -> Result<(), MetaError>;
-    async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError>;
-    async fn get_harness_pack(&self, name: &str) -> Result<Option<HarnessPack>, MetaError>;
-    async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError>;
+    // ADR 0021 P1.5a retired the harness-pack registry methods that
+    // used to live here. The harness is an image property baked at
+    // image-bake time now; there's no deployment-wide table for the
+    // MetadataStore to vend.
 
     // ---- enabled images (Phase 5b) ----
     //

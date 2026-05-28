@@ -350,26 +350,7 @@ mod tests {
         async fn delete_registry_credential(&self, _host: &str) -> Result<(), MetaError> {
             Ok(())
         }
-        async fn upsert_harness_pack(
-            &self,
-            _pack: engram_core::types::HarnessPack,
-        ) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn list_harness_packs(
-            &self,
-        ) -> Result<Vec<engram_core::types::HarnessPack>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn get_harness_pack(
-            &self,
-            _name: &str,
-        ) -> Result<Option<engram_core::types::HarnessPack>, MetaError> {
-            Ok(None)
-        }
-        async fn delete_harness_pack(&self, _name: &str) -> Result<(), MetaError> {
-            Ok(())
-        }
+        // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
         async fn upsert_enabled_image(
             &self,
             _image: engram_core::types::EnabledImage,

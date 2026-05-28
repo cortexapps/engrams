@@ -37,9 +37,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
-use engram_image_builder::{
-    AgentInjection, BuildRequest, Builder, DockerCli, Ext4Packer, Format, Mke2fsPacker, Transport,
-};
+use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
@@ -281,16 +279,10 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         .await
         .expect("ext4 bake");
 
-    // ---- 4. Build a substrate carrying the engram CA ----
-    let substrate_src = tempfile::tempdir().expect("substrate src");
-    let host_meta = substrate_src.path().join(".engram-host");
-    std::fs::create_dir_all(&host_meta).unwrap();
-    std::fs::write(host_meta.join("ca.pem"), &ca.cert_pem).unwrap();
-    let substrate_path = images.path().join("harness-substrate.img");
-    Mke2fsPacker::default()
-        .pack(substrate_src.path(), &substrate_path, 16 * 1024 * 1024)
-        .await
-        .expect("pack substrate");
+    // ADR 0021 P1.5: no substrate to build — the egress CA reaches
+    // the guest via `AgentSpec.host_ca_pem`, which triggers an
+    // `InstallHostCa` vsock RPC right before `SpawnHarness` (see the
+    // `start_agent` call below).
 
     // ---- 5. Set up FC backend with networking + proxy redirect ----
     let work = tempfile::tempdir().expect("work");
@@ -307,14 +299,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         image: "engram-proxy-e2e".into(),
         rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: Some(substrate_path),
         network: Default::default(),
     };
     let sandbox_id = backend.create(spec).await.expect("create");
@@ -364,12 +354,19 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     // SpawnHarnessRequest` skips the spawn when argv is empty) —
     // we don't actually want a harness child for this test, just
     // the proof that agentd is bound.
+    //
+    // ADR 0021 P1.1+P1.2: `host_ca_pem` triggers `InstallHostCa`
+    // over vsock right after agentd readiness and before the
+    // (no-op) SpawnHarness — the in-VM trust store now carries
+    // the egress proxy's CA, which is what previously rode in on
+    // the (retired) harness substrate.
     backend
         .start_agent(
             sandbox_id,
             AgentSpec {
                 argv: Vec::new(),
                 env: HashMap::new(),
+                host_ca_pem: Some(ca.cert_pem.clone()),
             },
         )
         .await

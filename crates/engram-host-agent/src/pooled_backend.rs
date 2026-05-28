@@ -1272,29 +1272,9 @@ async fn patch_fc_manifest_memory_ref(
 /// Pick a stable name for the harness substrate's mount-root
 /// subdirectory. Tries: (1) the env-injected
 /// `ENGRAM_SESSION_HARNESS_NAME` hint set by `resolve_harness` —
-/// the canonical name sessions select by; (2) the last path segment
-/// of the registry URI (drops `:tag`) — robust fallback for paths
-/// the coordinator hasn't annotated. The returned string lands in
-/// `/run/engram/harnesses/<name>/harness` inside the VM, so it must
-/// match what bootstrap exec's against — the env hint guarantees
-/// alignment, the URI fallback is best-effort.
-fn harness_name_for_substrate(spec: &SandboxSpec, uri: &str) -> String {
-    if let Some(name) = spec.env.get("ENGRAM_SESSION_HARNESS_NAME") {
-        return name.clone();
-    }
-    harness_name_from_uri(uri)
-}
-
-/// ADR 0014 M1.12: spec-less variant for the warm-lease path. The
-/// warm-pool slot doesn't carry an `ENGRAM_SESSION_HARNESS_NAME` env
-/// hint (it's per-session, not per-template), so the URI's last
-/// path segment is the only signal. Same fallback the cold path
-/// uses when the env hint is missing.
-pub fn harness_name_from_uri(uri: &str) -> String {
-    let last = uri.rsplit('/').next().unwrap_or(uri);
-    let no_tag = last.split(':').next().unwrap_or(last);
-    no_tag.to_string()
-}
+// ADR 0021 P1.5: `harness_name_for_substrate` / `harness_name_from_uri`
+// retired with the substrate. The in-VM harness path comes from the
+// image manifest's `[harness] exec` now, not a URI suffix.
 
 #[async_trait]
 impl SandboxBackend for PooledBackend {
@@ -1349,38 +1329,9 @@ impl SandboxBackend for PooledBackend {
                         pending_nbd_state = _state;
                     }
                 }
-                if let Some(uri) = spec.harness_pack_uri.clone() {
-                    // Backends that attach the substrate as a virtio-blk
-                    // device (FC, VZ block-device mode) need a real ext4
-                    // file at `harness_substrate`. ProcessBackend is
-                    // fine with a directory but accepts an ext4 path
-                    // too. We resolve the harness name from the spec's
-                    // existing `engram_session_harness_name` env hint
-                    // when present, falling back to the URI's last path
-                    // segment. This keeps the in-VM `/run/engram/
-                    // harnesses/<name>/harness` invariant intact.
-                    let name = harness_name_for_substrate(&spec, &uri);
-                    // ADR 0006: when a local egress proxy is attached,
-                    // stamp its CA cert into the substrate so the guest
-                    // trust store accepts MITM leaves.
-                    let host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.as_str());
-                    let t = std::time::Instant::now();
-                    let cached = cache
-                        .ensure_harness_ext4(&uri, &name, host_ca_pem)
-                        .await
-                        .map_err(|e| {
-                            SandboxError::InvalidSpec(format!("harness cache pull {uri}: {e}"))
-                        })?;
-                    image_resolve += t.elapsed();
-                    tracing::debug!(
-                        uri = %uri,
-                        name = %name,
-                        digest = %cached.digest,
-                        ext4 = %cached.ext4_path.display(),
-                        "harness substrate built"
-                    );
-                    spec.harness_substrate = Some(cached.ext4_path);
-                }
+                // ADR 0021 P1.5: no harness substrate to build —
+                // the harness binary travels in the rootfs at the
+                // manifest-declared `[harness] exec` path.
             }
 
             // `fc_boot` is emitted by the inner FC backend itself
@@ -1477,6 +1428,39 @@ impl SandboxBackend for PooledBackend {
                      proceeding with fresh attempt anyway",
                 );
             }
+        }
+
+        // ADR 0021 P1.6 follow-up: gate snapshot on agentd readiness.
+        //
+        // The pre-flush pause below freezes vCPUs. If the guest is still
+        // in early boot (kernel → engram-init → agentd start) at that
+        // moment, the snapshot captures a half-initialised kernel — in
+        // particular, agentd may not have completed `bind(AF_VSOCK)` —
+        // and the resumed kernel comes up with a half-initialised vsock
+        // driver. `panic=1 reboot=k` then trips `KVM_EXIT_SHUTDOWN`
+        // ~1 s after `load_snapshot` returns; every subsequent
+        // host→guest dial fails ECONNREFUSED.
+        //
+        // Reachable in prod via:
+        //   1. SIGTERM-during-cold-boot. `shutdown.rs` checkpoints all
+        //      sandboxes from `backend.list()` after a 5 s drain — a
+        //      sandbox still booting at SIGTERM gets snapshotted mid-
+        //      bind without this gate.
+        //   2. coord-driven `snapshot(id)` fired quickly after create
+        //      (any fast-rebake / probe path).
+        //
+        // `wait_agent_ready` blocks until agentd has dialled the host's
+        // ready port (port 1027) — proving the guest's vsock stack is
+        // operational end-to-end. On warm-restored sandboxes the watch
+        // is pre-set true (FC's `restore_in_jail`), so this is a no-op
+        // for warm re-snapshot paths. The FC backend is the only one
+        // with the per-sandbox agent_ready watch; non-FC backends
+        // (Process, future) return `InvalidSpec` from the default trait
+        // impl, which we treat as "no readiness concept here, proceed."
+        match self.inner.wait_agent_ready(id).await {
+            Ok(()) => {}
+            Err(SandboxError::InvalidSpec(_)) => {}
+            Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
 
         // ADR 0018 commit 12m: snapshot ordering is now
@@ -1936,7 +1920,18 @@ impl SandboxBackend for PooledBackend {
         result
     }
 
-    async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
+    async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
+        // ADR 0021 P1.2: only the host-agent knows the per-host egress-
+        // proxy CA, so it stamps the PEM onto the AgentSpec right
+        // before the backend sees it. The FC backend uses this in its
+        // `InstallHostCa` round-trip to agentd (post-readiness,
+        // pre-SpawnHarness). Coord-supplied specs always arrive with
+        // `host_ca_pem = None`; the host-agent fills it in here. The
+        // legacy drive-based delivery still runs in parallel until
+        // P1.5 retires the harness drive.
+        if agent.host_ca_pem.is_none() {
+            agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
+        }
         let result = self.inner.start_agent(id, agent).await;
         // ADR 0019: agent_ready has fired (or failed) — close the cold-boot
         // operation window so steady-state session I/O falls back to
@@ -1951,23 +1946,11 @@ impl SandboxBackend for PooledBackend {
     #[tracing::instrument(name = "host.build_base_snapshot", skip_all)]
     async fn build_base_snapshot(
         &self,
-        mut spec: SandboxSpec,
+        spec: SandboxSpec,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        // ADR 0020 P1. Attach the host-local stub harness so the captured
-        // snapshot carries a harness drive slot that `swap_harness_drive`
-        // re-points per session at restore (the option-D mechanism). We
-        // want a *stub*, not a session harness, so clear `harness_pack_uri`
-        // — that keeps `create`'s harness-cache-resolve branch from
-        // overwriting `harness_substrate` with a real pack.
-        let stub = self.inner.stub_harness_path().ok_or_else(|| {
-            SandboxError::InvalidSpec(
-                "base-snapshot capture needs a stub harness ext4 \
-                 (set ENGRAM_STUB_HARNESS_PATH on the host)"
-                    .into(),
-            )
-        })?;
-        spec.harness_pack_uri = None;
-        spec.harness_substrate = Some(stub);
+        // ADR 0021 P1.5: no stub-harness attach — the harness lives
+        // in the rootfs of the image being captured, so the snapshot
+        // is already complete without any second virtio-blk drive.
 
         // Boot the capture VM (opens the cold_boot operation scope on Linux).
         let id = self.create(spec).await?;
@@ -2008,13 +1991,11 @@ impl SandboxBackend for PooledBackend {
     async fn restore_base_for_session(
         &self,
         metadata: SnapshotMetadata,
-        harness_pack_uri: Option<String>,
-        harness_name: Option<String>,
         session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
-        //    stub harness at /dev/vdb, bootstrap parked on accept().
+        //    harness baked into the rootfs at /opt/engram/harness/.
         let id = self.restore(metadata).await?;
 
         // Inject the per-session env (manifest env + secrets + session
@@ -2024,46 +2005,14 @@ impl SandboxBackend for PooledBackend {
             self.inner.merge_session_env(id, session_env).await?;
         }
 
-        // 2. Late-bind the session harness (option D). For a real
-        //    harness, materialize its ext4 in the image cache and swap
-        //    the stub drive for it (pause → patch_drive → resume, with
-        //    virtio-blk cache invalidation handled by swap_harness_drive).
-        //    For a no-harness session there's nothing to bind — the stub
-        //    stays and start_agent skips SpawnHarness.
-        if let (Some(uri), Some(name)) = (harness_pack_uri, harness_name) {
-            let Some(cache) = self.image_cache.as_ref() else {
-                return Err(SandboxError::InvalidSpec(
-                    "restore_base_for_session needs an image cache to materialize the session harness"
-                        .into(),
-                ));
-            };
-            // ADR 0006: stamp the host egress CA into the substrate so
-            // the guest trust store accepts the MITM proxy's leaves.
-            let host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.as_str());
-            let cached = cache
-                .ensure_harness_ext4(&uri, &name, host_ca_pem)
-                .await
-                .map_err(|e| {
-                    SandboxError::InvalidSpec(format!(
-                        "materialize session harness {uri} for base restore: {e}"
-                    ))
-                })?;
-            self.inner.swap_harness_drive(id, cached.ext4_path).await?;
-        }
+        // ADR 0021 P1.5: option-D substrate swap retired. The harness
+        // travels in the rootfs (manifest `[harness] exec`); there's
+        // no per-session harness file to materialize or swap.
         Ok(id)
     }
 
-    async fn swap_harness_drive(
-        &self,
-        id: SandboxId,
-        new_path: std::path::PathBuf,
-    ) -> Result<(), SandboxError> {
-        // ADR 0014 M1.12: PooledBackend is a thin wrapper — forward to
-        // the inner backend (FC implements; VZ/Process default to
-        // unimplemented). Without this override the trait default
-        // returns "option D is FC-only" even when we *are* FC.
-        self.inner.swap_harness_drive(id, new_path).await
-    }
+    // ADR 0021 P1.5: `swap_harness_drive` wrapper retired with the
+    // trait method.
 
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         self.inner.set_harness_sink(sink);
@@ -2502,14 +2451,12 @@ mod tests {
             image: image.into(),
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         }
     }
@@ -3517,14 +3464,12 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: Some("test:1".into()),
-            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         };
         spec.image_uri = Some("test:1".into());

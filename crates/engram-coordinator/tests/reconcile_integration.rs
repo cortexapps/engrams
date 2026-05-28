@@ -26,7 +26,7 @@ use engram_coordinator::state::SessionEventBus;
 use engram_coordinator::HostRegistry;
 use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
-use engram_core::types::session::HarnessSpec;
+use engram_core::types::session::SessionMode;
 use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
@@ -61,7 +61,7 @@ impl ReconcileMeta {
                 host_id: Some(host),
                 sandbox_id: Some(sandbox),
                 image: "localhost:5001/demo:test".into(),
-                harness: HarnessSpec::None,
+                mode: SessionMode::Agent,
                 created_at: now,
                 last_active_at: now,
                 live_disk_manifest: None,
@@ -275,24 +275,7 @@ impl MetadataStore for ReconcileMeta {
     async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn upsert_harness_pack(
-        &self,
-        _: engram_core::types::HarnessPack,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_harness_packs(&self) -> Result<Vec<engram_core::types::HarnessPack>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn get_harness_pack(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::HarnessPack>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
+    // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
     async fn upsert_enabled_image(
         &self,
         _: engram_core::types::EnabledImage,

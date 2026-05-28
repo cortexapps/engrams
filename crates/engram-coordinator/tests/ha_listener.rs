@@ -51,7 +51,7 @@ async fn cross_replica_event_fan_out() {
     let session_id = meta
         .create_session(SessionSpec {
             image: "ha-listener-test:warm-test".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -186,7 +186,7 @@ async fn append_session_event_fires_pg_notify() {
     let session_id = store
         .create_session(SessionSpec {
             image: "ha-notify-test:warm-test".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await

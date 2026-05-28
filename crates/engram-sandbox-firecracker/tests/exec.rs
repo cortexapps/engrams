@@ -33,16 +33,19 @@ use common::drain;
 /// agent's `main.rs`.
 async fn spawn_test_agent(socket: PathBuf) -> JoinHandle<()> {
     let listener = UnixListener::bind(&socket).expect("bind UDS");
-    // One supervisor across all accepted connections — mirrors the
-    // real agent's main.rs shape.
+    // One supervisor + one CA-cert installer across all accepted
+    // connections — mirrors the real agent's main.rs shape (ADR
+    // 0021 P1.1 added the cacerts installer arg).
     let supervisor = HarnessSupervisor::new();
+    let cacerts = std::sync::Arc::new(engram_agentd::CaCertInstaller::for_tests());
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let sup = supervisor.clone();
+                    let ca = cacerts.clone();
                     tokio::spawn(async move {
-                        let _ = serve_connection(stream, None, sup).await;
+                        let _ = serve_connection(stream, None, sup, ca).await;
                     });
                 }
                 Err(_) => return,

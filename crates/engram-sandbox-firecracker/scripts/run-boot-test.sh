@@ -26,10 +26,11 @@ cargo build \
   --release
 
 case "${1:-all}" in
-  boot|lifecycle|snapshot|snapshot_uffd|cold_tier|exec_real_vm|harness_loopback|snapshot_net|host_startup|proxy_e2e)
-    # snapshot_net + proxy_e2e + host_startup need root for TAP/iptables.
-    # Detect and re-exec via sudo when not already root.
-    if [ "$1" = "proxy_e2e" ] || [ "$1" = "host_startup" ] || [ "$1" = "snapshot_net" ]; then
+  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e)
+    # Root-required tests: snapshot_net + host_startup + proxy_e2e
+    # all use real TAP / iptables / netns. Detect and re-exec via
+    # sudo when not already root.
+    if [ "$1" = "host_startup" ] || [ "$1" = "snapshot_net" ] || [ "$1" = "proxy_e2e" ]; then
       if [ "$(id -u)" -ne 0 ]; then
         exec sudo -E env "PATH=$PATH" cargo test -p engram-sandbox-firecracker --test "$1" -- --ignored --nocapture --test-threads=1
       fi
@@ -37,16 +38,22 @@ case "${1:-all}" in
     exec cargo test -p engram-sandbox-firecracker --test "$1" -- --ignored --nocapture
     ;;
   all)
-    cargo test -p engram-sandbox-firecracker --test boot              -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test lifecycle         -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test snapshot          -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test snapshot_uffd     -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test cold_tier         -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test exec_real_vm      -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test harness_loopback  -- --ignored --nocapture
+    # Mirrors ci.yml's unprivileged FC test list. The root-required
+    # tests (proxy_e2e, snapshot_net, host_startup, etc.) run via
+    # the dedicated CI step or by invoking the script with the
+    # specific test name + sudo.
+    cargo test -p engram-sandbox-firecracker --test boot                   -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test lifecycle              -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test snapshot               -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test snapshot_uffd          -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test exec_real_vm           -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test baked_harness_loopback -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test multi_restore          -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test cross_host_restore     -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test restore_chain          -- --ignored --nocapture
     ;;
   *)
-    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|cold_tier|exec_real_vm|harness_loopback|snapshot_net|host_startup|proxy_e2e|all]" >&2
+    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|all]" >&2
     exit 2
     ;;
 esac

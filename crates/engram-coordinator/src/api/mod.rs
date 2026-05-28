@@ -9,7 +9,9 @@ pub mod auth;
 mod enabled_images;
 mod events;
 mod exec;
-mod harnesses;
+// ADR 0021 P1.5a retired `mod harnesses;` — the harness_packs
+// registry doesn't exist anymore (the harness is an image property
+// baked at image-bake time).
 mod health;
 mod host_http;
 mod hosts;
@@ -78,11 +80,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/hosts/:id/drain", post(hosts::drain))
         // ADR 0016 Phase A: per-host COW diagnostic.
         .route("/api/hosts/:id/cow-state", get(hosts::cow_state))
-        .route(
-            "/api/harnesses",
-            get(harnesses::list_harnesses).post(harnesses::add_harness),
-        )
-        .route("/api/harnesses/:name", delete(harnesses::delete_harness))
+        // ADR 0021 P1.5a retired `/api/harnesses` — see migration
+        // 0040 + the deleted `mod harnesses` above.
         .route(
             "/api/registries",
             get(registries::list_registries).post(registries::add_registry),

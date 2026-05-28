@@ -415,14 +415,12 @@ impl SandboxBackend for ProcessBackend {
                     image: metadata.image_version.clone(),
                     rootfs_source: None,
                     image_uri: None,
-                    harness_pack_uri: None,
                     cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
                     memory: engram_core::types::sandbox::MemoryLimit { max_mib: 0 },
                     disk: engram_core::types::sandbox::DiskLimit { max_gib: 0 },
                     ttl: None,
                     env: HashMap::new(),
                     workdir: None,
-                    harness_substrate: None,
                     network: Default::default(),
                 };
                 self.sandboxes.insert(id, SandboxState { spec, cwd });
@@ -460,14 +458,12 @@ impl SandboxBackend for ProcessBackend {
             image: manifest.image_version,
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 0 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 0 },
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
@@ -680,14 +676,12 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 256 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
             ttl: None,
             env: HashMap::new(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         }
     }
@@ -863,6 +857,7 @@ mod tests {
                 format!("echo $$ > {pid_file}; exec sleep 60"),
             ],
             env: HashMap::new(),
+            host_ca_pem: None,
         };
         b.start_agent(id, agent).await.unwrap();
 

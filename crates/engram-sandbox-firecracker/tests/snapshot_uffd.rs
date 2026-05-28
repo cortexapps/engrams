@@ -80,14 +80,12 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         image: "fc-uffd-test".into(),
         rootfs_source: Some(local_rootfs),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: None,
         network: Default::default(),
     };
 

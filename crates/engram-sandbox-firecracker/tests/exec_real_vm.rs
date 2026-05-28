@@ -124,7 +124,6 @@ async fn exec_runs_inside_baked_microvm() {
         image: "engram-agent-vm-test".into(),
         rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         // 256 MiB: enough for debian-slim's kernel-mounted FS + the
         // agent. Smaller VMs OOM in early boot.
@@ -133,7 +132,6 @@ async fn exec_runs_inside_baked_microvm() {
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: None,
         network: Default::default(),
     };
     let sandbox_id = backend.create(spec).await.expect("create");

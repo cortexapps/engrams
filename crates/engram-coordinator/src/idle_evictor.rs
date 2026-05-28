@@ -482,7 +482,7 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::HarnessSpec;
+    use engram_core::types::session::SessionMode;
     use engram_core::types::{Session, SessionState};
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
@@ -540,14 +540,12 @@ mod tests {
             image: "evict-test".into(),
             rootfs_source: None,
             image_uri: None,
-            harness_pack_uri: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
             ttl: None,
             env: Default::default(),
             workdir: None,
-            harness_substrate: None,
             network: Default::default(),
         }
     }
@@ -565,7 +563,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -764,7 +762,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -972,7 +970,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -1077,7 +1075,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:reentry".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -1307,7 +1305,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:reorder".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -1422,7 +1420,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:reap".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -1513,7 +1511,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:evict-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,

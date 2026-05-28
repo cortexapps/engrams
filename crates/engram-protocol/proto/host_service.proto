@@ -170,8 +170,9 @@ message RestoreRequest {
 }
 message BuildBaseSnapshotRequest {
   // bincode-encoded `engram_core::types::sandbox::SandboxSpec` — the
-  // image to boot + capture. The host substitutes its local stub
-  // harness for the harness drive; harness_pack_uri is ignored.
+  // image to boot + capture. ADR 0021 P1.5: the image's `[harness]`
+  // block now lives in the rootfs, so the snapshot captures it
+  // directly — no separate stub-harness drive to swap.
   bytes spec_bincode = 1;
 }
 message BuildBaseSnapshotResponse {
@@ -182,10 +183,13 @@ message RestoreBaseForSessionRequest {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`
   // for the per-image base snapshot.
   bytes metadata_bincode = 1;
-  // The session's resolved harness pack OCI URI + canonical name.
-  // Absent for no-harness sessions (the stub harness stays attached).
-  optional string harness_pack_uri = 2;
-  optional string harness_name = 3;
+  // ADR 0021 P1.7 retired `harness_pack_uri` (field 2) +
+  // `harness_name` (field 3). The harness travels in the rootfs now;
+  // the host doesn't need a per-session name/URI to swap-in. Field
+  // numbers stay reserved so a future field doesn't accidentally
+  // collide with old wire payloads.
+  reserved 2, 3;
+  reserved "harness_pack_uri", "harness_name";
   // ADR 0020: per-session env (manifest env + resolved secrets +
   // ENGRAM_SESSION_*) merged into the restored sandbox — the shared base
   // snapshot can't carry per-session values.

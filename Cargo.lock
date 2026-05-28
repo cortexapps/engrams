@@ -1205,6 +1205,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-publish-builtin-harness"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "engram-oci",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "engram-sandbox-firecracker"
 version = "0.1.0"
 dependencies = [

@@ -45,9 +45,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::shell::{ShellFrame, ShellTunnel};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{
-    AgentInjection, BuildRequest, Builder, DockerCli, Ext4Packer, Format, Mke2fsPacker, Transport,
-};
+use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::{sleep, timeout};
 
@@ -154,7 +152,7 @@ fn cleanup_host_state() {
 /// — every InRelease fetch timed out after 40s). So we do all the
 /// network work HOST-side (download ttyd via `curl`) and use only
 /// `COPY` inside Docker, which doesn't need DNS.
-async fn bake_shell_rootfs(repo: &str) -> (PathBuf, PathBuf) {
+async fn bake_shell_rootfs(repo: &str) -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let agent_bin = target_root
@@ -249,16 +247,12 @@ async fn bake_shell_rootfs(repo: &str) -> (PathBuf, PathBuf) {
         .await
         .expect("bake ext4");
 
-    // Build an empty substrate (the bake's init still mounts it,
-    // but the test doesn't need any harness files in it).
-    let substrate_src = tempfile::tempdir().expect("substrate src");
-    let substrate_path = images_dir_path.join("harness-substrate.img");
-    Mke2fsPacker::default()
-        .pack(substrate_src.path(), &substrate_path, 16 * 1024 * 1024)
-        .await
-        .expect("pack substrate");
+    // ADR 0021 P1.5: no harness substrate — this test doesn't drive
+    // a harness anyway (it's about the SHELL tab + ttyd / proxy
+    // chain), and the substrate retired with option-D.
+    let _ = images_dir_path; // silence unused-binding if no other use lands
 
-    (outcome.rootfs_path, substrate_path)
+    outcome.rootfs_path
 }
 
 /// Wait up to `deadline` for `pooled.guest_ip(id)` to return Some.
@@ -458,7 +452,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
     cleanup_host_state();
 
     // ---- 1. Bake a real rootfs with ttyd + agentd ----
-    let (rootfs_path, substrate_path) = bake_shell_rootfs("engram-e2e-shell-cold").await;
+    let rootfs_path = bake_shell_rootfs("engram-e2e-shell-cold").await;
 
     // ---- 2. Wrap FC in PooledBackend (exactly as host-agent does) ----
     let work = tempfile::tempdir().expect("work");
@@ -473,14 +467,12 @@ async fn e2e_shell_cold_via_pooled_backend() {
         image: "engram-e2e-shell-cold".into(),
         rootfs_source: Some(rootfs_path),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: Some(substrate_path),
         network: Default::default(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
@@ -515,7 +507,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
     }
     cleanup_host_state();
 
-    let (rootfs_path, substrate_path) = bake_shell_rootfs("engram-e2e-shell-warm").await;
+    let rootfs_path = bake_shell_rootfs("engram-e2e-shell-warm").await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -528,14 +520,12 @@ async fn e2e_shell_warm_via_pooled_backend() {
         image: "engram-e2e-shell-warm".into(),
         rootfs_source: Some(rootfs_path),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: Some(substrate_path),
         network: Default::default(),
     };
 

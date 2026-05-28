@@ -57,13 +57,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RegistryCmd,
     },
-    /// Manage harness packs registered with the coordinator. Pack
-    /// bytes live in a Docker registry; this surface manages the
-    /// `(name, registry_uri)` index that sessions select by.
-    Harness {
-        #[command(subcommand)]
-        cmd: HarnessCmd,
-    },
+    // ADR 0021 P1.5a/P1.7 retired the `Harness` subcommand entirely.
+    // Built-in harness publish moved to the `engram-publish-builtin-
+    // harness` crate (CI-only); the `/api/harnesses` registry was
+    // deleted with the rest of the standalone subsystem.
     /// Admin operations — explicit triggers for primitives whose
     /// production driver is implicit (disk-pressure detector etc.).
     /// Auth-gated behind the same bearer token as the rest of the
@@ -101,14 +98,17 @@ enum SessionCmd {
         /// Example: `--image ghcr.io/cortex/api:warm-2026-04`
         #[arg(long)]
         image: String,
-        /// Which baked-in harness to attach. `none` (default) boots
-        /// the VM with no agent; otherwise the value is the manifest
-        /// `[[harness]] name = ...` to attach (e.g. `claude`, `noop`).
-        #[arg(long, default_value = "none")]
-        harness: String,
-        /// Initial prompt for the agent. Only meaningful when
-        /// `--harness` is not `none`; the API rejects with 400 if a
-        /// prompt is supplied alongside `--harness none`.
+        /// Boot the image as a pure dev VM — leave the baked harness
+        /// (if any) resident-but-undriven. Default is to drive the
+        /// image's harness (ADR 0021 P1.3 replaced the per-session
+        /// harness selection: which harness an image runs is now an
+        /// image property).
+        #[arg(long, default_value_t = false)]
+        dev_vm: bool,
+        /// Initial prompt for the agent. Only meaningful in the
+        /// default (agent) mode against an image that has a baked
+        /// harness; the API rejects with 400 if a prompt is supplied
+        /// alongside `--dev-vm`.
         #[arg(long)]
         prompt: Option<String>,
         /// Free-form user identifier surfaced on the row.
@@ -216,50 +216,10 @@ enum RegistryCmd {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum HarnessCmd {
-    /// Tar+gzip a local pack directory and push it as an OCI artifact
-    /// to the registry. Pure registry-side work — no Postgres write,
-    /// no coordinator API call. Symmetric with `engram image build
-    /// --push`. After the push, register the pack with the
-    /// coordinator via `engram harness add` (or the dashboard's
-    /// Settings → Harnesses panel).
-    Push {
-        /// Local directory containing the pack: at least an
-        /// executable `harness` entry-point, plus any sidecars the
-        /// wrapper exec's at runtime (bundled CLI binaries, etc.).
-        #[arg(long)]
-        from: PathBuf,
-        /// Destination OCI URI, e.g.
-        /// `localhost:5001/cortex/harness-claude:v1` or
-        /// `gcr.io/cortex/harness-claude:v1.2`.
-        #[arg(long)]
-        to: String,
-    },
-    /// Register an already-pushed harness pack with the coordinator.
-    /// POSTs to `/api/harnesses`; this is the only path that writes a
-    /// `harness_packs` row.
-    ///
-    /// Re-registering the same name updates the URI in place.
-    Add {
-        /// Logical harness name sessions select by (e.g. `claude`,
-        /// `noop`). Must be unique.
-        #[arg(long)]
-        name: String,
-        /// Already-pushed OCI URI, e.g. `gcr.io/cortex/harness-claude:v1.2`.
-        #[arg(long)]
-        registry_uri: String,
-        /// Optional one-line description for the dashboard dropdown.
-        #[arg(long)]
-        description: Option<String>,
-    },
-    /// List registered harness packs.
-    List,
-    /// Remove a harness-pack registration. Does not delete the
-    /// artifact in the registry — only un-registers it from the
-    /// coordinator.
-    Rm { name: String },
-}
+// ADR 0021 P1.7 retired `HarnessCmd` entirely. The built-in harness
+// publish primitive lives in `crates/engram-publish-builtin-harness`
+// (CI-only); user-facing `engram harness {add,list,rm}` retired with
+// the `/api/harnesses` registry in P1.5a.
 
 // `Build` has many optional path fields (rootfs source, agent
 // injection, bootstrap injection, canonical-capture kernel + FC
@@ -419,7 +379,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
         Cmd::Session { cmd } => match cmd {
             SessionCmd::Create {
                 image,
-                harness,
+                dev_vm,
                 prompt,
                 user_id,
             } => {
@@ -427,7 +387,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     &client,
                     &cli.endpoint,
                     image,
-                    harness,
+                    *dev_vm,
                     prompt.as_deref(),
                     user_id.as_deref(),
                     cli.json,
@@ -513,26 +473,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             RegistryCmd::List => registry_list(&client, &cli.endpoint, cli.json).await,
             RegistryCmd::Rm { host } => registry_rm(&client, &cli.endpoint, host).await,
         },
-        Cmd::Harness { cmd } => match cmd {
-            HarnessCmd::Push { from, to } => harness_push(from, to).await,
-            HarnessCmd::Add {
-                name,
-                registry_uri,
-                description,
-            } => {
-                harness_add(
-                    &client,
-                    &cli.endpoint,
-                    name,
-                    registry_uri,
-                    description.as_deref(),
-                    cli.json,
-                )
-                .await
-            }
-            HarnessCmd::List => harness_list(&client, &cli.endpoint, cli.json).await,
-            HarnessCmd::Rm { name } => harness_rm(&client, &cli.endpoint, name).await,
-        },
+        // ADR 0021 P1.7 retired the `Cmd::Harness` arm.
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Flush { id } => admin_flush(&client, &cli.endpoint, id, cli.json).await,
             AdminCmd::FlushIdle => admin_flush_idle(&client, &cli.endpoint, cli.json).await,
@@ -712,19 +653,19 @@ async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
     image: &str,
-    harness: &str,
+    dev_vm: bool,
     prompt: Option<&str>,
     user_id: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    let harness_value = match harness {
-        "none" => serde_json::json!({"kind": "none"}),
-        name => serde_json::json!({"kind": "builtin", "name": name}),
-    };
     let mut payload = serde_json::Map::new();
     // Stage B1+: image is a flat OCI URI string.
     payload.insert("image".into(), Value::from(image));
-    payload.insert("harness".into(), harness_value);
+    // ADR 0021 P1.3: the session axis is mode, not harness selection.
+    // Omit on Agent (the server default) so the wire stays minimal.
+    if dev_vm {
+        payload.insert("mode".into(), Value::from("dev_vm"));
+    }
     if let Some(u) = user_id {
         payload.insert("user_id".into(), Value::from(u));
     }
@@ -1123,7 +1064,16 @@ async fn image_build(
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
         std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let builder = Builder::new(docker, chunk_store);
+    // One OCI client for both built-in harness pulls (during `build`,
+    // when `engram.toml` carries `[harness] builtin = ...`) and the
+    // optional registry push afterwards. Auth resolves from the
+    // standard docker config — `docker login <registry>` upstream,
+    // or any docker/login-action equivalent in CI; with no config the
+    // resolver returns no creds and pull/push fall through to
+    // anonymous (matches public/local-registry behaviour).
+    let oci =
+        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
+    let builder = Builder::new(docker, chunk_store).with_oci(oci);
     let outcome = builder
         .build(&req)
         .await
@@ -1140,18 +1090,9 @@ async fn image_build(
     // NOT touch Postgres — once pushed, the image is reachable to
     // engram by URI alone. The auth resolver wired into the host-
     // agent's OCI client handles credential lookup at pull time.
-    //
-    // Push auth comes from the standard docker config — run
-    // `docker login <registry>` upstream and the creds get picked
-    // up. With no docker config the resolver returns no creds and
-    // the push falls through to anonymous (works for
-    // `localhost:5001` and public registries).
     if let Some(target) = push {
-        let oci = engram_oci::OciClient::new(std::sync::Arc::new(
-            engram_oci::DockerConfigResolver::new(),
-        ));
         let push = builder
-            .push_to_registry(&oci, &req, &outcome, target)
+            .push_to_registry(&req, &outcome, target)
             .await
             .map_err(|e| CliError::Other(format!("push: {e}")))?;
         println!(
@@ -1336,123 +1277,10 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
     Ok(())
 }
 
-// ---- harness subcommands ----------------------------------------------
-
-/// Tar+gzip a local pack directory and push it as an OCI artifact.
-/// Pure registry-side work — no API call, no Postgres write. Mirrors
-/// the `engram image build --push` shape so bake-and-register stay
-/// independent operations.
-///
-/// Anonymous push works for `localhost:5001` and public registries.
-/// For authenticated registries the user pre-runs `docker login` (or
-/// pushes via `oras`) — wiring `engram harness push` through the
-/// coordinator's encrypted creds resolver lands when that's
-/// genuinely needed.
-async fn harness_push(from: &Path, to: &str) -> Result<(), CliError> {
-    // Auth via the standard docker config — run `docker login`
-    // upstream (locally via the docker CLI, in CI via
-    // `docker/login-action@v3` or equivalent). No docker config =
-    // anonymous push, which works for `localhost:5001` and public
-    // registries.
-    let oci =
-        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
-    tracing::info!(uri = %to, dir = %from.display(), "pushing harness pack");
-    let digest = oci
-        .push_harness(to, from)
-        .await
-        .map_err(|e| CliError::Other(format!("oci push: {e}")))?;
-    println!("✓ pushed {to}");
-    println!("  digest: {}", digest.as_str());
-    println!();
-    println!("  register it with the coordinator:");
-    println!("    engram harness add --name <name> --registry-uri {to}");
-    println!("  or in the dashboard:");
-    println!("    http://localhost:5173/settings/harnesses");
-    Ok(())
-}
-
-async fn harness_add(
-    client: &reqwest::Client,
-    endpoint: &str,
-    name: &str,
-    registry_uri: &str,
-    description: Option<&str>,
-    json: bool,
-) -> Result<(), CliError> {
-    let mut body = serde_json::json!({
-        "name": name,
-        "registry_uri": registry_uri,
-    });
-    if let Some(d) = description {
-        body["description"] = serde_json::Value::String(d.into());
-    }
-    let resp = client
-        .post(format!("{endpoint}/api/harnesses"))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await?;
-    let status = resp.status();
-    let resp_body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), resp_body));
-    }
-    if json {
-        println!("{resp_body}");
-    } else {
-        let v: Value = serde_json::from_str(&resp_body)
-            .map_err(|e| CliError::Other(format!("invalid JSON from server: {e}")))?;
-        println!(
-            "added: name={} registry_uri={}",
-            v["name"].as_str().unwrap_or(""),
-            v["registry_uri"].as_str().unwrap_or(""),
-        );
-    }
-    Ok(())
-}
-
-async fn harness_list(
-    client: &reqwest::Client,
-    endpoint: &str,
-    json: bool,
-) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/harnesses")).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
-        return Ok(());
-    }
-    let empty = Vec::new();
-    let harnesses = body.as_array().unwrap_or(&empty);
-    if harnesses.is_empty() {
-        println!("(no harnesses registered)");
-        return Ok(());
-    }
-    println!("{:<24}  {:<60}  DESCRIPTION", "NAME", "REGISTRY_URI");
-    for h in harnesses {
-        let uri = h["registry_uri"].as_str().unwrap_or("(host-resident)");
-        println!(
-            "{:<24}  {:<60}  {}",
-            h["name"].as_str().unwrap_or(""),
-            uri,
-            h["description"].as_str().unwrap_or(""),
-        );
-    }
-    Ok(())
-}
-
-async fn harness_rm(client: &reqwest::Client, endpoint: &str, name: &str) -> Result<(), CliError> {
-    let resp = client
-        .delete(format!("{endpoint}/api/harnesses/{}", urlencode(name)))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    println!("removed");
-    Ok(())
-}
+// ADR 0021 P1.5a + P1.7 retired the entire `engram harness ...`
+// surface — the publish primitive moved to its own CI-only crate
+// (`engram-publish-builtin-harness`); the registry-CRUD subcommands
+// (add/list/rm) went with the `/api/harnesses` endpoint.
 
 // ---- enabled-images subcommands ---------------------------------------
 

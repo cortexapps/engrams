@@ -32,15 +32,10 @@ pub struct SandboxSpec {
     /// dev workflows that pre-bake images into `<local_path>/images/`.
     #[serde(default)]
     pub image_uri: Option<String>,
-    /// OCI registry URI for the harness pack chosen for this session
-    /// (`HarnessSpec::Builtin { name }`). The coordinator resolves
-    /// the name → URI from the `harness_packs` Postgres table at
-    /// session-create time; the host-agent pulls the artifact into
-    /// its content-addressable cache and assembles
-    /// `harness_substrate` below from it. `None` for sessions with
-    /// `HarnessSpec::None`.
-    #[serde(default)]
-    pub harness_pack_uri: Option<String>,
+    // ADR 0021 P1.5b retired `harness_pack_uri` + `harness_substrate`.
+    // The harness now lives in the image rootfs at the manifest-
+    // declared `[harness] exec` path — there's no separate registry
+    // URI to resolve and no per-session ext4 substrate to attach.
     pub cpu: CpuLimit,
     pub memory: MemoryLimit,
     pub disk: DiskLimit,
@@ -48,15 +43,6 @@ pub struct SandboxSpec {
     pub ttl: Option<Duration>,
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
-    /// Path on the host to a read-only ext4 image of the per-session
-    /// harness pack tree. Built lazily by the host-agent from the OCI
-    /// pack pulled via `harness_pack_uri`. Backends attach it as the
-    /// second virtio-blk drive (`/dev/vdb`); the init shim mounts it
-    /// at `/run/engram/harnesses`. `None` means "no harness substrate
-    /// for this sandbox" (e.g. `HarnessSpec::None` sessions, or
-    /// dev/test scaffolding).
-    #[serde(default)]
-    pub harness_substrate: Option<PathBuf>,
     /// Per-sandbox egress policy derived from the image manifest's
     /// `[network]` block plus any session-time augmentation (e.g. a
     /// `WorkspaceSpec::Git` URL host gets auto-allowed so clone
@@ -85,6 +71,26 @@ pub struct AgentSpec {
     /// without polluting the sandbox-wide env.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Per-host egress-proxy CA cert in PEM form (ADR 0021 P1).
+    /// Populated by the host-agent *after* receiving the spec from
+    /// coord, immediately before handing it to the sandbox backend —
+    /// only the host knows its own CA. The Firecracker backend pushes
+    /// this via `InstallHostCa` over vsock right after `wait_agent_ready`
+    /// and before `SpawnHarness`, replacing the pre-0021 path where the
+    /// CA rode in on the harness drive. `None` skips the install — used
+    /// by tests, dev backends, and any deploy without egress proxying.
+    ///
+    /// **Wire format note**: this field intentionally does NOT carry
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`. AgentSpec
+    /// crosses the coord ↔ host-agent gRPC boundary as bincode (see
+    /// `engram-protocol/src/grpc_client.rs::start_agent`), and bincode
+    /// is positional — skipping a field on encode breaks the decoder
+    /// with "unexpected end of file" because it has no field names to
+    /// look up. The `#[serde(default)]` covers the legacy-snapshot
+    /// JSON path (manifest read of older sidecars that pre-date this
+    /// field).
+    #[serde(default)]
+    pub host_ca_pem: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -192,6 +198,40 @@ pub struct ExecRusage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the bincode/serde footgun PR #40 ran into:
+    /// `AgentSpec` crosses the coord ↔ host-agent gRPC boundary as
+    /// bincode, and bincode is positional — any field marked
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` makes the
+    /// encoder emit a shorter buffer when that field is `None`, and
+    /// the decoder hits "unexpected end of file" when it tries to
+    /// read the missing tag. The test pins the round-trip for both
+    /// `None` and `Some` host_ca_pem so a future "let's clean up the
+    /// JSON shape" change can't silently break the wire.
+    #[test]
+    fn agent_spec_bincode_roundtrips_with_none_and_some_host_ca_pem() {
+        let none = AgentSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
+            env: HashMap::from_iter([("FOO".into(), "bar".into())]),
+            host_ca_pem: None,
+        };
+        let bytes = bincode::serialize(&none).expect("bincode encode None");
+        let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode None");
+        assert_eq!(back.argv, none.argv);
+        assert_eq!(back.env, none.env);
+        assert!(back.host_ca_pem.is_none());
+
+        let some = AgentSpec {
+            argv: vec!["/opt/engram/harness/harness".into()],
+            env: HashMap::new(),
+            host_ca_pem: Some(
+                "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into(),
+            ),
+        };
+        let bytes = bincode::serialize(&some).expect("bincode encode Some");
+        let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode Some");
+        assert_eq!(back.host_ca_pem, some.host_ca_pem);
+    }
 
     #[test]
     fn exec_event_terminal_only_on_exit() {

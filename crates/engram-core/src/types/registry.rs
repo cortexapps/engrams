@@ -133,17 +133,10 @@ impl From<RegistryCredential> for RegistryCredentialSummary {
     }
 }
 
-/// One row in `harness_packs`. Pointer-only — actual pack bytes live
-/// in the registry at `registry_uri`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HarnessPack {
-    pub id: Uuid,
-    pub name: String,
-    pub registry_uri: String,
-    pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: Option<DateTime<Utc>>,
-}
+// ADR 0021 P1.5a retired `HarnessPack` + the `harness_packs` Postgres
+// table — harnesses live in image rootfses now (built-ins injected by
+// the baker from the catalog, custom by the author's Dockerfile), so
+// there's no deployment-wide harness registry to model.
 
 /// One row in `session_secrets`: the per-request `secrets` map a
 /// dashboard / CLI client supplied at session-create time, sealed
@@ -225,6 +218,12 @@ pub struct EnabledImageSummary {
     /// fallback summary.
     pub manifest_name: Option<String>,
     pub manifest_description: Option<String>,
+    /// ADR 0021 P1.6 follow-up: name of the harness baked into this
+    /// image (lifted from `manifest.harness.name`), or `None` for a
+    /// harness-less image. The dashboard reads this to render the
+    /// session-create form — e.g. show the Claude OAuth/API-key
+    /// picker iff `harness_name == Some("claude")`.
+    pub harness_name: Option<String>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -236,9 +235,12 @@ impl From<EnabledImage> for EnabledImageSummary {
         // in the list so an operator can still disable it; the
         // dashboard falls back to rendering `image_uri` only.
         let manifest: Option<crate::types::ImageManifest> = toml::from_str(&row.manifest_toml).ok();
-        let (manifest_name, manifest_description) = match manifest {
-            Some(m) => (Some(m.name), m.description),
-            None => (None, None),
+        let (manifest_name, manifest_description, harness_name) = match manifest {
+            Some(m) => {
+                let harness_name = m.harness.as_ref().and_then(|h| h.name.clone());
+                (Some(m.name), m.description, harness_name)
+            }
+            None => (None, None, None),
         };
         Self {
             id: row.id,
@@ -246,6 +248,7 @@ impl From<EnabledImage> for EnabledImageSummary {
             manifest_digest: row.manifest_digest,
             manifest_name,
             manifest_description,
+            harness_name,
             last_refreshed_at: row.last_refreshed_at,
             created_at: row.created_at,
         }

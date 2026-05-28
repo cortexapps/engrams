@@ -35,7 +35,7 @@ use engram_chunk_store::{ChunkHash, ChunkRef, ChunkStore, Manifest, ManifestKind
 use engram_coordinator::chunk_gc::{run_one_sweep_inner, ChunkGcConfig, SweepMode, SweepReport};
 use engram_core::traits::{BlobStorage, MetadataStore};
 use engram_core::types::registry::EnabledImage;
-use engram_core::types::session::HarnessSpec;
+use engram_core::types::session::SessionMode;
 use engram_core::types::{SandboxId, SessionSpec, SnapshotId, SnapshotRecord};
 use engram_storage_local::LocalBlobStorage;
 use uuid::Uuid;
@@ -228,7 +228,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         .meta
         .create_session(SessionSpec {
             image: image_uri.clone(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -534,7 +534,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
         .meta
         .create_session(SessionSpec {
             image: format!("phase-c-unrec-test:warm-{}", Uuid::new_v4()),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await

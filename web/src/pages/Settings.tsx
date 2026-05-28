@@ -7,9 +7,13 @@ import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 // dots; the active tab gets a 1-pixel ink underline (a "page-marker"
 // flag in notebook terms, not a button-shaped pill).
 //
-// Sub-routes are nested under /settings: /settings/registries (the
-// default), /settings/harnesses, /settings/profile. Each renders as
+// Sub-routes are nested under /settings: /settings/images (the
+// default), /settings/registries, /settings/profile. Each renders as
 // the <Outlet/> below.
+//
+// ADR 0021 P1.5a retired the `/settings/harnesses` tab — the
+// `/api/harnesses` registry doesn't exist anymore (harnesses are an
+// image property baked at image-bake time).
 
 interface Tab {
   to: string;
@@ -29,11 +33,6 @@ const TABS: Tab[] = [
     to: 'registries',
     label: 'Registries',
     hint: 'Docker registry credentials, sealed under the deployment KEK',
-  },
-  {
-    to: 'harnesses',
-    label: 'Harnesses',
-    hint: 'Agent packs published to a registry, indexed by name',
   },
   {
     to: 'profile',

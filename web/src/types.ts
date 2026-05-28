@@ -45,9 +45,19 @@ export type SessionState =
 // URI against `enabled_images` at session-create time.
 export type ImageRef = string;
 
-export type HarnessSpec =
-  | { kind: 'none' }
-  | { kind: 'builtin'; name: string };
+/**
+ * ADR 0021 P1.3 retired the per-session harness *selection*. Which
+ * harness an image runs is now baked into the image manifest
+ * (`[harness]` block). The session keeps a single mode axis:
+ *
+ *   `agent`  — default; drive the image's baked harness if any.
+ *   `dev_vm` — boot the image as a shell-only dev VM; if the image
+ *              has a baked harness, leave it resident-but-undriven.
+ *
+ * For a harness-less image, both modes look the same (there's no
+ * harness to drive); we still send `mode` for wire uniformity.
+ */
+export type SessionMode = 'agent' | 'dev_vm';
 
 export interface Session {
   id: string;
@@ -56,7 +66,7 @@ export interface Session {
   host_id: string | null;
   sandbox_id: string | null;
   image: ImageRef;
-  harness: HarnessSpec;
+  mode: SessionMode;
   created_at: string;
   last_active_at: string;
 }
@@ -135,14 +145,8 @@ export interface SessionCowStateResponse {
   state: CowStateView | null;
 }
 
-// ---- Image registry (for the create-session form) ---------------------
-
-/** Harness available on this deployment — read from `/api/harnesses`,
- * a Postgres-backed list of registry-pulled packs. */
-export interface HarnessDescriptor {
-  name: string;
-  description: string | null;
-}
+// ADR 0021 P1.5a retired the `HarnessDescriptor` / `/api/harnesses`
+// surface — harnesses aren't a deployment-wide registry anymore.
 
 // ---- Session creation -------------------------------------------------
 
@@ -287,22 +291,8 @@ export interface ListRegistriesResponse {
   registries: RegistryCredentialSummary[];
 }
 
-// ---- Settings · Harness packs ------------------------------------------
-
-/** Wire shape of `GET /api/harnesses` rows. `registry_uri` non-null
- * means the pack is registered in Postgres (Phase 5+); null means it
- * came from the legacy host-resident scan. */
-export interface HarnessPackSummary {
-  name: string;
-  description: string | null;
-  registry_uri: string | null;
-}
-
-export interface AddHarnessPackRequest {
-  name: string;
-  registry_uri: string;
-  description?: string | null;
-}
+// ADR 0021 P1.5a retired the `HarnessPackSummary` / `AddHarnessPackRequest`
+// surface — the `/api/harnesses` registry doesn't exist anymore.
 
 // ---- Settings · Enabled images -----------------------------------------
 //
@@ -321,6 +311,13 @@ export interface EnabledImageSummary {
   manifest_digest: string;
   manifest_name: string | null;
   manifest_description: string | null;
+  /**
+   * ADR 0021: name of the harness baked into this image (lifted
+   * from `manifest.harness.name`), or null for a harness-less image.
+   * The session-create form reads this to decide whether to show the
+   * Claude OAuth/API-key picker, etc.
+   */
+  harness_name: string | null;
   last_refreshed_at: string;
   created_at: string;
 }

@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    EnabledImage, HarnessPack, HostCapacity, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    EnabledImage, HostCapacity, HostRecord, HostStatus, PersistedEvent, RegistryCredential,
+    Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -70,13 +70,14 @@ impl MetadataStore for PostgresStore {
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
-        let harness_json = serde_json::to_value(&spec.harness)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0021 P1.3: `mode` is a flat text column now (migration
+        // 0039); `SessionMode::as_str` renders the CHECK-valid value.
+        let mode_text = spec.mode.as_str();
         sqlx::query(
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id,
-                 image_uri, harness,
+                 image_uri, mode,
                  created_at, last_active_at)
             VALUES ($1, $2, $3, NULL, $4, $5, $6, $6)
             "#,
@@ -85,7 +86,7 @@ impl MetadataStore for PostgresStore {
         .bind(spec.user_id.as_deref())
         .bind(SessionState::Pending.as_str())
         .bind(&spec.image)
-        .bind(harness_json)
+        .bind(mode_text)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -101,13 +102,14 @@ impl MetadataStore for PostgresStore {
         sandbox_id: SandboxId,
     ) -> Result<(), MetaError> {
         let now = Utc::now();
-        let harness_json = serde_json::to_value(&spec.harness)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0021 P1.3: `mode` is a flat text column now (migration
+        // 0039); `SessionMode::as_str` renders the CHECK-valid value.
+        let mode_text = spec.mode.as_str();
         sqlx::query(
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id, sandbox_id,
-                 image_uri, harness,
+                 image_uri, mode,
                  created_at, last_active_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
             "#,
@@ -118,7 +120,7 @@ impl MetadataStore for PostgresStore {
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
         .bind(&spec.image)
-        .bind(harness_json)
+        .bind(mode_text)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -130,7 +132,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
+                   image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions WHERE id = $1
@@ -148,7 +150,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
+                   image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
@@ -372,7 +374,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
+                   image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    evac_attempts
@@ -1069,71 +1071,9 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    // ---------- harness packs ----------
-
-    async fn upsert_harness_pack(&self, pack: HarnessPack) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO harness_packs
-                (id, name, registry_uri, description, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, NULL)
-            ON CONFLICT (name) DO UPDATE SET
-                registry_uri = EXCLUDED.registry_uri,
-                description  = EXCLUDED.description,
-                updated_at   = NOW()
-            "#,
-        )
-        .bind(pack.id)
-        .bind(&pack.name)
-        .bind(&pack.registry_uri)
-        .bind(pack.description.as_deref())
-        .bind(pack.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn list_harness_packs(&self) -> Result<Vec<HarnessPack>, MetaError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, name, registry_uri, description, created_at, updated_at
-              FROM harness_packs
-             ORDER BY name
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.iter().map(row::harness_pack_from_row).collect()
-    }
-
-    async fn get_harness_pack(&self, name: &str) -> Result<Option<HarnessPack>, MetaError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, name, registry_uri, description, created_at, updated_at
-              FROM harness_packs
-             WHERE name = $1
-            "#,
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row.map(|r| row::harness_pack_from_row(&r)).transpose()
-    }
-
-    async fn delete_harness_pack(&self, name: &str) -> Result<(), MetaError> {
-        let res = sqlx::query("DELETE FROM harness_packs WHERE name = $1")
-            .bind(name)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        if res.rows_affected() == 0 {
-            return Err(MetaError::NotFound);
-        }
-        Ok(())
-    }
+    // ADR 0021 P1.5a retired the harness-packs CRUD here; the trait
+    // surface no longer carries them and migration 0040 drops the
+    // backing Postgres table.
 
     // ---------- enabled images ----------
 

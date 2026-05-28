@@ -140,24 +140,22 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
     //     on recycle — see docs/chunked-storage-rollout.md.
     let blob = engram_image_builder::blob::from_env(&opts.images_dir).await?;
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let builder = Builder::new(docker, chunk_store);
+    // One OCI client, set up once and used for both built-in harness
+    // pulls (during `build`) and the optional registry push (after
+    // `build`). Auth is read from the standard docker config
+    // (`$DOCKER_CONFIG/config.json` or `~/.docker/config.json`); run
+    // `docker login <registry>` upstream or let CI's login-action
+    // populate it. With no docker config the resolver returns no
+    // creds and pull/push fall through to anonymous — matches the
+    // previous behaviour for public/local registries.
+    let oci = OciClient::new(Arc::new(DockerConfigResolver::new()));
+    let builder = Builder::new(docker, chunk_store).with_oci(oci);
 
     let outcome = builder.build(&req).await?;
     println!("{}", outcome.image_dir.display());
 
-    // Optional: push to a Docker registry. Auth is read from the
-    // standard docker config (`$DOCKER_CONFIG/config.json` or
-    // `~/.docker/config.json`). Run `docker login <registry>`
-    // upstream of this command to populate it; CI can use any of
-    // the docker/login-action equivalents to drop creds into the
-    // same file. With no docker config present, the resolver
-    // returns no creds and the push falls through to anonymous —
-    // matches the previous behaviour for public/local registries.
     if let Some(target) = opts.push.as_deref() {
-        let oci = OciClient::new(Arc::new(DockerConfigResolver::new()));
-        let push = builder
-            .push_to_registry(&oci, &req, &outcome, target)
-            .await?;
+        let push = builder.push_to_registry(&req, &outcome, target).await?;
         tracing::info!(uri = %push.uri, digest = %push.manifest_digest.as_str(), "pushed to registry");
     }
 

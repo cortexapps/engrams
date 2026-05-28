@@ -2,9 +2,9 @@
 //! `lib.rs` stay readable.
 
 use chrono::{DateTime, Utc};
-use engram_core::types::session::HarnessSpec;
+use engram_core::types::session::SessionMode;
 use engram_core::types::{
-    EnabledImage, HarnessPack, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
+    EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
     RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
@@ -24,9 +24,19 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
     let last_active_at: DateTime<Utc> = row.try_get("last_active_at").map_err(col_err)?;
     let image_uri: String = row.try_get("image_uri").map_err(col_err)?;
-    let harness_json: serde_json::Value = row.try_get("harness").map_err(col_err)?;
-    let harness: HarnessSpec = serde_json::from_value(harness_json)
-        .map_err(|e| MetaError::Serialization(format!("harness: {e}")))?;
+    // ADR 0021 P1.3: `mode` replaced the JSONB `harness` column (see
+    // migration 0039). Plain text, CHECK-constrained to the
+    // SessionMode wire-string set — match it back here.
+    let mode_text: String = row.try_get("mode").map_err(col_err)?;
+    let mode = match mode_text.as_str() {
+        s if s == SessionMode::Agent.as_str() => SessionMode::Agent,
+        s if s == SessionMode::DevVm.as_str() => SessionMode::DevVm,
+        other => {
+            return Err(MetaError::Serialization(format!(
+                "sessions.mode: unknown value {other:?}"
+            )));
+        }
+    };
     // ADR 0016 Phase B: live_disk_manifest_* columns added in
     // migration 0034. The both-or-neither CHECK constraint
     // guarantees these two columns are either both NULL or both
@@ -50,7 +60,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
         image: image_uri,
-        harness,
+        mode,
         created_at,
         last_active_at,
         live_disk_manifest,
@@ -234,19 +244,8 @@ pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, Me
     })
 }
 
-pub(crate) fn harness_pack_from_row(row: &PgRow) -> Result<HarnessPack, MetaError> {
-    let id: Uuid = row.try_get("id").map_err(col_err)?;
-    let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
-    let updated_at: Option<DateTime<Utc>> = row.try_get("updated_at").map_err(col_err)?;
-    Ok(HarnessPack {
-        id,
-        name: row.try_get("name").map_err(col_err)?,
-        registry_uri: row.try_get("registry_uri").map_err(col_err)?,
-        description: row.try_get("description").map_err(col_err)?,
-        created_at,
-        updated_at,
-    })
-}
+// ADR 0021 P1.5a retired `harness_pack_from_row` with the rest of
+// the harness-packs registry.
 
 pub(crate) fn parse_session_state_for_lib(s: &str) -> Result<SessionState, MetaError> {
     parse_session_state(s)

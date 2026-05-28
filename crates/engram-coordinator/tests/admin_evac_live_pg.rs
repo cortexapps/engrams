@@ -34,7 +34,7 @@ use engram_core::traits::{HarnessDial, HostClient, MetadataStore};
 use engram_core::types::evacuation::EvacLoss;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
-use engram_core::types::session::{HarnessSpec, SessionSpec, SessionState};
+use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::snapshot::{SnapshotMetadata, SnapshotRecord};
 use engram_core::{HostId, SandboxError, SandboxId, SessionId, SnapshotId};
 use engram_storage_local::LocalBlobStorage;
@@ -220,7 +220,7 @@ async fn seed_active_session(
     let session_id = meta
         .create_session(SessionSpec {
             image: format!("ghcr.io/test/img:t-{}", uuid::Uuid::new_v4()),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await

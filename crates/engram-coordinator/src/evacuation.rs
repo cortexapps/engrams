@@ -269,7 +269,7 @@ mod tests {
     use async_trait::async_trait;
     use engram_core::traits::{HarnessDial, HostClient};
     use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
-    use engram_core::types::session::{HarnessSpec, Session, SessionState};
+    use engram_core::types::session::{Session, SessionMode, SessionState};
     use engram_core::types::snapshot::SnapshotMetadata;
     use engram_core::{HostId, SandboxId, SessionId};
     use parking_lot::Mutex as PlMutex;
@@ -586,26 +586,7 @@ mod tests {
         async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
             unreachable!()
         }
-        async fn upsert_harness_pack(
-            &self,
-            _: engram_core::types::registry::HarnessPack,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn list_harness_packs(
-            &self,
-        ) -> Result<Vec<engram_core::types::registry::HarnessPack>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn get_harness_pack(
-            &self,
-            _: &str,
-        ) -> Result<Option<engram_core::types::registry::HarnessPack>, MetaError> {
-            Ok(None)
-        }
-        async fn delete_harness_pack(&self, _: &str) -> Result<(), MetaError> {
-            unreachable!()
-        }
+        // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
         async fn upsert_enabled_image(
             &self,
             _: engram_core::types::registry::EnabledImage,
@@ -651,7 +632,7 @@ mod tests {
             host_id: Some(host),
             sandbox_id: Some(sandbox),
             image: "ghcr.io/test/img:t".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,

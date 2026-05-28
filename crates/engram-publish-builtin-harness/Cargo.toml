@@ -1,0 +1,26 @@
+# ADR 0021 P1.7: tiny CI-only binary that publishes a built-in
+# harness artifact to a Docker registry. Not a user-facing tool —
+# `bake-harness-claude.yml` and its successors call it during a
+# release; everyone else gets the artifact via the catalog at bake
+# time (`[harness] builtin = "..." version = "..."` in
+# `engram.toml`).
+#
+# Lives in its own crate so the dependency footprint stays tiny: no
+# Postgres, no coord HTTP, no clap subcommand explosion. Just
+# engram-oci's push_harness behind a flag-pair-shaped CLI.
+
+[package]
+name = "engram-publish-builtin-harness"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "engram-publish-builtin-harness"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+engram-oci.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

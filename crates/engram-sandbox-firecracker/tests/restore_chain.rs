@@ -37,15 +37,12 @@
 //! (`source_{rootfs,vsock}_canonical`), identical for flat-file and
 //! NBD-backed rootfs.
 //!
-//! ADR 0018 §12p: the sandbox is created WITH a harness substrate so
-//! the chain also exercises the harness virtio-blk drive — the device
-//! 12o explicitly exempted (it assumed `swap_harness_drive` re-points
-//! the harness onto the live id on every restore, which only held on
-//! the warm-lease path, not the idle→active / evac resume path). Pre-
-//! §12p this test (which used `harness_substrate: None`) passed while
-//! prod ENOENT'd on `harness/<ancestor>.ext4`; with the substrate
-//! attached, hop 2's restore reproduces the prod failure unless
-//! `restore` re-anchors the harness drive onto the live id.
+//! ADR 0021 P1.5 retired the harness virtio-blk drive (the harness
+//! lives in the rootfs now), so §12p's harness-drive lineage gate
+//! doesn't apply anymore — there's nothing for `restore` to
+//! re-anchor. The test still exercises the rootfs + vsock canonical
+//! paths (the §12o territory), which is the regression that
+//! originally motivated this file.
 //!
 //! Same gating as the other ignored FC integration tests (Linux +
 //! KVM + firecracker on PATH + fetched test artifacts).
@@ -90,25 +87,10 @@ async fn chained_restore_snapshot_lineage_holds() {
         .await
         .expect("clone rootfs into tempdir");
 
-    // ADR 0018 §12p: attach a harness substrate so the lineage
-    // exercises the harness virtio-blk drive. FC only needs to open it
-    // as a block device at `load_snapshot` time — a padded raw file is
-    // sufficient (the test's init never mounts it). Without this drive
-    // present the chain can't reproduce the prod harness-ENOENT.
-    let harness_substrate = work.path().join("harness.ext4");
-    {
-        use tokio::io::AsyncWriteExt;
-        let mut f = tokio::fs::File::create(&harness_substrate)
-            .await
-            .expect("create harness substrate");
-        f.write_all(b"ENGRAM-HARNESS-CHAIN")
-            .await
-            .expect("write sentinel");
-        f.set_len(16 * 1024 * 1024)
-            .await
-            .expect("pad harness to 16 MiB");
-        f.flush().await.expect("flush harness substrate");
-    }
+    // ADR 0021 P1.5: no harness substrate — the harness lives in
+    // the rootfs at the manifest-declared `[harness] exec` path,
+    // and there's no separate virtio-blk drive to anchor across
+    // restores.
 
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
@@ -119,14 +101,12 @@ async fn chained_restore_snapshot_lineage_holds() {
         image: "restore-chain-source".into(),
         rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
-        harness_pack_uri: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },
         ttl: None,
         env: HashMap::new(),
         workdir: None,
-        harness_substrate: Some(harness_substrate.clone()),
         network: Default::default(),
     };
 

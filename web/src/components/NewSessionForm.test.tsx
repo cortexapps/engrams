@@ -3,10 +3,13 @@
 // Catches drift in the `POST /sessions` body shape. Stage B1 made
 // `image` a flat OCI URI string (was a discriminated `{ kind, repo,
 // tag }` object); Stage D wired the form to read images from
-// `/api/enabled-images` instead of the legacy `/api/images`. A
-// refactor that re-introduces the structured shape, or that calls
-// the legacy list endpoint, would slip past Rust integration tests
-// — the contract sits between the UI and the coordinator.
+// `/api/enabled-images` instead of the legacy `/api/images`. ADR
+// 0021 P1.3 retired the per-session `harness` axis in favour of a
+// `mode` axis ("agent" | "dev_vm"); the harness identity rides on
+// the image manifest, surfaced as `EnabledImageSummary.harness_name`.
+// A refactor that re-introduces any of these would slip past Rust
+// integration tests — the contract sits between the UI and the
+// coordinator.
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { cleanup, screen, waitFor } from '@testing-library/react';
@@ -26,6 +29,7 @@ const ENABLED_IMAGE = {
   manifest_digest: 'sha256:abc',
   manifest_name: 'cortex-api',
   manifest_description: 'demo image for tests',
+  harness_name: null,
   last_refreshed_at: new Date().toISOString(),
   created_at: new Date().toISOString(),
 };
@@ -47,12 +51,9 @@ function installFetchMock() {
           headers: { 'content-type': 'application/json' },
         });
       }
-      if (url === '/api/harnesses' && method === 'GET') {
-        return new Response(JSON.stringify([]), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
+      // ADR 0021 P1.5a: the `/api/harnesses` endpoint doesn't exist
+      // anymore. The form no longer hits it; the test only mocks
+      // `/api/enabled-images` + `/sessions`.
       if (url === '/sessions' && method === 'POST') {
         return new Response(
           JSON.stringify({
@@ -145,9 +146,13 @@ describe('NewSessionForm wire contract', () => {
       // Locked: flat string, no kind/repo/tag discriminator.
       expect(body.image).toBe('ghcr.io/cortex/api:warm-1');
       expect(typeof body.image).toBe('string');
-      // ADR 0005 retired the workspace axis; harness default survives.
+      // ADR 0005 retired the workspace axis.
       expect(body.workspace).toBeUndefined();
-      expect(body.harness).toEqual({ kind: 'none' });
+      // ADR 0021 P1.3: per-session harness selection is gone; the
+      // form's mode defaults to `agent` and the wire omits it on
+      // the default arm to keep the payload minimal.
+      expect(body.harness).toBeUndefined();
+      expect(body.mode).toBeUndefined();
     });
   });
 });

@@ -45,6 +45,131 @@ pub struct ImageManifest {
     /// [`SecretMode`] for the security tradeoff.
     #[serde(default)]
     pub secret_mode: SecretMode,
+
+    /// The single agent harness baked into this image, if any (ADR
+    /// 0021). `None` → a harness-less template (a pure dev VM, driven
+    /// via shell / `engram exec`). At most one harness per image: this
+    /// keeps the per-template warm snapshot coherent.
+    ///
+    /// In a source `engram.toml` the author writes either the built-in
+    /// form (`builtin = "claude"`) or the custom form (`name`/`exec`);
+    /// the baker resolves that into the launched form
+    /// (`name`/`exec`/`args`/`version`) it renders into `manifest.toml`.
+    /// See [`HarnessManifest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessManifest>,
+}
+
+/// The harness baked into an image — both the source-authored `[harness]`
+/// table in `engram.toml` and the baker-resolved form rendered into
+/// `manifest.toml`. All fields are optional at the serde layer so the
+/// authored built-in form (`builtin` only) and the custom/resolved form
+/// (`name` + `exec`) share one struct; [`HarnessManifest::validate_source`]
+/// enforces the real shape rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessManifest {
+    /// Built-in harness name, e.g. `"claude"` (authored form). Mutually
+    /// exclusive with `exec`: the baker downloads the published
+    /// per-platform artifact for this name, injects it into the rootfs,
+    /// and fills in `name`/`exec`/`args`/`version` for the rendered
+    /// manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<String>,
+
+    /// Harness identity (recorded for the coordinator, the
+    /// warm-snapshot capture, and audit). For a built-in this is the
+    /// builtin name; for a custom harness the author supplies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Absolute path to the harness entry-point inside the rootfs. For
+    /// a custom harness the author's Dockerfile must have COPY'd a file
+    /// here; for a built-in the baker fills it with the canonical
+    /// inject path. Mutually exclusive with `builtin` in source form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<String>,
+
+    /// Extra argv appended after the SDK-standard flags when the
+    /// host launches the harness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+
+    /// Built-in artifact version. **Required** in source `engram.toml`
+    /// when `builtin` is set — the explicit pin that resolves to a
+    /// GHCR OCI digest. Must be omitted for custom harnesses (the
+    /// binary is whatever the author COPY'd into their rootfs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl HarnessManifest {
+    /// Validate a *source-authored* `[harness]` table. The shape rules:
+    ///
+    /// - Built-in: `builtin = "..."` **and** `version = "..."` together
+    ///   (no `name`/`exec`/`args`). Version pinning is required for
+    ///   reproducible bakes — the engram-CLI catalog resolves
+    ///   `(builtin, version)` to a GHCR OCI artifact at that exact
+    ///   digest.
+    /// - Custom: `name` + absolute `exec` (and optional `args`). `version`
+    ///   is meaningless for a custom harness — the binary is whatever
+    ///   the author's Dockerfile COPY'd in — so it must be omitted.
+    ///
+    /// `builtin` and `name`/`exec` are mutually exclusive.
+    pub fn validate_source(&self) -> Result<(), String> {
+        match (&self.builtin, &self.name, &self.exec) {
+            (Some(b), None, None) => {
+                if b.trim().is_empty() {
+                    return Err("[harness] builtin must not be empty".into());
+                }
+                if !self.args.is_empty() {
+                    return Err(
+                        "[harness] args is not allowed with builtin (the baker sets the launch argv)"
+                            .into(),
+                    );
+                }
+                match self.version.as_deref().map(str::trim) {
+                    Some("") | None => Err(
+                        "[harness] builtin requires an explicit `version = \"...\"` pin (no rolling defaults — reproducible bakes)"
+                            .into(),
+                    ),
+                    Some(_) => Ok(()),
+                }
+            }
+            (None, Some(name), Some(exec)) => {
+                if name.trim().is_empty() {
+                    return Err("[harness] name must not be empty".into());
+                }
+                if !exec.starts_with('/') {
+                    return Err(format!(
+                        "[harness] exec must be an absolute rootfs path, got {exec:?}"
+                    ));
+                }
+                if self.version.is_some() {
+                    return Err(
+                        "[harness] version is only meaningful with builtin; a custom harness ships the binary the author chose"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            (Some(_), _, _) => Err(
+                "[harness] builtin is mutually exclusive with name/exec — pick the built-in form or the custom form"
+                    .into(),
+            ),
+            (None, _, _) => Err(
+                "[harness] custom form requires both name and exec (or use builtin = \"...\")"
+                    .into(),
+            ),
+        }
+    }
+
+    /// True once the harness is fully resolved to a launchable form
+    /// (identity + entry-point present). The coordinator relies on this
+    /// when building the spawn request.
+    pub fn is_launchable(&self) -> bool {
+        self.name.is_some() && self.exec.is_some()
+    }
 }
 
 /// How an image wants its resolved secret values delivered to the
@@ -208,12 +333,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_harness_block() {
-        // `[[harness]]` was removed when harness binaries moved to a
-        // host-side directory mounted into every sandbox via
-        // virtio-fs. `deny_unknown_fields` on `ImageManifest` makes
-        // a stale engram.toml carrying `[[harness]]` fail-fast at
-        // parse rather than silently shipping an inert image.
+    fn manifest_rejects_harness_array_block() {
+        // ADR 0021 baked exactly one harness per image, so `harness`
+        // is a singular table, not an array. A stale `[[harness]]`
+        // (array-of-tables) block — the pre-0021 shape — fails to
+        // deserialize into the struct field, so a stale engram.toml
+        // fails fast at parse rather than silently shipping an inert
+        // image. The accepted singular form is exercised below.
         let src = r#"
             name = "cortex-api"
 
@@ -222,7 +348,153 @@ mod tests {
             guest_path = "/sbin/engram-harness-claude"
         "#;
         let res: Result<ImageManifest, _> = toml::from_str(src);
-        assert!(res.is_err(), "stale [[harness]] block must be rejected");
+        assert!(
+            res.is_err(),
+            "stale [[harness]] array block must be rejected"
+        );
+    }
+
+    #[test]
+    fn manifest_parses_builtin_harness_table() {
+        let src = r#"
+            name = "demo-claude"
+
+            [harness]
+            builtin = "claude"
+            version = "v1.2.3"
+        "#;
+        let m: ImageManifest = toml::from_str(src).unwrap();
+        let h = m.harness.expect("harness table parsed");
+        assert_eq!(h.builtin.as_deref(), Some("claude"));
+        assert_eq!(h.version.as_deref(), Some("v1.2.3"));
+        assert!(h.exec.is_none(), "builtin source form has no exec yet");
+        h.validate_source()
+            .expect("builtin + version is valid source");
+        assert!(!h.is_launchable(), "unresolved builtin isn't launchable");
+    }
+
+    #[test]
+    fn manifest_parses_custom_harness_table() {
+        let src = r#"
+            name = "my-agent-img"
+
+            [harness]
+            name = "my-agent"
+            exec = "/opt/my-agent/harness"
+            args = ["--serve"]
+        "#;
+        let m: ImageManifest = toml::from_str(src).unwrap();
+        let h = m.harness.expect("harness table parsed");
+        assert_eq!(h.name.as_deref(), Some("my-agent"));
+        assert_eq!(h.exec.as_deref(), Some("/opt/my-agent/harness"));
+        assert_eq!(h.args, vec!["--serve"]);
+        h.validate_source().expect("custom form is valid source");
+        assert!(h.is_launchable(), "custom form is immediately launchable");
+    }
+
+    #[test]
+    fn harness_validate_source_rejects_bad_shapes() {
+        // builtin + exec together: ambiguous.
+        let both = HarnessManifest {
+            builtin: Some("claude".into()),
+            exec: Some("/opt/x/harness".into()),
+            ..Default::default()
+        };
+        assert!(both.validate_source().is_err(), "builtin xor custom");
+
+        // custom name without exec.
+        let no_exec = HarnessManifest {
+            name: Some("my-agent".into()),
+            ..Default::default()
+        };
+        assert!(no_exec.validate_source().is_err(), "name needs exec");
+
+        // exec must be absolute.
+        let rel = HarnessManifest {
+            name: Some("a".into()),
+            exec: Some("opt/x/harness".into()),
+            ..Default::default()
+        };
+        assert!(rel.validate_source().is_err(), "exec must be absolute");
+
+        // builtin without version: rejected (explicit pin required).
+        let no_version = HarnessManifest {
+            builtin: Some("claude".into()),
+            ..Default::default()
+        };
+        assert!(
+            no_version.validate_source().is_err(),
+            "builtin requires explicit version pin"
+        );
+
+        // builtin with empty version: same rejection.
+        let empty_version = HarnessManifest {
+            builtin: Some("claude".into()),
+            version: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(
+            empty_version.validate_source().is_err(),
+            "blank version is not a pin"
+        );
+
+        // custom + version: rejected (version only applies to built-ins).
+        let custom_versioned = HarnessManifest {
+            name: Some("my-agent".into()),
+            exec: Some("/opt/x/harness".into()),
+            version: Some("v1.0.0".into()),
+            ..Default::default()
+        };
+        assert!(
+            custom_versioned.validate_source().is_err(),
+            "version not allowed with custom harness"
+        );
+
+        // builtin with args is rejected (baker owns argv).
+        let builtin_args = HarnessManifest {
+            builtin: Some("claude".into()),
+            version: Some("v1.2.3".into()),
+            args: vec!["--serve".into()],
+            ..Default::default()
+        };
+        assert!(
+            builtin_args.validate_source().is_err(),
+            "args not allowed with builtin"
+        );
+    }
+
+    #[test]
+    fn harness_validate_source_accepts_canonical_forms() {
+        // Built-in + version: valid.
+        let builtin = HarnessManifest {
+            builtin: Some("claude".into()),
+            version: Some("v1.2.3".into()),
+            ..Default::default()
+        };
+        builtin
+            .validate_source()
+            .expect("builtin + version is valid");
+
+        // Custom: name + absolute exec (+ optional args), no version.
+        let custom = HarnessManifest {
+            name: Some("my-agent".into()),
+            exec: Some("/opt/my-agent/harness".into()),
+            args: vec!["--serve".into()],
+            ..Default::default()
+        };
+        custom.validate_source().expect("custom form is valid");
+    }
+
+    #[test]
+    fn harness_none_round_trips_and_is_omitted() {
+        // A harness-less image: no [harness] in, none rendered out.
+        let m: ImageManifest = toml::from_str(r#"name = "dev-vm""#).unwrap();
+        assert!(m.harness.is_none());
+        let rendered = toml::to_string(&m).unwrap();
+        assert!(
+            !rendered.contains("harness"),
+            "harness-less image must not render a [harness] table"
+        );
     }
 
     #[test]
