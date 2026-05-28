@@ -344,10 +344,19 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
 - [x] `HarnessSpec` → `SessionMode::{Agent, DevVm}`; coord reads the harness from the
       image manifest, not the session. *(cbe7f36; migration 0039 swaps
       `sessions.harness` JSONB for `sessions.mode` TEXT.)*
-- [ ] Delete: `harness_packs` table (+ drop migration), coord `/api/harnesses`, CLI
-      `harness add/push/list/rm`, registry types, host-agent
-      `ensure_harness`/`ensure_harness_ext4`, `SandboxSpec.harness_substrate`/
-      `harness_pack_uri`, and option-D `swap_harness_drive` (+ `option_d_*` tests).
+- [x] **Subsystem deletion P1.5a — harness_packs registry** *(97fef2f)*:
+      `harness_packs` table (migration 0040 drops it), `HarnessPack` type, the
+      four `MetadataStore` trait methods + postgres impls, coord `/api/harnesses`
+      surface, CLI `harness add`/`list`/`rm` subcommands. `engram harness push`
+      survives (CI still uses it; retires with the publish-surface handoff below).
+- [ ] **Subsystem deletion P1.5b — substrate plumbing** *(pending)*: drop
+      `SandboxSpec.harness_substrate` + `harness_pack_uri`, delete host-agent
+      `ensure_harness`/`ensure_harness_ext4` in `image_cache.rs`, prune the
+      now-`None`-only paths in `pooled_backend.rs`.
+- [ ] **Subsystem deletion P1.5c — option-D `swap_harness_drive`** *(pending)*:
+      delete the FC swap path + the `option_d_warm_lease` / `option_d_latency_bench`
+      tests that exercised it; `harness_loopback` / `proxy_e2e` get rewritten to
+      use a baked-in harness rather than a `Some(substrate_path)`.
 - [ ] **Publish-surface handoff**: P0's `bake-harness-claude.yml` calls `engram-cli
       harness push` for the OCI push. That CLI subcommand is retired in this phase;
       introduce a replacement (e.g. `engram-cli builtin-harness publish` or a
