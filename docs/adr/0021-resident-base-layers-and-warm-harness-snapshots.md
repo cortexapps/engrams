@@ -306,9 +306,10 @@ third-party share one pipeline):
       attach handshake, event-emit helpers, command loop, one-call `signal_ready()`
       (`Idle`, which doubles as the warm-capture trigger). Port `engram-harness-noop`
       to it.
-- [ ] Singular `[harness]` table on `ImageManifest` + parse/validate in the baker's
+- [x] Singular `[harness]` table on `ImageManifest` + parse/validate in the baker's
       `engram.toml` reader (mutual-exclusion of `builtin` vs `name`/`exec`; replace
       the stale-`[[harness]]`-rejection tests with singular-form tests).
+      *(d157e87, 32bcddf)*
 - [ ] Baker injects the built-in artifact / validates the custom `exec`; renders the
       launch contract into `manifest.toml`.
 - [ ] Publish pipeline: rework `bake-harness-claude.yml` to emit a per-platform
