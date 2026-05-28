@@ -3098,8 +3098,40 @@ impl SandboxBackend for FirecrackerBackend {
                         cert_pem: pem.to_string(),
                     },
                 );
-                let resp: engram_agentd::WireResponse = tracing::Instrument::instrument(
-                    async {
+                // Restore-side settle: a warm-restored sandbox's
+                // `agent_ready` watch is pre-set to true (see
+                // `restore_in_jail`), so `wait_agent_ready` above
+                // returned instantly. But FC's vsock muxer has a
+                // brief window post-`load_snapshot` where it accepts
+                // a host `CONNECT`/returns `OK`, then closes the
+                // connection before agentd's accept-loop task wakes
+                // and drains the request bytes. Host then sees
+                // `read InstallHostCa response: early eof` 3-5 ms
+                // after the `CONNECT/OK` round-trip (vs the 140-180 ms
+                // a successful install takes). Surfaced by PR #40 e2e_
+                // stack on cold-snapshot-during-startup-fix landings.
+                // Cold paths don't hit this — the agentd dial of
+                // AgentReady gates `wait_agent_ready`, and by the
+                // time AgentReady fires the muxer has settled.
+                //
+                // Retry the full connect → write → read sequence on
+                // an EOF-shaped error, up to ~5 attempts with 50ms
+                // backoff. Each attempt is independent (fresh
+                // connect, fresh CONNECT verb, fresh write/read) so
+                // double-send is structurally impossible —
+                // agentd's `InstallHostCa` handler is idempotent
+                // (writes the same PEM to the same path; the
+                // `last_pem` cache short-circuits on identical
+                // input). A genuinely broken agentd surfaces as
+                // EOF every attempt; the final attempt's error
+                // propagates with the attempt count for
+                // diagnosis.
+                let max_attempts: u32 = 5;
+                let mut attempt: u32 = 0;
+                let resp = loop {
+                    attempt += 1;
+                    let span = tracing::info_span!("fc.install_host_ca", attempt);
+                    let inner = async {
                         let mut conn =
                             Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
                         engram_agentd::write_msg(&mut conn, &req)
@@ -3111,13 +3143,38 @@ impl SandboxBackend for FirecrackerBackend {
                             SandboxError::Vm(format!("read InstallHostCa response: {e}").into())
                         })?;
                         Ok::<_, SandboxError>(resp)
-                    },
-                    tracing::info_span!("fc.install_host_ca"),
-                )
-                .await?;
+                    };
+                    match tracing::Instrument::instrument(inner, span).await {
+                        Ok(r) => break r,
+                        Err(e) => {
+                            // Only retry EOF/RST-shaped errors. Other
+                            // failures (write failures, bincode decode
+                            // errors, protocol mismatches) are
+                            // structural — retrying won't help.
+                            let msg = format!("{e}");
+                            let retryable = msg.contains("early eof")
+                                || msg.contains("unexpected end of file")
+                                || msg.contains("connection reset")
+                                || msg.contains("broken pipe");
+                            if !retryable || attempt >= max_attempts {
+                                return Err(SandboxError::Vm(
+                                    format!("InstallHostCa failed after {attempt} attempt(s): {e}")
+                                        .into(),
+                                ));
+                            }
+                            tracing::debug!(
+                                sandbox_id = %id,
+                                attempt,
+                                error = %e,
+                                "InstallHostCa transient failure; retrying after 50 ms (vsock muxer settle)",
+                            );
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                };
                 match resp {
                     engram_agentd::WireResponse::InstallHostCaAck { changed } => {
-                        tracing::debug!(sandbox_id = %id, changed, "host CA install ack");
+                        tracing::debug!(sandbox_id = %id, attempt, changed, "host CA install ack");
                     }
                     engram_agentd::WireResponse::Error { kind, message } => {
                         return Err(SandboxError::Vm(
