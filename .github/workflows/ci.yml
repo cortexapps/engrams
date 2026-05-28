@@ -915,8 +915,10 @@ jobs:
   # ------------------------------------------------------------------
   # True end-to-end against the prod-shape stack. Brings up postgres
   # + fake-gcs + local registry + real coord + real host-agent + real
-  # Firecracker; bakes the demo image locally; pulls the published
-  # Claude harness pack; runs the three flows in `e2e_stack.rs`.
+  # Firecracker; bakes the `demo-claude` image locally (which itself
+  # pulls the published `harness-claude` OCI artifact from GHCR and
+  # injects it into the rootfs at `/opt/engram/harness/` per ADR
+  # 0021); runs the three flows in `e2e_stack.rs`.
   #
   # DAG dep on the cheap gates only (lint, test-linux, web,
   # cross-musl-linux) plus the artifacts producer. `test-firecracker`
@@ -937,13 +939,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     # `contents: read` for the checkout; `packages: read` so this
-    # job's GITHUB_TOKEN can pull ghcr.io/cortexapps/engrams/
-    # harness-claude:main (and ghcr.io/cortexapps/engrams/demo:main
-    # once that's published). The token is wired through to the
-    # coord's `registry_credentials` table via `engram-cli registry
-    # add` below — host-agent then asks coord per ADR 0013's
-    # HttpAuthResolver path; never writes creds to docker config or
-    # disk.
+    # job's GITHUB_TOKEN can pull from GHCR — two distinct consumers:
+    #   1. The host-agent (via coord's HttpAuthResolver, ADR 0013)
+    #      reads sealed creds from PG, seeded by `engram-cli registry
+    #      add` below.
+    #   2. The baker (`engram-cli image build`) reads
+    #      `~/.docker/config.json` via DockerConfigResolver, written
+    #      by `docker/login-action` below — needed for the
+    #      demo-claude variant's `harness-claude` pull (ADR 0021 P0).
     permissions:
       contents: read
       packages: read
@@ -1094,6 +1097,23 @@ jobs:
               --host ghcr.io \
               --username "${{ github.actor }}" \
               --password-stdin
+
+      # ADR 0021 P0: the demo-claude bake pulls the published
+      # harness-claude OCI artifact from GHCR during the bake. The
+      # baker uses `engram-cli`'s OciClient → DockerConfigResolver,
+      # which reads `~/.docker/config.json`. docker/login-action
+      # writes that file. Without this step the bake fails the
+      # GHCR pull with "Not authorized" on a private manifest pull.
+      # Distinct concern from `registry add` above: that path
+      # populates the coord's PG-backed credential store, used by
+      # host-agent at session-create time. The baker is a separate
+      # process that doesn't read coord state.
+      - name: Log in to GHCR for the bake
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bake demo image + capture URI
         run: |
