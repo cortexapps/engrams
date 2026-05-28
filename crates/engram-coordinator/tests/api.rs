@@ -842,6 +842,52 @@ async fn create_session_requires_image_and_workspace() {
 }
 
 #[tokio::test]
+async fn create_session_dev_vm_mode_skips_harness_on_harnessed_image() {
+    // ADR 0021 P1.6: `mode = dev_vm` against a harnessed image leaves
+    // the harness undriven — `resolve_harness` returns `None`, so
+    // the backend's `start_agent` receives an empty-argv AgentSpec
+    // (readiness probe; no spawn). Test asserts the session still
+    // reaches Active (the dev VM is just a shell-only session of the
+    // same image).
+    let store = MockMetadataStore::arc();
+    let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
+    // `exec` here would crash the test if it ran (no such binary), so
+    // a clean Active proves dev-VM mode bypassed the spawn.
+    f.write_image(
+        "demo/dev-vm-from-harnessed",
+        "v1",
+        r#"
+            name = "demo-dev-vm"
+            [harness]
+            name = "would-be-harness"
+            exec = "/this/path/does/not/exist"
+        "#,
+    );
+    let app = f.app;
+
+    let resp = app
+        .oneshot(json_request(
+            Method::POST,
+            "/sessions",
+            json!({
+                "image": "demo/dev-vm-from-harnessed:v1",
+                "mode": "dev_vm",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(v["status"], "active");
+    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+    let session = store.get_session(id).await.unwrap();
+    assert_eq!(
+        session.mode,
+        engram_core::types::session::SessionMode::DevVm,
+    );
+}
+
+#[tokio::test]
 async fn create_session_with_explicit_image_persists_full_row() {
     // The "automatic image selection" paths (latest-ready, default
     // tag) were removed in phase 2 — every session declares an

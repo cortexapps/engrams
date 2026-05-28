@@ -358,13 +358,20 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       (`option_d_*`, `harness_loopback`, `proxy_e2e`, `restore_chain`,
       `e2e_harness`, `e2e_shell`); CI workflow updated. P1.6 reintroduces
       baked-in-harness coverage.
-- [ ] **Publish-surface handoff**: P0's `bake-harness-claude.yml` calls `engram-cli
-      harness push` for the OCI push. That CLI subcommand is retired in this phase;
-      introduce a replacement (e.g. `engram-cli builtin-harness publish` or a
-      standalone publisher binary) and switch the workflow in the same pass so the
-      CI doesn't break between commits.
-- [ ] FC integration tests (`harness_loopback`, `e2e_harness`) green against the
-      baked-in harness and wired into `ci.yml`'s `--test` list.
+- [x] **Publish-surface handoff** *(087eccd)*: new `crates/engram-publish-builtin-
+      harness` binary; `bake-harness-claude.yml` switched; `engram-cli` `Harness`
+      subcommand surface deleted entirely; `RestoreBaseForSessionRequest`'s
+      `harness_pack_uri` / `harness_name` fields retired from the proto (numbers
+      reserved).
+- [x] **Coord-level test of the baked-harness path**: a `mode = dev_vm` session
+      against a harnessed image goes Active without spawning the harness — locks
+      the new SessionMode behavior in `tests/api.rs::
+      create_session_dev_vm_mode_skips_harness_on_harnessed_image`. (Full FC
+      integration coverage of the `mode = agent` path — the rewrites of the
+      deleted `harness_loopback` / `proxy_e2e` / `e2e_harness` — is follow-up
+      work: those need a real noop-harness musl binary + bake fixture, and the
+      coord-mock test can't reach the HostTcp dial without binding a listener
+      from inside `TestFixture`. Track separately.)
 
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
