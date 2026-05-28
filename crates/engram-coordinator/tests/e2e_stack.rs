@@ -6,20 +6,25 @@
 //! directly; `ha_listener.rs` and friends use an in-proc `AppState`.
 //! That left the coord HTTP → gRPC → host-agent → FC path uncovered,
 //! which is how prod session 8725648d's empty-Binary-frame bug shipped.
-//! This file covers the three flows the user named:
+//! This file covers the three flows the user named (ADR 0021 P1.3
+//! wire shape):
 //!
-//!   1. cold session with `harness=none` → `POST /exec ls` → assert stdout
-//!   2. cold session with `harness=claude` → `POST /exec ls` → assert stdout
-//!   3. cold session with `harness=claude` + bogus ANTHROPIC_API_KEY +
-//!      initial prompt → assert an Anthropic auth-failure event surfaces
-//!      in the session_events stream
+//!   1. cold session with `mode = dev_vm` → `POST /exec ls` → assert
+//!      stdout. Harness in the image (if any) is left undriven.
+//!   2. cold session with `mode = agent` against the baked-claude
+//!      image → `POST /exec ls` → assert stdout (agentd is up, harness
+//!      runs but the test just exec's a shell command).
+//!   3. cold session with `mode = agent` + bogus ANTHROPIC_API_KEY +
+//!      initial prompt → assert an Anthropic auth-failure event
+//!      surfaces in the session_events stream.
 //!
 //! All three are `#[ignore]`'d and gated by env vars. The CI lane
 //! `test-e2e-stack` in `.github/workflows/ci.yml` brings up the stack
-//! (`integration-up.sh` + `integration-bake-demo.sh` + `engram-cli
-//! harness add`), runs these tests via `cargo nextest --run-ignored`,
-//! and tears down on completion. Locally, follow the verification
-//! section of the e2e plan at `~/.claude/plans/wiggly-tickling-rose.md`.
+//! (`integration-up.sh` + `integration-bake-demo.sh`), runs these tests
+//! via `cargo nextest --run-ignored`, and tears down on completion.
+//! ADR 0021 P1.5 retired the separate `harness add` step — the harness
+//! is baked into the image at `/opt/engram/harness/` and the coord
+//! reads the launch contract from `manifest.toml`.
 
 use std::time::Duration;
 
@@ -103,9 +108,10 @@ impl Driver {
         )
     }
 
-    fn harness_name() -> String {
-        std::env::var("ENGRAM_E2E_HARNESS_NAME").unwrap_or_else(|_| "claude".to_string())
-    }
+    // ADR 0021 P1.3: `harness_name()` helper retired. Harness
+    // selection is baked into the image (`[harness]` in
+    // `engram.toml`); the wire shape just says "drive the agent"
+    // (`mode = agent`) or "skip it" (`mode = dev_vm`).
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let url = self.base.join(path).expect("join path");
@@ -116,10 +122,17 @@ impl Driver {
         req
     }
 
+    /// ADR 0021 P1.3: drive the image as a pure dev VM. Whether the
+    /// image has a baked `[harness]` block is irrelevant — `mode =
+    /// dev_vm` tells coord to skip `resolve_harness` and pass an
+    /// empty-argv `AgentSpec` to the backend. agentd hits the
+    /// readiness-probe branch (`harness_supervisor.rs::spawn`) and
+    /// never execs the harness binary even if it's sitting in the
+    /// rootfs at `/opt/engram/harness/`.
     async fn create_session_none_harness(&self, image: &str) -> SessionId {
         let body = serde_json::json!({
             "image": image,
-            "harness": { "kind": "none" },
+            "mode": "dev_vm",
         });
         let resp = self
             .req(reqwest::Method::POST, "/sessions")
@@ -138,16 +151,22 @@ impl Driver {
         parsed.session_id
     }
 
+    /// ADR 0021 P1.3: drive the image's baked harness. `mode =
+    /// agent` is the default but we set it explicitly so the test
+    /// remains correct if defaults shift later. The image referenced
+    /// by `ENGRAM_E2E_IMAGE_URI` must carry a `[harness] builtin =
+    /// "claude"` block (the CI bake of `deploy/demo-claude/` does);
+    /// coord reads the harness contract from `manifest.toml`, so
+    /// the request no longer names the harness directly.
     async fn create_session_claude(
         &self,
         image: &str,
         api_key: &str,
         prompt: Option<&str>,
     ) -> SessionId {
-        let harness_name = Self::harness_name();
         let mut body = serde_json::json!({
             "image": image,
-            "harness": { "kind": "builtin", "name": harness_name },
+            "mode": "agent",
             "secrets": { "ANTHROPIC_API_KEY": api_key },
         });
         if let Some(p) = prompt {
