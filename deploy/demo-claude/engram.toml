@@ -11,10 +11,16 @@ description = "Canonical workspace image with the built-in Claude harness baked 
 # read one source of truth.
 #
 # version is required: there are no rolling defaults. Bump it
-# explicitly when you want to track a newer harness build.
+# explicitly when you want to track a newer harness build. The
+# string here must match `HARNESS_VERSION` in
+# `.github/workflows/bake-harness-claude.yml` — that workflow
+# publishes `ghcr.io/cortexapps/engrams/harness-claude:<version>-
+# linux-x86_64`, and the baker pulls exactly that tag (no `:main`
+# / `:latest` fallback, by design — see the ADR's reproducibility
+# rule).
 [harness]
 builtin = "claude"
-version = "v0.1.0-placeholder"
+version = "v0.1.0"
 
 # Image-level secrets the *workspace* needs (e.g. NPM_TOKEN for
 # npm install, GITHUB_TOKEN for git push). Harness credentials

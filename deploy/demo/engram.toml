@@ -1,14 +1,12 @@
 name = "demo"
-description = "Canonical workspace image: debian:bookworm-slim + git + ttyd. Harness-neutral — the same image hosts any harness in `cfg.harnesses_dir`."
+description = "Harness-neutral starter image: debian:bookworm-slim + git + ttyd. Sessions of this image have no agent driving them (ADR 0021 P1.3: no `[harness]` block → `resolve_harness` returns None → coord passes an empty-argv AgentSpec → agentd hits its readiness-probe branch and never execs a harness child). Useful as a base for custom-harness authors who bring their own binary, and for shell-only / dev-VM workloads. For the default Claude-backed session see `deploy/demo-claude/` (same OS + tooling plus a baked [harness] = claude block)."
 
 # Image-level secret declarations are for things the *workspace* needs
 # (e.g. NPM_TOKEN for `npm install`, GITHUB_TOKEN for `git push`).
-# Harness credentials (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY,
-# etc.) live one layer above — they're per-harness and travel with
-# the harness pack at `cfg.harnesses_dir/<name>/`, not with the
-# image. The web form has a hard-coded UI for the `claude` harness
-# that asks the user for OAuth or API-key auth at session-create
-# time.
+# This image has no `[harness]` block, so there are no harness-level
+# secrets to declare here. When you bring your own harness, do it in
+# a sibling source dir (copy this one, add the binary + a `[harness]`
+# block in your `engram.toml`, point your bake at it).
 #
 # Add entries like the example below when your project actually
 # needs them; the demo image declares none.
