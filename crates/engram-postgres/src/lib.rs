@@ -70,13 +70,14 @@ impl MetadataStore for PostgresStore {
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
-        let harness_json = serde_json::to_value(&spec.harness)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0021 P1.3: `mode` is a flat text column now (migration
+        // 0039); `SessionMode::as_str` renders the CHECK-valid value.
+        let mode_text = spec.mode.as_str();
         sqlx::query(
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id,
-                 image_uri, harness,
+                 image_uri, mode,
                  created_at, last_active_at)
             VALUES ($1, $2, $3, NULL, $4, $5, $6, $6)
             "#,
@@ -85,7 +86,7 @@ impl MetadataStore for PostgresStore {
         .bind(spec.user_id.as_deref())
         .bind(SessionState::Pending.as_str())
         .bind(&spec.image)
-        .bind(harness_json)
+        .bind(mode_text)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -101,13 +102,14 @@ impl MetadataStore for PostgresStore {
         sandbox_id: SandboxId,
     ) -> Result<(), MetaError> {
         let now = Utc::now();
-        let harness_json = serde_json::to_value(&spec.harness)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0021 P1.3: `mode` is a flat text column now (migration
+        // 0039); `SessionMode::as_str` renders the CHECK-valid value.
+        let mode_text = spec.mode.as_str();
         sqlx::query(
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id, sandbox_id,
-                 image_uri, harness,
+                 image_uri, mode,
                  created_at, last_active_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
             "#,
@@ -118,7 +120,7 @@ impl MetadataStore for PostgresStore {
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
         .bind(&spec.image)
-        .bind(harness_json)
+        .bind(mode_text)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -130,7 +132,7 @@ impl MetadataStore for PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
+                   image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions WHERE id = $1
@@ -148,7 +150,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
+                   image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
@@ -372,7 +374,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
-                   image_uri, harness,
+                   image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    evac_attempts

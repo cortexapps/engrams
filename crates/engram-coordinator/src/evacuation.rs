@@ -269,7 +269,7 @@ mod tests {
     use async_trait::async_trait;
     use engram_core::traits::{HarnessDial, HostClient};
     use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
-    use engram_core::types::session::{HarnessSpec, Session, SessionState};
+    use engram_core::types::session::{Session, SessionMode, SessionState};
     use engram_core::types::snapshot::SnapshotMetadata;
     use engram_core::{HostId, SandboxId, SessionId};
     use parking_lot::Mutex as PlMutex;
@@ -651,7 +651,7 @@ mod tests {
             host_id: Some(host),
             sandbox_id: Some(sandbox),
             image: "ghcr.io/test/img:t".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,

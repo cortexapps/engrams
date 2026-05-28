@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
-use engram_core::types::session::{split_image_ref, HarnessSpec, ImageRef};
+use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -290,15 +290,19 @@ pub(crate) async fn load_session_secrets(
 pub struct CreateSessionRequest {
     /// Which baked image to boot. Required.
     pub image: ImageRef,
-    /// What agent process (if any) to attach. Defaults to
-    /// `HarnessSpec::None` — boot the VM and let the user drive it
-    /// via the in-browser shell or `engram exec`.
+    /// How the session uses the image (ADR 0021 P1.3). Defaults to
+    /// `SessionMode::Agent` — drive the image's baked harness if it
+    /// has one. `SessionMode::DevVm` keeps a harnessed image's agent
+    /// resident-but-undriven; the user interacts via shell /
+    /// `engram exec`. Per-session *selection* of which harness to
+    /// run is gone (the harness is baked at image-bake time).
     #[serde(default)]
-    pub harness: HarnessSpec,
+    pub mode: SessionMode,
     pub user_id: Option<String>,
     /// Initial prompt for the agent. Only meaningful when
-    /// `harness != None`; the API rejects with 400 when set
-    /// alongside `harness = None` (silent drop is a footgun).
+    /// `mode = Agent` and the image carries a `[harness]` block;
+    /// the API rejects with 400 when set alongside `mode = DevVm`
+    /// (silent drop is a footgun).
     #[serde(default)]
     pub prompt: Option<String>,
     /// Per-request secret values keyed by env-var name. Only
@@ -370,15 +374,13 @@ async fn create_session_inner(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     // -------- 0. Validate orthogonal axes --------
-    // `harness=None + non-empty prompt` is meaningless: there's no
-    // agent to consume the prompt. Silent drop hides the bug; reject
-    // explicitly so the dashboard / CLI surfaces the mistake.
-    if matches!(req.harness, HarnessSpec::None)
-        && !req.prompt.as_deref().map(str::is_empty).unwrap_or(true)
-    {
+    // ADR 0021 P1.3: `mode = DevVm + non-empty prompt` is meaningless
+    // — even if the image carries a baked harness, a DevVm session
+    // leaves it undriven, so there's nothing to receive the prompt.
+    // Reject explicitly so the dashboard / CLI surfaces the mistake.
+    if req.mode.is_dev_vm() && !req.prompt.as_deref().map(str::is_empty).unwrap_or(true) {
         return Err(ApiError::BadRequest(
-            "`prompt` requires a `harness` other than `none` — there is no agent to receive it"
-                .into(),
+            "`prompt` requires `mode = agent` — a dev-VM session has no agent to receive it".into(),
         ));
     }
 
@@ -413,38 +415,29 @@ async fn create_session_inner(
         ))
     })?;
 
-    // Validate the harness against the Postgres `harness_packs`
-    // registry. Stage B2 dropped the host-resident scan — every harness
-    // is registry-backed; the host-agent pulls the OCI artifact on
-    // first use and assembles a per-session substrate that gets
-    // mounted at `/run/engram/harnesses`. We resolve to the registry
-    // URI now so the SandboxSpec carries it down to the host-agent.
-    let harness_pack_uri: Option<String> = if let HarnessSpec::Builtin { name } = &req.harness {
-        let pack = state
-            .services
-            .meta
-            .get_harness_pack(name)
-            .await
-            .map_err(|e| ApiError::Internal(format!("harness lookup: {e}")))?;
-        match pack {
-            Some(p) => Some(p.registry_uri),
-            None => {
-                let available: Vec<String> = state
-                    .services
-                    .meta
-                    .list_harness_packs()
-                    .await
-                    .map(|v| v.into_iter().map(|p| p.name).collect())
-                    .unwrap_or_default();
-                return Err(ApiError::BadRequest(format!(
-                    "no harness `{name}` registered. Available: {available:?}. \
-                     Register via `engram harness add --name {name} --push <registry/repo:tag>`."
-                )));
-            }
+    // ADR 0021 P1.3: per-session harness selection is gone. The
+    // harness — if any — is an image property baked at image-bake
+    // time and recorded in `manifest.harness`. The old harness_packs
+    // registry lookup happens at no point in the new path; we just
+    // carry the image-manifest's resolved launch contract down to the
+    // backend. The legacy `harness_pack_uri` plumbing on SandboxSpec
+    // stays in place (always `None`) until P1.5 retires it along
+    // with the rest of the standalone harness subsystem.
+    let harness_pack_uri: Option<String> = None;
+    // Pre-flight gate: a session that asked for `mode = Agent` against
+    // a harness-less image is fine (it boots as if dev-VM), but we
+    // surface a 400 only when an image's `[harness]` block is
+    // malformed (`is_launchable() == false`). Manifests round-trip
+    // through `HarnessManifest::validate_source` at bake time, so
+    // this is defence-in-depth against drift.
+    if let Some(h) = manifest.harness.as_ref() {
+        if !h.is_launchable() && !req.mode.is_dev_vm() {
+            return Err(ApiError::Internal(format!(
+                "enabled image `{image_uri}` has a [harness] block that didn't resolve \
+                 (name/exec unset) — re-bake the image"
+            )));
         }
-    } else {
-        None
-    };
+    }
 
     // -------- 2. Resolve secrets --------
     let secret_ctx = SecretContext {
@@ -469,7 +462,7 @@ async fn create_session_inner(
     // never clones a repo or materializes anything itself.
     let spec = SessionSpec {
         image: req.image.clone(),
-        harness: req.harness.clone(),
+        mode: req.mode,
         user_id: req.user_id,
     };
 
@@ -552,21 +545,21 @@ async fn create_session_inner(
             None
         };
 
-    // The host-agent's `pooled_backend` reads this env hint to pick
-    // the substrate's mount-root subdir name. Without it, it falls
-    // back to the URI's last path segment (`harness-claude` for
-    // `localhost:5001/cortex/harness-claude:v1`) — but the in-VM
-    // bootstrap exec's `/run/engram/harnesses/<name>/harness` using
-    // the user-supplied harness name (`claude`), so the two paths
-    // diverge and the harness binary doesn't get found at boot. The
-    // env hint pins the host-agent to the canonical name.
-    if let HarnessSpec::Builtin { name } = &req.harness {
-        spec_env.insert("ENGRAM_SESSION_HARNESS_NAME".into(), name.clone());
+    // ADR 0021 P1.3: the harness identity (when any) comes from the
+    // image manifest, not the session request. Carry the resolved
+    // name through to the host-agent so the pooled_backend still
+    // pins its mount-root subdir name correctly (legacy substrate
+    // path; goes away with P1.5).
+    if let Some(h) = manifest.harness.as_ref() {
+        if let Some(name) = h.name.as_deref() {
+            spec_env.insert("ENGRAM_SESSION_HARNESS_NAME".into(), name.to_string());
+        }
     }
 
     let agent_for_session = resolve_harness(
         &state,
-        &req.harness,
+        manifest.harness.as_ref(),
+        req.mode,
         session_id,
         req.prompt.as_deref(),
         &spec_env,
@@ -611,11 +604,13 @@ async fn create_session_inner(
         .suggested_memory_mib
         .unwrap_or(DEFAULT_MEMORY_MIB);
 
-    let harness_name = if let HarnessSpec::Builtin { name } = &req.harness {
-        Some(name.clone())
-    } else {
-        None
-    };
+    // ADR 0021 P1.3: harness name comes from the resolved image
+    // manifest; the session no longer selects.
+    let harness_name = manifest
+        .harness
+        .as_ref()
+        .and_then(|h| h.name.clone())
+        .filter(|_| !req.mode.is_dev_vm());
     let (host_id, sandbox_id) = try_restore_base_snapshot(
         &state,
         base_snapshot_id,
@@ -1061,33 +1056,43 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Phase-0 transition shim. Translate the legacy `repo` URL scheme
-/// Resolve a session's [`HarnessSpec`] against the host's harness
-/// registry, building the [`AgentSpec`] the backend will spawn at
-/// `start_agent` time. `None` is returned for `HarnessSpec::None` —
-/// the sandbox boots with no agent, leaving the user to drive it
-/// via the in-browser shell or `engram exec`.
+/// Resolve the image's baked harness (ADR 0021 P1.3) into the
+/// [`AgentSpec`] the backend will spawn at `start_agent` time, or
+/// `None` for the readiness-probe path. Returns `None` when:
 ///
-/// Stage B2 made harnesses registry-only: the host-agent pulls the
-/// pack on first use into its content-addressable cache and assembles
-/// a per-session ext4 substrate that the VM mounts at
-/// `/run/engram/harnesses`. Two argv shapes depending on backend:
-/// - `HostTcp` (Process): `argv[0]` is the guest path; the host-agent
-///   rewrites it to its local cache path before launching, and the
-///   harness dials TCP loopback on `--connect`.
-/// - `Vsock` (FC/VZ): `argv[0]` is `/run/engram/harnesses/<name>`,
-///   exec'd inside the VM over the substrate mount; the harness
-///   dials AF_VSOCK on `--vsock-host`.
+/// - `session_mode` is [`SessionMode::DevVm`] — the user wants a pure
+///   dev VM and any resident agent stays undriven.
+/// - The image has no `[harness]` block.
+/// - The image's `[harness]` block is somehow not launchable
+///   (defence-in-depth; the validator catches this at bake time).
+///
+/// The argv builds off the manifest's resolved `exec` path (already
+/// rooted at `/opt/engram/harness/...` for built-ins, or whatever the
+/// custom-harness author's Dockerfile COPY'd), with backend-specific
+/// dial flags appended:
+/// - `HostTcp` (Process): `--connect <host:port>` against the
+///   coord-owned harness listener.
+/// - `Vsock` (FC/VZ): `--vsock-host <port>` for AF_VSOCK loopback into
+///   the host. The manifest's optional `args` ride after the standard
+///   flags so authors can pass adapter-specific switches.
 pub(crate) fn resolve_harness(
     state: &SharedState,
-    spec: &HarnessSpec,
+    image_harness: Option<&engram_core::types::image::HarnessManifest>,
+    session_mode: SessionMode,
     session_id: SessionId,
     initial_prompt: Option<&str>,
     base_env: &HashMap<String, String>,
 ) -> Result<Option<engram_core::types::sandbox::AgentSpec>, ApiError> {
-    let name = match spec {
-        HarnessSpec::None => return Ok(None),
-        HarnessSpec::Builtin { name } => name,
+    if session_mode.is_dev_vm() {
+        return Ok(None);
+    }
+    let Some(harness) = image_harness else {
+        return Ok(None);
+    };
+    // Defence-in-depth — engram.toml validation should have already
+    // rejected this at bake time.
+    let (Some(_name), Some(exec)) = (harness.name.as_deref(), harness.exec.as_deref()) else {
+        return Ok(None);
     };
 
     let mut env: HashMap<String, String> = base_env.clone();
@@ -1096,8 +1101,7 @@ pub(crate) fn resolve_harness(
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
     }
 
-    let guest_path = crate::harness_paths::guest_argv0(name);
-    let argv = match state.services.host.harness_dial() {
+    let mut argv = match state.services.host.harness_dial() {
         engram_core::traits::HarnessDial::HostTcp => {
             let addr = match *state.harness_listen_addr.lock() {
                 Some(addr) => addr,
@@ -1109,7 +1113,7 @@ pub(crate) fn resolve_harness(
             };
             env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
             vec![
-                guest_path,
+                exec.to_string(),
                 "--connect".into(),
                 addr.to_string(),
                 "--session-id".into(),
@@ -1119,7 +1123,7 @@ pub(crate) fn resolve_harness(
         engram_core::traits::HarnessDial::Vsock => {
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
-                guest_path,
+                exec.to_string(),
                 "--vsock-host".into(),
                 port.to_string(),
                 "--session-id".into(),
@@ -1127,6 +1131,11 @@ pub(crate) fn resolve_harness(
             ]
         }
     };
+    // Author-supplied extra args (manifest `[harness] args = [...]`)
+    // ride after the standard dial flags so they can specialise the
+    // adapter without overriding the SDK contract.
+    argv.extend(harness.args.iter().cloned());
+
     Ok(Some(engram_core::types::sandbox::AgentSpec {
         argv,
         env,

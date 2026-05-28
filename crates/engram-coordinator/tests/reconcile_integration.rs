@@ -26,7 +26,7 @@ use engram_coordinator::state::SessionEventBus;
 use engram_coordinator::HostRegistry;
 use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
-use engram_core::types::session::HarnessSpec;
+use engram_core::types::session::SessionMode;
 use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
@@ -61,7 +61,7 @@ impl ReconcileMeta {
                 host_id: Some(host),
                 sandbox_id: Some(sandbox),
                 image: "localhost:5001/demo:test".into(),
-                harness: HarnessSpec::None,
+                mode: SessionMode::Agent,
                 created_at: now,
                 last_active_at: now,
                 live_disk_manifest: None,

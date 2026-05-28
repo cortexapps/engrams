@@ -101,14 +101,17 @@ enum SessionCmd {
         /// Example: `--image ghcr.io/cortex/api:warm-2026-04`
         #[arg(long)]
         image: String,
-        /// Which baked-in harness to attach. `none` (default) boots
-        /// the VM with no agent; otherwise the value is the manifest
-        /// `[[harness]] name = ...` to attach (e.g. `claude`, `noop`).
-        #[arg(long, default_value = "none")]
-        harness: String,
-        /// Initial prompt for the agent. Only meaningful when
-        /// `--harness` is not `none`; the API rejects with 400 if a
-        /// prompt is supplied alongside `--harness none`.
+        /// Boot the image as a pure dev VM — leave the baked harness
+        /// (if any) resident-but-undriven. Default is to drive the
+        /// image's harness (ADR 0021 P1.3 replaced the per-session
+        /// harness selection: which harness an image runs is now an
+        /// image property).
+        #[arg(long, default_value_t = false)]
+        dev_vm: bool,
+        /// Initial prompt for the agent. Only meaningful in the
+        /// default (agent) mode against an image that has a baked
+        /// harness; the API rejects with 400 if a prompt is supplied
+        /// alongside `--dev-vm`.
         #[arg(long)]
         prompt: Option<String>,
         /// Free-form user identifier surfaced on the row.
@@ -419,7 +422,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
         Cmd::Session { cmd } => match cmd {
             SessionCmd::Create {
                 image,
-                harness,
+                dev_vm,
                 prompt,
                 user_id,
             } => {
@@ -427,7 +430,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     &client,
                     &cli.endpoint,
                     image,
-                    harness,
+                    *dev_vm,
                     prompt.as_deref(),
                     user_id.as_deref(),
                     cli.json,
@@ -712,19 +715,19 @@ async fn session_create(
     client: &reqwest::Client,
     endpoint: &str,
     image: &str,
-    harness: &str,
+    dev_vm: bool,
     prompt: Option<&str>,
     user_id: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    let harness_value = match harness {
-        "none" => serde_json::json!({"kind": "none"}),
-        name => serde_json::json!({"kind": "builtin", "name": name}),
-    };
     let mut payload = serde_json::Map::new();
     // Stage B1+: image is a flat OCI URI string.
     payload.insert("image".into(), Value::from(image));
-    payload.insert("harness".into(), harness_value);
+    // ADR 0021 P1.3: the session axis is mode, not harness selection.
+    // Omit on Agent (the server default) so the wire stays minimal.
+    if dev_vm {
+        payload.insert("mode".into(), Value::from("dev_vm"));
+    }
     if let Some(u) = user_id {
         payload.insert("user_id".into(), Value::from(u));
     }

@@ -164,7 +164,7 @@ mod tests {
     use crate::Services;
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
-    use engram_core::types::session::HarnessSpec;
+    use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
     use engram_core::types::SessionState;
     use engram_sandbox_process::ProcessBackend;
@@ -223,7 +223,7 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,

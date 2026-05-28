@@ -19,7 +19,7 @@ use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::registry::EnabledImage;
-use engram_core::types::session::HarnessSpec;
+use engram_core::types::session::SessionMode;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{SandboxId, SessionSpec, SnapshotId};
 use uuid::Uuid;
@@ -166,7 +166,7 @@ async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
     let session_id = meta
         .create_session(SessionSpec {
             image: "phase-c-helpers-test:warm-1".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -247,7 +247,7 @@ async fn record_snapshot_bumps_chunk_generation() {
     let session_id = meta
         .create_session(SessionSpec {
             image: "phase-c-snapshot-bump-test:warm-1".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await

@@ -475,10 +475,23 @@ pub async fn finish_resume_to_active(
             );
         }
     }
-    let agent_opt =
-        crate::api::sessions::resolve_harness(state, &session.harness, id, None, &resume_base_env)
-            .ok()
-            .flatten();
+    // ADR 0021 P1.3: resolve_harness reads the image manifest's
+    // [harness] block + the session's mode, not a per-session
+    // HarnessSpec. The resume bundle already loaded the manifest;
+    // a None bundle (manifest fetch failed above) means we skip the
+    // agent re-attach, same as the dev-VM path.
+    let agent_opt = resume_bundle.as_ref().and_then(|b| {
+        crate::api::sessions::resolve_harness(
+            state,
+            b.manifest.harness.as_ref(),
+            session.mode,
+            id,
+            None,
+            &resume_base_env,
+        )
+        .ok()
+        .flatten()
+    });
     let mut start_agent_failed = false;
     if let Some(agent) = agent_opt {
         // Rebuild the SessionEgressPolicy for the new sandbox.

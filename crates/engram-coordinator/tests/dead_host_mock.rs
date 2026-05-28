@@ -38,7 +38,7 @@ impl MetadataStore for MiniMeta {
                 sandbox_id: None,
                 created_at: Utc::now(),
                 image: spec.image,
-                harness: spec.harness,
+                mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
             },
@@ -62,7 +62,7 @@ impl MetadataStore for MiniMeta {
                 sandbox_id: Some(sandbox_id),
                 created_at: Utc::now(),
                 image: spec.image,
-                harness: spec.harness,
+                mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
             },
@@ -257,11 +257,11 @@ impl MetadataStore for MiniMeta {
 }
 
 async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> SessionId {
-    use engram_core::types::session::HarnessSpec;
+    use engram_core::types::session::SessionMode;
     let id = meta
         .create_session(SessionSpec {
             image: "localhost:5001/demo:warm-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             user_id: None,
         })
         .await

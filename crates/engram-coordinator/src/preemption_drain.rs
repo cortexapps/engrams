@@ -295,7 +295,7 @@ mod tests {
     use engram_cloud_mock::MockCloud;
     use engram_core::traits::{CloudBackend, SandboxBackend};
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-    use engram_core::types::session::HarnessSpec;
+    use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
@@ -359,7 +359,7 @@ mod tests {
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,
             image: "test/repo:drain-test".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,

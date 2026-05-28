@@ -698,7 +698,7 @@ pub(crate) mod tests {
     // ---------------------------------------------------------------
     use async_trait::async_trait;
     use engram_core::traits::MetadataStore;
-    use engram_core::types::session::HarnessSpec;
+    use engram_core::types::session::SessionMode;
     use engram_core::types::{
         HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SnapshotRecord,
     };
@@ -1153,7 +1153,7 @@ pub(crate) mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:idle-dedup".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
@@ -1214,7 +1214,7 @@ pub(crate) mod tests {
             host_id: None,
             sandbox_id,
             image: "test/repo:phase-b".into(),
-            harness: HarnessSpec::None,
+            mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,

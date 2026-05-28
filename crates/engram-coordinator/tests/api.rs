@@ -84,7 +84,7 @@ impl MetadataStore for MockMetadataStore {
             sandbox_id: None,
             created_at: Utc::now(),
             image: spec.image,
-            harness: spec.harness,
+            mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
         };
@@ -107,7 +107,7 @@ impl MetadataStore for MockMetadataStore {
             sandbox_id: Some(sandbox_id),
             created_at: Utc::now(),
             image: spec.image,
-            harness: spec.harness,
+            mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
         };
@@ -889,7 +889,13 @@ async fn create_session_with_explicit_image_persists_full_row() {
     let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
     let session = store.get_session(id).await.unwrap();
     assert_eq!(session.image, "cortex/api:warm-pinned");
-    assert!(session.harness.is_none());
+    // ADR 0021 P1.3: a default-mode session is `Agent` (the harness,
+    // if any, comes from the image). DevVm-vs-Agent is the session
+    // axis now, not None-vs-Builtin.
+    assert_eq!(
+        session.mode,
+        engram_core::types::session::SessionMode::Agent
+    );
     assert_eq!(session.status, SessionState::Active);
 }
 
@@ -916,10 +922,11 @@ async fn create_session_with_unknown_image_returns_400() {
 }
 
 #[tokio::test]
-async fn create_session_prompt_with_no_harness_is_400() {
-    // `prompt` requires an agent to receive it. Silent drop is a
-    // footgun — the API rejects with 400 so the dashboard surfaces
-    // the misuse explicitly.
+async fn create_session_prompt_with_dev_vm_mode_is_400() {
+    // ADR 0021 P1.3: `prompt` requires an agent to receive it. A
+    // dev-VM session leaves the image's baked harness undriven, so
+    // there's nothing on the other end of `prompt` — reject with 400
+    // rather than silently dropping the prompt.
     let app = build_app(MockMetadataStore::arc());
     let resp = app
         .oneshot(json_request(
@@ -927,8 +934,7 @@ async fn create_session_prompt_with_no_harness_is_400() {
             "/sessions",
             json!({
                 "image": "r:warm-bootstrap",
-                "workspace": {"kind":"empty"},
-                "harness": {"kind":"none"},
+                "mode": "dev_vm",
                 "prompt": "do the thing",
             }),
         ))
@@ -937,28 +943,15 @@ async fn create_session_prompt_with_no_harness_is_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
-async fn create_session_unknown_harness_name_is_400() {
-    // Harness names live in the host registry now (deployment-wide),
-    // not the image manifest. Asking for one that isn't registered
-    // returns 400. The test fixture's HarnessRegistry is empty so
-    // any builtin name is unknown.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/sessions",
-            json!({
-                "image": "r:warm-bootstrap",
-                "workspace": {"kind":"empty"},
-                "harness": {"kind":"builtin","name":"codex"},
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
+// ADR 0021 P1.3 deleted `create_session_unknown_harness_name_is_400`:
+// the session no longer selects which harness to attach (that's an
+// image-manifest property baked at image-bake time). The equivalent
+// post-0021 failure mode is "the image has no [harness] block, so
+// even with mode=Agent the session runs as a dev VM" — which is *not*
+// an error condition, it's the harness-less template case. The image-
+// manifest validation in engram-image-builder catches a malformed
+// `[harness]` block at bake; there's no per-session "unknown harness"
+// path anymore.
 
 #[tokio::test]
 async fn get_session_returns_404_for_unknown_id() {
@@ -1022,7 +1015,7 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
         store
             .create_session(SessionSpec {
                 image: format!("{repo}:warm-bootstrap"),
-                harness: engram_core::types::session::HarnessSpec::None,
+                mode: engram_core::types::session::SessionMode::Agent,
                 user_id: None,
             })
             .await
@@ -1062,9 +1055,10 @@ async fn list_sessions_serializes_full_session_record() {
     let id = store
         .create_session(SessionSpec {
             image: "cortex/api:warm-2026-04-27".into(),
-            harness: engram_core::types::session::HarnessSpec::Builtin {
-                name: "claude".into(),
-            },
+            // ADR 0021 P1.3: per-session HarnessSpec is gone — the
+            // harness is an image property. `mode = dev_vm` exercises
+            // the non-default arm of the wire shape.
+            mode: engram_core::types::session::SessionMode::DevVm,
             user_id: Some("user-42".into()),
         })
         .await
@@ -1091,8 +1085,11 @@ async fn list_sessions_serializes_full_session_record() {
         item.get("workspace").is_none(),
         "ADR 0005 retired the workspace field"
     );
-    assert_eq!(item["harness"]["kind"], "builtin");
-    assert_eq!(item["harness"]["name"], "claude");
+    assert!(
+        item.get("harness").is_none(),
+        "ADR 0021 P1.3 retired the per-session harness field"
+    );
+    assert_eq!(item["mode"], "dev_vm");
     assert_eq!(item["user_id"], "user-42");
     assert_eq!(item["status"], SessionState::Pending.as_str());
     assert!(item["created_at"].is_string());
@@ -1105,7 +1102,7 @@ async fn delete_session_marks_completed_and_returns_204() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -1310,7 +1307,7 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -1620,7 +1617,7 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -1694,7 +1691,7 @@ async fn evict_local_409_when_session_not_active() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -1725,7 +1722,7 @@ async fn resume_410_gone_when_no_snapshot_exists() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -1796,7 +1793,7 @@ async fn exec_rejects_request_without_command_or_argv() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -1820,7 +1817,7 @@ async fn exec_rejects_empty_argv() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -2018,7 +2015,7 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
     let id = store
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
-            harness: engram_core::types::session::HarnessSpec::None,
+            mode: engram_core::types::session::SessionMode::Agent,
             user_id: None,
         })
         .await
@@ -3146,7 +3143,7 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
                 host_id: None,
                 sandbox_id: Some(sandbox_id),
                 image: "test/repo:live-manifest".into(),
-                harness: engram_core::types::session::HarnessSpec::None,
+                mode: engram_core::types::session::SessionMode::Agent,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
@@ -3249,7 +3246,7 @@ async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
                 host_id: None,
                 sandbox_id: None,
                 image: "test/repo:no-bind".into(),
-                harness: engram_core::types::session::HarnessSpec::None,
+                mode: engram_core::types::session::SessionMode::Agent,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
@@ -3285,7 +3282,7 @@ async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
                 host_id: None,
                 sandbox_id: Some(sandbox_id),
                 image: "test/repo:idle-flush".into(),
-                harness: engram_core::types::session::HarnessSpec::None,
+                mode: engram_core::types::session::SessionMode::Agent,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
@@ -3330,7 +3327,7 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
                 host_id: None,
                 sandbox_id: Some(sandbox_id),
                 image: "test/repo:unbind".into(),
-                harness: engram_core::types::session::HarnessSpec::None,
+                mode: engram_core::types::session::SessionMode::Agent,
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,

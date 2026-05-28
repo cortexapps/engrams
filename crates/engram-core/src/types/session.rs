@@ -224,38 +224,64 @@ pub fn split_image_ref(uri: &str) -> (&str, &str) {
     (uri, "")
 }
 
-/// What long-running agent process (if any) attaches to the session.
-/// `None` is the "VM with a shell" mode — agentd runs RPC + shell
-/// but never spawns a harness child (`SpawnHarness` arrives with
-/// empty argv as a readiness probe).
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HarnessSpec {
+/// How a session uses its image (ADR 0021 P1.3). Whether a harness
+/// runs at all is now an *image* property (the `[harness]` block in
+/// `engram.toml`); the session only chooses whether the host actually
+/// drives the resident harness or treats the VM as a shell-only dev
+/// machine.
+///
+/// For a harness-less image (no `[harness]` block) `Agent` is
+/// effectively the same as `DevVm` — there's nothing for the host to
+/// drive — but the surface stays uniform: the session-create API
+/// always carries a `mode`, and the legacy `HarnessSpec` selection
+/// per session is gone (the harness is baked at image-bake time, not
+/// session-create time).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Run the image's baked harness (if any). The host calls
+    /// `SpawnHarness` with the manifest-declared argv; the resident
+    /// agent serves the session.
     #[default]
-    None,
-    /// One of the harnesses declared in the image manifest's
-    /// `harnesses` array. The coordinator validates `name` against
-    /// the manifest at create time and returns 400 on mismatch.
-    Builtin { name: String },
+    Agent,
+    /// Boot the image as a pure dev VM. If the image has a baked
+    /// harness, it's left resident in the warm snapshot but never
+    /// driven — `SpawnHarness` arrives with empty argv as a readiness
+    /// probe, just like the old `HarnessSpec::None` path. Sessions
+    /// interact via shell / `engram exec`.
+    DevVm,
 }
 
-impl HarnessSpec {
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+impl SessionMode {
+    /// True for the dev-VM case — no harness child spawn, regardless
+    /// of whether the image has one baked in.
+    pub fn is_dev_vm(self) -> bool {
+        matches!(self, Self::DevVm)
+    }
+
+    /// Wire-string used in the DB (`sessions.mode` TEXT column,
+    /// CHECK-constrained to this exact set in migration 0039) and in
+    /// the HTTP API. Matches the serde `rename_all = "snake_case"`
+    /// output for the same variants.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::DevVm => "dev_vm",
+        }
     }
 }
 
 /// User-facing request to create a session. Two axes:
-/// image (immutable rootfs that supplies the workspace) +
-/// harness (what agent attaches). ADR 0005 retired the
-/// `WorkspaceSpec` axis — the bake image's `/workspace` is the
-/// workspace; agents that need git push do it themselves inside the
-/// sandbox using credentials mounted via `[secrets.X]`.
+/// image (immutable rootfs that supplies the workspace + the optional
+/// baked harness) + mode (drive the harness or treat the VM as a dev
+/// machine). ADR 0005 retired the `WorkspaceSpec` axis; ADR 0021 P1.3
+/// retired the per-session `HarnessSpec` axis — the harness is an
+/// image property now.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionSpec {
     pub image: ImageRef,
     #[serde(default)]
-    pub harness: HarnessSpec,
+    pub mode: SessionMode,
     pub user_id: Option<String>,
 }
 
@@ -274,7 +300,7 @@ pub struct Session {
     pub sandbox_id: Option<SandboxId>,
     pub image: ImageRef,
     #[serde(default)]
-    pub harness: HarnessSpec,
+    pub mode: SessionMode,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
     /// ADR 0016 Phase B: the host's last-published live disk
@@ -457,26 +483,29 @@ mod tests {
     }
 
     #[test]
-    fn harness_spec_default_is_none() {
-        assert!(HarnessSpec::default().is_none());
-        assert!(!HarnessSpec::Builtin {
-            name: "claude".into()
-        }
-        .is_none());
+    fn session_mode_default_is_agent() {
+        // Default is the "drive the baked harness" case so a
+        // SessionSpec deserialized from a payload that omits `mode`
+        // matches today's expectation: hosts drive the harness when
+        // there's one to drive.
+        assert_eq!(SessionMode::default(), SessionMode::Agent);
+        assert!(!SessionMode::Agent.is_dev_vm());
+        assert!(SessionMode::DevVm.is_dev_vm());
     }
 
     #[test]
-    fn harness_spec_round_trips_through_json() {
-        let cases = vec![
-            HarnessSpec::None,
-            HarnessSpec::Builtin {
-                name: "claude".into(),
-            },
-        ];
-        for h in cases {
-            let blob = serde_json::to_string(&h).unwrap();
-            let back: HarnessSpec = serde_json::from_str(&blob).unwrap();
-            assert_eq!(back, h);
+    fn session_mode_round_trips_through_json() {
+        // Wire shape is the flat snake_case string — `"agent"` /
+        // `"dev_vm"` — chosen so the API surface stays human-readable
+        // and the dashboard form can use it directly.
+        for (mode, expected) in [
+            (SessionMode::Agent, "\"agent\""),
+            (SessionMode::DevVm, "\"dev_vm\""),
+        ] {
+            let blob = serde_json::to_string(&mode).unwrap();
+            assert_eq!(blob, expected);
+            let back: SessionMode = serde_json::from_str(&blob).unwrap();
+            assert_eq!(back, mode);
         }
     }
 
@@ -501,9 +530,7 @@ mod tests {
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
             image: "ghcr.io/cortex/api:warm-20260101T000000Z".into(),
-            harness: HarnessSpec::Builtin {
-                name: "claude".into(),
-            },
+            mode: SessionMode::DevVm,
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
@@ -512,6 +539,6 @@ mod tests {
         let back: Session = serde_json::from_str(&blob).unwrap();
         assert_eq!(back.id, original.id);
         assert_eq!(back.image, original.image);
-        assert_eq!(back.harness, original.harness);
+        assert_eq!(back.mode, original.mode);
     }
 }
