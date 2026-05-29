@@ -200,7 +200,7 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
 
 async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
     // Serialize resume against concurrent resume + eviction for this session.
-    // Reuses the per-session `eviction_inflight` lease (keyed on session_id).
+    // Reuses the per-session `session_lease` lease (keyed on session_id).
     // Without it, two concurrent resumes — e.g. the prompt path's auto-resume
     // (`ensure_active`) racing a manual `/resume`, or two prompts on one Idle
     // session — each call `restore_for_session`, creating a live VM *before*
@@ -209,15 +209,8 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
     // leave the row bound to the wrong one). Holding the lease for the whole
     // resume makes resume + eviction mutually exclusive per session. The
     // lease's `sandbox_id` is a diagnostic-only column; resume has no sandbox
-    // at acquire time, so a nil sentinel marks "resume in flight" (vs an
-    // eviction's real sandbox). (Renamed to a session-op lease in a follow-up.)
-    let _lease = match crate::idle_evictor::InflightEvictionGuard::try_acquire(
-        &state,
-        id,
-        SandboxId::from(uuid::Uuid::nil()),
-    )
-    .await
-    {
+    // at acquire time (it's about to create one), so we pass `None`.
+    let _lease = match crate::idle_evictor::SessionLeaseGuard::try_acquire(&state, id, None).await {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             return Err(ApiError::Conflict(format!(

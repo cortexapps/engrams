@@ -195,13 +195,13 @@ pub async fn run_with_registry_and_local(
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
 
     // ADR 0016 §A.1.5c: stale-lease reaper for the
-    // `eviction_inflight` PG table. Any lease whose RAII Drop was
+    // `session_lease` PG table. Any lease whose RAII Drop was
     // skipped (panic, OOM, pod terminated mid-pipeline) becomes
     // a permanent block on re-evicting that session until reaped.
     // 180s max-age matches the host-side §A.1.5a sweep; 30s poll
     // interval is cheap (one DELETE every 30s, rows are short-
     // lived under normal operation).
-    let _eviction_lease_reaper = idle_evictor::spawn_eviction_lease_reaper(
+    let _eviction_lease_reaper = idle_evictor::spawn_session_lease_reaper(
         state.services.meta.clone(),
         std::time::Duration::from_secs(180),
         std::time::Duration::from_secs(30),

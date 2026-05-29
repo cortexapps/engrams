@@ -1076,6 +1076,19 @@ Phase B's migration must take `0034_` (or whichever the next
 free number is when Phase B opens). Renumber + rename in the
 Phase B commit chain — do not leave a duplicate `0033`.
 
+**Later renamed (ADR 0021 follow-up, migration `0044`, 2026-05-29)**:
+the coord-side `eviction_inflight` table → `session_lease`, and its
+`sandbox_id` dropped `NOT NULL`. The lease stopped being
+eviction-only — the resume path now takes the same per-session lease
+so a resume can't race an eviction (or another resume) and orphan a
+sandbox; resume stores `sandbox_id = NULL` (no sandbox yet). The Rust
+surface moved with it: `SessionLeaseGuard`, `try_acquire_session_lease`,
+`release_session_lease`, `sweep_stale_session_leases`, `StaleSessionLease`.
+The design narrative below still uses the original `eviction_inflight`
+naming as the point-in-time record. NB: the host-side
+`HarnessHub::eviction_inflight` in-memory map (A.1.5a, below) is a
+*different* mechanism and keeps its name.
+
 #### Phase B failure mode to close: resumed sandboxes don't rejoin chunked-disk tracking
 
 **Surfaced 2026-05-24 on session 8588dc5c** (post-Phase-A.1

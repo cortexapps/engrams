@@ -77,7 +77,7 @@ pub async fn evict_session_to_state(
         )));
     }
     // ADR 0016 §A.1.5c: cross-replica re-entry guard backed by the
-    // `eviction_inflight` PG table. Replaces A.1.5b's per-pod
+    // `session_lease` PG table. Replaces A.1.5b's per-pod
     // DashMap. If two callers (different coord pods, operator
     // drain, future evacuation primitive) race into
     // `evict_idle_session` for the same session, the second one's
@@ -85,13 +85,13 @@ pub async fn evict_session_to_state(
     // return Ok(()) with an info log. The first owns the pipeline.
     // The RAII guard's Drop spawns a best-effort DELETE so the
     // lease releases on every exit path (success, error, panic).
-    let _guard = match InflightEvictionGuard::try_acquire(state, session_id, sandbox_id).await {
+    let _guard = match SessionLeaseGuard::try_acquire(state, session_id, Some(sandbox_id)).await {
         Ok(Some(g)) => g,
         Ok(None) => {
             tracing::info!(
                 session_id = %session_id,
                 sandbox_id = %sandbox_id,
-                "idle eviction skipped: pipeline already in flight (eviction_inflight row held)",
+                "idle eviction skipped: pipeline already in flight (session_lease row held)",
             );
             return Ok(());
         }
@@ -101,7 +101,7 @@ pub async fn evict_session_to_state(
             // unguarded pipeline that might race a peer pod. The
             // host-side gate (§A.1.5a) suppresses the storm.
             return Err(EvictError::Meta(format!(
-                "eviction lease acquire failed: {e}"
+                "session lease acquire failed: {e}"
             )));
         }
     };
@@ -312,28 +312,36 @@ pub async fn evict_session_to_state(
     Ok(())
 }
 
-/// ADR 0016 §A.1.5c: RAII guard around the `eviction_inflight` PG
+/// ADR 0016 §A.1.5c: RAII guard around the `session_lease` PG
 /// row. `try_acquire` does INSERT ... ON CONFLICT DO NOTHING; on
 /// 1 row affected returns `Ok(Some(Self))`, on 0 rows affected
 /// returns `Ok(None)` (lease held by another caller). Drop spawns
 /// a best-effort DELETE so the lease releases on every exit path
 /// (success, error, panic). A stale row that survives a panic /
-/// pod crash is reaped by `spawn_eviction_lease_reaper` at 180s.
-pub(crate) struct InflightEvictionGuard {
+/// pod crash is reaped by `spawn_session_lease_reaper` at 180s.
+///
+/// Held by both the idle-eviction pipeline (`evict_session_to_state`)
+/// and the resume path (`api::snapshot::resume_session`) so the two
+/// can never drive one session concurrently — without it, a resume
+/// racing an eviction (or two resumes) builds a live VM before the
+/// serializing state transition and orphans a sandbox. `sandbox_id`
+/// is diagnostic: `Some` for an eviction, `None` for a resume (no
+/// sandbox exists yet).
+pub(crate) struct SessionLeaseGuard {
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     session_id: SessionId,
 }
 
-impl InflightEvictionGuard {
+impl SessionLeaseGuard {
     pub(crate) async fn try_acquire(
         state: &SharedState,
         session_id: SessionId,
-        sandbox_id: SandboxId,
+        sandbox_id: Option<SandboxId>,
     ) -> Result<Option<Self>, engram_core::MetaError> {
         let acquired = state
             .services
             .meta
-            .try_acquire_eviction_lease(session_id, sandbox_id, state.pod_id.as_str())
+            .try_acquire_session_lease(session_id, sandbox_id, state.pod_id.as_str())
             .await?;
         if acquired {
             Ok(Some(Self {
@@ -346,20 +354,20 @@ impl InflightEvictionGuard {
     }
 }
 
-impl Drop for InflightEvictionGuard {
+impl Drop for SessionLeaseGuard {
     fn drop(&mut self) {
         // Drop is sync; release runs as a detached tokio task. Best-
         // effort: if the runtime is shutting down or the DELETE fails,
-        // the stale-lease reaper (`spawn_eviction_lease_reaper`)
+        // the stale-lease reaper (`spawn_session_lease_reaper`)
         // cleans it up at the next 180s tick.
         let meta = self.meta.clone();
         let session_id = self.session_id;
         tokio::spawn(async move {
-            if let Err(e) = meta.release_eviction_lease(session_id).await {
+            if let Err(e) = meta.release_session_lease(session_id).await {
                 tracing::warn!(
                     %session_id,
                     error = %e,
-                    "eviction lease release failed; stale-lease reaper will retry",
+                    "session lease release failed; stale-lease reaper will retry",
                 );
             }
         });
@@ -367,7 +375,7 @@ impl Drop for InflightEvictionGuard {
 }
 
 /// ADR 0016 §A.1.5c stale-lease reaper. Background task spawned at
-/// coord startup. Every 30s, deletes `eviction_inflight` rows older
+/// coord startup. Every 30s, deletes `session_lease` rows older
 /// than `max_age` (default 180s — 6× the prior host-side timeout,
 /// matches the §A.1.5a sweep threshold). One `tracing::warn!` per
 /// reaped row carries `(session_id, sandbox_id, locked_by,
@@ -375,7 +383,7 @@ impl Drop for InflightEvictionGuard {
 ///
 /// Returns the spawned `JoinHandle` so the caller can hold it for
 /// the process lifetime; dropping the handle aborts the loop.
-pub fn spawn_eviction_lease_reaper(
+pub fn spawn_session_lease_reaper(
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     max_age: std::time::Duration,
     poll_interval: std::time::Duration,
@@ -387,23 +395,23 @@ pub fn spawn_eviction_lease_reaper(
         tick.tick().await;
         loop {
             tick.tick().await;
-            match meta.sweep_stale_eviction_leases(max_age).await {
+            match meta.sweep_stale_session_leases(max_age).await {
                 Ok(reaped) => {
                     for lease in reaped {
                         tracing::warn!(
                             session_id = %lease.session_id,
-                            sandbox_id = %lease.sandbox_id,
+                            sandbox_id = ?lease.sandbox_id,
                             locked_by = %lease.locked_by,
                             locked_at = %lease.locked_at,
                             max_age_secs = max_age.as_secs(),
-                            "ADR 0016 §A.1.5c: reaped stale eviction_inflight lease",
+                            "ADR 0016 §A.1.5c: reaped stale session lease",
                         );
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "eviction lease reaper sweep failed; will retry next tick",
+                        "session lease reaper sweep failed; will retry next tick",
                     );
                 }
             }
@@ -1059,7 +1067,7 @@ mod tests {
     }
 
     /// ADR 0016 §A.1.5c regression guard. With a peer pod's lease
-    /// pre-installed in the `eviction_inflight` table (simulated
+    /// pre-installed in the `session_lease` table (simulated
     /// via MiniMeta's in-memory mirror), a fresh
     /// `evict_idle_session` call must short-circuit to Ok(())
     /// without touching the session. Once the peer's lease is
@@ -1095,11 +1103,11 @@ mod tests {
         // Simulate a peer coord pod holding the lease — direct
         // insert into MiniMeta's in-memory mirror is the
         // equivalent of another pod's prior
-        // `try_acquire_eviction_lease` having returned `true`.
+        // `try_acquire_session_lease` having returned `true`.
         state
             .services
             .meta
-            .try_acquire_eviction_lease(session_id, sandbox_id, "peer-pod-fixture")
+            .try_acquire_session_lease(session_id, Some(sandbox_id), "peer-pod-fixture")
             .await
             .expect("MiniMeta lease acquire never errors")
             .then_some(())
@@ -1129,7 +1137,7 @@ mod tests {
         state
             .services
             .meta
-            .release_eviction_lease(session_id)
+            .release_session_lease(session_id)
             .await
             .unwrap();
 
@@ -1156,7 +1164,7 @@ mod tests {
         let could_acquire_again = state
             .services
             .meta
-            .try_acquire_eviction_lease(session_id, sandbox_id, "post-test-probe")
+            .try_acquire_session_lease(session_id, Some(sandbox_id), "post-test-probe")
             .await
             .unwrap();
         assert!(
@@ -1411,7 +1419,7 @@ mod tests {
     /// MiniMeta's in-memory mirror — we backdate one entry by
     /// hand, then call sweep with a small threshold.
     #[tokio::test]
-    async fn sweep_stale_eviction_leases_reaps_old_entries() {
+    async fn sweep_stale_session_leases_reaps_old_entries() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
@@ -1440,13 +1448,13 @@ mod tests {
         state
             .services
             .meta
-            .try_acquire_eviction_lease(stale_session, sandbox_id, "stale-pod")
+            .try_acquire_session_lease(stale_session, Some(sandbox_id), "stale-pod")
             .await
             .unwrap();
         state
             .services
             .meta
-            .try_acquire_eviction_lease(fresh_session, sandbox_id, "fresh-pod")
+            .try_acquire_session_lease(fresh_session, Some(sandbox_id), "fresh-pod")
             .await
             .unwrap();
 
@@ -1456,7 +1464,7 @@ mod tests {
         // by virtue of "the acquires happened before the sweep
         // call". On a fast machine `chrono::Utc::now()` can return
         // the same microsecond for two adjacent calls; the strict
-        // `<` in MiniMeta::sweep_stale_eviction_leases (state.rs)
+        // `<` in MiniMeta::sweep_stale_session_leases (state.rs)
         // then skipped the second lease and `reaped_ids.contains(&fresh_session)`
         // failed intermittently. Sleeping ≥1 ms past `max_age = 1ms`
         // makes the assertion structurally deterministic regardless
@@ -1466,7 +1474,7 @@ mod tests {
         let reaped = state
             .services
             .meta
-            .sweep_stale_eviction_leases(std::time::Duration::from_millis(1))
+            .sweep_stale_session_leases(std::time::Duration::from_millis(1))
             .await
             .unwrap();
         let reaped_ids: std::collections::HashSet<_> =
@@ -1474,14 +1482,14 @@ mod tests {
         assert!(reaped_ids.contains(&stale_session));
         assert!(reaped_ids.contains(&fresh_session));
         for lease in &reaped {
-            assert_eq!(lease.sandbox_id, sandbox_id);
+            assert_eq!(lease.sandbox_id, Some(sandbox_id));
         }
 
         // After reap, both should be re-acquirable.
         assert!(state
             .services
             .meta
-            .try_acquire_eviction_lease(stale_session, sandbox_id, "post-reap")
+            .try_acquire_session_lease(stale_session, Some(sandbox_id), "post-reap")
             .await
             .unwrap());
 
@@ -1489,7 +1497,7 @@ mod tests {
         let reaped2 = state
             .services
             .meta
-            .sweep_stale_eviction_leases(std::time::Duration::from_secs(3600))
+            .sweep_stale_session_leases(std::time::Duration::from_secs(3600))
             .await
             .unwrap();
         assert!(

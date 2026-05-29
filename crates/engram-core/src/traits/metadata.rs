@@ -484,16 +484,19 @@ pub trait MetadataStore: Send + Sync {
     async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError>;
 
     // ----------------------------------------------------------------
-    // ADR 0016 §A.1.5c — cross-replica idle-eviction guard.
-    // Backed by the `eviction_inflight` table. The contract:
-    //   - `try_acquire_eviction_lease` is atomic INSERT ... ON
+    // ADR 0016 §A.1.5c — cross-replica per-session op lease.
+    // Serializes mutually-exclusive session-lifecycle ops (idle
+    // eviction, resume) so two coord pods can't drive the same
+    // session at once. Backed by the `session_lease` table. The
+    // contract:
+    //   - `try_acquire_session_lease` is atomic INSERT ... ON
     //     CONFLICT DO NOTHING. Returns Ok(true) if the row was
     //     inserted (caller owns the pipeline), Ok(false) if a
     //     row already exists (another caller is mid-pipeline).
-    //   - `release_eviction_lease` is idempotent — extra calls
+    //   - `release_session_lease` is idempotent — extra calls
     //     against an already-deleted row are Ok(()). Used by the
     //     RAII guard's drop path.
-    //   - `sweep_stale_eviction_leases` deletes rows older than
+    //   - `sweep_stale_session_leases` deletes rows older than
     //     `max_age` and returns them for warn-logging. Backs the
     //     coord-side stale-lease reaper.
     // ----------------------------------------------------------------
@@ -505,27 +508,32 @@ pub trait MetadataStore: Send + Sync {
     /// benign behaviour for test mocks / in-memory backends where
     /// concurrent coord-pod racing isn't a concern. `PostgresStore`
     /// overrides with the real INSERT ... ON CONFLICT DO NOTHING.
-    async fn try_acquire_eviction_lease(
+    ///
+    /// `sandbox_id` is diagnostic-only (records which sandbox the op
+    /// concerns): `Some` for an eviction, `None` for a resume — no
+    /// sandbox exists yet at resume-lease time, it's about to be
+    /// created.
+    async fn try_acquire_session_lease(
         &self,
         _session_id: SessionId,
-        _sandbox_id: SandboxId,
+        _sandbox_id: Option<SandboxId>,
         _locked_by: &str,
     ) -> Result<bool, MetaError> {
         Ok(true)
     }
 
     /// Idempotent. Drop-safe.
-    async fn release_eviction_lease(&self, _session_id: SessionId) -> Result<(), MetaError> {
+    async fn release_session_lease(&self, _session_id: SessionId) -> Result<(), MetaError> {
         Ok(())
     }
 
     /// Stale-lease reaper. Deletes rows where `locked_at < now() -
     /// max_age` and returns them so the caller can warn-log
     /// `(session_id, locked_by, locked_at)` per reaped row.
-    async fn sweep_stale_eviction_leases(
+    async fn sweep_stale_session_leases(
         &self,
         _max_age: std::time::Duration,
-    ) -> Result<Vec<StaleEvictionLease>, MetaError> {
+    ) -> Result<Vec<StaleSessionLease>, MetaError> {
         Ok(Vec::new())
     }
 
@@ -707,13 +715,13 @@ pub enum UpdateOutcome {
     DroppedStale,
 }
 
-/// One row from [`MetadataStore::sweep_stale_eviction_leases`].
+/// One row from [`MetadataStore::sweep_stale_session_leases`].
 /// Carried so the coord-side sweeper can warn-log who held the
 /// lease for how long before it was reaped.
 #[derive(Clone, Debug)]
-pub struct StaleEvictionLease {
+pub struct StaleSessionLease {
     pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
+    pub sandbox_id: Option<SandboxId>,
     pub locked_by: String,
     pub locked_at: chrono::DateTime<chrono::Utc>,
 }

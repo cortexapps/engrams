@@ -355,8 +355,8 @@ pub struct AppState {
     /// 1s TTL; cache eviction on host unregister.
     pub cow_state_cache: Arc<crate::cow_state::CowStateCache>,
     /// ADR 0016 §A.1.5c: stable identifier for this coord pod —
-    /// stamped on the `eviction_inflight.locked_by` column so
-    /// `SELECT * FROM eviction_inflight` tells an operator which
+    /// stamped on the `session_lease.locked_by` column so
+    /// `SELECT * FROM session_lease` tells an operator which
     /// pod is mid-eviction on which session. Defaults to
     /// `hostname` (the k8s pod name in prod); cheap to override
     /// via the `ENGRAM_COORD_POD_ID` env var if local tests want
@@ -458,7 +458,7 @@ impl AppState {
 pub type SharedState = Arc<AppState>;
 
 /// ADR 0016 §A.1.5c: resolve a stable pod identifier for the
-/// `eviction_inflight.locked_by` column. Precedence:
+/// `session_lease.locked_by` column. Precedence:
 ///   1. `ENGRAM_COORD_POD_ID` env (explicit override for local tests).
 ///   2. `HOSTNAME` env (set by k8s on every pod).
 ///   3. `unknown` string (no panic; the column is diagnostic).
@@ -720,10 +720,10 @@ pub(crate) mod tests {
         /// Reset to false on use.
         pub(crate) fail_next_record_snapshot: PlMutex<bool>,
         /// ADR 0016 §A.1.5c: in-memory mirror of the
-        /// `eviction_inflight` PG table for the trait's three
+        /// `session_lease` PG table for the trait's three
         /// lease methods. Tests insert directly here to simulate
         /// a peer coord pod holding a lease.
-        pub(crate) eviction_leases: PlMutex<EvictionLeaseMap>,
+        pub(crate) session_leases: PlMutex<SessionLeaseMap>,
         /// ADR 0016 Phase B: in-memory mirror of
         /// `sessions.live_disk_manifest_*` for tests that exercise
         /// the `update_live_disk_manifest` trait. Keyed by
@@ -754,12 +754,14 @@ pub(crate) mod tests {
     }
 
     /// Alias so the `clippy::type_complexity` lint stays happy on
-    /// MiniMeta's leases field. Mirrors `eviction_inflight`'s
-    /// shape: `session_id → (sandbox_id, locked_by, locked_at)`.
-    pub(crate) type EvictionLeaseMap = std::collections::HashMap<
+    /// MiniMeta's leases field. Mirrors `session_lease`'s
+    /// shape: `session_id → (sandbox_id?, locked_by, locked_at)` —
+    /// `sandbox_id` is `None` for a resume lease, `Some` for an
+    /// eviction.
+    pub(crate) type SessionLeaseMap = std::collections::HashMap<
         SessionId,
         (
-            engram_core::SandboxId,
+            Option<engram_core::SandboxId>,
             String,
             chrono::DateTime<chrono::Utc>,
         ),
@@ -773,7 +775,7 @@ pub(crate) mod tests {
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
-                eviction_leases: PlMutex::new(std::collections::HashMap::new()),
+                session_leases: PlMutex::new(std::collections::HashMap::new()),
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
                 chunk_generation: PlMutex::new(0),
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
@@ -1028,16 +1030,16 @@ pub(crate) mod tests {
         }
 
         // ADR 0016 §A.1.5c: in-memory mirror of the
-        // `eviction_inflight` PG table so the trait's lease
+        // `session_lease` PG table so the trait's lease
         // semantics are exercised end-to-end by the idle_evictor
         // unit tests.
-        async fn try_acquire_eviction_lease(
+        async fn try_acquire_session_lease(
             &self,
             session_id: SessionId,
-            sandbox_id: engram_core::SandboxId,
+            sandbox_id: Option<engram_core::SandboxId>,
             locked_by: &str,
         ) -> Result<bool, MetaError> {
-            let mut guard = self.eviction_leases.lock();
+            let mut guard = self.session_leases.lock();
             if guard.contains_key(&session_id) {
                 return Ok(false);
             }
@@ -1048,16 +1050,16 @@ pub(crate) mod tests {
             Ok(true)
         }
 
-        async fn release_eviction_lease(&self, session_id: SessionId) -> Result<(), MetaError> {
-            self.eviction_leases.lock().remove(&session_id);
+        async fn release_session_lease(&self, session_id: SessionId) -> Result<(), MetaError> {
+            self.session_leases.lock().remove(&session_id);
             Ok(())
         }
 
-        async fn sweep_stale_eviction_leases(
+        async fn sweep_stale_session_leases(
             &self,
             max_age: std::time::Duration,
-        ) -> Result<Vec<engram_core::traits::StaleEvictionLease>, MetaError> {
-            let mut guard = self.eviction_leases.lock();
+        ) -> Result<Vec<engram_core::traits::StaleSessionLease>, MetaError> {
+            let mut guard = self.session_leases.lock();
             let now = chrono::Utc::now();
             let cutoff = match chrono::Duration::from_std(max_age) {
                 Ok(d) => now - d,
@@ -1066,7 +1068,7 @@ pub(crate) mod tests {
             let mut reaped = Vec::new();
             guard.retain(|session_id, (sandbox_id, locked_by, locked_at)| {
                 if *locked_at < cutoff {
-                    reaped.push(engram_core::traits::StaleEvictionLease {
+                    reaped.push(engram_core::traits::StaleSessionLease {
                         session_id: *session_id,
                         sandbox_id: *sandbox_id,
                         locked_by: locked_by.clone(),
