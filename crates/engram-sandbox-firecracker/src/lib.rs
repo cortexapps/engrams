@@ -1011,10 +1011,9 @@ impl FirecrackerBackend {
         jail_dir: &Path,
         netns_name: Option<&str>,
     ) -> Result<(PathBuf, Child), SandboxError> {
-        tokio::fs::create_dir_all(jail_dir)
-            .await
-            .map_err(|e| vm_err(format!("create jail dir {}: {e}", jail_dir.display())))?;
-
+        // jail_dir is created by the caller (create_in_jail / restore_in_jail)
+        // before we're invoked — single owner for dir creation (ADR 0020 P3),
+        // so the UFFD-handler leg can't race a create_dir_all buried here.
         let socket = jail_dir.join("firecracker.sock");
         // Firecracker refuses to start if the socket already exists.
         let _ = tokio::fs::remove_file(&socket).await;
@@ -1215,6 +1214,13 @@ impl FirecrackerBackend {
                 self.config.kernel_image_path.display()
             )));
         }
+
+        // jail_dir (FC's per-sandbox chroot + sockets) is the caller's to
+        // create — symmetric with restore_in_jail — so spawn_firecracker can
+        // assume it exists (ADR 0020 P3: single owner for dir creation).
+        tokio::fs::create_dir_all(jail_dir)
+            .await
+            .map_err(|e| vm_err(format!("create jail dir {}: {e}", jail_dir.display())))?;
 
         // Provision per-VM networking BEFORE spawning firecracker:
         // the TAP needs to exist when FC opens it via
@@ -1665,6 +1671,21 @@ impl FirecrackerBackend {
             )));
         }
 
+        // ADR 0020 P3 fix: create jail_dir up front, before the parallel legs.
+        // Both spawn_firecracker (its chroot/jail setup) AND spawn_uffd_handler
+        // (its log + UDS at jail_dir/{uffd-handler.log,uffd.sock}) write here. In
+        // the old serial form FC-spawn's own create_dir_all ran first; once the
+        // two legs run concurrently the UFFD leg races it and File::create on the
+        // log fails with ENOENT (prod regression 501e30e, reverted a91f83b).
+        // Creating it here is idempotent with FC-spawn's create_dir_all and makes
+        // the dir present for whichever leg touches it first.
+        tokio::fs::create_dir_all(jail_dir).await.map_err(|e| {
+            vm_err(format!(
+                "create restore jail dir {}: {e}",
+                jail_dir.display()
+            ))
+        })?;
+
         // ADR 0014 M1.16: warm-restore networking provisions a
         // per-VM netns BEFORE spawning FC. The netns has the bake's
         // TAP recreated inside it (collision-free vs other warm VMs
@@ -1676,65 +1697,136 @@ impl FirecrackerBackend {
         // Legacy/test snapshots with `manifest.net = None` keep the
         // historical host-root flow: TAP lives directly on host
         // root, FC stays in host root, no netns at all.
-        // ADR 0020 P3: span each restore-setup leg so the trace shows the
-        // per-leg breakdown of `fc.restore_in_jail` (netns / spawn / symlinks /
-        // uffd / load). These are sequential today; the spans tell us which
-        // legs are worth `try_join!`-ing and what the parallelizable headroom
-        // actually is before we rework the cleanup path. Pure observability.
-        let netns_setup = match tracing::Instrument::instrument(
-            self.reserve_restored_netns(sandbox_id, manifest.net.as_ref()),
-            tracing::info_span!("fc.reserve_netns"),
-        )
-        .await
-        {
-            Ok(setup) => setup,
-            Err(e) => return Err(e),
-        };
+        // ADR 0020 P3: the restore-setup legs are independent up to the
+        // `load_snapshot` gate. {reserve netns → spawn FC into it} is a real
+        // chain, but spawning the UFFD handler (a separate process on its own
+        // UDS) need not wait for it. Run the two concurrently. We use `join!`,
+        // NOT `try_join!`: try_join cancels the slower leg on the first error,
+        // which can strand a half-created netns / FC child / handler; `join!`
+        // lets both finish, then we tear down whatever succeeded if either
+        // failed. Measured (trace 309633f4): collapses the ~250 ms serial setup
+        // to ~max-leg — the ~102 ms UFFD spawn hides under the ~110 ms
+        // netns→spawn chain. Each leg self-cleans its own partial state, so its
+        // Err carries no live resource; reconciliation below only undoes the
+        // OTHER leg.
 
-        let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
-        let (socket, child) = match tracing::Instrument::instrument(
-            self.spawn_firecracker(jail_dir, netns_name.as_deref()),
-            tracing::info_span!("fc.spawn_process"),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
+        // Leg 1 — netns → FC spawn → rootfs symlinks (a chain; the symlinks are
+        // ~0.5 ms so they ride here rather than as a third leg). Spans inline.
+        let leg_setup = async {
+            let netns_setup = tracing::Instrument::instrument(
+                self.reserve_restored_netns(sandbox_id, manifest.net.as_ref()),
+                tracing::info_span!("fc.reserve_netns"),
+            )
+            .await?;
+            let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
+            let (socket, child) = match tracing::Instrument::instrument(
+                self.spawn_firecracker(jail_dir, netns_name.as_deref()),
+                tracing::info_span!("fc.spawn_process"),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Some(setup) = netns_setup.as_ref() {
+                        net::teardown_netns(setup, &self.net_allocator).await;
+                    }
+                    return Err(e);
+                }
+            };
+            // ADR 0014: `state.bin` embeds the canonical rootfs path keyed by
+            // the SOURCE sandbox_id; recreate the source-id-keyed symlink
+            // pointing at the host-local backing before `load_snapshot` opens
+            // it. On failure drop `child` (kill_on_drop SIGKILLs FC) + tear the
+            // netns down before propagating.
+            if let Err(e) = tracing::Instrument::instrument(
+                restore_canonical_symlinks(
+                    &self.work_dir,
+                    sandbox_id,
+                    manifest,
+                    self.config.stub_harness_path.as_deref(),
+                ),
+                tracing::info_span!("fc.restore_symlinks"),
+            )
+            .await
+            {
+                drop(child);
                 if let Some(setup) = netns_setup.as_ref() {
                     net::teardown_netns(setup, &self.net_allocator).await;
                 }
                 return Err(e);
             }
+            Ok::<_, SandboxError>((netns_setup, socket, child))
         };
 
-        // ADR 0014: FC's `state.bin` embeds the canonical rootfs
-        // path keyed by the **source** sandbox_id, not this new
-        // restored sandbox_id. The receiver must materialize the
-        // rootfs at that exact host-visible path before
-        // `load_snapshot` opens it. Same `<work_dir>` contract +
-        // re-create the source-id-keyed symlink pointing at the
-        // host-local source (same OCI cache file for same-host
-        // restore; cross-host restore expects the caller to have
-        // materialized into `manifest.spec.rootfs_source` already).
-        // Errors here drop `child` explicitly so the spawned FC
-        // process gets SIGKILLed before we propagate.
-        if let Err(e) = tracing::Instrument::instrument(
-            restore_canonical_symlinks(
-                &self.work_dir,
-                sandbox_id,
-                manifest,
-                self.config.stub_harness_path.as_deref(),
-            ),
-            tracing::info_span!("fc.restore_symlinks"),
-        )
-        .await
-        {
-            drop(child);
-            if let Some(setup) = netns_setup.as_ref() {
-                net::teardown_netns(setup, &self.net_allocator).await;
+        // Leg 2 — spawn the UFFD page-fault handler (Uffd mode) so it's
+        // listening before `load_snapshot` connects; File mode has none.
+        // spawn_uffd_handler sets kill_on_drop, so dropping the Child on a
+        // cleanup path SIGKILLs it. Returns (handler, the UDS the gate dials).
+        let leg_uffd = async {
+            match self.config.restore_mode {
+                RestoreMode::File => Ok::<_, SandboxError>(None),
+                RestoreMode::Uffd => {
+                    // ADR 0007: the handler reads its memory manifest from the
+                    // chunk store; without one, refuse loud rather than
+                    // silently lose chunked restore.
+                    let session_ref = manifest.memory_manifest.ok_or_else(|| {
+                        SandboxError::Snapshot(
+                            "RestoreMode::Uffd requires manifest.memory_manifest \
+                             (snapshot wasn't taken via PooledBackend with a \
+                             chunk_store attached; either wrap the FC backend \
+                             with PooledBackend.with_chunk_store(...) before \
+                             snapshotting, or switch to RestoreMode::File)"
+                                .into(),
+                        )
+                    })?;
+                    // ADR 0015 M5: canonical_ref == session_ref.
+                    let canonical_ref = session_ref;
+                    let uffd_uds = jail_dir.join("uffd.sock");
+                    let _ = tokio::fs::remove_file(&uffd_uds).await;
+                    // ADR 0007 Phase 5: prefault host from the sidecar (capture
+                    // host); publish under THIS host so later restores here use
+                    // the local trace.
+                    let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
+                    let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
+                    let handler = self
+                        .spawn_uffd_handler(
+                            &uffd_uds,
+                            canonical_ref,
+                            session_ref,
+                            prefault_host,
+                            publish_host,
+                            jail_dir,
+                        )
+                        .await?;
+                    Ok(Some((handler, uffd_uds)))
+                }
             }
-            return Err(e);
-        }
+        };
+
+        let (setup_res, uffd_res) = tokio::join!(leg_setup, leg_uffd);
+
+        // Reconcile: each leg self-cleaned its own partial state, so on a
+        // failure we only undo the OTHER leg, then return the first error.
+        let (netns_setup, socket, child, uffd_leg) = match (setup_res, uffd_res) {
+            (Ok((netns, socket, child)), Ok(uffd)) => (netns, socket, child, uffd),
+            (Err(e), Ok(uffd)) => {
+                // Setup failed (self-cleaned). Kill the handler leg 2 spawned.
+                if let Some((handler, _uds)) = uffd {
+                    drop(handler);
+                }
+                return Err(e);
+            }
+            (Ok((netns, _socket, child)), Err(e)) => {
+                // UFFD leg failed. Tear down leg 1's netns + FC child.
+                drop(child);
+                if let Some(setup) = netns.as_ref() {
+                    net::teardown_netns(setup, &self.net_allocator).await;
+                }
+                return Err(e);
+            }
+            // Both failed; each self-cleaned. Surface the setup error.
+            (Err(e), Err(_)) => return Err(e),
+        };
 
         // Legacy/test path: no netns means we still might need the
         // old host-root TAP setup (when `manifest.net.is_some` but
@@ -1755,15 +1847,12 @@ impl FirecrackerBackend {
         // ceiling only bites File mode; tune up for huge VMs.)
         let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
 
-        // For UFFD restore, spawn the handler BEFORE PUT /snapshot/load
-        // so it's listening when Firecracker connects. The handler
-        // takes ownership of the kernel UFFD via SCM_RIGHTS and serves
-        // every fault from the chunk cache/store (ADR 0020 Route B —
-        // no memory.bin, hence `materialize_memory_if_missing` is
-        // skipped upstream for Uffd). Either way the VM is running by
-        // the time `load_snapshot*` returns (resume_vm: true).
-        let load_result: Result<Option<Child>, SandboxError> = match self.config.restore_mode {
-            RestoreMode::File => tracing::Instrument::instrument(
+        // The UFFD handler was already spawned concurrently in leg 2
+        // (`uffd_leg`); the gate just dials it. File mode loads memory.bin
+        // synchronously; Uffd returns immediately and pages fault lazily.
+        // Either way the VM is running once `load_snapshot*` returns.
+        let load_result: Result<(), SandboxError> = match &uffd_leg {
+            None => tracing::Instrument::instrument(
                 api.load_snapshot(&SnapshotPaths {
                     state_path: state_path.clone(),
                     mem_path: mem_path.clone(),
@@ -1771,85 +1860,29 @@ impl FirecrackerBackend {
                 tracing::info_span!("fc.load_snapshot", mode = "file"),
             )
             .await
-            .map(|_| None),
-            RestoreMode::Uffd => {
-                // ADR 0007: the handler reads its memory manifests
-                // from the chunk store. Without `memory_manifest` on
-                // the snapshot we have nothing to hand it — refuse
-                // loud rather than fall back to a degenerate path
-                // that would silently lose the chunked benefits.
-                let session_ref = match manifest.memory_manifest {
-                    Some(r) => r,
-                    None => {
-                        drop(child);
-                        if let Some(setup) = net_setup.as_ref() {
-                            net::teardown(setup, &self.net_allocator).await;
-                        }
-                        if let Some(setup) = netns_setup.as_ref() {
-                            net::teardown_netns(setup, &self.net_allocator).await;
-                        }
-                        return Err(SandboxError::Snapshot(
-                            "RestoreMode::Uffd requires manifest.memory_manifest \
-                             (snapshot wasn't taken via PooledBackend with a \
-                             chunk_store attached; either wrap the FC backend \
-                             with PooledBackend.with_chunk_store(...) before \
-                             snapshotting, or switch to RestoreMode::File)"
-                                .into(),
-                        ));
-                    }
-                };
-                // ADR 0015 M5: bake-time canonical capture was retired,
-                // so canonical_ref == session_ref unconditionally. The
-                // resolver returns `Canonical` for every fault; Route B
-                // serves those by fetching the canonical chunk hash
-                // from the chunk store (or UFFDIO_ZEROPAGE for omitted
-                // zero chunks) — no memory.bin.
-                let canonical_ref = session_ref;
-                let uffd_uds = jail_dir.join("uffd.sock");
-                let _ = tokio::fs::remove_file(&uffd_uds).await;
-                // ADR 0007 Phase 5: replay the snapshotting
-                // host's recorded trace if both ends opted in.
-                // Pre-fault host comes from the sidecar JSON (set
-                // at snapshot time by the host that captured
-                // memory.bin); publish-trace host is the current
-                // host's id from FC config (so the recorder
-                // republishes under THIS host's key — subsequent
-                // restores on this host use the local trace).
-                let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
-                let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
-                match self
-                    .spawn_uffd_handler(
-                        &uffd_uds,
-                        canonical_ref,
-                        session_ref,
-                        prefault_host,
-                        publish_host,
-                        jail_dir,
-                    )
-                    .await
-                {
-                    Ok(handler) => tracing::Instrument::instrument(
-                        api.load_snapshot_uffd(&state_path, &uffd_uds),
-                        tracing::info_span!("fc.load_snapshot", mode = "uffd"),
-                    )
-                    .await
-                    .map(|_| Some(handler)),
-                    Err(e) => Err(e),
-                }
-            }
+            .map(|_| ()),
+            Some((_handler, uffd_uds)) => tracing::Instrument::instrument(
+                api.load_snapshot_uffd(&state_path, uffd_uds),
+                tracing::info_span!("fc.load_snapshot", mode = "uffd"),
+            )
+            .await
+            .map(|_| ()),
         };
 
-        let uffd_handler = match load_result {
-            Ok(h) => h,
+        let uffd_handler: Option<Child> = match load_result {
+            Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
             Err(e) => {
-                // Snapshot load failed: tear down the TAP we provisioned
-                // and free the /30 slot before propagating. Otherwise a
-                // failed restore leaks host-side network state.
+                // Snapshot load failed: tear down the network state, the leg-2
+                // UFFD handler, and the FC child before propagating, so a
+                // failed restore leaks nothing host-side.
                 if let Some(setup) = net_setup.as_ref() {
                     net::teardown(setup, &self.net_allocator).await;
                 }
                 if let Some(setup) = netns_setup.as_ref() {
                     net::teardown_netns(setup, &self.net_allocator).await;
+                }
+                if let Some((handler, _uds)) = uffd_leg {
+                    drop(handler);
                 }
                 drop(child);
                 return Err(e);
