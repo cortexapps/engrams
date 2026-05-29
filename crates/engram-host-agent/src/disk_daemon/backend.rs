@@ -22,7 +22,7 @@
 //! shape anyway. Realistic Python/Node sessions touch < 100 MiB
 //! of fresh writes between snapshots; that's six dirty chunks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -177,6 +177,11 @@ pub struct ChunkedDiskBackend {
     total_bytes: u64,
     cache: ChunkCache,
     store: Arc<ChunkStore>,
+    /// ADR 0021 P2: in-memory LRU of clean chunks, so the guest's repeated
+    /// `resume` reads of a hot chunk don't each re-read + re-sha256-verify the
+    /// full 16 MiB off the (pd-balanced) chunk-cache disk. `std::sync::Mutex`
+    /// (not tokio) because every access is a brief, non-awaiting get/put.
+    mem_cache: Arc<std::sync::Mutex<ChunkMemCache>>,
     /// `chunk_idx -> dirty bytes`. Locked together so a concurrent
     /// read + write of the same chunk doesn't see torn state.
     dirty: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
@@ -290,6 +295,74 @@ struct BackendState {
     base: PositionalDiskManifest,
 }
 
+/// ADR 0021 P2: byte budget for the per-backend in-memory chunk cache.
+/// The guest's `resume` I/O re-reads a handful of hot chunks (prod measured
+/// chunk 0 — the ext4 superblock region — read 27× in a single restore);
+/// 64 MiB comfortably holds that hot set at the 16 MiB disk chunk size while
+/// bounding per-sandbox RAM.
+const DISK_CHUNK_MEM_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// In-memory LRU of recently-read **clean** chunks, keyed by content hash.
+///
+/// Why this exists: a guest block read resolves to its containing chunk and
+/// `read_chunk` pulls the WHOLE chunk through `ChunkCache::get` — which, on a
+/// local hit, still reads the full chunk off the (pd-balanced, network-
+/// attached) cache disk AND re-sha256-verifies all 16 MiB (~84 ms). With no
+/// in-memory layer, a guest re-reading one hot chunk dozens of times during
+/// `resume` paid that ~84 ms every time → seconds of substrate. This LRU makes
+/// the 2nd..Nth read of a chunk a cheap RAM clone.
+///
+/// Content-addressed keys need no invalidation: a rewritten region produces a
+/// fresh hash, so a stale entry is simply never looked up again and ages out.
+struct ChunkMemCache {
+    map: HashMap<ChunkHash, Bytes>,
+    order: VecDeque<ChunkHash>,
+    bytes: u64,
+    budget_bytes: u64,
+}
+
+impl ChunkMemCache {
+    fn new(budget_bytes: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            budget_bytes,
+        }
+    }
+
+    /// Return the chunk's bytes if cached, bumping it to most-recently-used.
+    fn get(&mut self, hash: &ChunkHash) -> Option<Bytes> {
+        let bytes = self.map.get(hash).cloned()?;
+        if let Some(pos) = self.order.iter().position(|h| h == hash) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(*hash);
+        Some(bytes)
+    }
+
+    /// Insert a chunk, evicting LRU entries until it fits the byte budget.
+    fn put(&mut self, hash: ChunkHash, value: Bytes) {
+        let len = value.len() as u64;
+        if self.map.contains_key(&hash) || len > self.budget_bytes {
+            return;
+        }
+        while self.bytes + len > self.budget_bytes {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some(evicted) = self.map.remove(&old) {
+                        self.bytes -= evicted.len() as u64;
+                    }
+                }
+                None => break,
+            }
+        }
+        self.bytes += len;
+        self.map.insert(hash, value);
+        self.order.push_back(hash);
+    }
+}
+
 impl ChunkedDiskBackend {
     /// Build a backend rooted at `manifest_ref`. `cache` should be
     /// the host-agent's shared `ChunkCache` — that way base chunks
@@ -314,6 +387,9 @@ impl ChunkedDiskBackend {
             total_bytes,
             cache,
             store,
+            mem_cache: Arc::new(std::sync::Mutex::new(ChunkMemCache::new(
+                DISK_CHUNK_MEM_BUDGET_BYTES,
+            ))),
             dirty: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
@@ -341,6 +417,9 @@ impl ChunkedDiskBackend {
             total_bytes,
             cache,
             store,
+            mem_cache: Arc::new(std::sync::Mutex::new(ChunkMemCache::new(
+                DISK_CHUNK_MEM_BUDGET_BYTES,
+            ))),
             dirty: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
@@ -827,25 +906,39 @@ impl ChunkedDiskBackend {
             .copied()
             .flatten();
         match hash {
-            // ADR 0019: when a lifecycle operation is active (e.g. cold
-            // boot), span this base-chunk fetch under it so the page-in
-            // shows in the operation's trace. Fast NVMe hits → short spans,
-            // GCS misses → long ones; inactive → no span (metrics only).
             Some(hash) => {
+                // ADR 0021 P2: serve hot re-reads from an in-memory LRU before
+                // touching the on-disk chunk cache. A resume churns a handful of
+                // ext4 superblock/metadata chunks dozens of times; without this
+                // each hit re-reads a 16 MiB chunk off the pd-balanced disk and
+                // re-runs a full sha256 verify (~84 ms), strictly serial — which
+                // measured as ~2.3 s of the 2.6 s substrate (chunk 0 read 27×).
+                // Keyed by content hash, so it is immune to a mid-fetch flush
+                // rebase for the same reason the hash snapshot above is.
+                {
+                    let mut mem = self.mem_cache.lock().unwrap();
+                    if let Some(bytes) = mem.get(&hash) {
+                        return Ok(bytes);
+                    }
+                }
                 let fut = self.cache.get(hash, || self.store.get_chunk(hash));
-                match self.operation_scope.current() {
+                // ADR 0019: when a lifecycle operation is active (e.g. cold
+                // boot), span this base-chunk fetch under it so the page-in
+                // shows in the operation's trace. Fast NVMe hits → short spans,
+                // GCS misses → long ones; inactive → no span (metrics only).
+                let bytes = match self.operation_scope.current() {
                     Some(op) => {
-                        // ADR 0021 P2 diag: during a lifecycle op (resume/boot),
-                        // log whether the chunk the disk daemon is about to read
-                        // was warmed onto local NVMe, and which cache dir it's
-                        // reading — to pin why residency prefetch isn't hitting.
+                        // ADR 0021 P2 diag: now fires only on a true mem-cache
+                        // miss — i.e. once per distinct chunk per op. Before the
+                        // mem cache the hot superblock chunk reached here ~27×;
+                        // post-fix each distinct chunk should appear once.
                         tracing::debug!(
                             hash = %hash,
                             chunk = chunk_idx,
                             op = op.kind,
                             on_disk = self.cache.contains_on_disk(hash),
                             cache_root = %self.cache.cache_root().display(),
-                            "P2 diag: disk read_chunk during op",
+                            "P2 diag: disk read_chunk mem-cache miss during op",
                         );
                         let span = op.span.in_scope(|| {
                             tracing::info_span!(
@@ -855,10 +948,12 @@ impl ChunkedDiskBackend {
                                 bytes = chunk_len,
                             )
                         });
-                        Ok(tracing::Instrument::instrument(fut, span).await?)
+                        tracing::Instrument::instrument(fut, span).await?
                     }
-                    None => Ok(fut.await?),
-                }
+                    None => fut.await?,
+                };
+                self.mem_cache.lock().unwrap().put(hash, bytes.clone());
+                Ok(bytes)
             }
             // Zero-filled hole — the manifest had no entry here.
             None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
@@ -958,6 +1053,60 @@ mod tests {
 
         let bytes = backend.read(4096, 4096).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    #[tokio::test]
+    async fn mem_cache_evicts_lru_protecting_recently_touched() {
+        // ADR 0021 P2: byte-budgeted LRU. Budget = 2 chunks. Touching h0
+        // after inserting h1 must protect h0, so inserting h2 evicts h1.
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk = 4096usize;
+        let h0 = put_chunk(&store, 0xa0, chunk).await;
+        let h1 = put_chunk(&store, 0xb1, chunk).await;
+        let h2 = put_chunk(&store, 0xc2, chunk).await;
+        let bytes = |b: u8| Bytes::from(vec![b; chunk]);
+
+        let mut mem = ChunkMemCache::new((2 * chunk) as u64);
+        mem.put(h0, bytes(0xa0));
+        mem.put(h1, bytes(0xb1));
+        assert!(mem.get(&h0).is_some(), "h0 present after two inserts");
+        // get(h0) above bumped h0 to MRU; h1 is now LRU.
+        mem.put(h2, bytes(0xc2));
+        assert!(mem.get(&h1).is_none(), "LRU h1 evicted by h2");
+        assert!(mem.get(&h0).is_some(), "recently-touched h0 survives");
+        assert!(mem.get(&h2).is_some(), "freshly-inserted h2 present");
+        assert_eq!(mem.bytes, (2 * chunk) as u64, "byte accounting holds");
+
+        // Re-putting an existing key is a no-op (no double-count).
+        mem.put(h0, bytes(0xa0));
+        assert_eq!(mem.bytes, (2 * chunk) as u64, "duplicate put does not grow");
+    }
+
+    #[tokio::test]
+    async fn reading_same_chunk_twice_is_consistent() {
+        // Exercises the mem-cache put-on-miss / hit-on-second-read wiring in
+        // read_chunk: the second read of the same offset must match the first.
+        let total = 8192u64;
+        let chunk_size = 4096u64;
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        let first = backend.read(0, 4096).await.unwrap();
+        let second = backend.read(0, 4096).await.unwrap();
+        assert_eq!(first, second, "second (mem-cached) read matches first");
+        assert!(second.iter().all(|b| *b == 0xaa));
     }
 
     #[tokio::test]
