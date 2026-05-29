@@ -218,6 +218,21 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     // mirrors disk_manifest's build-then-stamp shape — a persisted row
     // always has it.
     let base_snapshot_id: Option<Uuid> = row.try_get("base_snapshot_id").map_err(col_err)?;
+    // ADR 0021 P2: NOT NULL in the DB (migration 0042) — every enabled image
+    // carries its base snapshot's disk manifest (clean break, no fallback).
+    // Option on the struct only mirrors base_snapshot_id's build-then-stamp
+    // shape; a persisted row always has Some. Strict decode (no missing-column
+    // tolerance): the live SELECTs always project both columns.
+    let base_snapshot_disk_manifest_id: Uuid = row
+        .try_get("base_snapshot_disk_manifest_id")
+        .map_err(col_err)?;
+    let base_snapshot_disk_manifest_version: i64 = row
+        .try_get("base_snapshot_disk_manifest_version")
+        .map_err(col_err)?;
+    let base_snapshot_disk_manifest = Some(engram_core::types::manifest::ManifestRef {
+        manifest_id: base_snapshot_disk_manifest_id,
+        version: base_snapshot_disk_manifest_version as u64,
+    });
     // ADR 0021 P1.8: nullable soft-delete marker (migration 0041).
     // Missing-column-tolerant via try_get → `Ok(None)` from the
     // generic decode path so a row pulled before the migration runs
@@ -230,6 +245,7 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
         disk_manifest,
         base_snapshot_id: base_snapshot_id.map(engram_core::types::SnapshotId),
+        base_snapshot_disk_manifest,
         last_refreshed_at,
         created_at,
         updated_at,

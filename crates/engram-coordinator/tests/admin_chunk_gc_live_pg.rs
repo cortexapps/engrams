@@ -210,6 +210,10 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             manifest_digest: format!("sha256:{:064x}", 1u32),
             disk_manifest: Some(img_disk),
             base_snapshot_id: Some(base_snap),
+            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,
@@ -359,6 +363,10 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             manifest_digest: format!("sha256:{:064x}", 2u32),
             disk_manifest: Some(pinned_mref),
             base_snapshot_id: Some(base_snap),
+            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,

@@ -398,14 +398,30 @@ pub async fn heartbeat(
 }
 
 /// ADR 0015 M5: project enabled-image rows down to the wire
-/// representation the host consumes — just `(image_uri, manifest_digest)`.
+/// representation the host consumes — `(image_uri, manifest_digest)` plus,
+/// since ADR 0021 P2, the base snapshot's disk manifest so the host can warm
+/// the rootfs working set on NVMe (residency) before sessions restore.
 fn enabled_image_refs_from_rows(
     rows: Vec<engram_core::types::EnabledImage>,
 ) -> Vec<EnabledImageRef> {
     rows.into_iter()
-        .map(|row| EnabledImageRef {
-            image_uri: row.image_uri,
-            manifest_digest: ManifestDigest(row.manifest_digest),
+        .filter_map(|row| {
+            // base_snapshot_disk_manifest is NOT NULL (migration 0042), so a
+            // persisted row always has it — the Option is only the build-then-
+            // stamp shape. Defensively skip (rather than panic) the impossible
+            // None so one malformed row can't break the whole advertisement.
+            let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
+                tracing::error!(
+                    image_uri = %row.image_uri,
+                    "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
+                );
+                return None;
+            };
+            Some(EnabledImageRef {
+                image_uri: row.image_uri,
+                manifest_digest: ManifestDigest(row.manifest_digest),
+                base_snapshot_disk_manifest,
+            })
         })
         .collect()
 }

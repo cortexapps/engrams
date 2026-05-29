@@ -198,6 +198,18 @@ pub struct EnabledImage {
     /// always carries `Some`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_snapshot_id: Option<crate::types::ids::SnapshotId>,
+    /// ADR 0021 P2: the base snapshot's *disk* manifest — the rootfs after
+    /// template-boot, including the divergent runtime chunks the agent reads
+    /// during startup (Bun / node_modules / claude). Denormalized from the
+    /// snapshot record at enable so the heartbeat advertisement (and the
+    /// host's residency prefetch) can warm it without a per-heartbeat
+    /// snapshot lookup — the on-demand serial-from-GCS page-in of these chunks
+    /// during `resume` is the substrate cost P2 retires. `NOT NULL` in the DB
+    /// (migration 0042): residency requires it, so an image can't be enabled
+    /// without it. Like `base_snapshot_id`, the `Option` here only mirrors the
+    /// build-then-stamp shape — a persisted row always has `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_snapshot_disk_manifest: Option<crate::types::manifest::ManifestRef>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,

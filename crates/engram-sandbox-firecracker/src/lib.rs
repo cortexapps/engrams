@@ -235,8 +235,9 @@ pub struct FirecrackerConfig {
     /// hosts can use as-is; unprivileged CI runners + the FC
     /// backend's own work_dir convention should set this
     /// explicitly. Constructors derive a sensible default
-    /// (`<work_dir>/uffd-chunk-cache/`) when the backend is built
-    /// via `FirecrackerBackend::new`.
+    /// (`<work_dir>/chunk-cache/`, shared with the host-agent's chunk
+    /// cache so residency prefetch warms what the handler reads —
+    /// ADR 0021 P2) when the backend is built via `FirecrackerBackend::new`.
     pub uffd_cache_root: Option<PathBuf>,
     /// ADR 0014 M1.12 (option D): host-local stub harness ext4 used
     /// as the symlink target for warm-pool restores. State.bin
@@ -629,9 +630,20 @@ impl FirecrackerBackend {
         // one explicitly. This avoids the handler's compiled-in
         // `/var/cache/engram/chunks` default that requires root on
         // CI runners + unprivileged production hosts.
+        //
+        // ADR 0021 P2: share the host's `chunk-cache` by default
+        // rather than a separate `uffd-chunk-cache`. The residency
+        // invariant is *one* shared content-addressed NVMe cache: the
+        // host-agent's restore-prefetch and host-boot residency warm
+        // `<work_dir>/chunk-cache`, and the UFFD handler must read the
+        // *same* dir or it re-fetches the same chunks cold from GCS.
+        // Prod already sets this explicitly (host-agent + coord); making
+        // it the default closes the footgun for any caller that forgets
+        // (tests, standalone, future deploy paths). A caller that truly
+        // wants an isolated cache still opts in via `uffd_cache_root`.
         let mut config = config;
         if config.uffd_cache_root.is_none() {
-            config.uffd_cache_root = Some(work_dir.join("uffd-chunk-cache"));
+            config.uffd_cache_root = Some(work_dir.join("chunk-cache"));
         }
         Self {
             work_dir,

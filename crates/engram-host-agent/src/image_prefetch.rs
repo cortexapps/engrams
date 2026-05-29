@@ -188,6 +188,8 @@ async fn reconcile(
         let image_uri = image.image_uri.clone();
         let expected_digest = image.manifest_digest.clone();
         let digest = image.manifest_digest.clone();
+        // ADR 0021 P2: warm the base snapshot's rootfs too (Copy, so no clone).
+        let base_snapshot_disk_manifest = image.base_snapshot_disk_manifest;
         let readiness = readiness.clone();
         let image_cache = image_cache.clone();
         let chunk_store = chunk_store.clone();
@@ -197,6 +199,7 @@ async fn reconcile(
             match prefetch_one(
                 &image_uri,
                 &expected_digest,
+                base_snapshot_disk_manifest,
                 &image_cache,
                 &chunk_store,
                 &chunk_cache,
@@ -226,14 +229,16 @@ async fn reconcile(
     }
 }
 
-/// Pull every chunk of an image's chunked rootfs through the
-/// tiered resolver. Each `chunk_store.get_chunk(hash)` call hits
-/// tier 1 (NVMe cache) if present, else faults through tier 2
-/// (BlobStorage) or tier 3 (OCI Range GET) and tees the bytes
-/// into the local cache. Returns the chunk count on success.
+/// Pull every chunk of an image's chunked rootfs — and, since ADR
+/// 0021 P2, its base snapshot's rootfs — through the tiered
+/// resolver. Each `chunk_store.get_chunk(hash)` call hits tier 1
+/// (NVMe cache) if present, else faults through tier 2 (BlobStorage)
+/// or tier 3 (OCI Range GET) and tees the bytes into the local
+/// cache. Returns the total chunk count on success.
 async fn prefetch_one(
     image_uri: &str,
     expected_digest: &ManifestDigest,
+    base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef,
     image_cache: &ImageCache,
     chunk_store: &ChunkStore,
     chunk_cache: &ChunkCache,
@@ -273,11 +278,40 @@ async fn prefetch_one(
         .ok_or_else(|| PrefetchError::NoBundle(image_uri.to_string()))?;
     let disk_manifest_ref = bundle.disk_manifest;
 
+    // (1) The image's chunked rootfs.
     let manifest: Manifest = chunk_store
         .get_manifest(disk_manifest_ref)
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("{e}")))?;
+    let mut total = prefetch_manifest_chunks(manifest, chunk_store, chunk_cache, semaphore).await?;
 
+    // (2) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
+    // the per-image base snapshot, whose disk manifest carries the runtime
+    // files written at template-boot (Bun / node_modules / claude) that the
+    // image's own manifest does NOT. Warming these on NVMe here is what keeps
+    // the resuming guest's rootfs page-in off GCS — the serial 16 MiB-chunk
+    // fetches during `resume` were the measured substrate cost. Folding it
+    // into readiness means an image isn't "warm" until its base snapshot's
+    // rootfs is resident too.
+    let base_manifest: Manifest = chunk_store
+        .get_manifest(base_snapshot_disk_manifest)
+        .await
+        .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot: {e}")))?;
+    total += prefetch_manifest_chunks(base_manifest, chunk_store, chunk_cache, semaphore).await?;
+
+    Ok(total)
+}
+
+/// Pull every chunk of one chunked manifest through the tiered
+/// resolver into the local NVMe cache, bounded by `semaphore`.
+/// Returns the chunk count. Shared by the image-rootfs and (ADR
+/// 0021 P2) base-snapshot-rootfs prefetch paths.
+async fn prefetch_manifest_chunks(
+    manifest: Manifest,
+    chunk_store: &ChunkStore,
+    chunk_cache: &ChunkCache,
+    semaphore: &Arc<Semaphore>,
+) -> Result<usize, PrefetchError> {
     let total = manifest.chunks.len();
     let mut handles = Vec::with_capacity(total);
     for chunk in manifest.chunks.into_iter() {
