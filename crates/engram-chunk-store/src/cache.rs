@@ -163,22 +163,10 @@ impl ChunkCache {
         self.inner.config.root.join(&hex[..2]).join(&hex[2..])
     }
 
-    /// ADR 0021 P2 diagnosis: the cache's on-disk root, so a log can show
-    /// which directory a given instance reads/writes — the cross-instance
-    /// residency check (does the disk daemon read the dir image_prefetch warmed?).
-    pub fn cache_root(&self) -> &std::path::Path {
-        &self.inner.config.root
-    }
-
-    /// ADR 0021 P2 diagnosis: the LRU eviction budget — to confirm whether the
-    /// resident working set fits (a too-small budget would evict warmed chunks).
-    pub fn budget_bytes(&self) -> u64 {
-        self.inner.config.budget_bytes
-    }
-
-    /// ADR 0021 P2 diagnosis: does this chunk's content-addressed file exist on
-    /// local NVMe right now? Distinguishes "never warmed here" / "evicted" from
-    /// "warmed but `get` still missed".
+    /// Does this chunk's content-addressed file exist on local NVMe right now?
+    /// The disk daemon reads this to label a read's tier (nvme vs blobstorage);
+    /// it also distinguishes "never warmed here" / "evicted" from "warmed but
+    /// `get` still missed".
     pub fn contains_on_disk(&self, hash: ChunkHash) -> bool {
         self.path_for(hash).try_exists().unwrap_or(false)
     }
