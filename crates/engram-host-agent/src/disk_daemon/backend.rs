@@ -907,45 +907,55 @@ impl ChunkedDiskBackend {
             .flatten();
         match hash {
             Some(hash) => {
-                // ADR 0021 P2: serve hot re-reads from an in-memory LRU before
-                // touching the on-disk chunk cache. A resume churns a handful of
-                // ext4 superblock/metadata chunks dozens of times; without this
-                // each hit re-reads a 16 MiB chunk off the pd-balanced disk and
-                // re-runs a full sha256 verify (~84 ms), strictly serial — which
-                // measured as ~2.3 s of the 2.6 s substrate (chunk 0 read 27×).
-                // Keyed by content hash, so it is immune to a mid-fetch flush
-                // rebase for the same reason the hash snapshot above is.
+                // ADR 0021: in-memory LRU above the on-disk chunk cache. With
+                // the per-read sha256 now removed (verify-on-populate lives in
+                // the chunk cache), a warm on-disk hit is already cheap — this
+                // layer guarantees a RAM-speed re-read even if page-cache
+                // pressure evicts the file and would otherwise force a cold
+                // pd-balanced re-read. Keyed by content hash, so it is immune
+                // to a mid-fetch flush rebase, same as the hash snapshot above.
                 {
                     let mut mem = self.mem_cache.lock().unwrap();
                     if let Some(bytes) = mem.get(&hash) {
+                        // Emit a zero-cost marker span so the trace shows the
+                        // mem tier serving hot re-reads (the win is countable).
+                        if let Some(op) = self.operation_scope.current() {
+                            op.span.in_scope(|| {
+                                let _e = tracing::info_span!(
+                                    "chunk.fetch",
+                                    op = op.kind,
+                                    chunk = chunk_idx,
+                                    bytes = chunk_len,
+                                    tier = "mem",
+                                )
+                                .entered();
+                            });
+                        }
                         return Ok(bytes);
                     }
                 }
+                // Best-effort tier label for the span: present on local disk
+                // (warm) vs cold fetch from blob storage. Sampled just before
+                // the fetch — a concurrent populate could flip it, which is
+                // fine for a diagnostic attribute (ADR 0021: cold/hot in OTel).
+                let tier = if self.cache.contains_on_disk(hash) {
+                    "nvme"
+                } else {
+                    "blobstorage"
+                };
                 let fut = self.cache.get(hash, || self.store.get_chunk(hash));
                 // ADR 0019: when a lifecycle operation is active (e.g. cold
                 // boot), span this base-chunk fetch under it so the page-in
-                // shows in the operation's trace. Fast NVMe hits → short spans,
-                // GCS misses → long ones; inactive → no span (metrics only).
+                // shows in the operation's trace, tagged with the serving tier.
                 let bytes = match self.operation_scope.current() {
                     Some(op) => {
-                        // ADR 0021 P2 diag: now fires only on a true mem-cache
-                        // miss — i.e. once per distinct chunk per op. Before the
-                        // mem cache the hot superblock chunk reached here ~27×;
-                        // post-fix each distinct chunk should appear once.
-                        tracing::debug!(
-                            hash = %hash,
-                            chunk = chunk_idx,
-                            op = op.kind,
-                            on_disk = self.cache.contains_on_disk(hash),
-                            cache_root = %self.cache.cache_root().display(),
-                            "P2 diag: disk read_chunk mem-cache miss during op",
-                        );
                         let span = op.span.in_scope(|| {
                             tracing::info_span!(
                                 "chunk.fetch",
                                 op = op.kind,
                                 chunk = chunk_idx,
                                 bytes = chunk_len,
+                                tier = tier,
                             )
                         });
                         tracing::Instrument::instrument(fut, span).await?
