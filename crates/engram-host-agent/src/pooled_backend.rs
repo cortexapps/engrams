@@ -592,14 +592,14 @@ impl PooledBackend {
                     tracing::debug!(
                         ws_key,
                         chunk_count = chunks.len(),
-                        "warm-pool refill: prefetch narrowed to working set",
+                        "chunked restore prefetch narrowed to working set",
                     );
                     chunks
                 }
                 Ok(_) => {
                     tracing::debug!(
                         ws_key,
-                        "warm-pool refill: working set empty, falling back to full manifest",
+                        "chunked restore prefetch: working set empty, falling back to full manifest",
                     );
                     let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
                         SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
@@ -610,7 +610,7 @@ impl PooledBackend {
                     tracing::warn!(
                         ws_key,
                         error = %e,
-                        "warm-pool refill: working set fetch failed, falling back to full manifest",
+                        "chunked restore prefetch: working set fetch failed, falling back to full manifest",
                     );
                     let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
                         SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
@@ -637,7 +637,7 @@ impl PooledBackend {
         tracing::debug!(
             manifest = %mref,
             chunk_count,
-            "warm-pool refill: memory chunks prefetched into NVMe",
+            "chunked restore: memory chunks prefetched into NVMe",
         );
         Ok(chunk_count)
     }
@@ -847,13 +847,21 @@ async fn materialize_state_if_missing(
     Ok(())
 }
 
-/// ADR 0014 cross-host warm-pool refill: materialize `rootfs.ext4`
+/// Cross-host chunked-rootfs materialization: rebuild `rootfs.ext4`
 /// from chunks if it isn't already on disk, then patch the FC
 /// sidecar's `spec.rootfs_source` to the local file path. Without
 /// this, `restore_in_jail` installs the canonical-rootfs symlink
 /// pointing at the bake-time path (`/tmp/.tmpXXX/...`) which
 /// doesn't exist on the receiver, and FC `load_snapshot` errors
 /// with "Block: Virtio backend error: No such file or directory".
+///
+/// Reached today by the ADR 0018 dead-host evac path (source FC is
+/// gone; the snapshot lives in BlobStorage and the rootfs must be
+/// rebuilt locally before `load_snapshot`) and by any /resume that
+/// lands on a host that didn't capture the snapshot. The original
+/// caller — ADR 0014's warm-pool cross-host refill — was retired
+/// with ADR 0015 M5, but the same primitive serves the current
+/// restore shapes unchanged.
 ///
 /// Called from `PooledBackend::restore` after `materialize_state_if_missing`
 /// (which downloads the sidecar that this function then patches).
@@ -1724,7 +1732,7 @@ impl SandboxBackend for PooledBackend {
             tracing::warn!(
                 error = %e,
                 snapshot_id = %metadata.id,
-                "warm-pool memory chunk prefetch failed; falling back to serial fault path",
+                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
             );
         }
         let _ = (prefetched_chunks, prefetch_start);
