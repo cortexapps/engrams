@@ -405,10 +405,23 @@ fn enabled_image_refs_from_rows(
     rows: Vec<engram_core::types::EnabledImage>,
 ) -> Vec<EnabledImageRef> {
     rows.into_iter()
-        .map(|row| EnabledImageRef {
-            image_uri: row.image_uri,
-            manifest_digest: ManifestDigest(row.manifest_digest),
-            base_snapshot_disk_manifest: row.base_snapshot_disk_manifest,
+        .filter_map(|row| {
+            // base_snapshot_disk_manifest is NOT NULL (migration 0042), so a
+            // persisted row always has it — the Option is only the build-then-
+            // stamp shape. Defensively skip (rather than panic) the impossible
+            // None so one malformed row can't break the whole advertisement.
+            let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
+                tracing::error!(
+                    image_uri = %row.image_uri,
+                    "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
+                );
+                return None;
+            };
+            Some(EnabledImageRef {
+                image_uri: row.image_uri,
+                manifest_digest: ManifestDigest(row.manifest_digest),
+                base_snapshot_disk_manifest,
+            })
         })
         .collect()
 }

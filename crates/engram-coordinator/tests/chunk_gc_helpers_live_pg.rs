@@ -325,7 +325,10 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
         manifest_digest: format!("sha256:{:064x}", 0xdeadbeefu32),
         disk_manifest: None,
         base_snapshot_id: Some(seed_base_snapshot(&meta).await),
-        base_snapshot_disk_manifest: None,
+        base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        }),
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,

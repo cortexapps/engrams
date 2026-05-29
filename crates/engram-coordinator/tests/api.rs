@@ -622,7 +622,10 @@ fn seed_enabled(
             manifest_digest: digest.clone(),
             disk_manifest: None,
             base_snapshot_id: Some(base_snapshot_id),
-            base_snapshot_disk_manifest: None,
+            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,

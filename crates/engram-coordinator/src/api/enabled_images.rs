@@ -93,7 +93,7 @@ pub async fn enable_image(
     let (base_snapshot_id, base_snapshot_disk_manifest) =
         capture_and_record_base_snapshot(&state, &row, &manifest).await?;
     row.base_snapshot_id = Some(base_snapshot_id);
-    row.base_snapshot_disk_manifest = base_snapshot_disk_manifest;
+    row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
     state
         .services
         .meta
@@ -147,7 +147,7 @@ pub async fn refresh_enabled_image(
     let (base_snapshot_id, base_snapshot_disk_manifest) =
         capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
     refreshed.base_snapshot_id = Some(base_snapshot_id);
-    refreshed.base_snapshot_disk_manifest = base_snapshot_disk_manifest;
+    refreshed.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
     state
         .services
         .meta
@@ -376,7 +376,7 @@ async fn capture_and_record_base_snapshot(
 ) -> Result<
     (
         engram_core::types::SnapshotId,
-        Option<engram_core::types::manifest::ManifestRef>,
+        engram_core::types::manifest::ManifestRef,
     ),
     ApiError,
 > {
@@ -397,7 +397,15 @@ async fn capture_and_record_base_snapshot(
                     snapshot_id = %id,
                     "base snapshot already recorded for this digest; reusing",
                 );
-                return Ok((id, existing.base_snapshot_disk_manifest));
+                let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "enabled image `{}` reuses base snapshot {id} but carries no \
+                         base_snapshot_disk_manifest (NOT NULL since migration 0042); \
+                         refresh the image to re-stamp it",
+                        row.image_uri
+                    ))
+                })?;
+                return Ok((id, disk_manifest));
             }
         }
     }
@@ -499,7 +507,14 @@ async fn capture_and_record_base_snapshot(
         size_bytes = meta.size_bytes,
         "recorded base snapshot for image",
     );
-    Ok((meta.id, meta.disk_manifest))
+    let disk_manifest = meta.disk_manifest.ok_or_else(|| {
+        ApiError::Internal(format!(
+            "base snapshot for `{}` was captured without a chunked disk manifest; \
+             residency requires a chunked rootfs — not enabling",
+            row.image_uri
+        ))
+    })?;
+    Ok((meta.id, disk_manifest))
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`

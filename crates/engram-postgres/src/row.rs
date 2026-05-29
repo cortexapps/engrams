@@ -218,27 +218,21 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     // mirrors disk_manifest's build-then-stamp shape — a persisted row
     // always has it.
     let base_snapshot_id: Option<Uuid> = row.try_get("base_snapshot_id").map_err(col_err)?;
-    // ADR 0021 P2: the base snapshot's disk manifest (migration 0042),
-    // denormalized so the heartbeat advertisement can warm the rootfs
-    // working set. Decoded tolerantly (→ None) so a row pulled before the
-    // migration — or a pre-P2 row never re-enabled — still decodes; the host
-    // just skips the residency prefetch for that image.
-    let base_snapshot_disk_manifest_id: Option<Uuid> = row
+    // ADR 0021 P2: NOT NULL in the DB (migration 0042) — every enabled image
+    // carries its base snapshot's disk manifest (clean break, no fallback).
+    // Option on the struct only mirrors base_snapshot_id's build-then-stamp
+    // shape; a persisted row always has Some. Strict decode (no missing-column
+    // tolerance): the live SELECTs always project both columns.
+    let base_snapshot_disk_manifest_id: Uuid = row
         .try_get("base_snapshot_disk_manifest_id")
-        .unwrap_or(None);
-    let base_snapshot_disk_manifest_version: Option<i64> = row
+        .map_err(col_err)?;
+    let base_snapshot_disk_manifest_version: i64 = row
         .try_get("base_snapshot_disk_manifest_version")
-        .unwrap_or(None);
-    let base_snapshot_disk_manifest = match (
-        base_snapshot_disk_manifest_id,
-        base_snapshot_disk_manifest_version,
-    ) {
-        (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
-            manifest_id: id,
-            version: v as u64,
-        }),
-        _ => None,
-    };
+        .map_err(col_err)?;
+    let base_snapshot_disk_manifest = Some(engram_core::types::manifest::ManifestRef {
+        manifest_id: base_snapshot_disk_manifest_id,
+        version: base_snapshot_disk_manifest_version as u64,
+    });
     // ADR 0021 P1.8: nullable soft-delete marker (migration 0041).
     // Missing-column-tolerant via try_get → `Ok(None)` from the
     // generic decode path so a row pulled before the migration runs

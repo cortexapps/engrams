@@ -238,7 +238,7 @@ async fn reconcile(
 async fn prefetch_one(
     image_uri: &str,
     expected_digest: &ManifestDigest,
-    base_snapshot_disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef,
     image_cache: &ImageCache,
     chunk_store: &ChunkStore,
     chunk_cache: &ChunkCache,
@@ -293,14 +293,11 @@ async fn prefetch_one(
     // fetches during `resume` were the measured substrate cost. Folding it
     // into readiness means an image isn't "warm" until its base snapshot's
     // rootfs is resident too.
-    if let Some(base_ref) = base_snapshot_disk_manifest {
-        let base_manifest: Manifest = chunk_store
-            .get_manifest(base_ref)
-            .await
-            .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot: {e}")))?;
-        total +=
-            prefetch_manifest_chunks(base_manifest, chunk_store, chunk_cache, semaphore).await?;
-    }
+    let base_manifest: Manifest = chunk_store
+        .get_manifest(base_snapshot_disk_manifest)
+        .await
+        .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot: {e}")))?;
+    total += prefetch_manifest_chunks(base_manifest, chunk_store, chunk_cache, semaphore).await?;
 
     Ok(total)
 }

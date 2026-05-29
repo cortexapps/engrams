@@ -651,7 +651,10 @@ async fn list_enabled_images_returns_seeded_rows_sorted() {
             manifest_digest: "sha256:beefcafe".into(),
             disk_manifest: None,
             base_snapshot_id: Some(engram_core::types::SnapshotId::new()),
-            base_snapshot_disk_manifest: None,
+            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,
@@ -708,7 +711,10 @@ async fn disable_enabled_image_204_then_idempotent_404() {
         manifest_digest: "sha256:abc".into(),
         disk_manifest: None,
         base_snapshot_id: Some(engram_core::types::SnapshotId::new()),
-        base_snapshot_disk_manifest: None,
+        base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        }),
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
