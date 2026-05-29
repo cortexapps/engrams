@@ -1,5 +1,19 @@
 # ADR 0021: Resident templates + warm snapshots — the from-scratch boot model
 
+Status: 2026-05-29 — **Accepted, in progress.** P0 + P1 shipped (harness baked into
+templates; standalone harness subsystem retired — see Phasing). P2's substrate half
+shipped + prod-validated, with a **corrected root cause**: the dominant cost was not
+disk-vs-memory residency alone but a **per-read sha256 of every 16 MiB chunk on every
+cache hit** (~80 ms on our no-SHA-NI Cascade Lake hosts; the disk daemon re-read one hot
+chunk **27×** → ~2.2 s of a 2.6 s substrate). Fixes — verify-on-populate (`717c18d`) +
+an in-memory LRU (`f9f688e`) + base-snapshot **memory** residency at host-boot
+(`c6510d4`) — took the warm substrate **2.6 s → ~516 ms** and erased the cold-host cliff
+(**3.15 s → ~618 ms**); substrate is now FC-floor-bound (~600 ms). The runtime-RAM-dedup
+**mechanism** (File backend vs an FC memfd patch) + the **forking** strategy are split
+into their own decision — **ADR 0022** — and parked for now. P3 (persistent agent)
+remains. Corrections are inline + in Prod measurements; the original 2026-05-27 framing
+follows.
+
 Status: 2026-05-27 — **Proposed.** ADR 0020 shipped chunk-native UFFD restore to
 prod and **measured where the time goes now**: guest-memory restore is cheap
 (~1.2 s, warms further), the Anthropic round-trip is negligible (~0.2 s), and the
@@ -241,20 +255,24 @@ snapshots are the fallback for "the agent boot is genuinely expensive and persis
   deduped store must treat GC as first-class.
 - **(b) Memory at rest — free dedup.** Warm snapshots are content-addressed; they
   share kernel/base-OS/agent chunks across templates.
-- **(c) Runtime RAM — NOT free.** `UFFDIO_COPY` installs a **private** page per
-  guest, so K live sessions of one template cost K× the working set in host RAM. Fix:
-  a **shared per-template backing** (memfd/tmpfs populated once from resident chunks)
-  served via **`UFFDIO_CONTINUE`** (minor faults), so sessions share read-only base
-  pages, COW on write → K sessions cost `base + K×dirty`. This is the one piece
-  needing a new mechanism + FC support (open question 1). COW divergence is unaffected.
+- **(c) Runtime RAM — not free; mechanism is its own ADR.** `UFFDIO_COPY` (our current
+  UFFD path) installs a **private** page per guest, so K live sessions of one template
+  cost K× the working set in host RAM. Deduping the shared base (so K sessions cost
+  `base + K×dirty`) — and the closely-related **session-forking** capability — is a real
+  win but a real design fork: FC's stock **File backend** (`MAP_PRIVATE` of a resident
+  memfile → page-cache sharing + COW, no patch) vs a **memfd / `UFFDIO_CONTINUE`**
+  backing (needs an FC patch, but enables live zero-pause fork). That trade-off and the
+  forking strategy are **deferred to ADR 0022** rather than expanded here; they gate
+  only runtime-RAM dedup, not the latency/density wins residency already delivers. COW
+  divergence is unaffected either way.
 
 ### 5. Resulting layering
 
 | layer | model |
 |---|---|
 | **template (OS + tools + agent)** | one baked image; chunked-disk + COW for the rootfs (it mutates); resident |
-| **canonical/warm memory** | chunked + UFFD, captured at idle (incl. the agent); resident; runtime-shared via `UFFDIO_CONTINUE` |
-| **session workspace + mutations** | COW on top (disk divergence + private/`CONTINUE` memory pages) |
+| **canonical/warm memory** | chunked + UFFD, captured at idle (incl. the agent); resident; same-template runtime sharing mechanism (File backend vs memfd) is **ADR 0022** |
+| **session workspace + mutations** | COW on top (disk divergence + private memory pages on first write) |
 | **everything** | resident on NVMe (pinned); GCS = durable origin + transport, off the boot path |
 
 This **retires** the on-demand-fetch / prefetch / working-set-trace machinery on the
@@ -277,6 +295,11 @@ run-time code in its own domain:
   sandbox is the safety boundary").
 - **Warm-snapshot capture is itself a sandboxed boot** (the capture VM is a microVM),
   so even capturing a third-party agent runs it only inside the sandbox.
+- **In-process VMM stays ruled out** for untrusted code: pulling FC's vCPU loop into the
+  host-agent would dissolve the jailer/seccomp boundary (a guest escape must pass through
+  both the guest kernel *and* the jailer). FC stays a separate jailed process; spawn
+  latency is reclaimed by pre-spawning, not by going in-process. The full analysis (and
+  why FC isn't usable as a Rust library — only rust-vmm is) lives in **ADR 0022**.
 
 ## The endgame this composes into
 
@@ -288,11 +311,10 @@ remaining per-session cost is the COW delta + the first-prompt workspace scan.
 
 ## Open questions
 
-1. **FC shared-memfd / minor-fault support** for `UFFDIO_CONTINUE`. Stock FC backs
-   guest RAM anonymous-private + MISSING-mode; runtime RAM dedup needs FC to back
-   guest RAM with a shared memfd + register MINOR. **Unverified on our FC build** —
-   gates the runtime-dedup half only (latency + storage wins don't depend on it).
-   Worth a spike before committing P4.
+1. **Runtime RAM dedup + forking mechanism — split into ADR 0022.** File backend
+   (`MAP_PRIVATE` of a resident memfile, stock FC) vs a memfd / `UFFDIO_CONTINUE` backing
+   (FC patch, enables live fork). Density + substrate do **not** depend on this; it gates
+   only runtime-RAM dedup + session forking. Parked pending the dedicated ADR.
 2. **Cheap agent boot vs warm snapshots.** Before building the warm-snapshot capture
    pipeline, measure whether a persistent agent + in-process warm start (Bun/V8
    startup snapshot in the template) already gets first-token under ~1 s. If so, skip
@@ -607,10 +629,16 @@ Measure against the ~2.7 s baseline before the full residency machinery lands.
 | P3 (warm + persistent) | ~230 ms | <1 s           | restored into a hot Bun runtime             |
 | P4 (RAM dedup)    | **sub-100 ms** | <1 s         | shared backing, minor-faults only           |
 
-P2 is the biggest single move and is unblocked. P4 is what gets us *under*
-100 ms but requires the FC build to support `UFFDIO_CONTINUE` (open
-question 1). P3 is orthogonal to substrate latency and is what removes
-the 2 m 40 s agent gap.
+**Measured (2026-05-29), superseding the projections above.** The substrate root cause
+was sharper than "disk prefetch": every cache hit re-ran a **16 MiB sha256** (~80 ms,
+no SHA-NI), and the disk daemon re-read one hot chunk **27×**. Fixes — verify-on-populate
+(`717c18d`) + in-mem LRU (`f9f688e`) + base-snapshot memory residency at host-boot
+(`c6510d4`) — landed **warm ~516 ms / cold ~618 ms** (not ~230 ms; the FC restore floor
+is ~600 ms, higher than the original ~200 ms guess). The cold-host cliff is gone. P4's
+"sub-100 ms via RAM dedup" is **not** simply gated on `UFFDIO_CONTINUE` — the
+mechanism (File backend, no fork, vs a memfd patch) is its own decision in **ADR 0022**,
+and it buys density + forking more than raw substrate ms. P3 (the 2 m 40 s agent gap)
+stays the orthogonal big win.
 
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate), **symmetric over disk + memory + snapshot**. GCS off the boot path for both
@@ -621,24 +649,29 @@ on-demand **rootfs/disk** page-in during resume (memory is already warm). Target
 after this phase: substrate ~230 ms (the 30 cold disk fetches collapse to NVMe @
 ~1 ms; remaining ~200 ms is FC restore overhead).
 
-- [ ] **Pre-P2 cheap win (corrected): rootfs/disk prefetch.** Extend host-boot
-      `image_prefetch` to warm the base **snapshot's** disk (+ memory) manifest,
-      not just the image's — mirroring `prefetch_memory_chunks`. (The
-      originally-named parallel-UFFD-prefault is moot — memory is warm; shrink-4 MiB
-      is secondary — see the corrected cheap-win note above.) Measure vs the 2.7 s
-      baseline.
-- [ ] Pin enabled-template chunks — image disk + base snapshot disk + memory +
-      warm snapshot — on NVMe; transactional stage-on-enable; host not `Ready`
-      until its working set (disk *and* memory) is staged.
-- [ ] **Cache invariant**: the UFFD handler must share the host's `chunk-cache`.
-      Today only prod overrides the `uffd-chunk-cache` default — make the shared
-      cache the default, not opt-in (`engram-sandbox-firecracker` lib.rs).
+- [x] **Pre-P2 cheap win (corrected): rootfs/disk prefetch.** Host-boot
+      `image_prefetch` warms the base **snapshot's** disk manifest, not just the
+      image's. *(56c2f70; migration 0042 carries `base_snapshot_disk_manifest`.)*
+- [x] **The actual root cause + fix.** Re-tracing showed the dominant cost wasn't a
+      missing prefetch but a **per-read 16 MiB sha256 on every cache hit** (~80 ms,
+      no SHA-NI; one hot chunk re-read 27×). Fixed by **verify-on-populate**
+      (`717c18d`) — hash once at populate, trust the content-addressed file on read —
+      plus an in-mem LRU backstop (`f9f688e`) and `tier` span labels (`804a660`).
+      Warm substrate 2.6 s → ~516 ms; disk `chunk.fetch` 2.5 s → ~17 ms.
+- [x] Pin enabled-template chunks — image disk + base snapshot **disk + memory** — on
+      NVMe at host-boot, folded into image readiness (host not advertised ready until
+      both are resident). *(56c2f70 disk; `c6510d4` + migration 0043 memory.)* Warm
+      *snapshot* pinning rides P3. Transactional stage-on-enable beyond host-boot
+      prefetch is the remaining piece.
+- [x] **Cache invariant**: the UFFD handler shares the host's `chunk-cache` (the
+      fragile `uffd-chunk-cache` default fixed).
 - [ ] Retire the now-subsumed prefetch / working-set machinery (per-restore
       `prefetch_memory_chunks`, image-only host-boot prefetch, ADR 0014
-      M1.13/M1.14) — folded into the one residency mechanism.
-- [ ] Verify on prod: re-measure substrate against a freshly-rolled host that
-      staged at enable-time; the `chunk.fetch{bytes=16 MiB, op=resume}` spans
-      should be gone. Target ~230 ms substrate.
+      M1.13/M1.14) — folded into the one residency mechanism. *(still open)*
+- [x] Verify on prod: traces `c55e1035` (warm 516 ms) / `ff752f81` (fresh-host
+      618 ms, cold cliff gone) — the `chunk.fetch{bytes=16 MiB}` cost collapsed to
+      ~17 ms NVMe-hit. Substrate floor is ~600 ms (FC restore), higher than the
+      original ~230 ms guess.
 
 **P3 — Warm snapshots per template** (capture at the agent-`idle` signal; restore
 into a ready agent). Removes the ~7–9 s. The big payoff.
@@ -668,10 +701,11 @@ moves both ends of this:
       when the harness has emitted `Idle`, (b) the harness contract to
       guarantee `Idle` after first-prompt-ready, not just after attach.
 
-**P4 — Runtime RAM dedup** (`UFFDIO_CONTINUE` + shared per-template backing) — gated
-on the FC spike (open question 1). Density, not latency.
-- [ ] FC spike: shared memfd + MINOR-mode on our FC build.
-- [ ] If viable: shared per-template backing → K sessions cost `base + K×dirty`.
+**P4 — Runtime RAM dedup + forking → moved to [ADR 0022](0022-runtime-memory-sharing-and-forking.md).**
+Density (K sessions cost `base + K×dirty`) and session forking share one primitive
+(`MAP_PRIVATE` of an immutable memfile). The mechanism is its own decision — stock FC
+**File backend** (no fork) vs a **memfd / `UFFDIO_CONTINUE`** patch (live-fork) — and is
+**parked** there, measure-first, off the critical path for the latency wins above.
 
 **Cross-cutting — storage refcount/GC** (open question 5): residency + COW divergence
 is only sound with a correct GC (currently regressed — chunk-GC pulled May 2026).
@@ -685,3 +719,5 @@ is only sound with a correct GC (currently regressed — chunk-GC pulled May 202
 - ADR 0019 (cold-boot tracing) — produced the trace evidence above.
 - ADR 0020 (base-snapshot restore + chunk-native UFFD) — shipped; **Blocked on this
   ADR** for its remaining phases; its prod profile is the input here.
+- ADR 0022 (runtime memory sharing & forking) — the runtime-RAM-dedup + forking
+  mechanism (File backend vs `direct-mem`) deferred from §4c / open question 1 / P4.
