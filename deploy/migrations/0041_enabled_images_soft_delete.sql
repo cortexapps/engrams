@@ -1,0 +1,31 @@
+-- ADR 0021 P1.8: soft-delete enabled_images.
+--
+-- Today the disable endpoint physically DELETEs the row. That breaks
+-- the resume path for every existing session referencing the image:
+-- `resume_manifest_bundle` (api/sessions.rs) calls `get_enabled_image`
+-- and surfaces "session image is no longer enabled" as a hard error,
+-- so an operator who rebuilds an image — even with byte-identical
+-- contents — orphans every active and idle session bound to the old
+-- row. The evac-resumer then burns 20 retries per session before
+-- giving up.
+--
+-- Fix: soft-delete. The `enabled_images` row stays as the durable
+-- record of "these chunks were ever a coherent image"; a nullable
+-- `soft_deleted_at` controls whether the scheduler offers it for
+-- *new* sessions. Resume looks past the flag. Eventually a refcount-
+-- based chunk-GC (cross-cutting work item tracked under ADR 0021)
+-- reaps soft-deleted rows whose referencing sessions are all
+-- terminal — but until then, soft-deleted rows are pinned by every
+-- non-terminal session that ever booted from them.
+--
+-- Existing rows: all enabled today → NULL (still live). Operators
+-- using the disable endpoint after this lands will see the row
+-- stick around with `soft_deleted_at = NOW()`.
+--
+-- No index needed: the table is small (~tens of rows per deployment)
+-- and the existing UNIQUE on `image_uri` plus the soft_deleted_at
+-- filter on a sequential scan is well under 1 ms even on the
+-- largest deployments we project.
+
+ALTER TABLE enabled_images
+    ADD COLUMN soft_deleted_at TIMESTAMPTZ NULL;

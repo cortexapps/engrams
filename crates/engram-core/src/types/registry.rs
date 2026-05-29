@@ -201,6 +201,21 @@ pub struct EnabledImage {
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// ADR 0021 P1.8: soft-delete marker. `None` ⇒ live; the
+    /// scheduler offers this image to new session-create. `Some(ts)`
+    /// ⇒ disabled at `ts`; new sessions can't reference it but the
+    /// resume path looks past the flag (so existing sessions can
+    /// still come back). A future refcount-based chunk-GC reaps
+    /// soft-deleted rows whose referencing sessions are all
+    /// terminal.
+    ///
+    /// **Filter discipline**: every caller deciding "is this image
+    /// available for a new session" must check `soft_deleted_at.is_none()`.
+    /// Callers on the resume path (`resume_manifest_bundle`,
+    /// evac-resumer's pipeline) intentionally do not, so a session
+    /// whose image was disabled while it was idle can still resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_deleted_at: Option<DateTime<Utc>>,
 }
 
 /// Public summary view used by `GET /api/enabled-images`. Strips

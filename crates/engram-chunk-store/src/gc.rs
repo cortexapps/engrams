@@ -368,6 +368,18 @@ mod tests {
         ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
             Ok(None)
         }
+        async fn get_enabled_image_any(
+            &self,
+            _uri: &str,
+        ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+            Ok(None)
+        }
+        async fn soft_delete_enabled_image(
+            &self,
+            _uri: &str,
+        ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
+            Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled)
+        }
         async fn delete_enabled_image(&self, _uri: &str) -> Result<(), MetaError> {
             Ok(())
         }

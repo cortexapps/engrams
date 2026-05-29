@@ -20,7 +20,9 @@ pub mod storage;
 
 pub use cloud::{CloudBackend, PreemptionStream};
 pub use host_client::HostClient;
-pub use metadata::{GcCandidateRow, MetadataStore, StaleEvictionLease, UpdateOutcome};
+pub use metadata::{
+    DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, StaleEvictionLease, UpdateOutcome,
+};
 pub use sandbox::{HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend};
 pub use secrets::{ResolvedSecret, SecretBundle, SecretContext, SecretStore};
 pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};

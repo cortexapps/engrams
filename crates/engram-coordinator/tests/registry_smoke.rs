@@ -215,6 +215,21 @@ impl MetadataStore for MockMetadataStore {
     ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
         Ok(self.enabled_images.lock().get(uri).cloned())
     }
+    async fn get_enabled_image_any(
+        &self,
+        uri: &str,
+    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+        Ok(self.enabled_images.lock().get(uri).cloned())
+    }
+    async fn soft_delete_enabled_image(
+        &self,
+        uri: &str,
+    ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
+        match self.enabled_images.lock().remove(uri) {
+            Some(_) => Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled),
+            None => Err(MetaError::NotFound),
+        }
+    }
     async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
         match self.enabled_images.lock().remove(uri) {
             Some(_) => Ok(()),
@@ -639,6 +654,7 @@ async fn list_enabled_images_returns_seeded_rows_sorted() {
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,
+            soft_deleted_at: None,
         })
         .await
         .unwrap();
@@ -694,6 +710,7 @@ async fn disable_enabled_image_204_then_idempotent_404() {
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
+        soft_deleted_at: None,
     })
     .await
     .unwrap();

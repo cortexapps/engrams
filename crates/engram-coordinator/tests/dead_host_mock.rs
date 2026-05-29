@@ -219,6 +219,18 @@ impl MetadataStore for MiniMeta {
     ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
         Ok(None)
     }
+    async fn get_enabled_image_any(
+        &self,
+        _: &str,
+    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+        Ok(None)
+    }
+    async fn soft_delete_enabled_image(
+        &self,
+        _: &str,
+    ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
+        Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled)
+    }
     async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }

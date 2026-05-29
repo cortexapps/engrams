@@ -424,6 +424,57 @@ Kills the ~2 s serial `chunk.fetch`. (Cheapest high-value; no new kernel mechani
       reach a production-consumed GHCR namespace. Closed
       `.github/workflows/bake-harness-claude.yml` (folded entirely).
 
+**P1.8 — Soft-delete `enabled_images`; unblock resume after disable.**
+Prod-found 2026-05-28 against session `cb8e4e35`: the existing
+"disable image" endpoint **physically `DELETE`s the `enabled_images`
+row**, so any idle session whose image was disabled while it was idle
+fails resume on `resume_manifest_bundle` ("session image is no longer
+enabled"). Combined with the dead-host detector marking those sessions
+`Evacuating` after a MIG roll, this then thrashes the evac-resumer
+through `evac_attempts=20` per stuck session.
+- [x] Schema: `enabled_images.soft_deleted_at TIMESTAMPTZ NULL`
+      (migration 0041). Re-enable via the same `upsert` clears the
+      flag (operator-friendly undelete; chunks were never GC'd because
+      the pin-set query treats soft-deleted rows as live).
+- [x] API split: `list_enabled_images` + `get_enabled_image` are
+      live-only (session-create + dashboard); new
+      `get_enabled_image_any` returns the row regardless of
+      soft-delete (resume path); `delete_enabled_image` is reserved
+      for the future chunk-GC physical drop.
+- [x] Guarded disable: `soft_delete_enabled_image` is transactional,
+      takes a row-level `FOR UPDATE` lock on the image row, counts
+      sessions in `{pending, created, active, evacuating}`, returns
+      `Disabled` / `AlreadyDisabled` (idempotent) / `Blocked(Vec<…>)`.
+      `POST /api/enabled-images/disable` maps to 204 on success +
+      409 with a `DisableBlockedResponse` JSON body listing the
+      blocking sessions when blocked.
+- [x] Resume-path lookup: `resume_manifest_bundle`
+      (`api/sessions.rs`) uses `get_enabled_image_any`. A
+      soft-deleted-but-still-present row resumes cleanly with
+      manifest env intact. A genuinely-missing row (chunk-GC ate it
+      — not reachable today since chunk-GC is pulled) downgrades to
+      warn + harness-less resume, which is good enough for forensics.
+- [x] Audit: chunk-GC pin-set (`engram-postgres`'s
+      `list_enabled_image_disk_manifest_ids`) is **already correct**
+      because it doesn't filter `soft_deleted_at` — soft-deleted
+      rows continue to pin their base-layer chunks until physically
+      dropped. Comment added to lock the invariant.
+
+**P1.8 follow-ups (deferred, not blocking this commit chain):**
+- [ ] **Idle reaper.** Today an `Idle` session lives forever unless
+      the operator nukes it manually. Once we ship a reaper that
+      moves `Idle → Dead` after configurable inactivity, a
+      soft-deleted image with zero remaining references becomes a
+      candidate for physical delete + chunk reap.
+- [ ] **Refcount-driven physical delete of soft-deleted images.**
+      Pair with the cross-cutting GC effort (below). Trigger: 0
+      sessions reference the image AND 0 recoverable snapshots
+      derive from it. `delete_enabled_image` is the existing trait
+      surface; the missing piece is the sweeper.
+- [ ] **Force-override of `Blocked`.** Operator escape hatch — kill
+      blocking sessions + soft-delete in one call. Not on the
+      correctness path; defer until the routine flow is exercised.
+
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
 - [ ] Pin enabled-template chunks (+ warm snapshot) on NVMe; transactional

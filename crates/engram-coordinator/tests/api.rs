@@ -377,6 +377,27 @@ impl MetadataStore for MockMetadataStore {
     ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
         Ok(self.enabled.lock().get(uri).cloned())
     }
+    async fn get_enabled_image_any(
+        &self,
+        uri: &str,
+    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
+        // Mock doesn't model soft-delete state separately — same
+        // data as get_enabled_image. Real PG impl returns rows
+        // regardless of soft_deleted_at; tests that need to
+        // exercise that distinction should construct an
+        // EnabledImage with soft_deleted_at = Some(...) and verify
+        // their consumer's branch directly.
+        Ok(self.enabled.lock().get(uri).cloned())
+    }
+    async fn soft_delete_enabled_image(
+        &self,
+        uri: &str,
+    ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
+        match self.enabled.lock().remove(uri) {
+            Some(_) => Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled),
+            None => Err(MetaError::NotFound),
+        }
+    }
     async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
         self.enabled.lock().remove(uri);
         Ok(())
@@ -604,6 +625,7 @@ fn seed_enabled(
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,
+            soft_deleted_at: None,
         },
     );
     engram_protocol::heartbeat::ManifestDigest::new(&digest)

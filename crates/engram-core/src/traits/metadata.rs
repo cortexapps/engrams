@@ -9,6 +9,26 @@ use crate::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
 use crate::types::session::{Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
 
+/// ADR 0021 P1.8: outcome of [`MetadataStore::soft_delete_enabled_image`].
+/// `Disabled` is the happy path; `AlreadyDisabled` keeps the disable
+/// endpoint idempotent for retries; `Blocked` carries the offending
+/// sessions so the operator can decide whether to force-stop them or
+/// wait.
+#[derive(Clone, Debug)]
+pub enum DisableEnabledImageOutcome {
+    /// Row was live; `soft_deleted_at` flipped to `NOW()` in this call.
+    Disabled,
+    /// Row was already soft-deleted before this call; no change made.
+    /// Returned instead of an error so the disable endpoint can be
+    /// safely retried (operator hit it twice, two coord pods raced).
+    AlreadyDisabled,
+    /// One or more sessions in `{pending, created, active, evacuating}`
+    /// reference the image. `Vec` is bounded to the first 16 sessions
+    /// (`ORDER BY created_at ASC LIMIT 16`) — enough for an operator to
+    /// triage without unbounded response size.
+    Blocked(Vec<(SessionId, String)>),
+}
+
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
@@ -408,8 +428,44 @@ pub trait MetadataStore: Send + Sync {
     // but that's lazy + cached separately by digest.
 
     async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError>;
+    /// Live-only — filters `soft_deleted_at IS NULL`. Used by host
+    /// advertisement, the dashboard's enabled-images list, and the
+    /// session-create handler (where a disabled image must fail with
+    /// "not enabled" rather than silently start a session against a
+    /// deprecated image).
     async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError>;
+    /// Live-only lookup (`soft_deleted_at IS NULL`). Use this for
+    /// the session-create path; resume callers should use
+    /// [`Self::get_enabled_image_any`].
     async fn get_enabled_image(&self, image_uri: &str) -> Result<Option<EnabledImage>, MetaError>;
+    /// ADR 0021 P1.8: resume-path lookup. Returns the row even if
+    /// `soft_deleted_at` is set, so a session whose image was
+    /// disabled while it was idle can still resume from the
+    /// (chunks-still-pinned) lineage. New-session callers should
+    /// use [`Self::get_enabled_image`] (live-filtered).
+    async fn get_enabled_image_any(
+        &self,
+        image_uri: &str,
+    ) -> Result<Option<EnabledImage>, MetaError>;
+    /// ADR 0021 P1.8: guarded soft-delete. Inside one transaction:
+    /// lock the `enabled_images` row, count sessions in
+    /// `{pending, created, active, evacuating}` referencing the
+    /// image, return [`DisableEnabledImageOutcome::Blocked`] (with
+    /// up to 16 blocking sessions) when nonzero, else flip
+    /// `soft_deleted_at = NOW()` and return
+    /// [`DisableEnabledImageOutcome::Disabled`]. Idempotent: a
+    /// second disable of an already-soft-deleted row returns
+    /// [`DisableEnabledImageOutcome::AlreadyDisabled`] without
+    /// re-bumping the timestamp.
+    async fn soft_delete_enabled_image(
+        &self,
+        image_uri: &str,
+    ) -> Result<DisableEnabledImageOutcome, MetaError>;
+    /// ADR 0021 P1.8: physical delete reserved for the future
+    /// chunk-GC sweeper. Routine "disable" goes through
+    /// [`Self::soft_delete_enabled_image`]; only call this when the
+    /// row's chunks have been confirmed unreferenced and removed
+    /// from BlobStorage.
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
 
     // ---- session secrets ----

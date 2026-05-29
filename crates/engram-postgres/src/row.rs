@@ -12,7 +12,7 @@ use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
 
-fn col_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
+pub(crate) fn col_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
 }
 
@@ -218,6 +218,11 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     // mirrors disk_manifest's build-then-stamp shape — a persisted row
     // always has it.
     let base_snapshot_id: Option<Uuid> = row.try_get("base_snapshot_id").map_err(col_err)?;
+    // ADR 0021 P1.8: nullable soft-delete marker (migration 0041).
+    // Missing-column-tolerant via try_get → `Ok(None)` from the
+    // generic decode path so a row pulled before the migration runs
+    // still decodes; live SELECTs always project the column.
+    let soft_deleted_at: Option<DateTime<Utc>> = row.try_get("soft_deleted_at").unwrap_or(None);
     Ok(EnabledImage {
         id,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
@@ -228,6 +233,7 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         last_refreshed_at,
         created_at,
         updated_at,
+        soft_deleted_at,
     })
 }
 

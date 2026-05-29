@@ -17,13 +17,21 @@
 //! missing.
 //!
 //! Verbs:
-//! - `POST /api/enabled-images   { image_uri }` — enable an image.
-//! - `GET  /api/enabled-images`                — list enabled rows.
+//! - `POST /api/enabled-images   { image_uri }` — enable an image
+//!   (or undelete a previously soft-deleted row).
+//! - `GET  /api/enabled-images`                — list live rows
+//!   (`soft_deleted_at IS NULL`).
 //! - `POST /api/enabled-images/refresh { image_uri }` — re-fetch the
 //!   manifest from the registry and update `manifest_toml` +
 //!   `manifest_digest`. Useful when an image tag is moved.
-//! - `POST /api/enabled-images/disable { image_uri }` — remove the
-//!   row. Sessions referencing the image fail at the next create.
+//! - `POST /api/enabled-images/disable { image_uri }` — soft-delete
+//!   the row. ADR 0021 P1.8: rather than physical DELETE, flip
+//!   `soft_deleted_at = NOW()` so existing idle sessions can still
+//!   resume against the same chunk lineage. Refuses (409) when one
+//!   or more sessions in `{pending, created, active, evacuating}`
+//!   still reference the image — the response lists the blocking
+//!   sessions so the operator can decide. Re-enabling an
+//!   image_uri via POST clears `soft_deleted_at`.
 //!
 //! URI as path-segment: image URIs contain `/` and `:`, which axum's
 //! Path extractor will URL-decode but the dashboard's HTTP client
@@ -144,22 +152,83 @@ pub async fn refresh_enabled_image(
     Ok(Json(EnabledImageSummary::from(refreshed)))
 }
 
+/// ADR 0021 P1.8: response body for a refused disable.
+///
+/// 409 Conflict + this JSON, so the operator sees exactly which
+/// sessions are pinning the image. Sessions in `{pending, created,
+/// active, evacuating}` block; sessions in `{idle, completed, dead,
+/// failed}` don't (idle resumes against the soft-deleted row, the
+/// others are terminal).
+#[derive(Serialize)]
+pub struct DisableBlockedResponse {
+    pub error: &'static str,
+    pub message: String,
+    pub blocking_sessions: Vec<BlockingSession>,
+}
+
+#[derive(Serialize)]
+pub struct BlockingSession {
+    pub session_id: Uuid,
+    pub status: String,
+}
+
 pub async fn disable_enabled_image(
     State(state): State<SharedState>,
     Json(req): Json<ImageUriRequest>,
-) -> Result<StatusCode, ApiError> {
-    match state
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    use engram_core::traits::DisableEnabledImageOutcome as Outcome;
+
+    let outcome = state
         .services
         .meta
-        .delete_enabled_image(&req.image_uri)
+        .soft_delete_enabled_image(&req.image_uri)
         .await
-    {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(MetaError::NotFound) => Err(ApiError::NotFound(format!(
-            "image `{}` is not enabled",
-            req.image_uri
-        ))),
-        Err(e) => Err(e.into()),
+        .map_err(|e| match e {
+            MetaError::NotFound => {
+                ApiError::NotFound(format!("image `{}` is not enabled", req.image_uri))
+            }
+            other => other.into(),
+        })?;
+
+    match outcome {
+        Outcome::Disabled | Outcome::AlreadyDisabled => {
+            // Both are no-error for the caller. AlreadyDisabled
+            // keeps the endpoint idempotent for retries — the
+            // operator who clicked "Disable" twice gets the same
+            // 204 either way. Distinguishing would only be useful
+            // for telemetry, which we already get from the
+            // outcome metric below.
+            tracing::info!(
+                image_uri = %req.image_uri,
+                already_disabled = matches!(outcome, Outcome::AlreadyDisabled),
+                "enabled_image soft-deleted",
+            );
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Outcome::Blocked(sessions) => {
+            // Refuse with 409 + the offending sessions. The list
+            // is bounded to the first 16 by the PG query so the
+            // response stays small even when many sessions
+            // reference the image.
+            let n = sessions.len();
+            let body = DisableBlockedResponse {
+                error: "image_in_use",
+                message: format!(
+                    "Cannot disable image `{}`: {n} session(s) reference it. \
+                     Wait for them to go idle, or force-stop them, then retry.",
+                    req.image_uri,
+                ),
+                blocking_sessions: sessions
+                    .into_iter()
+                    .map(|(id, status)| BlockingSession {
+                        session_id: id.as_uuid(),
+                        status,
+                    })
+                    .collect(),
+            };
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
     }
 }
 
@@ -212,6 +281,11 @@ async fn fetch_and_seal_manifest(
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
+        // Newly enabled or refreshed → always live. The upsert's
+        // ON CONFLICT branch in PG flips `soft_deleted_at = NULL`
+        // explicitly, so even an existing soft-deleted row gets
+        // undeleted by re-enabling.
+        soft_deleted_at: None,
     };
     Ok((row, manifest, artifacts))
 }

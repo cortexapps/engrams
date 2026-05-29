@@ -143,14 +143,23 @@ pub(crate) async fn resume_manifest_bundle(
     state: &SharedState,
     session: &Session,
 ) -> Result<ResumeManifestBundle, ApiError> {
+    // ADR 0021 P1.8: resume reads via `get_enabled_image_any` so a
+    // session whose image was soft-deleted while it was idle still
+    // resumes — the chunk lineage is pinned by the soft-deleted
+    // row until the (future) refcount-based GC retires it, and the
+    // manifest_toml is still on the same row regardless of the
+    // soft-delete flag. Only a completely-physically-missing row
+    // (no PG entry at all) is terminal; that's the chunk-GC-ran
+    // case, which today's deployment can't reach (GC was pulled
+    // pre-ADR-0021, per commit 3a3fa50).
     let enabled = state
         .services
         .meta
-        .get_enabled_image(&session.image)
+        .get_enabled_image_any(&session.image)
         .await?
         .ok_or_else(|| {
             ApiError::Internal(format!(
-                "session image `{}` is no longer enabled; can't re-resolve manifest secrets",
+                "session image `{}` has no enabled_images row at all (lineage gone — chunk-GC or operator nuke); session is unrecoverable",
                 session.image,
             ))
         })?;

@@ -8,13 +8,14 @@
 //! ship a `.sqlx/` cache.
 
 use async_trait::async_trait;
-use chrono::Utc;
-use engram_core::traits::MetadataStore;
+use chrono::{DateTime, Utc};
+use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore};
 use engram_core::types::{
     EnabledImage, HostCapacity, HostRecord, HostStatus, PersistedEvent, RegistryCredential,
     Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
+use row::col_err;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
@@ -1097,8 +1098,8 @@ impl MetadataStore for PostgresStore {
             INSERT INTO enabled_images
                 (id, image_uri, manifest_toml, manifest_digest,
                  disk_manifest_id, disk_manifest_version, base_snapshot_id,
-                 last_refreshed_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
+                 last_refreshed_at, created_at, updated_at, soft_deleted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL)
             ON CONFLICT (image_uri) DO UPDATE SET
                 manifest_toml         = EXCLUDED.manifest_toml,
                 manifest_digest       = EXCLUDED.manifest_digest,
@@ -1106,7 +1107,15 @@ impl MetadataStore for PostgresStore {
                 disk_manifest_version = EXCLUDED.disk_manifest_version,
                 base_snapshot_id      = EXCLUDED.base_snapshot_id,
                 last_refreshed_at     = EXCLUDED.last_refreshed_at,
-                updated_at            = NOW()
+                updated_at            = NOW(),
+                -- ADR 0021 P1.8: enabling an image always "undeletes" any
+                -- prior soft-delete on the same image_uri. Operator who
+                -- disabled v1.0.0 then re-enables it gets a live row again,
+                -- without needing a separate undelete flow. The row's
+                -- chunks were never GC'd (chunk-GC's pin-set counts
+                -- soft-deleted images as still-referenced), so the
+                -- transition is a pure metadata flip.
+                soft_deleted_at       = NULL
             "#,
         )
         .bind(image.id)
@@ -1130,12 +1139,16 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError> {
+        // ADR 0021 P1.8: live-only filter. Hosts advertise + the
+        // dashboard surfaces only `soft_deleted_at IS NULL`. The
+        // resume path's lookup uses `get_enabled_image_any` instead.
         let rows = sqlx::query(
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
-                   last_refreshed_at, created_at, updated_at
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
+             WHERE soft_deleted_at IS NULL
              ORDER BY image_uri
             "#,
         )
@@ -1146,11 +1159,40 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn get_enabled_image(&self, image_uri: &str) -> Result<Option<EnabledImage>, MetaError> {
+        // ADR 0021 P1.8: live-only filter. Callers on the
+        // session-create path get None for a disabled image and
+        // surface "not enabled" to the user. The resume path uses
+        // `get_enabled_image_any` to look past the flag.
         let row = sqlx::query(
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
-                   last_refreshed_at, created_at, updated_at
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
+              FROM enabled_images
+             WHERE image_uri = $1 AND soft_deleted_at IS NULL
+            "#,
+        )
+        .bind(image_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enabled_image_from_row(&r)).transpose()
+    }
+
+    async fn get_enabled_image_any(
+        &self,
+        image_uri: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        // ADR 0021 P1.8: resume-path lookup. Returns the row even if
+        // soft-deleted, so a session whose image was disabled while
+        // it was idle can still resume. Caller is expected to be on
+        // a resume codepath; the session-create path uses
+        // `get_enabled_image` (live-filtered).
+        let row = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_toml, manifest_digest,
+                   disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1
             "#,
@@ -1162,7 +1204,101 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::enabled_image_from_row(&r)).transpose()
     }
 
+    async fn soft_delete_enabled_image(
+        &self,
+        image_uri: &str,
+    ) -> Result<DisableEnabledImageOutcome, MetaError> {
+        // ADR 0021 P1.8: guarded soft-delete.
+        //
+        // Inside one transaction: take a row-level lock on the
+        // enabled_images row (FOR UPDATE), count sessions in
+        // states that pin the image, return the blocking list if
+        // nonzero, else flip `soft_deleted_at = NOW()`. The row-
+        // level lock + session counting in the same TX closes the
+        // race where a session-create starts between the count and
+        // the UPDATE — the create's own `get_enabled_image` lookup
+        // takes the same lock and serialises.
+        //
+        // Blocking states: {pending, created, active, evacuating}.
+        // Sessions in {idle, completed, dead, failed} don't block
+        // because they either can resume against the soft-deleted
+        // row or are terminal.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Step 1: lock the image row. Returns NotFound if no row;
+        // returns Ok with no-op semantics if already soft-deleted
+        // (idempotent — second `disable` of the same URI is a no-op).
+        let row = sqlx::query(
+            "SELECT id, soft_deleted_at FROM enabled_images \
+             WHERE image_uri = $1 \
+             FOR UPDATE",
+        )
+        .bind(image_uri)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else {
+            return Err(MetaError::NotFound);
+        };
+        let already_soft_deleted: Option<DateTime<Utc>> =
+            row.try_get("soft_deleted_at").map_err(col_err)?;
+        if already_soft_deleted.is_some() {
+            // Idempotent: tell the caller it was already disabled,
+            // no further work to do. Tx commits with no changes.
+            tx.commit().await.map_err(db_err)?;
+            return Ok(DisableEnabledImageOutcome::AlreadyDisabled);
+        }
+
+        // Step 2: blocking-session check.
+        let blocking: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, status FROM sessions \
+             WHERE image_uri = $1 \
+               AND status IN ('pending', 'created', 'active', 'evacuating') \
+             ORDER BY created_at ASC \
+             LIMIT 16",
+        )
+        .bind(image_uri)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if !blocking.is_empty() {
+            // Don't commit — leave the row untouched. The lock
+            // releases on tx drop.
+            return Ok(DisableEnabledImageOutcome::Blocked(
+                blocking
+                    .into_iter()
+                    .map(|(id, status)| (SessionId(id), status))
+                    .collect(),
+            ));
+        }
+
+        // Step 3: flip the bit + bump chunk_generation so any future
+        // chunk-GC sweep that read the pin-set pre-flip observes
+        // divergence and restarts. (Soft-deleted images are still in
+        // the pin-set today; the bump is forward-compat with a
+        // future GC that treats them as candidates.)
+        sqlx::query(
+            "UPDATE enabled_images \
+             SET soft_deleted_at = NOW(), updated_at = NOW() \
+             WHERE image_uri = $1",
+        )
+        .bind(image_uri)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(DisableEnabledImageOutcome::Disabled)
+    }
+
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError> {
+        // ADR 0021 P1.8: physical DELETE is reserved for chunk-GC.
+        // Routine "disable" goes through `soft_delete_enabled_image`.
+        // This trait method stays for forward use by the future GC
+        // sweeper once a row's chunks are confirmed unreferenced.
         let res = sqlx::query("DELETE FROM enabled_images WHERE image_uri = $1")
             .bind(image_uri)
             .execute(&self.pool)
@@ -1440,6 +1576,15 @@ impl MetadataStore for PostgresStore {
     /// `idx_enabled_images_disk_manifest` (migration 0036) skips
     /// harness-only rows (`disk_manifest_id IS NULL`) so the scan
     /// is bounded by chunked-image count.
+    ///
+    /// ADR 0021 P1.8: soft-deleted rows (`soft_deleted_at IS NOT NULL`)
+    /// **are intentionally included** in the pin set. The soft-delete
+    /// is the chunk-lineage extension mechanism — a row stays in PG
+    /// (and contributes its disk-manifest chunks here) until the
+    /// future refcount-driven physical delete drops it. This keeps the
+    /// resume path correctness invariant — "if the row exists, its
+    /// chunks are reachable" — without needing a separate "soft-
+    /// deleted-but-still-referenced" pin source.
     async fn list_enabled_image_disk_manifest_ids(
         &self,
     ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {

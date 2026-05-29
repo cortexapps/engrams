@@ -328,6 +328,7 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,
+        soft_deleted_at: None,
     };
     meta.upsert_enabled_image(image.clone())
         .await
@@ -395,6 +396,7 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,
+        soft_deleted_at: None,
     };
     meta.upsert_enabled_image(image.clone())
         .await

@@ -1010,6 +1010,20 @@ mod tests {
         {
             Ok(None)
         }
+        async fn get_enabled_image_any(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::types::registry::EnabledImage>, engram_core::MetaError>
+        {
+            Ok(None)
+        }
+        async fn soft_delete_enabled_image(
+            &self,
+            _: &str,
+        ) -> Result<engram_core::traits::DisableEnabledImageOutcome, engram_core::MetaError>
+        {
+            unreachable!()
+        }
         async fn delete_enabled_image(&self, _: &str) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }
