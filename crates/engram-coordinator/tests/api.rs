@@ -622,6 +622,7 @@ fn seed_enabled(
             manifest_digest: digest.clone(),
             disk_manifest: None,
             base_snapshot_id: Some(base_snapshot_id),
+            base_snapshot_disk_manifest: None,
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,

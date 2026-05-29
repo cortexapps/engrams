@@ -218,6 +218,27 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     // mirrors disk_manifest's build-then-stamp shape — a persisted row
     // always has it.
     let base_snapshot_id: Option<Uuid> = row.try_get("base_snapshot_id").map_err(col_err)?;
+    // ADR 0021 P2: the base snapshot's disk manifest (migration 0042),
+    // denormalized so the heartbeat advertisement can warm the rootfs
+    // working set. Decoded tolerantly (→ None) so a row pulled before the
+    // migration — or a pre-P2 row never re-enabled — still decodes; the host
+    // just skips the residency prefetch for that image.
+    let base_snapshot_disk_manifest_id: Option<Uuid> = row
+        .try_get("base_snapshot_disk_manifest_id")
+        .unwrap_or(None);
+    let base_snapshot_disk_manifest_version: Option<i64> = row
+        .try_get("base_snapshot_disk_manifest_version")
+        .unwrap_or(None);
+    let base_snapshot_disk_manifest = match (
+        base_snapshot_disk_manifest_id,
+        base_snapshot_disk_manifest_version,
+    ) {
+        (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: id,
+            version: v as u64,
+        }),
+        _ => None,
+    };
     // ADR 0021 P1.8: nullable soft-delete marker (migration 0041).
     // Missing-column-tolerant via try_get → `Ok(None)` from the
     // generic decode path so a row pulled before the migration runs
@@ -230,6 +251,7 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
         disk_manifest,
         base_snapshot_id: base_snapshot_id.map(engram_core::types::SnapshotId),
+        base_snapshot_disk_manifest,
         last_refreshed_at,
         created_at,
         updated_at,

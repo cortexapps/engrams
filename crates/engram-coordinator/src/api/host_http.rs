@@ -398,7 +398,9 @@ pub async fn heartbeat(
 }
 
 /// ADR 0015 M5: project enabled-image rows down to the wire
-/// representation the host consumes — just `(image_uri, manifest_digest)`.
+/// representation the host consumes — `(image_uri, manifest_digest)` plus,
+/// since ADR 0021 P2, the base snapshot's disk manifest so the host can warm
+/// the rootfs working set on NVMe (residency) before sessions restore.
 fn enabled_image_refs_from_rows(
     rows: Vec<engram_core::types::EnabledImage>,
 ) -> Vec<EnabledImageRef> {
@@ -406,6 +408,7 @@ fn enabled_image_refs_from_rows(
         .map(|row| EnabledImageRef {
             image_uri: row.image_uri,
             manifest_digest: ManifestDigest(row.manifest_digest),
+            base_snapshot_disk_manifest: row.base_snapshot_disk_manifest,
         })
         .collect()
 }

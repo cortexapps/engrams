@@ -91,6 +91,14 @@ pub struct HeartbeatAck {
 pub struct EnabledImageRef {
     pub image_uri: String,
     pub manifest_digest: ManifestDigest,
+    /// ADR 0021 P2: the base snapshot's disk manifest, advertised so the host
+    /// can warm the rootfs working set on NVMe (residency) before sessions
+    /// restore. The on-demand serial-from-GCS page-in of these chunks during
+    /// `resume` is the measured substrate cost. `None` for pre-P2 rows or
+    /// harness-less images. `#[serde(default)]` so a host on an older build
+    /// still decodes a heartbeat-ack that carries the field, and vice versa.
+    #[serde(default)]
+    pub base_snapshot_disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
 }
 
 /// Newtype over the OCI manifest digest string (`sha256:<hex>`).
@@ -192,6 +200,7 @@ mod tests {
             enabled_images: vec![EnabledImageRef {
                 image_uri: "localhost:5001/test/demo:warm-1".into(),
                 manifest_digest: ManifestDigest::new("sha256:abc123"),
+                base_snapshot_disk_manifest: None,
             }],
         };
         let json = serde_json::to_string(&original).unwrap();

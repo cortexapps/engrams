@@ -1098,14 +1098,17 @@ impl MetadataStore for PostgresStore {
             INSERT INTO enabled_images
                 (id, image_uri, manifest_toml, manifest_digest,
                  disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                 base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                  last_refreshed_at, created_at, updated_at, soft_deleted_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, NULL)
             ON CONFLICT (image_uri) DO UPDATE SET
                 manifest_toml         = EXCLUDED.manifest_toml,
                 manifest_digest       = EXCLUDED.manifest_digest,
                 disk_manifest_id      = EXCLUDED.disk_manifest_id,
                 disk_manifest_version = EXCLUDED.disk_manifest_version,
                 base_snapshot_id      = EXCLUDED.base_snapshot_id,
+                base_snapshot_disk_manifest_id      = EXCLUDED.base_snapshot_disk_manifest_id,
+                base_snapshot_disk_manifest_version = EXCLUDED.base_snapshot_disk_manifest_version,
                 last_refreshed_at     = EXCLUDED.last_refreshed_at,
                 updated_at            = NOW(),
                 -- ADR 0021 P1.8: enabling an image always "undeletes" any
@@ -1125,6 +1128,8 @@ impl MetadataStore for PostgresStore {
         .bind(image.disk_manifest.map(|m| m.manifest_id))
         .bind(image.disk_manifest.map(|m| m.version as i64))
         .bind(image.base_snapshot_id.map(|s| s.as_uuid()))
+        .bind(image.base_snapshot_disk_manifest.map(|m| m.manifest_id))
+        .bind(image.base_snapshot_disk_manifest.map(|m| m.version as i64))
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
         .execute(&mut *tx)
@@ -1146,6 +1151,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE soft_deleted_at IS NULL
@@ -1167,6 +1173,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1 AND soft_deleted_at IS NULL
@@ -1192,6 +1199,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, image_uri, manifest_toml, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1
