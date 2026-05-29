@@ -435,14 +435,31 @@ rootfs stage).
 `engram_chunk_fetch_seconds{tier=blobstorage}` count drops on 2nd+ restore per
 host; `{kind=cold}` p50 under ~500 ms.
 
-## Phase 3 — Parallelize restore subsystem setup [~300 ms → ~150 ms]
+## Phase 3 — Parallelize restore subsystem setup [~300 ms → ~150 ms] — ✅ SHIPPED (2026-05-29, `3600018`)
 
-`restore_in_jail` (`lib.rs:1604`) + `PooledBackend::restore`
-(`pooled_backend.rs:1723`) run netns → FC spawn → symlinks → UFFD spawn →
-socket wait → materialize → load_snapshot serially. `try_join!` the independent
-units, join at the `load_snapshot_paused` gate; rework partial-init cleanup for
-the joined shape. Add the deferred `restore_in_jail` sub-step spans (ADR 0019
-0c) to measure the collapse to the max leg.
+`restore_in_jail` ran netns → FC spawn → symlinks → UFFD spawn → load_snapshot
+serially. Now: instrument the sub-steps (`c16c5c0`; measured the per-leg
+breakdown — trace `309633f4`), then run two legs concurrently — {reserve netns →
+spawn FC} ∥ {spawn UFFD handler} — converging at the `load_snapshot` gate.
+
+Used **`join!`, not `try_join!`**: try_join cancels the slower leg on the first
+error, which can strand a half-created netns / FC child / handler; `join!` lets
+both finish, then a reconciliation match tears down whatever succeeded if either
+failed (each leg also self-cleans its own partial state; `kill_on_drop` on both
+children makes the drop-based cleanup SIGKILL).
+
+**Regression + fix (worth recording):** the first attempt (`501e30e`) hit prod
+and every restore failed — `spawn_uffd_handler` writes its log + UDS into
+`jail_dir`, which `spawn_firecracker` creates, so the parallel UFFD leg **raced**
+the dir into existence and lost (`File::create` → ENOENT). CI/dev-vm masked it
+(test `jail_dir` pre-existed / won the race). Reverted (`a91f83b`); fixed by making
+**jail_dir creation the caller's responsibility** (single owner — `restore_in_jail`
+*and* `create_in_jail` each `create_dir_all` up front; removed from
+`spawn_firecracker`), which is deterministic — no race. Take 2 (`3600018`)
+prod-validated: trace `c730f91b` shows `reserve_netns` + `spawn_uffd_handler` both
+starting at 108 ms (overlapping), the ~107 ms UFFD spawn fully hidden under the
+netns→spawn chain → ~100 ms off the critical path. `reserve_netns` (~91 ms) is now
+the long pole → that's **Phase 4's** target.
 
 ## Phase 4 — Network slot pre-allocation pool [~150 ms → ~100 ms]
 
