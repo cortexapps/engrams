@@ -20,7 +20,13 @@ shave the ~1 s restore tail to ~100 ms; phased P1–P5; P1 code-complete + green
 `just check` 822 tests + dev-vm clippy; the dev-vm vsock-handshake stall was
 resolved by a capture-scoped handshake retry, NOT io_uring, see below.)*
 
-Phase: 1 (P1 = the lever). Commit chain recorded here as work lands.
+Phase status (2026-05-29): P1 + chunk-native UFFD + **P3** (restore-subsystem
+parallelism, `3600018`) SHIPPED. P2 superseded by ADR 0021 residency. **P4
+reframed + PARKED** — the netns long pole (~91 ms) is mostly `ip`/`iptables`
+subprocess spawn, so the first lever is a netlink swap, not a pool (per the E2B
+`network/pool.go` analysis in P4 below). **#7 (prefetch/`restore_in_jail`
+overlap) PARKED** — residency erases it. P5 (concurrent restores) stands alone,
+unscheduled.
 
 ## The slow-cold-boot vsock handshake — root cause + resolution (not io_uring)
 
@@ -461,13 +467,64 @@ starting at 108 ms (overlapping), the ~107 ms UFFD spawn fully hidden under the
 netns→spawn chain → ~100 ms off the critical path. `reserve_netns` (~91 ms) is now
 the long pole → that's **Phase 4's** target.
 
-## Phase 4 — Network slot pre-allocation pool [~150 ms → ~100 ms]
+## Phase 4 — Cheapen the netns leg (`reserve_netns` ~91 ms) — REFRAMED, PARKED
 
-`crates/engram-sandbox-firecracker/src/net.rs` + `reserve_restored_netns`
-(`lib.rs:1927`): pre-create a pool of netns+TAP+SNAT slots (E2B
-`network/pool.go` shape, e.g. New=32 / Reused=100); restore pops a ready slot
-and rebinds the bake's TAP name inside it; background refill keeps it topped.
-Low yield (~30 ms), the last leg to ~100 ms.
+P3 left `reserve_netns` (~91 ms) as the restore long pole. The original framing —
+"pre-allocate a netns+TAP+SNAT pool, E2B `network/pool.go` shape (New=32 /
+Reused=100)" — turns out to be E2B's *endgame*, not the first lever. Reading
+E2B's actual implementation
+(`packages/orchestrator/pkg/sandbox/network/{pool,slot,network}.go`, 2026-05-29)
+shows their speed comes from **three compounding choices**; we have **none** of
+them, so the pool is the wrong place to start.
+
+**Why our ~91 ms is what it is.** `provision_netns_inner` (`net.rs:784`) shells
+out to **~15 `ip`/`iptables` subprocesses** (fork+exec ≈ ~6 ms each). The cost is
+almost entirely process-spawn overhead, *not* inherent namespace setup. E2B
+builds the identical topology with **netlink syscalls** (the
+`vishvananda/netlink` library — `netns.NewNamed`, `LinkAdd`, `AddrAdd`,
+`LinkSetUp`) — microseconds each, no subprocess.
+
+**What makes E2B's namespaces *reusable* (the pool's real value):**
+1. **Constant in-namespace identity** (`slot.go`). Every slot is identical from
+   the inside — `tap0`, gateway `169.254.0.22`, guest `169.254.0.21` (hardcoded
+   link-local); all per-slot uniqueness is host-side (`ns-<idx>`, `veth-<idx>`,
+   host IP `10.11.0.<idx>`). So **any snapshot drops into any slot**. We bake a
+   per-template TAP name (`snap.tap_name`) + `/30` (`bake_cidr`) *into the
+   snapshot*, so our namespaces are template-specific and can't be pooled
+   generically without recreating the TAP per acquire.
+2. **Per-sandbox config = firewall only.** `ConfigureInternet`/`ResetInternet`
+   swap nftables allow/deny CIDR rules and nothing else — a *literal no-op* when a
+   sandbox has no custom egress. Acquire is ~free and reset-and-reuse is sound.
+   Ours does structural work per restore (create TAP, `reserve(bake_cidr)`, SNAT
+   rule).
+3. **Two-tier pool** (`pool.go`: `New=32` background-`Populate`d + `Reused=100`),
+   `Get` prefers reused, `Return` waits a 3 s drain then `ResetInternet` → back to
+   the reused pool (or `RemoveNetwork` + release IP if full/closed). The *reused*
+   tier is where the win lives — and it exists **only because (1)+(2) make slots
+   generic**.
+
+**Reframed ladder (in order, if/when we resume):**
+- **(a) Subprocess → netlink** (`rtnetlink` / `netlink-packet-route` crates) in
+  `net.rs`. Almost certainly the biggest cheap win — attacks the same ~91 ms with
+  **zero** pooling / lifecycle / reuse-correctness risk; self-contained in one
+  crate. Likely lands `reserve_netns` at ~20–30 ms on its own and may make the
+  pool unnecessary. **This is what to do first, not the pool.**
+- **(b) Constant in-namespace identity** (fixed TAP name + fixed guest IP/gateway;
+  push uniqueness entirely to the host-side SNAT slot we already allocate). A
+  **bake-side** change (template build + a per-template-snapshot fallback) — the
+  real prerequisite for E2B-style reuse.
+- **(c) The pool itself** — only after (a)+(b); valuable mainly for the reused
+  tier's near-zero acquire.
+
+**Risk.** Our shared-`bake_cidr` model already bit prod once (2026-05-21
+double-bound `/30` → wrong-VM shell; see `teardown_netns:883`). Slot *reuse*
+multiplies that hazard; E2B avoids it structurally via (1). Don't bolt reuse onto
+the current model.
+
+**Status: PARKED** (2026-05-29). Low absolute yield (~40–60 ms) on a path the
+warm substrate (~516 ms) and the agent first-token gap still dominate. Resume
+with **(a) the netlink swap** as a self-contained, measured change — not as "a
+pool."
 
 ## Phase 5 — N>1 concurrent restores per base (throughput, not latency)
 
@@ -475,6 +532,19 @@ Low yield (~30 ms), the last leg to ~100 ms.
 the canonical rootfs/vsock paths to private copies (the per-FC mount-namespace
 approach ADR 0014 defers). Lifts P1's depth-1 cap. Sequence last, only if
 measured demand requires concurrent restores per image per host.
+
+## Deferred — overlap per-restore prefetch with `restore_in_jail` (#7) — PARKED
+
+The restore path runs `prefetch_memory_chunks` *then* `restore_in_jail`
+serially; #7 would overlap them (run the prefetch concurrently with jail setup,
+~50 ms hide). **Parked (2026-05-29) — doubly superseded:** (1) P2's prod finding
+is that memory prefetch is already cheap (memory restore is no longer the
+bottleneck — see P2's "low-value" note above), so the overlap saves little; (2)
+ADR 0021's residency retires the boot-path prefetch *entirely* (base memory
+resident on NVMe, off the restore read path), which **erases** the work rather
+than hiding it. Not worth adding restore-path concurrency — the same class that
+regressed in P3 (`501e30e`) — for a win residency removes outright. Resume only
+if residency stalls and memory prefetch re-emerges as a measured cost.
 
 ## Per-phase ship loop
 
