@@ -25,9 +25,13 @@
 //!
 //! What this module does NOT do:
 //!
-//! - Detect external modifications to cache files (the bytes are
-//!   hash-verified on every read; corruption surfaces as
-//!   `HashMismatch` from the store layer).
+//! - Re-verify cache files on read. Integrity is checked once on
+//!   *populate* — `get`'s fetch arm and `put` hash the bytes before the
+//!   atomic temp+rename — and the read path then trusts the
+//!   content-addressed file. Re-hashing a 16 MiB chunk is ~80 ms on our
+//!   no-SHA-NI hosts and, re-run per read, dominated restore latency
+//!   (ADR 0021). Post-write bit-rot / external modification is left to
+//!   PD / local-SSD durability, not caught here.
 //! - GC. Eviction is local LRU; cross-host BlobStorage lifecycle
 //!   is currently no-op (the chunk-store GC was removed 2026-05-23
 //!   — see ADR 0015 M5 "Known regression").
@@ -197,40 +201,36 @@ impl ChunkCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Bytes>>,
     {
-        // Fast path: local hit.
+        // Fast path: local hit. The cache is content-addressed and every
+        // populate path verifies `bytes == hash` before the atomic write
+        // (`get`'s fetch arm below, and `put`), so a file present at
+        // `path_for(hash)` is known-good. We deliberately do NOT re-hash it
+        // here. ADR 0021: a full sha256 of a 16 MiB chunk is ~80 ms on our
+        // no-SHA-NI (Cascade Lake) hosts, and the disk daemon re-reads hot
+        // ext4 chunks dozens of times per restore — re-verifying on every
+        // read was ~2.2 s of a 2.6 s substrate, the dominant cost. Verify on
+        // populate; trust on read. (Atomic temp+rename means a present file is
+        // never torn; post-write bit-rot is left to PD/local-SSD durability.)
         let path = self.path_for(hash);
         if let Some(bytes) = read_if_present(&path).await? {
-            // Verify locally — catches a corrupted cache file
-            // (concurrent mutation, FS bit-rot, our own bugs).
-            let actual = ChunkHash::of(&bytes);
-            if actual == hash {
-                // ADR 0014 M1.15: local NVMe hit. Don't differentiate
-                // singleflight-piggyback from true cache hit here —
-                // the user-visible win is the same.
-                metrics::counter!(
-                    "engram_chunk_cache_hits_total",
-                    "tier" => "nvme",
-                )
-                .increment(1);
-                // ADR 0019 0d: bytes served per tier. With the hit counter
-                // this gives page-in volume + the nvme/blob split — the
-                // aggregate view of chunked-NBD page-in during ext4 mount
-                // (per-read spans would flood the trace; this is the metric).
-                metrics::counter!(
-                    "engram_chunk_cache_bytes_total",
-                    "tier" => "nvme",
-                )
-                .increment(bytes.len() as u64);
-                return Ok(bytes);
-            }
-            // Mismatch: drop the local copy and fall through to
-            // remote fetch.
-            tracing::warn!(
-                hash = %hash,
-                actual = %actual,
-                "cached chunk hash mismatch; refetching",
-            );
-            let _ = fs::remove_file(&path).await;
+            // ADR 0014 M1.15: local NVMe hit. Don't differentiate
+            // singleflight-piggyback from true cache hit here —
+            // the user-visible win is the same.
+            metrics::counter!(
+                "engram_chunk_cache_hits_total",
+                "tier" => "nvme",
+            )
+            .increment(1);
+            // ADR 0019 0d: bytes served per tier. With the hit counter
+            // this gives page-in volume + the nvme/blob split — the
+            // aggregate view of chunked-NBD page-in during ext4 mount
+            // (per-read spans would flood the trace; this is the metric).
+            metrics::counter!(
+                "engram_chunk_cache_bytes_total",
+                "tier" => "nvme",
+            )
+            .increment(bytes.len() as u64);
+            return Ok(bytes);
         }
 
         // Singleflight: register our waiter; if we're the first,
@@ -250,31 +250,57 @@ impl ChunkCache {
             // the bytes counter below quantify "how much of the boot is
             // blob page-in" without per-read trace spam.
             let fetch_start = std::time::Instant::now();
-            let result = fetch().await;
+            let fetched = fetch().await;
             metrics::histogram!(
                 "engram_chunk_fetch_seconds",
                 "tier" => "blobstorage",
             )
             .record(fetch_start.elapsed().as_secs_f64());
+            // Verify-on-populate. This is the ONE place a chunk is hashed:
+            // a content-addressed cache must never serve OR store bytes that
+            // don't match the requested hash (corrupt / truncated object). On
+            // mismatch we fail the read for every waiter rather than poison
+            // the guest's rootfs, and never write the bad bytes. The read
+            // fast path above then trusts the verified, atomically-written
+            // file — that's what moves the 16 MiB sha256 off the hot per-read
+            // path (ADR 0021).
+            let result = match fetched {
+                Ok(bytes) => {
+                    let actual = ChunkHash::of(&bytes);
+                    if actual == hash {
+                        Ok(bytes)
+                    } else {
+                        tracing::error!(
+                            hash = %hash,
+                            actual = %actual,
+                            "fetched chunk hash mismatch; refusing to cache or serve",
+                        );
+                        Err(ChunkStoreError::HashMismatch {
+                            expected: hash.to_hex(),
+                            actual: actual.to_hex(),
+                        })
+                    }
+                }
+                Err(e) => Err(e),
+            };
             // Persist + drain waiters under a single lock acquisition.
             let waiters = {
                 let mut inflight = self.inner.inflight.lock();
                 inflight.remove(&hash).unwrap_or_default()
             };
             if let Ok(bytes) = result.as_ref() {
-                // ADR 0021 P2 diag: write errors here were silently swallowed
-                // (`let _ =`). If chunks fail to land on NVMe (ENOSPC, perms,
-                // etc.) they're never cached → every read re-fetches from GCS,
-                // which presents exactly as "warming ran but reads still miss".
-                // Surface the failure (+ keep it non-fatal: the fetched bytes
-                // still return to the caller).
+                // write_local failure is non-fatal I/O (ENOSPC, perms): the
+                // fetched bytes still return to the caller, but the chunk
+                // isn't cached, so every later read re-fetches from GCS —
+                // which presents exactly as "warming ran but reads still
+                // miss". Surface it loudly rather than swallowing (`let _ =`).
                 if let Err(e) = self.write_local(hash, bytes).await {
                     tracing::warn!(
                         hash = %hash,
                         root = %self.inner.config.root.display(),
                         bytes = bytes.len(),
                         error = %e,
-                        "P2 diag: chunk cache write_local FAILED — chunk not cached (reads will miss → GCS)",
+                        "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
                     );
                 }
                 metrics::counter!(
@@ -760,18 +786,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_detects_corrupted_local_copy_and_refetches() {
+    async fn get_rejects_fetch_returning_mismatched_bytes() {
+        // ADR 0021: verification moved to the populate path. A fetcher that
+        // returns bytes not matching the requested hash must error — never
+        // served (would poison the guest rootfs), never cached. A single
+        // get() is the singleflight leader, so it sees the real HashMismatch.
+        let (cache, _store, _b, _c) = setup(1024 * 1024).await;
+        let h = ChunkHash::of(b"the real bytes");
+        let got = cache
+            .get(h, || async { Ok(Bytes::from_static(b"WRONG bytes")) })
+            .await;
+        assert!(
+            matches!(got, Err(ChunkStoreError::HashMismatch { .. })),
+            "fetch returning mismatched bytes must be rejected, got {got:?}",
+        );
+        assert!(
+            !cache.contains_on_disk(h),
+            "mismatched fetch must not populate the cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_trusts_present_file_without_rehashing() {
+        // ADR 0021: the read fast path no longer re-verifies (a 16 MiB sha256
+        // was ~80 ms/read on no-SHA-NI hosts). Once a chunk is present at its
+        // content-addressed path, get() returns it verbatim and never
+        // refetches. We document the deliberate trade by overwriting the file
+        // out-of-band and asserting the divergent bytes are served as-is and
+        // the fetcher is not consulted.
         let (cache, store, _b, _c) = setup(1024 * 1024).await;
         let body = b"valid bytes";
         let h = store.put_chunk(body).await.unwrap();
-        // Warm the cache.
-        let _ = cache_get_from(&cache, &store, h).await.unwrap();
-        // Corrupt the local copy directly.
+        let _ = cache_get_from(&cache, &store, h).await.unwrap(); // warm
         let path = cache.path_for(h);
-        fs::write(&path, b"corrupted").await.unwrap();
-        // Get should detect the mismatch, evict, refetch.
-        let got = cache_get_from(&cache, &store, h).await.unwrap();
-        assert_eq!(&got[..], body);
+        fs::write(&path, b"divergent on-disk bytes").await.unwrap();
+        let got = cache
+            .get(h, || async {
+                panic!("must not refetch when the file is present")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            &got[..],
+            b"divergent on-disk bytes",
+            "read path trusts the present content-addressed file (no re-hash, no refetch)",
+        );
     }
 
     #[tokio::test]
