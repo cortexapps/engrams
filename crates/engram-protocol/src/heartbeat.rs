@@ -98,6 +98,14 @@ pub struct EnabledImageRef {
     /// `enabled_images` column is `NOT NULL` (migration 0042); no
     /// `serde(default)`: this is a clean break, coord + hosts deploy together.
     pub base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef,
+    /// ADR 0021 P2 (memory residency): the base snapshot's memory manifest,
+    /// advertised so the host warms the chunked memory image on NVMe at
+    /// host-boot — symmetric with the disk manifest above. Without it, the
+    /// first session on a freshly rolled host pays a cold per-restore memory
+    /// prefetch from GCS (~2.84 s, measured). Always present (`enabled_images`
+    /// column is `NOT NULL`, migration 0043); no `serde(default)` — clean
+    /// break, coord + hosts deploy together.
+    pub base_snapshot_memory_manifest: engram_core::types::manifest::ManifestRef,
 }
 
 /// Newtype over the OCI manifest digest string (`sha256:<hex>`).
@@ -200,6 +208,10 @@ mod tests {
                 image_uri: "localhost:5001/test/demo:warm-1".into(),
                 manifest_digest: ManifestDigest::new("sha256:abc123"),
                 base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef {
+                    manifest_id: uuid::Uuid::nil(),
+                    version: 1,
+                },
+                base_snapshot_memory_manifest: engram_core::types::manifest::ManifestRef {
                     manifest_id: uuid::Uuid::nil(),
                     version: 1,
                 },

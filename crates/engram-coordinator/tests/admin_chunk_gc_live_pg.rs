@@ -214,6 +214,10 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
                 manifest_id: uuid::Uuid::new_v4(),
                 version: 1,
             }),
+            base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,
@@ -364,6 +368,10 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             disk_manifest: Some(pinned_mref),
             base_snapshot_id: Some(base_snap),
             base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
+            base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
                 manifest_id: uuid::Uuid::new_v4(),
                 version: 1,
             }),

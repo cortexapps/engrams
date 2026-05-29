@@ -626,6 +626,10 @@ fn seed_enabled(
                 manifest_id: uuid::Uuid::new_v4(),
                 version: 1,
             }),
+            base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
             last_refreshed_at: now,
             created_at: now,
             updated_at: None,

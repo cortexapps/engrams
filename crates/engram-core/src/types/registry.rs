@@ -210,6 +210,16 @@ pub struct EnabledImage {
     /// build-then-stamp shape — a persisted row always has `Some`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_snapshot_disk_manifest: Option<crate::types::manifest::ManifestRef>,
+    /// ADR 0021 P2 (memory residency): the base snapshot's *memory* manifest —
+    /// the chunked FC memory image the UFFD handler pages in at restore.
+    /// Symmetric companion to `base_snapshot_disk_manifest`: denormalized from
+    /// the snapshot record at enable so the heartbeat advertisement (and the
+    /// host's residency prefetch) can warm these chunks on NVMe at host-boot,
+    /// retiring the cold per-restore memory prefetch (~2.84 s on a freshly
+    /// rolled host). `NOT NULL` in the DB (migration 0043); the `Option` only
+    /// mirrors the build-then-stamp shape — a persisted row always has `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_snapshot_memory_manifest: Option<crate::types::manifest::ManifestRef>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,

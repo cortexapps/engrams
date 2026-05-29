@@ -329,6 +329,10 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
             manifest_id: uuid::Uuid::new_v4(),
             version: 1,
         }),
+        base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        }),
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,
@@ -385,6 +389,12 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
         manifest_id: Uuid::new_v4(),
         version: 7,
     };
+    // ADR 0021 P2 (memory residency): a distinct ref for the base snapshot's
+    // memory manifest, so its round-trip can't pass by coincidence with disk.
+    let base_mem_mref = ManifestRef {
+        manifest_id: Uuid::new_v4(),
+        version: 9,
+    };
 
     // Pre-write: pin-set source #1 must NOT contain our fresh ref.
     let before = meta
@@ -404,6 +414,7 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
         disk_manifest: Some(mref),
         base_snapshot_id: Some(seed_base_snapshot(&meta).await),
         base_snapshot_disk_manifest: Some(base_mref),
+        base_snapshot_memory_manifest: Some(base_mem_mref),
         last_refreshed_at: Utc::now(),
         created_at: Utc::now(),
         updated_at: None,
@@ -430,6 +441,14 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
         fetched.base_snapshot_disk_manifest,
         Some(base_mref),
         "base_snapshot_disk_manifest must round-trip through PG",
+    );
+    // ADR 0021 P2 (memory residency): the base snapshot's memory manifest must
+    // round-trip too — it's what the heartbeat advertises so hosts warm the
+    // memory working set at host-boot.
+    assert_eq!(
+        fetched.base_snapshot_memory_manifest,
+        Some(base_mem_mref),
+        "base_snapshot_memory_manifest must round-trip through PG",
     );
 
     // Pin-set query picks it up.

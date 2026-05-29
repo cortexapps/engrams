@@ -90,10 +90,11 @@ pub async fn enable_image(
     // row, so a failed snapshot leaves zero rows (the NOT NULL FK on
     // base_snapshot_id makes that a schema invariant, not just a
     // convention).
-    let (base_snapshot_id, base_snapshot_disk_manifest) =
+    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
         capture_and_record_base_snapshot(&state, &row, &manifest).await?;
     row.base_snapshot_id = Some(base_snapshot_id);
     row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
+    row.base_snapshot_memory_manifest = Some(base_snapshot_memory_manifest);
     state
         .services
         .meta
@@ -144,10 +145,11 @@ pub async fn refresh_enabled_image(
     refreshed.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
     // ADR 0020 P1: a moved tag is new content — capture a fresh base
     // snapshot for the new digest before the refreshed row goes live.
-    let (base_snapshot_id, base_snapshot_disk_manifest) =
+    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
         capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
     refreshed.base_snapshot_id = Some(base_snapshot_id);
     refreshed.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
+    refreshed.base_snapshot_memory_manifest = Some(base_snapshot_memory_manifest);
     state
         .services
         .meta
@@ -284,8 +286,9 @@ async fn fetch_and_seal_manifest(
         // this is set — enforcing "enabled iff base snapshot exists".
         base_snapshot_id: None,
         // ADR 0021 P2: stamped by the caller from the captured snapshot's
-        // disk manifest, alongside base_snapshot_id. `None` until then.
+        // disk + memory manifests, alongside base_snapshot_id. `None` until then.
         base_snapshot_disk_manifest: None,
+        base_snapshot_memory_manifest: None,
         last_refreshed_at: now,
         created_at: now,
         updated_at: None,
@@ -376,6 +379,8 @@ async fn capture_and_record_base_snapshot(
 ) -> Result<
     (
         engram_core::types::SnapshotId,
+        // (disk manifest, memory manifest) of the base snapshot.
+        engram_core::types::manifest::ManifestRef,
         engram_core::types::manifest::ManifestRef,
     ),
     ApiError,
@@ -405,7 +410,15 @@ async fn capture_and_record_base_snapshot(
                         row.image_uri
                     ))
                 })?;
-                return Ok((id, disk_manifest));
+                let memory_manifest = existing.base_snapshot_memory_manifest.ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "enabled image `{}` reuses base snapshot {id} but carries no \
+                         base_snapshot_memory_manifest (NOT NULL since migration 0043); \
+                         refresh the image to re-stamp it",
+                        row.image_uri
+                    ))
+                })?;
+                return Ok((id, disk_manifest, memory_manifest));
             }
         }
     }
@@ -514,7 +527,14 @@ async fn capture_and_record_base_snapshot(
             row.image_uri
         ))
     })?;
-    Ok((meta.id, disk_manifest))
+    let memory_manifest = meta.memory_manifest.ok_or_else(|| {
+        ApiError::Internal(format!(
+            "base snapshot for `{}` was captured without a chunked memory manifest; \
+             memory residency requires one — not enabling",
+            row.image_uri
+        ))
+    })?;
+    Ok((meta.id, disk_manifest, memory_manifest))
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`

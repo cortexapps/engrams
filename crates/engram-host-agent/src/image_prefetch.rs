@@ -185,41 +185,30 @@ async fn reconcile(
         if current.contains(&image.manifest_digest) {
             continue;
         }
-        let image_uri = image.image_uri.clone();
-        let expected_digest = image.manifest_digest.clone();
-        let digest = image.manifest_digest.clone();
-        // ADR 0021 P2: warm the base snapshot's rootfs too (Copy, so no clone).
-        let base_snapshot_disk_manifest = image.base_snapshot_disk_manifest;
+        // Clone the whole ref into the task — it carries everything
+        // prefetch_one needs (uri, digest, base-snapshot disk + memory
+        // manifests). Two Strings + two Copy refs; cheap per reconcile.
+        let image = image.clone();
         let readiness = readiness.clone();
         let image_cache = image_cache.clone();
         let chunk_store = chunk_store.clone();
         let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
-            match prefetch_one(
-                &image_uri,
-                &expected_digest,
-                base_snapshot_disk_manifest,
-                &image_cache,
-                &chunk_store,
-                &chunk_cache,
-                &semaphore,
-            )
-            .await
-            {
+            match prefetch_one(&image, &image_cache, &chunk_store, &chunk_cache, &semaphore).await {
                 Ok(chunks) => {
-                    readiness.mark_ready(digest.clone());
+                    readiness.mark_ready(image.manifest_digest.clone());
                     tracing::info!(
-                        image_uri = %image_uri,
-                        digest = digest.as_str(),
+                        image_uri = %image.image_uri,
+                        digest = image.manifest_digest.as_str(),
                         chunks,
                         "image prefetched; marked ready",
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
-                        image_uri = %image_uri,
-                        digest = digest.as_str(),
+                        image_uri = %image.image_uri,
+                        digest = image.manifest_digest.as_str(),
                         error = %e,
                         "image prefetch failed; will retry on next reconcile",
                     );
@@ -230,20 +219,23 @@ async fn reconcile(
 }
 
 /// Pull every chunk of an image's chunked rootfs — and, since ADR
-/// 0021 P2, its base snapshot's rootfs — through the tiered
-/// resolver. Each `chunk_store.get_chunk(hash)` call hits tier 1
-/// (NVMe cache) if present, else faults through tier 2 (BlobStorage)
-/// or tier 3 (OCI Range GET) and tees the bytes into the local
-/// cache. Returns the total chunk count on success.
+/// 0021 P2, its base snapshot's rootfs *and* memory image — through
+/// the tiered resolver. Each `chunk_store.get_chunk(hash)` call hits
+/// tier 1 (NVMe cache) if present, else faults through tier 2
+/// (BlobStorage) or tier 3 (OCI Range GET) and tees the bytes into the
+/// local cache. Returns the total chunk count on success.
 async fn prefetch_one(
-    image_uri: &str,
-    expected_digest: &ManifestDigest,
-    base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef,
+    image: &EnabledImageRef,
     image_cache: &ImageCache,
     chunk_store: &ChunkStore,
     chunk_cache: &ChunkCache,
     semaphore: &Arc<Semaphore>,
 ) -> Result<usize, PrefetchError> {
+    let image_uri = image.image_uri.as_str();
+    let expected_digest = &image.manifest_digest;
+    // ADR 0021 P2: the base snapshot's rootfs + memory working sets to warm.
+    let base_snapshot_disk_manifest = image.base_snapshot_disk_manifest;
+    let base_snapshot_memory_manifest = image.base_snapshot_memory_manifest;
     let mut cached = image_cache
         .ensure_image(image_uri)
         .await
@@ -298,6 +290,20 @@ async fn prefetch_one(
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot: {e}")))?;
     total += prefetch_manifest_chunks(base_manifest, chunk_store, chunk_cache, semaphore).await?;
+
+    // (3) ADR 0021 P2 (memory residency) — the base snapshot's memory image.
+    // The UFFD handler pages these chunks in when the guest resumes; warming
+    // them on NVMe here retires the cold per-restore memory prefetch that was
+    // ~2.84 s on a freshly-rolled host (trace d4cb3728 cold vs c55e1035 warm).
+    // Folding it into readiness means an image isn't "warm" until BOTH its disk
+    // and memory working sets are resident — so a host serves its first session
+    // warm, not just its second.
+    let base_memory_manifest: Manifest = chunk_store
+        .get_manifest(base_snapshot_memory_manifest)
+        .await
+        .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
+    total +=
+        prefetch_manifest_chunks(base_memory_manifest, chunk_store, chunk_cache, semaphore).await?;
 
     Ok(total)
 }

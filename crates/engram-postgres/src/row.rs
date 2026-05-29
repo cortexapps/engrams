@@ -233,6 +233,18 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         manifest_id: base_snapshot_disk_manifest_id,
         version: base_snapshot_disk_manifest_version as u64,
     });
+    // ADR 0021 P2 (memory residency): NOT NULL in the DB (migration 0043),
+    // same clean-break decode as the disk manifest above.
+    let base_snapshot_memory_manifest_id: Uuid = row
+        .try_get("base_snapshot_memory_manifest_id")
+        .map_err(col_err)?;
+    let base_snapshot_memory_manifest_version: i64 = row
+        .try_get("base_snapshot_memory_manifest_version")
+        .map_err(col_err)?;
+    let base_snapshot_memory_manifest = Some(engram_core::types::manifest::ManifestRef {
+        manifest_id: base_snapshot_memory_manifest_id,
+        version: base_snapshot_memory_manifest_version as u64,
+    });
     // ADR 0021 P1.8: nullable soft-delete marker (migration 0041).
     // Missing-column-tolerant via try_get → `Ok(None)` from the
     // generic decode path so a row pulled before the migration runs
@@ -246,6 +258,7 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         disk_manifest,
         base_snapshot_id: base_snapshot_id.map(engram_core::types::SnapshotId),
         base_snapshot_disk_manifest,
+        base_snapshot_memory_manifest,
         last_refreshed_at,
         created_at,
         updated_at,
