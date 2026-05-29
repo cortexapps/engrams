@@ -32,9 +32,10 @@
 //!   no-SHA-NI hosts and, re-run per read, dominated restore latency
 //!   (ADR 0021). Post-write bit-rot / external modification is left to
 //!   PD / local-SSD durability, not caught here.
-//! - GC. Eviction is local LRU; cross-host BlobStorage lifecycle
-//!   is currently no-op (the chunk-store GC was removed 2026-05-23
-//!   — see ADR 0015 M5 "Known regression").
+//! - GC. This module only does local-NVMe LRU eviction. Cross-host
+//!   BlobStorage lifecycle is the coordinator's chunk-GC sweep (ADR
+//!   0016 Phase C — `engram-coordinator/src/chunk_gc.rs`: pin-set +
+//!   24 h-grace candidate promotion), not this cache's concern.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

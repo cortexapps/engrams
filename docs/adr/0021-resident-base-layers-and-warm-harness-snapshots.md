@@ -250,9 +250,11 @@ snapshots are the fallback for "the agent boot is genuinely expensive and persis
 
 - **(a) Storage dedup — free.** Immutable, content-addressed. A session's disk =
   template manifest (shared) + divergent chunks (its writes, deduped by content).
-  Per-session storage ≈ divergence. **Requires a correct refcount/GC** for
-  unreferenced divergent chunks — currently a hole (chunk-GC pulled May 2026); the
-  deduped store must treat GC as first-class.
+  Per-session storage ≈ divergence. **The refcount/GC this needs is in place** —
+  ADR 0016 Phase C's chunk-GC (`engram-coordinator/src/chunk_gc.rs`: pin-set sweep +
+  24 h-grace candidate promotion, default-ON background loop + admin endpoints).
+  Residency just adds the resident manifests to the pin-set (which already counts
+  enabled-image + snapshot manifests as live).
 - **(b) Memory at rest — free dedup.** Warm snapshots are content-addressed; they
   share kernel/base-OS/agent chunks across templates.
 - **(c) Runtime RAM — not free; mechanism is its own ADR.** `UFFDIO_COPY` (our current
@@ -327,8 +329,11 @@ remaining per-session cost is the COW delta + the first-prompt workspace scan.
    mount on top of the template, or baked into the template? Separate-mount keeps
    templates reusable and warm snapshots small; needs a per-session volume + the
    first-prompt scan. (Likely separate-mount — confirm.)
-5. **Storage GC.** Residency + COW divergence is only sound with a correct refcount/GC
-   (currently a regression) — design it in, not bolt-on.
+5. **Storage GC — resolved.** Residency + COW divergence is only sound with a correct
+   refcount/GC, and ADR 0016 Phase C ships it (chunk-GC pin-set sweep + 24 h-grace
+   candidate promotion, default-ON). Residency only needs to ensure the resident
+   manifests are counted by the pin-set (they already are: enabled-image + snapshot
+   manifests are live).
 
 ## Consequences
 
@@ -707,9 +712,12 @@ Density (K sessions cost `base + K×dirty`) and session forking share one primit
 **File backend** (no fork) vs a **memfd / `UFFDIO_CONTINUE`** patch (live-fork) — and is
 **parked** there, measure-first, off the critical path for the latency wins above.
 
-**Cross-cutting — storage refcount/GC** (open question 5): residency + COW divergence
-is only sound with a correct GC (currently regressed — chunk-GC pulled May 2026).
-- [ ] Design GC in as first-class, not bolt-on (`engram-chunk-store/src/gc.rs`).
+**Cross-cutting — storage refcount/GC** (open question 5): **already shipped** — ADR 0016
+Phase C's chunk-GC (`engram-coordinator/src/chunk_gc.rs` sweep + `engram-chunk-store`
+`PinSet`; default-ON `gc_sweep_loop`, admin dry-run/sweep/candidates endpoints, live-PG
+tests). GC was pulled 2026-05-23 (ADR 0015 M5) and restored by Phase C.
+- [x] GC is first-class. Residency just keeps the resident manifests in the pin-set
+      (enabled-image + snapshot manifests are already counted live).
 
 ## References
 

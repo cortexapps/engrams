@@ -55,7 +55,7 @@ memfile** (materialized once per template per host from the resident chunks — 
   `session.create` (base restore), UFFD/chunked for idle-resume** (unique per-session
   divergence, content-dedup at rest).
 - ⚠️ Invariant: a shared memfile must be **immutable + pinned** for the lifetime of any
-  sharer (joins the pin-set; pairs with the chunk-GC work, ADR 0021 OQ5).
+  sharer (extends the existing chunk-GC pin-set — ADR 0016 Phase C — to memfile granularity).
 
 ### Option B — `direct-mem`: memfd-backed guest RAM + `UFFDIO_CONTINUE` (FC patch)
 
@@ -142,8 +142,9 @@ measure **shared RSS across siblings** (the density number) + restore latency vs
 - Density (more microVMs/host) becomes achievable with **no FC fork** (Option A).
 - Forking is unlocked as a future capability — snapshot-fork on stock FC, live-fork only
   if we later adopt Option B.
-- A shared memfile is a new pinned, immutable artifact → couples to the chunk-GC/refcount
-  work (ADR 0021 OQ5): a base/fork-point memfile is pinned while any child references it.
+- A shared memfile is a new pinned, immutable artifact → extends the existing chunk-GC
+  pin-set (ADR 0016 Phase C) to memfile granularity: a base/fork-point memfile is pinned
+  while any child references it.
 - Restore path bifurcates: File backend for base `session.create`, UFFD/chunked for
   idle-resume. Manageable, but a real branch in the FC backend.
 
