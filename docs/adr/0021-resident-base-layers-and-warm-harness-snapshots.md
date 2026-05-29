@@ -475,20 +475,162 @@ through `evac_attempts=20` per stuck session.
       blocking sessions + soft-delete in one call. Not on the
       correctness path; defer until the routine flow is exercised.
 
+## Prod measurements (2026-05-29) — what P2 + P3 are actually fixing
+
+Measured against `demo-claude:warm-d94ed06`, post-`fbce5dc` deploy, two fresh
+FC hosts (`engrams-fc-5cd6`, `engrams-fc-bdz6`), traced via Cloud Trace and
+host Prometheus. These numbers should be the entry-point for P2 + P3 work.
+
+### Substrate cost: created → active
+
+DevVm session (no claude harness — pure substrate):
+
+| Phase                        | Cost      | Where it goes                                        |
+| ---------------------------- | --------- | ---------------------------------------------------- |
+| `fc.restore_in_jail` setup   | ~0.4 s    | spawn FC, configure jail, open sockets, UFFD handler |
+| UFFD pre-fault (30 chunks)   | **~2.5 s** | 30 × `chunk.fetch` @ ~84 ms **serial** from GCS      |
+| `fc.install_host_ca`         | parallel  | not on critical path                                 |
+| **Total substrate**          | **~2.7 s**| measured directly via `POST /sessions mode=dev_vm`   |
+
+Agent-mode session (same image, same host) adds `fc.spawn_harness` ~0.2 s
+for the agentd→harness RPC, then *the claude bottleneck below*.
+
+The dominant substrate cost is the 30 serial GCS round-trips inside UFFD
+pre-fault — exactly the 84 ms-per-chunk latency P2's NVMe residency
+retires. Trace ID for the anchor measurement:
+`4bdd4903f265883e927aa1cccecdc5e2` (session `49272389`).
+
+### Agent cost: harness attached → `run_started`
+
+Same image, agent-mode: **2 m 44 s**. Two sessions on the same host
+(`a8c6950f`) both measured 2 m 44 s ± 3 s — host warmth doesn't help.
+
+What rules out disk I/O as the agent-mode bottleneck:
+
+- Host metrics (`engram_chunk_cache_*` on `engrams-fc-5cd6`): 8,783 NVMe
+  hits vs 297 GCS misses (97 % cache hit rate), 30.8 s total GCS time
+  across the host's entire lifetime. Even if every GCS fetch on the host
+  happened inside one slow session, it couldn't account for >31 s of
+  the 160 s.
+- Cloud Trace coverage gap: NBD `chunk.fetch` spans are only emitted while
+  the `resume` operation scope is open (`trace_scope.rs:14-16`), and that
+  scope closes at `start_agent` completion (`13:05:31` for trace
+  `4bdd4903…`). The 2 m 40 s window after that is invisible to traces —
+  not because nothing's happening, but because emitters are scope-gated.
+  When investigating in-guest latency, lean on host Prometheus + guest-side
+  evidence (disk-flush rate, run-loop hooks), not trace queries.
+- `engram-harness-claude/src/main.rs:424` spawns `Command::new(claude_bin)`
+  per prompt — fresh Bun runtime + JIT-compile of node_modules + config
+  init on every cold start. The 67 MiB disk-write batches every 30 s in
+  the host log are claude/Bun's startup writes, not large reads.
+
+The dev_vm comparison is the proof: second `exec` on the same dev_vm
+session round-trips in **10 ms**. The 150× cost of agent mode is entirely
+inside claude/Bun — exactly what P3 (persistent agent + warm snapshot at
+`Idle`) targets.
+
+### E2B comparison (`~/test/infra` checkout, GCP-deployed)
+
+E2B advertises ~150 ms sandbox starts. From their codebase the
+architectural moves we don't have yet:
+
+1. **Templates resident as first-class objects** on every orchestrator
+   (`packages/orchestrator/pkg/sandbox/template/cache.go`, 25 h TTL).
+   `Template{memfile, rootfs, snapfile, metafile}` kept in-process; cold-
+   cache cost paid once per template per host, then every restore reuses
+   the in-memory file handles directly. *Maps to P2.*
+2. **4 MiB chunk size** (`shared/pkg/storage/storage.go:43`
+   `MemoryChunkSize = 4 * 1024 * 1024`). We're on 16 MiB. Theirs needs 4×
+   more chunks but each fetch is faster + finer-grained for parallel
+   prefetch. *Cheap-win lever for P2 (or pre-P2).*
+3. **Parallel memory prefetcher with worker pools**
+   (`uffd/prefetch/prefetcher.go`, feature-flag-tunable
+   `MemoryPrefetchMaxFetchWorkers` + `MemoryPrefetchMaxCopyWorkers`). Our
+   UFFD pre-fault during `load_snapshot` is serial. *Cheap-win lever — can
+   land pre-P2.*
+4. **Peer-to-peer template transfer**
+   (`template/peerclient` + `peerserver`). A fresh orchestrator pulls
+   templates from another orchestrator on the same network instead of
+   GCS. *Optional P2 enhancement; nice-to-have for cross-zone latency.*
+5. **(Likely) `UFFDIO_CONTINUE` + shared memfd backing** — pages shared
+   across same-template sandboxes in RAM. *Maps to P4 (gated on
+   open question 1).*
+
+### Two cheap wins available pre-P2 (no residency machinery needed)
+
+- **Parallel UFFD pre-fault workers** to mirror E2B's prefetcher pattern.
+  30 chunks at 8-way concurrency lands ~330 ms instead of ~2.5 s without
+  pinning anything. Implementation point: the UFFD handler in
+  `engram-uffd-handler` (currently fetches serially per page-fault
+  request).
+- **Shrink chunk size 16 MiB → 4 MiB**. Mechanical change in chunker +
+  re-bake. More chunks but cheaper per-chunk fetch and better prefetch
+  granularity. Worth measuring; might combine with the parallel-workers
+  change.
+
+Either or both can ship as a P2 prelude commit and prove the headline P2
+gain (GCS off the boot path) on a smaller diff before the full residency
+machinery lands.
+
+### Expected impact by phase
+
+| After             | Substrate | Agent first-token | Notes                                |
+| ----------------- | --------- | ----------------- | ------------------------------------ |
+| Today             | ~2.7 s    | ~2 m 44 s         | the regression we measured           |
+| Pre-P2 cheap wins | ~330 ms   | ~2 m 44 s         | parallel prefault + 4 MiB chunks     |
+| P2 (residency)    | ~230 ms   | ~2 m 44 s         | NVMe-local fetches @ ~1 ms × 30 + FC |
+| P3 (warm + persistent) | ~230 ms | <1 s           | restored into a hot Bun runtime      |
+| P4 (RAM dedup)    | **sub-100 ms** | <1 s         | shared backing, minor-faults only    |
+
+P2 is the biggest single move and is unblocked. P4 is what gets us *under*
+100 ms but requires the FC build to support `UFFDIO_CONTINUE` (open
+question 1). P3 is orthogonal to substrate latency and is what removes
+the 2 m 40 s agent gap.
+
 **P2 — Residency for template chunks** (pin NVMe + stage-on-enable + host warmup
 gate). GCS off the boot path; retire the boot-path prefetch.
+
+Entry-point context: see "Prod measurements" above. Target after this phase
+lands: substrate ~230 ms (cold-cache UFFD pre-fault collapses from ~2.5 s to
+~30 ms; remaining ~200 ms is FC restore overhead).
+
+- [ ] **Optional pre-P2 cheap wins** (either as a prelude commit or merged
+      into the residency PR): parallel UFFD pre-fault workers mirroring
+      E2B's `uffd/prefetch/prefetcher.go`, and/or shrink chunk size 16
+      MiB → 4 MiB. Measure each independently against the 2.7 s baseline.
 - [ ] Pin enabled-template chunks (+ warm snapshot) on NVMe; transactional
       stage-on-enable; host not `Ready` until its working set is staged.
 - [ ] Retire the boot-path prefetch / working-set machinery (ADR 0014 M1.13/M1.14).
+- [ ] Verify on prod: re-measure substrate against a freshly-rolled host
+      that staged at enable-time, not on demand. Target ~230 ms substrate.
 
 **P3 — Warm snapshots per template** (capture at the agent-`idle` signal; restore
 into a ready agent). Removes the ~7–9 s. The big payoff.
+
+Entry-point context: the prod measurement of **2 m 44 s** for harness-attached
+→ `run_started` (above) is the regression P3 retires. The original ADR plan
+budgeted ~7–9 s — that was for a single Bun startup, not for
+`Command::new(claude_bin).args(...)` spawning a fresh child *per prompt*.
+Today's code path is at `engram-harness-claude/src/main.rs:424` inside
+`run_one_claude_prompt`; each turn pays the full cold-start cost. The
+base_snapshot captured by `build_base_snapshot` at `pooled_backend.rs:1971`
+is taken at `wait_agent_ready` — *before* the harness binary is even
+launched — so restoring it gives you agentd-ready, not claude-ready. P3
+moves both ends of this:
+
 - [ ] Move the agent to a **persistent model** (claude server/SDK mode; emits `Idle`)
-      — supersedes the child-per-prompt `claude --print` loop.
+      — supersedes the child-per-prompt `claude --print` loop at
+      `engram-harness-claude/src/main.rs:424`. Open question whether
+      claude's server mode is mature enough; alternative is keeping the
+      child but warming Bun via V8 startup snapshots.
 - [ ] Open-question-2 measurement first: persistent-agent + cheap in-process warm
       start under ~1 s? If yes, skip VM warm snapshots.
 - [ ] If not: capture the warm memory snapshot at `Idle` (incl. running agent);
-      restore into a ready agent; per-session COW on top.
+      restore into a ready agent; per-session COW on top. Concrete change:
+      `build_base_snapshot` shifts capture from `wait_agent_ready` to
+      `wait_harness_idle` (new primitive) — requires (a) host-side to know
+      when the harness has emitted `Idle`, (b) the harness contract to
+      guarantee `Idle` after first-prompt-ready, not just after attach.
 
 **P4 — Runtime RAM dedup** (`UFFDIO_CONTINUE` + shared per-template backing) — gated
 on the FC spike (open question 1). Density, not latency.
