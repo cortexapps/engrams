@@ -835,6 +835,18 @@ impl ChunkedDiskBackend {
                 let fut = self.cache.get(hash, || self.store.get_chunk(hash));
                 match self.operation_scope.current() {
                     Some(op) => {
+                        // ADR 0021 P2 diag: during a lifecycle op (resume/boot),
+                        // log whether the chunk the disk daemon is about to read
+                        // was warmed onto local NVMe, and which cache dir it's
+                        // reading — to pin why residency prefetch isn't hitting.
+                        tracing::debug!(
+                            hash = %hash,
+                            chunk = chunk_idx,
+                            op = op.kind,
+                            on_disk = self.cache.contains_on_disk(hash),
+                            cache_root = %self.cache.cache_root().display(),
+                            "P2 diag: disk read_chunk during op",
+                        );
                         let span = op.span.in_scope(|| {
                             tracing::info_span!(
                                 "chunk.fetch",

@@ -313,6 +313,22 @@ async fn prefetch_manifest_chunks(
     semaphore: &Arc<Semaphore>,
 ) -> Result<usize, PrefetchError> {
     let total = manifest.chunks.len();
+    // ADR 0021 P2 diag: log the cache dir + a hash sample so prod logs can
+    // confirm the disk daemon reads the SAME dir + hashes this warms (residency
+    // cross-instance / chunk-set check).
+    tracing::info!(
+        chunks = total,
+        cache_root = %chunk_cache.cache_root().display(),
+        budget_bytes = chunk_cache.budget_bytes(),
+        approx_bytes = (total as u64) * manifest.chunk_size.0,
+        first_hashes = ?manifest
+            .chunks
+            .iter()
+            .take(4)
+            .map(|c| c.hash.to_hex())
+            .collect::<Vec<_>>(),
+        "P2 diag: prefetching manifest into NVMe",
+    );
     let mut handles = Vec::with_capacity(total);
     for chunk in manifest.chunks.into_iter() {
         let permit = semaphore

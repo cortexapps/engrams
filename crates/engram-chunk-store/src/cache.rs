@@ -158,6 +158,26 @@ impl ChunkCache {
         self.inner.config.root.join(&hex[..2]).join(&hex[2..])
     }
 
+    /// ADR 0021 P2 diagnosis: the cache's on-disk root, so a log can show
+    /// which directory a given instance reads/writes — the cross-instance
+    /// residency check (does the disk daemon read the dir image_prefetch warmed?).
+    pub fn cache_root(&self) -> &std::path::Path {
+        &self.inner.config.root
+    }
+
+    /// ADR 0021 P2 diagnosis: the LRU eviction budget — to confirm whether the
+    /// resident working set fits (a too-small budget would evict warmed chunks).
+    pub fn budget_bytes(&self) -> u64 {
+        self.inner.config.budget_bytes
+    }
+
+    /// ADR 0021 P2 diagnosis: does this chunk's content-addressed file exist on
+    /// local NVMe right now? Distinguishes "never warmed here" / "evicted" from
+    /// "warmed but `get` still missed".
+    pub fn contains_on_disk(&self, hash: ChunkHash) -> bool {
+        self.path_for(hash).try_exists().unwrap_or(false)
+    }
+
     /// Get a chunk's bytes. Local NVMe first; on miss, the
     /// `fetch` closure is invoked exactly once (singleflight —
     /// concurrent waiters for the same hash share its result).
@@ -242,7 +262,21 @@ impl ChunkCache {
                 inflight.remove(&hash).unwrap_or_default()
             };
             if let Ok(bytes) = result.as_ref() {
-                let _ = self.write_local(hash, bytes).await;
+                // ADR 0021 P2 diag: write errors here were silently swallowed
+                // (`let _ =`). If chunks fail to land on NVMe (ENOSPC, perms,
+                // etc.) they're never cached → every read re-fetches from GCS,
+                // which presents exactly as "warming ran but reads still miss".
+                // Surface the failure (+ keep it non-fatal: the fetched bytes
+                // still return to the caller).
+                if let Err(e) = self.write_local(hash, bytes).await {
+                    tracing::warn!(
+                        hash = %hash,
+                        root = %self.inner.config.root.display(),
+                        bytes = bytes.len(),
+                        error = %e,
+                        "P2 diag: chunk cache write_local FAILED — chunk not cached (reads will miss → GCS)",
+                    );
+                }
                 metrics::counter!(
                     "engram_chunk_cache_bytes_total",
                     "tier" => "blobstorage",
