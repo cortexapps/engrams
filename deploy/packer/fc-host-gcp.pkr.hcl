@@ -1,29 +1,27 @@
-# Packer manifest for the Engram Firecracker host image on GCE.
+# Packer manifest for the Engram Firecracker host image on GCE — THIN bake.
 #
-# Produces a custom GCE image with:
-#   - Firecracker binary at /usr/local/bin/firecracker (pinned version)
-#   - engram-host-agent binary at /usr/local/bin/engram-host-agent
-#   - engram-drain.sh wrapper at /usr/local/bin/engram-drain.sh
-#   - systemd unit `engram-host-agent.service` that runs the agent on
-#     boot and fires the drain hook on shutdown
-#   - KVM kernel module pre-loaded + the user added to the `kvm` group
-#   - iptables-persistent installed so FC's per-VM TAP rules survive
-#     reboot
+# This is the fast, per-commit half of a two-stage bake. It starts FROM the
+# `engram-fc-host-base` family (built by fc-host-base-gcp.pkr.hcl, which
+# carries Firecracker, the guest kernel, Ops Agent, otelcol, the systemd
+# unit, KVM/NBD config, etc.) and does nothing but drop the two freshly-built
+# binaries on top:
 #
-# Inputs:
-#   - host_agent_gcs_url: gs:// URL of a pre-built engram-host-agent
-#     binary (musl-static). Upload via your CI before invoking Packer.
-#   - firecracker_version: the FC release to pin. v1.10.x is the
-#     current production line.
-#   - source_image_family: the GCE base image family
-#     (default: debian-12).
+#   - engram-host-agent  -> /usr/local/bin/engram-host-agent
+#   - engram-uffd-handler -> /usr/local/bin/engram-uffd-handler
+#
+# The binaries are uploaded over SSH from the CI runner's local disk via the
+# `file` provisioner — no gsutil, no GCS staging bucket, no google-cloud-cli.
+# CI pulls them from GHCR (oras) where the OSS bake-images workflow published
+# the exact musl binaries it compiled and tested. So a host-agent change
+# skips the entire OS-layer bake; only this ~minute of provisioning + the
+# GCE image-snapshot floor remains.
 #
 # Build with:
 #   packer init deploy/packer/fc-host-gcp.pkr.hcl
 #   packer build \
 #     -var "project_id=$PROJECT" \
-#     -var "host_agent_gcs_url=gs://engram-artifacts/host-agent/0.1.0/engram-host-agent" \
-#     -var "image_family=engram-fc-host" \
+#     -var "host_agent_local_path=./engram-host-agent" \
+#     -var "uffd_handler_local_path=./engram-uffd-handler" \
 #     deploy/packer/fc-host-gcp.pkr.hcl
 #
 # The resulting image is what `fc-host-mig` consumes as
@@ -63,35 +61,35 @@ variable "image_family" {
 
 variable "source_image_family" {
   type        = string
-  description = "Base image family. debian-12 is what the FC test images target."
-  default     = "debian-12"
+  description = "Base image family this thin bake layers onto. Produced by fc-host-base-gcp.pkr.hcl."
+  default     = "engram-fc-host-base"
 }
 
 variable "source_image_project_id" {
   type        = list(string)
-  description = "Projects searched (in order) for `source_image_family`. The plugin's `googlecompute` source treats this as a fallback chain; a single-element list is the normal case."
-  default     = ["debian-cloud"]
+  description = "Project(s) the base image family lives in. Defaults to project_id since engram-fc-host-base is one of our own images, not a stock public base."
+  default     = null
 }
 
-variable "host_agent_gcs_url" {
+variable "host_agent_local_path" {
   type        = string
-  description = "gs:// URL of the pre-built static engram-host-agent binary."
+  description = "Local filesystem path to the pre-built static engram-host-agent binary (CI pulls it from GHCR before invoking Packer)."
 }
 
-variable "uffd_handler_gcs_url" {
+variable "uffd_handler_local_path" {
   type        = string
-  description = "gs:// URL of the pre-built static engram-uffd-handler binary (ADR 0020 Route B; co-located with firecracker for UFFD restore)."
+  description = "Local filesystem path to the pre-built static engram-uffd-handler binary (ADR 0020 Route B; spawned by host-agent on a UFFD restore)."
 }
 
 variable "firecracker_version" {
   type        = string
-  description = "Firecracker release tag to pin. v1.10.x is the production line."
+  description = "Firecracker release tag — for the image label only; the binary already lives in the base image."
   default     = "v1.10.1"
 }
 
 variable "machine_type" {
   type        = string
-  description = "Build worker shape. n2-standard-2 is plenty; the build is IO-bound."
+  description = "Build worker shape. n2-standard-2 is plenty; the thin bake is dominated by VM boot + image snapshot, not CPU."
   default     = "n2-standard-2"
 }
 
@@ -108,11 +106,14 @@ variable "subnetwork" {
 }
 
 source "googlecompute" "fc_host" {
-  project_id              = var.project_id
-  zone                    = var.zone
-  region                  = var.region
-  source_image_family     = var.source_image_family
-  source_image_project_id = var.source_image_project_id
+  project_id          = var.project_id
+  zone                = var.zone
+  region              = var.region
+  source_image_family = var.source_image_family
+  # The base family is one of our own images. When source_image_project_id
+  # is left null, default the search to our own project rather than
+  # debian-cloud.
+  source_image_project_id = var.source_image_project_id != null ? var.source_image_project_id : [var.project_id]
   image_family            = var.image_family
   image_name              = "${var.image_family}-{{timestamp}}"
   image_description       = "Engram Firecracker host image (FC ${var.firecracker_version})"
@@ -120,13 +121,9 @@ source "googlecompute" "fc_host" {
   network                 = var.network
   subnetwork              = var.subnetwork
   disk_size               = 50
-  disk_type               = "pd-balanced"
+  disk_type               = "pd-ssd"
   ssh_username            = "packer"
   use_internal_ip         = false
-  # Required scopes for `gsutil cp` of the host-agent binary.
-  scopes = [
-    "https://www.googleapis.com/auth/cloud-platform",
-  ]
   image_labels = {
     builder           = "packer"
     firecracker       = replace(var.firecracker_version, ".", "_")
@@ -141,170 +138,39 @@ build {
     "source.googlecompute.fc_host",
   ]
 
-  # 1. Base apt packages. Pull a small set: tooling for KVM probing,
-  #    iptables persistence, gsutil for the host-agent download.
-  #
-  # Inline provisioners below all set `inline_shebang` to bash:
-  # Packer's default `/bin/sh -e` resolves to dash on Debian, which
-  # doesn't support `set -o pipefail`. Bash is in the base image so
-  # the swap is free.
+  # 1. Upload the two pre-built musl-static binaries from the CI runner's
+  #    local disk to the build VM over SSH. No download happens on the VM.
+  provisioner "file" {
+    source      = var.host_agent_local_path
+    destination = "/tmp/engram-host-agent"
+  }
+  provisioner "file" {
+    source      = var.uffd_handler_local_path
+    destination = "/tmp/engram-uffd-handler"
+  }
+
+  # 2. Install both into /usr/local/bin. The systemd unit (baked into the
+  #    base image, already `enable`d) picks up engram-host-agent on the next
+  #    boot of a real FC host once the MIG startup-script drops the env file.
   provisioner "shell" {
     inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
-      "sudo apt-get update -y",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\",
-      "    ca-certificates curl gnupg lsb-release \\",
-      "    iptables iptables-persistent netfilter-persistent \\",
-      "    qemu-utils e2fsprogs cpu-checker python3 \\",
-      "    google-cloud-cli",
-      "sudo apt-get clean",
+      "file /tmp/engram-host-agent /tmp/engram-uffd-handler",
+      "sudo install -m 0755 /tmp/engram-host-agent  /usr/local/bin/engram-host-agent",
+      "sudo install -m 0755 /tmp/engram-uffd-handler /usr/local/bin/engram-uffd-handler",
     ]
   }
 
-  # 2. Firecracker — pinned release fetched from GitHub.
-  provisioner "shell" {
-    environment_vars = [
-      "FC_VER=${var.firecracker_version}",
-    ]
-    script = "${path.root}/provisioners/install-firecracker.sh"
-  }
-
-  # 2b. FC guest kernel at /usr/local/lib/engram/vmlinux. Host-agent
-  # boots every microVM with this kernel; without it `create()`
-  # rejects every sandbox spec.
-  provisioner "shell" {
-    script = "${path.root}/provisioners/install-fc-kernel.sh"
-  }
-
-  # 3. engram-host-agent — pulled from the operator-provided GCS URL.
-  provisioner "shell" {
-    environment_vars = [
-      "HOST_AGENT_GCS_URL=${var.host_agent_gcs_url}",
-    ]
-    script = "${path.root}/provisioners/install-host-agent.sh"
-  }
-
-  # 3a'. engram-uffd-handler (ADR 0020 Route B) — pulled from the
-  #      operator-provided GCS URL, co-located with firecracker. Also sets
-  #      vm.unprivileged_userfaultfd=1 so FC's UFFD restore works under the
-  #      jailer. Inert until ENGRAM_FC_RESTORE_MODE=uffd is set on host-agent.
-  provisioner "shell" {
-    environment_vars = [
-      "UFFD_HANDLER_GCS_URL=${var.uffd_handler_gcs_url}",
-    ]
-    script = "${path.root}/provisioners/install-uffd-handler.sh"
-  }
-
-  # 4a. Google Cloud Ops Agent. Ships engram-host-agent's systemd
-  #     journal (plus the rest of the system journal: kernel, OOM,
-  #     iptables) to Cloud Logging so post-mortems don't require
-  #     `sudo journalctl` on every FC host VM. GCP-specific — the
-  #     installer + config live under `provisioners/gcp/`. Other
-  #     clouds will need their own per-cloud equivalent (e.g.
-  #     CloudWatch agent on AWS) when those Packer manifests land.
-  provisioner "shell" {
-    inline_shebang = "/usr/bin/env bash"
-    script         = "${path.root}/provisioners/gcp/install-ops-agent.sh"
-  }
-
-  # 3b. OpenTelemetry Collector (ADR 0019) — local trace collector. Receives
-  #     OTLP on :4317 from host-agent (localhost) + in-guest agentd (TAP
-  #     gateway) and ships traces to Cloud Trace via the googlecloud
-  #     exporter. GCP-specific (config under deploy/otel/, installer under
-  #     provisioners/gcp/); other clouds get their own exporter variant.
-  #     Stage the shared config + the systemd unit, then install.
-  provisioner "file" {
-    source      = "${path.root}/../otel/collector-gcp.yaml"
-    destination = "/tmp/collector-gcp.yaml"
-  }
-  provisioner "file" {
-    source      = "${path.root}/provisioners/systemd/otelcol.service"
-    destination = "/tmp/otelcol.service"
-  }
-  provisioner "shell" {
-    inline_shebang = "/usr/bin/env bash"
-    script         = "${path.root}/provisioners/gcp/install-otelcol.sh"
-  }
-
-  # 4. systemd unit + drain hook.
-  provisioner "file" {
-    source      = "${path.root}/provisioners/systemd/engram-host-agent.service"
-    destination = "/tmp/engram-host-agent.service"
-  }
-  provisioner "file" {
-    source      = "${path.root}/provisioners/engram-drain.sh"
-    destination = "/tmp/engram-drain.sh"
-  }
-  provisioner "shell" {
-    inline_shebang = "/usr/bin/env bash"
-    inline = [
-      "set -euo pipefail",
-      "sudo install -m 0644 /tmp/engram-host-agent.service /etc/systemd/system/engram-host-agent.service",
-      "sudo install -m 0755 /tmp/engram-drain.sh /usr/local/bin/engram-drain.sh",
-      "sudo systemctl daemon-reload",
-      "sudo systemctl enable engram-host-agent.service",
-    ]
-  }
-
-  # 5. KVM verification + module load on next boot. cpu-checker's
-  #    `kvm-ok` reports the bare CPU's capability; the build worker
-  #    must be on a host with nested-virt or KVM. We don't fail the
-  #    build if kvm-ok complains here — the IMAGE will run on a real
-  #    KVM-capable VM (n2-standard-N etc.) where /dev/kvm is present.
-  provisioner "shell" {
-    inline_shebang = "/usr/bin/env bash"
-    inline = [
-      "set -euo pipefail",
-      # `sudo` because cpu-checker installs kvm-ok at /usr/sbin/kvm-ok,
-      # and Packer's SSH session as the `packer` user has a stripped
-      # PATH that doesn't include sbin dirs. sudo's secure_path does.
-      "sudo kvm-ok || echo 'kvm-ok complained on the build worker — fine; the resulting image runs on real KVM hosts'",
-      # Ensure kvm + nbd modules load at boot on the deployed VM.
-      "echo kvm | sudo tee /etc/modules-load.d/engram-kvm.conf",
-      "echo nbd | sudo tee /etc/modules-load.d/engram-nbd.conf",
-      # ADR 0007 Phase 4: the NBD daemon allocates from a fixed
-      # pool of /dev/nbdN devices, sized at modprobe time. 64
-      # gives us comfortable headroom for high-density hosts;
-      # operators reduce via /etc/modprobe.d/engram-nbd-tuning.conf
-      # if they want fewer slots.
-      "echo 'options nbd nbds_max=64' | sudo tee /etc/modprobe.d/engram-nbd-tuning.conf",
-      # The host-agent runs as root so default 0660 permissions
-      # are fine; document the device name format for operators
-      # who later want to scope it to a non-root user.
-      "echo '# ADR 0007 Phase 4 NBD devices created by `nbd` module' | sudo tee /etc/udev/rules.d/90-engram-nbd.rules",
-      "echo 'KERNEL==\"nbd*\", GROUP=\"root\", MODE=\"0660\"' | sudo tee -a /etc/udev/rules.d/90-engram-nbd.rules",
-    ]
-  }
-
-  # 6. Engram-specific directories + permissions.
-  provisioner "shell" {
-    inline_shebang = "/usr/bin/env bash"
-    inline = [
-      "set -euo pipefail",
-      # Working directory for sandbox state, materialized rootfs files,
-      # OCI cache, chunk cache. Tuned to the host-agent's CLI defaults.
-      "sudo mkdir -p /var/lib/engram/sandboxes",
-      "sudo mkdir -p /var/lib/engram/chunked-rootfs",
-      "sudo mkdir -p /var/lib/engram/chunk-cache",
-      "sudo mkdir -p /var/lib/engram/oci-cache",
-      "sudo mkdir -p /var/lib/engram/egress-ca",
-      # The host-agent runs as root (it needs CAP_NET_ADMIN for TAPs +
-      # /dev/kvm for Firecracker). systemd unit will lock it down with
-      # ProtectSystem etc.
-      "sudo chmod 0750 /var/lib/engram",
-    ]
-  }
-
-  # 7. Final sanity-check + bake. Verify the binaries are in place;
-  #    the systemd unit is masked until the deployed instance has its
-  #    env file (provisioned by the MIG's startup-script).
+  # 3. Final sanity-check + bake. Firecracker comes from the base image;
+  #    the host-agent binary is what we just installed.
   provisioner "shell" {
     inline_shebang = "/usr/bin/env bash"
     inline = [
       "set -euo pipefail",
       "/usr/local/bin/firecracker --version",
       "/usr/local/bin/engram-host-agent --help >/dev/null",
+      "/usr/local/bin/engram-uffd-handler --help >/dev/null 2>&1 || true",
       "echo 'image build OK'",
     ]
   }

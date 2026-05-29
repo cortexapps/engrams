@@ -10,14 +10,23 @@ binary **release** dependency closure (dev-deps excluded — they don't
 ship), or a changed file matches a non-crate path rule for the lane.
 
 Lanes:
-  images      container rebake — release closure of {coordinator, host-agent}
-              + web/ + docker/ + migrations/
-  host_image  FC host GCE image — release closure of {host-agent, uffd-handler}
-              + deploy/packer/ + rust-toolchain.toml
-  tf_or_helm  deploy/terraform/ + deploy/helm/
+  images        container rebake — release closure of {coordinator, host-agent}
+                + web/ + docker/ + migrations/
+  host_binaries FC host binaries changed — release closure of
+                {host-agent, uffd-handler} + rust-toolchain.toml. Drives the
+                fast per-commit THIN bake (just re-drop the two binaries onto
+                the base image).
+  host_base     FC host OS layer changed — deploy/packer/ + deploy/otel/.
+                Drives the infrequent BASE bake (apt, Firecracker, kernel,
+                Ops Agent, otelcol, systemd unit). A base rebake re-triggers a
+                thin bake downstream so the new OS layer reaches prod.
+  host_image    host_binaries OR host_base. The union gates the OSS
+                publish-host-binaries job — the GHCR artifact must exist at
+                this SHA for either downstream bake to consume.
+  tf_or_helm    deploy/terraform/ + deploy/helm/
 
 `Cargo.lock` / root `Cargo.toml` / this script / the bake workflow are
-conservative triggers for both binary lanes.
+conservative triggers for the host_binaries lane.
 
 Usage (CI):   detect-rebake-lanes.py --base "$BEFORE" --head "$HEAD"
 Usage (test): printf 'crates/engram-postgres/src/x.rs\n' | detect-rebake-lanes.py --stdin
@@ -30,17 +39,25 @@ import sys
 from pathlib import Path
 
 # Binaries that bake into each artifact. uffd-handler ships ONLY on the FC
-# host image (spawned by host-agent), never in a container — so it gates
-# host_image but not images.
+# host image (spawned by host-agent), never in a container — so it gates the
+# host lanes but not images.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
 CONTAINER_BINS = {"engram-coordinator", "engram-host-agent"}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
-# script/the bake workflow conservatively trip both binary lanes.
+# script/the bake workflow conservatively trip the binary lanes.
 BINARY_COMMON = ["Cargo.lock", "Cargo.toml",
                  ".github/workflows/bake-images.yml",
                  ".github/scripts/detect-rebake-lanes.py"]
-HOST_IMAGE_PATHS = ["deploy/packer/", "rust-toolchain.toml"] + BINARY_COMMON
+# A toolchain bump changes how the binaries compile, so it belongs to the
+# binaries lane (recompile + republish), not the OS-layer base lane.
+HOST_BINARIES_PATHS = ["rust-toolchain.toml"] + BINARY_COMMON
+# The OS layer baked into engram-fc-host-base: the packer manifests +
+# provisioners (deploy/packer/) and the otelcol config (deploy/otel/). A
+# change here means the BASE image must be re-baked. (deploy/otel/ was missing
+# from the old single host_image lane — an otel-config change silently never
+# rebaked the host.)
+HOST_BASE_PATHS = ["deploy/packer/", "deploy/otel/"]
 IMAGES_PATHS = ["docker/", "web/", "deploy/migrations/"] + BINARY_COMMON
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 
@@ -130,17 +147,24 @@ def main():
     cont = release_closure(meta, CONTAINER_BINS)
 
     images = bool(cc & cont) or any_path(changed, IMAGES_PATHS)
-    host_image = bool(cc & fc) or any_path(changed, HOST_IMAGE_PATHS)
+    host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
+    host_base = any_path(changed, HOST_BASE_PATHS)
+    # Union — gates the publish-host-binaries job so the GHCR artifact exists
+    # at this SHA for whichever downstream bake (thin and/or base) fires.
+    host_image = host_binaries or host_base
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
 
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
-    print(f"-> images={images} host_image={host_image} tf_or_helm={tf_or_helm}", file=sys.stderr)
+    print(f"-> images={images} host_binaries={host_binaries} "
+          f"host_base={host_base} host_image={host_image} tf_or_helm={tf_or_helm}", file=sys.stderr)
 
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a") as f:
             f.write(f"images={'true' if images else 'false'}\n")
+            f.write(f"host_binaries={'true' if host_binaries else 'false'}\n")
+            f.write(f"host_base={'true' if host_base else 'false'}\n")
             f.write(f"host_image={'true' if host_image else 'false'}\n")
             f.write(f"tf_or_helm={'true' if tf_or_helm else 'false'}\n")
 

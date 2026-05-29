@@ -43,6 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       images: ${{ steps.lanes.outputs.images }}
+      host_binaries: ${{ steps.lanes.outputs.host_binaries }}
+      host_base: ${{ steps.lanes.outputs.host_base }}
       host_image: ${{ steps.lanes.outputs.host_image }}
       tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
     steps:
@@ -59,11 +61,16 @@ jobs:
       # that list wrongly excluded engram-postgres / engram-agentd /
       # engram-image-builder / engram-harness-proto, all of which bake into
       # the FC-host binaries — a change to them never rebaked the host.
-      #   images     = closure(coordinator, host-agent) + web/docker/migrations
-      #   host_image = closure(host-agent, uffd-handler) + deploy/packer + toolchain
-      #   tf_or_helm = deploy/terraform + deploy/helm
+      #   images        = closure(coordinator, host-agent) + web/docker/migrations
+      #   host_binaries = closure(host-agent, uffd-handler) + toolchain  (thin bake)
+      #   host_base     = deploy/packer + deploy/otel                    (base bake)
+      #   host_image    = host_binaries OR host_base                     (publish gate)
+      #   tf_or_helm    = deploy/terraform + deploy/helm
       # Containers and the FC host image are decoupled: a uffd-handler change
       # rebakes the host image only; a coord change rebakes containers only.
+      # The host image is itself two-staged — a binary change re-drops the
+      # binaries (host_binaries -> thin bake); an OS-layer change rebakes the
+      # base (host_base -> base bake, which then re-triggers a thin bake).
       - id: lanes
         run: |
           python3 .github/scripts/detect-rebake-lanes.py \
@@ -128,6 +135,94 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
 
+  # Compile the FC-host musl binaries ONCE — the exact, CI-tested binaries —
+  # and publish them to GHCR as an OCI artifact keyed by SHA. The downstream
+  # FC-host bakes in engrams-internal pull these instead of recompiling from
+  # a private source checkout (ADR 0013-era split): the bake that ships is
+  # now the bake that CI tested, and the bake workflow no longer needs a Rust
+  # toolchain. Gated on the host_image UNION so the artifact is present at
+  # this SHA for either downstream bake (thin and/or base).
+  publish-host-binaries:
+    needs: detect
+    if: needs.detect.outputs.host_image == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Rust (stable + musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # engram-protocol/build.rs invokes protoc to compile host_service.proto
+      # (ADR 0013). Pin an exact tag — the action's default semver range hits
+      # the GitHub releases API, which flakes on the shared Blacksmith IP pool.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.9"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo build state
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install musl-tools + kernel uapi headers
+        # linux-libc-dev provides /usr/include/linux/*.h needed by
+        # uffd-handler's transitive userfaultfd-sys build script; the musl
+        # cross-gcc sysroot has no kernel uapi headers.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools linux-libc-dev
+
+      - name: Build engram-host-agent + engram-uffd-handler (musl-static)
+        env:
+          # Point the musl C compile (cc-rs) + bindgen/clang at the system
+          # kernel uapi headers so userfaultfd-sys finds <linux/types.h>.
+          # uapi headers are libc-agnostic, so mixing them with the musl
+          # sysroot is safe.
+          CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+        run: |
+          cargo build \
+            --target x86_64-unknown-linux-musl \
+            --release \
+            -p engram-host-agent -p engram-uffd-handler
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/engram-host-agent dist/
+          cp target/x86_64-unknown-linux-musl/release/engram-uffd-handler dist/
+          file dist/engram-host-agent dist/engram-uffd-handler
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Publish musl binaries to GHCR (oras)
+        working-directory: dist
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${{ github.repository }}/host-binaries"
+          SHORT="${SHA:0:7}"
+          # Push the two static binaries as a single OCI artifact tagged by
+          # full SHA. `oras pull <repo>:<sha>` on the consumer side drops both
+          # files into cwd verbatim.
+          oras push "$REPO:$SHA" \
+            --artifact-type application/vnd.engrams.fc-host-binaries.v1 \
+            engram-host-agent:application/octet-stream \
+            engram-uffd-handler:application/octet-stream
+          # Convenience tags. `oras tag` is a cheap registry-side re-point.
+          oras tag "$REPO:$SHA" "$SHORT"
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            oras tag "$REPO:$SHA" "main"
+          fi
+          echo "Published host-binaries -> $REPO:{$SHA,$SHORT}"
+
   # Fires on EVERY push to main where the `bake` job didn't fail.
   # Fans path-aware repository_dispatches into engrams-internal so
   # each downstream workflow only runs when its inputs actually
@@ -135,9 +230,12 @@ jobs:
   #
   #   - `engrams-changed` → helm-deploy. Fires when container
   #     images got (or could have) rebaked.
-  #   - `engrams-host-changed` → bake-fc-host-image. Fires when
-  #     the FC host GCE image needs a rebake (host-agent code,
-  #     packer manifest, Cargo lock, etc.).
+  #   - `engrams-host-changed` → bake-fc-host-image (THIN). Fires
+  #     when only the FC-host binaries moved — re-drop them onto
+  #     the existing base image.
+  #   - `engrams-host-base-changed` → bake-fc-host-base (BASE).
+  #     Fires when the OS layer moved (deploy/packer, deploy/otel).
+  #     The base bake re-triggers a thin bake when it finishes.
   #   - `engrams-tf-changed` → tf-apply directly. Fires for
   #     OSS-side TF/helm module changes that don't need a
   #     container or host-image rebake. Without this dispatch,
@@ -145,16 +243,21 @@ jobs:
   #     model.
   #
   # `if: always() && ...` lets this fire when `bake` was skipped
-  # for path reasons; the `bake.result != 'failure'` guard keeps
-  # it from firing if a bake actually broke.
+  # for path reasons; the `*.result != 'failure'` guards keep it
+  # from firing if a bake actually broke. The host dispatches
+  # additionally require publish-host-binaries to have succeeded —
+  # the downstream FC-host bakes pull that GHCR artifact, so firing
+  # them without it would 404 on the pull.
   notify:
-    needs: [detect, bake]
+    needs: [detect, bake, publish-host-binaries]
     if: |
       always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
       needs.bake.result != 'failure' &&
-      needs.bake.result != 'cancelled'
+      needs.bake.result != 'cancelled' &&
+      needs.publish-host-binaries.result != 'failure' &&
+      needs.publish-host-binaries.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - name: Fire path-aware repository_dispatches at engrams-internal
@@ -163,7 +266,8 @@ jobs:
           SHA: ${{ github.sha }}
           BAKED: ${{ needs.bake.result == 'success' }}
           CONTAINERS_CHANGED: ${{ needs.detect.outputs.images }}
-          HOST_IMAGE_CHANGED: ${{ needs.detect.outputs.host_image }}
+          HOST_BINARIES_CHANGED: ${{ needs.detect.outputs.host_binaries }}
+          HOST_BASE_CHANGED: ${{ needs.detect.outputs.host_base }}
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
         run: |
           set -euo pipefail
@@ -180,14 +284,24 @@ jobs:
           if [[ "$CONTAINERS_CHANGED" == "true" ]]; then
             fire engrams-changed
           fi
-          if [[ "$HOST_IMAGE_CHANGED" == "true" ]]; then
+          # The base bake re-fires engrams-host-changed (thin) when it
+          # finishes, so when the OS layer moved we fire ONLY the base event
+          # and let it drive the thin re-layer. Firing the thin bake directly
+          # too would race the base — the thin bake sources from
+          # engram-fc-host-base, which may not exist yet (cutover) or would be
+          # the stale pre-rebake image. So: host_base => base only; thin fires
+          # directly only when binaries moved WITHOUT an OS-layer change.
+          if [[ "$HOST_BASE_CHANGED" == "true" ]]; then
+            fire engrams-host-base-changed
+          elif [[ "$HOST_BINARIES_CHANGED" == "true" ]]; then
             fire engrams-host-changed
           fi
           if [[ "$TF_CHANGED" == "true" ]]; then
             fire engrams-tf-changed
           fi
           if [[ "$CONTAINERS_CHANGED" != "true" \
-             && "$HOST_IMAGE_CHANGED" != "true" \
+             && "$HOST_BINARIES_CHANGED" != "true" \
+             && "$HOST_BASE_CHANGED" != "true" \
              && "$TF_CHANGED" != "true" ]]; then
             echo "No deploy-relevant paths changed in this push; skipping dispatches."
           fi

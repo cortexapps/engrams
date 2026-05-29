@@ -314,8 +314,11 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
       - uses: Swatinem/rust-cache@v2
-      - name: Install musl-tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install musl-tools + kernel uapi headers
+        # linux-libc-dev: uffd-handler's transitive userfaultfd-sys build
+        # script compiles a C shim that #includes <linux/types.h>, absent
+        # from the musl cross-gcc sysroot.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev
 
       # Mirrors what `just install-harnesses` and `just fc-bake-demo`
       # produce on Linux. If any of these stop building the demo bake
@@ -349,6 +352,20 @@ jobs:
             --target x86_64-unknown-linux-musl \
             --release \
             -p engram-host-agent
+
+      # uffd-handler also ships into the FC host image (ADR 0020 Route B),
+      # so guard its musl build here too. userfaultfd-sys's C shim needs the
+      # kernel uapi headers pointed at via CFLAGS/bindgen (libc-agnostic, so
+      # safe to mix with the musl sysroot).
+      - name: build engram-uffd-handler (musl)
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+        run: |
+          cargo build \
+            --target x86_64-unknown-linux-musl \
+            --release \
+            -p engram-uffd-handler
 
   web:
     name: web (pnpm)
