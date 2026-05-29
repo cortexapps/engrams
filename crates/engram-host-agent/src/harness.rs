@@ -592,15 +592,26 @@ async fn drive_attached<R, W>(
         session_id: attach.session_id,
     };
     inner.connections.lock().insert(sandbox_id, handle);
-    // Seed the timers at attach. `last_event_at` so the hard TTL
-    // can fire on a harness that goes silent without ever sending
-    // a real event. `last_idle_at` so the soft TTL fires on an
-    // adapter that attaches and just sits there (a Claude adapter
-    // started without ENGRAM_INITIAL_PROMPT — awaiting a Prompt
-    // command, which is exactly "awaiting user input").
+    // Seed only `last_event_at` at attach — the hard TTL needs an
+    // origin so a never-emits-anything adapter still gets reaped
+    // eventually. `last_idle_at` is **deliberately not seeded**:
+    // soft TTL must mean "harness explicitly emitted Idle and has
+    // been quiet since", not "harness attached and is still booting
+    // its agent". Every harness in our tree emits `HarnessEvent::
+    // Idle` itself when it has no work
+    // (`engram-harness-claude` line ~326 when `next_prompt.is_none()`;
+    // `engram-harness-noop` at the end of its scripted run), so the
+    // "attached and awaiting Prompt" case is covered by the harness
+    // contract, not the hub.
+    //
+    // Prod-found 2026-05-28 against session `43fe13b4`: the old
+    // seed-at-attach made the soft TTL fire at T+30s on every fresh
+    // session whose harness needed >30s to emit its first event —
+    // claude's ~7-9s cold-boot plus first-prompt processing easily
+    // crosses that line. The eviction pause-suspended agentd, which
+    // surfaced to the user as "no harness response + shell timeout".
     let now = Utc::now();
     inner.last_event_at.lock().insert(sandbox_id, now);
-    inner.last_idle_at.lock().insert(sandbox_id, now);
 
     let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
@@ -967,6 +978,13 @@ mod tests {
 
     #[tokio::test]
     async fn idle_sandboxes_returns_pairs_past_ttl() {
+        // Soft TTL fires only after the harness has explicitly
+        // emitted `Idle`. Prod-found 2026-05-28: previously the hub
+        // seeded `last_idle_at` at attach time, which made the soft
+        // TTL fire 30 s after attach on every fresh session whose
+        // harness was still cold-booting. Now the soft TTL is purely
+        // event-driven — the test drives a real Idle frame before
+        // asserting it fires.
         let (sink, _) = collecting_sink();
         let hub = HarnessHub::new(sink);
         let sandbox_id = SandboxId::new();
@@ -975,8 +993,8 @@ mod tests {
 
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
-        // Drive the harness side so the connection establishes,
-        // then keep it alive (don't close).
+        // Drive the harness side: attach, emit Idle, then keep the
+        // connection alive without further events.
         let _harness_task = tokio::spawn(async move {
             let (mut hr, mut hw) = tokio::io::split(harness_side);
             write_msg(
@@ -989,7 +1007,9 @@ mod tests {
             .await
             .unwrap();
             let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            // Keep the connection open until the test drops us.
+            write_msg(&mut hw, &HarnessFrame::Event(HarnessEvent::Idle))
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
 
@@ -998,15 +1018,125 @@ mod tests {
             "harness should attach"
         );
 
-        // Just attached — both timers seeded with `now`. Long
-        // TTLs mean no sandbox is idle yet.
+        // Fresh attach with no Idle yet: long TTLs see no idle
+        // sandbox AND short soft TTL also sees none (we did not
+        // seed `last_idle_at` at attach — that's the bug we fixed).
+        // Hard TTL still has its origin from attach so a zero hard
+        // TTL would fire; test that separately below.
         let fresh = hub.idle_sandboxes(Duration::from_secs(60), Duration::from_secs(3600));
         assert!(fresh.is_empty(), "fresh attach is not idle: {fresh:?}");
 
-        // Zero soft TTL — `last_idle_at` was seeded at attach so
-        // soft fires; the pair comes back. Hard 0 would also fire,
-        // but we test soft alone here.
+        // Wait for the harness's Idle frame to be processed.
+        assert!(
+            wait_until(|| hub.last_event_at(sandbox_id).is_some()).await,
+            "Idle event should reach the hub",
+        );
+
+        // Now the soft TTL has its anchor. Zero soft TTL fires.
         let aged = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].0, session_id);
+        assert_eq!(aged[0].1, sandbox_id);
+    }
+
+    #[tokio::test]
+    async fn soft_ttl_does_not_fire_before_explicit_idle_emit() {
+        // Prod regression guard (2026-05-28 session 43fe13b4):
+        // the hub previously seeded `last_idle_at` at attach time
+        // so the soft TTL fired at attach + soft_ttl seconds, even
+        // if the harness had never emitted `Idle`. The result in
+        // prod: every fresh agent session whose harness took more
+        // than the soft TTL to produce its first event got hot-
+        // suspended mid-cold-boot.
+        //
+        // This test reproduces the regression with `soft_ttl = 0ms`,
+        // `hard_ttl = 1h`: with the seed in place, the zero soft TTL
+        // would immediately fire because `last_idle_at` is the
+        // attach instant (`attach_instant <= now - 0ms` is true).
+        // With the fix, `last_idle_at` is None for a not-yet-Idled
+        // harness, so the soft check short-circuits to false and
+        // the result is empty.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let _harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            // Stay attached but never emit anything. Mirrors a
+            // harness in the middle of its agent-cold-boot window
+            // (claude takes ~7-9s before its first event).
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(wait_until(|| hub.attached_count() == 1).await);
+
+        // Zero soft TTL + long hard TTL. With the seed-at-attach bug,
+        // soft fires immediately (the assertion below trips with a
+        // non-empty result). Without the bug, soft check returns
+        // false because `last_idle_at` is None.
+        let result = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
+        assert!(
+            result.is_empty(),
+            "soft TTL must not fire before the harness emits Idle; \
+             got {result:?} — this regression caused the prod \
+             session 43fe13b4 hot-suspension on 2026-05-28",
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_ttl_fires_on_silent_adapter_without_idle() {
+        // The companion case to the soft-TTL fix above. An adapter
+        // that attaches and never emits *anything* (buggy harness,
+        // stuck in cold boot indefinitely) must still get reaped —
+        // that's what the hard TTL exists for. We seed
+        // `last_event_at` at attach so its clock is the attach
+        // moment, even though `last_idle_at` is left None.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let _harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            // Never emit any frame; just keep the connection alive.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(wait_until(|| hub.attached_count() == 1).await);
+
+        // Long soft TTL alone sees nothing — `last_idle_at` is None.
+        let none = hub.idle_sandboxes(Duration::from_secs(3600), Duration::from_secs(3600));
+        assert!(none.is_empty(), "no idle emit + long TTLs: {none:?}");
+
+        // Zero hard TTL with `last_event_at` seeded at attach fires.
+        let aged = hub.idle_sandboxes(Duration::from_secs(3600), Duration::from_millis(0));
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].0, session_id);
         assert_eq!(aged[0].1, sandbox_id);
