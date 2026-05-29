@@ -1628,13 +1628,29 @@ impl FirecrackerBackend {
     ) -> Result<(), SandboxError> {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
-        for (label, p) in [("state.bin", &state_path), ("memory.bin", &mem_path)] {
-            if !p.exists() {
-                return Err(SandboxError::Snapshot(format!(
-                    "snapshot {label} missing at {}",
-                    p.display()
-                )));
-            }
+        if !state_path.exists() {
+            return Err(SandboxError::Snapshot(format!(
+                "snapshot state.bin missing at {}",
+                state_path.display()
+            )));
+        }
+        // ADR 0020 Route B: UFFD mode faults memory pages from chunks
+        // on demand via the handler we spawn below; memory.bin is not
+        // read by `PUT /snapshot/load` in this mode and won't exist on
+        // disk after a cross-host receive (PooledBackend::restore
+        // skips `materialize_memory_if_missing` when
+        // `restore_memory_is_lazy()` returns true). Requiring it here
+        // unconditionally was the prod blocker on 2026-05-29: after a
+        // MIG roll the new hosts had every base-snapshot restore fail
+        // with "snapshot memory.bin missing" before the mode-specific
+        // load branch could run. Same-host UFFD restore passed only
+        // because `PooledBackend::snapshot` had already written
+        // memory.bin during capture on the same host.
+        if matches!(self.config.restore_mode, RestoreMode::File) && !mem_path.exists() {
+            return Err(SandboxError::Snapshot(format!(
+                "snapshot memory.bin missing at {}",
+                mem_path.display()
+            )));
         }
 
         // ADR 0014 M1.16: warm-restore networking provisions a
