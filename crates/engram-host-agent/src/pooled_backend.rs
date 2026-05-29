@@ -1726,8 +1726,16 @@ impl SandboxBackend for PooledBackend {
         // bounded concurrency reduces that to roughly ~2 s.
         // Subsequent restores against the same template hit NVMe
         // and the prefetch is a no-op.
+        // ADR 0020 P3: span the pre-`restore_in_jail` prep legs (memory
+        // prefetch / state materialize / NBD attach) alongside the
+        // `fc.restore_in_jail` legs, so one trace shows where the whole
+        // `host.restore_base_for_session` window goes. Pure observability.
         let prefetch_start = std::time::Instant::now();
-        let prefetched_chunks = self.prefetch_memory_chunks(&metadata).await;
+        let prefetched_chunks = tracing::Instrument::instrument(
+            self.prefetch_memory_chunks(&metadata),
+            tracing::info_span!("restore.prefetch_memory"),
+        )
+        .await;
         if let Err(e) = prefetched_chunks.as_ref() {
             tracing::warn!(
                 error = %e,
@@ -1759,11 +1767,14 @@ impl SandboxBackend for PooledBackend {
         // "snapshot memory.bin missing".
         if let Some(chunk_store) = self.chunk_store.as_ref() {
             let blob = chunk_store.blob_storage();
-            if let Err(e) = materialize_state_if_missing(
-                blob.as_ref(),
-                &src,
-                metadata.state_blob_key.as_deref(),
-                metadata.sidecar_blob_key.as_deref(),
+            if let Err(e) = tracing::Instrument::instrument(
+                materialize_state_if_missing(
+                    blob.as_ref(),
+                    &src,
+                    metadata.state_blob_key.as_deref(),
+                    metadata.sidecar_blob_key.as_deref(),
+                ),
+                tracing::info_span!("restore.materialize_state"),
             )
             .await
             {
@@ -1805,7 +1816,11 @@ impl SandboxBackend for PooledBackend {
         // BEFORE `inner.restore` reads the sidecar to install the
         // canonical-rootfs symlinks.
         #[cfg(target_os = "linux")]
-        let pending_nbd_state = self.prepare_resume_nbd_attach(&metadata, &src).await?;
+        let pending_nbd_state = tracing::Instrument::instrument(
+            self.prepare_resume_nbd_attach(&metadata, &src),
+            tracing::info_span!("restore.prepare_nbd"),
+        )
+        .await?;
 
         // Non-NBD fallback runs only when the NBD path didn't take.
         // On macOS this is the only path; on Linux it covers hosts

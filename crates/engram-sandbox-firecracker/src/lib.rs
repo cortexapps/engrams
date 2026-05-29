@@ -1676,18 +1676,27 @@ impl FirecrackerBackend {
         // Legacy/test snapshots with `manifest.net = None` keep the
         // historical host-root flow: TAP lives directly on host
         // root, FC stays in host root, no netns at all.
-        let netns_setup = match self
-            .reserve_restored_netns(sandbox_id, manifest.net.as_ref())
-            .await
+        // ADR 0020 P3: span each restore-setup leg so the trace shows the
+        // per-leg breakdown of `fc.restore_in_jail` (netns / spawn / symlinks /
+        // uffd / load). These are sequential today; the spans tell us which
+        // legs are worth `try_join!`-ing and what the parallelizable headroom
+        // actually is before we rework the cleanup path. Pure observability.
+        let netns_setup = match tracing::Instrument::instrument(
+            self.reserve_restored_netns(sandbox_id, manifest.net.as_ref()),
+            tracing::info_span!("fc.reserve_netns"),
+        )
+        .await
         {
             Ok(setup) => setup,
             Err(e) => return Err(e),
         };
 
         let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
-        let (socket, child) = match self
-            .spawn_firecracker(jail_dir, netns_name.as_deref())
-            .await
+        let (socket, child) = match tracing::Instrument::instrument(
+            self.spawn_firecracker(jail_dir, netns_name.as_deref()),
+            tracing::info_span!("fc.spawn_process"),
+        )
+        .await
         {
             Ok(v) => v,
             Err(e) => {
@@ -1709,11 +1718,14 @@ impl FirecrackerBackend {
         // materialized into `manifest.spec.rootfs_source` already).
         // Errors here drop `child` explicitly so the spawned FC
         // process gets SIGKILLed before we propagate.
-        if let Err(e) = restore_canonical_symlinks(
-            &self.work_dir,
-            sandbox_id,
-            manifest,
-            self.config.stub_harness_path.as_deref(),
+        if let Err(e) = tracing::Instrument::instrument(
+            restore_canonical_symlinks(
+                &self.work_dir,
+                sandbox_id,
+                manifest,
+                self.config.stub_harness_path.as_deref(),
+            ),
+            tracing::info_span!("fc.restore_symlinks"),
         )
         .await
         {
@@ -1751,13 +1763,15 @@ impl FirecrackerBackend {
         // skipped upstream for Uffd). Either way the VM is running by
         // the time `load_snapshot*` returns (resume_vm: true).
         let load_result: Result<Option<Child>, SandboxError> = match self.config.restore_mode {
-            RestoreMode::File => api
-                .load_snapshot(&SnapshotPaths {
+            RestoreMode::File => tracing::Instrument::instrument(
+                api.load_snapshot(&SnapshotPaths {
                     state_path: state_path.clone(),
                     mem_path: mem_path.clone(),
-                })
-                .await
-                .map(|_| None),
+                }),
+                tracing::info_span!("fc.load_snapshot", mode = "file"),
+            )
+            .await
+            .map(|_| None),
             RestoreMode::Uffd => {
                 // ADR 0007: the handler reads its memory manifests
                 // from the chunk store. Without `memory_manifest` on
@@ -1814,10 +1828,12 @@ impl FirecrackerBackend {
                     )
                     .await
                 {
-                    Ok(handler) => api
-                        .load_snapshot_uffd(&state_path, &uffd_uds)
-                        .await
-                        .map(|_| Some(handler)),
+                    Ok(handler) => tracing::Instrument::instrument(
+                        api.load_snapshot_uffd(&state_path, &uffd_uds),
+                        tracing::info_span!("fc.load_snapshot", mode = "uffd"),
+                    )
+                    .await
+                    .map(|_| Some(handler)),
                     Err(e) => Err(e),
                 }
             }
