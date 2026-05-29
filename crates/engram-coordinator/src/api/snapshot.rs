@@ -199,6 +199,38 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
 }
 
 async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
+    // Serialize resume against concurrent resume + eviction for this session.
+    // Reuses the per-session `eviction_inflight` lease (keyed on session_id).
+    // Without it, two concurrent resumes — e.g. the prompt path's auto-resume
+    // (`ensure_active`) racing a manual `/resume`, or two prompts on one Idle
+    // session — each call `restore_for_session`, creating a live VM *before*
+    // the `Idle → Created` transition that would serialize them. The loser
+    // orphans its sandbox (and last-writer-wins on `sessions.sandbox_id` can
+    // leave the row bound to the wrong one). Holding the lease for the whole
+    // resume makes resume + eviction mutually exclusive per session. The
+    // lease's `sandbox_id` is a diagnostic-only column; resume has no sandbox
+    // at acquire time, so a nil sentinel marks "resume in flight" (vs an
+    // eviction's real sandbox). (Renamed to a session-op lease in a follow-up.)
+    let _lease = match crate::idle_evictor::InflightEvictionGuard::try_acquire(
+        &state,
+        id,
+        SandboxId::from(uuid::Uuid::nil()),
+    )
+    .await
+    {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Err(ApiError::Conflict(format!(
+                "session {id} is already mid-resume or mid-eviction; retry shortly",
+            )))
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "resume lease acquire failed: {e}"
+            )))
+        }
+    };
+
     let session = state.services.meta.get_session(id).await?;
 
     // ADR 0007: single-tier dispatcher.

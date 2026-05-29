@@ -319,13 +319,13 @@ pub async fn evict_session_to_state(
 /// a best-effort DELETE so the lease releases on every exit path
 /// (success, error, panic). A stale row that survives a panic /
 /// pod crash is reaped by `spawn_eviction_lease_reaper` at 180s.
-struct InflightEvictionGuard {
+pub(crate) struct InflightEvictionGuard {
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     session_id: SessionId,
 }
 
 impl InflightEvictionGuard {
-    async fn try_acquire(
+    pub(crate) async fn try_acquire(
         state: &SharedState,
         session_id: SessionId,
         sandbox_id: SandboxId,
