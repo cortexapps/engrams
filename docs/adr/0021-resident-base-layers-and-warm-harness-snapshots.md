@@ -10,9 +10,11 @@ an in-memory LRU (`f9f688e`) + base-snapshot **memory** residency at host-boot
 (`c6510d4`) — took the warm substrate **2.6 s → ~516 ms** and erased the cold-host cliff
 (**3.15 s → ~618 ms**); substrate is now FC-floor-bound (~600 ms). The runtime-RAM-dedup
 **mechanism** (File backend vs an FC memfd patch) + the **forking** strategy are split
-into their own decision — **ADR 0022** — and parked for now. P3 (persistent agent)
-remains. Corrections are inline + in Prod measurements; the original 2026-05-27 framing
-follows.
+into their own decision — **ADR 0022** — and parked for now. **P3 (warm snapshots) is
+closed**: the substrate fix collapsed the agent cold start to ~5 s (the agent's rootfs
+reads paid the same sha256 tax), and the warm-snapshot-shared model fights claude's
+env-at-exec secret injection. Corrections are inline + in Prod measurements; the original
+2026-05-27 framing follows.
 
 Status: 2026-05-27 — **Proposed.** ADR 0020 shipped chunk-native UFFD restore to
 prod and **measured where the time goes now**: guest-memory restore is cheap
@@ -317,10 +319,11 @@ remaining per-session cost is the COW delta + the first-prompt workspace scan.
    (`MAP_PRIVATE` of a resident memfile, stock FC) vs a memfd / `UFFDIO_CONTINUE` backing
    (FC patch, enables live fork). Density + substrate do **not** depend on this; it gates
    only runtime-RAM dedup + session forking. Parked pending the dedicated ADR.
-2. **Cheap agent boot vs warm snapshots.** Before building the warm-snapshot capture
-   pipeline, measure whether a persistent agent + in-process warm start (Bun/V8
-   startup snapshot in the template) already gets first-token under ~1 s. If so, skip
-   VM warm snapshots. This also requires moving the agent off child-per-prompt.
+2. **Cheap agent boot vs warm snapshots — resolved (2026-05-29).** Moot: the agent cold
+   start fell to ~5 s on its own once the P2 substrate fix removed the per-read sha256 that
+   claude's rootfs reads were also paying — no warm snapshot needed — and the
+   warm-snapshot-shared model fights claude's env-at-exec secret model anyway. **P3 closed**
+   (see the P3 phase).
 3. **Warm-snapshot freshness.** An agent/base update = re-bake + re-warm-snapshot the
    template (one artifact, one version, one pipeline — cleaner than the old split,
    but still churn). Trigger + transactionality (mirror enable: not ready until
@@ -551,6 +554,12 @@ every uncached rootfs chunk pays ~84 ms. Memory got the full prefetch treatment
 
 ### Agent cost: harness attached → `run_started`
 
+> **Superseded (2026-05-29).** This section's ~2 m 44 s — and its "CPU-bound, not I/O"
+> conclusion — were measured **before** the verify-on-populate fix. Post-fix the agent
+> cold start is **~5 s** (user-observed): claude's node_modules/Bun rootfs reads were
+> paying the same per-read 16 MiB sha256 tax we removed, so the gap was largely I/O after
+> all. **P3 is closed** (see the P3 phase). The analysis below is retained for history.
+
 Same image, agent-mode: **2 m 44 s**. Two sessions on the same host
 (`a8c6950f`) both measured 2 m 44 s ± 3 s — host warmth doesn't help.
 
@@ -678,33 +687,31 @@ after this phase: substrate ~230 ms (the 30 cold disk fetches collapse to NVMe @
       ~17 ms NVMe-hit. Substrate floor is ~600 ms (FC restore), higher than the
       original ~230 ms guess.
 
-**P3 — Warm snapshots per template** (capture at the agent-`idle` signal; restore
-into a ready agent). Removes the ~7–9 s. The big payoff.
+**P3 — Warm snapshots per template → CLOSED (2026-05-29), not pursued.** Two reasons stack:
 
-Entry-point context: the prod measurement of **2 m 44 s** for harness-attached
-→ `run_started` (above) is the regression P3 retires. The original ADR plan
-budgeted ~7–9 s — that was for a single Bun startup, not for
-`Command::new(claude_bin).args(...)` spawning a fresh child *per prompt*.
-Today's code path is at `engram-harness-claude/src/main.rs:424` inside
-`run_one_claude_prompt`; each turn pays the full cold-start cost. The
-base_snapshot captured by `build_base_snapshot` at `pooled_backend.rs:1971`
-is taken at `wait_agent_ready` — *before* the harness binary is even
-launched — so restoring it gives you agentd-ready, not claude-ready. P3
-moves both ends of this:
+1. **The premise is gone.** P3 existed to kill the measured **2 m 44 s** agent
+   first-token. After the P2 substrate fix, a fresh session's agent cold start is **~5 s**
+   (user-observed). The harness is *unchanged* — still child-per-prompt at
+   `engram-harness-claude/src/main.rs` — so the collapse came from **verify-on-populate
+   bleeding into the agent's own startup**: claude's node_modules + Bun rootfs reads were
+   paying the same per-read 16 MiB sha256 tax we removed. The Agent-cost section above
+   ("CPU-bound, not I/O") was wrong — it ruled out GCS misses but not the sha256-on-cache-
+   hit cost we hadn't found yet. (Re-trace to confirm the exact breakdown if it ever
+   matters; the 2 m 44 s regression is gone either way.)
+2. **The warm-snapshot-shared model is a bad fit for claude regardless.** A warm snapshot
+   is captured *after* claude is running (agent-idle) and restored into many sessions —
+   which breaks **per-session secret injection**: claude reads `ANTHROPIC_API_KEY` from env
+   at exec, and you can't re-env a warm-resumed process, so serving per-session keys would
+   require claude in a **per-request-auth server mode** (key from a mutable source, not
+   env). Today's flow sidesteps this *by construction* — the base snapshot is captured at
+   `wait_agent_ready` (**before** claude), so the secret-bearing harness launches claude
+   fresh per session. (vsock reconnect is already solved — `a50dbd6`; an idle agent holds
+   no open Anthropic connection; identity/entropy/clock is the existing base-restore concern.)
 
-- [ ] Move the agent to a **persistent model** (claude server/SDK mode; emits `Idle`)
-      — supersedes the child-per-prompt `claude --print` loop at
-      `engram-harness-claude/src/main.rs:424`. Open question whether
-      claude's server mode is mature enough; alternative is keeping the
-      child but warming Bun via V8 startup snapshots.
-- [ ] Open-question-2 measurement first: persistent-agent + cheap in-process warm
-      start under ~1 s? If yes, skip VM warm snapshots.
-- [ ] If not: capture the warm memory snapshot at `Idle` (incl. running agent);
-      restore into a ready agent; per-session COW on top. Concrete change:
-      `build_base_snapshot` shifts capture from `wait_agent_ready` to
-      `wait_harness_idle` (new primitive) — requires (a) host-side to know
-      when the harness has emitted `Idle`, (b) the harness contract to
-      guarantee `Idle` after first-prompt-ready, not just after attach.
+**Revival condition:** only if a future agent gap reappears *and* the agent has moved to a
+per-request-auth server mode (removing the secret-injection blocker). Until both hold, P3
+stays closed; child-per-prompt is retained — it handles per-session secrets + connections
+cleanly by launching the secret-bearing process fresh.
 
 **P4 — Runtime RAM dedup + forking → moved to [ADR 0022](0022-runtime-memory-sharing-and-forking.md).**
 Density (K sessions cost `base + K×dirty`) and session forking share one primitive
