@@ -389,25 +389,32 @@ if dev_split:
 # Vite's HMR runs in-process — Tilt should NEVER restart this.
 # Edits to web/src/** are picked up via vite's own file watcher,
 # not via a Tilt re-run. We deliberately don't pass `deps` here.
+#
+# Skipped when ENGRAM_SKIP_WEB is set (CI's `tilt ci` has no browser
+# to drive the SPA, and pnpm install + a vite readiness wait only slow
+# the e2e gate down). Mirrors integration-up.sh's ENGRAM_SKIP_WEB.
 # ----------------------------------------------------------------
 
-local_resource('web',
-    serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
-    resource_deps=['coordinator'],
-    # See the coordinator probe above — same loopback port-pool
-    # constraint applies to vite.
-    readiness_probe=probe(
-        period_secs=30,
-        timeout_secs=2,
-        tcp_socket=tcp_socket_action(port=5173),
-    ),
-    links=[
-        link('http://localhost:5173/', 'overview'),
-        link('http://localhost:5173/settings', 'settings'),
-    ],
-    labels=['app'],
-    trigger_mode=TRIGGER_MODE_MANUAL,
-    auto_init=True)
+skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
+
+if not skip_web:
+    local_resource('web',
+        serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
+        resource_deps=['coordinator'],
+        # See the coordinator probe above — same loopback port-pool
+        # constraint applies to vite.
+        readiness_probe=probe(
+            period_secs=30,
+            timeout_secs=2,
+            tcp_socket=tcp_socket_action(port=5173),
+        ),
+        links=[
+            link('http://localhost:5173/', 'overview'),
+            link('http://localhost:5173/settings', 'settings'),
+        ],
+        labels=['app'],
+        trigger_mode=TRIGGER_MODE_MANUAL,
+        auto_init=True)
 
 # Resources are grouped in the Tilt UI by `labels` above:
 # infra (postgres, registry) → setup (bootstrap) → app (coordinator,
