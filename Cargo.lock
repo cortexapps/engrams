@@ -785,6 +785,8 @@ name = "engram-agentd"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "engram-core",
+ "engram-harness-proto",
  "engram-telemetry",
  "engram-transport",
  "nix 0.29.0",
@@ -902,6 +904,8 @@ dependencies = [
  "engram-core",
  "engram-crypto",
  "engram-egress-proxy",
+ "engram-git-dev",
+ "engram-git-github",
  "engram-harness-proto",
  "engram-host-agent",
  "engram-image-builder",
@@ -996,6 +1000,38 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-git-dev"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "engram-core",
+ "parking_lot",
+ "tokio",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-git-github"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "engram-core",
+ "jsonwebtoken",
+ "parking_lot",
+ "rand 0.8.6",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
  "workspace-hack",
 ]
 
@@ -5599,6 +5635,7 @@ dependencies = [
  "chrono",
  "crossbeam-utils",
  "crypto-common",
+ "der",
  "deranged",
  "digest",
  "either",
@@ -5615,6 +5652,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "idna",
+ "lazy_static",
  "libc",
  "log",
  "memchr",
@@ -5623,6 +5661,7 @@ dependencies = [
  "num-traits",
  "percent-encoding",
  "phf_shared",
+ "pkcs8",
  "prost",
  "rand 0.8.6",
  "rand_core 0.6.4",
@@ -5640,11 +5679,13 @@ dependencies = [
  "slab",
  "smallvec",
  "socket2 0.6.3",
+ "spki",
  "sqlx-core",
  "sqlx-postgres",
  "syn 2.0.117",
  "thiserror 2.0.18",
  "time",
+ "time-macros",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
