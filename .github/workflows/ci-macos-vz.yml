@@ -104,7 +104,7 @@ jobs:
       # Pull the Kata Containers arm64 kernel into the cache path
       # the `#[ignore]`'d live smoke reads (`ENGRAM_VZ_KERNEL_PATH`,
       # default `~/.cache/engram-vz-test/vmlinux-arm64`). Same script
-      # `just vz-pull-kernel` invokes locally — pinned URL, ~290 MB
+      # `just pull-kernel` invokes locally — pinned URL, ~290 MB
       # tarball, ~25 MB extracted kernel.
       - name: Pull VZ kernel (Kata arm64)
         if: always()

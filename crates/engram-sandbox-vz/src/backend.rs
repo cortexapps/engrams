@@ -45,7 +45,7 @@ pub struct VzConfig {
     /// `CONFIG_VIRTIO_BLK=y`, `CONFIG_VIRTIO_NET=y`,
     /// `CONFIG_VIRTIO_CONSOLE=y`. Cached at
     /// `~/.cache/engram-vz-test/vmlinux-arm64` by default. The
-    /// canonical source is `just vz-pull-kernel`, which fetches
+    /// canonical source is `just pull-kernel`, which fetches
     /// the Kata Containers static kernel.
     pub kernel_path: PathBuf,
     /// Default RAM in MiB applied when `SandboxSpec::memory.max_mib`
