@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { useMemo } from 'react';
 import { ToolCall } from './ToolCall';
 import { IdleMarker, RunBoundary } from './RunBoundary';
+import { PullRequestCard } from './PullRequestCard';
 import type { AgentRole, IndexedEvent } from '../types';
 
 // Render the session's event stream as a continuous transcript. Layout
@@ -14,6 +15,8 @@ import type { AgentRole, IndexedEvent } from '../types';
 //   - Time stamps live in the right margin, faded.
 //   - The most-recent paragraph briefly tints amber (".ink-settle"),
 //     then fades to ink. It's the only place amber is used here.
+//   - A pull request opened via the forge seam renders as a framed
+//     notice (PullRequestCard) — the session's reviewable artifact.
 //
 // Any event the transcript doesn't recognise (stdout, exec_started,
 // snapshot, …) is dropped. Those still appear in the raw event log
@@ -34,7 +37,18 @@ type Block =
     }
   | { kind: 'run-start'; key: string; runId: string; prompt: string | null }
   | { kind: 'run-end'; key: string; runId: string; ok: boolean }
-  | { kind: 'idle'; key: string };
+  | { kind: 'idle'; key: string }
+  | {
+      kind: 'pr';
+      key: string;
+      url: string;
+      repo: string;
+      title: string;
+      number: number;
+      headBranch: string;
+      baseBranch: string;
+      at: string;
+    };
 
 export function Transcript({ events }: TranscriptProps) {
   const blocks = useMemo(() => buildBlocks(events), [events]);
@@ -106,6 +120,19 @@ export function Transcript({ events }: TranscriptProps) {
                 texts={b.texts}
                 at={b.at}
                 fresh={b.key === lastMsgKey}
+              />
+            );
+          case 'pr':
+            return (
+              <PullRequestCard
+                key={b.key}
+                url={b.url}
+                repo={b.repo}
+                title={b.title}
+                number={b.number}
+                headBranch={b.headBranch}
+                baseBranch={b.baseBranch}
+                at={b.at}
               />
             );
         }
@@ -256,6 +283,21 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
 
       case 'harness_idle':
         out.push({ kind: 'idle', key: `i:${indexed.idx}` });
+        activeMsg = null;
+        break;
+
+      case 'pull_request_opened':
+        out.push({
+          kind: 'pr',
+          key: `pr:${indexed.idx}`,
+          url: ev.url,
+          repo: ev.repo,
+          title: ev.title,
+          number: ev.number,
+          headBranch: ev.head_branch,
+          baseBranch: ev.base_branch,
+          at: ev.at,
+        });
         activeMsg = null;
         break;
 

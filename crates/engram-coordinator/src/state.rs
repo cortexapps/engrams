@@ -116,11 +116,15 @@ pub enum SessionEvent {
         at: DateTime<Utc>,
     },
     /// ADR 0023: the agent opened a change request (PR/MR) via the
-    /// in-session forge seam. Surfaces the URL to the web UI / SSE
-    /// subscribers so the session's output artifact is visible.
+    /// in-session forge seam. Surfaces the title + URL to the web UI /
+    /// SSE subscribers so the session's output artifact is visible (the
+    /// web transcript renders this as a pull-request card). `number` is
+    /// the provider's PR number / MR iid.
     PullRequestOpened {
         url: String,
         repo: String,
+        title: String,
+        number: u64,
         head_branch: String,
         base_branch: String,
         at: DateTime<Utc>,

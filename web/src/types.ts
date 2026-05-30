@@ -231,7 +231,17 @@ export type SessionEvent =
       at: string;
     }
   | { type: 'run_completed'; run_id: string; ok: boolean; at: string }
-  | { type: 'harness_idle'; at: string };
+  | { type: 'harness_idle'; at: string }
+  | {
+      type: 'pull_request_opened';
+      url: string;
+      repo: string;
+      title: string;
+      number: number;
+      head_branch: string;
+      base_branch: string;
+      at: string;
+    };
 
 export type SessionEventKind = SessionEvent['type'];
 

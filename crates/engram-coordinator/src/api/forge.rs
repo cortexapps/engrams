@@ -117,6 +117,8 @@ async fn op_create_pull_request(
             SessionEvent::PullRequestOpened {
                 url: pr.url.clone(),
                 repo: repo.to_string(),
+                title: spec.title,
+                number: pr.id,
                 head_branch: spec.head_branch,
                 base_branch: spec.base_branch,
                 at: chrono::Utc::now(),
