@@ -68,6 +68,30 @@ auth:
   existingSecret: ""
   secretKey: ENGRAM_AUTH_TOKENS
 
+# Git forge (ADR 0023). Lets in-session agents fetch short-lived git
+# credentials and open pull/merge requests through the platform — no
+# durable token ever lives in the sandbox. Off by default.
+#
+# This block is the coordinator-side authority (the App credential).
+# WHICH repos a session may act on is set per image in the manifest's
+# `[git]` block (`provider` + `owner`); the seam only activates for a
+# session whose image declares one. An installation token works across
+# every repo the App can reach, so one App serves all of an org's images.
+forge:
+  # `none` (off) or `github`.
+  provider: none
+  github:
+    # Numeric GitHub App ID, as a string (an identifier, not a secret).
+    # The App needs Contents + Pull requests = Read & write, and must be
+    # installed on the org/user that owns the target repos.
+    appId: ""
+    # The App's PEM private key — the one durable secret. The chart never
+    # inlines it: put the PEM in a Secret and reference it here. The coord
+    # receives it as `ENGRAM_GITHUB_APP_PRIVATE_KEY`.
+    privateKey:
+      existingSecret: ""
+      secretKey: github-app-private-key
+
 # Cloud-agnostic identity. Production overlays bind to a
 # cloud-specific SA via annotations (GKE Workload Identity, EKS IRSA).
 # Web pods use the namespace `default` SA — they make no cloud API

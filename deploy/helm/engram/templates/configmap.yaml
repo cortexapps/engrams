@@ -34,6 +34,18 @@ data:
   {{- end }}
   ENGRAM_GCP_PROJECT_ID: {{ .Values.secrets.gcpProjectId | quote }}
   {{- end }}
+  # Git forge (ADR 0023). `none` disables the seam; `github` needs an App
+  # ID (non-secret, here) + a private key (a Secret — see deployment.yaml).
+  ENGRAM_GIT_FORGE: {{ .Values.forge.provider | quote }}
+  {{- if eq .Values.forge.provider "github" }}
+  {{- if not .Values.forge.github.appId }}
+  {{- fail "values.forge.github.appId is required when forge.provider=github" }}
+  {{- end }}
+  {{- if not .Values.forge.github.privateKey.existingSecret }}
+  {{- fail "values.forge.github.privateKey.existingSecret is required when forge.provider=github" }}
+  {{- end }}
+  ENGRAM_GITHUB_APP_ID: {{ .Values.forge.github.appId | quote }}
+  {{- end }}
   ENGRAM_BIND_ADDR: {{ printf "0.0.0.0:%d" (int .Values.service.port) | quote }}
   {{- range $k, $v := .Values.extraConfig }}
   {{ $k }}: {{ $v | quote }}

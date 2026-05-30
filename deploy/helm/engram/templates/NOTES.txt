@@ -16,6 +16,9 @@ Pre-flight checks the chart did not perform:
 4. {{- if eq .Values.kek.provider "gcp-kms" }} The KMS key {{ printf "%q" .Values.kek.gcpResource }} exists and the Service Account can Encrypt/Decrypt on it.
 {{- else if eq .Values.kek.provider "env-var" }} The DATABASE_URL Secret also carries an `ENGRAM_KEK_MASTER_KEY` entry (base64 32-byte key). Production should use kek.provider=gcp-kms.
 {{- end }}
+{{- if eq .Values.forge.provider "github" }}
+5. The GitHub App forge Secret {{ printf "%q" .Values.forge.github.privateKey.existingSecret }} exists with key {{ printf "%q" .Values.forge.github.privateKey.secretKey }} holding the App's PEM private key; App {{ .Values.forge.github.appId | quote }} has Contents + Pull requests = Read & write and is installed on the orgs whose repos sessions will target. Per-image: the manifest's `[git]` block (provider + owner) must be set for the seam to activate.
+{{- end }}
 
 Tail the coord:
 
