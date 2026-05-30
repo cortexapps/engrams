@@ -1,6 +1,7 @@
 # ADR 0023: Engrams on engrams — dogfooding the product plane
 
-Status: 2026-05-29 — **Proposed.** The micro-VM substrate is mature (ADRs 0019–0022). This
+Status: 2026-05-29 — **Accepted.** P1 (the dogfood loop) is shipped; see the commit chain and
+the one design divergence below. The micro-VM substrate is mature (ADRs 0019–0022). This
 ADR opens the *product* plane: the surfaces that turn engrams from a sandbox orchestrator into
 a product an org actually drives — git handoff, integrations (Slack/Linear), identity — and
 the dev loop where we build those surfaces by **running agents inside engrams sessions**. P1
@@ -8,6 +9,25 @@ the dev loop where we build those surfaces by **running agents inside engrams se
 an in-session forge seam, and the built-in `create-pull-request` skill (the dynamic,
 centrally-managed skills platform is designed here for a later phase). Later phases are
 designed here but deferred. Nothing in this ADR touches the substrate's latency wins.
+
+**P1 commit chain.** `a2a5d83` (#45 — `GitForge` trait + types + `engram-git-{github,dev}`,
+guarded `ProcessBackend`, forge API + per-session broker token + `[git]` manifest block,
+ProcessBackend loopback transport) → `2728fd1` (Firecracker vsock forge bridge) → `76c2308`
+(dogfood image `deploy/dev-engrams` + built-in `create-pull-request` skill) → `0e577f1`
+(Cargo.lock catch-up for the two new crates + agentd deps) → `080c217` (real-microVM
+forge-bridge e2e test + CI wiring). Verified: `just check` green (854 tests) + the FC
+`forge_loopback` integration test green on the dev-vm.
+
+**One divergence from the proposed design.** §3 proposed multiplexing the forge RPC onto the
+existing harness vsock channel (`GuestRequest`/`GuestResponse` — "no new vsock port, no
+per-backend plumbing"). The implementation instead added a **dedicated forge vsock port**
+(`FORGE_VSOCK_PORT` = 1028) with its own `ForgeRequest`/`ForgeResponse` framing and a
+`ForgeSink` that mirrors the existing `HarnessSink`. This keeps the forge protocol decoupled
+from the harness `GuestRequest` enum and its accept loop, and lets the coordinator wire the
+forge channel exactly like the harness sink — one more instance of the established seam rather
+than a widening of the harness contract. The cost is the per-backend plumbing the proposal
+hoped to avoid (FC `spawn_forge_listener`), but it is a direct mirror of the
+`spawn_harness_listener` already present in each backend, so the marginal surface is small.
 
 ## Context
 
@@ -95,6 +115,8 @@ Two transports:
   vsock channel** (port 1026, `engram-harness-proto` framing): add
   `GuestRequest::{FetchGitCredential, CreatePullRequest}` ⇄ `GuestResponse`, handled host-side
   and forwarded to the coord forge API. No new vsock port, no per-backend plumbing.
+  _(Shipped differently — a dedicated forge vsock port + a `ForgeSink`; see the divergence note
+  under Status.)_
 
 Short-lived creds in-guest are acceptable (single-org trusted-tenant assumption — DESIGN.md),
 so the egress-proxy secret-substitution approach is **dropped** (not deferred): it's an
@@ -177,8 +199,9 @@ present when it boots; no mid-session hot-add).
 - `GitForge` + the forge seam establish the integration pattern: a platform-side trait
   authority + an in-session seam + a skill. Every future integration is a smaller instance of
   the same shape rather than new architecture.
-- A new guest→host request type rides the harness vsock channel — the first guest-originated
-  RPC; a real (if small) extension of that channel's contract.
+- A dedicated guest→host **forge** vsock channel (`FORGE_VSOCK_PORT`, with a `ForgeSink`
+  mirroring `HarnessSink`) — the first guest-originated RPC. (The proposal expected this to
+  ride the harness channel; see the Status divergence note for why it shipped as its own port.)
 - The built-in skill rides the rootfs (no per-backend mount code); the deferred dynamic-skills
   mount engine will bifurcate per backend (FC RO virtio-blk drive vs ProcessBackend dir).
 - `ProcessBackend` as a runnable backend is a loaded footgun; the insecure-flag gate +
