@@ -311,6 +311,15 @@ enum ImageCmd {
         #[arg(long, value_parser = parse_transport, default_value = "vsock")]
         transport: engram_image_builder::Transport,
 
+        /// Guest platform to resolve a built-in `[harness]` artifact for
+        /// (`harness-<name>:<ver>-<platform>`). The harness runs inside
+        /// the guest, so this is the rootfs's arch. Defaults to the
+        /// host's arch — correct for the dev bake recipes, which
+        /// cross-compile the rootfs for the host. Set explicitly only
+        /// when baking cross-arch. Accepts `linux-x86_64` | `linux-arm64`.
+        #[arg(long, value_parser = parse_harness_platform)]
+        harness_platform: Option<engram_image_builder::Platform>,
+
         /// Push the baked image to a Docker registry as an Engram OCI
         /// artifact. Accepts either `host/repo` (auto-appends the
         /// produced tag) or `host/repo:tag`. Format must be `ext4`.
@@ -322,6 +331,10 @@ enum ImageCmd {
         #[arg(long)]
         push: Option<String>,
     },
+}
+
+fn parse_harness_platform(s: &str) -> Result<engram_image_builder::Platform, String> {
+    engram_image_builder::Platform::parse(s)
 }
 
 fn parse_transport(s: &str) -> Result<engram_image_builder::Transport, String> {
@@ -423,6 +436,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 format,
                 inject_agent,
                 transport,
+                harness_platform,
                 push,
             } => {
                 image_build(
@@ -434,6 +448,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                     *format,
                     inject_agent.as_deref(),
                     *transport,
+                    *harness_platform,
                     push.as_deref(),
                 )
                 .await
@@ -1024,6 +1039,7 @@ async fn image_build(
     format: Format,
     inject_agent: Option<&Path>,
     transport: engram_image_builder::Transport,
+    harness_platform: Option<engram_image_builder::Platform>,
     push: Option<&str>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
@@ -1073,7 +1089,12 @@ async fn image_build(
     // anonymous (matches public/local-registry behaviour).
     let oci =
         engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
-    let builder = Builder::new(docker, chunk_store).with_oci(oci);
+    let mut builder = Builder::new(docker, chunk_store).with_oci(oci);
+    // Default is the host's arch (Builder::host); only override when the
+    // operator asked for a cross-arch bake.
+    if let Some(platform) = harness_platform {
+        builder = builder.with_harness_platform(platform);
+    }
     let outcome = builder
         .build(&req)
         .await

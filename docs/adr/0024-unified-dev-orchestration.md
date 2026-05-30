@@ -101,9 +101,16 @@ the same `just bake-demo` works on macOS/VZ and the Linux dev-vm. For local dev,
 
 0. **This ADR** (Proposed → Accepted at the end).
 1. `deploy/dev/detect-backend.sh` — the single host-capability source of truth.
-2. arm64 built-in harness: `Platform::LinuxArm64`, build-request platform
-   selection, `engram-cli image build --harness-platform`, CI publishes both
-   arch tags.
+2. arm64 built-in harness: `Platform::LinuxArm64`, builder platform selection
+   (defaulting to host arch), `engram-cli image build --harness-platform`. The
+   dev loop builds the arm64 harness from source and publishes it to the local
+   registry (`bake-demo.sh` + catalog env override), so macOS/VZ works without
+   any GHCR change. **Follow-up:** publishing the arm64 tag to the *default*
+   GHCR catalog needs an arm runner or an aarch64-musl cross toolchain in CI
+   (today's CI only cross-compiles x86_64-musl); deferred so it doesn't risk the
+   finely-tuned `test-e2e-stack` lane. Until then a default-catalog arm64 bake
+   404s — same gap as before this ADR (arm64 didn't exist at all), and the dev
+   path never hits GHCR.
 3. Tilt as the one orchestrator: `tilt` into the flake devShell; `Tiltfile`
    collapses the `uname` ladder to one `detect-backend.sh` probe → concrete
    backend + topology, with the Linux host-agent run under `sudo -n

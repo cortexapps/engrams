@@ -427,6 +427,13 @@ pub struct Builder<D: DockerRunner, P: Ext4Packer = Mke2fsPacker> {
     /// `[harness] builtin = "..."`. Defaulted to
     /// [`BuiltinCatalog::default_catalog`]; tests can override.
     catalog: BuiltinCatalog,
+    /// Guest platform a built-in harness artifact is resolved for
+    /// (`harness-claude:<ver>-<platform>`). The harness runs inside the
+    /// guest, so this is the rootfs's arch, not the host's. Defaults to
+    /// [`Platform::host`] — correct for the dev bake recipes, which
+    /// cross-compile the rootfs for the host's own arch. Override with
+    /// [`Self::with_harness_platform`] for cross-arch bakes.
+    harness_platform: Platform,
 }
 
 impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
@@ -447,6 +454,7 @@ impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
             // unset and falls through to the GHCR repos hardcoded in
             // `default_catalog`. See `with_overrides_from_env`.
             catalog: BuiltinCatalog::default_catalog().with_overrides_from_env(),
+            harness_platform: Platform::host(),
         }
     }
 }
@@ -461,6 +469,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             chunk_store,
             oci: None,
             catalog: BuiltinCatalog::default_catalog(),
+            harness_platform: Platform::host(),
         }
     }
 
@@ -478,6 +487,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     /// uses [`BuiltinCatalog::default_catalog`] (wired by `Builder::new`).
     pub fn with_catalog(mut self, catalog: BuiltinCatalog) -> Self {
         self.catalog = catalog;
+        self
+    }
+
+    /// Override the guest platform built-in harness artifacts are
+    /// resolved for. Defaults to [`Platform::host`]; the bake recipes
+    /// set this from the detected backend's guest arch (e.g. `--harness-
+    /// platform linux-arm64` for a VZ image). Returns `self` so it
+    /// composes with the other `with_*` builders.
+    pub fn with_harness_platform(mut self, platform: Platform) -> Self {
+        self.harness_platform = platform;
         self
     }
 
@@ -614,7 +633,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                     oci,
                     &self.catalog,
                     &source_harness,
-                    harness::Platform::LinuxX86_64,
+                    self.harness_platform,
                 )
                 .await?;
                 effective_manifest.harness = Some(resolved);
