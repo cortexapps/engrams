@@ -83,7 +83,7 @@ pub async fn enable_image(
     // ADR 0016 Phase C commit 3a: stamp the bake's ManifestRef on
     // the row so the GC pin-set can read it back without re-pulling
     // bundle.json from OCI on every sweep. `None` for harness-only.
-    row.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
+    row.disk_manifest = materialize_disk_chunks(&state, &req.image_uri, &artifacts).await?;
     // ADR 0020 P1: an image is not enabled unless its per-image base
     // snapshot was captured + recorded. This blocks on a host-side
     // capture; on failure we return before writing the enabled_images
@@ -142,7 +142,7 @@ pub async fn refresh_enabled_image(
     refreshed.created_at = existing.created_at;
     refreshed.updated_at = Some(Utc::now());
 
-    refreshed.disk_manifest = materialize_disk_chunks(&state, &artifacts).await?;
+    refreshed.disk_manifest = materialize_disk_chunks(&state, &req.image_uri, &artifacts).await?;
     // ADR 0020 P1: a moved tag is new content — capture a fresh base
     // snapshot for the new digest before the refreshed row goes live.
     let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
@@ -250,7 +250,7 @@ async fn fetch_and_seal_manifest(
     let artifacts = state
         .services
         .oci
-        .pull_template_artifacts(image_uri)
+        .pull_template_metadata(image_uri)
         .await
         .map_err(|e| {
             ApiError::BadRequest(format!(
@@ -306,16 +306,17 @@ async fn fetch_and_seal_manifest(
 /// `Manifest` at the disk `ManifestRef`. Hosts' prefetch loop reads
 /// from BlobStorage; nothing else feeds it.
 ///
-/// Bundle without disk chunks (`disk_bootstrap_json` / `disk_chunks_blob`
-/// both `None`) is silently accepted — that's the harness-builder
-/// pattern (bake produced just a manifest layer).
+/// Bundle without disk chunks (`disk_bootstrap_json` /
+/// `disk_chunks_blob_digest` both `None`) is silently accepted — that's
+/// the harness-builder pattern (bake produced just a manifest layer).
 async fn materialize_disk_chunks(
     state: &SharedState,
+    image_uri: &str,
     artifacts: &engram_oci::TemplateArtifacts,
 ) -> Result<Option<engram_core::types::manifest::ManifestRef>, ApiError> {
-    let (Some(boot), Some(blob_bytes), Some(bundle_json)) = (
+    let (Some(boot), Some(blob_digest), Some(bundle_json)) = (
         artifacts.disk_bootstrap_json.as_deref(),
-        artifacts.disk_chunks_blob.as_deref(),
+        artifacts.disk_chunks_blob_digest.as_deref(),
         artifacts.bundle_json.as_deref(),
     ) else {
         // Harness-only image: no chunked-disk artifact to materialize,
@@ -339,13 +340,18 @@ async fn materialize_disk_chunks(
                 .into(),
         )
     })?;
+    let source = ChunkSource::OciRange {
+        oci: state.services.oci.as_ref(),
+        image_uri,
+        blob_digest,
+    };
     let (wrote, deduped) = materialize_chunk_blob(
         state.services.blob.as_ref(),
         &state.services.chunk_store,
         manifest_ref,
         &bootstrap,
         &manifest,
-        blob_bytes,
+        &source,
     )
     .await?;
     tracing::info!(
@@ -550,12 +556,71 @@ fn parse_disk_manifest_ref(
     serde_json::from_value(field).ok()
 }
 
-/// Push a chunk-blob into BlobStorage at the content-addressed key
-/// for each chunk in `bootstrap`, plus the reconstructed `Manifest`
-/// at `manifest_ref`. Content-addressing means chunks present from
-/// a prior bake are skipped — only genuinely new bytes hit the wire.
-/// Bounded-parallel exists+put fans out so the materialization isn't
-/// a thousand-deep sequential round-trip.
+/// Where `materialize_chunk_blob` reads each chunk's bytes from.
+///
+/// `Slice` keeps the whole blob in memory (tests / small artifacts).
+/// `OciRange` Range-GETs each chunk from the registry on demand, so the
+/// coord never holds more than `CONCURRENCY` chunks at once — the bound
+/// that stops a multi-GiB image from OOM-killing the coord on enable.
+enum ChunkSource<'a> {
+    /// In-memory blob — only the materialize unit test constructs this;
+    /// prod always uses `OciRange`.
+    #[cfg(test)]
+    Slice(&'a [u8]),
+    OciRange {
+        oci: &'a engram_oci::OciClient,
+        image_uri: &'a str,
+        blob_digest: &'a str,
+    },
+}
+
+impl ChunkSource<'_> {
+    async fn fetch(
+        &self,
+        entry: &engram_chunk_store::BootstrapEntry,
+    ) -> Result<bytes::Bytes, ApiError> {
+        // `*self` copies the Copy ref-fields out (they're all `&_`), so
+        // the OciRange arm gets `&str`/`&OciClient` rather than the
+        // double-refs match-ergonomics would bind on `match self`.
+        match *self {
+            #[cfg(test)]
+            ChunkSource::Slice(blob) => {
+                let start = entry.blob_offset as usize;
+                let end = start
+                    .checked_add(entry.length as usize)
+                    .ok_or_else(|| ApiError::Internal("chunk offset+length overflow".into()))?;
+                if end > blob.len() {
+                    return Err(ApiError::Internal(format!(
+                        "chunks blob too short for entry {}: end={end}, blob_len={}",
+                        entry.sha256,
+                        blob.len()
+                    )));
+                }
+                Ok(bytes::Bytes::copy_from_slice(&blob[start..end]))
+            }
+            ChunkSource::OciRange {
+                oci,
+                image_uri,
+                blob_digest,
+            } => oci
+                .fetch_blob_range(
+                    image_uri,
+                    blob_digest,
+                    entry.blob_offset,
+                    entry.length as u64,
+                )
+                .await
+                .map_err(|e| ApiError::Internal(format!("fetch chunk {}: {e}", entry.sha256))),
+        }
+    }
+}
+
+/// Push a chunk-blob into BlobStorage at the content-addressed key for
+/// each chunk in `bootstrap`, plus the reconstructed `Manifest` at
+/// `manifest_ref`. Content-addressing means chunks already present (a
+/// prior bake / re-enable) are skipped — and with an `OciRange` source
+/// they aren't even fetched. Bounded-parallel exists?-fetch-put keeps
+/// the wire busy without a thousand-deep sequential round-trip.
 ///
 /// Returns (wrote, deduped) chunk counts.
 async fn materialize_chunk_blob(
@@ -564,53 +629,45 @@ async fn materialize_chunk_blob(
     manifest_ref: engram_core::types::manifest::ManifestRef,
     bootstrap: &engram_chunk_store::Bootstrap,
     manifest: &engram_chunk_store::Manifest,
-    chunks_blob: &[u8],
+    source: &ChunkSource<'_>,
 ) -> Result<(usize, usize), ApiError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut tasks = FuturesUnordered::new();
-    // GCS is comfortable with high concurrency on a single bucket
-    // (documented at 5k writes/sec/bucket once you spread keys).
-    let concurrency = 64;
+    // Cap in-flight chunks: with an OciRange source each task holds a
+    // freshly-downloaded chunk (~chunk_size) until its put completes, so
+    // peak memory is ~CONCURRENCY × chunk_size. That bound is the whole
+    // point — it's what keeps a multi-GiB enable from OOM-killing the
+    // coord. GCS easily sustains this fan-out (5k writes/sec/bucket).
+    const CONCURRENCY: usize = 16;
     let mut iter = bootstrap.entries.iter();
     let mut written = 0usize;
     let mut deduped = 0usize;
 
     async fn process_one(
         blob: &dyn engram_core::traits::BlobStorage,
+        source: &ChunkSource<'_>,
         entry: engram_chunk_store::BootstrapEntry,
-        chunks_blob_slice: bytes::Bytes,
     ) -> Result<bool, ApiError> {
         let key = entry.sha256.storage_key();
-        match blob.exists(&key).await {
-            Ok(true) => Ok(false),
-            Ok(false) => {
-                blob.put(&key, chunks_blob_slice)
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("put chunk {}: {e}", entry.sha256)))?;
-                Ok(true)
-            }
-            Err(e) => Err(ApiError::Internal(format!(
-                "exists probe {}: {e}",
-                entry.sha256
-            ))),
+        // Content-addressed: a chunk already in BlobStorage is skipped,
+        // and (OciRange) never fetched.
+        if blob
+            .exists(&key)
+            .await
+            .map_err(|e| ApiError::Internal(format!("exists probe {}: {e}", entry.sha256)))?
+        {
+            return Ok(false);
         }
+        let bytes = source.fetch(&entry).await?;
+        blob.put(&key, bytes)
+            .await
+            .map_err(|e| ApiError::Internal(format!("put chunk {}: {e}", entry.sha256)))?;
+        Ok(true)
     }
 
-    for _ in 0..concurrency {
+    for _ in 0..CONCURRENCY {
         if let Some(entry) = iter.next() {
-            let start = entry.blob_offset as usize;
-            let end = start
-                .checked_add(entry.length as usize)
-                .ok_or_else(|| ApiError::Internal("chunk offset+length overflow".into()))?;
-            if end > chunks_blob.len() {
-                return Err(ApiError::Internal(format!(
-                    "chunks blob too short for entry {}: end={end}, blob_len={}",
-                    entry.sha256,
-                    chunks_blob.len()
-                )));
-            }
-            let slice = bytes::Bytes::copy_from_slice(&chunks_blob[start..end]);
-            tasks.push(process_one(blob, entry.clone(), slice));
+            tasks.push(process_one(blob, source, entry.clone()));
         }
     }
     while let Some(res) = tasks.next().await {
@@ -619,10 +676,7 @@ async fn materialize_chunk_blob(
             false => deduped += 1,
         }
         if let Some(entry) = iter.next() {
-            let start = entry.blob_offset as usize;
-            let end = start + entry.length as usize;
-            let slice = bytes::Bytes::copy_from_slice(&chunks_blob[start..end]);
-            tasks.push(process_one(blob, entry.clone(), slice));
+            tasks.push(process_one(blob, source, entry.clone()));
         }
     }
 
@@ -712,7 +766,7 @@ mod tests {
             manifest_ref,
             &bootstrap,
             &manifest,
-            &chunks_blob,
+            &ChunkSource::Slice(&chunks_blob),
         )
         .await
         .expect("materialize");
@@ -743,7 +797,7 @@ mod tests {
             manifest_ref,
             &bootstrap,
             &manifest,
-            &chunks_blob,
+            &ChunkSource::Slice(&chunks_blob),
         )
         .await
         .expect("materialize again");

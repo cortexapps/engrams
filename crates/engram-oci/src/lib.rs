@@ -353,53 +353,58 @@ impl OciClient {
         })
     }
 
-    /// ADR 0014 M1.11: pull every engram-canonical layer of the
-    /// artifact at `uri` and return them in memory. Used by the
-    /// coord's `enable_image` to materialize the artifact into the
-    /// deployment's BlobStorage at canonical keys — once that lands,
-    /// host-agents read everything by key, the bake's environment
-    /// doesn't need to share a blob backend with prod, and the OCI
-    /// artifact stays the portable unit of distribution.
+    /// ADR 0014 M1.11 / ADR 0007: pull the *metadata* layers of the
+    /// engram artifact at `uri` — manifest, bundle, disk-bootstrap (all
+    /// small) — into memory, and record the disk-chunks layer's OCI
+    /// digest **without downloading it**. The coord's `enable_image`
+    /// materializer then Range-GETs each chunk it actually needs via
+    /// [`OciClient::fetch_blob_range`], so the coord's RAM stays bounded
+    /// regardless of rootfs size — mirroring what `pull_image` /
+    /// `OciChunkResolver` already do on the host.
     ///
-    /// Differs from `pull_image` in that the chunk-blob layers are
-    /// returned in-memory (caller wants the bytes to slice them
-    /// into BlobStorage), and nothing is written to disk. For a
-    /// typical demo image the total is a few hundred MiB — fine
-    /// for the coord's RAM. For multi-GiB rootfses we'd switch to
-    /// a streaming variant later.
-    pub async fn pull_template_artifacts(&self, uri: &str) -> Result<TemplateArtifacts, OciError> {
+    /// This replaces an earlier variant that pulled the whole chunk blob
+    /// into memory ("fine for a demo image; we'd stream multi-GiB ones
+    /// later"): a 7.6 GiB dogfood image OOM-killed the 2 GiB coord pod
+    /// during enable. This is that streaming variant.
+    pub async fn pull_template_metadata(&self, uri: &str) -> Result<TemplateArtifacts, OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
         let client = Self::client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
-        let accepted = vec![
-            ENGRAM_MANIFEST_MEDIA_TYPE,
-            ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
-            ENGRAM_BUNDLE_MEDIA_TYPE,
-            ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
-            ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
-            OCI_IMAGE_MEDIA_TYPE,
-        ];
-        let data = client
-            .pull(&reference, &auth, accepted)
+        // Manifest only — layer descriptors, no bodies. This also
+        // populates the client's token cache so the per-layer pulls
+        // below (and the materializer's later Range GETs) authenticate.
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
             .await
-            .map_err(|e| OciError::Distribution(e.to_string()))?;
+            .map_err(|e| OciError::Distribution(format!("pull manifest for {uri}: {e}")))?;
 
         let mut out = TemplateArtifacts {
-            manifest_digest: Digest256(data.digest.unwrap_or_default()),
+            manifest_digest: Digest256(manifest_digest),
             manifest_toml: Vec::new(),
             bundle_json: None,
             disk_bootstrap_json: None,
-            disk_chunks_blob: None,
+            disk_chunks_blob_digest: None,
         };
-        for layer in data.layers {
-            match layer.media_type.as_str() {
-                ENGRAM_MANIFEST_MEDIA_TYPE => out.manifest_toml = layer.data,
-                ENGRAM_BUNDLE_MEDIA_TYPE => out.bundle_json = Some(layer.data),
-                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE => out.disk_bootstrap_json = Some(layer.data),
-                ENGRAM_CHUNKS_DISK_MEDIA_TYPE => out.disk_chunks_blob = Some(layer.data),
+        for desc in &manifest.layers {
+            match desc.media_type.as_str() {
+                ENGRAM_MANIFEST_MEDIA_TYPE => {
+                    out.manifest_toml = pull_layer_to_vec(&client, &reference, desc).await?;
+                }
+                ENGRAM_BUNDLE_MEDIA_TYPE => {
+                    out.bundle_json = Some(pull_layer_to_vec(&client, &reference, desc).await?);
+                }
+                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE => {
+                    out.disk_bootstrap_json =
+                        Some(pull_layer_to_vec(&client, &reference, desc).await?);
+                }
+                // The big one: record its digest, never download the bytes.
+                // `enable_image` Range-GETs chunks via `fetch_blob_range`.
+                ENGRAM_CHUNKS_DISK_MEDIA_TYPE => {
+                    out.disk_chunks_blob_digest = Some(desc.digest.clone());
+                }
                 _ => {}
             }
         }
@@ -660,18 +665,24 @@ pub struct EngramMetadataLayers {
     pub bundle_json: Option<Vec<u8>>,
 }
 
-/// ADR 0014 M1.11: full in-memory view of an engram OCI artifact.
-/// Returned by `OciClient::pull_template_artifacts` and consumed by
-/// the coord's `enable_image` materializer. Field set parallels
-/// `PulledImage` minus the disk paths; chunk-blob layers are
-/// `Some` only when the bake actually emitted them.
+/// ADR 0014 M1.11: the metadata view of an engram OCI artifact, consumed
+/// by the coord's `enable_image` materializer. The small layers (manifest
+/// / bundle / disk-bootstrap) are pulled into memory; the potentially
+/// multi-GiB disk-chunks layer is **not** — we record only its OCI digest
+/// and the materializer Range-GETs each chunk it actually needs (mirroring
+/// the host's `pull_image` / `OciChunkResolver`). That keeps the coord's
+/// RAM bounded regardless of image size — without it, enabling a large
+/// image OOM-kills the coord pod.
 #[derive(Clone, Debug)]
 pub struct TemplateArtifacts {
     pub manifest_toml: Vec<u8>,
     pub manifest_digest: Digest256,
     pub bundle_json: Option<Vec<u8>>,
     pub disk_bootstrap_json: Option<Vec<u8>>,
-    pub disk_chunks_blob: Option<Vec<u8>>,
+    /// OCI digest (`sha256:<hex>`) of the disk-chunks layer — `Some` when
+    /// the bake emitted chunked-disk layers. The blob is never pulled
+    /// whole; `fetch_blob_range` reads per-chunk slices on demand.
+    pub disk_chunks_blob_digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -806,6 +817,30 @@ async fn tar_gz_dir(dir: &Path) -> Result<Vec<u8>, OciError> {
     .await
     .map_err(|e| OciError::Distribution(format!("join error: {e}")))?
     .map_err(OciError::Io)
+}
+
+/// Pull one (small) OCI layer fully into a Vec. Used only for the
+/// metadata layers in `pull_template_metadata` — never the multi-GiB
+/// chunk blob, which is Range-GETted per-chunk instead.
+async fn pull_layer_to_vec(
+    client: &Client,
+    reference: &Reference,
+    desc: &oci_client::manifest::OciDescriptor,
+) -> Result<Vec<u8>, OciError> {
+    use futures::TryStreamExt;
+    let stream = client
+        .pull_blob_stream(reference, desc)
+        .await
+        .map_err(|e| OciError::Distribution(format!("pull layer {}: {e}", desc.digest)))?;
+    let parts: Vec<Bytes> = stream
+        .try_collect()
+        .await
+        .map_err(|e| OciError::Distribution(format!("read layer {}: {e}", desc.digest)))?;
+    let mut buf = Vec::with_capacity(desc.size.max(0) as usize);
+    for p in parts {
+        buf.extend_from_slice(&p);
+    }
+    Ok(buf)
 }
 
 async fn untar_gz_to_dir(bytes: &[u8], dest: &Path) -> Result<(), OciError> {
