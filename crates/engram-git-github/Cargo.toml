@@ -1,0 +1,30 @@
+[package]
+name = "engram-git-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GitHub App GitForge: mints scoped installation tokens and opens pull requests."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+jsonwebtoken = "9"
+parking_lot.workspace = true
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = "0.6"
+# Generate a throwaway RSA key at test time rather than committing a
+# private-key fixture (keeps PEM material out of git history).
+rsa = "0.9"
+rand = "0.8"
