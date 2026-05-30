@@ -466,6 +466,138 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
     api::router(state)
 }
 
+/// ADR 0023: build a router with a configured (mock) git forge + a
+/// seeded session whose credential-broker token is `broker-tok-123`.
+/// Returns the router, the session id, and the forge handle (so tests
+/// can assert recorded change requests).
+async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::StaticGitForge>) {
+    let meta = Arc::new(MockMetadataStore::new());
+    let session_id = meta
+        .create_session(engram_core::types::session::SessionSpec {
+            image: "cortexapps/engrams:warm-bootstrap".to_string(),
+            mode: Default::default(),
+            user_id: None,
+        })
+        .await
+        .expect("seed session");
+    let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
+    let forge = Arc::new(engram_git_dev::StaticGitForge::github("ghs_test_xyz"));
+    let services = Services {
+        meta,
+        cloud: Arc::new(MockCloud::new()),
+        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
+            ProcessBackend::new(sandbox_dir),
+        ))),
+        secrets: Arc::new(InMemorySecretStore::new()),
+        kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+            [0u8; 32], "test:v1",
+        )),
+        oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+            engram_oci::AnonymousResolver,
+        ))),
+        auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+        blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+            std::env::temp_dir().join("engram-blobs-test"),
+        )),
+        chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+            engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            ),
+        )),
+        host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+        materialize_dir: None,
+    };
+    let cfg = CoordinatorConfig {
+        default_image_version: "warm-bootstrap".into(),
+        ..CoordinatorConfig::default()
+    };
+    let mut app = AppState::new(cfg, services);
+    app.forge = Some(forge.clone());
+    let state = Arc::new(app);
+    state
+        .git_broker_tokens
+        .insert(session_id, "broker-tok-123".to_string());
+    (api::router(state), session_id, forge)
+}
+
+#[tokio::test]
+async fn forge_git_credential_gated_by_broker_token() {
+    let (app, sid, _forge) = build_forge_app().await;
+    let uri = format!("/sessions/{sid}/git-credential");
+
+    // No token → 401.
+    let resp = app
+        .clone()
+        .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong token → 401.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(&uri)
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Valid broker token → 200 + the minted credential.
+    let resp = app
+        .oneshot(
+            Request::get(&uri)
+                .header("authorization", "Bearer broker-tok-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(v["username"], "x-access-token");
+    assert_eq!(v["password"], "ghs_test_xyz");
+}
+
+#[tokio::test]
+async fn forge_create_pull_request_opens_and_records() {
+    let (app, sid, forge) = build_forge_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/sessions/{sid}/pull-request"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer broker-tok-123")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "repo": "cortexapps/engrams",
+                        "head_branch": "feat/x",
+                        "base_branch": "main",
+                        "title": "Add x",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp.into_body()).await;
+    assert!(
+        v["url"].as_str().unwrap().contains("cortexapps/engrams"),
+        "unexpected PR url: {v:?}"
+    );
+
+    let recorded = forge.recorded_pull_requests();
+    assert_eq!(recorded.len(), 1, "forge should have recorded one PR");
+    assert_eq!(recorded[0].0.to_string(), "cortexapps/engrams");
+    assert_eq!(recorded[0].1.title, "Add x");
+}
+
 /// Test fixture exposing the meta store so individual tests can
 /// populate images / secrets before exercising the API. The default
 /// `build_app` discards the handle (most tests don't care).

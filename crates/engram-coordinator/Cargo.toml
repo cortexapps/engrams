@@ -73,6 +73,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 [dev-dependencies]
 engram-harness-proto.workspace = true
 engram-secrets-dev.workspace = true
+engram-git-dev.workspace = true
 futures = { workspace = true }
 http-body-util = "0.1"
 parking_lot.workspace = true

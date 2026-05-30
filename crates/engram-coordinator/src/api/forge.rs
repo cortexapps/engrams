@@ -177,3 +177,30 @@ pub async fn create_pull_request(
         state: pr.state,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header::AUTHORIZATION, HeaderValue};
+
+    #[test]
+    fn bearer_extracts_only_bearer_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer tok123"));
+        assert_eq!(bearer(&h).as_deref(), Some("tok123"));
+
+        assert!(bearer(&HeaderMap::new()).is_none());
+
+        let mut basic = HeaderMap::new();
+        basic.insert(AUTHORIZATION, HeaderValue::from_static("Basic tok123"));
+        assert!(bearer(&basic).is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_compares_exactly() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b"secres"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+    }
+}
