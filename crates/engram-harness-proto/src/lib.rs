@@ -247,6 +247,68 @@ pub struct ShutdownAck {
     pub message: Option<String>,
 }
 
+// ---- Forge bridge (ADR 0023) -------------------------------------------
+//
+// A *separate* guest→host channel from the harness one above: the
+// in-guest `GIT_ASKPASS` / `engram-pr` helpers dial the host on
+// `FORGE_VSOCK_PORT`, send one [`ForgeRequest`], read one
+// [`ForgeResponse`], and close. The host validates the per-session
+// broker token, forwards to the coordinator's `GitForge`, and replies.
+// Same 4-byte-length + bincode framing (`read_msg`/`write_msg`).
+
+/// Vsock port the in-guest forge helper dials (guest→host). Distinct
+/// from the harness channel (1026), agentd exec (1024), and agentd
+/// ready (1027) ports so the host can demux at accept time.
+pub const FORGE_VSOCK_PORT: u32 = 1028;
+
+/// One-shot request from an in-guest forge helper to the host.
+/// Authenticated by the per-session credential-broker token (injected
+/// into the guest as `ENGRAM_FORGE_TOKEN`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeRequest {
+    pub session_id: SessionId,
+    pub broker_token: String,
+    pub op: ForgeOp,
+}
+
+/// The forge operation requested. Mirrors the coord's HTTP forge
+/// endpoints so the vsock bridge and the loopback path share semantics.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ForgeOp {
+    /// Mint a fresh git credential for `host` (optionally scoping the
+    /// installation to `owner`). The reply is [`ForgeResponse::Credential`].
+    FetchCredential { host: String, owner: Option<String> },
+    /// Open a change request (PR/MR). The reply is
+    /// [`ForgeResponse::PullRequest`].
+    CreatePullRequest {
+        repo: String,
+        head_branch: String,
+        base_branch: String,
+        title: String,
+        body: String,
+        draft: bool,
+    },
+}
+
+/// The host's reply to a [`ForgeRequest`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ForgeResponse {
+    Credential {
+        username: String,
+        password: String,
+    },
+    PullRequest {
+        url: String,
+        id: u64,
+        state: String,
+    },
+    /// Auth failure, unknown session, no forge configured, or a
+    /// provider error — `message` is safe to surface to the guest.
+    Error {
+        message: String,
+    },
+}
+
 // ---- Framing -----------------------------------------------------------
 
 /// Read one length-prefixed bincode frame. Mirrors
@@ -384,6 +446,42 @@ mod tests {
         round_trip(HarnessFrame::Command(HarnessCommand::Prompt {
             text: "do the thing".into(),
         }));
+    }
+
+    #[test]
+    fn forge_request_response_round_trip() {
+        round_trip(ForgeRequest {
+            session_id: SessionId::new(),
+            broker_token: "tok".into(),
+            op: ForgeOp::FetchCredential {
+                host: "github.com".into(),
+                owner: Some("cortexapps".into()),
+            },
+        });
+        round_trip(ForgeRequest {
+            session_id: SessionId::new(),
+            broker_token: "tok".into(),
+            op: ForgeOp::CreatePullRequest {
+                repo: "cortexapps/engrams".into(),
+                head_branch: "feat/x".into(),
+                base_branch: "main".into(),
+                title: "Add x".into(),
+                body: String::new(),
+                draft: false,
+            },
+        });
+        round_trip(ForgeResponse::Credential {
+            username: "x-access-token".into(),
+            password: "ghs_x".into(),
+        });
+        round_trip(ForgeResponse::PullRequest {
+            url: "https://github.com/cortexapps/engrams/pull/1".into(),
+            id: 1,
+            state: "open".into(),
+        });
+        round_trip(ForgeResponse::Error {
+            message: "nope".into(),
+        });
     }
 
     #[test]

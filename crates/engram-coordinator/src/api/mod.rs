@@ -9,7 +9,7 @@ pub mod auth;
 mod enabled_images;
 mod events;
 mod exec;
-mod forge;
+pub(crate) mod forge;
 // ADR 0021 P1.5a retired `mod harnesses;` — the harness_packs
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).

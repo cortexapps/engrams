@@ -23,7 +23,7 @@
 use async_trait::async_trait;
 
 use crate::error::SandboxError;
-use crate::traits::sandbox::{HarnessDial, HarnessSink};
+use crate::traits::sandbox::{ForgeSink, HarnessDial, HarnessSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
@@ -215,6 +215,12 @@ pub trait HostClient: Send + Sync {
     /// local sink internally, and the closure (capturing coord-side
     /// state) wouldn't serialize anyway.
     fn set_harness_sink(&self, _sink: HarnessSink) {}
+
+    /// ADR 0023: register a forge sink on this host's local backend.
+    /// Same in-process-only semantics as [`set_harness_sink`](Self::set_harness_sink)
+    /// — `LocalHostClient` forwards to its inner `SandboxBackend`;
+    /// remote impls no-op.
+    fn set_forge_sink(&self, _sink: ForgeSink) {}
 
     /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
     /// `None` if this host doesn't have a chunk-tracked view of

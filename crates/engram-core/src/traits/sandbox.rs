@@ -34,6 +34,14 @@ pub type HarnessByteStream = Pin<Box<dyn HarnessByteStreamObj + Send + Unpin + '
 /// `Fn` (not `FnOnce`) so a single sink handles many connections.
 pub type HarnessSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 
+/// ADR 0023: handler for inbound in-guest forge connections (one
+/// stream per guest dial on `FORGE_VSOCK_PORT`). Same shape as
+/// [`HarnessSink`] but a separate channel — the host reads a
+/// `ForgeRequest`, validates the broker token, and replies. FC wires
+/// this through its vsock UDS; `ProcessBackend` doesn't need it (its
+/// in-guest helper hits the coord's HTTP forge endpoint on loopback).
+pub type ForgeSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
+
 /// VM lifecycle seam. Production implementation: `engram-sandbox-firecracker`
 /// (Firecracker over its HTTP-over-Unix-socket API). Dev implementation:
 /// `engram-sandbox-process` (host subprocesses, no isolation).
@@ -90,6 +98,12 @@ pub trait SandboxBackend: Send + Sync {
     /// backends shouldn't expect multiple sinks. Pass before any
     /// session-create call so the first dial isn't dropped.
     fn set_harness_sink(&self, _sink: HarnessSink) {}
+
+    /// ADR 0023: register a sink for inbound in-guest forge connections
+    /// (one stream per guest dial on `FORGE_VSOCK_PORT`). Mirrors
+    /// [`set_harness_sink`](Self::set_harness_sink); default no-op
+    /// (`ProcessBackend` uses the coord's HTTP forge endpoint instead).
+    fn set_forge_sink(&self, _sink: ForgeSink) {}
 
     /// Push per-session egress policy to the backend. The
     /// coordinator calls this after `create_for_session` returns,

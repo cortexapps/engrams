@@ -216,6 +216,10 @@ impl HostClient for LocalHostClient {
         self.sandbox.set_harness_sink(sink);
     }
 
+    fn set_forge_sink(&self, sink: engram_core::traits::ForgeSink) {
+        self.sandbox.set_forge_sink(sink);
+    }
+
     async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
         Ok(self.sandbox.cow_state(id).await)
     }

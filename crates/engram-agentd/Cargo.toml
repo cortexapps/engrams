@@ -19,6 +19,10 @@ path = "src/main.rs"
 [dependencies]
 bincode.workspace = true
 engram-transport.workspace = true
+# ADR 0023: forge wire types (ForgeRequest/Response, FORGE_VSOCK_PORT) +
+# SessionId for the in-guest `forge-*` client subcommands.
+engram-harness-proto.workspace = true
+engram-core.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

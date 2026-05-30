@@ -813,6 +813,13 @@ impl HostClient for HostRegistry {
             entry.value().backend.set_harness_sink(sink.clone());
         }
     }
+
+    fn set_forge_sink(&self, sink: engram_core::traits::ForgeSink) {
+        // Fan out to every registered host, same as `set_harness_sink`.
+        for entry in self.hosts.iter() {
+            entry.value().backend.set_forge_sink(sink.clone());
+        }
+    }
 }
 
 #[cfg(test)]

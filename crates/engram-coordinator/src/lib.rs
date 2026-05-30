@@ -284,6 +284,21 @@ pub async fn run_with_registry_and_local(
         state.services.host.set_harness_sink(sink);
     }
 
+    // ADR 0023: register a ForgeSink so per-VM forge vsock dials are
+    // served by the coord's GitForge (Firecracker path). ProcessBackend's
+    // default no-op is fine — its in-guest helper hits the HTTP forge
+    // endpoint on loopback.
+    {
+        let forge_state = state.clone();
+        let sink: engram_core::traits::ForgeSink = std::sync::Arc::new(move |stream| {
+            let st = forge_state.clone();
+            tokio::spawn(async move {
+                crate::api::forge::handle_vsock_connection(st, stream).await;
+            });
+        });
+        state.services.host.set_forge_sink(sink);
+    }
+
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
         .await

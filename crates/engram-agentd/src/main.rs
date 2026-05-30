@@ -26,6 +26,19 @@ use std::process::ExitCode;
 use engram_agentd::serve_connection;
 
 fn main() -> ExitCode {
+    // ADR 0023: in-guest forge client mode. `engram-agentd
+    // forge-credential` (GIT_ASKPASS) / `forge-pull-request` (engram-pr)
+    // dial the host's forge vsock port and exit, rather than running the
+    // exec server. Intercept before telemetry/runtime setup.
+    {
+        let mut argv = std::env::args().skip(1);
+        if let Some(sub) = argv.next() {
+            if sub == "forge-credential" || sub == "forge-pull-request" {
+                return engram_agentd::forge::run(&sub, argv.collect());
+            }
+        }
+    }
+
     // ADR 0019: the host injects the OTLP collector endpoint + parent trace
     // context into the kernel cmdline on cold boot (BootSource.boot_args).
     // Adopt the endpoint into the env *before* telemetry init so the guest

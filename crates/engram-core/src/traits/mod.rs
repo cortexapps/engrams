@@ -27,6 +27,6 @@ pub use host_client::HostClient;
 pub use metadata::{
     DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, StaleSessionLease, UpdateOutcome,
 };
-pub use sandbox::{HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend};
+pub use sandbox::{ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend};
 pub use secrets::{ResolvedSecret, SecretBundle, SecretContext, SecretStore};
 pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};

@@ -15,6 +15,7 @@
 //! `main.rs` ties them together with a CLI for the in-guest binary.
 
 pub mod cacerts;
+pub mod forge;
 pub mod handler;
 pub mod harness_supervisor;
 pub mod proto;

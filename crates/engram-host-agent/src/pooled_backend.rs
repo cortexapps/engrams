@@ -2041,6 +2041,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.set_harness_sink(sink);
     }
 
+    fn set_forge_sink(&self, sink: engram_core::traits::ForgeSink) {
+        self.inner.set_forge_sink(sink);
+    }
+
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
         let sandbox_id = policy.sandbox_id;
         let session_id = policy.session_id;
