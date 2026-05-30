@@ -602,15 +602,47 @@ impl ChunkSource<'_> {
                 oci,
                 image_uri,
                 blob_digest,
-            } => oci
-                .fetch_blob_range(
-                    image_uri,
-                    blob_digest,
-                    entry.blob_offset,
-                    entry.length as u64,
-                )
-                .await
-                .map_err(|e| ApiError::Internal(format!("fetch chunk {}: {e}", entry.sha256))),
+            } => {
+                // Streaming does one Range GET per chunk, so a single
+                // transient registry hiccup (connection reset / partial
+                // body — "error decoding response body") would otherwise
+                // fail the whole enable. Retry with backoff; the old
+                // whole-blob pull only had one request to get wrong.
+                const MAX_ATTEMPTS: u32 = 5;
+                let mut attempt = 1u32;
+                loop {
+                    match oci
+                        .fetch_blob_range(
+                            image_uri,
+                            blob_digest,
+                            entry.blob_offset,
+                            entry.length as u64,
+                        )
+                        .await
+                    {
+                        Ok(b) => break Ok(b),
+                        Err(e) if attempt < MAX_ATTEMPTS => {
+                            tracing::warn!(
+                                chunk = %entry.sha256,
+                                attempt,
+                                error = %e,
+                                "chunk Range GET failed; retrying with backoff"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                200 * attempt as u64,
+                            ))
+                            .await;
+                            attempt += 1;
+                        }
+                        Err(e) => {
+                            break Err(ApiError::Internal(format!(
+                                "fetch chunk {} after {attempt} attempts: {e}",
+                                entry.sha256
+                            )))
+                        }
+                    }
+                }
+            }
         }
     }
 }
