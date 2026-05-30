@@ -1422,4 +1422,7 @@ jobs:
       - name: Tear down stack
         if: always()
         run: |
+          # `tilt down` re-evaluates the Tiltfile, which fail()s if the
+          # FC kernel env isn't set (only the bring-up step exported it).
+          export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
           bash deploy/dev/tilt-down-ci.sh || true

@@ -306,22 +306,31 @@ local_resource('coordinator',
 # (or `tilt up`); the env flag adds host-agent-b.
 two_hosts = env_or('ENGRAM_INTEG_TWO_HOSTS', '') in ('1', 'true', 'yes')
 
-def _split_nbd():
-    # Two host-agents on one box need disjoint NBD device sets (FC rootfs
-    # page-in binds /dev/nbdN). VZ doesn't use NBD; single-host lets the
-    # agent auto-discover (return None => leave ENGRAM_NBD_DEVICES unset,
-    # preserving today's behavior).
-    if not two_hosts or sandbox_backend != 'firecracker':
-        return (None, None)
+def _discover_nbd():
+    # FC serves the chunked rootfs over /dev/nbdN. The host-agent only
+    # takes the chunked-NBD path (which produces the chunked disk +
+    # memory manifests that `POST /api/enabled-images` REQUIRES — it
+    # 500s on a base snapshot built via the materialize-to-file
+    # fallback) when ENGRAM_NBD_DEVICES is set, so discover the host's
+    # devices and pass them, exactly as the old integration-up.sh did.
+    # VZ/macOS don't use NBD.
+    if sandbox_backend != 'firecracker':
+        return []
     listing = str(local("ls -1 /dev/nbd* 2>/dev/null || true",
                         echo_off=True, quiet=True)).strip()
-    devs = [d for d in listing.split('\n') if d]
-    if not devs:
-        return (None, None)
-    half = max(1, len(devs) // 2)
-    return (','.join(devs[:half]), ','.join(devs[half:]))
+    return [d for d in listing.split('\n') if d]
 
-nbd_a, nbd_b = _split_nbd()
+_nbd = _discover_nbd()
+if two_hosts and len(_nbd) >= 2:
+    # Two host-agents on one box need disjoint device sets.
+    _half = max(1, len(_nbd) // 2)
+    nbd_a = ','.join(_nbd[:_half])
+    nbd_b = ','.join(_nbd[_half:])
+else:
+    nbd_a = ','.join(_nbd)  # single host gets all discovered devices ('' if none)
+    nbd_b = None
+if sandbox_backend == 'firecracker':
+    print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
 
 def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
     env = {
