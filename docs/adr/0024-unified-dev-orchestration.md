@@ -1,13 +1,48 @@
 # ADR 0024: One dev orchestrator, one switch-free interface
 
-Status: 2026-05-30 — **Proposed.** The local-dev story has drifted into two
-parallel orchestrators that express the *same* prod-shape service map, and the
-backend/arch switch has leaked all the way up into the operator interface
-(`justfile` + `Tiltfile`). This ADR collapses both onto a single switch-free
-interface — `just dev` everywhere — and pushes the host-capability decision down
-into one orchestration-layer probe. Nothing here touches the substrate's latency
-work (ADRs 0019–0022) or the product plane (ADR 0023); it is purely about how a
+Status: 2026-05-30 — **Accepted.** Shipped on PR #49 (branch
+`worktree-unified-dev-orchestration`), full CI green incl. the ported
+`test-e2e-stack` lane. The local-dev story had drifted into two parallel
+orchestrators expressing the *same* prod-shape service map, with the backend/arch
+switch leaked all the way up into the operator interface (`justfile` + `Tiltfile`).
+This ADR collapsed both onto a single switch-free interface — `just dev`
+everywhere — and pushed the host-capability decision down into one
+orchestration-layer probe. Nothing here touches the substrate's latency work
+(ADRs 0019–0022) or the product plane (ADR 0023); it is purely about how a
 developer spins the stack up.
+
+**Commit chain.** `8f569d6` (this ADR, Proposed) → `d47c8bd` (detect-backend.sh)
+→ `45e1934` (arm64 harness `Platform`) → `4821657` (Tiltfile probe → backend +
+topology; tilt in the flake) → `e138090` (switch-free justfile: dev / bake-demo /
+pull-kernel) → `e591f14` (ENGRAM_SKIP_WEB) → `30f27cb` (CI e2e via tilt) →
+`50db82e` (two-host Tiltfile support; retire integration-{up,down,reset}.sh) →
+`da49a07` (README + dev-vm docs) → `d521a7e` (grep/pipefail guard in the CI
+host-wait) → `640670a` (set ENGRAM_NBD_DEVICES single-host; CI teardown kernel env).
+
+**Divergences / findings vs the proposal.**
+- **Two-host support landed in the Tiltfile** (`ENGRAM_INTEG_TWO_HOSTS=1 just dev`
+  → `host-agent-b`) before retiring `integration-up.sh`, so the ADR-0018 M4 evac
+  harness kept working — no e2e coverage dropped.
+- **The CI port backgrounds `tilt up`, not `tilt ci`.** `tilt ci` tears down its
+  `serve_cmd` children on exit (verified on the dev-vm), so it can't host the
+  stack for a separate test step; `tilt-up-ci.sh` backgrounds `tilt up --stream`
+  and waits for readiness instead.
+- **arm64 built-in-harness GHCR publish is deferred** (CI only cross-compiles
+  x86_64-musl today); the dev loop builds the arm64 harness from source and
+  publishes it to the local registry, so macOS/VZ works without GHCR. A
+  default-catalog arm64 bake 404s until an arm runner / cross toolchain lands.
+- **Two CI-port bugs the iteration surfaced:** the host-registration poll aborted
+  on `set -e` + `pipefail` when `grep` found no host yet (fixed with the
+  `{ grep || true; }` guard `integration-up.sh` already used); and a single-host
+  host-agent with `ENGRAM_NBD_DEVICES` unset fell back to materialize-to-file,
+  yielding a base snapshot without the chunked manifests `enable-images` requires
+  (500). Both are the kind of lore `integration-up.sh` had accreted — re-encoded
+  in the Tiltfile / CI scripts.
+
+**Follow-ups (tracked, not blocking):** publish the arm64 harness artifact from CI
+(needs an arm runner or aarch64-musl cross toolchain); fold the per-backend
+`docs/demo-*.md` runbooks into the one `just dev` story (README + `docs/dev-vm.md`
+already updated).
 
 ## Context
 
