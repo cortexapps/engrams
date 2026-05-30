@@ -4,7 +4,7 @@
 # "session survives a host loss without manual intervention."
 #
 # Preconditions:
-#   - `ENGRAM_INTEG_TWO_HOSTS=1 just integration-up` is running.
+#   - `ENGRAM_INTEG_TWO_HOSTS=1 just dev` is running (adds host-agent-b).
 #   - A baked demo image exists (ghcr.io/cortex/demo:warm-1 or the
 #     equivalent ENGRAM_E2E_IMAGE_URI).
 #
@@ -42,7 +42,7 @@ note "checking host count (expect ≥ 2 for evac to actually relocate)"
 HOSTS_JSON=$(curl -fsS "$COORD_URL/api/hosts")
 HOST_COUNT=$(echo "$HOSTS_JSON" | grep -o '"hostname"' | wc -l | tr -d ' ')
 if [ "$HOST_COUNT" -lt 2 ]; then
-    die "only $HOST_COUNT host(s) registered. Restart integration-up.sh with ENGRAM_INTEG_TWO_HOSTS=1."
+    die "only $HOST_COUNT host(s) registered. Restart with ENGRAM_INTEG_TWO_HOSTS=1 just dev."
 fi
 ok "$HOST_COUNT hosts registered"
 

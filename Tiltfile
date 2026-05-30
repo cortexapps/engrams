@@ -300,22 +300,42 @@ local_resource('coordinator',
 # (ADR 0024) — only `process` collapses to coord-only mode=all.
 # ----------------------------------------------------------------
 
-if dev_split:
-    host_agent_env = {
+# ADR 0018 M4: ENGRAM_INTEG_TWO_HOSTS=1 launches a SECOND host-agent so
+# coord sees a 2-host cluster — the alive-source evac path has somewhere
+# to relocate onto. From the operator's side it's still just `just dev`
+# (or `tilt up`); the env flag adds host-agent-b.
+two_hosts = env_or('ENGRAM_INTEG_TWO_HOSTS', '') in ('1', 'true', 'yes')
+
+def _split_nbd():
+    # Two host-agents on one box need disjoint NBD device sets (FC rootfs
+    # page-in binds /dev/nbdN). VZ doesn't use NBD; single-host lets the
+    # agent auto-discover (return None => leave ENGRAM_NBD_DEVICES unset,
+    # preserving today's behavior).
+    if not two_hosts or sandbox_backend != 'firecracker':
+        return (None, None)
+    listing = str(local("ls -1 /dev/nbd* 2>/dev/null || true",
+                        echo_off=True, quiet=True)).strip()
+    devs = [d for d in listing.split('\n') if d]
+    if not devs:
+        return (None, None)
+    half = max(1, len(devs) // 2)
+    return (','.join(devs[:half]), ','.join(devs[half:]))
+
+nbd_a, nbd_b = _split_nbd()
+
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
+    env = {
         # Same per-image kernel as the coord-side mode=all path uses.
         kernel_key: kernel_path,
-        'ENGRAM_SANDBOX_WORK_DIR': './var/host-sandboxes',
+        'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
-        # gRPC plumbing — coord dials this address (advertise) and
-        # the host-agent listens on the bind addr. Same machine in
-        # dev, so loopback works for both.
-        'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:9101',
-        'ENGRAM_GRPC_ADVERTISE_ADDR': 'http://127.0.0.1:9101',
-        # Coord HTTP — host-agent register/heartbeat target.
+        # gRPC plumbing — coord dials advertise, host-agent listens on
+        # bind. Same machine in dev, so loopback works for both.
+        'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,
+        'ENGRAM_GRPC_ADVERTISE_ADDR': 'http://127.0.0.1:' + grpc_port,
         'ENGRAM_COORDINATOR_ENDPOINT': 'http://127.0.0.1:8090',
         # Same GCS backend the coord uses, so chunks materialized
-        # coord-side are reachable from the host-agent's
-        # PooledBackend at runtime.
+        # coord-side are reachable from the PooledBackend at runtime.
         'ENGRAM_BLOB_BACKEND': 'gcs',
         'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
         'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
@@ -323,36 +343,37 @@ if dev_split:
         # enable. CI sets it (Blacksmith doesn't NAT FC TAP traffic, so
         # guests route via the proxy); local dev relies on host masquerade.
         'ENGRAM_EGRESS_PROXY_PORT': env_or('ENGRAM_EGRESS_PROXY_PORT', '0'),
+        'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
         'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
         'RUST_LOG': 'info,engram=debug',
     }
+    if nbd_csv:
+        env['ENGRAM_NBD_DEVICES'] = nbd_csv
     if 'Darwin' in uname_str:
-        host_agent_env['PATH'] = (
-            '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
-        )
+        env['PATH'] = '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
     else:
         # Linux: the host-agent runs under sudo (below), which scrubs
         # PATH to a secure default. Preserve the caller's PATH so it
         # still finds firecracker / ip / iptables / mke2fs.
-        host_agent_env['PATH'] = os.environ.get('PATH', '')
+        env['PATH'] = os.environ.get('PATH', '')
 
-    # How to produce + launch the host-agent binary:
+    # How to produce + launch the binary:
     #   • bin_dir set (CI): exec the prebuilt release binary, no compile.
     #   • else: cargo build, then launch the debug binary.
     if bin_dir:
         ha_bin = bin_dir + '/engram-host-agent'
-        ha_build_prefix = ''
+        build_prefix = ''
     else:
         ha_bin = './target/debug/engram-host-agent'
-        ha_build_prefix = 'cargo build -p engram-host-agent && '
+        build_prefix = 'cargo build -p engram-host-agent && '
 
     if needs_codesign:
         # VZ (macOS): the binary needs the virtualization entitlement;
         # codesign after build, before exec. No sudo on macOS.
-        host_agent_serve_cmd = (
-            ha_build_prefix +
+        serve_cmd = (
+            build_prefix +
             ('bash crates/engram-sandbox-vz/scripts/codesign.sh debug && '
              if not bin_dir else '') +
             'exec ' + ha_bin
@@ -363,27 +384,32 @@ if dev_split:
         # scrubs the environment, so preserve exactly the keys Tilt
         # injected (--preserve-env). Needs a NOPASSWD sudoers entry on
         # the box (the dev-vm skill's bootstrap-remote installs one).
-        preserve = ','.join(host_agent_env.keys())
-        host_agent_serve_cmd = (
-            ha_build_prefix +
+        preserve = ','.join(env.keys())
+        serve_cmd = (
+            build_prefix +
             'exec sudo -n --preserve-env=' + preserve + ' ' + ha_bin
         )
 
-    local_resource('host-agent',
-        serve_cmd=host_agent_serve_cmd,
-        serve_env=host_agent_env,
+    local_resource(name,
+        serve_cmd=serve_cmd,
+        serve_env=env,
         resource_deps=['coordinator'],
         readiness_probe=probe(
             period_secs=30,
             timeout_secs=2,
-            tcp_socket=tcp_socket_action(port=9101),
+            tcp_socket=tcp_socket_action(port=int(grpc_port)),
         ),
         links=[
-            link('http://127.0.0.1:9100/metrics', 'metrics'),
+            link('http://127.0.0.1:' + metrics_port + '/metrics', 'metrics'),
         ],
         labels=['app'],
         trigger_mode=TRIGGER_MODE_MANUAL,
         auto_init=True)
+
+if dev_split:
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a)
+    if two_hosts:
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b)
 
 # ----------------------------------------------------------------
 # Web SPA (vite dev server).

@@ -79,8 +79,8 @@ registry-down:
 # Bring up Jaeger for ADR 0019 cold-boot tracing. UI at
 # http://localhost:16686; OTLP/gRPC collector on :4317. Export
 # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 to make the
-# binaries emit spans (`just dev` / `just integration-up` set it for
-# you). Works the same on macOS and the Linux dev-vm.
+# binaries emit spans (`just dev` sets it for you). Works the same on
+# macOS and the Linux dev-vm.
 trace-up:
     docker compose -f deploy/docker-compose.dev.yml up -d jaeger
     @echo "Jaeger UI → http://localhost:16686  (OTLP/gRPC on :4317)"
@@ -163,56 +163,22 @@ pull-kernel:
     bash deploy/dev/pull-kernel.sh
 
 # ------------------------------------------------------------------
-# `just integration-up` — prod-shape stack without Tilt.
-#
-# Designed for the dev VM, which has docker + just but not Tilt.
-# Brings up:
-#   • postgres (compose)
-#   • fake-gcs-server (compose)
-#   • local OCI registry (compose)
-#   • KEK + GCS bucket seed (one-shot)
-#   • coordinator in `mode=coordinator` (background, logs in
-#     ./var/integration/coord.log)
-#   • engram-host-agent dialing the coordinator (background,
-#     logs in ./var/integration/host-agent.log)
-#
-# Once everything is up, run `just integration-test` to exercise
-# the bake → enable → host-prefetch → session-create loop end-to-end
-# against the local stack. `just integration-down` stops the
-# processes and the compose services.
-#
-# Linux-only (Firecracker requires KVM); the rig assumes a kernel
-# artifact in $HOME/.cache/engram-fc-test/. Run the fetch script
-# (crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)
-# if you don't have one.
+# Smoke / e2e helpers — run against a stack brought up by `just dev`
+# (ADR 0024 retired the standalone `integration-up.sh`; the prod-shape
+# stack is now just `just dev`, on the dev-vm typically inside tmux).
 # ------------------------------------------------------------------
-integration-up:
-    bash deploy/dev/integration-up.sh
 
-# Stop the integration stack. Kills the background coord +
-# host-agent processes, stops docker compose services. Volumes
-# stay (db, gcs bucket) so re-running picks up state.
-integration-down:
-    bash deploy/dev/integration-down.sh
-
-# Hard-reset the integration stack: kills processes, drops compose
-# volumes (postgres + fake-gcs + registry), wipes ./var dirs. After
-# this, run `just integration-up`.
-integration-reset:
-    bash deploy/dev/integration-reset.sh
-
-# Smoke-test the full bake → enable → host-prefetch → session
-# flow against the local integration stack. Times each step.
-# Run after `just integration-up`.
+# Smoke-test the full bake → enable → host-prefetch → session flow
+# against the running stack. Times each step. Run after `just dev`.
 integration-test:
     bash deploy/dev/integration-test.sh
 
 # ADR 0018 M4 e2e evacuation test. Run after
-# `ENGRAM_INTEG_TWO_HOSTS=1 just integration-up`. Creates a session,
-# writes a deterministic disk canary, evacuates via the admin
-# endpoint, asserts the session reaches Active on a different host
-# with the disk contents preserved. The gold-standard "M4 actually
-# works" check.
+# `ENGRAM_INTEG_TWO_HOSTS=1 just dev` (which adds a second host-agent so
+# coord sees a 2-host cluster). Creates a session, writes a deterministic
+# disk canary, evacuates via the admin endpoint, asserts the session
+# reaches Active on a different host with the disk contents preserved.
+# The gold-standard "M4 actually works" check.
 integration-evac-test:
     bash deploy/dev/integration-evac-test.sh
 
