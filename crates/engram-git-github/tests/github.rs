@@ -33,7 +33,7 @@ fn repo() -> RepoRef {
 
 async fn mount_installation(server: &MockServer, times: u64) {
     Mock::given(method("GET"))
-        .and(path("/repos/cortexapps/engrams/installation"))
+        .and(path("/orgs/cortexapps/installation"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 42 })))
         .expect(times)
         .mount(server)
@@ -64,11 +64,17 @@ async fn mints_and_caches_installation_token() {
         .unwrap()
         .with_base_url(server.uri());
 
-    let t1 = app.mint_repo_token(&repo()).await.unwrap();
+    let t1 = app
+        .mint_installation_token(Some("cortexapps"))
+        .await
+        .unwrap();
     assert_eq!(t1.username, "x-access-token");
     assert_eq!(t1.password, "ghs_abc123");
 
-    let t2 = app.mint_repo_token(&repo()).await.unwrap();
+    let t2 = app
+        .mint_installation_token(Some("cortexapps"))
+        .await
+        .unwrap();
     assert_eq!(t2.password, "ghs_abc123");
 }
 

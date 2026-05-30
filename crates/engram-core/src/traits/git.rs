@@ -4,8 +4,9 @@
 //! coordinator, holds the long-lived provider credential (e.g. a GitHub
 //! App private key), and exposes two provider-agnostic operations:
 //!
-//! 1. [`GitForge::mint_repo_token`] — mint a short-lived, repo-scoped
-//!    credential. The coordinator hands this to an in-session
+//! 1. [`GitForge::mint_installation_token`] — mint a short-lived
+//!    installation credential, valid across every repo the install can
+//!    access (not one repo). The coordinator hands this to an in-session
 //!    `GIT_ASKPASS` helper on demand (ADR 0023's forge seam), so the
 //!    sandbox never stores a durable secret and token expiry is
 //!    invisible in-guest.
@@ -73,11 +74,12 @@ impl std::fmt::Display for RepoRef {
     }
 }
 
-/// A short-lived credential for git operations against one repo. For a
-/// GitHub App installation token this is
-/// `("x-access-token", "ghs_…")`; the `GIT_ASKPASS` helper presents
-/// `password` to git. `expires_at` is advisory for the coordinator's
-/// own caching — the guest never sees it (it fetches fresh per op).
+/// A short-lived credential for git operations. For a GitHub App
+/// installation token this is `("x-access-token", "ghs_…")`, valid for
+/// **every repo the installation can access** (not one repo); the
+/// `GIT_ASKPASS` helper presents `password` to git. `expires_at` is
+/// advisory for the coordinator's own caching — the guest never sees it
+/// (it fetches fresh per op).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScopedToken {
     pub username: String,
@@ -113,15 +115,22 @@ pub struct PullRequest {
 
 #[async_trait]
 pub trait GitForge: Send + Sync {
-    /// Mint a short-lived credential scoped to `repo`. Called on demand
-    /// by the in-session forge seam; never injected at session create.
-    /// Impls should cache + lazily refresh (provider tokens are
-    /// typically ~1h).
-    async fn mint_repo_token(&self, repo: &RepoRef) -> Result<ScopedToken, GitForgeError>;
+    /// Mint a short-lived credential for the forge **installation** —
+    /// valid across every repo that installation can access, not a
+    /// single repo. `owner` selects the installation when the app spans
+    /// several orgs/users; `None` uses the app's sole installation
+    /// (impls error if that's ambiguous). Called on demand by the
+    /// in-session forge seam; never injected at session create. Impls
+    /// cache + lazily refresh (provider tokens are typically ~1h).
+    async fn mint_installation_token(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<ScopedToken, GitForgeError>;
 
-    /// Open a change request against `repo`. The impl maps the neutral
-    /// [`PullRequestSpec`] onto the provider's API and authenticates
-    /// with its own credential.
+    /// Open a change request against `repo` (any repo the installation
+    /// can access — the agent picks it per call). The impl maps the
+    /// neutral [`PullRequestSpec`] onto the provider's API and
+    /// authenticates with its own credential.
     async fn create_pull_request(
         &self,
         repo: &RepoRef,

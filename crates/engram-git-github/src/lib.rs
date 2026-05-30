@@ -90,20 +90,72 @@ impl GitHubApp {
             .map_err(|e| GitForgeError::Unauthorized(format!("sign app JWT: {e}")))
     }
 
-    async fn installation_id(&self, repo: &RepoRef) -> Result<u64, GitForgeError> {
-        let slug = repo.to_string();
-        if let Some(id) = self.installations.lock().get(&slug).copied() {
+    /// Resolve the installation id for `owner` (org first, then user),
+    /// or the app's sole installation when `owner` is `None`. Cached by
+    /// owner key (`""` for the default).
+    async fn installation_id(&self, owner: Option<&str>) -> Result<u64, GitForgeError> {
+        let key = owner.unwrap_or("").to_string();
+        if let Some(id) = self.installations.lock().get(&key).copied() {
             return Ok(id);
         }
         let jwt = self.app_jwt()?;
-        let url = format!(
-            "{}/repos/{}/{}/installation",
-            self.base_url, repo.owner, repo.name
-        );
+        let id = match owner {
+            // Org installs are the common case; fall back to a user
+            // install on 404.
+            Some(o) => match self
+                .get_installation_id(&jwt, &format!("{}/orgs/{}/installation", self.base_url, o))
+                .await
+            {
+                Ok(id) => id,
+                Err(GitForgeError::NotFound(_)) => {
+                    self.get_installation_id(
+                        &jwt,
+                        &format!("{}/users/{}/installation", self.base_url, o),
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            },
+            None => {
+                let url = format!("{}/app/installations", self.base_url);
+                let resp = self
+                    .http
+                    .get(&url)
+                    .bearer_auth(&jwt)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .send()
+                    .await
+                    .map_err(|e| GitForgeError::Backend(Box::new(e)))?;
+                let resp = ensure_ok(resp, "list installations").await?;
+                #[derive(Deserialize)]
+                struct Inst {
+                    id: u64,
+                }
+                let insts: Vec<Inst> = resp
+                    .json()
+                    .await
+                    .map_err(|e| GitForgeError::Protocol(format!("installations json: {e}")))?;
+                match insts.as_slice() {
+                    [one] => one.id,
+                    [] => return Err(GitForgeError::NotFound("app has no installations".into())),
+                    _ => {
+                        return Err(GitForgeError::InvalidSpec(
+                            "app spans multiple installations; specify an owner".into(),
+                        ))
+                    }
+                }
+            }
+        };
+        self.installations.lock().insert(key, id);
+        Ok(id)
+    }
+
+    async fn get_installation_id(&self, jwt: &str, url: &str) -> Result<u64, GitForgeError> {
         let resp = self
             .http
-            .get(&url)
-            .bearer_auth(&jwt)
+            .get(url)
+            .bearer_auth(jwt)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
             .send()
@@ -118,26 +170,30 @@ impl GitHubApp {
             .json()
             .await
             .map_err(|e| GitForgeError::Protocol(format!("installation json: {e}")))?;
-        self.installations.lock().insert(slug, inst.id);
         Ok(inst.id)
     }
 }
 
 #[async_trait]
 impl GitForge for GitHubApp {
-    async fn mint_repo_token(&self, repo: &RepoRef) -> Result<ScopedToken, GitForgeError> {
-        let slug = repo.to_string();
+    async fn mint_installation_token(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<ScopedToken, GitForgeError> {
+        let key = owner.unwrap_or("").to_string();
         // Serve from cache while comfortably inside the validity window.
-        if let Some(tok) = self.tokens.lock().get(&slug) {
+        if let Some(tok) = self.tokens.lock().get(&key) {
             if tok.expires_at > Utc::now() + Duration::minutes(5) {
                 return Ok(tok.clone());
             }
         }
-        let id = self.installation_id(repo).await?;
+        let id = self.installation_id(owner).await?;
         let jwt = self.app_jwt()?;
         let url = format!("{}/app/installations/{}/access_tokens", self.base_url, id);
+        // No `repositories` restriction: the token covers every repo the
+        // installation can access, so one credential works across repos
+        // (ADR 0023). GitHub still enforces the installation boundary.
         let body = serde_json::json!({
-            "repositories": [repo.name],
             "permissions": { "contents": "write", "pull_requests": "write" },
         });
         let resp = self
@@ -165,7 +221,7 @@ impl GitForge for GitHubApp {
             password: tr.token,
             expires_at: tr.expires_at,
         };
-        self.tokens.lock().insert(slug, scoped.clone());
+        self.tokens.lock().insert(key, scoped.clone());
         Ok(scoped)
     }
 
@@ -174,7 +230,7 @@ impl GitForge for GitHubApp {
         repo: &RepoRef,
         pr: &PullRequestSpec,
     ) -> Result<PullRequest, GitForgeError> {
-        let token = self.mint_repo_token(repo).await?;
+        let token = self.mint_installation_token(Some(&repo.owner)).await?;
         let url = format!("{}/repos/{}/{}/pulls", self.base_url, repo.owner, repo.name);
         let body = serde_json::json!({
             "title": pr.title,

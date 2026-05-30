@@ -50,7 +50,10 @@ impl StaticGitForge {
 
 #[async_trait]
 impl GitForge for StaticGitForge {
-    async fn mint_repo_token(&self, _repo: &RepoRef) -> Result<ScopedToken, GitForgeError> {
+    async fn mint_installation_token(
+        &self,
+        _owner: Option<&str>,
+    ) -> Result<ScopedToken, GitForgeError> {
         Ok(ScopedToken {
             username: "x-access-token".to_string(),
             password: self.token.clone(),
@@ -88,8 +91,7 @@ mod tests {
     #[tokio::test]
     async fn mints_the_configured_token() {
         let forge = StaticGitForge::github("ghs_test");
-        let repo = RepoRef::parse("cortexapps/engrams").unwrap();
-        let tok = forge.mint_repo_token(&repo).await.unwrap();
+        let tok = forge.mint_installation_token(None).await.unwrap();
         assert_eq!(tok.username, "x-access-token");
         assert_eq!(tok.password, "ghs_test");
         assert!(tok.expires_at > Utc::now());
