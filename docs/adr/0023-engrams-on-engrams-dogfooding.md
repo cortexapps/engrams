@@ -5,8 +5,9 @@ ADR opens the *product* plane: the surfaces that turn engrams from a sandbox orc
 a product an org actually drives — git handoff, integrations (Slack/Linear), identity — and
 the dev loop where we build those surfaces by **running agents inside engrams sessions**. P1
 (scoped below) is the first slice: a guarded non-FC backend, a provider-agnostic `GitForge`,
-an in-session forge seam, and a skills delivery engine. Later phases are designed here but
-deferred. Nothing in this ADR touches the substrate's latency wins.
+an in-session forge seam, and the built-in `create-pull-request` skill (the dynamic,
+centrally-managed skills platform is designed here for a later phase). Later phases are
+designed here but deferred. Nothing in this ADR touches the substrate's latency wins.
 
 ## Context
 
@@ -112,18 +113,24 @@ client. Skills generalize into the **universal delivery vehicle** for every plat
 capability (PR now; `post-to-slack` / `comment-on-linear` later) — each integration ships as a
 skill over a seam, not bespoke wiring.
 
-Delivery is a **per-session read-only mount** at `~/.agents/skills/` (harness-agnostic; the
-harness adapter points the harness's loader there). Performance constraint, learned from ADR
-0021 (which baked the harness into templates to kill per-session boot cost): unlike the
-harness — a *stateful process* whose multi-second readiness had to be captured in the warm
-snapshot — skills are *passive files*, so the mount is single-digit-ms and can sit **off the
-time-to-ready path**. To keep it a pure local attach (no boot-path fetch), the **full skill
-set is continuously synced onto each host** (a host-agent background task, like image
-prefetch). Semantics are **fixed-at-boot**: a session uses the skills present when it boots;
-there is **no mid-session hot-add** (a skill added after a session starts is simply
-unavailable to it — by design, to avoid live re-scan complexity). On FC the mount mirrors the
-existing harness drive (attach RO device + mount + resume re-anchor, ADR 0018 §12p); on
-ProcessBackend it is a materialized directory.
+**Phase 1 bakes the built-in skill into the image's rootfs** at `~/.agents/skills/` (the Claude
+loader dir is symlinked at it). This is the simplest delivery that works on *both* backends
+with **no per-backend mount code** — it's just files in the rootfs, present on FC (the booted
+rootfs) and on ProcessBackend (the materialized rootfs) alike — it's ADR-0021-consistent (a
+static built-in rides the warm snapshot like the baked harness), and it adds **zero** boot
+cost or resume complexity. It unblocks the dogfood loop now.
+
+The **dynamic, per-session, RO-mounted, centrally-managed skills platform** — host-synced skill
+store + per-session RO mount + user uploads — is **deferred** (below). Worth recording *why* it
+isn't a quick "mount it" on FC: the per-session harness *drive* was **retired in ADR 0021 P1.5**
+(the harness moved into the rootfs), and Firecracker has **no virtiofs** (its device model is
+virtio-blk/net/vsock/rng/balloon only). So a per-session RO *mount* on FC necessarily means an
+**additional read-only virtio-blk drive** (`put_drive` with `is_read_only`) built from the
+host-synced store, mounted guest-side, and **re-anchored on resume** (the snapshot embeds the
+host path) — i.e. reviving the drive machinery 0021 removed. That's a sizable, FC-iterative
+feature deserving its own design, and it's only needed once skills are *dynamic*; static
+built-ins don't need it. Semantics when it lands: **fixed-at-boot** (a session uses the skills
+present when it boots; no mid-session hot-add).
 
 ## Phasing
 
@@ -134,16 +141,20 @@ ProcessBackend it is a materialized directory.
 3. `engram-git-github` (GitHub App: lazy-cached installation tokens + create-PR).
 4. In-session forge seam: coord API + per-session broker token + `[git]` manifest block + env
    injection, on both transports (ProcessBackend loopback; FC vsock bridge — the priority).
-5. Per-session RO skills-mount engine + host-side continuous sync + the built-in
-   `create-pull-request` skill.
+5. The built-in `create-pull-request` skill — `SKILL.md` + the `git-askpass` / `engram-pr`
+   forge-helper scripts — **baked into the dogfood image's rootfs** (works on both backends, no
+   per-backend mount code).
 6. A dogfood image (`deploy/dev-engrams`) + tests (ProcessBackend e2e in the default job; FC
-   bridge + skills-mount validated on the dev-vm and wired into the FC CI job).
+   forge bridge validated on the dev-vm).
 
 **Deferred (designed here, not built in P1).**
 
-- **User-uploaded skills**: a registry + upload API/UI, BlobStorage-backed skill zips, a PG
-  `skills` table with org enable/disable (mirroring `enabled_images`), and the trust boundary
-  — **user skills may only call already-exposed seams; they never add privileged platform
+- **Dynamic, centrally-managed skills platform**: the per-session RO-**mount** engine (a
+  host-synced content-addressed skill store + an FC additional read-only virtio-blk drive with
+  resume re-anchor — see §4 for why this revives 0021-retired drive machinery; ProcessBackend
+  materializes a dir), plus user uploads (registry + upload API/UI, BlobStorage-backed skill
+  zips, a PG `skills` table with org enable/disable mirroring `enabled_images`). Trust boundary:
+  **user skills may only call already-exposed seams; they never add privileged platform
   surface** (built-in skills may pair with new coord endpoints; uploaded zips may not). Skill
   scripts execute with the session's privileges (incl. the broker token), acceptable for
   single-org/trusted-tenant; multi-tenant wants skill signing/provenance.
@@ -168,29 +179,33 @@ ProcessBackend it is a materialized directory.
   the same shape rather than new architecture.
 - A new guest→host request type rides the harness vsock channel — the first guest-originated
   RPC; a real (if small) extension of that channel's contract.
-- The skills mount bifurcates per backend (FC drive vs ProcessBackend dir) and adds a
-  host-side sync task — manageable, modeled on existing prefetch/warm-pool tasks.
+- The built-in skill rides the rootfs (no per-backend mount code); the deferred dynamic-skills
+  mount engine will bifurcate per backend (FC RO virtio-blk drive vs ProcessBackend dir).
 - `ProcessBackend` as a runnable backend is a loaded footgun; the insecure-flag gate +
   banner are load-bearing and must stay.
 
 ## Open questions
 
-1. **Harness skill-scan timing.** The resident (snapshotted) harness must read the per-session
-   skills mount at session start (SpawnHarness). Confirm the Claude adapter scans skills at
-   session start, not only at baked process start; P1 explicitly does *not* build live re-scan.
-2. **FC skills-mount mechanism.** Mirror the harness drive (RO block device + mount + resume
-   re-anchor) vs a chunked overlay — confirm against ADR 0018 §12p during implementation.
-3. **Broker-token lifetime / revocation** across idle→resume and across coord pods (P1
+1. **Dynamic-skills delivery (deferred engine).** Baking the built-in skill into the rootfs
+   sidesteps both the FC mount mechanism (an additional RO virtio-blk drive + resume re-anchor,
+   reviving 0021-retired machinery) and the harness skill-scan-timing question (a baked skill is
+   present at the harness's snapshot-time scan). Both resurface when dynamic / user-uploaded
+   skills land — that phase must confirm the Claude adapter re-scans at session start, not only
+   at baked process start.
+2. **Broker-token lifetime / revocation** across idle→resume and across coord pods (P1
    in-memory map; PG-backed is the multi-pod follow-on).
-4. **Repo scoping** when the session's `[git]` repo differs from the image repo (P1 takes the
-   target repo from the manifest `[git]` block).
+3. **Multi-installation forge.** P1's credential endpoint uses the `[git] owner` (or the App's
+   sole installation). A forge App spanning several orgs needs per-request owner disambiguation
+   (the helper would pass the target owner) — fine to defer; one installation covers the
+   dogfood org.
 
 ## References
 
 - ADR 0001 (Track F.6: deferred `POST /sessions/:id/pr` + GitHub App), ADR 0005 (git retired
   as durability; kept as agent handoff), ADR 0018 §12p (harness-drive resume re-anchor — the
-  skills-mount template), ADR 0020/0021 (substrate residency + warm snapshots; the boot-cost
-  lesson), ADR 0022 (the substrate's next lever).
+  pattern a future dynamic-skills RO drive would revive), ADR 0021 P1.5 (retired the per-session
+  harness drive; baked it into the rootfs — the boot-cost lesson this ADR follows for skills),
+  ADR 0022 (the substrate's next lever).
 - Prior art: Coder external-auth (`GIT_ASKPASS`, server-held tokens), Gitpod `gp` credential
   helper, GitHub Codespaces (`gh` as credential helper), OpenHands (server-side token store +
   lazy refresh). GitHub App installation tokens: 1h, `POST /app/installations/{id}/access_tokens`.

@@ -1,0 +1,8 @@
+#!/bin/sh
+# ADR 0023 provider-agnostic change-request opener (dogfood image).
+#
+# Thin wrapper over the baked `engram-agentd forge-pull-request`
+# subcommand, which dials the host's forge vsock bridge → coordinator
+# GitForge. Flags: --repo owner/name --head <branch> [--base main]
+# --title <t> [--body <b>] [--draft]. Prints the created PR/MR URL.
+exec engram-agentd forge-pull-request "$@"
