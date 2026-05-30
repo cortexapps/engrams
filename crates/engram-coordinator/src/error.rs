@@ -27,6 +27,10 @@ pub enum ApiError {
     /// (resource exists in a state that rejects the op) and
     /// `Internal` (genuinely broken).
     Unavailable(String),
+    /// 401 — the caller's credential is missing or invalid. Used by the
+    /// ADR 0023 in-session forge endpoints, authenticated by the
+    /// per-session credential-broker token.
+    Unauthorized(String),
     Internal(String),
 }
 
@@ -45,6 +49,7 @@ impl ApiError {
             Self::Gone(_) | Self::HostLost(_) => StatusCode::GONE,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -58,6 +63,7 @@ impl ApiError {
             Self::HostLost(_) => "host_lost",
             Self::Unsupported(_) => "unsupported",
             Self::Unavailable(_) => "unavailable",
+            Self::Unauthorized(_) => "unauthorized",
             Self::Internal(_) => "internal",
         }
     }
@@ -71,6 +77,7 @@ impl ApiError {
             | Self::HostLost(m)
             | Self::Unsupported(m)
             | Self::Unavailable(m)
+            | Self::Unauthorized(m)
             | Self::Internal(m) => m,
         }
     }

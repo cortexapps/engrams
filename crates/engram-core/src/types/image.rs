@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::traits::ForgeKind;
+
 // ---------------------------------------------------------------------
 // ImageManifest — the per-image declarative spec.
 //
@@ -58,6 +60,37 @@ pub struct ImageManifest {
     /// See [`HarnessManifest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessManifest>,
+
+    /// Optional git forge binding (ADR 0023). When set, sessions of this
+    /// image get a per-session credential broker + the
+    /// `create-pull-request` capability for `provider`, reached via the
+    /// in-session forge seam. The minted credential works across *all*
+    /// repos the forge installation can access — repos are not pinned
+    /// here; PR targets are chosen per request. The coordinator must have
+    /// a matching `GitForge` configured (e.g. `--git-forge=github`); a
+    /// mismatch fails the forge request, not session create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitConfig>,
+}
+
+/// Git forge binding for an image (ADR 0023). Declares which forge a
+/// session talks to (and, optionally, which installation), so the
+/// coordinator can mint installation-scoped credentials. Deliberately
+/// does **not** pin a repo: one image / session commonly operates across
+/// several repos in an org, and a GitHub App installation token already
+/// spans every repo it can access.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitConfig {
+    /// Which forge: `github` today (later `gitlab` / `gitea`). Must match
+    /// the coordinator's configured `GitForge`.
+    pub provider: ForgeKind,
+    /// Optional installation owner (org/user) the credential targets.
+    /// The minted token works across *all* repos that installation can
+    /// access. Omit when the forge has a single installation (the common
+    /// case); set it to disambiguate a multi-org app.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// The harness baked into an image — both the source-authored `[harness]`
@@ -285,6 +318,46 @@ mod tests {
         assert!(m.secrets.is_empty());
         assert_eq!(m.secret_mode, SecretMode::Literal);
         assert_eq!(m.network.default, NetworkDefault::Deny);
+    }
+
+    #[test]
+    fn manifest_parses_git_block() {
+        // Minimal: just a provider (single-installation app).
+        let m: ImageManifest = toml::from_str(
+            r#"
+            name = "dev-engrams"
+            [git]
+            provider = "github"
+        "#,
+        )
+        .unwrap();
+        let g = m.git.expect("git block parsed");
+        assert_eq!(g.provider, ForgeKind::GitHub);
+        assert!(g.owner.is_none());
+
+        // Explicit installation owner.
+        let m2: ImageManifest = toml::from_str(
+            r#"
+            name = "dev-engrams"
+            [git]
+            provider = "github"
+            owner = "cortexapps"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(m2.git.unwrap().owner.as_deref(), Some("cortexapps"));
+
+        // `repo` is intentionally NOT a field — a stale `repo =` fails
+        // (deny_unknown_fields) so nobody accidentally pins one repo.
+        assert!(toml::from_str::<ImageManifest>(
+            r#"
+            name = "x"
+            [git]
+            provider = "github"
+            repo = "cortexapps/engrams"
+        "#
+        )
+        .is_err());
     }
 
     #[test]

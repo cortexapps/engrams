@@ -23,8 +23,9 @@ bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
+der = { version = "0.7", default-features = false, features = ["oid", "pem", "std"] }
 deranged = { version = "0.5", features = ["powerfmt", "serde"] }
-digest = { version = "0.10", features = ["mac", "std"] }
+digest = { version = "0.10", features = ["mac", "oid", "std"] }
 either = { version = "1", features = ["serde", "use_std"] }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -37,11 +38,13 @@ getrandom = { version = "0.2", default-features = false, features = ["std"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 idna = { version = "1" }
+lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
+num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }
+pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
 prost = { version = "0.13", features = ["prost-derive"] }
 rand = { version = "0.8", features = ["small_rng"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
@@ -57,6 +60,7 @@ sha2 = { version = "0.10" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
+spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "chrono", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono", "json", "migrate", "offline", "uuid"] }
 thiserror = { version = "2" }
@@ -82,7 +86,7 @@ bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
-digest = { version = "0.10", features = ["mac", "std"] }
+digest = { version = "0.10", features = ["mac", "oid", "std"] }
 either = { version = "1", features = ["serde", "use_std"] }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -93,7 +97,7 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom = { version = "0.2", default-features = false, features = ["std"] }
 idna = { version = "1" }
 log = { version = "0.4", default-features = false, features = ["std"] }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
+num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }
 prost = { version = "0.13", features = ["prost-derive"] }
@@ -113,6 +117,7 @@ sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki
 sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono", "json", "migrate", "offline", "uuid"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 thiserror = { version = "2" }
+time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -138,6 +143,7 @@ tower-http = { version = "0.6", features = ["cors", "follow-redirect", "trace"] 
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 memchr = { version = "2" }
 nom = { version = "7" }
@@ -158,6 +164,7 @@ tower-http = { version = "0.6", features = ["cors", "follow-redirect", "trace"] 
 
 [target.x86_64-unknown-linux-musl.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 memchr = { version = "2" }
 nom = { version = "7" }

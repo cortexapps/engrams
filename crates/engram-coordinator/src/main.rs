@@ -154,6 +154,25 @@ struct Cli {
     /// backend is selected.
     #[arg(long, env = "ENGRAM_GCP_PROJECT_ID")]
     gcp_project_id: Option<String>,
+
+    /// Git forge provider for the in-session forge seam (ADR 0023).
+    /// `none` (default) disables it; `github` enables the GitHub App
+    /// backend (requires `--github-app-id` + a private key).
+    #[arg(long, env = "ENGRAM_GIT_FORGE", default_value = "none")]
+    git_forge: String,
+
+    /// GitHub App ID (numeric, as a string) for `--git-forge=github`.
+    #[arg(long, env = "ENGRAM_GITHUB_APP_ID")]
+    github_app_id: Option<String>,
+
+    /// Path to the GitHub App private-key PEM for `--git-forge=github`.
+    #[arg(long, env = "ENGRAM_GITHUB_APP_PRIVATE_KEY_PATH")]
+    github_app_private_key_path: Option<PathBuf>,
+
+    /// GitHub App private-key PEM inline (e.g. piped from a secret
+    /// manager). Takes precedence over `--github-app-private-key-path`.
+    #[arg(long, env = "ENGRAM_GITHUB_APP_PRIVATE_KEY")]
+    github_app_private_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +194,43 @@ fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
         other => Err(format!(
             "unknown secrets backend `{other}` (expected env | gcp)"
         )),
+    }
+}
+
+/// ADR 0023: build the optional git forge authority from CLI flags.
+/// `none` → `None` (forge endpoints 501); `github` → a `GitHubApp`.
+fn build_forge(
+    cli: &Cli,
+) -> Result<Option<Arc<dyn engram_core::traits::GitForge>>, CoordinatorError> {
+    match cli.git_forge.as_str() {
+        "none" => Ok(None),
+        "github" => {
+            let app_id = cli.github_app_id.clone().ok_or_else(|| {
+                CoordinatorError::Config("--git-forge=github requires --github-app-id".into())
+            })?;
+            let pem = match (
+                &cli.github_app_private_key,
+                &cli.github_app_private_key_path,
+            ) {
+                (Some(pem), _) => pem.clone(),
+                (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+                    CoordinatorError::Config(format!("read github app key {}: {e}", path.display()))
+                })?,
+                (None, None) => {
+                    return Err(CoordinatorError::Config(
+                        "--git-forge=github requires --github-app-private-key or \
+                         --github-app-private-key-path"
+                            .into(),
+                    ))
+                }
+            };
+            let app = engram_git_github::GitHubApp::new(app_id, &pem)
+                .map_err(|e| CoordinatorError::Config(format!("github forge: {e}")))?;
+            Ok(Some(Arc::new(app)))
+        }
+        other => Err(CoordinatorError::Config(format!(
+            "invalid --git-forge `{other}` (expected none | github)"
+        ))),
     }
 }
 
@@ -470,116 +526,148 @@ async fn main() -> Result<(), CoordinatorError> {
                     ));
                 }
             }
-        };
-        // Wrap in PooledBackend so the chunked-OCI / image-cache /
-        // egress / chunk-store wiring is shared between `--mode=all`
-        // (single-binary dev) and production host-agents (which build
-        // the same wrapper in `engram-host-agent::lib::run`).
-        //
-        // The cache root lives under `<local_path>/oci-cache` so it
-        // doesn't collide with the legacy on-disk image registry tree.
-        // Reuses the OCI client built up-front (also shared with
-        // `/api/enabled-images`).
-        let oci_cache_root = cli.local_path.join("oci-cache");
-        let image_cache =
-            engram_host_agent::image_cache::ImageCache::open(oci_cache_root, (*oci_client).clone())
-                .await
-                .map_err(|e| CoordinatorError::Config(format!("oci cache: {e}")))?;
-        // ADR 0006: --mode=all gets a local HostEgress so the
-        // single-binary dev loop and the multi-host production
-        // topology share one egress code path. `egress_proxy_port=0`
-        // (default) skips it.
-        let host_egress = if cli.egress_proxy_port > 0 {
-            let dir = cli.local_path.join("egress-ca");
-            let source: Arc<dyn engram_egress_proxy::CaSource> =
-                Arc::new(engram_egress_proxy::LocalDiskCaSource::new(dir));
-            let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
-                .parse()
-                .expect("egress-proxy-port maps to a valid SocketAddr");
-            match engram_host_agent::egress::HostEgress::spawn(source, bind).await {
-                Ok(e) => Some(Arc::new(e)),
-                Err(e) => {
-                    tracing::error!(error = %e, "--mode=all egress proxy spawn failed; aborting");
-                    return Err(CoordinatorError::Config(format!("egress: {e}")));
+            // ADR 0023: dev-only, un-isolated ProcessBackend, gated
+            // behind ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND so it can't
+            // be selected by accident. Lets the product plane run
+            // without KVM (laptop, or inside an engrams session).
+            SandboxBackendChoice::Process => {
+                if std::env::var("ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND").as_deref() != Ok("1") {
+                    return Err(CoordinatorError::Config(
+                        "--sandbox-backend=process is DEV-ONLY and provides NO isolation; set \
+                         ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1 to acknowledge and enable it"
+                            .into(),
+                    ));
                 }
+                tracing::warn!(
+                    "⚠️  DEV-ONLY ProcessBackend: sessions run as un-isolated host subprocesses \
+                     (ADR 0023). NEVER use with untrusted input or in production."
+                );
+                Arc::new(engram_sandbox_process::ProcessBackend::new(
+                    cli.sandbox_work_dir.clone(),
+                )) as Arc<dyn SandboxBackend>
             }
+        };
+        // ProcessBackend has no chunk store / egress / materialize
+        // wiring — register it directly and skip the PooledBackend
+        // wrapper FC/VZ need. (ADR 0023)
+        let local_backend: Arc<dyn SandboxBackend> = if matches!(
+            cli.sandbox_backend,
+            SandboxBackendChoice::Process
+        ) {
+            raw_backend
         } else {
-            None
-        };
-        // ADR 0007: chunked-rootfs materialization root. In
-        // `--mode=all`, coordinator + host-agent share one process,
-        // so the chunk store wired into the PooledBackend uses the
-        // same `blob` Arc the coordinator's Services consumes.
-        // Multi-host deployments wire each host-agent's chunk store
-        // independently, pointing at the same backing bucket via env.
-        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
-        // The materialize dir lives at `<local_path>/chunked-rootfs/`
-        // — defined inside this block but ALSO consumed by the
-        // Services wiring outside it (so the admin orphan-reap
-        // endpoint knows the path). Pulled out below via the
-        // `coord_materialize_dir` binding.
-        let materialize_dir = cli.local_path.join("chunked-rootfs");
-        // ADR 0007 #3a: NVMe-backed chunk cache. Amortises repeat
-        // reads for chunks shared across manifests (canonical-base
-        // images, fork lineage). Budget defaults to 200 GiB; smaller
-        // hosts (dev VMs, lab boxes) override via
-        // `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`.
-        let chunk_cache = engram_chunk_store::ChunkCache::new(
-            engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
-                cli.local_path.join("chunk-cache"),
-            ),
-        );
-        // ADR 0007 Phase 4: optional NBD daemon for chunked
-        // rootfs. `ENGRAM_NBD_DEVICES` is a comma-separated list
-        // of `/dev/nbdN` paths the host-agent allocates from when
-        // serving sessions whose image bundle carries a
-        // `disk_manifest`. Empty / unset → fall back to the
-        // materialize-to-file path (still correct, just slower
-        // cold start). Production Packer images load
-        // `modprobe nbd nbds_max=64` and populate this env var to
-        // match.
-        let nbd_pool = match std::env::var("ENGRAM_NBD_DEVICES") {
-            Ok(s) if !s.trim().is_empty() => {
-                let paths: Vec<std::path::PathBuf> = s
-                    .split(',')
-                    .map(|p| p.trim())
-                    .filter(|p| !p.is_empty())
-                    .map(std::path::PathBuf::from)
-                    .collect();
-                match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
-                    Ok(pool) => {
-                        tracing::info!(
-                            slots = pool.capacity(),
-                            "NBD daemon enabled; chunked rootfs serves /dev/nbdN",
-                        );
-                        Some(pool)
-                    }
+            // Wrap in PooledBackend so the chunked-OCI / image-cache /
+            // egress / chunk-store wiring is shared between `--mode=all`
+            // (single-binary dev) and production host-agents (which build
+            // the same wrapper in `engram-host-agent::lib::run`).
+            //
+            // The cache root lives under `<local_path>/oci-cache` so it
+            // doesn't collide with the legacy on-disk image registry tree.
+            // Reuses the OCI client built up-front (also shared with
+            // `/api/enabled-images`).
+            let oci_cache_root = cli.local_path.join("oci-cache");
+            let image_cache = engram_host_agent::image_cache::ImageCache::open(
+                oci_cache_root,
+                (*oci_client).clone(),
+            )
+            .await
+            .map_err(|e| CoordinatorError::Config(format!("oci cache: {e}")))?;
+            // ADR 0006: --mode=all gets a local HostEgress so the
+            // single-binary dev loop and the multi-host production
+            // topology share one egress code path. `egress_proxy_port=0`
+            // (default) skips it.
+            let host_egress = if cli.egress_proxy_port > 0 {
+                let dir = cli.local_path.join("egress-ca");
+                let source: Arc<dyn engram_egress_proxy::CaSource> =
+                    Arc::new(engram_egress_proxy::LocalDiskCaSource::new(dir));
+                let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
+                    .parse()
+                    .expect("egress-proxy-port maps to a valid SocketAddr");
+                match engram_host_agent::egress::HostEgress::spawn(source, bind).await {
+                    Ok(e) => Some(Arc::new(e)),
                     Err(e) => {
-                        tracing::error!(error = %e, "ENGRAM_NBD_DEVICES misconfigured; aborting");
-                        std::process::exit(1);
+                        tracing::error!(error = %e, "--mode=all egress proxy spawn failed; aborting");
+                        return Err(CoordinatorError::Config(format!("egress: {e}")));
                     }
                 }
-            }
-            _ => None,
-        };
+            } else {
+                None
+            };
+            // ADR 0007: chunked-rootfs materialization root. In
+            // `--mode=all`, coordinator + host-agent share one process,
+            // so the chunk store wired into the PooledBackend uses the
+            // same `blob` Arc the coordinator's Services consumes.
+            // Multi-host deployments wire each host-agent's chunk store
+            // independently, pointing at the same backing bucket via env.
+            let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+            // The materialize dir lives at `<local_path>/chunked-rootfs/`
+            // — defined inside this block but ALSO consumed by the
+            // Services wiring outside it (so the admin orphan-reap
+            // endpoint knows the path). Pulled out below via the
+            // `coord_materialize_dir` binding.
+            let materialize_dir = cli.local_path.join("chunked-rootfs");
+            // ADR 0007 #3a: NVMe-backed chunk cache. Amortises repeat
+            // reads for chunks shared across manifests (canonical-base
+            // images, fork lineage). Budget defaults to 200 GiB; smaller
+            // hosts (dev VMs, lab boxes) override via
+            // `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`.
+            let chunk_cache = engram_chunk_store::ChunkCache::new(
+                engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
+                    cli.local_path.join("chunk-cache"),
+                ),
+            );
+            // ADR 0007 Phase 4: optional NBD daemon for chunked
+            // rootfs. `ENGRAM_NBD_DEVICES` is a comma-separated list
+            // of `/dev/nbdN` paths the host-agent allocates from when
+            // serving sessions whose image bundle carries a
+            // `disk_manifest`. Empty / unset → fall back to the
+            // materialize-to-file path (still correct, just slower
+            // cold start). Production Packer images load
+            // `modprobe nbd nbds_max=64` and populate this env var to
+            // match.
+            let nbd_pool = match std::env::var("ENGRAM_NBD_DEVICES") {
+                Ok(s) if !s.trim().is_empty() => {
+                    let paths: Vec<std::path::PathBuf> = s
+                        .split(',')
+                        .map(|p| p.trim())
+                        .filter(|p| !p.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .collect();
+                    match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
+                        Ok(pool) => {
+                            tracing::info!(
+                                slots = pool.capacity(),
+                                "NBD daemon enabled; chunked rootfs serves /dev/nbdN",
+                            );
+                            Some(pool)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "ENGRAM_NBD_DEVICES misconfigured; aborting");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                _ => None,
+            };
 
-        let pooled_backend: Arc<dyn SandboxBackend> = Arc::new({
-            let mut p = engram_host_agent::pooled_backend::PooledBackend::new(raw_backend)
-                // ADR 0008 Phase 5: feed the OciClient to the pooled
-                // backend so chunked-OCI images can fault chunks from
-                // the registry on BlobStorage miss.
-                .with_oci_client((*oci_client).clone())
-                .with_image_cache(image_cache)
-                .with_chunk_store(chunk_store, materialize_dir)
-                .with_chunk_cache(chunk_cache);
-            if let Some(egress) = host_egress.clone() {
-                p = p.with_egress(egress);
-            }
-            if let Some(pool) = nbd_pool {
-                p = p.with_nbd_pool(pool);
-            }
-            p
-        });
+            Arc::new({
+                let mut p = engram_host_agent::pooled_backend::PooledBackend::new(raw_backend)
+                    // ADR 0008 Phase 5: feed the OciClient to the pooled
+                    // backend so chunked-OCI images can fault chunks from
+                    // the registry on BlobStorage miss.
+                    .with_oci_client((*oci_client).clone())
+                    .with_image_cache(image_cache)
+                    .with_chunk_store(chunk_store, materialize_dir)
+                    .with_chunk_cache(chunk_cache);
+                if let Some(egress) = host_egress.clone() {
+                    p = p.with_egress(egress);
+                }
+                if let Some(pool) = nbd_pool {
+                    p = p.with_nbd_pool(pool);
+                }
+                p
+            })
+        };
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions
         // / snapshots inserted in a prior run still reference a valid
@@ -596,7 +684,7 @@ async fn main() -> Result<(), CoordinatorError> {
         // AppState is built (via `run_with_registry_and_local` below),
         // because `LocalHostClient` needs the AppState's `HarnessHub`
         // — and that hub doesn't exist until AppState is constructed.
-        in_proc_local_backend = Some(pooled_backend.clone());
+        in_proc_local_backend = Some(local_backend.clone());
         // Persist a row in `hosts` so any FK-bearing insert (snapshots
         // record the host that wrote them, sessions track host_id)
         // doesn't trip on a phantom host. The dialer-driven multi-host
@@ -713,11 +801,13 @@ async fn main() -> Result<(), CoordinatorError> {
         materialize_dir: coord_materialize_dir,
     };
 
+    let forge = build_forge(&cli)?;
     engram_coordinator::run_with_registry_and_local(
         cfg,
         services,
         host_registry,
         in_proc_local_backend.map(|b| (in_proc_host, b)),
+        forge,
     )
     .await
 }

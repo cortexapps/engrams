@@ -115,6 +115,16 @@ pub enum SessionEvent {
     HarnessIdle {
         at: DateTime<Utc>,
     },
+    /// ADR 0023: the agent opened a change request (PR/MR) via the
+    /// in-session forge seam. Surfaces the URL to the web UI / SSE
+    /// subscribers so the session's output artifact is visible.
+    PullRequestOpened {
+        url: String,
+        repo: String,
+        head_branch: String,
+        base_branch: String,
+        at: DateTime<Utc>,
+    },
 }
 
 impl SessionEvent {
@@ -138,6 +148,7 @@ impl SessionEvent {
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessIdle { .. } => "harness_idle",
+            Self::PullRequestOpened { .. } => "pull_request_opened",
         }
     }
 
@@ -362,6 +373,19 @@ pub struct AppState {
     /// via the `ENGRAM_COORD_POD_ID` env var if local tests want
     /// a deterministic value.
     pub pod_id: Arc<String>,
+    /// ADR 0023: per-session credential-broker tokens (session →
+    /// expected bearer). Minted at session create and injected into the
+    /// guest as `ENGRAM_FORGE_TOKEN`; the in-session forge endpoints
+    /// authenticate the caller by matching against this, then resolve
+    /// the session's `GitForge`. Cleared at terminal. In-memory (one
+    /// `--mode=all` process); PG-backed is the multi-pod follow-on.
+    pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
+    /// ADR 0023: the configured git forge authority (GitHub App, etc).
+    /// Set on `main`'s run path via `run_with_registry_and_local`;
+    /// `None` in tests and when `--git-forge` is unset (the forge
+    /// endpoints then 501). Kept here rather than on `Services` so the
+    /// many test `Services` literals don't need touching.
+    pub forge: Option<Arc<dyn engram_core::traits::GitForge>>,
 }
 
 impl AppState {
@@ -404,6 +428,8 @@ impl AppState {
             reconciler,
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
+            git_broker_tokens: Arc::new(dashmap::DashMap::new()),
+            forge: None,
         }
     }
 

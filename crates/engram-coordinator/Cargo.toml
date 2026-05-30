@@ -24,12 +24,17 @@ engram-chunk-store.workspace = true
 engram-host-agent.workspace = true
 engram-sandbox-firecracker.workspace = true
 engram-sandbox-vz.workspace = true
+# ADR 0023: ProcessBackend is now an operator-selectable (guarded) backend,
+# not just a test fixture — promoted from dev-dependencies.
+engram-sandbox-process.workspace = true
 engram-cloud-static.workspace = true
 engram-cloud-gcp.workspace = true
 engram-cloud-mock.workspace = true
 engram-harness-proto.workspace = true
 engram-secrets-dev.workspace = true
 engram-secrets-gcp.workspace = true
+# ADR 0023: GitHub App forge for the in-session credential + PR seam.
+engram-git-github.workspace = true
 engram-image-builder.workspace = true
 engram-egress-proxy.workspace = true
 engram-crypto.workspace = true
@@ -67,8 +72,8 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 engram-harness-proto.workspace = true
-engram-sandbox-process.workspace = true
 engram-secrets-dev.workspace = true
+engram-git-dev.workspace = true
 futures = { workspace = true }
 http-body-util = "0.1"
 parking_lot.workspace = true

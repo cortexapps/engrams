@@ -98,6 +98,13 @@ pub enum SandboxBackendChoice {
     /// must carry the `com.apple.security.virtualization` entitlement
     /// (see `just vz-codesign`).
     Vz,
+    /// **Dev only (ADR 0023).** Un-isolated host subprocesses
+    /// (`engram-sandbox-process`). Lets the product plane (coord API,
+    /// integrations) run without KVM — on a laptop or inside an engrams
+    /// session. Hard-gated in `main.rs` behind
+    /// `ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1`; never serves untrusted
+    /// input.
+    Process,
 }
 
 impl SandboxBackendChoice {
@@ -105,8 +112,9 @@ impl SandboxBackendChoice {
         match s {
             "firecracker" => Ok(Self::Firecracker),
             "vz" => Ok(Self::Vz),
+            "process" => Ok(Self::Process),
             other => Err(format!(
-                "invalid sandbox backend `{other}` — expected `firecracker` or `vz`"
+                "invalid sandbox backend `{other}` — expected `firecracker`, `vz`, or `process`"
             )),
         }
     }
@@ -166,11 +174,15 @@ mod tests {
             SandboxBackendChoice::parse("vz").unwrap(),
             SandboxBackendChoice::Vz,
         );
-        // `process` was an intermediate-phase variant before harness
-        // dispatch moved onto the SandboxBackend trait; the test-only
-        // ProcessBackend now reports its own capabilities and the enum
-        // no longer enumerates it.
-        assert!(SandboxBackendChoice::parse("process").is_err());
+        // ADR 0023 re-introduced `process` as an operator-selectable
+        // dev backend (it had been removed when harness dispatch moved
+        // onto the SandboxBackend trait). It's back so the product plane
+        // can run without KVM; the insecure-flag gate lives in main.rs,
+        // not in this parse.
+        assert_eq!(
+            SandboxBackendChoice::parse("process").unwrap(),
+            SandboxBackendChoice::Process,
+        );
         // microsandbox was a Phase 1 alternative; removed when we
         // committed to Firecracker for production.
         assert!(SandboxBackendChoice::parse("microsandbox").is_err());
