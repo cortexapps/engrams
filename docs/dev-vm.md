@@ -7,6 +7,11 @@ gRPC, fake-gcs-server for the blob backend, NBD-served chunked
 rootfs, local OCI registry, and the web SPA — bound to localhost
 on the VM, with auth disabled.
 
+It's the same `just dev` you run on a laptop: one orchestrator (Tilt),
+backend auto-detected per host (ADR 0024). On the dev-vm the probe finds
+`/dev/kvm` and selects Firecracker + the prod-shape split topology; no
+flag, no per-arch recipe. Tilt comes from the nix devShell.
+
 The recipes assume the [`dev-vm` Claude skill](../.claude/skills/dev-vm/SKILL.md)
 is installed (Mutagen sync, `gcloud` SSH config). All commands
 below run **on the dev VM** unless noted otherwise.
@@ -18,34 +23,43 @@ below run **on the dev VM** unless noted otherwise.
 bash .claude/skills/dev-vm/scripts/start.sh         # boot the VM
 bash .claude/skills/dev-vm/scripts/sync-start.sh    # start Mutagen
 
-# dev-vm side (via run.sh or a direct SSH)
-bash .claude/skills/dev-vm/scripts/run.sh just integration-up
+# dev-vm side — `just dev` (tilt up) is long-running, so launch it in
+# tmux: SSH-spawned foreground jobs die on disconnect.
+bash .claude/skills/dev-vm/scripts/ssh.sh \
+  "tmux new-session -d -s engram 'cd ~/engrams && nix develop --command just dev'"
+
+# bake the Claude demo image + create a session (once the stack is up)
+bash .claude/skills/dev-vm/scripts/run.sh just bake-demo
 bash .claude/skills/dev-vm/scripts/run.sh just integration-session
 
 # laptop side — port-forward + open
-bash .claude/skills/dev-vm/scripts/portforward.sh
-open http://localhost:5173
+bash .claude/skills/dev-vm/scripts/portforward.sh   # web 5173, coord 8090, registry 5001, tilt 10350
+open http://localhost:5173        # SPA      |  http://localhost:10350  # Tilt UI
 ```
 
 ## What gets brought up
 
-`just integration-up` (script: `deploy/dev/integration-up.sh`) brings:
+`just dev` (`tilt up`, see the `Tiltfile`) brings:
 
 | Service | Port  | Backed by |
 |---|---|---|
 | Postgres | 5435 → 5432 | `docker compose -f deploy/docker-compose.dev.yml` |
-| fake-gcs-server | 4443 | docker compose (acts as the blob backend) |
+| fake-gcs-server | 4443 | docker compose (+ the Linux host-net override) |
 | local OCI registry | 5001 | docker compose (anonymous push/pull) |
+| jaeger | 16686 (UI), 4317 (OTLP) | docker compose (ADR 0019 tracing) |
 | coordinator | 8090 | `engram-coordinator`, `mode=coordinator`, GCS blob |
-| host-agent | 9101 (gRPC), 9100 (metrics) | `engram-host-agent`, FC backend |
-| web SPA | 5173 | `pnpm dev` (vite), proxies `/sessions`+`/api` to coord |
+| host-agent | 9101 (gRPC), 9100 (metrics) | `engram-host-agent`, FC backend, under `sudo` |
+| web SPA | 5173 | `pnpm dev` (vite); set `ENGRAM_SKIP_WEB=1` to drop it |
 
-NBD is auto-detected: any `/dev/nbd*` device the dev-vm kernel
-exposes is fed into `ENGRAM_NBD_DEVICES`. Modify `nbds_max` on the
-nbd module kernel cmdline to expand the slot count.
+NBD is auto-detected: any `/dev/nbd*` device the dev-vm kernel exposes is
+used. The host-agent runs under `sudo -n` for `CAP_NET_ADMIN` (TAP
+creation) — passwordless sudo is required on the dev-vm (the Tiltfile's
+serve_cmd is `cargo build … && exec sudo -n --preserve-env=… engram-host-agent`).
 
-The host-agent runs under `sudo -E` for `CAP_NET_ADMIN` (TAP
-creation). Passwordless sudo is required on the dev-vm.
+**Two-host (evac) mode:** `ENGRAM_INTEG_TWO_HOSTS=1 just dev` adds a
+second host-agent (`host-agent-b`, gRPC 9102 / metrics 9110, disjoint NBD
+half) so coord sees a 2-host cluster — what `just integration-evac-test`
+needs.
 
 ## Daily workflow
 
@@ -57,55 +71,52 @@ creation). Passwordless sudo is required on the dev-vm.
    ```bash
    bash .claude/skills/dev-vm/scripts/start.sh
    bash .claude/skills/dev-vm/scripts/sync-start.sh
-   bash .claude/skills/dev-vm/scripts/run.sh just integration-up
+   bash .claude/skills/dev-vm/scripts/ssh.sh \
+     "tmux new-session -d -s engram 'cd ~/engrams && nix develop --command just dev'"
    bash .claude/skills/dev-vm/scripts/portforward.sh   # laptop, foreground
    ```
+   Watch progress at http://localhost:10350 (Tilt UI) once port-forwarded.
 
 3. **Iterate on a session**:
    ```bash
-   # Bring up (or reuse) a session at HEAD's commit. Idempotent.
-   bash .claude/skills/dev-vm/scripts/run.sh just integration-session
-
-   # With a harness + initial prompt:
-   bash .claude/skills/dev-vm/scripts/run.sh \
-       env HARNESS=claude PROMPT='read /etc/os-release' just integration-session
-
-   # Hit the API or the SPA directly:
+   bash .claude/skills/dev-vm/scripts/run.sh just bake-demo          # build + bake the Claude image
+   bash .claude/skills/dev-vm/scripts/run.sh just integration-session # create (or reuse) a session
    curl localhost:8090/sessions
    open http://localhost:5173
    ```
 
-4. **After code changes**:
-   ```bash
-   # Mutagen syncs the source tree automatically; rebuild + restart
-   # is just the integration-up cycle:
-   bash .claude/skills/dev-vm/scripts/run.sh bash -c 'just integration-down && just integration-up'
-   ```
+4. **After code changes**: Mutagen syncs the source tree automatically.
+   Rebuild + restart a single process from the Tilt UI (click its
+   "rebuild") at http://localhost:10350, or restart the whole stack by
+   killing + relaunching the tmux session.
 
 5. **Reset to a clean slate** (drops DB volumes, fake-gcs bucket,
    sandbox state, baked images):
    ```bash
-   bash .claude/skills/dev-vm/scripts/run.sh just integration-reset
+   bash .claude/skills/dev-vm/scripts/run.sh bash -c '
+     tilt down || true
+     docker compose -f deploy/docker-compose.dev.yml -f deploy/docker-compose.linux.yml down -v
+     sudo rm -rf var/host-sandboxes var/host-sandboxes-b var/engram var/sandboxes'
    ```
-   Use this between substantial schema changes, or when an
-   on-disk image cache or chunk cache is interfering with the
-   current bake.
+   (`var/host-sandboxes*` are root-owned — the host-agent ran under sudo.)
 
 6. **End of day**:
    ```bash
-   bash .claude/skills/dev-vm/scripts/run.sh just integration-down
+   bash .claude/skills/dev-vm/scripts/ssh.sh "tmux kill-session -t engram"
    bash .claude/skills/dev-vm/scripts/stop.sh
    ```
 
 ## Recipes at a glance
 
-| just recipe         | what it does                                            |
-|---------------------|---------------------------------------------------------|
-| `integration-up`    | Brings up Postgres + fake-gcs + registry + coord + host-agent + web SPA. Idempotent on already-up services. |
-| `integration-down`  | Stops the four processes + composes-down (volumes intact). |
-| `integration-reset` | Hard reset: down + drop volumes + wipe `./var/integration`, `./var/host-sandboxes-integration`, etc. |
-| `integration-test`  | Bake → enable → cascade → create session → delete session. Asserts the cascade lands a templates row. |
-| `integration-session` | Like integration-test but keeps the session alive. Idempotent: reuses image + session at HEAD. |
+| just recipe           | what it does                                            |
+|-----------------------|---------------------------------------------------------|
+| `dev`                 | Full stack via Tilt (run in tmux on the VM). Backend auto-detected. |
+| `dev-down`            | `tilt down` — stop the Tilt-managed processes + compose services. |
+| `bake-demo`           | Build the Claude harness + bake `deploy/demo-claude/` → local registry. |
+| `pull-kernel`         | Fetch the kernel this host's backend needs. |
+| `integration-test`    | Bake → enable → cascade → create session → delete. Run after `just dev`. |
+| `integration-session` | Like integration-test but keeps the session alive. Idempotent at HEAD. |
+| `integration-evac-test` | ADR 0018 M4 evac. Run after `ENGRAM_INTEG_TWO_HOSTS=1 just dev`. |
 
 ## Smoke-test the loop
 
@@ -136,18 +147,17 @@ dev-vm with a warm fake-gcs bucket:
   emitting Active).
 
 - **TTY-less pnpm install** prompts about `confirmModulesPurge`
-  in some scenarios. `integration-up.sh` sets `CI=true` to skip the
-  prompt. If you re-run with `pnpm install` manually outside the
-  recipe, do the same.
+  in some scenarios. If you hit it, set `ENGRAM_SKIP_WEB=1` (drops the
+  web resource) or run `CI=true pnpm install` once in `web/`.
 
 - **Mutagen sync stalls** if you've edited a large untracked dir
   (e.g. `target/` getting excluded after the fact). Check with
   `.claude/skills/dev-vm/scripts/sync-status.sh`; force-reconcile
   with `sync-flush.sh`.
 
-- **`./var/host-sandboxes-integration/` is root-owned** because the
-  host-agent runs under `sudo`. `integration-reset` uses `sudo rm
-  -rf` to handle this. Don't try to `rm -rf` it as your normal user.
+- **`./var/host-sandboxes*/` is root-owned** because the host-agent
+  runs under `sudo`. The reset snippet above uses `sudo rm -rf`. Don't
+  try to `rm -rf` it as your normal user.
 
 - **NBD devices on the dev-vm: only 4 by default.** Bump
   `nbds_max` if you need more concurrent sandboxes. Production

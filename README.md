@@ -296,8 +296,9 @@ just check              # fmt + clippy + tests (cargo nextest), the pre-push gat
 just test               # all tests via cargo nextest
 just psql               # psql into the dev Postgres
 just db-reset           # destroy + recreate the dev DB
-just dev-firecracker    # coordinator wired to the Firecracker backend (Linux + KVM only)
-just dev-vz             # coordinator wired to the Apple Silicon backend (macOS only)
+just dev                # full stack via Tilt; backend auto-detected per host (ADR 0024)
+just bake-demo          # build + bake the Claude demo image → local registry
+just pull-kernel        # fetch the kernel this host's backend needs
 just clean-var          # rm -rf the local sandbox cwds + snapshots
 ```
 
@@ -442,7 +443,7 @@ The dev backend is for orchestration iteration. Real Firecracker needs Linux + K
 - A Linux laptop or workstation
 - CI
 
-`just dev-firecracker` runs the coordinator against the Firecracker backend. Set `ENGRAM_KERNEL_IMAGE_PATH` to a vmlinux on disk; the rootfs comes from images baked with `--format ext4` (and, for `exec_stream`, with `engram-agentd` injected — see `crates/engram-image-builder/src/lib.rs::AgentInjection`).
+On a Linux + KVM host, `just dev` auto-detects `/dev/kvm` and runs the Firecracker backend (no flag, no per-arch recipe — ADR 0024); `just pull-kernel` fetches a vmlinux into the standard cache. The rootfs comes from images baked with `--format ext4` (and, for `exec_stream`, with `engram-agentd` injected — see `crates/engram-image-builder/src/lib.rs::AgentInjection`).
 
 The crate ships an integration suite that covers the full surface against real microVMs:
 
