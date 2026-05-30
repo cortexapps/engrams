@@ -1175,9 +1175,9 @@ jobs:
       # nextest is what every other test step in this workflow uses.
       - uses: taiki-e/install-action@nextest
 
-      # `integration-up.sh` calls `just bootstrap` to seed the KEK
-      # env. Blacksmith runners don't ship `just` (it's only required
-      # by this lane; the other CI jobs hit cargo directly).
+      # The Tiltfile's `bootstrap` local_resource runs `just bootstrap`,
+      # so the runner needs `just` (Blacksmith runners don't ship it; the
+      # other CI jobs hit cargo directly).
       - uses: taiki-e/install-action@just
 
       # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
@@ -1247,10 +1247,10 @@ jobs:
       # touched by a workspace dep add in ADR 0016 Phase A). The
       # download placed engram-coordinator/host-agent/cli at
       # target/release/, the cache restore wiped them, and
-      # integration-up.sh dropped into its cargo-build fallback for
-      # coord + host-agent only — leaving engram-cli missing, which
-      # broke the next step's `./target/release/engram-cli registry
-      # add`. Moving the download below all rust-cache operations
+      # the Tiltfile's prebuilt-binary branch had nothing to exec for
+      # coord + host-agent, and engram-cli was missing — which broke the
+      # next step's `./target/release/engram-cli registry add`. Moving
+      # the download below all rust-cache operations
       # makes the order unambiguous: nothing can prune what hasn't
       # been written yet.
       #
@@ -1273,13 +1273,21 @@ jobs:
           ls -l target/release/engram-{coordinator,host-agent,cli,publish-builtin-harness} \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
-      # integration-up.sh boots: postgres + fake-gcs + registry via
-      # docker-compose, then coord + host-agent as background
-      # processes. ENGRAM_INTEG_BIN_DIR=target/release tells it to
-      # skip the cargo build and run the binaries we downloaded.
-      # ENGRAM_SKIP_WEB=1 because there's no browser in CI to drive
-      # the SPA.
-      - name: Bring up prod-shape stack
+      # `tilt up` (via tilt-up-ci.sh) boots: postgres + fake-gcs +
+      # registry + jaeger via docker-compose, then coord + host-agent.
+      # ENGRAM_INTEG_BIN_DIR=target/release makes the Tiltfile exec the
+      # downloaded release binaries instead of `cargo run`/build.
+      # ENGRAM_SKIP_WEB=1 because there's no browser in CI for the SPA.
+      # Tilt is the one dev orchestrator (ADR 0024). Local dev gets it
+      # from the nix devShell; CI runners aren't in nix, so install the
+      # pinned release binary via the official script.
+      - name: Install Tilt
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh \
+            | sudo bash
+          tilt version
+
+      - name: Bring up prod-shape stack (tilt)
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
           ENGRAM_SKIP_WEB: "1"
@@ -1293,7 +1301,7 @@ jobs:
           ENGRAM_EGRESS_PROXY_PORT: "14443"
         run: |
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
-          bash deploy/dev/integration-up.sh
+          bash deploy/dev/tilt-up-ci.sh
 
       # ADR 0013: host-agent doesn't read docker config; it asks
       # the coord per-pull, and the coord reads sealed credentials
@@ -1316,8 +1324,8 @@ jobs:
       # ADR 0021 P0: pull the harness-claude artifact built by the
       # upstream `bake-harness-claude-artifact` job, re-publish to
       # the integration test's local registry (the `registry:2`
-      # container `integration-up.sh` brought up on port 5001), and
-      # let the catalog override route the demo-claude bake to it.
+      # container `tilt up` brought up on port 5001), and let the
+      # catalog override route the demo-claude bake to it.
       #
       # Why this shape (vs pulling from GHCR):
       # - Tests THIS PR's harness binary, not whatever tag main
@@ -1405,20 +1413,13 @@ jobs:
               --no-fail-fast \
               --test-threads=1
 
-      - name: Dump coord + host-agent logs on failure
+      - name: Dump tilt + stack logs on failure
         if: failure()
         run: |
-          echo "--- coord.log (last 200 lines) ---"
-          tail -200 var/integration/coord.log 2>/dev/null || true
-          echo ""
-          echo "--- host-agent.log (last 200 lines) ---"
-          tail -200 var/integration/host-agent.log 2>/dev/null || true
+          echo "--- tilt.log (last 300 lines: coord + host-agent streams) ---"
+          tail -300 var/integration/tilt.log 2>/dev/null || true
 
       - name: Tear down stack
         if: always()
         run: |
-          bash deploy/dev/integration-down.sh || true
-          # integration-down.sh runs under sudo for the host-agent
-          # kill; chown back so the rust-cache action can read
-          # target/.
-          sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+          bash deploy/dev/tilt-down-ci.sh || true

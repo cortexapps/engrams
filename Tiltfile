@@ -319,8 +319,10 @@ if dev_split:
         'ENGRAM_BLOB_BACKEND': 'gcs',
         'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
         'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
-        # Egress proxy off in dev — set non-zero to enable.
-        'ENGRAM_EGRESS_PROXY_PORT': '0',
+        # Egress proxy off in dev — set ENGRAM_EGRESS_PROXY_PORT to
+        # enable. CI sets it (Blacksmith doesn't NAT FC TAP traffic, so
+        # guests route via the proxy); local dev relies on host masquerade.
+        'ENGRAM_EGRESS_PROXY_PORT': env_or('ENGRAM_EGRESS_PROXY_PORT', '0'),
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
         'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
