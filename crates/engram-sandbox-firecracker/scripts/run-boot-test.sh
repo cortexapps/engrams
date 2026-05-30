@@ -26,7 +26,7 @@ cargo build \
   --release
 
 case "${1:-all}" in
-  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e)
+  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|forge_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e)
     # Root-required tests: snapshot_net + host_startup + proxy_e2e
     # all use real TAP / iptables / netns. Detect and re-exec via
     # sudo when not already root.
@@ -48,12 +48,13 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test snapshot_uffd          -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test exec_real_vm           -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test baked_harness_loopback -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test forge_loopback         -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test multi_restore          -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test cross_host_restore     -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test restore_chain          -- --ignored --nocapture
     ;;
   *)
-    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|all]" >&2
+    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|forge_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|all]" >&2
     exit 2
     ;;
 esac
