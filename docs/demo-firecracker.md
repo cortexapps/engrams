@@ -63,53 +63,44 @@ Cache the FC test artifacts on the VM (kernel + ubuntu rootfs):
 
 ## Run the demo
 
+Bring the stack up and bake the image with the unified recipes — `just
+dev` auto-detects KVM and runs the FC split topology (ADR 0024); there's
+no FC-specific recipe anymore. Then exercise the VM lifecycle by hand.
+
 ```
-# 1. Bake the FC image with engram-agentd injected.
-/dev-vm run just fc-bake-demo
-
-# 2. Start Postgres on the VM.
-/dev-vm run just db-up
-
-# 3. Start the coordinator wired to FC. tmux because the VM
-#    cgroup kills SSH-spawned background jobs on disconnect.
+# 1. Stack up via Tilt (coord + host-agent, FC). tmux because the VM
+#    cgroup kills SSH-spawned background jobs on disconnect. Watch
+#    http://localhost:10350 (port-forwarded) until resources are green.
 /dev-vm ssh "tmux new-session -d -s engram \
-  'cd ~/engrams && /nix/var/nix/profiles/default/bin/nix develop --command \
-   env ENGRAM_KERNEL_IMAGE_PATH=\$HOME/.cache/engram-fc-test/vmlinux-5.10.223 \
-       ENGRAM_DEFAULT_IMAGE=warm-1 \
-       just dev-firecracker > /tmp/engram-coord.log 2>&1'"
+  'cd ~/engrams && nix develop --command just dev > /tmp/engram-tilt.log 2>&1'"
 
-# wait for the build + boot
-/dev-vm ssh "tail -f /tmp/engram-coord.log" &  # ctrl-c when you see "coordinator listening"
+# 2. Bake + enable the demo image, create a session. integration-session
+#    prints the session id + ready-to-paste curls; grab SID from it.
+/dev-vm run just bake-demo
+/dev-vm run just integration-session    # set SID to the printed session id
+```
 
-# 4. Drive a session.
-/dev-vm ssh '
-SID=$(curl -s -X POST http://localhost:8090/sessions \
-  -H "content-type: application/json" \
-  -d "{\"repo\":\"local://demo\",\"branch\":\"main\"}" | jq -r .session_id)
-echo session: $SID
+Then exercise snapshot → evict → resume against `$SID` (these hit the
+coord API directly; unchanged by ADR 0024):
 
+```
 # Real microVM exec.
 curl -s -X POST http://localhost:8090/sessions/$SID/exec \
   -H "content-type: application/json" \
-  -d "{\"command\":\"uname -a; cat /etc/os-release | head -3\"}" --max-time 30 | jq
+  -d '{"command":"uname -a; cat /etc/os-release | head -3"}' --max-time 30 | jq
 
-# Write a marker, then snapshot.
+# Write a marker, snapshot, evict (drop the live VM), resume (UFFD restore).
 curl -s -X POST http://localhost:8090/sessions/$SID/exec \
   -H "content-type: application/json" \
-  -d "{\"command\":\"echo phase4-was-here > /tmp/marker\"}" --max-time 30 | jq -r .stdout
+  -d '{"command":"echo phase4-was-here > /tmp/marker"}' --max-time 30 | jq -r .stdout
 curl -s -X POST http://localhost:8090/sessions/$SID/snapshot --max-time 90 | jq
-
-# Evict (drops the live VM, keeps the snapshot).
 curl -s -X DELETE http://localhost:8090/sessions/$SID/local --max-time 30
-
-# Resume (UFFD-backed restore).
 curl -s -X POST http://localhost:8090/sessions/$SID/resume --max-time 60 | jq
 
 # Marker survives the round-trip.
 curl -s -X POST http://localhost:8090/sessions/$SID/exec \
   -H "content-type: application/json" \
-  -d "{\"command\":\"cat /tmp/marker\"}" --max-time 30 | jq -r .stdout
-'
+  -d '{"command":"cat /tmp/marker"}' --max-time 30 | jq -r .stdout
 ```
 
 ## Idle eviction → hot resume → cold flush → cold resume
@@ -123,7 +114,7 @@ rather than an APFS clone.
 /dev-vm ssh '
 SID=$(curl -s -X POST http://localhost:8090/sessions \
   -H "content-type: application/json" \
-  -d "{\"image\":\"localhost:5001/engram/fc-claude:warm-1\",
+  -d "{\"image\":\"localhost:5001/demo-claude:warm-1\",
        \"harness\":{\"kind\":\"builtin\",\"name\":\"claude\"}}" | jq -r .session_id)
 
 # Idle eviction → hot auto-resume.
@@ -164,7 +155,8 @@ curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
    CLI didn't expose `--inject-agent`, so produced rootfs.ext4
    files had no `engram-agentd` and the host couldn't `exec()`
    against the VM (no vsock listener inside the guest). Added
-   the flag, plus a `just fc-bake-demo` recipe.
+   the flag, plus a bake recipe (later unified as `just bake-demo`,
+   ADR 0024).
 
 2. **`FirecrackerConfig::with_kernel` default boot args missed
    `init=/sbin/engram-init`.** The image-baker writes

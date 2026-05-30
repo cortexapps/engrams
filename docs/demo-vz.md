@@ -39,7 +39,7 @@ in-VM binaries select the transport at runtime via
 sets automatically.
 
 ```bash
-just vz-pull-kernel
+just pull-kernel   # detects VZ on Apple Silicon → fetches the Kata arm64 kernel
 # → ~/.cache/engram-vz-test/vmlinux-arm64
 file ~/.cache/engram-vz-test/vmlinux-arm64
 # → "Linux kernel ARM64 boot executable Image"
@@ -65,22 +65,20 @@ the machine):
 ## Step 2 — bake the rootfs
 
 ```bash
-just vz-bake-demo      # noop harness, ~230 MB
-# or
-just vz-bake-claude    # claude harness, ~400 MB. Requires
-                       # ANTHROPIC_API_KEY at coord startup.
+just bake-demo     # builds the Claude harness for arm64, bakes
+                   # deploy/demo-claude/, pushes localhost:5001/demo-claude:warm-1
 ```
 
-Both recipes:
-1. Cross-compile `engram-{agentd,bootstrap,harness-*}` for
-   `aarch64-unknown-linux-musl`.
-2. `docker buildx --platform linux/arm64` build a debian-slim
-   (or node:20-slim) base image with the binaries injected at
-   `/sbin/engram-{agentd,bootstrap,harness-*}` plus the
-   `/sbin/engram-init` shim.
-3. Convert to ext4 via `mke2fs` (PATH-prepended from
-   `/opt/homebrew/opt/e2fsprogs/sbin`).
-4. Land at `./var/engram/images/local:/{demo|claude-demo}/warm-1/rootfs.ext4`.
+`bake-demo` (arch detected from the backend probe — `linux-arm64` on VZ):
+1. Cross-compiles `engram-agentd` + `engram-harness-claude` for
+   `aarch64-unknown-linux-musl` and downloads the matching `claude` CLI.
+2. Publishes the harness artifact to the local registry and points the
+   baker's catalog at it (so it builds from your tree, not GHCR).
+3. `docker build --platform linux/arm64` a debian-slim base with the
+   agent injected + the `/sbin/engram-init` shim; converts to ext4 via
+   `mke2fs` (PATH-prepended from `/opt/homebrew/opt/e2fsprogs/sbin`).
+4. Pushes `localhost:5001/demo-claude:warm-1` (the registry `just dev`
+   runs). Enable it with `engram image enable …` or `just integration-session`.
 
 VZ requires disk images to be 512-byte aligned. The bake pads
 automatically; a stale unpadded ext4 will fail `create()` with VZ
@@ -89,16 +87,17 @@ NSError "Invalid disk image. The disk image format is not recognized."
 ## Step 3 — codesign + run
 
 ```bash
-just dev-vz            # codesigns + launches coord with VZ backend
+just dev               # detects VZ on Apple Silicon; codesigns + launches the stack
 ```
 
-The `vz-codesign` recipe ad-hoc-signs `target/debug/engram-coordinator`
-plus the `engram-sandbox-vz` test binaries with the
-`com.apple.security.virtualization` entitlement. Without it, every VZ
-API call fails with NSError "process doesn't have the
-com.apple.security.virtualization entitlement" — caught by the
-`vz_vm_new_full_plumbing_runs_or_fails_cleanly` smoke test in
-`crates/engram-sandbox-vz/src/vm.rs`.
+On macOS `just dev` builds, then ad-hoc-signs the coordinator +
+host-agent with the `com.apple.security.virtualization` entitlement
+before exec (the Tiltfile's serve_cmd chains `codesign.sh debug`).
+Without the entitlement every VZ API call fails with NSError "process
+doesn't have the com.apple.security.virtualization entitlement" — caught
+by the `vz_vm_new_full_plumbing_runs_or_fails_cleanly` smoke test in
+`crates/engram-sandbox-vz/src/vm.rs`. (The standalone `vz-codesign`
+recipe still exists, used by `just vz-test`.)
 
 ## Step 4 — exercise the lifecycle
 
@@ -106,11 +105,11 @@ com.apple.security.virtualization entitlement" — caught by the
 # Pre-req: enable an image (one-time):
 curl -sS -X POST http://127.0.0.1:8090/api/enabled-images \
     -H 'Content-Type: application/json' \
-    -d '{"image_uri": "localhost:5001/engram/vz-claude:warm-1"}'
+    -d '{"image_uri": "localhost:5001/demo-claude:warm-1"}'
 
 SID=$(curl -sS -X POST http://127.0.0.1:8090/sessions \
         -H 'Content-Type: application/json' \
-        -d '{"image": "localhost:5001/engram/vz-claude:warm-1",
+        -d '{"image": "localhost:5001/demo-claude:warm-1",
              "harness": {"kind": "builtin", "name": "claude"}}' \
       | jq -r .session_id)
 

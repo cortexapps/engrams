@@ -45,45 +45,34 @@ in-VM `claude` process picks it up.
 ## Bake the image
 
 ```
-/dev-vm run just fc-bake-claude
+/dev-vm run just bake-demo
 ```
 
-What this does:
-1. Cross-compiles `engram-agentd` and `engram-harness-claude`
-   for `x86_64-unknown-linux-musl`.
-2. Builds a Docker image off `node:20-slim` with `git`,
-   `ca-certificates`, and `@anthropic-ai/claude-code` installed.
-3. Runs `engram image build` to produce an ext4 rootfs at
-   `./var/engram/images/local/claude-demo/warm-1.ext4` with
-   the musl binaries injected at `/sbin/`.
-
-Rootfs is ~400 MB. Acceptable for the demo.
+`bake-demo` cross-compiles `engram-agentd` + `engram-harness-claude` for
+the guest arch, downloads the matching `claude` CLI, publishes the
+harness artifact to the local registry, and bakes `deploy/demo-claude/`
+(the Claude harness baked into the rootfs at `/opt/engram/harness/`,
+ADR 0021) → `localhost:5001/demo-claude:warm-1`.
 
 ## Run the coordinator
 
 ```
 /dev-vm ssh "tmux new-session -d -s engram \
-  'cd ~/engrams && /nix/.../nix develop --command \
-   env ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-       ENGRAM_KERNEL_IMAGE_PATH=$HOME/.cache/engram-fc-test/vmlinux-5.10.223 \
-       ENGRAM_DEFAULT_IMAGE=warm-1 \
-       ENGRAM_DEV_AUTO_AGENT=claude \
-       just dev-firecracker > /tmp/engram-coord.log 2>&1'"
+  'cd ~/engrams && nix develop --command just dev > /tmp/engram-tilt.log 2>&1'"
 ```
 
 Notes:
-- `ENGRAM_DEV_AUTO_AGENT=claude` flips `build_dev_agent` to
-  pick `dev_claude_harness_path` (defaulted to
-  `/sbin/engram-harness-claude` by the dev-firecracker recipe).
-- Sessions take the chunked-OCI cold path; warm pools were retired
-  again with ADR 0015 M5 (after ADR 0014's `templates`-backed
-  attempt). Hosts prefetch chunks into local NVMe via the
-  heartbeat-driven readiness loop before sessions can land.
+- The Claude harness is baked into the image (ADR 0021) — there's no
+  `ENGRAM_DEV_AUTO_AGENT` flag and the coord needs no `ANTHROPIC_API_KEY`
+  at startup. Supply the key per session (the web form's secrets, or
+  `secrets.ANTHROPIC_API_KEY` on session create).
+- Sessions take the chunked-OCI cold path; hosts prefetch chunks into
+  local NVMe via the heartbeat-driven readiness loop before sessions land.
 
 ## Drive the demo
 
 ```
-SID=$(engram session create --repo local://claude-demo \
+SID=$(engram session create --image localhost:5001/demo-claude:warm-1 \
         --prompt "list /workspace and tell me what's there")
 
 # Watch the conversation live (the same SSE stream a Slack bot

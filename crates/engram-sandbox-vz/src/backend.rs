@@ -148,7 +148,7 @@ impl VzBackend {
         if !cfg.kernel_path.exists() {
             return Err(SandboxError::InvalidSpec(format!(
                 "vz kernel image not found at {} (set ENGRAM_VZ_KERNEL_PATH or run \
-                 `just vz-bake-kernel`)",
+                 `just pull-kernel`)",
                 cfg.kernel_path.display()
             )));
         }
@@ -284,7 +284,7 @@ impl SandboxBackend for VzBackend {
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
                 "VzBackend requires SandboxSpec.rootfs_source — point it at the ext4 \
-                 rootfs produced by `just vz-bake-claude`"
+                 rootfs produced by `just bake-demo`"
                     .into(),
             )
         })?;
@@ -292,7 +292,7 @@ impl SandboxBackend for VzBackend {
         // specific NSError later.
         if !bake_rootfs.exists() {
             return Err(SandboxError::InvalidSpec(format!(
-                "vz rootfs not found at {} — bake an image with `just vz-bake-claude` and \
+                "vz rootfs not found at {} — bake an image with `just bake-demo` and \
                  point SandboxSpec.rootfs_source at it",
                 bake_rootfs.display()
             )));

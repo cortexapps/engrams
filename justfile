@@ -324,8 +324,9 @@ clean-var:
 
 # ------------------------------------------------------------------
 # Web dashboard — read-only live view of the running coordinator.
-# Run alongside `just dev` (or `just dev-vz`) in another terminal;
-# Vite proxies /sessions and /api to 127.0.0.1:8090.
+# `just dev` already runs the web SPA; this recipe is for running it
+# standalone against a coordinator on 127.0.0.1:8090. Vite proxies
+# /sessions and /api there.
 # ------------------------------------------------------------------
 
 # Install web deps (idempotent — pnpm skips if lockfile is fresh).

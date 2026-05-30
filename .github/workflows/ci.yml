@@ -320,8 +320,8 @@ jobs:
         # from the musl cross-gcc sysroot.
         run: sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev
 
-      # Mirrors what `just install-harnesses` and `just fc-bake-demo`
-      # produce on Linux. If any of these stop building the demo bake
+      # Mirrors what `just bake-demo` produces on Linux. If any of these
+      # stop building the demo bake
       # path is broken even when the host-target workspace check is
       # green.
       - name: build agentd (musl)
