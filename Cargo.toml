@@ -24,6 +24,7 @@ members = [
     "crates/engram-transport",
     "crates/engram-secrets-dev",
     "crates/engram-secrets-gcp",
+    "crates/engram-git-dev",
     "crates/engram-postgres",
     "crates/engram-egress-proxy",
     "crates/engram-crypto",
@@ -62,6 +63,8 @@ engram-host-agent = { path = "crates/engram-host-agent" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
+engram-git-dev = { path = "crates/engram-git-dev" }
+engram-git-github = { path = "crates/engram-git-github" }
 engram-image-builder = { path = "crates/engram-image-builder" }
 engram-agentd = { path = "crates/engram-agentd" }
 engram-uffd-handler = { path = "crates/engram-uffd-handler" }

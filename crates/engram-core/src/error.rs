@@ -227,6 +227,48 @@ impl StdError for SecretError {
     }
 }
 
+// ---------- GitForgeError (GitForge) ----------
+
+#[derive(Debug)]
+pub enum GitForgeError {
+    /// The forge backend (HTTP API / SDK) failed.
+    Backend(BoxError),
+    /// The forge declined to authenticate (bad app key, missing
+    /// installation, expired/insufficient credential).
+    Unauthorized(String),
+    /// The repo, installation, or branch does not exist.
+    NotFound(String),
+    /// Backend returned an unexpected response shape.
+    Protocol(String),
+    /// The change request was rejected by the forge (e.g. head == base,
+    /// a PR already exists for this branch pair, base is protected).
+    Rejected(String),
+    /// The repo reference or request spec was malformed.
+    InvalidSpec(String),
+}
+
+impl fmt::Display for GitForgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(e) => write!(f, "git forge backend error: {e}"),
+            Self::Unauthorized(m) => write!(f, "git forge unauthorized: {m}"),
+            Self::NotFound(m) => write!(f, "git forge not found: {m}"),
+            Self::Protocol(m) => write!(f, "git forge protocol error: {m}"),
+            Self::Rejected(m) => write!(f, "git forge rejected change request: {m}"),
+            Self::InvalidSpec(m) => write!(f, "invalid git forge spec: {m}"),
+        }
+    }
+}
+
+impl StdError for GitForgeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
