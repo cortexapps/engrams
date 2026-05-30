@@ -623,6 +623,28 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             }
         }
 
+        // Fold the built image's Docker config (its `ENV` + `WORKDIR`)
+        // into the manifest as defaults — the author's `engram.toml`
+        // [env]/workdir wins. The platform doesn't otherwise read the
+        // OCI image config, so this is what lets a Dockerfile's ENV /
+        // WORKDIR reach the guest (the agent at start_agent + `engram
+        // exec`). Inspect the created-but-unstarted container, whose
+        // `Config` mirrors the image's Env/WorkingDir.
+        match self.docker.inspect_config(container_id).await {
+            Ok(cfg) => {
+                effective_manifest.apply_image_config_defaults(&cfg.env, cfg.working_dir.as_deref())
+            }
+            // Non-fatal: an inspect hiccup shouldn't fail an otherwise
+            // good bake. The image still works; it just doesn't inherit
+            // the Dockerfile env/workdir (same as pre-this-feature), and
+            // the author can always set them in engram.toml.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "docker inspect for image config failed; \
+                 manifest will not inherit the Dockerfile ENV/WORKDIR",
+            ),
+        }
+
         let manifest_path = image_dir.join("manifest.toml");
         let manifest_str = render_manifest_value(&effective_manifest)?;
         tokio::fs::write(&manifest_path, manifest_str).await?;

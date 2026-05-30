@@ -24,6 +24,18 @@ pub struct BuildArgs {
     pub build_args: HashMap<String, String>,
 }
 
+/// The subset of a built image's container config the baker folds into
+/// the rendered manifest: the Dockerfile's `ENV` (as the raw Docker
+/// `KEY=VALUE` strings) and `WORKDIR`. Read via `docker inspect` so a
+/// Dockerfile's environment + working directory reach the guest without
+/// the author restating them in `engram.toml` — the platform doesn't
+/// otherwise read the OCI image config.
+#[derive(Clone, Debug, Default)]
+pub struct DockerImageConfig {
+    pub env: Vec<String>,
+    pub working_dir: Option<String>,
+}
+
 /// Minimal interface the baker uses. Implementations:
 ///
 /// - [`DockerCli`] — production: shells out to `docker`.
@@ -44,6 +56,14 @@ pub trait DockerRunner: Send + Sync {
 
     async fn rmi(&self, image_tag: &str) -> Result<(), DockerError>;
 
+    /// Read `Config.Env` + `Config.WorkingDir` off a created container
+    /// (or image) via `docker inspect`. A created-but-unstarted
+    /// container's `Config` mirrors the image's `ENV`/`WORKDIR`, so the
+    /// baker inspects the container it already made for the export. The
+    /// baker folds these into the rendered manifest as defaults under
+    /// the author's `engram.toml`.
+    async fn inspect_config(&self, id: &str) -> Result<DockerImageConfig, DockerError>;
+
     /// For the [`Drop`] cleanup helper in `Builder` to launch
     /// best-effort async cleanup tasks. Implementations return a
     /// boxed clone of themselves.
@@ -58,6 +78,9 @@ pub enum DockerError {
         code: Option<i32>,
         stderr: String,
     },
+    /// `docker` succeeded but its output didn't parse as expected (e.g.
+    /// `docker inspect` JSON). Carries a human-readable reason.
+    Parse(String),
     Io(std::io::Error),
 }
 
@@ -73,6 +96,7 @@ impl std::fmt::Display for DockerError {
                 "`{command}` exited with {code:?}: {}",
                 stderr.trim()
             ),
+            Self::Parse(m) => write!(f, "docker output parse error: {m}"),
             Self::Io(e) => write!(f, "spawn: {e}"),
         }
     }
@@ -200,9 +224,51 @@ impl DockerRunner for DockerCli {
         run_to_completion(cmd, "docker rmi").await
     }
 
+    async fn inspect_config(&self, id: &str) -> Result<DockerImageConfig, DockerError> {
+        let mut cmd = self.cmd();
+        cmd.arg("inspect")
+            .arg("--format")
+            .arg("{{json .Config}}")
+            .arg(id);
+        let out = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(DockerError::NonZeroExit {
+                command: format!("docker inspect {id}"),
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        parse_inspect_config(&out.stdout)
+    }
+
     fn clone_runner(&self) -> Box<dyn DockerRunner> {
         Box::new(self.clone())
     }
+}
+
+/// Parse `docker inspect --format '{{json .Config}}'` output into the
+/// env + workdir the baker folds. An empty `WorkingDir` (the value for
+/// an image with no `WORKDIR`) maps to `None` so it doesn't shadow the
+/// sandbox default. Split out from the CLI call so it's unit-testable
+/// without a daemon.
+fn parse_inspect_config(stdout: &[u8]) -> Result<DockerImageConfig, DockerError> {
+    #[derive(serde::Deserialize)]
+    struct InspectConfig {
+        #[serde(rename = "Env", default)]
+        env: Vec<String>,
+        #[serde(rename = "WorkingDir", default)]
+        working_dir: Option<String>,
+    }
+    let parsed: InspectConfig = serde_json::from_slice(stdout)
+        .map_err(|e| DockerError::Parse(format!("inspect .Config: {e}")))?;
+    Ok(DockerImageConfig {
+        env: parsed.env,
+        working_dir: parsed.working_dir.filter(|w| !w.is_empty()),
+    })
 }
 
 /// Single-quote-escape a value for safe shell substitution. Docker
@@ -252,5 +318,29 @@ mod tests {
         // be split into close-escape-reopen so the shell still sees a
         // single literal token.
         assert_eq!(shell_escape("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn parse_inspect_config_extracts_env_and_workdir() {
+        let json = br#"{"Env":["PATH=/opt/cargo/bin:/usr/bin","CARGO_HOME=/opt/cargo"],"WorkingDir":"/workspace","Cmd":["/bin/sh"]}"#;
+        let cfg = parse_inspect_config(json).unwrap();
+        assert_eq!(
+            cfg.env,
+            vec!["PATH=/opt/cargo/bin:/usr/bin", "CARGO_HOME=/opt/cargo"]
+        );
+        assert_eq!(cfg.working_dir.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn parse_inspect_config_empty_workdir_is_none() {
+        // Images without a WORKDIR report `"WorkingDir":""` — must not
+        // shadow the sandbox default.
+        let cfg = parse_inspect_config(br#"{"Env":[],"WorkingDir":""}"#).unwrap();
+        assert!(cfg.env.is_empty());
+        assert_eq!(cfg.working_dir, None);
+        // Missing keys default cleanly too.
+        let cfg = parse_inspect_config(br#"{}"#).unwrap();
+        assert!(cfg.env.is_empty());
+        assert_eq!(cfg.working_dir, None);
     }
 }

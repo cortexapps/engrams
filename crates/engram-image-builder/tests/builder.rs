@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use engram_image_builder::docker::{BuildArgs, DockerError, DockerRunner};
+use engram_image_builder::docker::{BuildArgs, DockerError, DockerImageConfig, DockerRunner};
 use engram_image_builder::ext4::{Ext4Error, Ext4Packer};
 use engram_image_builder::{AgentInjection, BuildRequest, Builder, Format};
 
@@ -50,6 +50,8 @@ struct RecordingState {
     inject_export_err: Option<DockerError>,
     /// Files to materialize when `export_to_dir` is invoked.
     fake_rootfs: Vec<(PathBuf, Vec<u8>)>,
+    /// Canned `docker inspect` config the baker folds into the manifest.
+    image_config: DockerImageConfig,
 }
 
 #[derive(Clone)]
@@ -66,6 +68,11 @@ impl RecordingDocker {
 
     fn with_fake_rootfs(self, files: impl IntoIterator<Item = (PathBuf, Vec<u8>)>) -> Self {
         self.inner.lock().fake_rootfs = files.into_iter().collect();
+        self
+    }
+
+    fn with_image_config(self, env: Vec<String>, working_dir: Option<String>) -> Self {
+        self.inner.lock().image_config = DockerImageConfig { env, working_dir };
         self
     }
 
@@ -140,6 +147,13 @@ impl DockerRunner for RecordingDocker {
             tag: image_tag.to_string(),
         });
         Ok(())
+    }
+
+    async fn inspect_config(&self, _id: &str) -> Result<DockerImageConfig, DockerError> {
+        // Intentionally not recorded as a `Call` so existing
+        // orchestration-order assertions (build/create/export/rm/rmi)
+        // stay stable.
+        Ok(self.inner.lock().image_config.clone())
     }
 
     fn clone_runner(&self) -> Box<dyn DockerRunner> {
@@ -264,10 +278,17 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
     let images = tempfile::tempdir().unwrap();
     write_source_repo(src.path(), r#"name = "cortex-api""#);
 
-    let docker = RecordingDocker::new().with_fake_rootfs(vec![
-        (PathBuf::from("README.md"), b"# starter\n".to_vec()),
-        (PathBuf::from("scripts/run.sh"), b"#!/bin/sh\n".to_vec()),
-    ]);
+    let docker = RecordingDocker::new()
+        .with_fake_rootfs(vec![
+            (PathBuf::from("README.md"), b"# starter\n".to_vec()),
+            (PathBuf::from("scripts/run.sh"), b"#!/bin/sh\n".to_vec()),
+        ])
+        // The Dockerfile's ENV + WORKDIR (engram.toml here sets neither),
+        // surfaced via `docker inspect`, must fold into the manifest.
+        .with_image_config(
+            vec!["DOCKER_ONLY=yes".to_string(), "PATH=/usr/bin".to_string()],
+            Some("/from-docker".to_string()),
+        );
     let (cs, _csdir) = test_chunk_store();
     let builder = Builder::new(docker.clone(), cs);
 
@@ -286,6 +307,16 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
     assert!(
         !rendered.contains("[build]"),
         "rendered manifest must NOT carry the source-only [build] section",
+    );
+    // The Dockerfile ENV + WORKDIR were folded in (the platform reads
+    // the OCI image config so authors needn't restate them).
+    assert!(
+        rendered.contains("DOCKER_ONLY"),
+        "rendered manifest must inherit the Dockerfile ENV; got {rendered:?}",
+    );
+    assert!(
+        rendered.contains("/from-docker"),
+        "rendered manifest must inherit the Dockerfile WORKDIR; got {rendered:?}",
     );
 
     // Rootfs was materialized.

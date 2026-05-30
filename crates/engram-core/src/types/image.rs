@@ -22,21 +22,25 @@ pub struct ImageManifest {
     pub description: Option<String>,
 
     /// Non-secret environment variables applied to every sandbox
-    /// spawned from this image. Session-supplied env wins on collision.
+    /// spawned from this image. Includes the image's Dockerfile `ENV`,
+    /// folded in at bake time as a base (see
+    /// [`ImageManifest::apply_image_config_defaults`]); an `engram.toml`
+    /// `[env]` key overrides the Dockerfile value for the same key, and
+    /// a session-supplied env value in turn overrides this.
     #[serde(default)]
     pub env: HashMap<String, String>,
 
     /// Default working directory for processes launched in this image:
     /// the harness at `start_agent`, and `engram exec` when the request
-    /// doesn't carry its own `workdir`. `None` ⇒ the sandbox's default
-    /// cwd (`/`).
+    /// doesn't carry its own `workdir`.
     ///
-    /// The platform does **not** read the OCI image config's
-    /// `WorkingDir` (engram-oci parses no image config), so a Dockerfile
-    /// `WORKDIR` has no effect here — set this explicitly in
-    /// `engram.toml` (`workdir = "/workspace"`). The directory must
-    /// already exist in the rootfs; like a bad `exec` path, an absent
-    /// `workdir` fails the spawn.
+    /// Resolution, highest precedence first: an explicit `engram.toml`
+    /// `workdir`, else the Dockerfile `WORKDIR` (the baker reads the
+    /// image config and folds it in via
+    /// [`ImageManifest::apply_image_config_defaults`]), else the sandbox
+    /// default cwd `/` (`None`). The directory must already exist in the
+    /// rootfs; like a bad `exec` path, an absent `workdir` fails the
+    /// spawn.
     #[serde(default)]
     pub workdir: Option<String>,
 
@@ -85,6 +89,37 @@ pub struct ImageManifest {
     /// mismatch fails the forge request, not session create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitConfig>,
+}
+
+impl ImageManifest {
+    /// Fold a built image's Docker config (its `ENV` as raw
+    /// `KEY=VALUE` strings + `WORKDIR`) in as **defaults** — the
+    /// author's `engram.toml` always wins:
+    /// - env: a `KEY` already present in `[env]` is left untouched;
+    ///   only Dockerfile-only keys are added.
+    /// - workdir: an explicit manifest `workdir` overrides; otherwise
+    ///   the Dockerfile `WORKDIR` applies; absent both, the sandbox
+    ///   default (`/`) stands (left `None`).
+    ///
+    /// The baker calls this before rendering `manifest.toml`, so every
+    /// downstream consumer (enable, create, resume, `/exec`) sees one
+    /// merged manifest and the platform never has to re-read the OCI
+    /// image config. Malformed env entries (no `=`) are skipped; an
+    /// empty `WORKDIR` is treated as unset by the caller.
+    pub fn apply_image_config_defaults(&mut self, env: &[String], working_dir: Option<&str>) {
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                self.env
+                    .entry(k.to_string())
+                    .or_insert_with(|| v.to_string());
+            }
+        }
+        if self.workdir.is_none() {
+            if let Some(wd) = working_dir.filter(|w| !w.is_empty()) {
+                self.workdir = Some(wd.to_string());
+            }
+        }
+    }
 }
 
 /// Git forge binding for an image (ADR 0023). Declares which forge a
@@ -581,6 +616,77 @@ mod tests {
         assert!(
             !rendered.contains("harness"),
             "harness-less image must not render a [harness] table"
+        );
+    }
+
+    #[test]
+    fn apply_image_config_defaults_folds_env_and_workdir() {
+        // engram.toml that overrides one var + sets nothing for workdir.
+        let mut m: ImageManifest = toml::from_str(
+            r#"
+            name = "x"
+            [env]
+            RUSTC_WRAPPER = "sccache"
+        "#,
+        )
+        .unwrap();
+        m.apply_image_config_defaults(
+            &[
+                "PATH=/opt/cargo/bin:/usr/bin".to_string(),
+                "RUSTC_WRAPPER=should-not-win".to_string(), // manifest wins
+                "malformed-no-equals".to_string(),          // skipped
+            ],
+            Some("/workspace/engrams"),
+        );
+        // Dockerfile-only key added; manifest's value preserved.
+        assert_eq!(
+            m.env.get("PATH").map(String::as_str),
+            Some("/opt/cargo/bin:/usr/bin")
+        );
+        assert_eq!(
+            m.env.get("RUSTC_WRAPPER").map(String::as_str),
+            Some("sccache")
+        );
+        assert!(!m.env.contains_key("malformed-no-equals"));
+        // Dockerfile WORKDIR fills the unset manifest workdir.
+        assert_eq!(m.workdir.as_deref(), Some("/workspace/engrams"));
+    }
+
+    #[test]
+    fn apply_image_config_defaults_respects_explicit_workdir_and_empty() {
+        let mut m: ImageManifest =
+            toml::from_str("name = \"x\"\nworkdir = \"/manifest-wins\"").unwrap();
+        m.apply_image_config_defaults(&[], Some("/from-docker"));
+        assert_eq!(
+            m.workdir.as_deref(),
+            Some("/manifest-wins"),
+            "explicit manifest workdir wins"
+        );
+
+        // Empty Dockerfile WORKDIR must not shadow the default `/`.
+        let mut m: ImageManifest = toml::from_str(r#"name = "x""#).unwrap();
+        m.apply_image_config_defaults(&[], Some(""));
+        assert_eq!(m.workdir, None);
+        m.apply_image_config_defaults(&[], None);
+        assert_eq!(m.workdir, None);
+    }
+
+    #[test]
+    fn manifest_with_env_and_workdir_round_trips_through_toml() {
+        // Guards the baker's re-render: a non-empty [env] table *and* a
+        // top-level `workdir` scalar must serialize + parse back intact
+        // (toml must tolerate the scalar after the table).
+        let mut m: ImageManifest = toml::from_str(r#"name = "x""#).unwrap();
+        m.apply_image_config_defaults(
+            &["PATH=/opt/cargo/bin:/usr/bin".to_string()],
+            Some("/workspace"),
+        );
+        let rendered = toml::to_string(&m).unwrap();
+        let back: ImageManifest = toml::from_str(&rendered).unwrap();
+        assert_eq!(back.workdir.as_deref(), Some("/workspace"));
+        assert_eq!(
+            back.env.get("PATH").map(String::as_str),
+            Some("/opt/cargo/bin:/usr/bin")
         );
     }
 
