@@ -18,6 +18,15 @@ ProcessBackend loopback transport) → `2728fd1` (Firecracker vsock forge bridge
 forge-bridge e2e test + CI wiring). Verified: `just check` green (854 tests) + the FC
 `forge_loopback` integration test green on the dev-vm.
 
+**Follow-up (post-Accepted).** The dogfood image was relocated from `deploy/dev-engrams` to the
+deployment repo (engrams-internal) and hardened there — it's cortexapps-specific (the `[git]`
+owner) and is baked by engrams-internal CI, not OSS. The hardening fixed the toolchain pin (→
+the workspace's `stable` channel, not the MSRV floor it had pinned), reconstructed the full Nix
+build inputs on debian (openssl / libclang / kernel headers), added the verify tooling (`just` /
+`cargo-nextest` / `cargo-hakari`) + node/pnpm for the web plane, and warms the cargo registry +
+product-plane `target/` + web `node_modules` at bake. The built-in `create-pull-request` skill +
+forge helpers moved with it.
+
 **One divergence from the proposed design.** §3 proposed multiplexing the forge RPC onto the
 existing harness vsock channel (`GuestRequest`/`GuestResponse` — "no new vsock port, no
 per-backend plumbing"). The implementation instead added a **dedicated forge vsock port**
@@ -166,8 +175,9 @@ present when it boots; no mid-session hot-add).
 5. The built-in `create-pull-request` skill — `SKILL.md` + the `git-askpass` / `engram-pr`
    forge-helper scripts — **baked into the dogfood image's rootfs** (works on both backends, no
    per-backend mount code).
-6. A dogfood image (`deploy/dev-engrams`) + tests (ProcessBackend e2e in the default job; FC
-   forge bridge validated on the dev-vm).
+6. A dogfood image (initially `deploy/dev-engrams`; since relocated to engrams-internal — see
+   the follow-up note above) + tests (ProcessBackend e2e in the default job; FC forge bridge
+   validated on the dev-vm).
 
 **Deferred (designed here, not built in P1).**
 
