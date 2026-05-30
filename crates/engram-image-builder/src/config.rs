@@ -169,6 +169,7 @@ mod tests {
             name = "cortex-api"
             description = "API service"
             secret_mode = "broker"
+            workdir = "/workspace"
 
             [env]
             NODE_ENV = "production"
@@ -198,6 +199,9 @@ mod tests {
             cfg.manifest.env.get("NODE_ENV").map(String::as_str),
             Some("production")
         );
+        // Top-level `workdir` routes into the manifest (ImageManifest
+        // has deny_unknown_fields, so this also guards the key name).
+        assert_eq!(cfg.manifest.workdir.as_deref(), Some("/workspace"));
         assert!(cfg.manifest.secrets.contains_key("GITHUB_TOKEN"));
         assert_eq!(cfg.manifest.network.allow_hosts, vec!["api.github.com"]);
         assert_eq!(cfg.manifest.resources.suggested_memory_mib, Some(4096));

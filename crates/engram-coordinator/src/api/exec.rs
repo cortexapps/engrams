@@ -45,16 +45,58 @@ pub struct ExecResponse {
     pub rusage: ExecRusage,
 }
 
+/// Resolve the image's launch env + default workdir for `id` so exec'd
+/// processes inherit the same environment + cwd the harness would get
+/// (manifest `[env]` + resolved `[secrets]` + per-request secret
+/// overrides, via [`crate::api::sessions::resolve_session_env`]).
+///
+/// This is the fix for agentless `dev_vm` sessions, whose *only* entry
+/// point is exec: agentd inherits a bare boot env (default `PATH`, no
+/// manifest env, no secrets) and a `/` cwd, and the harness-spawn path
+/// — the one place that injected the manifest env — is skipped entirely
+/// in dev-VM mode. Without this, `engram exec` in such a session sees
+/// none of the image's environment.
+///
+/// Best-effort: a session/manifest load failure degrades to
+/// request-only env (the pre-injection behaviour) and never blocks
+/// exec — the subsequent `ensure_active` / registry lookup surfaces any
+/// real "no such session" error.
+async fn session_exec_env(
+    state: &SharedState,
+    id: SessionId,
+) -> (HashMap<String, String>, Option<String>) {
+    match state.services.meta.get_session(id).await {
+        Ok(session) => {
+            let (bundle, env) = crate::api::sessions::resolve_session_env(state, &session).await;
+            (env, bundle.and_then(|b| b.manifest.workdir))
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "exec: session load failed; env/workdir injection skipped",
+            );
+            (HashMap::new(), None)
+        }
+    }
+}
+
 /// Helper: validate the request shape and produce an argv + sandbox
 /// ExecRequest. Centralised so the sync and streaming endpoints stay
 /// consistent.
 ///
-/// `ENGRAM_SESSION_ID` is always injected last so user-supplied env
-/// can't accidentally clobber it. Pool-served sandboxes don't have
-/// a session id baked into their spec — this is where it lands.
+/// `base_env` is the image's launch env (see [`session_exec_env`]); the
+/// request's own `env` is layered on top so a caller can override an
+/// image default. `ENGRAM_SESSION_ID` is always injected last so
+/// neither can clobber it. Pool-served sandboxes don't have a session
+/// id baked into their spec — this is where it lands. `default_workdir`
+/// (the manifest `workdir`) applies only when the request doesn't carry
+/// its own.
 fn build_exec(
     req: ExecRequest,
     session: SessionId,
+    base_env: HashMap<String, String>,
+    default_workdir: Option<String>,
 ) -> Result<(Vec<String>, SandboxExecRequest), ApiError> {
     let argv = match (req.command.as_ref(), req.argv.as_ref()) {
         (Some(c), None) => vec!["sh".into(), "-c".into(), c.clone()],
@@ -65,13 +107,14 @@ fn build_exec(
             ));
         }
     };
-    let mut env = req.env;
+    let mut env = base_env;
+    env.extend(req.env);
     env.insert("ENGRAM_SESSION_ID".into(), session.to_string());
     let sandbox_req = SandboxExecRequest {
         command: argv.clone(),
         stdin: None,
         env,
-        workdir: req.workdir,
+        workdir: req.workdir.or(default_workdir),
         timeout: req.timeout_secs.map(Duration::from_secs),
     };
     Ok((argv, sandbox_req))
@@ -82,7 +125,8 @@ pub async fn exec(
     Path(id): Path<SessionId>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
-    let (argv, sandbox_req) = build_exec(req, id)?;
+    let (base_env, default_workdir) = session_exec_env(&state, id).await;
+    let (argv, sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
 
     // Track B: idle sessions transparently auto-resume on the next
     // request. The exec handler doesn't need to know whether the
@@ -194,7 +238,8 @@ pub async fn exec_stream(
     Path(id): Path<SessionId>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let (argv, sandbox_req) = build_exec(req, id)?;
+    let (base_env, default_workdir) = session_exec_env(&state, id).await;
+    let (argv, sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
 
     crate::api::snapshot::ensure_active(&state, id).await?;
     let sandbox_id = state.registry.get(id).ok_or_else(|| {
@@ -326,4 +371,92 @@ pub async fn exec_stream(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(env: &[(&str, &str)], workdir: Option<&str>) -> ExecRequest {
+        ExecRequest {
+            command: Some("true".into()),
+            argv: None,
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            workdir: workdir.map(str::to_string),
+            timeout_secs: None,
+        }
+    }
+
+    fn base(env: &[(&str, &str)]) -> HashMap<String, String> {
+        env.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn image_env_is_the_base_request_env_overrides_session_id_wins() {
+        let session = SessionId::new();
+        let (_argv, sandbox_req) = build_exec(
+            req(&[("B", "req"), ("C", "req")], None),
+            session,
+            base(&[("A", "img"), ("B", "img")]),
+            None,
+        )
+        .unwrap();
+        // Image env is the base; request env overrides on collision (B);
+        // both image-only (A) and request-only (C) survive.
+        assert_eq!(sandbox_req.env.get("A").map(String::as_str), Some("img"));
+        assert_eq!(sandbox_req.env.get("B").map(String::as_str), Some("req"));
+        assert_eq!(sandbox_req.env.get("C").map(String::as_str), Some("req"));
+        // ENGRAM_SESSION_ID is injected last and can't be clobbered.
+        assert_eq!(
+            sandbox_req.env.get("ENGRAM_SESSION_ID").map(String::as_str),
+            Some(session.to_string().as_str()),
+        );
+    }
+
+    #[test]
+    fn request_cannot_clobber_session_id() {
+        let session = SessionId::new();
+        let (_argv, sandbox_req) = build_exec(
+            req(&[("ENGRAM_SESSION_ID", "evil")], None),
+            session,
+            base(&[]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sandbox_req.env.get("ENGRAM_SESSION_ID").map(String::as_str),
+            Some(session.to_string().as_str()),
+        );
+    }
+
+    #[test]
+    fn workdir_defaults_to_manifest_but_request_wins() {
+        let session = SessionId::new();
+        // No request workdir → the manifest default applies.
+        let (_a, with_default) = build_exec(
+            req(&[], None),
+            session,
+            base(&[]),
+            Some("/workspace".into()),
+        )
+        .unwrap();
+        assert_eq!(with_default.workdir.as_deref(), Some("/workspace"));
+        // Request workdir wins over the manifest default.
+        let (_b, overridden) = build_exec(
+            req(&[], Some("/tmp/here")),
+            session,
+            base(&[]),
+            Some("/workspace".into()),
+        )
+        .unwrap();
+        assert_eq!(overridden.workdir.as_deref(), Some("/tmp/here"));
+        // Neither set → None (sandbox's own default cwd).
+        let (_c, neither) = build_exec(req(&[], None), session, base(&[]), None).unwrap();
+        assert_eq!(neither.workdir, None);
+    }
 }

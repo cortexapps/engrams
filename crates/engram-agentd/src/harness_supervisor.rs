@@ -74,8 +74,19 @@ impl HarnessSupervisor {
         // manifest's resolved `exec` + `args`.
         let mut cmd = Command::new(&argv0);
         cmd.args(&req.argv[1..]);
+        // The harness working directory rides in on a reserved env key
+        // (see `engram_harness_proto::HARNESS_CWD_ENV` for why it's not
+        // a wire-struct field). Pull it out so it sets `current_dir`
+        // rather than leaking into the child's environment.
+        let harness_cwd = req.env.get(engram_harness_proto::HARNESS_CWD_ENV);
         for (k, v) in &req.env {
+            if k == engram_harness_proto::HARNESS_CWD_ENV {
+                continue;
+            }
             cmd.env(k, v);
+        }
+        if let Some(cwd) = harness_cwd {
+            cmd.current_dir(cwd);
         }
         // Point TLS libraries at the canonical CA paths the
         // CaCertInstaller writes (ADR 0021 P1.1). The host called
@@ -182,5 +193,58 @@ mod tests {
             let _ = c.kill().await;
             let _ = c.wait().await;
         }
+    }
+
+    #[tokio::test]
+    async fn harness_cwd_env_sets_working_dir_and_is_stripped_from_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = HarnessSupervisor::new();
+        // cwd rides in on the reserved key; a normal var rides alongside
+        // it. The child writes `pwd`/`env` into files — relative to its
+        // cwd, so they land in `dir` iff current_dir was honored.
+        let mut env = HashMap::new();
+        env.insert(
+            engram_harness_proto::HARNESS_CWD_ENV.to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        env.insert("HARNESS_CWD_MARKER".to_string(), "yes".to_string());
+        let pid = sup
+            .spawn(SpawnHarnessRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "pwd > pwd.out; printenv > env.out".into(),
+                ],
+                env,
+            })
+            .await
+            .unwrap();
+        assert!(pid.is_some());
+        // Let the (fast) child run to completion, then inspect.
+        {
+            let mut guard = sup.inner.lock().await;
+            let mut child = guard.current_child.take().expect("child handle");
+            drop(guard);
+            child.wait().await.unwrap();
+        }
+        let pwd = std::fs::read_to_string(dir.path().join("pwd.out")).unwrap();
+        // Symlinked temp roots (e.g. macOS /var → /private/var) mean we
+        // compare canonical forms, not raw strings.
+        assert_eq!(
+            std::fs::canonicalize(pwd.trim()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap(),
+            "harness should have started in the cwd from HARNESS_CWD_ENV",
+        );
+        let child_env = std::fs::read_to_string(dir.path().join("env.out")).unwrap();
+        assert!(
+            child_env.lines().any(|l| l == "HARNESS_CWD_MARKER=yes"),
+            "ordinary env vars still reach the child",
+        );
+        assert!(
+            !child_env
+                .lines()
+                .any(|l| l.starts_with(&format!("{}=", engram_harness_proto::HARNESS_CWD_ENV))),
+            "the reserved cwd key must be consumed, not leaked into the child env",
+        );
     }
 }

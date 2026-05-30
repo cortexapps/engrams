@@ -26,6 +26,20 @@ pub struct ImageManifest {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
+    /// Default working directory for processes launched in this image:
+    /// the harness at `start_agent`, and `engram exec` when the request
+    /// doesn't carry its own `workdir`. `None` ⇒ the sandbox's default
+    /// cwd (`/`).
+    ///
+    /// The platform does **not** read the OCI image config's
+    /// `WorkingDir` (engram-oci parses no image config), so a Dockerfile
+    /// `WORKDIR` has no effect here — set this explicitly in
+    /// `engram.toml` (`workdir = "/workspace"`). The directory must
+    /// already exist in the rootfs; like a bad `exec` path, an absent
+    /// `workdir` fails the spawn.
+    #[serde(default)]
+    pub workdir: Option<String>,
+
     /// Secrets this image expects. Session creation fails if a
     /// required secret is not provided by the SecretStore. Each
     /// secret's `allow_hosts` list constrains where the value may be

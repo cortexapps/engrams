@@ -470,36 +470,10 @@ pub async fn finish_resume_to_active(
     // + env-with-placeholders) once and reuse it both for the launch
     // env below AND for the post-resume egress policy rebuild. Avoids
     // a second SecretStore round-trip on the resume hot path.
-    let resume_bundle = match crate::api::sessions::resume_manifest_bundle(state, session).await {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "resume_manifest_bundle failed; resume continues without manifest env",
-            );
-            None
-        }
-    };
-    let mut resume_base_env = resume_bundle
-        .as_ref()
-        .map(|b| b.env.clone())
-        .unwrap_or_default();
-    match crate::api::sessions::load_session_secrets(state, id).await {
-        Ok(Some(overrides)) => {
-            for (k, v) in overrides {
-                resume_base_env.insert(k, v);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "load_session_secrets failed; resume continues without per-request overrides",
-            );
-        }
-    }
+    // `resolve_session_env` folds the manifest env + secrets + the
+    // per-request overrides identically to the `/exec` path.
+    let (resume_bundle, resume_base_env) =
+        crate::api::sessions::resolve_session_env(state, session).await;
     // ADR 0021 P1.3: resolve_harness reads the image manifest's
     // [harness] block + the session's mode, not a per-session
     // HarnessSpec. The resume bundle already loaded the manifest;
@@ -513,6 +487,7 @@ pub async fn finish_resume_to_active(
             id,
             None,
             &resume_base_env,
+            b.manifest.workdir.clone(),
         )
         .ok()
         .flatten()

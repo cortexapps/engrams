@@ -48,6 +48,19 @@ pub const HARNESS_VSOCK_PORT: u32 = 1026;
 /// per tool call); 16 MiB gives plenty of headroom for outliers.
 pub const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
 
+/// Reserved env key carrying the harness's working directory from
+/// coord → agentd. The cwd rides the *existing* `SpawnHarnessRequest.env`
+/// field rather than a new wire field on purpose: the host↔agentd frame
+/// is positional bincode (`engram-agentd::proto`) and agentd is baked
+/// into the image, so a freshly-deployed host can talk to an *older*
+/// agentd inside an already-baked base snapshot. Adding a struct field
+/// would risk breaking SpawnHarness for every pre-existing image; an env
+/// entry an old agentd simply ignores (harness stays in `/`) and a new
+/// agentd honors (`current_dir`). Set by `resolve_harness` from the
+/// image manifest's `workdir`; consumed (and stripped from the child
+/// env) by `engram-agentd`'s harness supervisor.
+pub const HARNESS_CWD_ENV: &str = "ENGRAM_HARNESS_CWD";
+
 /// First frame the harness sends after dialing the host. Identifies
 /// which session this connection belongs to. The host validates the
 /// session exists and is in a state that accepts harness traffic; on

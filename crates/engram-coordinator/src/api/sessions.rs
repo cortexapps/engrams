@@ -189,6 +189,58 @@ pub(crate) async fn resume_manifest_bundle(
     })
 }
 
+/// The full launch environment for an existing session: the image
+/// manifest's `[env]` + resolved `[secrets]` (via
+/// [`resume_manifest_bundle`]) with the per-request secret overrides
+/// from [`load_session_secrets`] layered on top — exactly the env the
+/// harness is (re)spawned with on resume.
+///
+/// Shared by two callers that both need this assembled identically:
+/// the resume path (which also wants the [`ResumeManifestBundle`] for
+/// the egress-policy rebuild + harness resolution) and `/exec` (which
+/// wants the env + the manifest `workdir`). Returning the bundle as
+/// well as the folded env lets `/exec` read `manifest.workdir` without
+/// a second load.
+///
+/// Best-effort by design: a manifest-load failure (warn-logged in
+/// [`resume_manifest_bundle`]) yields `(None, request-or-default env)`,
+/// and a secrets-load failure is warn-logged and skipped — neither
+/// blocks the caller. This keeps `/exec` working (request-only env, the
+/// pre-injection behaviour) even if the image lineage is degraded.
+pub(crate) async fn resolve_session_env(
+    state: &SharedState,
+    session: &Session,
+) -> (Option<ResumeManifestBundle>, HashMap<String, String>) {
+    let bundle = match resume_manifest_bundle(state, session).await {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session.id,
+                error = %e,
+                "resolve_session_env: manifest bundle load failed; launch env falls back to overrides-only",
+            );
+            None
+        }
+    };
+    let mut env = bundle.as_ref().map(|b| b.env.clone()).unwrap_or_default();
+    match load_session_secrets(state, session.id).await {
+        Ok(Some(overrides)) => {
+            for (k, v) in overrides {
+                env.insert(k, v);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session.id,
+                error = %e,
+                "resolve_session_env: per-request secret overrides unavailable; continuing without them",
+            );
+        }
+    }
+    (bundle, env)
+}
+
 /// ADR 0016 §A.1.7: rebuild the post-resume [`SessionEgressPolicy`]
 /// from a previously-loaded [`ResumeManifestBundle`] + the new
 /// sandbox's guest IP. Returns `None` when the host doesn't know a
@@ -572,6 +624,7 @@ async fn create_session_inner(
         session_id,
         req.prompt.as_deref(),
         &spec_env,
+        manifest.workdir.clone(),
     )?;
 
     // Network policy: image manifest's `[network]` block, verbatim.
@@ -1125,6 +1178,7 @@ pub(crate) fn resolve_harness(
     session_id: SessionId,
     initial_prompt: Option<&str>,
     base_env: &HashMap<String, String>,
+    workdir: Option<String>,
 ) -> Result<Option<engram_core::types::sandbox::AgentSpec>, ApiError> {
     if session_mode.is_dev_vm() {
         return Ok(None);
@@ -1142,6 +1196,12 @@ pub(crate) fn resolve_harness(
     env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
     if let Some(prompt) = initial_prompt {
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
+    }
+    // The manifest `workdir` reaches agentd as a reserved env entry so
+    // the harness child starts there instead of `/`. See
+    // `HARNESS_CWD_ENV` for why this isn't a wire-struct field.
+    if let Some(cwd) = workdir {
+        env.insert(engram_harness_proto::HARNESS_CWD_ENV.to_string(), cwd);
     }
 
     let mut argv = match state.services.host.harness_dial() {
@@ -1232,6 +1292,7 @@ mod tests {
             name: "test-image".into(),
             description: None,
             env: HashMap::new(),
+            workdir: None,
             secrets: secrets_schema,
             network: NetworkPolicy {
                 default: engram_core::types::image::NetworkDefault::Deny,
@@ -1317,6 +1378,7 @@ mod tests {
             name: "test-image".into(),
             description: None,
             env: HashMap::new(),
+            workdir: None,
             secrets: HashMap::new(),
             network: NetworkPolicy::default(),
             resources: Default::default(),

@@ -1050,6 +1050,54 @@ async fn create_session_dev_vm_mode_skips_harness_on_harnessed_image() {
 }
 
 #[tokio::test]
+async fn dev_vm_exec_inherits_image_env() {
+    // Regression for the dev-VM env gap: an agentless session's only
+    // entry point is `/exec`, and the harness-spawn path (the one place
+    // that injected the manifest `[env]`) is skipped in dev-VM mode. The
+    // exec handler now resolves the image's launch env coord-side
+    // (`session_exec_env` → `resolve_session_env`) and folds it under the
+    // request env, so `engram exec` sees the image's environment instead
+    // of a bare process env. This also guards the wiring + best-effort
+    // degradation of that resolve on a dev-VM session.
+    let store = MockMetadataStore::arc();
+    let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
+    f.write_image(
+        "demo/env-inject",
+        "v1",
+        r#"
+            name = "env-inject"
+            [env]
+            ENGRAM_TEST_IMAGE_VAR = "from-manifest"
+        "#,
+    );
+    let app = f.app;
+
+    let resp = post(
+        app.clone(),
+        "/sessions",
+        json!({ "image": "demo/env-inject:v1", "mode": "dev_vm" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = body_json(resp.into_body()).await;
+    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+
+    let resp = post(
+        app,
+        &format!("/sessions/{id}/exec"),
+        json!({ "command": "printenv ENGRAM_TEST_IMAGE_VAR" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(
+        v["stdout"].as_str().unwrap_or_default().trim(),
+        "from-manifest",
+        "dev-VM exec should inherit the image manifest's [env]",
+    );
+}
+
+#[tokio::test]
 async fn create_session_with_explicit_image_persists_full_row() {
     // The "automatic image selection" paths (latest-ready, default
     // tag) were removed in phase 2 — every session declares an
