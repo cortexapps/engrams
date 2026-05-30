@@ -67,36 +67,54 @@ def env_or(key, default):
     return env_file.get(key) or os.environ.get(key) or default
 
 # ----------------------------------------------------------------
-# Arch dispatch — VZ on Apple Silicon, Firecracker on Linux+KVM.
-# Process backend isn't part of the dev loop anymore (test-only).
+# Backend + topology — one probe, no arch ladder (ADR 0024).
+#
+# `detect-backend.sh` is the single host-capability source of truth
+# (the same script the bake/kernel recipes use): /dev/kvm -> firecracker,
+# macOS+arm64 -> vz, else -> process. The binaries keep their explicit
+# ENGRAM_SANDBOX_BACKEND; we just hand them the concrete value here.
+#
+# The probe drives two coupled decisions:
+#   • backend  — passed verbatim as ENGRAM_SANDBOX_BACKEND.
+#   • topology — `process` runs the coordinator in-process (mode=all,
+#     no host-agent, which has no Process backend); every real-virt
+#     backend runs the prod-shape split (coord mode=coordinator +
+#     host-agent). Split is the default; `process` is the auto-degrade.
 # ----------------------------------------------------------------
 
 uname_str = str(local('uname -s -m', echo_off=True, quiet=True)).strip()
+sandbox_backend = str(
+    local('bash deploy/dev/detect-backend.sh', echo_off=True, quiet=True)
+).strip()
 
-if 'Darwin' in uname_str and 'arm64' in uname_str:
-    sandbox_backend = 'vz'
+# Split (prod-shape) for the real-virt backends; in-process for `process`.
+dev_split = sandbox_backend != 'process'
+# VZ is the only backend that needs the macOS virtualization entitlement,
+# so codesigning is gated on it (not just "is macOS").
+needs_codesign = sandbox_backend == 'vz'
+
+# Kernel artifact: only the real-virt backends boot one. Pick the env
+# var + cache default that matches the chosen backend; the binary reads
+# whichever one corresponds to its backend.
+kernel_key = None
+kernel_path = None
+if sandbox_backend == 'vz':
     kernel_key = 'ENGRAM_VZ_KERNEL_PATH'
     kernel_default = os.environ.get('HOME', '') + '/.cache/engram-vz-test/vmlinux-arm64'
-    kernel_pull_hint = '`just vz-pull-kernel` to populate the cache'
-    needs_codesign = True
-elif 'Linux' in uname_str and 'x86_64' in uname_str:
-    sandbox_backend = 'firecracker'
+    kernel_pull_hint = '`just pull-kernel` to populate the cache'
+elif sandbox_backend == 'firecracker':
     kernel_key = 'ENGRAM_KERNEL_IMAGE_PATH'
     kernel_default = os.environ.get('HOME', '') + '/.cache/engram-fc-test/vmlinux'
-    kernel_pull_hint = ('`bash crates/engram-sandbox-firecracker/scripts/' +
-                        'fetch-fc-test-artifacts.sh` to populate the cache')
-    needs_codesign = False
-else:
-    fail('engram dev: unsupported host %r — Darwin/arm64 (VZ) or ' +
-         'Linux/x86_64 (Firecracker) required' % uname_str)
+    kernel_pull_hint = '`just pull-kernel` to populate the cache'
 
-kernel_path = env_or(kernel_key, kernel_default)
-if not os.path.exists(kernel_path):
-    fail(
-        'kernel artifact not found at {path}. Run {hint}, ' +
-        'or set {key} in .env to a vmlinux path you already have.'
-            .format(path=kernel_path, hint=kernel_pull_hint, key=kernel_key)
-    )
+if kernel_key:
+    kernel_path = env_or(kernel_key, kernel_default)
+    if not os.path.exists(kernel_path):
+        fail(
+            'kernel artifact not found at {path}. Run {hint}, ' +
+            'or set {key} in .env to a vmlinux path you already have.'
+                .format(path=kernel_path, hint=kernel_pull_hint, key=kernel_key)
+        )
 
 # ----------------------------------------------------------------
 # Infra: postgres + registry via docker-compose.
@@ -134,9 +152,9 @@ dc_resource('jaeger',
 # ----------------------------------------------------------------
 # Setup one-shots: KEK + GCS bucket seed + (Mac only) codesign.
 #
-# Harness packs are pushed to the local registry and registered with
-# the coordinator manually via `just bake-harness <name>` (Stage B2:
-# host-resident harnesses gone, registry-only).
+# Built-in harnesses are baked into the image (ADR 0021); `just
+# bake-demo` builds the Claude harness from source, publishes it to the
+# local registry, and bakes deploy/demo-claude/ against it.
 # ----------------------------------------------------------------
 
 local_resource('bootstrap',
@@ -169,18 +187,17 @@ local_resource('seed-buckets',
 # the chain tight.
 # ----------------------------------------------------------------
 
-# ADR 0014: when `ENGRAM_DEV_SPLIT=1` (or set in .env), wire the
-# stack the same way prod is: coord in `mode=coordinator`, a
-# separate host-agent process dialing it over HTTP+gRPC. Default
-# (unset) keeps `mode=all` for the fast inner-loop experience —
-# the same binary serves coord HTTP + a local in-process backend,
-# and there's no host-agent process to manage.
-#
-# Use `ENGRAM_DEV_SPLIT=1 tilt up` (or `ENGRAM_DEV_SPLIT=1` in
-# `.env`) when validating cross-host behavior locally — warm-pool
-# refill driven by the heartbeat-ack, register-time template
-# delivery, and the OCI → BlobStorage materialization end-to-end.
-dev_split = env_or('ENGRAM_DEV_SPLIT', '') in ('1', 'true', 'yes')
+# ADR 0024: topology follows the backend probe (above) — `dev_split`
+# is True for every real-virt backend (coord mode=coordinator + a
+# separate host-agent, matching prod) and False only for `process`
+# (coord mode=all, in-process backend, no host-agent to manage).
+# This is no longer an env flag; the host's capabilities decide.
+
+# CI consumes prebuilt release binaries via ENGRAM_INTEG_BIN_DIR
+# (e.g. target/release) so `tilt ci` doesn't recompile. When set, the
+# serve_cmds `exec` the binary directly instead of `cargo run` /
+# build+codesign. Empty in normal dev.
+bin_dir = env_or('ENGRAM_INTEG_BIN_DIR', '')
 
 # ADR 0019: default the OTLP export target to the local Jaeger (dc above).
 # Both coord and host-agent honor it; engram-telemetry is inert if it ever
@@ -195,7 +212,6 @@ coord_env = {
     'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
     'ENGRAM_SANDBOX_WORK_DIR': './var/sandboxes',
     'ENGRAM_LOCAL_PATH': './var/engram',
-    kernel_key: kernel_path,
     'ENGRAM_DEFAULT_IMAGE': env_or('ENGRAM_DEFAULT_IMAGE', 'warm-1'),
     'ENGRAM_KEK_MASTER_KEY': env_or('ENGRAM_KEK_MASTER_KEY', ''),
     # ADR 0005 / Stage 4: cold-tier blob durability. Default to the
@@ -211,6 +227,17 @@ coord_env = {
     'RUST_LOG': 'info,engram=debug',
 }
 
+# Kernel env var only applies to a real-virt backend (mode=all + vz, or
+# the host-agent under split). `process` boots no kernel.
+if kernel_key and not dev_split:
+    coord_env[kernel_key] = kernel_path
+
+# The process backend is insecure (un-isolated host subprocesses), so
+# the binary refuses to start it unless explicitly allowed. `just dev`
+# on a virt-less box is exactly the sanctioned dev case, so opt in here.
+if sandbox_backend == 'process':
+    coord_env['ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND'] = '1'
+
 # `mke2fs` is keg-only under homebrew/e2fsprogs, so it isn't on the
 # default PATH on Apple Silicon. The host-agent's harness substrate
 # builder shells out to it, so the coordinator process needs it
@@ -220,7 +247,10 @@ if 'Darwin' in uname_str:
         '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
     )
 
-if needs_codesign:
+if bin_dir:
+    # CI: run the downloaded release binary, no compile.
+    coord_serve_cmd = 'exec ' + bin_dir + '/engram-coordinator'
+elif needs_codesign:
     coord_serve_cmd = (
         'cargo build -p engram-coordinator && ' +
         'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
@@ -265,8 +295,9 @@ local_resource('coordinator',
 # and a local in-process backend. In `mode=coordinator` it serves
 # only the API, and a separate `engram-host-agent` process owns
 # the sandbox backend (FC/VZ), heartbeats over HTTP, and answers
-# gRPC HostService calls. Production runs this split shape; the
-# `ENGRAM_DEV_SPLIT=1` flag flips dev to match.
+# gRPC HostService calls. Production runs this split shape; dev runs
+# it too whenever the backend probe picked a real-virt backend
+# (ADR 0024) — only `process` collapses to coord-only mode=all.
 # ----------------------------------------------------------------
 
 if dev_split:
@@ -299,15 +330,42 @@ if dev_split:
         host_agent_env['PATH'] = (
             '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
         )
+    else:
+        # Linux: the host-agent runs under sudo (below), which scrubs
+        # PATH to a secure default. Preserve the caller's PATH so it
+        # still finds firecracker / ip / iptables / mke2fs.
+        host_agent_env['PATH'] = os.environ.get('PATH', '')
+
+    # How to produce + launch the host-agent binary:
+    #   • bin_dir set (CI): exec the prebuilt release binary, no compile.
+    #   • else: cargo build, then launch the debug binary.
+    if bin_dir:
+        ha_bin = bin_dir + '/engram-host-agent'
+        ha_build_prefix = ''
+    else:
+        ha_bin = './target/debug/engram-host-agent'
+        ha_build_prefix = 'cargo build -p engram-host-agent && '
 
     if needs_codesign:
+        # VZ (macOS): the binary needs the virtualization entitlement;
+        # codesign after build, before exec. No sudo on macOS.
         host_agent_serve_cmd = (
-            'cargo build -p engram-host-agent && ' +
-            'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
-            'exec ./target/debug/engram-host-agent'
+            ha_build_prefix +
+            ('bash crates/engram-sandbox-vz/scripts/codesign.sh debug && '
+             if not bin_dir else '') +
+            'exec ' + ha_bin
         )
     else:
-        host_agent_serve_cmd = 'cargo run -p engram-host-agent'
+        # Firecracker (Linux): the host-agent creates per-VM TAPs
+        # (CAP_NET_ADMIN), so it runs under passwordless sudo. sudo
+        # scrubs the environment, so preserve exactly the keys Tilt
+        # injected (--preserve-env). Needs a NOPASSWD sudoers entry on
+        # the box (the dev-vm skill's bootstrap-remote installs one).
+        preserve = ','.join(host_agent_env.keys())
+        host_agent_serve_cmd = (
+            ha_build_prefix +
+            'exec sudo -n --preserve-env=' + preserve + ' ' + ha_bin
+        )
 
     local_resource('host-agent',
         serve_cmd=host_agent_serve_cmd,
