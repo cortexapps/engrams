@@ -104,7 +104,14 @@ if not os.path.exists(kernel_path):
 # `docker-only`, so this call brings up just the two infra services.
 # ----------------------------------------------------------------
 
-docker_compose('deploy/docker-compose.dev.yml')
+# On Linux, layer in the host-networking override for fake-gcs-server
+# (see deploy/docker-compose.linux.yml). macOS uses the base file's
+# published-port form — host networking is unreachable from the Mac
+# host through Docker Desktop's Linux VM.
+compose_files = ['deploy/docker-compose.dev.yml']
+if 'Linux' in uname_str:
+    compose_files.append('deploy/docker-compose.linux.yml')
+docker_compose(compose_files)
 dc_resource('postgres',
     labels=['infra'],
     links=['postgres://engram:engram@localhost:5435/engram'])

@@ -1,0 +1,38 @@
+# Linux-only overrides for the dev / integration stack.
+#
+# Layered on top of `docker-compose.dev.yml` on Linux hosts only:
+#
+#   docker compose -f docker-compose.dev.yml -f docker-compose.linux.yml ...
+#
+# The Tiltfile applies it automatically on Linux; `integration-up.sh`
+# (the dev-vm rig) passes both `-f` flags. macOS / Docker Desktop must
+# NOT apply this file — see below.
+#
+# ----------------------------------------------------------------
+# fake-gcs-server: host networking instead of a published port.
+#
+# On a Linux box that's been used for engram-host-agent development,
+# `host_startup` writes iptables rules into the FORWARD / PREROUTING /
+# POSTROUTING chains. If the host-agent crashes or is killed without
+# running its teardown path, docker's port-publishing DNAT writes
+# collide with those chains ("iptables: No chain/target/match by that
+# name") and the container fails to start. `network_mode: host` skips
+# docker's bridge + DNAT path entirely — the container binds 4443
+# directly on the host, no DNAT involved. Postgres + registry don't
+# hit this because their bindings are realized before the host-agent
+# runs; a freshly (re)started bridge-mode container does.
+#
+# This is the inverse of the macOS situation: on Docker Desktop the
+# container runs inside a Linux VM, so host networking would bind 4443
+# inside that VM and leave it unreachable from the Mac host. That's
+# why host networking lives here, in the Linux-only override, rather
+# than in the base file.
+services:
+  fake-gcs-server:
+    # Host networking makes the base file's published `ports:` mapping
+    # a no-op (compose merges the two files and emits a one-line
+    # "Published ports are discarded when using host network mode"
+    # warning on `up` — harmless). We intentionally don't clear it
+    # with `ports: !reset []`: that tag needs Compose >= 2.24, and the
+    # dev-vm / older Docker Desktop installs predate it.
+    network_mode: host

@@ -37,15 +37,20 @@ fi
 INTEG_DIR="./var/integration"
 mkdir -p "$INTEG_DIR"
 
+# Linux dev-vm: layer in the host-networking override for
+# fake-gcs-server (see deploy/docker-compose.linux.yml) so its port
+# binding doesn't collide with the host-agent's iptables DNAT chains.
+COMPOSE="docker compose -f deploy/docker-compose.dev.yml -f deploy/docker-compose.linux.yml"
+
 echo "==> docker compose: postgres + fake-gcs-server + registry + jaeger"
 # jaeger (ADR 0019) comes up here, BEFORE the host-agent writes its
 # iptables rules, so its bridge-mode published ports don't collide with
 # the host-agent's DNAT chains (same ordering reason as the others).
-docker compose -f deploy/docker-compose.dev.yml up -d postgres fake-gcs-server registry jaeger
+$COMPOSE up -d postgres fake-gcs-server registry jaeger
 
 echo "==> wait for postgres health"
 for _ in $(seq 1 30); do
-    if docker compose -f deploy/docker-compose.dev.yml \
+    if $COMPOSE \
         exec -T postgres pg_isready -U engram -d engram >/dev/null 2>&1; then
         break
     fi

@@ -40,7 +40,7 @@ bash deploy/dev/integration-down.sh
 
 echo ""
 echo "==> docker compose down -v (drops postgres + fake-gcs volumes)"
-docker compose -f deploy/docker-compose.dev.yml down -v
+docker compose -f deploy/docker-compose.dev.yml -f deploy/docker-compose.linux.yml down -v
 
 echo ""
 echo "==> wiping ./var dirs"

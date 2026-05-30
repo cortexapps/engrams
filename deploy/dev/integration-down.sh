@@ -59,6 +59,6 @@ sudo -n pkill -KILL engram-host-agent 2>/dev/null || true
 kill_by_pidfile "$INTEG_DIR/coord.pid" "coordinator"
 
 echo "==> docker compose down (volumes preserved)"
-docker compose -f deploy/docker-compose.dev.yml down
+docker compose -f deploy/docker-compose.dev.yml -f deploy/docker-compose.linux.yml down
 
 echo "✓ integration stack down"
