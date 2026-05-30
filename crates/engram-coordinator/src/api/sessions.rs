@@ -560,6 +560,11 @@ async fn create_session_inner(
         }
     }
 
+    // ADR 0023: mint the per-session forge credential-broker token +
+    // inject the forge env into the sandbox env (which resolve_harness
+    // also clones into the harness env).
+    inject_forge_env(&state, session_id, manifest.git.as_ref(), &mut spec_env);
+
     let agent_for_session = resolve_harness(
         &state,
         manifest.harness.as_ref(),
@@ -1006,6 +1011,9 @@ pub async fn delete_session(
                     },
                 )
                 .await?;
+            // ADR 0023: drop the session's credential-broker token so a
+            // terminated session can no longer mint git credentials.
+            state.git_broker_tokens.remove(&id);
         }
         Err(engram_core::MetaError::Conflict(msg)) => {
             tracing::info!(
@@ -1046,6 +1054,49 @@ pub async fn delete_session(
     let _ = state.services.meta.assign_session_sandbox(id, None).await;
     state.services.host.unbind_session(id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// ADR 0023: when a forge is configured and the image declares `[git]`,
+/// mint a per-session credential-broker token (stored in
+/// `state.git_broker_tokens`) and inject the forge env so the in-session
+/// `GIT_ASKPASS` helper can fetch credentials + open PRs. No-op when no
+/// forge is configured or the image has no `[git]` block. Re-minting on
+/// resume is fine — the latest token wins.
+pub(crate) fn inject_forge_env(
+    state: &SharedState,
+    session_id: SessionId,
+    git: Option<&engram_core::types::image::GitConfig>,
+    env: &mut HashMap<String, String>,
+) {
+    let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
+        return;
+    };
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    state.git_broker_tokens.insert(session_id, token.clone());
+    env.insert("ENGRAM_FORGE_TOKEN".into(), token);
+    if let Some(owner) = git.owner.as_deref() {
+        env.insert("ENGRAM_FORGE_OWNER".into(), owner.to_string());
+    }
+    // Where the in-guest helper reaches the forge endpoints. HostTcp
+    // (ProcessBackend / `--mode=all`): the guest shares host networking,
+    // so it hits the coord on loopback. Vsock (Firecracker): the helper
+    // uses the agentd forge-request bridge instead (ADR 0023 §5), so no
+    // HTTP URL is injected here.
+    if matches!(
+        state.services.host.harness_dial(),
+        engram_core::traits::HarnessDial::HostTcp
+    ) {
+        if let Some((_host, port)) = state.cfg.bind_addr.rsplit_once(':') {
+            env.insert(
+                "ENGRAM_FORGE_ENDPOINT".into(),
+                format!("http://127.0.0.1:{port}"),
+            );
+        }
+    }
 }
 
 /// Resolve the image's baked harness (ADR 0021 P1.3) into the
@@ -1190,6 +1241,7 @@ mod tests {
             resources: Default::default(),
             secret_mode: SecretMode::Broker,
             harness: None,
+            git: None,
         };
 
         // Bundle: one resolved secret; the schema's allow_hosts must
@@ -1270,6 +1322,7 @@ mod tests {
             resources: Default::default(),
             secret_mode: SecretMode::Broker,
             harness: None,
+            git: None,
         };
 
         let mut bundle_inner = HashMap::new();

@@ -9,6 +9,7 @@ pub mod auth;
 mod enabled_images;
 mod events;
 mod exec;
+mod forge;
 // ADR 0021 P1.5a retired `mod harnesses;` — the harness_packs
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).
@@ -147,6 +148,15 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
+        // ADR 0023 in-session forge seam. Authenticated in-handler by
+        // the per-session credential-broker token (not the deployment
+        // bearer), so these live OUTSIDE the `protected` layer — the
+        // in-guest helper holds only its session-scoped token.
+        .route("/sessions/:id/git-credential", get(forge::git_credential))
+        .route(
+            "/sessions/:id/pull-request",
+            post(forge::create_pull_request),
+        )
         .merge(protected)
         .with_state(state)
 }

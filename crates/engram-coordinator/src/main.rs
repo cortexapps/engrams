@@ -154,6 +154,25 @@ struct Cli {
     /// backend is selected.
     #[arg(long, env = "ENGRAM_GCP_PROJECT_ID")]
     gcp_project_id: Option<String>,
+
+    /// Git forge provider for the in-session forge seam (ADR 0023).
+    /// `none` (default) disables it; `github` enables the GitHub App
+    /// backend (requires `--github-app-id` + a private key).
+    #[arg(long, env = "ENGRAM_GIT_FORGE", default_value = "none")]
+    git_forge: String,
+
+    /// GitHub App ID (numeric, as a string) for `--git-forge=github`.
+    #[arg(long, env = "ENGRAM_GITHUB_APP_ID")]
+    github_app_id: Option<String>,
+
+    /// Path to the GitHub App private-key PEM for `--git-forge=github`.
+    #[arg(long, env = "ENGRAM_GITHUB_APP_PRIVATE_KEY_PATH")]
+    github_app_private_key_path: Option<PathBuf>,
+
+    /// GitHub App private-key PEM inline (e.g. piped from a secret
+    /// manager). Takes precedence over `--github-app-private-key-path`.
+    #[arg(long, env = "ENGRAM_GITHUB_APP_PRIVATE_KEY")]
+    github_app_private_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +194,43 @@ fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
         other => Err(format!(
             "unknown secrets backend `{other}` (expected env | gcp)"
         )),
+    }
+}
+
+/// ADR 0023: build the optional git forge authority from CLI flags.
+/// `none` → `None` (forge endpoints 501); `github` → a `GitHubApp`.
+fn build_forge(
+    cli: &Cli,
+) -> Result<Option<Arc<dyn engram_core::traits::GitForge>>, CoordinatorError> {
+    match cli.git_forge.as_str() {
+        "none" => Ok(None),
+        "github" => {
+            let app_id = cli.github_app_id.clone().ok_or_else(|| {
+                CoordinatorError::Config("--git-forge=github requires --github-app-id".into())
+            })?;
+            let pem = match (
+                &cli.github_app_private_key,
+                &cli.github_app_private_key_path,
+            ) {
+                (Some(pem), _) => pem.clone(),
+                (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+                    CoordinatorError::Config(format!("read github app key {}: {e}", path.display()))
+                })?,
+                (None, None) => {
+                    return Err(CoordinatorError::Config(
+                        "--git-forge=github requires --github-app-private-key or \
+                         --github-app-private-key-path"
+                            .into(),
+                    ))
+                }
+            };
+            let app = engram_git_github::GitHubApp::new(app_id, &pem)
+                .map_err(|e| CoordinatorError::Config(format!("github forge: {e}")))?;
+            Ok(Some(Arc::new(app)))
+        }
+        other => Err(CoordinatorError::Config(format!(
+            "invalid --git-forge `{other}` (expected none | github)"
+        ))),
     }
 }
 
@@ -745,11 +801,13 @@ async fn main() -> Result<(), CoordinatorError> {
         materialize_dir: coord_materialize_dir,
     };
 
+    let forge = build_forge(&cli)?;
     engram_coordinator::run_with_registry_and_local(
         cfg,
         services,
         host_registry,
         in_proc_local_backend.map(|b| (in_proc_host, b)),
+        forge,
     )
     .await
 }
