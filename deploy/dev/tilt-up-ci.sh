@@ -53,15 +53,20 @@ echo "    coord up"
 
 # Wait for at least one host-agent to register (FC backend always runs
 # the split topology, so a host-agent is expected).
+#
+# `{ grep || true; }` scopes grep's no-match exit-1 so `set -o pipefail`
+# + `set -e` don't abort the script on the first poll (before any host
+# has registered, /api/hosts is `{"hosts":[]}` and grep matches nothing).
+# Same guard integration-up.sh used; omitting it kills the loop instantly.
 echo "==> waiting for host registration"
 for _ in $(seq 1 180); do
     n=$(curl -fsS http://127.0.0.1:8090/api/hosts 2>/dev/null \
-        | grep -o '"hostname"' | wc -l | tr -d ' ')
+        | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
     [ "${n:-0}" -ge 1 ] && break
     sleep 1
 done
 n=$(curl -fsS http://127.0.0.1:8090/api/hosts 2>/dev/null \
-    | grep -o '"hostname"' | wc -l | tr -d ' ')
+    | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
 if [ "${n:-0}" -lt 1 ]; then
     echo "ERROR: no host-agent registered" >&2
     tail -80 "$LOG" >&2 || true
