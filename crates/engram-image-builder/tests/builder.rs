@@ -331,6 +331,57 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
     assert!(matches!(calls[2], Call::Export { .. }));
     assert!(matches!(calls[3], Call::RmContainer { .. }));
     assert!(matches!(calls[4], Call::Rmi { .. }));
+
+    // No [git] binding → no forge glue injected.
+    assert!(!outcome.rootfs_path.join("opt/engram/git-askpass").exists());
+    assert!(!outcome.rootfs_path.join("usr/local/bin/engram-pr").exists());
+}
+
+#[tokio::test]
+async fn build_injects_forge_helpers_for_git_images() {
+    // ADR 0023: a `[git]` binding makes the baker plant the forge-seam
+    // client glue (askpass + engram-pr + git config + the built-in skill)
+    // into the rootfs — no per-image Dockerfile glue.
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(
+        src.path(),
+        "name = \"forge-img\"\n[git]\nprovider = \"github\"\n",
+    );
+    let docker = RecordingDocker::new();
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
+
+    let outcome = builder
+        .build(&req(src.path(), images.path(), "acme/forge-img", "warm-1"))
+        .await
+        .unwrap();
+    let rootfs = &outcome.rootfs_path;
+
+    assert!(
+        rootfs.join("opt/engram/git-askpass").is_file(),
+        "git-askpass"
+    );
+    assert!(
+        rootfs.join("usr/local/bin/engram-pr").is_file(),
+        "engram-pr"
+    );
+    assert!(rootfs.join("etc/gitconfig").is_file(), "forge gitconfig");
+    assert!(
+        rootfs
+            .join("root/.agents/skills/create-pull-request/SKILL.md")
+            .is_file(),
+        "create-pull-request skill",
+    );
+    // gitconfig wires the askpass; skill teaches engram-pr.
+    let cfg = std::fs::read_to_string(rootfs.join("etc/gitconfig")).unwrap();
+    assert!(
+        cfg.contains("askPass = /opt/engram/git-askpass"),
+        "got {cfg:?}"
+    );
+    // Claude Code loader dir points at the harness-agnostic skills dir.
+    let target = std::fs::read_link(rootfs.join("root/.claude/skills")).unwrap();
+    assert_eq!(target, std::path::Path::new("/root/.agents/skills"));
 }
 
 #[tokio::test]
