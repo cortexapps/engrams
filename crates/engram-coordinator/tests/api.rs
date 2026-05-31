@@ -598,6 +598,73 @@ async fn forge_create_pull_request_opens_and_records() {
     assert_eq!(recorded[0].1.title, "Add x");
 }
 
+#[tokio::test]
+async fn forge_forward_runs_the_core_for_split_hosts() {
+    // ADR 0023 split-mode forwarding: an FC host can't run the forge sink
+    // locally, so it POSTs the in-guest ForgeRequest (with its broker
+    // token) to /api/hosts/forge and gets back the same ForgeResponse the
+    // vsock path would produce.
+    let (app, sid, _forge) = build_forge_app().await;
+
+    // Valid broker token in the body → a minted credential.
+    let req = engram_harness_proto::ForgeRequest {
+        session_id: sid,
+        broker_token: "broker-tok-123".to_string(),
+        op: engram_harness_proto::ForgeOp::FetchCredential {
+            host: "github.com".to_string(),
+            owner: None,
+        },
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/hosts/forge")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp.into_body()).await;
+    assert!(
+        v["Credential"]["password"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty()),
+        "expected a minted credential, got {v:?}",
+    );
+
+    // Wrong broker token → ForgeResponse::Error (200, error in the body),
+    // never a minted credential — the body token is still validated.
+    let bad = engram_harness_proto::ForgeRequest {
+        session_id: sid,
+        broker_token: "wrong".to_string(),
+        op: engram_harness_proto::ForgeOp::FetchCredential {
+            host: "github.com".to_string(),
+            owner: None,
+        },
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/hosts/forge")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&bad).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp.into_body()).await;
+    assert!(
+        v.get("Error").is_some(),
+        "bad token must yield Error, got {v:?}"
+    );
+}
+
 /// Test fixture exposing the meta store so individual tests can
 /// populate images / secrets before exercising the API. The default
 /// `build_app` discards the handle (most tests don't care).

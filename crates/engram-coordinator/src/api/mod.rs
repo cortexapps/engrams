@@ -56,6 +56,10 @@ pub fn router(state: SharedState) -> Router {
         // dispatches back to them over gRPC.
         .route("/api/hosts/register", post(host_http::register))
         .route("/api/hosts/:id/heartbeat", post(host_http::heartbeat))
+        // ADR 0023 split-mode forge forwarding: FC hosts proxy each
+        // in-guest forge request here (the forge sink can't run on the
+        // remote host). Host-authed; the broker token rides in the body.
+        .route("/api/hosts/forge", post(forge::forge_forward))
         .route(
             "/api/hosts/:id/auth/resolve-registry",
             post(host_http::resolve_registry_auth),

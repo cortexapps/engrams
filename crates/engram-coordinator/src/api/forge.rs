@@ -236,6 +236,29 @@ pub async fn create_pull_request(
     }))
 }
 
+// ---- host-facing forwarder (Firecracker split mode) --------------------
+
+/// `POST /api/hosts/forge` — ADR 0023 split-mode forge forwarding.
+///
+/// On a split deployment the FC host can't run the forge `ForgeSink`
+/// locally: the sink needs the coord's `GitForge` + the broker-token
+/// map, and the closure can't cross the coord↔host gRPC boundary
+/// (`RemoteHostClient::set_forge_sink` is a no-op). So the host-agent
+/// reads the in-guest [`ForgeRequest`] off the vsock stream and POSTs it
+/// here; we run the exact same [`process_request`] core as the vsock
+/// path and return the [`ForgeResponse`].
+///
+/// Mounted in the bearer-authed `/api/hosts/*` group (host identity).
+/// The per-session broker token still rides in the body and is validated
+/// by `process_request`, so this is not a way to bypass session scoping —
+/// it's the same two-factor check the in-process path applies.
+pub async fn forge_forward(
+    State(state): State<SharedState>,
+    Json(req): Json<ForgeRequest>,
+) -> Json<ForgeResponse> {
+    Json(process_request(&state, req).await)
+}
+
 // ---- vsock transport (Firecracker) -------------------------------------
 
 /// Handle one in-guest forge connection: read a [`ForgeRequest`], run

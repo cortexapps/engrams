@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::{HostId, SandboxId, SessionId};
-use engram_harness_proto::HarnessEvent;
+use engram_harness_proto::{ForgeRequest, ForgeResponse, HarnessEvent};
 use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
 use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,26 @@ impl CoordClient {
             });
         }
         Ok(())
+    }
+
+    /// POST /api/hosts/forge
+    ///
+    /// ADR 0023 split-mode forge forwarding. The host-agent reads the
+    /// in-guest `ForgeRequest` off the forge vsock stream and proxies it
+    /// to the coord (which holds the `GitForge` + broker map), then writes
+    /// the returned `ForgeResponse` back to the guest. A transport/HTTP
+    /// failure surfaces as an `Err`; a forge-level failure (bad token,
+    /// API error) comes back inside `ForgeResponse::Error` with a 200, so
+    /// the guest helper always gets a usable reply.
+    pub async fn forge(&self, req: &ForgeRequest) -> Result<ForgeResponse, CoordClientError> {
+        let url = self.endpoint("/api/hosts/forge");
+        let builder = self.http.post(&url);
+        let resp = self
+            .auth(builder, req)
+            .send()
+            .await
+            .map_err(CoordClientError::Transport)?;
+        decode_json(resp, "forge").await
     }
 
     /// POST /api/hosts/:id/live-manifest

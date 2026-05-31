@@ -331,6 +331,47 @@ impl HostAgent {
             let sink: engram_core::traits::HarnessSink =
                 std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
             pooled.set_harness_sink(sink);
+
+            // ADR 0023 split-mode forge forwarding. The forge sink can't
+            // live on the host (it needs the coord's GitForge + broker
+            // map), so — exactly like the harness event forwarding above
+            // — the host proxies each in-guest forge dial to the coord
+            // over HTTP: read the `ForgeRequest` off the vsock stream,
+            // POST it to `/api/hosts/forge`, write the `ForgeResponse`
+            // back. Without this the FC forge accept loop has no sink and
+            // drops every dial (guest sees "Broken pipe").
+            let coord_client_for_forge = coord_client::CoordClient::new(
+                coord_url.clone(),
+                self.cfg.coordinator_token.clone(),
+            );
+            let forge_sink: engram_core::traits::ForgeSink = std::sync::Arc::new(
+                move |mut stream| {
+                    let cc = coord_client_for_forge.clone();
+                    tokio::spawn(async move {
+                        let req: engram_harness_proto::ForgeRequest =
+                            match engram_harness_proto::read_msg(&mut stream).await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "forge: malformed request from guest");
+                                    return;
+                                }
+                            };
+                        let resp = match cc.forge(&req).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "forge: forward to coord failed");
+                                engram_harness_proto::ForgeResponse::Error {
+                                    message: format!("forge forward to coord failed: {e}"),
+                                }
+                            }
+                        };
+                        if let Err(e) = engram_harness_proto::write_msg(&mut stream, &resp).await {
+                            tracing::debug!(error = %e, "forge: response write to guest failed");
+                        }
+                    });
+                },
+            );
+            pooled.set_forge_sink(forge_sink);
             // ADR 0015 M5: warm-pool retired. LocalHostClient is just
             // the cold-create dispatch wrapper now.
             let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
