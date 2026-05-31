@@ -67,7 +67,22 @@ async fn session_exec_env(
 ) -> (HashMap<String, String>, Option<String>) {
     match state.services.meta.get_session(id).await {
         Ok(session) => {
-            let (bundle, env) = crate::api::sessions::resolve_session_env(state, &session).await;
+            let (bundle, mut env) =
+                crate::api::sessions::resolve_session_env(state, &session).await;
+            // ADR 0023: a dev_vm session has no harness to carry the forge
+            // broker token (agent mode gets it via `spec_env`), so fold it
+            // in here too — otherwise git-askpass / engram-pr from an exec
+            // shell has no ENGRAM_FORGE_TOKEN and the forge seam rejects
+            // the request. `inject_forge_env` is idempotent: it reuses the
+            // token minted at create, and no-ops without `[git]` + a forge.
+            if let Some(b) = bundle.as_ref() {
+                crate::api::sessions::inject_forge_env(
+                    state,
+                    id,
+                    b.manifest.git.as_ref(),
+                    &mut env,
+                );
+            }
             (env, bundle.and_then(|b| b.manifest.workdir))
         }
         Err(e) => {

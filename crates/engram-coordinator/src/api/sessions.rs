@@ -1124,12 +1124,22 @@ pub(crate) fn inject_forge_env(
     let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
         return;
     };
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    state.git_broker_tokens.insert(session_id, token.clone());
+    // Idempotent: reuse the session's existing broker token (minted at
+    // create) when present, so a later call from the `/exec` path injects
+    // the SAME token rather than orphaning a fresh one in the map. The
+    // first call (create) mints + stores it.
+    let token = match state.git_broker_tokens.get(&session_id) {
+        Some(existing) => existing.value().clone(),
+        None => {
+            let minted = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            state.git_broker_tokens.insert(session_id, minted.clone());
+            minted
+        }
+    };
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
     if let Some(owner) = git.owner.as_deref() {
         env.insert("ENGRAM_FORGE_OWNER".into(), owner.to_string());
