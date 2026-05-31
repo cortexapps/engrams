@@ -487,4 +487,4 @@ See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK
 
 ## License
 
-Apache-2.0 — see `LICENSE`.
+Apache-2.0 — see [`LICENSE`](./LICENSE).
