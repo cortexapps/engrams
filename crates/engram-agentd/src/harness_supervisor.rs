@@ -65,6 +65,11 @@ impl HarnessSupervisor {
             tracing::debug!("SpawnHarness with empty argv — readiness probe; no spawn");
             return Ok(None);
         }
+        // Sync the guest clock to the host before spawning the harness, so
+        // the agent (and the git/cargo children it drives) start on a
+        // correct clock right after a resume. The periodic tick keeps a
+        // long-running harness corrected across later resumes.
+        crate::clock::sync_now();
         let argv0 = req.argv[0].clone();
 
         // ADR 0021 P1.4: the harness binary is baked into the rootfs

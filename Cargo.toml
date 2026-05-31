@@ -87,6 +87,9 @@ futures-util = "0.3"
 bytes = "1"
 pin-project-lite = "0.2"
 base64 = "0.22"
+# guest clock discipline — agentd steps CLOCK_REALTIME to the host KVM PTP
+# clock (/dev/ptp0) after snapshot/restore. The clock layer behind ntpd-rs.
+clock-steering = "0.2.1"
 
 # wire codecs
 bincode = "1.3"

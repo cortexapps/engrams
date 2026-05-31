@@ -175,6 +175,12 @@ where
         ));
     }
 
+    // Sync the guest clock to the host before spawning. A just-resumed
+    // session would otherwise run this command on a clock frozen at
+    // snapshot time (hours behind), breaking SigV4 (e.g. sccache → GCS),
+    // token windows, and timestamps. No-op when there's no skew / no PTP.
+    crate::clock::sync_now();
+
     let mut cmd = Command::new(&req.command[0]);
     cmd.args(&req.command[1..]);
     for (k, v) in &req.env {

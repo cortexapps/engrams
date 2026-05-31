@@ -224,6 +224,12 @@ fn boot_uptime_secs() -> Option<f64> {
 }
 
 async fn run(args: Args) -> std::io::Result<()> {
+    // Keep the guest wall clock synced to the host across snapshot/restore
+    // (FC freezes CLOCK_REALTIME at capture; a long-idle restore wakes up
+    // hours behind, breaking SigV4 / token windows). No-op without a KVM
+    // PTP device. Must run inside the runtime — it spawns the tick loop.
+    engram_agentd::clock::init();
+
     let token = args.token.clone();
     if token.is_some() {
         tracing::info!("first-frame token auth enabled");
