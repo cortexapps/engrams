@@ -251,12 +251,23 @@ pub enum WireRequest {
 pub struct SpawnHarnessRequest {
     /// argv to exec as the harness child. Empty = readiness probe;
     /// no spawn happens, the agent replies `HarnessSpawned { pid:
-    /// None }`.
+    /// None }`. agentd still records `session_env` on a readiness
+    /// probe — dev_vm sessions never spawn a harness but their
+    /// exec/shell processes still inherit the session env.
     pub argv: Vec<String>,
-    /// Env merged on top of agentd's own env (additive; duplicate
-    /// keys take this value).
+    /// Harness-only extras (initial prompt, dial address, working-dir
+    /// key, forge broker token), merged on top of `session_env` for
+    /// the harness child. Additive; duplicate keys take this value.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// The durable session environment (image `[env]` + resolved
+    /// secrets + `ENGRAM_SESSION_ID`). agentd holds this from the bind
+    /// and applies it as the base env for every process it spawns —
+    /// the harness, `/exec` commands, and the interactive shell — so
+    /// they all see the same environment. Forge tokens and other
+    /// per-request/harness-only vars ride `env` instead.
+    #[serde(default)]
+    pub session_env: HashMap<String, String>,
 }
 
 /// Body of [`WireRequest::InstallHostCa`]. ADR 0021 P1 reference:

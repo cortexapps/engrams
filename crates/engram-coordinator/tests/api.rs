@@ -1119,13 +1119,14 @@ async fn create_session_dev_vm_mode_skips_harness_on_harnessed_image() {
 #[tokio::test]
 async fn dev_vm_exec_inherits_image_env() {
     // Regression for the dev-VM env gap: an agentless session's only
-    // entry point is `/exec`, and the harness-spawn path (the one place
-    // that injected the manifest `[env]`) is skipped in dev-VM mode. The
-    // exec handler now resolves the image's launch env coord-side
-    // (`session_exec_env` → `resolve_session_env`) and folds it under the
-    // request env, so `engram exec` sees the image's environment instead
-    // of a bare process env. This also guards the wiring + best-effort
-    // degradation of that resolve on a dev-VM session.
+    // entry point is `/exec`, and dev-VM mode spawns no harness. The
+    // durable session env (the image manifest `[env]` + secrets) is the
+    // sandbox-wide env applied to every process: ProcessBackend (this
+    // test) applies it to each exec from `SandboxSpec.env`, and on
+    // Firecracker agentd holds it from the bind and applies it to
+    // exec/shell/harness alike — so `engram exec` sees the image's
+    // environment instead of a bare process env, with no per-request
+    // re-injection by the coord.
     let store = MockMetadataStore::arc();
     let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
     f.write_image(

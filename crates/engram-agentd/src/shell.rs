@@ -24,6 +24,7 @@
 //! tokio Mutex so concurrent StartShell calls serialize on the spawn
 //! decision rather than racing each other into two ttyd processes.
 
+use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -93,7 +94,17 @@ pub struct ShellOutcome {
 /// the spawn path we probe the port; an existing listener (whether
 /// from init or from a previous StartShell on this same agentd) is
 /// reported as `spawned = false`.
-pub async fn start_shell(port: u16) -> io::Result<ShellOutcome> {
+/// `session_env` is the durable session environment (image `[env]` +
+/// secrets + session id) the host carried in on `SpawnHarness`. It's
+/// applied to ttyd so the interactive shell — and the bash it execs on
+/// connect — start in the same environment the harness and `/exec` see
+/// (sccache wrapper, GCS creds, toolchain PATH, …). Only the fresh-spawn
+/// path uses it; a pre-existing/re-entry ttyd already carries it from its
+/// own spawn.
+pub async fn start_shell(
+    port: u16,
+    session_env: HashMap<String, String>,
+) -> io::Result<ShellOutcome> {
     let mut guard = state().await.lock().await;
 
     // Path 0: somebody already bound the port — typically the bake's
@@ -163,6 +174,10 @@ pub async fn start_shell(port: u16) -> io::Result<ShellOutcome> {
         // -p <port> = bind port.
         // Final positional arg = command to exec on connect.
         .args(["-W", "-p", &port.to_string(), &shell_bin])
+        // The session env (sccache, secrets, toolchain PATH) on top of
+        // agentd's inherited boot env; the bash ttyd execs on connect
+        // inherits it, then layers /root/.bashrc.
+        .envs(&session_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

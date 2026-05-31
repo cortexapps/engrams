@@ -857,6 +857,7 @@ mod tests {
                 format!("echo $$ > {pid_file}; exec sleep 60"),
             ],
             env: HashMap::new(),
+            session_env: HashMap::new(),
             host_ca_pem: None,
         };
         b.start_agent(id, agent).await.unwrap();

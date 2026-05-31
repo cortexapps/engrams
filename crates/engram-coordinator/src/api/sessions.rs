@@ -612,20 +612,32 @@ async fn create_session_inner(
         }
     }
 
-    // ADR 0023: mint the per-session forge credential-broker token +
-    // inject the forge env into the sandbox env (which resolve_harness
-    // also clones into the harness env).
-    inject_forge_env(&state, session_id, manifest.git.as_ref(), &mut spec_env);
+    // The durable session environment agentd holds at bind and applies as
+    // the base env for every process it spawns — harness, `/exec`, and the
+    // interactive shell. It's the image `[env]` + resolved secrets (already
+    // in spec_env) plus the session id. The forge broker token is
+    // deliberately NOT folded in: it's a short-lived per-request credential
+    // (re-minted so it survives a coord restart), so it rides each spawn's
+    // own env instead of the cached session env. See `AgentSpec::session_env`.
+    let mut session_env = spec_env.clone();
+    session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
 
-    let agent_for_session = resolve_harness(
+    let mut agent_for_session = resolve_harness(
         &state,
         manifest.harness.as_ref(),
         req.mode,
         session_id,
         req.prompt.as_deref(),
-        &spec_env,
+        session_env.clone(),
         manifest.workdir.clone(),
     )?;
+    // ADR 0023: mint the per-session forge broker token and hand it to the
+    // harness as a per-spawn extra (`AgentSpec::env`, layered on top of
+    // session_env). dev_vm sessions have no harness; their `/exec` path
+    // mints the token per request instead.
+    if let Some(agent) = agent_for_session.as_mut() {
+        inject_forge_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
+    }
 
     // Network policy: image manifest's `[network]` block, verbatim.
     // ADR 0005 retired the platform's git workspace (no clone URL to
@@ -806,6 +818,9 @@ async fn create_session_inner(
     let agent = agent_for_session.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
         argv: Vec::new(),
         env: std::collections::HashMap::new(),
+        // dev_vm readiness probe: no harness ever spawns, but agentd still
+        // records this so the session's `/exec` and shell inherit it.
+        session_env,
         // Host-agent fills `host_ca_pem` in from its local egress
         // state (ADR 0021 P1.2). Coord leaves it None.
         host_ca_pem: None,
@@ -1187,7 +1202,7 @@ pub(crate) fn resolve_harness(
     session_mode: SessionMode,
     session_id: SessionId,
     initial_prompt: Option<&str>,
-    base_env: &HashMap<String, String>,
+    session_env: HashMap<String, String>,
     workdir: Option<String>,
 ) -> Result<Option<engram_core::types::sandbox::AgentSpec>, ApiError> {
     if session_mode.is_dev_vm() {
@@ -1202,8 +1217,11 @@ pub(crate) fn resolve_harness(
         return Ok(None);
     };
 
-    let mut env: HashMap<String, String> = base_env.clone();
-    env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
+    // Harness-only extras, layered on top of `session_env` for the harness
+    // child. `session_env` already carries ENGRAM_SESSION_ID + the image
+    // env + secrets, so they aren't repeated here; the forge broker token
+    // is added by the caller (per-spawn, kept out of the cached env).
+    let mut env: HashMap<String, String> = HashMap::new();
     if let Some(prompt) = initial_prompt {
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
     }
@@ -1252,6 +1270,7 @@ pub(crate) fn resolve_harness(
     Ok(Some(engram_core::types::sandbox::AgentSpec {
         argv,
         env,
+        session_env,
         host_ca_pem: None,
     }))
 }

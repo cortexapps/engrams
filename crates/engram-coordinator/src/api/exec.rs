@@ -65,48 +65,53 @@ async fn session_exec_env(
     state: &SharedState,
     id: SessionId,
 ) -> (HashMap<String, String>, Option<String>) {
-    match state.services.meta.get_session(id).await {
-        Ok(session) => {
-            let (bundle, mut env) =
-                crate::api::sessions::resolve_session_env(state, &session).await;
-            // ADR 0023: a dev_vm session has no harness to carry the forge
-            // broker token (agent mode gets it via `spec_env`), so fold it
-            // in here too — otherwise git-askpass / engram-pr from an exec
-            // shell has no ENGRAM_FORGE_TOKEN and the forge seam rejects
-            // the request. `inject_forge_env` is idempotent: it reuses the
-            // token minted at create, and no-ops without `[git]` + a forge.
-            if let Some(b) = bundle.as_ref() {
-                crate::api::sessions::inject_forge_env(
-                    state,
-                    id,
-                    b.manifest.git.as_ref(),
-                    &mut env,
-                );
-            }
-            (env, bundle.and_then(|b| b.manifest.workdir))
-        }
+    // agentd holds the durable session env (image `[env]` + secrets +
+    // session id) from the bind and applies it to every exec, so we don't
+    // re-resolve it here (that would just duplicate what agentd already
+    // has). The exec wire env carries only the per-request forge broker
+    // token — a short-lived credential deliberately kept out of the cached
+    // session env so it's minted fresh and survives a coord restart — plus
+    // the manifest's default workdir.
+    let session = match state.services.meta.get_session(id).await {
+        Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 session_id = %id,
                 error = %e,
-                "exec: session load failed; env/workdir injection skipped",
+                "exec: session load failed; forge/workdir injection skipped",
             );
-            (HashMap::new(), None)
+            return (HashMap::new(), None);
         }
+    };
+    let bundle = match crate::api::sessions::resume_manifest_bundle(state, &session).await {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "exec: manifest bundle load failed; forge/workdir injection skipped",
+            );
+            None
+        }
+    };
+    let mut env = HashMap::new();
+    if let Some(b) = bundle.as_ref() {
+        crate::api::sessions::inject_forge_env(state, id, b.manifest.git.as_ref(), &mut env);
     }
+    (env, bundle.and_then(|b| b.manifest.workdir))
 }
 
 /// Helper: validate the request shape and produce an argv + sandbox
 /// ExecRequest. Centralised so the sync and streaming endpoints stay
 /// consistent.
 ///
-/// `base_env` is the image's launch env (see [`session_exec_env`]); the
-/// request's own `env` is layered on top so a caller can override an
-/// image default. `ENGRAM_SESSION_ID` is always injected last so
-/// neither can clobber it. Pool-served sandboxes don't have a session
-/// id baked into their spec — this is where it lands. `default_workdir`
-/// (the manifest `workdir`) applies only when the request doesn't carry
-/// its own.
+/// `base_env` is the per-request exec additions (the forge broker token;
+/// see [`session_exec_env`]) — the durable image env + secrets are held by
+/// agentd and applied *underneath* this. The request's own `env` layers on
+/// top so a caller can override a default. `ENGRAM_SESSION_ID` is injected
+/// last so neither can clobber it (agentd also carries it in session_env;
+/// setting it here keeps exec self-describing). `default_workdir` (the
+/// manifest `workdir`) applies only when the request doesn't carry its own.
 fn build_exec(
     req: ExecRequest,
     session: SessionId,
@@ -412,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn image_env_is_the_base_request_env_overrides_session_id_wins() {
+    fn base_env_is_the_base_request_env_overrides_session_id_wins() {
         let session = SessionId::new();
         let (_argv, sandbox_req) = build_exec(
             req(&[("B", "req"), ("C", "req")], None),
@@ -421,8 +426,10 @@ mod tests {
             None,
         )
         .unwrap();
-        // Image env is the base; request env overrides on collision (B);
-        // both image-only (A) and request-only (C) survive.
+        // base_env (per-request additions — the forge token in prod) is the
+        // base; request env overrides on collision (B); both base-only (A)
+        // and request-only (C) survive. The durable image env lives a layer
+        // below this, applied by the backend/agentd, not here.
         assert_eq!(sandbox_req.env.get("A").map(String::as_str), Some("img"));
         assert_eq!(sandbox_req.env.get("B").map(String::as_str), Some("req"));
         assert_eq!(sandbox_req.env.get("C").map(String::as_str), Some("req"));

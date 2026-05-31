@@ -3338,6 +3338,7 @@ impl SandboxBackend for FirecrackerBackend {
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
+            session_env: agent.session_env.into_iter().collect(),
         });
 
         // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.

@@ -66,11 +66,25 @@ pub struct AgentSpec {
     /// ProcessBackend this means an absolute host path; for
     /// Firecracker it's a path inside the rootfs.
     pub argv: Vec<String>,
-    /// Extra env on top of the sandbox-wide env. Used to inject
-    /// the harness-hub address, session id, attach token, etc.
-    /// without polluting the sandbox-wide env.
+    /// Harness-*only* extras, layered on top of [`Self::session_env`]
+    /// for the harness child: the initial prompt, the harness dial
+    /// address, the working-directory key, and the per-request forge
+    /// broker token. These are deliberately NOT in `session_env` —
+    /// they're either harness-specific or short-lived credentials, so
+    /// they don't belong in the env every session process inherits.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// The durable session environment: the image manifest `[env]` +
+    /// resolved secrets + `ENGRAM_SESSION_ID`. agentd holds this at
+    /// bind (it rides the `SpawnHarness` frame) and applies it as the
+    /// base env for *every* process it spawns — the harness, `/exec`
+    /// commands, and the interactive shell — so "every way you run a
+    /// command in a session sees the same environment" holds by
+    /// construction. Populated for all modes, including the dev_vm
+    /// readiness probe (empty argv) where no harness ever spawns but
+    /// exec/shell still need it.
+    #[serde(default)]
+    pub session_env: HashMap<String, String>,
     /// Per-host egress-proxy CA cert in PEM form (ADR 0021 P1).
     /// Populated by the host-agent *after* receiving the spec from
     /// coord, immediately before handing it to the sandbox backend —
@@ -213,17 +227,20 @@ mod tests {
         let none = AgentSpec {
             argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
             env: HashMap::from_iter([("FOO".into(), "bar".into())]),
+            session_env: HashMap::from_iter([("RUSTC_WRAPPER".into(), "sccache".into())]),
             host_ca_pem: None,
         };
         let bytes = bincode::serialize(&none).expect("bincode encode None");
         let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode None");
         assert_eq!(back.argv, none.argv);
         assert_eq!(back.env, none.env);
+        assert_eq!(back.session_env, none.session_env);
         assert!(back.host_ca_pem.is_none());
 
         let some = AgentSpec {
             argv: vec!["/opt/engram/harness/harness".into()],
             env: HashMap::new(),
+            session_env: HashMap::new(),
             host_ca_pem: Some(
                 "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into(),
             ),

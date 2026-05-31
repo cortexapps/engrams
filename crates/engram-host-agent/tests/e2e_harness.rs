@@ -450,6 +450,7 @@ async fn drive_harness(
             AgentSpec {
                 argv,
                 env,
+                session_env: HashMap::new(),
                 // ADR 0021 P1.1+P1.2: triggers `InstallHostCa` over
                 // vsock right before SpawnHarness, so the in-VM
                 // trust store carries the engram proxy CA before
@@ -755,6 +756,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
             AgentSpec {
                 argv: Vec::new(),
                 env: HashMap::new(),
+                session_env: HashMap::new(),
                 host_ca_pem: Some(ca_pem.clone()),
             },
         )

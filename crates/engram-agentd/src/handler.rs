@@ -130,7 +130,10 @@ where
         }
         WireRequest::StartShell { port } => {
             let port = port.unwrap_or(crate::shell::DEFAULT_TTYD_PORT);
-            let resp = match crate::shell::start_shell(port).await {
+            // The interactive shell inherits the same durable session env
+            // as the harness and `/exec`, so `cargo build` in the SHELL tab
+            // uses the shared sccache + sees the image's secrets.
+            let resp = match crate::shell::start_shell(port, supervisor.session_env()).await {
                 Ok(outcome) => WireResponse::ShellReady {
                     port: outcome.port,
                     spawned: outcome.spawned,
@@ -183,6 +186,16 @@ where
 
     let mut cmd = Command::new(&req.command[0]);
     cmd.args(&req.command[1..]);
+    // Base: the durable session env agentd holds from the bind (image
+    // `[env]`, secrets, PATH, session id) — identical to what the harness
+    // and the interactive shell get, so `engram exec cargo build` sees the
+    // same sccache/secret env an agent would. The request's own env layers
+    // on top: a caller can override an image default, and per-request
+    // credentials (the forge broker token) ride in here.
+    let session_env = supervisor.session_env();
+    for (k, v) in &session_env {
+        cmd.env(k, v);
+    }
     for (k, v) in &req.env {
         cmd.env(k, v);
     }

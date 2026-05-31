@@ -423,6 +423,7 @@ impl SandboxBackend for VzBackend {
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
+            session_env: agent.session_env.into_iter().collect(),
         });
         engram_agentd::write_msg(&mut conn, &req)
             .await

@@ -366,6 +366,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
             AgentSpec {
                 argv: Vec::new(),
                 env: HashMap::new(),
+                session_env: HashMap::new(),
                 host_ca_pem: Some(ca.cert_pem.clone()),
             },
         )

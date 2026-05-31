@@ -480,17 +480,25 @@ pub async fn finish_resume_to_active(
     // a None bundle (manifest fetch failed above) means we skip the
     // agent re-attach, same as the dev-VM path.
     let agent_opt = resume_bundle.as_ref().and_then(|b| {
-        crate::api::sessions::resolve_harness(
+        // Same split as create: agentd holds the durable session env (image
+        // env + secrets + session id); the harness gets the forge broker
+        // token as a per-spawn extra — re-minted here so it's valid even
+        // after a coord restart dropped the in-memory token map.
+        let mut session_env = resume_base_env.clone();
+        session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
+        let mut agent = crate::api::sessions::resolve_harness(
             state,
             b.manifest.harness.as_ref(),
             session.mode,
             id,
             None,
-            &resume_base_env,
+            session_env,
             b.manifest.workdir.clone(),
         )
         .ok()
-        .flatten()
+        .flatten()?;
+        crate::api::sessions::inject_forge_env(state, id, b.manifest.git.as_ref(), &mut agent.env);
+        Some(agent)
     });
     let mut start_agent_failed = false;
     if let Some(agent) = agent_opt {

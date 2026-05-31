@@ -200,6 +200,7 @@ exec = "/opt/noop/harness"
             session_id.to_string(),
         ],
         env: HashMap::new(),
+        session_env: HashMap::new(),
         host_ca_pem: None,
     };
     backend
