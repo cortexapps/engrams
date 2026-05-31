@@ -16,21 +16,28 @@ TCP transport here stands in for vsock.
 
 ## 1. Start the stack
 
+`just dev` auto-detects the backend (ADR 0024). For this no-virt
+walkthrough, force the process backend with the env override —
+`detect-backend.sh` honors it, so the Tiltfile runs the coordinator in
+`mode=all` with the in-process `ProcessBackend`:
+
 ```bash
-just dev
+ENGRAM_SANDBOX_BACKEND=process just dev
 ```
 
-This brings up Postgres in Docker, builds `engram-harness-noop`, and
-runs the coordinator with:
+This brings up Postgres in Docker and runs the coordinator with:
 
-- `ENGRAM_MODE=all` — single-binary; the host-agent runs in the
-  same process as the coordinator.
-- `ENGRAM_SANDBOX_BACKEND=process` — sandboxes are subprocesses
-  rooted in `./var/sandboxes/<sandbox-id>/`.
-- `ENGRAM_DEV_AUTO_NOOP=1` — every new session auto-spawns the
-  noop harness adapter, which dials the host-agent's harness TCP
-  listener.
-Sessions go through the chunked-OCI cold path on every create.
+- `ENGRAM_MODE=all` — single-binary; the host-agent runs in the same
+  process as the coordinator (auto-selected for the process backend).
+- `ENGRAM_SANDBOX_BACKEND=process` — sandboxes are subprocesses rooted
+  in `./var/sandboxes/<sandbox-id>/`. `just dev` sets
+  `ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1` for you.
+
+To drive a no-agent session, use `just integration-session`
+(`HARNESS=none`), or attach the noop adapter by exporting
+`ENGRAM_DEV_AUTO_AGENT=noop` (renamed from the old
+`ENGRAM_DEV_AUTO_NOOP`). Sessions go through the chunked-OCI cold path
+on every create.
 Warm pools were retired with ADR 0008, briefly revived in ADR 0014,
 and retired again under ADR 0015 M5; hosts now prefetch image
 chunks into a per-host NVMe cache so cold-create reads stay local.

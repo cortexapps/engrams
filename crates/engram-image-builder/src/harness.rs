@@ -43,13 +43,16 @@ pub const CANONICAL_HARNESS_DIR_ABS: &str = "/opt/engram/harness";
 /// `<rootfs>/opt/engram/harness/artifact.toml`).
 pub const ARTIFACT_DESCRIPTOR: &str = "artifact.toml";
 
-/// Target platform for a built-in harness artifact. Today only
-/// `linux/x86_64` ships; arm64 is a follow-up the catalog will gain
-/// once we publish those tags. The variant maps to the tag suffix
-/// used in the OCI reference (e.g. `:v1.2.3-linux-x86_64`).
+/// Target platform for a built-in harness artifact. The harness binary
+/// runs inside the guest, so the relevant arch is the guest rootfs's,
+/// not the host's. The variant maps to the tag suffix used in the OCI
+/// reference (e.g. `:v1.2.3-linux-x86_64`). CI publishes one artifact
+/// per variant (`harness-claude:<ver>-linux-x86_64` and
+/// `-linux-arm64`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Platform {
     LinuxX86_64,
+    LinuxArm64,
 }
 
 impl Platform {
@@ -57,6 +60,34 @@ impl Platform {
     pub fn tag_suffix(self) -> &'static str {
         match self {
             Platform::LinuxX86_64 => "linux-x86_64",
+            Platform::LinuxArm64 => "linux-arm64",
+        }
+    }
+
+    /// The platform of the host this binary is running on. Used as the
+    /// default when a build request doesn't specify one: the dev bake
+    /// recipes cross-compile the rootfs for the host's own arch, so
+    /// host arch == guest arch in that path.
+    pub fn host() -> Self {
+        if cfg!(target_arch = "aarch64") {
+            Platform::LinuxArm64
+        } else {
+            Platform::LinuxX86_64
+        }
+    }
+
+    /// Parse the canonical tag suffix back into a `Platform`. Accepts
+    /// exactly the strings [`tag_suffix`] produces, so the CLI flag and
+    /// the OCI tag stay in lockstep.
+    ///
+    /// [`tag_suffix`]: Self::tag_suffix
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "linux-x86_64" => Ok(Platform::LinuxX86_64),
+            "linux-arm64" => Ok(Platform::LinuxArm64),
+            other => Err(format!(
+                "invalid harness platform `{other}` — expected `linux-x86_64` or `linux-arm64`"
+            )),
         }
     }
 }
@@ -340,6 +371,26 @@ mod tests {
             uri,
             "ghcr.io/cortexapps/engrams/harness-claude:v1.2.3-linux-x86_64"
         );
+    }
+
+    #[test]
+    fn catalog_resolves_claude_linux_arm64() {
+        let cat = BuiltinCatalog::default_catalog();
+        let uri = cat
+            .resolve("claude", "v1.2.3", Platform::LinuxArm64)
+            .unwrap();
+        assert_eq!(
+            uri,
+            "ghcr.io/cortexapps/engrams/harness-claude:v1.2.3-linux-arm64"
+        );
+    }
+
+    #[test]
+    fn platform_parse_round_trips_tag_suffix() {
+        for p in [Platform::LinuxX86_64, Platform::LinuxArm64] {
+            assert_eq!(Platform::parse(p.tag_suffix()), Ok(p));
+        }
+        assert!(Platform::parse("linux-riscv64").is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 # share one bake choreography.
 #
 # Preconditions:
-#   - integration-up.sh has been run (PG, registry, fake-gcs, coord,
+#   - the stack is up via `just dev` (PG, registry, fake-gcs, coord,
 #     host-agent are all up).
 #   - host-target engram-cli at ./target/release/engram-cli.
 #   - musl-target engram-agentd at
@@ -44,7 +44,7 @@ log() { echo "$@" >&2; }
 
 if ! curl -fsS "$COORD/healthz" >/dev/null 2>&1; then
     log "ERROR: coord not reachable at $COORD"
-    log "       Run 'just integration-up' first."
+    log "       Run 'just dev' first."
     exit 1
 fi
 

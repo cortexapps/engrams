@@ -4,9 +4,8 @@
 #
 #   docker compose -f docker-compose.dev.yml -f docker-compose.linux.yml ...
 #
-# The Tiltfile applies it automatically on Linux; `integration-up.sh`
-# (the dev-vm rig) passes both `-f` flags. macOS / Docker Desktop must
-# NOT apply this file — see below.
+# The Tiltfile applies it automatically on Linux (the dev-vm rig).
+# macOS / Docker Desktop must NOT apply this file — see below.
 #
 # ----------------------------------------------------------------
 # fake-gcs-server: host networking instead of a published port.

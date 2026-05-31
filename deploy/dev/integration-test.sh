@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ADR 0015 M5 smoke test: bake → enable → wait-for-host-ready →
 # session-create against the local prod-shape stack. Run after
-# `just integration-up`.
+# `just dev`.
 #
 # Steps:
 #   1-3. bake + enable + ready-poll, factored out into

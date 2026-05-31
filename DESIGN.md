@@ -933,10 +933,10 @@ Each phase has its own verification, summarized:
 | Phase | How to verify |
 |---|---|
 | 1 ✅ | `just dev` (subprocess backend on any platform), `curl -X POST :8090/sessions -d '{"repo":"local://demo"}'`, exec a command, verify output. Cold start <5s. |
-| 2 ✅ | On a Linux + KVM host: `just dev-firecracker`, repeat Phase 1 verification, then idle a session, observe FC snapshot, evict via `DELETE /sessions/:id/local`, resume in <100ms via UFFD. The 5-test integration suite (`crates/engram-sandbox-firecracker/tests/`) drives all of this against real microVMs. |
+| 2 ✅ | On a Linux + KVM host: `just dev` (auto-detects KVM → Firecracker), repeat Phase 1 verification, then idle a session, observe FC snapshot, evict via `DELETE /sessions/:id/local`, resume in <100ms via UFFD. The 5-test integration suite (`crates/engram-sandbox-firecracker/tests/`) drives all of this against real microVMs. |
 | 3 ✅ | Stand up 2 hosts. Spawn sessions, verify even distribution per `engram host list`. `kill -9` one host, observe sessions transition `Active → Dead` within 30s via the dead-host detector. Restart a coordinator replica; SSE streams reconnect via `Last-Event-ID`. |
 | 4 ✅ | Same orchestration runs against the same coord backend whether the host is FC, VZ, or process. Per-run git checkpoint pushes; idle-evict + auto-resume; `engram session fork` from a Dead session. ADRs 0001 + 0002. |
-| 4.5 ✅ | macOS Apple Silicon: `just vz-pull-kernel && just vz-bake-demo && just dev-vz`. Cold boot <1s; full lifecycle (`harness_idle → snapshot_taken → evicted → idle → resumed → active`) end-to-end. ADR 0003. |
+| 4.5 ✅ | macOS Apple Silicon: `just pull-kernel && just bake-demo && just dev` (auto-detects VZ). Cold boot <1s; full lifecycle (`harness_idle → snapshot_taken → evicted → idle → resumed → active`) end-to-end. ADR 0003. |
 | 5 | Watch image-builder cron run, verify new image appears in `image_versions` with `status=ready`, observe new sessions for that image picking up the new tag without disrupting in-flight sessions. |
 | 6 | Run on GCE Spot. Trigger preemption via `gcloud compute instances simulate-maintenance-event`, verify the host-agent's preemption handler fires `checkpoint_session` for each live sandbox before the VM dies. Sessions land `Dead`; calling system forks the workspace to continue. Production hardening (TLS, auth, broker proxy, jailer) all green. |
 | 7 | Load test with locust/k6: 100 concurrent sessions. Chaos test: kill coordinator, kill hosts, kill Postgres briefly. Web app + Slack bot consume `/events` SSE in real time. |

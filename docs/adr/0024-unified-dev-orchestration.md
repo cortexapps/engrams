@@ -1,0 +1,187 @@
+# ADR 0024: One dev orchestrator, one switch-free interface
+
+Status: 2026-05-30 — **Accepted.** Shipped on PR #49 (branch
+`worktree-unified-dev-orchestration`), full CI green incl. the ported
+`test-e2e-stack` lane. The local-dev story had drifted into two parallel
+orchestrators expressing the *same* prod-shape service map, with the backend/arch
+switch leaked all the way up into the operator interface (`justfile` + `Tiltfile`).
+This ADR collapsed both onto a single switch-free interface — `just dev`
+everywhere — and pushed the host-capability decision down into one
+orchestration-layer probe. Nothing here touches the substrate's latency work
+(ADRs 0019–0022) or the product plane (ADR 0023); it is purely about how a
+developer spins the stack up.
+
+**Commit chain.** `8f569d6` (this ADR, Proposed) → `d47c8bd` (detect-backend.sh)
+→ `45e1934` (arm64 harness `Platform`) → `4821657` (Tiltfile probe → backend +
+topology; tilt in the flake) → `e138090` (switch-free justfile: dev / bake-demo /
+pull-kernel) → `e591f14` (ENGRAM_SKIP_WEB) → `30f27cb` (CI e2e via tilt) →
+`50db82e` (two-host Tiltfile support; retire integration-{up,down,reset}.sh) →
+`da49a07` (README + dev-vm docs) → `d521a7e` (grep/pipefail guard in the CI
+host-wait) → `640670a` (set ENGRAM_NBD_DEVICES single-host; CI teardown kernel env).
+
+**Divergences / findings vs the proposal.**
+- **Two-host support landed in the Tiltfile** (`ENGRAM_INTEG_TWO_HOSTS=1 just dev`
+  → `host-agent-b`) before retiring `integration-up.sh`, so the ADR-0018 M4 evac
+  harness kept working — no e2e coverage dropped.
+- **The CI port backgrounds `tilt up`, not `tilt ci`.** `tilt ci` tears down its
+  `serve_cmd` children on exit (verified on the dev-vm), so it can't host the
+  stack for a separate test step; `tilt-up-ci.sh` backgrounds `tilt up --stream`
+  and waits for readiness instead.
+- **arm64 built-in-harness GHCR publish is deferred** (CI only cross-compiles
+  x86_64-musl today); the dev loop builds the arm64 harness from source and
+  publishes it to the local registry, so macOS/VZ works without GHCR. A
+  default-catalog arm64 bake 404s until an arm runner / cross toolchain lands.
+- **Two CI-port bugs the iteration surfaced:** the host-registration poll aborted
+  on `set -e` + `pipefail` when `grep` found no host yet (fixed with the
+  `{ grep || true; }` guard `integration-up.sh` already used); and a single-host
+  host-agent with `ENGRAM_NBD_DEVICES` unset fell back to materialize-to-file,
+  yielding a base snapshot without the chunked manifests `enable-images` requires
+  (500). Both are the kind of lore `integration-up.sh` had accreted — re-encoded
+  in the Tiltfile / CI scripts.
+
+**Follow-ups (tracked, not blocking):** publish the arm64 harness artifact from CI
+(needs an arm runner or aarch64-musl cross toolchain); fold the per-backend
+`docs/demo-*.md` runbooks into the one `just dev` story (README + `docs/dev-vm.md`
+already updated).
+
+## Context
+
+There are two ways to run the full stack locally, and they share almost no code:
+
+- **macOS** runs `just dev` → `tilt up`. The `Tiltfile` selects the VZ backend
+  by `uname`, and prod-shape split mode is an opt-in env flag
+  (`ENGRAM_DEV_SPLIT=1`).
+- **The Linux KVM dev-vm** runs `just integration-up` → a ~500-line
+  `deploy/dev/integration-up.sh` (plus `integration-down.sh` /
+  `integration-reset.sh`). It exists because the dev-vm has no Tilt and because
+  the Linux host-agent needs `sudo` to create per-VM TAPs (CAP_NET_ADMIN). CI's
+  `test-e2e-stack` lane drives the same script.
+
+Both express the identical topology — postgres + registry + fake-gcs + jaeger,
+coordinator, host-agent, web — yet one is Starlark under Tilt and the other is
+hand-rolled bash with nohup/pidfiles. They drift independently: the recent
+macOS `seed-buckets` breakage (fake-gcs-server `network_mode: host`, fixed in
+`cb808a9`) was a symptom — a change made for the Linux path silently broke the
+mac path because nothing tied them together.
+
+On top of the orchestrator split, the **arch switch leaks up to the operator
+interface**:
+
+- `Tiltfile` has a `uname` ladder that picks `vz` vs `firecracker` and
+  hard-fails on anything else.
+- The justfile has parallel arch-specific recipes: `dev-vz` / `dev-firecracker`,
+  `fc-bake-demo` / `vz-bake-demo`, `vz-pull-kernel` vs the FC fetch script.
+
+A developer therefore has to know their host's backend to pick the right recipe.
+That is exactly backwards: the tooling should detect the host and Do The Right
+Thing.
+
+## Decision
+
+**One interface, switch-free:**
+
+```
+just dev          # full prod-shape stack; backend + topology auto-selected
+just dev-down     # tear it down
+just bake-demo    # build + bake the demo-claude image → local OCI registry
+just pull-kernel  # fetch the right kernel for this host
+```
+
+`just dev` runs `tilt up` on **every** host. Tilt becomes the single
+orchestrator; the `integration-*` scripts are retired and CI's e2e lane runs
+`tilt ci`.
+
+**Detection belongs ABOVE the binary, not inside it.** The sandbox backends are
+compile-time gated — `VzBackend` is `#[cfg(target_os = "macos")]`, Firecracker
+only compiles on Linux — so a single binary physically cannot contain all three.
+"Auto-detect among all backends" cannot live in the binary; it is a
+host-capability decision, not a runtime branch. The binaries keep their existing
+**explicit** selector (`ENGRAM_SANDBOX_BACKEND=firecracker|vz|process`) and do
+not change. Production is unaffected: Helm sets the backend explicitly and never
+runs the probe.
+
+Detection lives in one place — `deploy/dev/detect-backend.sh` — using a single
+rule:
+
+```
+/dev/kvm present & readable   -> firecracker
+else macOS && arm64           -> vz
+else                          -> process
+```
+
+The `Tiltfile` calls that probe once and uses its result for **both** coupled
+decisions:
+
+1. The concrete `ENGRAM_SANDBOX_BACKEND` passed to the stack (+ the matching
+   kernel path).
+2. The process topology: `process` → coordinator `mode=all` only (no separate
+   host-agent, which has no Process backend); otherwise the **split** topology
+   (coord `mode=coordinator` + a `engram-host-agent` process) — making prod-shape
+   split the default and auto-degrading on a virt-less host.
+
+The bake/kernel helper scripts derive the guest arch from the same probe, so the
+justfile recipe bodies carry no `uname`.
+
+**arm64 built-in harness.** `just bake-demo` bakes `deploy/demo-claude/`, whose
+`[harness] builtin = "claude"` makes the baker inject a published harness
+artifact. That artifact is currently x86_64-only (`Platform` enum has one
+variant), so the baked-harness image can't run on an arm64 VZ guest. We add
+`Platform::LinuxArm64`, select the platform from the build request (defaulting to
+host arch) instead of hardcoding it, and publish the arm64 harness tag in CI — so
+the same `just bake-demo` works on macOS/VZ and the Linux dev-vm. For local dev,
+`bake-demo` builds the harness from source and publishes it to the local registry
+(catalog env override), rather than pulling the released GHCR tag.
+
+## Phasing
+
+0. **This ADR** (Proposed → Accepted at the end).
+1. `deploy/dev/detect-backend.sh` — the single host-capability source of truth.
+2. arm64 built-in harness: `Platform::LinuxArm64`, builder platform selection
+   (defaulting to host arch), `engram-cli image build --harness-platform`. The
+   dev loop builds the arm64 harness from source and publishes it to the local
+   registry (`bake-demo.sh` + catalog env override), so macOS/VZ works without
+   any GHCR change. **Follow-up:** publishing the arm64 tag to the *default*
+   GHCR catalog needs an arm runner or an aarch64-musl cross toolchain in CI
+   (today's CI only cross-compiles x86_64-musl); deferred so it doesn't risk the
+   finely-tuned `test-e2e-stack` lane. Until then a default-catalog arm64 bake
+   404s — same gap as before this ADR (arm64 didn't exist at all), and the dev
+   path never hits GHCR.
+3. Tilt as the one orchestrator: `tilt` into the flake devShell; `Tiltfile`
+   collapses the `uname` ladder to one `detect-backend.sh` probe → concrete
+   backend + topology, with the Linux host-agent run under `sudo -n
+   --preserve-env` and a prebuilt-binary `serve_cmd` branch (for CI). justfile
+   collapses to `dev` / `dev-down` / `bake-demo` / `pull-kernel`; arch recipes
+   retired.
+4. Retire `integration-{up,down,reset}.sh`; port CI `test-e2e-stack` to
+   `ENGRAM_INTEG_BIN_DIR=… tilt ci` (consume prebuilt binaries, no cargo build).
+5. dev-vm skill (forward Tilt UI :10350, NOPASSWD sudoers for the host-agent,
+   tmux note) + fold the per-backend demo docs into the one `just dev` story.
+
+## Consequences
+
+- **Wins:** one orchestrator, one interface, ~500 fewer lines of bespoke bash; a
+  change to the dev stack can no longer break one host while leaving the other
+  green, because there is only one description of it. The operator never picks a
+  backend.
+- **Costs / risks:**
+  - The CI `tilt ci` port (Phase 4) is the riskiest leg — the lane is tuned
+    around prebuilt-binary layout and artifact-prune ordering. Mitigated by the
+    Phase-3 `ENGRAM_INTEG_BIN_DIR` branch (no cargo build in CI) and validating
+    on the branch before deleting `integration-up.sh`.
+  - The Linux host-agent under Tilt needs NOPASSWD sudo on the dev-vm; macOS
+    involves no sudo.
+  - The detection rule now exists only in shell. That is acceptable because prod
+    never runs it; a drift would only affect which dev backend is chosen, and the
+    binary still validates the concrete choice it's given.
+
+## Alternatives considered
+
+- **Auto mode inside the binary (`ENGRAM_SANDBOX_BACKEND=auto`).** Rejected: the
+  backends are `cfg(target_os)`-gated, so a binary can't contain all variants —
+  "auto" would imply every binary has everything, which is false. Detection is a
+  host-capability concern that belongs in the orchestrator.
+- **Keep two orchestrators behind one `just dev` dispatcher.** Rejected: it
+  preserves the duplication (and the drift) this ADR exists to remove.
+- **Drop Tilt, make `just dev` a portable script everywhere.** Rejected: loses
+  Tilt's UI / log aggregation / readiness model that the inner loop relies on;
+  the script path is the thing we're retiring, not the engine.

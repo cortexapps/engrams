@@ -15,8 +15,8 @@
 #   HARNESS=claude bash deploy/dev/integration-session.sh
 #   PROMPT='hi' HARNESS=claude bash deploy/dev/integration-session.sh
 #
-# Cleanup: `just integration-down` reaps the session along with
-# everything else; or curl -X DELETE $COORD/sessions/$SID directly.
+# Cleanup: `just dev-down` reaps the session along with everything
+# else; or curl -X DELETE $COORD/sessions/$SID directly.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -32,7 +32,7 @@ fi
 
 if ! curl -fsS "$COORD/healthz" >/dev/null 2>&1; then
     echo "ERROR: coord not reachable at $COORD" >&2
-    echo "       Run 'just integration-up' first." >&2
+    echo "       Run 'just dev' first." >&2
     exit 1
 fi
 
@@ -78,7 +78,7 @@ fi
 # tagged via metadata-style harness so we can find it). The session
 # row doesn't carry a label field, so we filter by image+status and
 # pick the most recent. Best-effort: stale rows from prior runs are
-# possible if integration-down didn't reap.
+# possible if `just dev-down` didn't reap.
 existing_sid=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/sessions" 2>/dev/null \
     | python3 -c "
 import sys, json

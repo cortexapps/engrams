@@ -30,6 +30,11 @@
           packages = with pkgs; [
             rustToolchain
             just
+            tilt                    # `just dev` orchestrator (ADR 0024).
+                                    # One engine on every host: macOS via
+                                    # nix develop or brew, the Linux dev-vm
+                                    # via nix develop. Replaces the bespoke
+                                    # integration-up.sh path.
             jq
             postgresql              # psql + pg_dump; not the server
             sqlx-cli

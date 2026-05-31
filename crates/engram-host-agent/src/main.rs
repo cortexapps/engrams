@@ -95,7 +95,7 @@ struct Cli {
     /// Path to an arm64 Linux kernel image VZ can boot. Required
     /// when `--sandbox-backend=vz`. Default points at
     /// `~/.cache/engram-vz-test/vmlinux-arm64` (populated by
-    /// `just vz-pull-kernel`).
+    /// `just pull-kernel`).
     #[arg(long, env = "ENGRAM_VZ_KERNEL_PATH")]
     vz_kernel_path: Option<PathBuf>,
 
@@ -334,7 +334,7 @@ async fn main() -> Result<(), HostAgentError> {
                             "ENGRAM_VZ_KERNEL_PATH (or --vz-kernel-path) is required when \
                              --sandbox-backend=vz; default location \
                              ~/.cache/engram-vz-test/vmlinux-arm64 does not exist (run \
-                             `just vz-pull-kernel`)"
+                             `just pull-kernel`)"
                                 .into(),
                         )
                     })?;
@@ -630,7 +630,7 @@ fn init_tracing() -> engram_telemetry::TelemetryGuard {
 /// Default location for the arm64 Linux kernel `engram-sandbox-vz`
 /// boots: `~/.cache/engram-vz-test/vmlinux-arm64`. Returns `None` if
 /// `$HOME` isn't set or the file doesn't exist; the caller surfaces
-/// a config error pointing at `just vz-pull-kernel`.
+/// a config error pointing at `just pull-kernel`.
 #[cfg(target_os = "macos")]
 fn default_vz_kernel_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
