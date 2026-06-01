@@ -16,8 +16,9 @@
 //! ProcessBackend loopback land in later phases.
 
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap};
+use axum::response::Response;
 use axum::Json;
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
@@ -30,6 +31,7 @@ use engram_harness_proto::{
 };
 use futures::StreamExt;
 
+use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
 /// Magic-byte sniff window. The longest signature we check (WebP / MP4)
@@ -356,6 +358,72 @@ pub async fn upload_forward(
             .map(|r| r.map_err(|e| BlobError::Protocol(format!("recv artifact body: {e}")))),
     );
     Json(authorized_untrusted_upload(&state, header, src).await)
+}
+
+// ---- serve (web UI) ----------------------------------------------------
+
+/// `GET /sessions/:id/artifacts/:artifact_id` — stream an artifact back
+/// to the dashboard. Mounted in the bearer-authed group (in prod the
+/// browser reaches it via the IAP cookie at the LB; nginx stamps the
+/// bearer), so artifacts are never world-readable.
+///
+/// **MIME-agnostic hardening** (applies to media + arbitrary
+/// operator-pulled types alike): the response carries the
+/// server-DETECTED `Content-Type`, `X-Content-Type-Options: nosniff`,
+/// `Content-Disposition: inline`, a `Content-Security-Policy: sandbox`
+/// (a scriptless, opaque-origin context even if the bytes are somehow an
+/// HTML document), and `no-store`. This — not the upload allowlist — is
+/// what makes serving attacker-controlled bytes to operators safe.
+pub async fn serve_artifact(
+    State(state): State<SharedState>,
+    Path((session, artifact_id)): Path<(SessionId, String)>,
+) -> Result<Response, ApiError> {
+    let aid = uuid::Uuid::parse_str(&artifact_id)
+        .map_err(|_| ApiError::BadRequest("invalid artifact id".into()))?;
+    // Scoped to the session: a valid-but-mismatched pair 404s.
+    let row = state
+        .services
+        .meta
+        .get_artifact(session, aid)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("artifact not found".into()))?;
+    let stream = state
+        .services
+        .blob
+        .get_streaming(&row.blob_key)
+        .await
+        .map_err(|e| match e {
+            BlobError::NotFound => ApiError::NotFound("artifact blob missing".into()),
+            other => ApiError::Internal(format!("read artifact blob: {other}")),
+        })?;
+
+    let filename = format!("{}.{}", aid.simple(), ext_for_media(&row.media_type));
+    Response::builder()
+        .header(header::CONTENT_TYPE, row.media_type)
+        .header(header::CONTENT_LENGTH, row.size_bytes)
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{filename}\""),
+        )
+        .header("Content-Security-Policy", "sandbox")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from_stream(stream))
+        .map_err(|e| ApiError::Internal(format!("build artifact response: {e}")))
+}
+
+/// File extension for a stored media type — used only for the
+/// `Content-Disposition` filename (not for sniffing). Unknown → `bin`.
+fn ext_for_media(media_type: &str) -> &'static str {
+    match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        _ => "bin",
+    }
 }
 
 fn decode_upload_header(headers: &HeaderMap) -> Result<UploadRequest, String> {

@@ -44,7 +44,18 @@ data:
 
       # SPA: every unknown path falls through to index.html so
       # client-side routing handles it.
+      #
+      # ADR 0026: a dashboard-wide Content-Security-Policy (defense in
+      # depth for the whole SPA, incl. agent-shared artifacts rendered
+      # inline). Artifacts are served same-origin under /sessions/... so
+      # `img-src`/`media-src 'self'` covers them; `object-src`/
+      # `frame-ancestors 'none'` block embeds + clickjacking. This is the
+      # SPA's own CSP only — the coord sets a stricter `sandbox` CSP on
+      # each artifact response itself (proxied via the location below,
+      # untouched here).
       location / {
+        add_header Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header X-Content-Type-Options "nosniff" always;
         try_files $uri $uri/ /index.html;
       }
 

@@ -43,6 +43,14 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/exec", post(exec::exec))
         .route("/sessions/:id/exec/stream", post(exec::exec_stream))
         .route("/sessions/:id/events", get(events::events))
+        // ADR 0026: serve a shared artifact to the dashboard. In the
+        // protected group so it inherits IAP/bearer gating (the browser
+        // hits it via the IAP cookie + nginx-stamped bearer); never
+        // world-readable. Hardened headers live in the handler.
+        .route(
+            "/sessions/:id/artifacts/:artifact_id",
+            get(upload::serve_artifact),
+        )
         .route("/sessions/:id/snapshot", post(snapshot::snapshot))
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
