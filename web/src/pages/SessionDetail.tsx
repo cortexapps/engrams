@@ -110,7 +110,7 @@ export function SessionDetail() {
 
       {tab === 'transcript' && (
         <>
-          <Transcript events={events} />
+          <Transcript events={events} sessionId={id ?? ''} />
           {id && <PromptComposer sessionId={id} status={session?.status} />}
         </>
       )}
