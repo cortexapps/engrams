@@ -1,32 +1,40 @@
 //! ADR 0015 M5: per-host image-readiness prefetch supervisor.
 //!
-//! Each host watches the heartbeat-ack's `enabled_images` set and
-//! drives chunk pulls for any image it hasn't yet prefetched to
-//! local NVMe. Once every chunk of an image's chunked rootfs is
-//! reachable via `chunk_store.get_chunk()` (cache-tier hit), the
-//! image's `manifest_digest` is added to `ImageReadiness` — which
-//! the heartbeat builder reads on every tick to populate
-//! `Heartbeat.ready_images`. Coord's scheduler gates session
-//! placement on hosts that report the requested image's digest in
-//! their ready set; non-ready hosts surface as HTTP 503
-//! `image_not_ready` to the API caller.
+//! Each host watches the heartbeat-ack's `enabled_images` set and warms each
+//! enabled image's **base-snapshot working set** (disk + memory chunks) onto
+//! local NVMe. Once those chunks are all reachable via `chunk_store.get_chunk()`
+//! (cache-tier hit), the image's `manifest_digest` is added to `ImageReadiness`
+//! — which the heartbeat builder reads on every tick to populate
+//! `Heartbeat.ready_images`. Coord's scheduler gates session placement on hosts
+//! that report the requested image's digest in their ready set; non-ready hosts
+//! surface as HTTP 503 `image_not_ready` to the API caller.
 //!
-//! Why this exists: pre-M5, hosts learned about images via the
-//! `templates` table cascade and warm-pool refill — implicit and
-//! coupled. The prefetch loop replaces both with one explicit
-//! "diff enabled vs ready, fill the delta" supervisor.
+//! Why this exists: pre-M5, hosts learned about images via the `templates`
+//! table cascade and warm-pool refill — implicit and coupled. The prefetch loop
+//! replaces both with one explicit "diff enabled vs ready, fill the delta"
+//! supervisor.
 //!
-//! Storage tier model (reused, no new code):
-//!   - Tier 1: local NVMe `ChunkCache` (canonical "ready"
-//!     inventory; hit here = chunk is local + counts toward
-//!     readiness).
-//!   - Tier 2: `BlobStorage` at `chunks/sha256/<hex>` — bake's
-//!     enable-image step writes chunks here.
-//!   - Tier 3: OCI Range GET against the chunked artifact (safety
-//!     net; CDN-fills BlobStorage on hit).
+//! **What we prefetch (and what we deliberately do NOT):** session create
+//! restores from the per-image *base snapshot* (ADR 0020), whose disk manifest
+//! is a superset of the image rootfs — it carries the template-boot writes the
+//! image's own manifest lacks. So the source OCI image is never read at session
+//! time. We therefore warm ONLY the base snapshot's disk + memory manifests
+//! (ADR 0021 P2) and never pull the OCI image. Pulling the multi-GB OCI artifact
+//! from the registry onto every host was pure redundancy — and an unbounded OCI
+//! pull under a registry 429 retry storm wedged prod hosts during the ADR-0025
+//! roll. The base-snapshot chunks live in the GCS chunk store (flushed at
+//! enable), so this path is GCS-backed, not registry-backed.
 //!
-//! `chunk_store.get_chunk(hash)` walks the tiers and tees on miss,
-//! so the prefetch driver is just an eager loop over chunk hashes.
+//! Storage tier model (for the per-chunk `get_chunk` walk):
+//!   - Tier 1: local NVMe `ChunkCache` (canonical "ready" inventory; hit here =
+//!     chunk is local + counts toward readiness).
+//!   - Tier 2: `BlobStorage` at `chunks/sha256/<hex>` (GCS) — where the base
+//!     snapshot's chunks are flushed at enable. This is the hot tier here.
+//!   - Tier 3: OCI Range GET (safety net; CDN-fills BlobStorage on a tier-2
+//!     miss). In practice the base-snapshot chunks are always in tier 2.
+//!
+//! `chunk_store.get_chunk(hash)` walks the tiers and tees on miss, so the
+//! prefetch driver is just an eager loop over the base snapshot's chunk hashes.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -35,8 +43,6 @@ use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
 use parking_lot::RwLock;
 use tokio::sync::{watch, Semaphore};
-
-use crate::image_cache::ImageCache;
 
 /// Shared, mutable view of "which images is this host ready to
 /// serve?" — written by the prefetch supervisor, read by the
@@ -97,11 +103,10 @@ const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30)
 /// set into. The supervisor task runs for the lifetime of the
 /// returned [`tokio::task::JoinHandle`] — drop it (or `abort()`)
 /// to stop. ChunkStore is required; without it nothing can fault
-/// chunks. ImageCache is required for the manifest walk that
-/// turns an `image_uri` into a sequence of chunk hashes.
-#[allow(clippy::too_many_arguments)]
+/// chunks. No ImageCache: the prefetch warms the base snapshot's
+/// chunks from the GCS chunk store and never reads the source OCI
+/// image (see [`prefetch_one`]).
 pub fn spawn_supervisor(
-    image_cache: ImageCache,
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
     readiness: Arc<ImageReadiness>,
@@ -115,7 +120,7 @@ pub fn spawn_supervisor(
     tracing::info!(
         permits,
         recheck_secs = RECHECK_INTERVAL.as_secs(),
-        "image prefetch supervisor starting",
+        "image prefetch supervisor starting (base-snapshot only; no OCI prefetch)",
     );
     let handle = tokio::spawn(async move {
         loop {
@@ -123,7 +128,6 @@ pub fn spawn_supervisor(
             reconcile(
                 &enabled,
                 readiness.clone(),
-                image_cache.clone(),
                 chunk_store.clone(),
                 chunk_cache.clone(),
                 semaphore.clone(),
@@ -154,7 +158,6 @@ pub fn spawn_supervisor(
 async fn reconcile(
     enabled: &[EnabledImageRef],
     readiness: Arc<ImageReadiness>,
-    image_cache: ImageCache,
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
     semaphore: Arc<Semaphore>,
@@ -190,19 +193,18 @@ async fn reconcile(
         // manifests). Two Strings + two Copy refs; cheap per reconcile.
         let image = image.clone();
         let readiness = readiness.clone();
-        let image_cache = image_cache.clone();
         let chunk_store = chunk_store.clone();
         let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
-            match prefetch_one(&image, &image_cache, &chunk_store, &chunk_cache, &semaphore).await {
+            match prefetch_one(&image, &chunk_store, &chunk_cache, &semaphore).await {
                 Ok(chunks) => {
                     readiness.mark_ready(image.manifest_digest.clone());
                     tracing::info!(
                         image_uri = %image.image_uri,
                         digest = image.manifest_digest.as_str(),
                         chunks,
-                        "image prefetched; marked ready",
+                        "image base snapshot prefetched; marked ready",
                     );
                 }
                 Err(e) => {
@@ -218,100 +220,55 @@ async fn reconcile(
     }
 }
 
-/// Pull every chunk of an image's chunked rootfs — and, since ADR
-/// 0021 P2, its base snapshot's rootfs *and* memory image — through
-/// the tiered resolver. Each `chunk_store.get_chunk(hash)` call hits
-/// tier 1 (NVMe cache) if present, else faults through tier 2
-/// (BlobStorage) or tier 3 (OCI Range GET) and tees the bytes into the
-/// local cache. Returns the total chunk count on success.
+/// Warm an enabled image's base-snapshot working set on local NVMe so the
+/// first session restoring it pages in from tier-1, not GCS. We prefetch the
+/// base snapshot's disk + memory manifests ONLY — never the source OCI image.
+///
+/// Session create restores from the per-image base snapshot (ADR 0020), whose
+/// disk manifest is a superset of the image rootfs (it carries the
+/// template-boot writes the image manifest lacks), so the OCI image is never
+/// read at session time. Both manifests are always present (the
+/// `enabled_images` columns are NOT NULL, migrations 0042/0043). Returns the
+/// total chunk count on success.
 async fn prefetch_one(
     image: &EnabledImageRef,
-    image_cache: &ImageCache,
     chunk_store: &ChunkStore,
     chunk_cache: &ChunkCache,
     semaphore: &Arc<Semaphore>,
 ) -> Result<usize, PrefetchError> {
-    let image_uri = image.image_uri.as_str();
-    let expected_digest = &image.manifest_digest;
-    // ADR 0021 P2: the base snapshot's rootfs + memory working sets to warm.
-    let base_snapshot_disk_manifest = image.base_snapshot_disk_manifest;
-    let base_snapshot_memory_manifest = image.base_snapshot_memory_manifest;
-    let mut cached = image_cache
-        .ensure_image(image_uri)
-        .await
-        .map_err(|e| PrefetchError::ImageCache(format!("{e}")))?;
-
-    // ADR 0015 M5: when the registry has rotated under the same
-    // tag (a re-push of `:warm-<sha>`), the on-disk cache from
-    // the prior pull holds a stale bundle whose chunk manifest
-    // ref points at blob keys the coord no longer materialized.
-    // The coord's `enabled_images` advertises the current digest;
-    // if our cached digest differs, invalidate and re-pull. The
-    // prior digest's artifacts ride LRU eviction rather than an
-    // eager delete (any in-flight session still consuming the
-    // old digest is left intact).
-    if cached.digest != expected_digest.as_str() {
-        tracing::info!(
-            image_uri = %image_uri,
-            cached_digest = %cached.digest,
-            expected_digest = expected_digest.as_str(),
-            "cached image digest stale; invalidating and re-pulling",
-        );
-        image_cache.invalidate_uri(image_uri).await;
-        cached = image_cache
-            .ensure_image(image_uri)
-            .await
-            .map_err(|e| PrefetchError::ImageCache(format!("{e}")))?;
-    }
-
-    let bundle = cached
-        .bundle
-        .as_ref()
-        .ok_or_else(|| PrefetchError::NoBundle(image_uri.to_string()))?;
-    let disk_manifest_ref = bundle.disk_manifest;
-
-    // (1) The image's chunked rootfs.
-    let manifest: Manifest = chunk_store
-        .get_manifest(disk_manifest_ref)
-        .await
-        .map_err(|e| PrefetchError::ManifestLoad(format!("{e}")))?;
-    let mut total = prefetch_manifest_chunks(manifest, chunk_store, chunk_cache, semaphore).await?;
-
-    // (2) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
+    // (1) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
     // the per-image base snapshot, whose disk manifest carries the runtime
-    // files written at template-boot (Bun / node_modules / claude) that the
-    // image's own manifest does NOT. Warming these on NVMe here is what keeps
-    // the resuming guest's rootfs page-in off GCS — the serial 16 MiB-chunk
-    // fetches during `resume` were the measured substrate cost. Folding it
-    // into readiness means an image isn't "warm" until its base snapshot's
-    // rootfs is resident too.
-    let base_manifest: Manifest = chunk_store
-        .get_manifest(base_snapshot_disk_manifest)
+    // files written at template-boot (Bun / node_modules / claude). Warming
+    // these on NVMe keeps the resuming guest's rootfs page-in off GCS — the
+    // serial 16 MiB-chunk fetches during `resume` were the measured substrate
+    // cost.
+    let disk_manifest: Manifest = chunk_store
+        .get_manifest(image.base_snapshot_disk_manifest)
         .await
-        .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot: {e}")))?;
-    total += prefetch_manifest_chunks(base_manifest, chunk_store, chunk_cache, semaphore).await?;
+        .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot disk: {e}")))?;
+    let mut total =
+        prefetch_manifest_chunks(disk_manifest, chunk_store, chunk_cache, semaphore).await?;
 
-    // (3) ADR 0021 P2 (memory residency) — the base snapshot's memory image.
+    // (2) ADR 0021 P2 (memory residency) — the base snapshot's memory image.
     // The UFFD handler pages these chunks in when the guest resumes; warming
-    // them on NVMe here retires the cold per-restore memory prefetch that was
-    // ~2.84 s on a freshly-rolled host (trace d4cb3728 cold vs c55e1035 warm).
-    // Folding it into readiness means an image isn't "warm" until BOTH its disk
-    // and memory working sets are resident — so a host serves its first session
-    // warm, not just its second.
-    let base_memory_manifest: Manifest = chunk_store
-        .get_manifest(base_snapshot_memory_manifest)
+    // them on NVMe retires the cold per-restore memory prefetch that was
+    // ~2.84 s on a freshly-rolled host. Folding both into readiness means an
+    // image isn't "warm" until BOTH its disk and memory working sets are
+    // resident — so a host serves its first session warm, not just its second.
+    let memory_manifest: Manifest = chunk_store
+        .get_manifest(image.base_snapshot_memory_manifest)
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
     total +=
-        prefetch_manifest_chunks(base_memory_manifest, chunk_store, chunk_cache, semaphore).await?;
+        prefetch_manifest_chunks(memory_manifest, chunk_store, chunk_cache, semaphore).await?;
 
     Ok(total)
 }
 
 /// Pull every chunk of one chunked manifest through the tiered
 /// resolver into the local NVMe cache, bounded by `semaphore`.
-/// Returns the chunk count. Shared by the image-rootfs and (ADR
-/// 0021 P2) base-snapshot-rootfs prefetch paths.
+/// Returns the chunk count. Shared by the base-snapshot disk + memory
+/// prefetch paths.
 async fn prefetch_manifest_chunks(
     manifest: Manifest,
     chunk_store: &ChunkStore,
@@ -353,8 +310,6 @@ async fn prefetch_manifest_chunks(
 
 #[derive(Debug)]
 enum PrefetchError {
-    ImageCache(String),
-    NoBundle(String),
     ManifestLoad(String),
     ChunkFetch(String),
     SemaphoreClosed,
@@ -364,8 +319,6 @@ enum PrefetchError {
 impl std::fmt::Display for PrefetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ImageCache(m) => write!(f, "image cache pull: {m}"),
-            Self::NoBundle(u) => write!(f, "image {u} has no bundle.json — can't enumerate chunks"),
             Self::ManifestLoad(m) => write!(f, "load chunk manifest: {m}"),
             Self::ChunkFetch(m) => write!(f, "chunk fetch: {m}"),
             Self::SemaphoreClosed => write!(f, "prefetch semaphore closed"),

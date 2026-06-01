@@ -528,11 +528,9 @@ impl HostAgent {
             let enabled_images_tx = match (
                 self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
                 self.chunk_cache.clone(),
-                self.image_cache.clone(),
             ) {
-                (Some(chunk_store), Some(chunk_cache), Some(image_cache)) => {
+                (Some(chunk_store), Some(chunk_cache)) => {
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
-                        image_cache,
                         chunk_store,
                         chunk_cache,
                         readiness.clone(),
@@ -541,7 +539,7 @@ impl HostAgent {
                 }
                 _ => {
                     tracing::warn!(
-                        "image_prefetch supervisor disabled: chunk_store / chunk_cache / image_cache \
+                        "image_prefetch supervisor disabled: chunk_store / chunk_cache \
                          missing — host will never report ready_images and coord will 503 every session",
                     );
                     None
