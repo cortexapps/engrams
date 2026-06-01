@@ -18,10 +18,12 @@ mod host_http;
 mod hosts;
 mod prompt;
 mod registries;
+pub(crate) mod session_auth;
 mod sessions;
 mod sessions_inspect;
 mod shell;
 pub mod snapshot;
+pub(crate) mod upload;
 
 pub fn router(state: SharedState) -> Router {
     // The protected sub-router gets the bearer-token layer.
@@ -60,6 +62,11 @@ pub fn router(state: SharedState) -> Router {
         // in-guest forge request here (the forge sink can't run on the
         // remote host). Host-authed; the broker token rides in the body.
         .route("/api/hosts/forge", post(forge::forge_forward))
+        // ADR 0026 split-mode artifact forwarding: FC hosts relay each
+        // in-guest upload here (the upload sink can't run on the remote
+        // host). Host-authed; the broker token rides in the base64'd
+        // `X-Engram-Upload` header and is validated by `process_upload`.
+        .route("/api/hosts/upload", post(upload::upload_forward))
         .route(
             "/api/hosts/:id/auth/resolve-registry",
             post(host_http::resolve_registry_auth),

@@ -982,6 +982,30 @@ mod tests {
         {
             Ok(Vec::new())
         }
+        async fn insert_artifact(
+            &self,
+            _: uuid::Uuid,
+            _: engram_core::SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: Option<&str>,
+        ) -> Result<(), engram_core::MetaError> {
+            Ok(())
+        }
+        async fn get_artifact(
+            &self,
+            _: engram_core::SessionId,
+            _: uuid::Uuid,
+        ) -> Result<Option<engram_core::types::ArtifactRow>, engram_core::MetaError> {
+            Ok(None)
+        }
+        async fn artifact_usage(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<(i64, i64), engram_core::MetaError> {
+            Ok((0, 0))
+        }
         async fn upsert_registry_credential(
             &self,
             _: engram_core::types::registry::RegistryCredential,

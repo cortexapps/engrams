@@ -58,18 +58,15 @@ impl From<Denied> for ApiError {
 }
 
 /// Verify the per-session broker token (constant-time) and return the
-/// configured forge. Shared by both transports.
+/// configured forge. Layers the forge-configured check on top of the
+/// shared [`crate::api::session_auth::authorize_broker_token`].
 fn authorize(
     state: &SharedState,
     session: SessionId,
     token: &str,
 ) -> Result<Arc<dyn GitForge>, Denied> {
     let forge = state.forge.clone().ok_or(Denied::NoForge)?;
-    let ok = match state.git_broker_tokens.get(&session) {
-        Some(expected) => constant_time_eq(token.as_bytes(), expected.value().as_bytes()),
-        None => false,
-    };
-    if ok {
+    if crate::api::session_auth::authorize_broker_token(state, session, token) {
         Ok(forge)
     } else {
         Err(Denied::BadToken)
@@ -131,24 +128,7 @@ async fn op_create_pull_request(
     Ok(pr)
 }
 
-fn bearer(headers: &HeaderMap) -> Option<String> {
-    let v = headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    v.strip_prefix("Bearer ").map(str::to_string)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+use crate::api::session_auth::bearer;
 
 // ---- HTTP transport ----------------------------------------------------
 
@@ -323,30 +303,5 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
                 Err(message) => ForgeResponse::Error { message },
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::{header::AUTHORIZATION, HeaderValue};
-
-    #[test]
-    fn bearer_extracts_only_bearer_scheme() {
-        let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer tok123"));
-        assert_eq!(bearer(&h).as_deref(), Some("tok123"));
-        assert!(bearer(&HeaderMap::new()).is_none());
-        let mut basic = HeaderMap::new();
-        basic.insert(AUTHORIZATION, HeaderValue::from_static("Basic tok123"));
-        assert!(bearer(&basic).is_none());
-    }
-
-    #[test]
-    fn constant_time_eq_compares_exactly() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(constant_time_eq(b"", b""));
-        assert!(!constant_time_eq(b"secret", b"secres"));
-        assert!(!constant_time_eq(b"secret", b"secret-longer"));
     }
 }

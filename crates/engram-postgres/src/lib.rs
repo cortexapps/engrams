@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore};
 use engram_core::types::{
-    EnabledImage, HostCapacity, HostRecord, HostStatus, PersistedEvent, RegistryCredential,
-    Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    ArtifactRow, EnabledImage, HostCapacity, HostRecord, HostStatus, PersistedEvent,
+    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use row::col_err;
@@ -986,6 +986,75 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         rows.iter().map(row::persisted_event_from_row).collect()
+    }
+
+    // ---------- file artifacts (ADR 0026) ----------
+
+    async fn insert_artifact(
+        &self,
+        id: uuid::Uuid,
+        session_id: SessionId,
+        blob_key: &str,
+        media_type: &str,
+        size_bytes: i64,
+        caption: Option<&str>,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, session_id, blob_key, media_type, size_bytes, caption)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(id)
+        .bind(session_id.as_uuid())
+        .bind(blob_key)
+        .bind(media_type)
+        .bind(size_bytes)
+        .bind(caption)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_artifact(
+        &self,
+        session_id: SessionId,
+        id: uuid::Uuid,
+    ) -> Result<Option<ArtifactRow>, MetaError> {
+        // Scoped to the session so one session can never read another's
+        // blob key even with a guessed artifact id.
+        let row = sqlx::query(
+            r#"
+            SELECT id, blob_key, media_type, size_bytes, caption, created_at
+              FROM artifacts
+             WHERE id = $1 AND session_id = $2
+            "#,
+        )
+        .bind(id)
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.as_ref().map(row::artifact_from_row).transpose()
+    }
+
+    async fn artifact_usage(&self, session_id: SessionId) -> Result<(i64, i64), MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS n,
+                   COALESCE(SUM(size_bytes), 0)::bigint AS total
+              FROM artifacts
+             WHERE session_id = $1
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let n: i64 = sqlx::Row::try_get(&row, "n").map_err(db_err)?;
+        let total: i64 = sqlx::Row::try_get(&row, "total").map_err(db_err)?;
+        Ok((n, total))
     }
 
     // ---------- registry credentials ----------
