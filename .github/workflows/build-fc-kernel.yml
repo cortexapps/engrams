@@ -1,0 +1,64 @@
+name: Build FC guest kernel
+
+# Builds the engram Firecracker guest kernel (ADR 0025) and publishes
+# vmlinux as a GitHub release asset. The stock Firecracker-CI kernels strip
+# the netfilter stack; this rebuild adds nf_tables + the `raw` table so
+# Docker/compose run inside a sandbox (the engrams-on-engrams loop).
+#
+# Manual-only: the guest kernel changes rarely, and a change is a prod-wide
+# event (every FC host re-bakes + base snapshots re-capture). The consumers
+# pin the resulting tag/asset:
+#   - deploy/packer/provisioners/install-fc-kernel.sh  (prod FC-host bake)
+#   - crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh (dev/test)
+#
+# Note: cortexapps/engrams is private, so the release asset is NOT anonymous;
+# consumers download it with a token (the host bake passes GH_TOKEN through).
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux_version:
+        description: 'Linux source version (cdn.kernel.org v6.x)'
+        required: false
+        default: '6.1.102'
+      kernel_rev:
+        description: 'Engram build revision (bump when engram-docker.fragment changes)'
+        required: false
+        default: '1'
+
+permissions:
+  contents: write   # create the release + upload the asset
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LINUX_VERSION: ${{ github.event.inputs.linux_version || '6.1.102' }}
+      KERNEL_REV: ${{ github.event.inputs.kernel_rev || '1' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install kernel build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev cpio kmod
+
+      - name: Build vmlinux (base config + Docker fragment)
+        run: bash deploy/kernel/build-fc-kernel.sh
+
+      - name: Publish as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSET="vmlinux-engram-${LINUX_VERSION}-${KERNEL_REV}"
+          TAG="fc-kernel-${LINUX_VERSION}-${KERNEL_REV}"
+          # Idempotent: create the release if absent, then clobber-upload the
+          # asset + its checksum so a re-run replaces them.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "FC guest kernel ${LINUX_VERSION} (engram rev ${KERNEL_REV})" \
+              --notes "Firecracker guest kernel = stock microvm 6.1 config + deploy/kernel/engram-docker.fragment (ADR 0025). nf_tables + raw table for in-guest Docker."
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+          echo "Published $ASSET to release $TAG"
