@@ -26,6 +26,7 @@ use engram_core::error::BlobError;
 use engram_core::traits::storage::ByteStream;
 use engram_core::traits::HarnessByteStream;
 use engram_core::types::ids::SessionId;
+use engram_core::types::sandbox::{ExecEvent, ExecEventStream, ExecRequest};
 use engram_harness_proto::{
     read_msg, write_msg, UploadOp, UploadRequest, UploadResponse, MAX_ARTIFACT_BYTES,
 };
@@ -52,13 +53,47 @@ pub enum Trust {
     /// magic-byte-verified image/video is accepted.
     Untrusted,
     /// Operator pull of any file by path — any type accepted.
-    /// Constructed by the `from-path` endpoint (ADR 0026 phase 7).
-    #[allow(dead_code)]
     Trusted,
 }
 
-fn err(message: String) -> UploadResponse {
-    UploadResponse::Error { message }
+/// A stored artifact (the success of [`process_upload`]).
+pub struct SharedArtifact {
+    pub artifact_id: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+}
+
+/// Typed failure of [`process_upload`], so the untrusted transports can
+/// render `UploadResponse::Error` while the trusted HTTP `from-path`
+/// handler maps to the right status (413 / 429 / 400 / 500).
+pub enum UploadError {
+    /// Per-session count/byte quota hit (→ 429).
+    Quota(String),
+    /// Per-file size cap exceeded mid-stream (→ 413).
+    TooLarge(String),
+    /// Disallowed media type on the untrusted path, or empty body (→ 400).
+    BadMedia(String),
+    /// Storage / metadata / read failure (→ 500).
+    Internal(String),
+}
+
+impl UploadError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Quota(m) | Self::TooLarge(m) | Self::BadMedia(m) | Self::Internal(m) => m,
+        }
+    }
+}
+
+impl From<UploadError> for ApiError {
+    fn from(e: UploadError) -> Self {
+        match e {
+            UploadError::Quota(m) => ApiError::TooManyRequests(m),
+            UploadError::TooLarge(m) => ApiError::PayloadTooLarge(m),
+            UploadError::BadMedia(m) => ApiError::BadRequest(m),
+            UploadError::Internal(m) => ApiError::Internal(m),
+        }
+    }
 }
 
 /// Detect a media type from leading magic bytes. Never trusts a
@@ -109,6 +144,10 @@ fn sanitize_caption(caption: Option<String>) -> Option<String> {
 /// only (the persisted media type comes from sniffing). Streams into
 /// blob storage with a hard size cap + per-session byte budget, records
 /// the row, and emits the event. Auth is the caller's responsibility.
+/// Sentinel embedded in the mid-stream cap-exceeded `BlobError` so the
+/// caller can map it back to a 413 (vs a generic 500 storage failure).
+const SIZE_CAP_SENTINEL: &str = "artifact exceeds size limit";
+
 pub async fn process_upload(
     state: &SharedState,
     session: SessionId,
@@ -116,19 +155,23 @@ pub async fn process_upload(
     _ext: &str,
     caption: Option<String>,
     trust: Trust,
-) -> UploadResponse {
+) -> Result<SharedArtifact, UploadError> {
     // Pre-write quota check against existing usage.
-    let (count, total) = match state.services.meta.artifact_usage(session).await {
-        Ok(u) => u,
-        Err(e) => return err(format!("artifact usage lookup: {e}")),
-    };
+    let (count, total) = state
+        .services
+        .meta
+        .artifact_usage(session)
+        .await
+        .map_err(|e| UploadError::Internal(format!("artifact usage lookup: {e}")))?;
     if count >= MAX_ARTIFACTS_PER_SESSION {
-        return err(format!(
+        return Err(UploadError::Quota(format!(
             "per-session artifact count limit reached ({MAX_ARTIFACTS_PER_SESSION})"
-        ));
+        )));
     }
     if total >= MAX_ARTIFACT_TOTAL_BYTES_PER_SESSION {
-        return err("per-session artifact storage limit reached".into());
+        return Err(UploadError::Quota(
+            "per-session artifact storage limit reached".into(),
+        ));
     }
 
     // Pull a sniff prefix before deciding anything (so an untrusted
@@ -138,7 +181,7 @@ pub async fn process_upload(
     while prefix.len() < SNIFF_LEN {
         match src.next().await {
             Some(Ok(chunk)) => prefix.extend_from_slice(&chunk),
-            Some(Err(e)) => return err(format!("read artifact body: {e}")),
+            Some(Err(e)) => return Err(UploadError::Internal(format!("read artifact body: {e}"))),
             None => {
                 hit_eof = true;
                 break;
@@ -146,16 +189,16 @@ pub async fn process_upload(
         }
     }
     if prefix.is_empty() {
-        return err("empty artifact body".into());
+        return Err(UploadError::BadMedia("empty artifact body".into()));
     }
     let media_type = match (trust, detect_media_type(&prefix)) {
         (Trust::Untrusted, Some(mt)) if is_media(mt) => mt.to_string(),
         (Trust::Untrusted, _) => {
-            return err(
+            return Err(UploadError::BadMedia(
                 "unsupported media type: only image (png/jpeg/gif/webp) and video \
                  (mp4/webm) may be shared from the sandbox"
                     .into(),
-            )
+            ))
         }
         (Trust::Trusted, Some(mt)) => mt.to_string(),
         (Trust::Trusted, None) => "application/octet-stream".to_string(),
@@ -175,7 +218,7 @@ pub async fn process_upload(
         if !prefix.is_empty() {
             written += prefix.len() as u64;
             if written > cap {
-                yield Err(BlobError::Protocol("artifact exceeds size limit".into()));
+                yield Err(BlobError::Protocol(SIZE_CAP_SENTINEL.into()));
                 return;
             }
             yield Ok(prefix);
@@ -186,7 +229,7 @@ pub async fn process_upload(
                     Ok(chunk) => {
                         written += chunk.len() as u64;
                         if written > cap {
-                            yield Err(BlobError::Protocol("artifact exceeds size limit".into()));
+                            yield Err(BlobError::Protocol(SIZE_CAP_SENTINEL.into()));
                             return;
                         }
                         yield Ok(chunk);
@@ -210,7 +253,16 @@ pub async fn process_upload(
         Err(e) => {
             // Abort: best-effort delete the (possibly partial) object.
             let _ = state.services.blob.delete(&key).await;
-            return err(format!("store artifact: {e}"));
+            let msg = e.to_string();
+            return Err(if msg.contains(SIZE_CAP_SENTINEL) {
+                UploadError::TooLarge(format!(
+                    "artifact exceeds the size limit ({} MiB) or the session's \
+                     remaining storage budget",
+                    MAX_ARTIFACT_BYTES / (1024 * 1024)
+                ))
+            } else {
+                UploadError::Internal(format!("store artifact: {e}"))
+            });
         }
     };
 
@@ -228,7 +280,7 @@ pub async fn process_upload(
         .await
     {
         let _ = state.services.blob.delete(&key).await;
-        return err(format!("record artifact: {e}"));
+        return Err(UploadError::Internal(format!("record artifact: {e}")));
     }
 
     let id_str = artifact_id.simple().to_string();
@@ -248,16 +300,16 @@ pub async fn process_upload(
         tracing::warn!(session = %session, error = %e, "emit FileShared failed (artifact stored)");
     }
 
-    UploadResponse::Shared {
+    Ok(SharedArtifact {
         artifact_id: id_str,
         media_type,
         size_bytes: size,
-    }
+    })
 }
 
 /// Authorize an untrusted in-guest [`UploadRequest`] (broker token) and
-/// run the shared core with its body stream. Shared by the vsock and
-/// split-mode HTTP transports.
+/// run the shared core with its body stream, rendering the wire
+/// [`UploadResponse`]. Shared by the vsock and split-mode HTTP transports.
 async fn authorized_untrusted_upload(
     state: &SharedState,
     header: UploadRequest,
@@ -268,10 +320,12 @@ async fn authorized_untrusted_upload(
         header.session_id,
         &header.broker_token,
     ) {
-        return err("invalid or missing upload token".into());
+        return UploadResponse::Error {
+            message: "invalid or missing upload token".into(),
+        };
     }
     let UploadOp::ShareFile { ext, caption, .. } = header.op;
-    process_upload(
+    match process_upload(
         state,
         header.session_id,
         body,
@@ -280,6 +334,16 @@ async fn authorized_untrusted_upload(
         Trust::Untrusted,
     )
     .await
+    {
+        Ok(a) => UploadResponse::Shared {
+            artifact_id: a.artifact_id,
+            media_type: a.media_type,
+            size_bytes: a.size_bytes,
+        },
+        Err(e) => UploadResponse::Error {
+            message: e.message().to_string(),
+        },
+    }
 }
 
 /// Adapt a capped `AsyncRead` (the vsock body after the header frame)
@@ -351,13 +415,114 @@ pub async fn upload_forward(
 ) -> Json<UploadResponse> {
     let header = match decode_upload_header(&headers) {
         Ok(h) => h,
-        Err(message) => return Json(err(message)),
+        Err(message) => return Json(UploadResponse::Error { message }),
     };
     let src = ByteStream::new(
         body.into_data_stream()
             .map(|r| r.map_err(|e| BlobError::Protocol(format!("recv artifact body: {e}")))),
     );
     Json(authorized_untrusted_upload(&state, header, src).await)
+}
+
+// ---- trusted operator pull (any file by path) --------------------------
+
+#[derive(serde::Deserialize)]
+pub struct FromPathRequest {
+    pub path: String,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FromPathResponse {
+    pub artifact_id: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+}
+
+/// `POST /sessions/:id/artifacts/from-path` — ADR 0026 trusted operator
+/// file pull. Mounted in the bearer/IAP group (NOT broker-token-authed):
+/// a trusted operator can capture **any** file in the session, with no
+/// MIME restriction (`Trust::Trusted`), same size cap + quota.
+///
+/// `ensure_active` auto-resumes a recoverable (Idle) session; the file is
+/// read out of the guest by streaming `cat` over the existing exec
+/// channel (works in-proc + split mode — no new gRPC surface), so the
+/// body never buffers host-side. A missing/unreadable path surfaces as a
+/// non-zero `cat` exit → the stream errors and the upload aborts.
+pub async fn create_from_path(
+    State(state): State<SharedState>,
+    Path(session): Path<SessionId>,
+    Json(req): Json<FromPathRequest>,
+) -> Result<Json<FromPathResponse>, ApiError> {
+    crate::api::snapshot::ensure_active(&state, session).await?;
+    let sandbox_id = state.registry.get(session).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox — create a new session or resume from snapshot".into(),
+        )
+    })?;
+    let exec_req = ExecRequest {
+        command: vec!["cat".into(), "--".into(), req.path.clone()],
+        stdin: None,
+        env: std::collections::HashMap::new(),
+        workdir: None,
+        timeout: Some(std::time::Duration::from_secs(600)),
+    };
+    let stream = state
+        .services
+        .host
+        .exec_stream(sandbox_id, exec_req)
+        .await?;
+    let body = exec_stdout_bytestream(stream.events);
+    let ext = ext_from_path(&req.path);
+    let a = process_upload(
+        &state,
+        session,
+        body,
+        &ext,
+        sanitize_caption(req.caption),
+        Trust::Trusted,
+    )
+    .await?;
+    Ok(Json(FromPathResponse {
+        artifact_id: a.artifact_id,
+        media_type: a.media_type,
+        size_bytes: a.size_bytes,
+    }))
+}
+
+fn ext_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin")
+        .to_ascii_lowercase()
+}
+
+/// Adapt an exec event stream (a `cat` of the target file) into a
+/// [`ByteStream`]: stdout becomes body bytes; a non-zero exit becomes a
+/// stream error so [`process_upload`] aborts + deletes (e.g. the path was
+/// missing/unreadable). Stderr is dropped.
+fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
+    let s = async_stream::stream! {
+        let mut events = events;
+        while let Some(ev) = events.next().await {
+            match ev {
+                ExecEvent::Stdout(b) => yield Ok(b),
+                ExecEvent::Stderr(_) => {}
+                ExecEvent::Exit(Some(0)) => return,
+                ExecEvent::Exit(_) => {
+                    yield Err(BlobError::Protocol(
+                        "reading file from guest failed (cat exited non-zero — \
+                         missing or unreadable path?)"
+                            .into(),
+                    ));
+                    return;
+                }
+            }
+        }
+    };
+    ByteStream::new(s)
 }
 
 // ---- serve (web UI) ----------------------------------------------------

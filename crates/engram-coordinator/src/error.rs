@@ -31,6 +31,13 @@ pub enum ApiError {
     /// ADR 0023 in-session forge endpoints, authenticated by the
     /// per-session credential-broker token.
     Unauthorized(String),
+    /// 413 — the request body exceeded a hard size cap. ADR 0026:
+    /// an artifact upload over `MAX_ARTIFACT_BYTES` (or the session's
+    /// remaining byte budget).
+    PayloadTooLarge(String),
+    /// 429 — a per-session rate/quota limit was hit. ADR 0026: an
+    /// artifact upload over the session's count/total-bytes quota.
+    TooManyRequests(String),
     Internal(String),
 }
 
@@ -50,6 +57,8 @@ impl ApiError {
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -64,6 +73,8 @@ impl ApiError {
             Self::Unsupported(_) => "unsupported",
             Self::Unavailable(_) => "unavailable",
             Self::Unauthorized(_) => "unauthorized",
+            Self::PayloadTooLarge(_) => "payload_too_large",
+            Self::TooManyRequests(_) => "too_many_requests",
             Self::Internal(_) => "internal",
         }
     }
@@ -78,6 +89,8 @@ impl ApiError {
             | Self::Unsupported(m)
             | Self::Unavailable(m)
             | Self::Unauthorized(m)
+            | Self::PayloadTooLarge(m)
+            | Self::TooManyRequests(m)
             | Self::Internal(m) => m,
         }
     }

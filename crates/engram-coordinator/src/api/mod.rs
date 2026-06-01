@@ -51,6 +51,15 @@ pub fn router(state: SharedState) -> Router {
             "/sessions/:id/artifacts/:artifact_id",
             get(upload::serve_artifact),
         )
+        // ADR 0026: trusted operator file pull — capture any file by
+        // path from the session (no MIME restriction). Bearer/IAP-authed
+        // (in the protected group), distinct from the untrusted in-guest
+        // push. Static `from-path` segment takes priority over the
+        // `:artifact_id` param above; artifact ids are UUIDs, no clash.
+        .route(
+            "/sessions/:id/artifacts/from-path",
+            post(upload::create_from_path),
+        )
         .route("/sessions/:id/snapshot", post(snapshot::snapshot))
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
