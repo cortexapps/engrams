@@ -19,14 +19,18 @@
 //! low-frequency POSTs against the coord LB.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use engram_core::{HostId, SandboxId, SessionId};
-use engram_harness_proto::{ForgeRequest, ForgeResponse, HarnessEvent};
+use engram_harness_proto::{
+    ForgeRequest, ForgeResponse, HarnessEvent, UploadRequest, UploadResponse,
+};
 use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
 use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::io::ReaderStream;
 
 /// Persistent HTTP client to the coord. One per host-agent process;
 /// cheap to clone (`reqwest::Client` is `Arc` internally).
@@ -198,6 +202,50 @@ impl CoordClient {
             .await
             .map_err(CoordClientError::Transport)?;
         decode_json(resp, "forge").await
+    }
+
+    /// POST /api/hosts/upload
+    ///
+    /// ADR 0026 split-mode artifact forwarding. The host-agent reads the
+    /// in-guest `UploadRequest` header off the upload vsock stream, then
+    /// streams the raw file body straight through to the coord (which
+    /// holds BlobStorage + the broker map) **without buffering**, and
+    /// writes the returned `UploadResponse` back to the guest. The header
+    /// rides a base64'd bincode `X-Engram-Upload` request header — keeps
+    /// the broker token out of the URL/query log and survives a unicode
+    /// caption; the body is the raw file bytes. The coord always replies
+    /// 200 with an `UploadResponse` (upload-level failures are
+    /// `UploadResponse::Error`), so the guest helper gets a usable reply.
+    pub async fn upload_artifact<R>(
+        &self,
+        header: &UploadRequest,
+        body: R,
+    ) -> Result<UploadResponse, CoordClientError>
+    where
+        R: tokio::io::AsyncRead + Send + 'static,
+    {
+        let url = self.endpoint("/api/hosts/upload");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            bincode::serialize(header).map_err(|e| CoordClientError::Decode {
+                error: e.to_string(),
+                what: "upload_artifact header encode",
+            })?,
+        );
+        let stream_body = reqwest::Body::wrap_stream(ReaderStream::new(Box::pin(body)));
+        let mut builder = self
+            .http
+            .post(&url)
+            .header("X-Engram-Upload", encoded)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            // A multi-hundred-MB video can take a while to stream through;
+            // override the shared client's 30s default for this lane.
+            .timeout(Duration::from_secs(600))
+            .body(stream_body);
+        if !self.auth_token.is_empty() {
+            builder = builder.bearer_auth(&self.auth_token);
+        }
+        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        decode_json(resp, "upload_artifact").await
     }
 
     /// POST /api/hosts/:id/live-manifest

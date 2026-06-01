@@ -820,6 +820,13 @@ impl HostClient for HostRegistry {
             entry.value().backend.set_forge_sink(sink.clone());
         }
     }
+
+    fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
+        // Fan out to every registered host, same as `set_forge_sink`.
+        for entry in self.hosts.iter() {
+            entry.value().backend.set_upload_sink(sink.clone());
+        }
+    }
 }
 
 #[cfg(test)]

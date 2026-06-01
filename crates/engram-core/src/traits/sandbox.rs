@@ -42,6 +42,15 @@ pub type HarnessSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// in-guest helper hits the coord's HTTP forge endpoint on loopback).
 pub type ForgeSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 
+/// ADR 0026: handler for inbound in-guest artifact-upload connections
+/// (one stream per guest dial on `UPLOAD_VSOCK_PORT`). Same shape as
+/// [`ForgeSink`] but a separate channel — the host reads an
+/// `UploadRequest` header frame, then the raw file body, streams it to
+/// the coord, and replies. FC wires this through its vsock UDS;
+/// `ProcessBackend` doesn't need it (its in-guest helper hits the
+/// coord's loopback HTTP artifact endpoint).
+pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
+
 /// VM lifecycle seam. Production implementation: `engram-sandbox-firecracker`
 /// (Firecracker over its HTTP-over-Unix-socket API). Dev implementation:
 /// `engram-sandbox-process` (host subprocesses, no isolation).
@@ -104,6 +113,13 @@ pub trait SandboxBackend: Send + Sync {
     /// [`set_harness_sink`](Self::set_harness_sink); default no-op
     /// (`ProcessBackend` uses the coord's HTTP forge endpoint instead).
     fn set_forge_sink(&self, _sink: ForgeSink) {}
+
+    /// ADR 0026: register a sink for inbound in-guest artifact-upload
+    /// connections (one stream per guest dial on `UPLOAD_VSOCK_PORT`).
+    /// Mirrors [`set_forge_sink`](Self::set_forge_sink); default no-op
+    /// (`ProcessBackend` uses the coord's loopback HTTP artifact
+    /// endpoint instead).
+    fn set_upload_sink(&self, _sink: UploadSink) {}
 
     /// Push per-session egress policy to the backend. The
     /// coordinator calls this after `create_for_session` returns,
