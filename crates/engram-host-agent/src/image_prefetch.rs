@@ -259,8 +259,7 @@ async fn prefetch_one(
         .get_manifest(image.base_snapshot_memory_manifest)
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
-    total +=
-        prefetch_manifest_chunks(memory_manifest, chunk_store, chunk_cache, semaphore).await?;
+    total += prefetch_manifest_chunks(memory_manifest, chunk_store, chunk_cache, semaphore).await?;
 
     Ok(total)
 }
