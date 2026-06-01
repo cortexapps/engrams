@@ -637,6 +637,9 @@ async fn create_session_inner(
     // mints the token per request instead.
     if let Some(agent) = agent_for_session.as_mut() {
         inject_forge_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
+        // ADR 0026: artifact-upload token, injected for every image
+        // (not git-gated) so the baked `engram-share` skill always works.
+        inject_upload_env(&state, session_id, &mut agent.env);
     }
 
     // Network policy: image manifest's `[network]` block, verbatim.
@@ -1130,20 +1133,16 @@ pub async fn delete_session(
 /// `GIT_ASKPASS` helper can fetch credentials + open PRs. No-op when no
 /// forge is configured or the image has no `[git]` block. Re-minting on
 /// resume is fine — the latest token wins.
-pub(crate) fn inject_forge_env(
-    state: &SharedState,
-    session_id: SessionId,
-    git: Option<&engram_core::types::image::GitConfig>,
-    env: &mut HashMap<String, String>,
-) {
-    let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
-        return;
-    };
-    // Idempotent: reuse the session's existing broker token (minted at
-    // create) when present, so a later call from the `/exec` path injects
-    // the SAME token rather than orphaning a fresh one in the map. The
-    // first call (create) mints + stores it.
-    let token = match state.git_broker_tokens.get(&session_id) {
+/// Mint-or-reuse the session's broker token (stored in
+/// `state.git_broker_tokens`). Idempotent: a later call from the
+/// `/exec` path returns the SAME token rather than orphaning a fresh
+/// one. ADR 0023 minted it for the forge seam; ADR 0026 reuses it for
+/// the artifact-upload seam (the name is historical). The
+/// `loopback_endpoint` (`http://127.0.0.1:<port>`) is returned for the
+/// HostTcp/ProcessBackend path so the in-guest helper can reach the
+/// coord on loopback; `None` on the vsock (Firecracker) path.
+pub(crate) fn get_or_mint_broker_token(state: &SharedState, session_id: SessionId) -> String {
+    match state.git_broker_tokens.get(&session_id) {
         Some(existing) => existing.value().clone(),
         None => {
             let minted = format!(
@@ -1154,7 +1153,34 @@ pub(crate) fn inject_forge_env(
             state.git_broker_tokens.insert(session_id, minted.clone());
             minted
         }
+    }
+}
+
+fn loopback_endpoint(state: &SharedState) -> Option<String> {
+    if matches!(
+        state.services.host.harness_dial(),
+        engram_core::traits::HarnessDial::HostTcp
+    ) {
+        state
+            .cfg
+            .bind_addr
+            .rsplit_once(':')
+            .map(|(_host, port)| format!("http://127.0.0.1:{port}"))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn inject_forge_env(
+    state: &SharedState,
+    session_id: SessionId,
+    git: Option<&engram_core::types::image::GitConfig>,
+    env: &mut HashMap<String, String>,
+) {
+    let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
+        return;
     };
+    let token = get_or_mint_broker_token(state, session_id);
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
     if let Some(owner) = git.owner.as_deref() {
         env.insert("ENGRAM_FORGE_OWNER".into(), owner.to_string());
@@ -1164,16 +1190,27 @@ pub(crate) fn inject_forge_env(
     // so it hits the coord on loopback. Vsock (Firecracker): the helper
     // uses the agentd forge-request bridge instead (ADR 0023 §5), so no
     // HTTP URL is injected here.
-    if matches!(
-        state.services.host.harness_dial(),
-        engram_core::traits::HarnessDial::HostTcp
-    ) {
-        if let Some((_host, port)) = state.cfg.bind_addr.rsplit_once(':') {
-            env.insert(
-                "ENGRAM_FORGE_ENDPOINT".into(),
-                format!("http://127.0.0.1:{port}"),
-            );
-        }
+    if let Some(ep) = loopback_endpoint(state) {
+        env.insert("ENGRAM_FORGE_ENDPOINT".into(), ep);
+    }
+}
+
+/// ADR 0026: inject the artifact-upload env so the in-guest
+/// `engram-share` helper can stream files out. Unlike
+/// [`inject_forge_env`] this is **NOT git-gated** — every image gets it
+/// (the skill is baked unconditionally). Reuses the same per-session
+/// broker token (a distinct env name, same secret value); the upload
+/// auth check (`session_auth::authorize_broker_token`) doesn't require a
+/// forge to be configured.
+pub(crate) fn inject_upload_env(
+    state: &SharedState,
+    session_id: SessionId,
+    env: &mut HashMap<String, String>,
+) {
+    let token = get_or_mint_broker_token(state, session_id);
+    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token);
+    if let Some(ep) = loopback_endpoint(state) {
+        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep);
     }
 }
 

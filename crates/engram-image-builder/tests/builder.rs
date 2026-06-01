@@ -335,6 +335,26 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
     // No [git] binding → no forge glue injected.
     assert!(!outcome.rootfs_path.join("opt/engram/git-askpass").exists());
     assert!(!outcome.rootfs_path.join("usr/local/bin/engram-pr").exists());
+
+    // ADR 0026: the artifact-share seam IS baked for every image (not
+    // git-gated) — even this no-`[git]` image gets `engram-share` + the
+    // share-file skill + the Claude Code skills symlink.
+    assert!(
+        outcome
+            .rootfs_path
+            .join("usr/local/bin/engram-share")
+            .is_file(),
+        "engram-share present without [git]"
+    );
+    assert!(
+        outcome
+            .rootfs_path
+            .join("root/.agents/skills/share-file/SKILL.md")
+            .is_file(),
+        "share-file skill present without [git]"
+    );
+    let target = std::fs::read_link(outcome.rootfs_path.join("root/.claude/skills")).unwrap();
+    assert_eq!(target, std::path::Path::new("/root/.agents/skills"));
 }
 
 #[tokio::test]

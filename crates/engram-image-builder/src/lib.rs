@@ -660,6 +660,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             inject_forge_helpers(&rootfs_dir, git).await?;
         }
 
+        // ADR 0026: the artifact-share seam glue (`engram-share` wrapper +
+        // the share-file skill) is injected for EVERY image, not gated on
+        // `[git]` — uploads aren't git-related and `engram-agentd` is
+        // always baked. Lets any agent surface a screenshot/recording in
+        // the session's conversation history with no tokens.
+        inject_share_helpers(&rootfs_dir).await?;
+
         // Fold the built image's Docker config (its `ENV` + `WORKDIR`)
         // into the manifest as defaults — the author's `engram.toml`
         // [env]/workdir wins. The platform doesn't otherwise read the
@@ -1151,6 +1158,63 @@ It prints the URL of the created PR/MR. Notes:
 The opened PR is also surfaced on the session's event stream, so whoever
 launched the session sees the link.
 "#;
+
+/// Provider-agnostic artifact-share wrapper (ADR 0026).
+const SHARE_ENGRAM_SHARE: &str = r#"#!/bin/sh
+# ADR 0026 artifact-share helper (injected by the engram image baker).
+# Thin wrapper over the baked `engram-agentd share-file` subcommand,
+# which dials the host's upload vsock bridge -> coordinator BlobStorage.
+# Flags: --file <path> [--caption <text>]. The shared image/video shows
+# up in the session's conversation history. No tokens needed.
+exec engram-agentd share-file "$@"
+"#;
+
+/// Built-in `share-file` skill (teaches the harness to use
+/// `engram-share`). Baked into every image, like `create-pull-request`.
+const SHARE_FILE_SKILL: &str = r#"---
+name: share-file
+description: Share an image or video file so it appears in the engrams session's conversation history for the person who launched the session. Use when you want to SHOW your work visually — a screenshot of a page you built, a screen recording of a flow, a rendered chart. No tokens or setup needed.
+---
+
+# Sharing a file (image / video)
+
+This engrams session can surface an image or video in the conversation history
+the launcher is watching — use it to **show**, not just describe, your work
+(e.g. a screenshot after a UI change, a short screen recording of a flow).
+
+## Usage
+
+```bash
+engram-share --file /path/to/screenshot.png --caption "Dashboard after the fix"
+```
+
+- `--file` (required): path to the file in this session's filesystem.
+- `--caption` (optional): a short human-readable caption.
+
+Supported types: images (`png`, `jpeg`, `gif`, `webp`) and video (`mp4`,
+`webm`). The file's content is verified — other file types are rejected. It
+prints a confirmation with the stored artifact id. The shared file is surfaced
+on the session's event stream, so whoever launched the session sees it inline.
+"#;
+
+/// Inject the artifact-share seam glue into the rootfs for EVERY image
+/// (ADR 0026; not git-gated): the `engram-share` wrapper and the
+/// built-in `share-file` skill, planted at the harness-agnostic
+/// `~/.agents/skills` with Claude Code's loader dir symlinked at it.
+async fn inject_share_helpers(rootfs_dir: &Path) -> Result<(), BuildError> {
+    write_rootfs_executable(
+        rootfs_dir.join("usr/local/bin/engram-share"),
+        SHARE_ENGRAM_SHARE,
+    )
+    .await?;
+    write_rootfs_file(
+        rootfs_dir.join("root/.agents/skills/share-file/SKILL.md"),
+        SHARE_FILE_SKILL,
+    )
+    .await?;
+    ensure_claude_skills_symlink(rootfs_dir).await?;
+    Ok(())
+}
 
 /// Inject the forge-seam client glue into the rootfs for an image with a
 /// `[git]` binding: the `GIT_ASKPASS` helper, the `engram-pr` opener, the
