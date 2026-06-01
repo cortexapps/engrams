@@ -115,8 +115,15 @@ async fn share_file_round_trips_over_vsock() {
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
-    // Captured: (broker_token, ext, size_bytes, body sha-less len + first/last bytes).
-    let captured: Arc<Mutex<Option<(String, String, u64, Vec<u8>)>>> = Arc::new(Mutex::new(None));
+    // Captured by the sink for post-run assertions: broker token, ext,
+    // advertised size, and the full streamed body.
+    struct Captured {
+        token: String,
+        ext: String,
+        size_bytes: u64,
+        body: Vec<u8>,
+    }
+    let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
     let captured_sink = captured.clone();
     let sink: engram_core::traits::UploadSink = Arc::new(move |stream| {
         let captured = captured_sink.clone();
@@ -137,7 +144,12 @@ async fn share_file_round_trips_over_vsock() {
                 eprintln!("upload sink: body read failed: {e}");
                 return;
             }
-            *captured.lock() = Some((header.broker_token.clone(), ext, size_bytes, body));
+            *captured.lock() = Some(Captured {
+                token: header.broker_token.clone(),
+                ext,
+                size_bytes,
+                body,
+            });
             let resp = UploadResponse::Shared {
                 artifact_id: "0190testartifactid".into(),
                 media_type: "image/png".into(),
@@ -203,12 +215,21 @@ async fn share_file_round_trips_over_vsock() {
     );
 
     let got = captured.lock().take().expect("sink captured the upload");
-    let (token, ext, size_bytes, body) = got;
-    assert_eq!(token, "utok-xyz789", "broker token crossed the wire intact");
-    assert_eq!(ext, "png");
-    assert_eq!(size_bytes, 20_971_520, "header advertised the full size");
-    assert_eq!(body.len(), 20_971_520, "full body streamed past the 16 MiB frame cap");
-    assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "PNG magic preserved");
+    assert_eq!(
+        got.token, "utok-xyz789",
+        "broker token crossed the wire intact"
+    );
+    assert_eq!(got.ext, "png");
+    assert_eq!(
+        got.size_bytes, 20_971_520,
+        "header advertised the full size"
+    );
+    assert_eq!(
+        got.body.len(),
+        20_971_520,
+        "full body streamed past the 16 MiB frame cap"
+    );
+    assert_eq!(&got.body[..8], b"\x89PNG\r\n\x1a\n", "PNG magic preserved");
 
     backend.destroy(sandbox_id).await.expect("destroy sandbox");
 }
