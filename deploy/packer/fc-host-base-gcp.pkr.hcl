@@ -84,6 +84,13 @@ variable "machine_type" {
   default     = "n2-standard-2"
 }
 
+variable "gh_token" {
+  type        = string
+  sensitive   = true
+  description = "GitHub token with read access to cortexapps/engrams releases — install-fc-kernel.sh fetches the private FC guest-kernel asset (ADR 0025) on the build VM via the releases API (curl + python3, both installed in step 1). Empty = the script falls back to a pre-staged file or anonymous fetch."
+  default     = ""
+}
+
 variable "network" {
   type        = string
   description = "VPC for the build worker. `default` works for one-shot builds."
@@ -165,8 +172,13 @@ build {
 
   # 2b. FC guest kernel at /usr/local/lib/engram/vmlinux. Host-agent boots
   # every microVM with this kernel; without it `create()` rejects every
-  # sandbox spec.
+  # sandbox spec. ADR 0025: this is engram's own kernel (nf_tables + raw table
+  # for in-guest Docker), a private GitHub release asset — install-fc-kernel.sh
+  # fetches it on the VM via the releases API using GH_TOKEN.
   provisioner "shell" {
+    environment_vars = [
+      "GH_TOKEN=${var.gh_token}",
+    ]
     script = "${path.root}/provisioners/install-fc-kernel.sh"
   }
 

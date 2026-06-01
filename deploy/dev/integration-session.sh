@@ -58,12 +58,10 @@ else
         --format ext4 \
         --images-dir ./var/integration/images \
         --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
-        --capture-canonical-memory \
-        --canonical-kernel "${ENGRAM_KERNEL_IMAGE_PATH:-$HOME/.cache/engram-fc-test/vmlinux-5.10.223}" \
-        --canonical-boot-wait-secs 8 \
-        --canonical-memory-mib 256 \
         --push "$IMAGE_URI" \
         2>&1 | tail -3
+    # Base snapshot is captured at enable time (ADR 0020), not at bake — the
+    # old --capture-canonical-* flags were removed from `engram-cli image build`.
 
     echo "==> POST /api/enabled-images (cascade)"
     ENABLE_BODY=$(printf '{"image_uri": "%s"}' "$IMAGE_URI")

@@ -16,8 +16,8 @@
 //!
 //! `waitid(P_PIDFD, fd, WNOHANG)` reaps the zombie (since 5.4). On
 //! kernels older than 5.4 we'd need a different reaper; the FC
-//! production target requires Linux 5.10+ anyway (the test kernel
-//! in `~/.cache/engram-fc-test/vmlinux-5.10.223` is the minimum).
+//! production target is engram's own guest kernel (ADR 0025, Linux
+//! 6.1.x), well above the 5.4 floor.
 //!
 //! Linux-only by construction. On macOS this module compiles
 //! (cfg(target_os = "linux")-gated) but every function is a stub

@@ -484,6 +484,11 @@ jobs:
       # `common::fc_preflight()` reads. Idempotent: on a cache hit
       # this just re-emits the env exports without re-downloading.
       - name: Fetch FC kernel + rootfs artifacts
+        # GH_TOKEN: the FC guest kernel is now a private release asset on this
+        # repo (ADR 0025); fetch-fc-test-artifacts.sh `gh release download`s it.
+        # The in-repo GITHUB_TOKEN can read this repo's own releases.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
             | sed 's/^export //' >> "$GITHUB_ENV"
@@ -1236,6 +1241,9 @@ jobs:
             fc-test-artifacts-
 
       - name: Fetch FC kernel + rootfs artifacts
+        # GH_TOKEN: private release asset for the FC guest kernel (ADR 0025).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
             --cache-dir "$HOME/.cache/engram-fc-test"
