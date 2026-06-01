@@ -228,6 +228,15 @@ mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 fi
+# /etc/hosts: a slim rootfs (debian-slim etc.) ships an empty one, so
+# `localhost` has no entry and `nsswitch` (files then dns) falls through to
+# the nameservers above — which the FC guest can't reach — and anything that
+# binds or dials localhost fails with "lookup localhost ... no such host".
+# That breaks the in-guest `just dev` loop (tilt, the coordinator, the web
+# dev server). Seed the loopback names if /etc/hosts is empty.
+if [ ! -s /etc/hosts ]; then
+    printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' > /etc/hosts
+fi
 # ADR 0014 M1.12 (option D) + ADR 0015 M1: engram-init no longer
 # leaves a persistent mount of the harness substrate at
 # /run/engram/harnesses. The host's SpawnHarness frame nominates
