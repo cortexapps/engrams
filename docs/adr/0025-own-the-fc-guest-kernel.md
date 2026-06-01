@@ -1,6 +1,14 @@
 # ADR 0025: Own the Firecracker guest kernel
 
-Status: 2026-06-01 — **Proposed.** Engrams has booted FC sessions on
+Status: 2026-06-01 — **Accepted.** Shipped + prod-validated: the custom kernel
+(`vmlinux-engram-6.1.102-1`) is live on the FC-host MIG, and a prod `dev-engrams`
+session boots it (`uname -r` = 6.1.102) and runs **Docker 29.5.2 + `docker
+compose up postgres` with zero workarounds** (`pg_isready` → accepting
+connections on the published port). Dev-vm-verified first, then rolled through
+the auto-pipeline (base bake installed the kernel via the token'd API → thin →
+tf-apply → MIG roll). _Original proposal below._
+
+Engrams has booted FC sessions on
 Firecracker's stock CI guest kernel (`vmlinux-5.10.223`, pulled from the public
 `spec.ccfc.min` bucket). That kernel is deliberately minimal and **cannot run
 Docker inside a sandbox** — which blocks the "engrams on engrams" dogfood loop
@@ -84,4 +92,21 @@ zero daemon workarounds, no per-container latency.**
 
 ## Commit chain
 
-_(to be filled as commits land; flip to Accepted once prod is rolled + validated)_
+- OSS `b52d821` — build capability (this ADR Proposed + `deploy/kernel/` +
+  `build-fc-kernel.yml`); pushed, then `build-fc-kernel.yml` dispatched to
+  publish the asset.
+- OSS `c5fa6be` — consumers + auth (`install-fc-kernel.sh`,
+  `fetch-fc-test-artifacts.sh`, `ci.yml` token, packer `gh_token`, pidfd doc,
+  integration-session).
+- engrams-internal `ccecc37` — base bake passes `gh_token` to packer.
+- engrams-internal `2fb1b4d` — dev-engrams plain Docker 29.
+- _(this commit)_ — flip to Accepted.
+
+**Roll notes.** Pushing both lanes (host_base + host_binaries) at once made the
+deploy pipeline fan out base+thin in parallel + double-bake (redundant, both on
+the custom kernel) — a one-line sequencing improvement for a follow-up. The
+GHCR pull of the 7.6 GB dev-engrams image to a cold-cache fresh host hit 429s;
+it converged on retry (chunk cache accumulates). **Follow-up housekeeping:** the
+other previously-enabled images (demo-claude, older dev-engrams tags) still carry
+old-kernel base snapshots and must be re-enabled (delete + re-POST) to
+re-capture on 6.1.x before they can boot again.
