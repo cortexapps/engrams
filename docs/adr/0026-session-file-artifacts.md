@@ -151,8 +151,10 @@ but leaves the blob (acceptable for v1; an artifacts-GC is deferred).
 - `b6f05fb` — phase 7: trusted operator pull
   `POST /sessions/:id/artifacts/from-path`; `process_upload` → `Result<_, UploadError>`;
   `ApiError::PayloadTooLarge`/`TooManyRequests`.
-- _(this commit)_ — phase 8: FC `upload_loopback` e2e (wired into `ci.yml` +
+- `71cdf59` — phase 8: FC `upload_loopback` e2e (wired into `ci.yml` +
   `run-boot-test.sh`); ADR commit chain.
+- `33bfe1d` — phase 8 fixup: rustfmt + clippy `type_complexity` on the
+  Linux-gated e2e (only surfaced on the Linux CI runner; see verification note).
 - _(final, post-merge)_ — flip to **Accepted** once prod-validated (dogfood: an
   agent screenshots a page and it renders in the conversation UI).
 
@@ -173,8 +175,14 @@ but leaves the blob (acceptable for v1; an artifacts-GC is deferred).
   which is what the e2e exercises. `share-file` only dials the vsock port today; the
   HTTP-loopback fallback (+ `ENGRAM_UPLOAD_ENDPOINT`) can land with the serve work
   if `just dev` testing needs it.
-- **Verification gap to close before Accepted:** the `upload_loopback` FC e2e is
-  `#![cfg(target_os = "linux")]`, so it's invisible to macOS `just check` and was
-  NOT compiled locally (no cross C toolchain; dev VM was down). It must be confirmed
-  green via CI (Blacksmith `test-firecracker`) or a dev-vm run. All non-gated code
-  passed `just check` (882 tests).
+- **Verification (closed).** The `upload_loopback` FC e2e is
+  `#![cfg(target_os = "linux")]`, so it's invisible to macOS `just check` — which is
+  exactly why its rustfmt + clippy slips only surfaced on the Linux CI runner (fixed
+  in `33bfe1d`; lesson: run dev-vm fmt/clippy on cfg(linux) test files before
+  pushing, per `feedback_linux_only_clippy_via_dev_vm`). Now fully verified: CI green
+  across all jobs (incl. `tests (firecracker, Linux + KVM)`), and a **real dev-VM
+  microVM boot** of `share_file_round_trips_over_vsock` passed in 27.79s — baked a
+  rootfs, booted FC, ran `engram-agentd share-file` on a >16 MiB file, and confirmed
+  the broker token + full body crossed the vsock intact (past the 16 MiB frame cap).
+  The lone CI red along the way was an unrelated `e2e stack` postgres-bring-up race
+  that passed on re-run. All non-gated code: `just check` (882 tests) + web `tsc`.
