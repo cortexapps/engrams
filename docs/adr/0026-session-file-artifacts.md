@@ -109,10 +109,11 @@ but leaves the blob (acceptable for v1; an artifacts-GC is deferred).
 
 ## Consequences
 
-- New vsock port 1029 and a new agentd verb (`DownloadStream`) — both baked into the
-  guest image, so enabling artifacts requires a session-image re-bake + re-enable
-  (per `reference_engrams_deploy_auto_triggers`). Clean break, no compat shim (0
-  users).
+- New vsock port 1029 (+ the baked `engram-share` skill) live in the guest image, so
+  enabling artifacts requires a session-image re-bake + re-enable (per
+  `reference_engrams_deploy_auto_triggers`). Clean break, no compat shim (0 users).
+  The operator pull adds **no** guest-side verb — it reads files by streaming `cat`
+  over the existing exec channel (see divergence below).
 - The forge broker token is generalized to a per-session "broker token" guarding
   both git and uploads, and is now injected for **every** image (not just `[git]`
   ones). `authorize_broker_token` drops the `state.forge` requirement; forge keeps
@@ -139,15 +140,41 @@ but leaves the blob (acceptable for v1; an artifacts-GC is deferred).
   `/api/hosts/upload` transports, `UploadSink` registration, `artifacts` table
   (0045), `MetadataStore` artifact methods, `SessionEvent::FileShared`, shared
   `session_auth` factored out of forge.
-- _(remaining: env decouple+baked skill, serve+security+CSP, web UI, operator pull)._
-- _(final)_ — flip to Accepted with prod-validation note.
+- `60b4249` — phase 4: decouple the upload token from `[git]`
+  (`get_or_mint_broker_token` + `inject_upload_env` at both forge sites); bake the
+  `engram-share` wrapper + `share-file` skill into **every** image.
+- `325df32` — phase 5: serve endpoint `GET /sessions/:id/artifacts/:artifact_id`
+  with the MIME-agnostic hardened headers (nosniff + Content-Disposition + CSP
+  sandbox + no-store); dashboard-wide CSP in the web nginx SPA block.
+- `b8b6cb0` — phase 6: web `file_shared` event + `ArtifactCard` (media inline,
+  non-media download chip) + Transcript wiring.
+- `b6f05fb` — phase 7: trusted operator pull
+  `POST /sessions/:id/artifacts/from-path`; `process_upload` → `Result<_, UploadError>`;
+  `ApiError::PayloadTooLarge`/`TooManyRequests`.
+- _(this commit)_ — phase 8: FC `upload_loopback` e2e (wired into `ci.yml` +
+  `run-boot-test.sh`); ADR commit chain.
+- _(final, post-merge)_ — flip to **Accepted** once prod-validated (dogfood: an
+  agent screenshots a page and it renders in the conversation UI).
 
-**Notes / divergences so far.**
+**Notes / divergences.**
 - Adding the three `MetadataStore` artifact methods fanned out to **7 impls** (the
   real Postgres one + 6 test/mock doubles across coordinator, chunk-store, oci-auth);
   the mocks get trivial stubs.
+- **Operator pull reuses `exec_stream` + `cat`, not a dedicated agentd
+  `DownloadStream` verb** (which the plan proposed). The only streaming `HostClient`
+  method that crosses the coord↔host gRPC boundary is `exec_stream`; a new download
+  verb would have needed a whole parallel gRPC streaming RPC for split-mode parity.
+  `cat`'s stdout is byte-preserving (there's a proto test), works in-proc + split
+  with zero new surface, and a missing/unreadable path surfaces as a non-zero exit →
+  the body stream errors and the upload aborts. The `DownloadStream` verb was
+  prototyped then reverted.
 - The ProcessBackend loopback `POST /sessions/:id/artifacts` (dev `--mode=all`) is
   **deferred** — the production FC path is vsock + split-mode `/api/hosts/upload`,
   which is what the e2e exercises. `share-file` only dials the vsock port today; the
   HTTP-loopback fallback (+ `ENGRAM_UPLOAD_ENDPOINT`) can land with the serve work
   if `just dev` testing needs it.
+- **Verification gap to close before Accepted:** the `upload_loopback` FC e2e is
+  `#![cfg(target_os = "linux")]`, so it's invisible to macOS `just check` and was
+  NOT compiled locally (no cross C toolchain; dev VM was down). It must be confirmed
+  green via CI (Blacksmith `test-firecracker`) or a dev-vm run. All non-gated code
+  passed `just check` (882 tests).
