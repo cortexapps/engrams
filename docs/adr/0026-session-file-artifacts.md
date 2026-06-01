@@ -130,7 +130,24 @@ but leaves the blob (acceptable for v1; an artifacts-GC is deferred).
 
 ## Commit chain
 
-- _(this commit)_ — ADR 0026 Proposed.
-- _(filled in as phases land: proto+helper, sink/relay wiring, coord core+storage+
-  migration, env decouple+baked skill, serve+security+CSP, web UI, operator pull)._
+- `9a50bf9` — ADR 0026 Proposed.
+- `193fab6` — phase 1: proto upload bridge (port 1029, `MAX_ARTIFACT_BYTES`,
+  `Upload{Request,Op,Response}`) + `engram-agentd share-file` guest helper.
+- `522f89f` — phase 2: `UploadSink` trait plumbing, FC vsock listener (create +
+  restore), host-agent pure-byte relay (`CoordClient::upload_artifact`).
+- `e14de08` — phase 3: coord `process_upload` core (sniff/quota/cap), vsock +
+  `/api/hosts/upload` transports, `UploadSink` registration, `artifacts` table
+  (0045), `MetadataStore` artifact methods, `SessionEvent::FileShared`, shared
+  `session_auth` factored out of forge.
+- _(remaining: env decouple+baked skill, serve+security+CSP, web UI, operator pull)._
 - _(final)_ — flip to Accepted with prod-validation note.
+
+**Notes / divergences so far.**
+- Adding the three `MetadataStore` artifact methods fanned out to **7 impls** (the
+  real Postgres one + 6 test/mock doubles across coordinator, chunk-store, oci-auth);
+  the mocks get trivial stubs.
+- The ProcessBackend loopback `POST /sessions/:id/artifacts` (dev `--mode=all`) is
+  **deferred** — the production FC path is vsock + split-mode `/api/hosts/upload`,
+  which is what the e2e exercises. `share-file` only dials the vsock port today; the
+  HTTP-loopback fallback (+ `ENGRAM_UPLOAD_ENDPOINT`) can land with the serve work
+  if `just dev` testing needs it.
