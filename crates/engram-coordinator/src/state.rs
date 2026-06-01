@@ -129,6 +129,19 @@ pub enum SessionEvent {
         base_branch: String,
         at: DateTime<Utc>,
     },
+    /// ADR 0026: a file artifact was shared into this session and
+    /// surfaces in the conversation history. `media_type` is the
+    /// coord-detected type (never the guest-supplied one); the web
+    /// transcript renders an image/video inline and anything else as a
+    /// download chip. `artifact_id` keys the serve endpoint
+    /// `GET /sessions/:id/artifacts/:artifact_id`.
+    FileShared {
+        artifact_id: String,
+        media_type: String,
+        size_bytes: u64,
+        caption: Option<String>,
+        at: DateTime<Utc>,
+    },
 }
 
 impl SessionEvent {
@@ -153,6 +166,7 @@ impl SessionEvent {
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessIdle { .. } => "harness_idle",
             Self::PullRequestOpened { .. } => "pull_request_opened",
+            Self::FileShared { .. } => "file_shared",
         }
     }
 
@@ -989,6 +1003,27 @@ pub(crate) mod tests {
                 .take(limit as usize)
                 .cloned()
                 .collect())
+        }
+        async fn insert_artifact(
+            &self,
+            _: uuid::Uuid,
+            _: engram_core::SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: Option<&str>,
+        ) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn get_artifact(
+            &self,
+            _: engram_core::SessionId,
+            _: uuid::Uuid,
+        ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
+            Ok(None)
+        }
+        async fn artifact_usage(&self, _: engram_core::SessionId) -> Result<(i64, i64), MetaError> {
+            Ok((0, 0))
         }
         async fn upsert_registry_credential(
             &self,

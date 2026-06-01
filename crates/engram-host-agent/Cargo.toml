@@ -39,6 +39,7 @@ engram-cloud-static.workspace = true
 engram-secrets-gcp.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bincode.workspace = true
 bytes.workspace = true
 # Linux-only: raw libc bindings for the NBD ioctl orchestration

@@ -573,6 +573,7 @@ jobs:
             --test exec_real_vm \
             --test baked_harness_loopback \
             --test forge_loopback \
+            --test upload_loopback \
             --test multi_restore \
             --test cross_host_restore \
             --test restore_chain \

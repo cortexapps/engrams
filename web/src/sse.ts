@@ -61,6 +61,7 @@ export function subscribeSession(
     'run_completed',
     'harness_idle',
     'pull_request_opened',
+    'file_shared',
   ];
   for (const kind of kinds) {
     es.addEventListener(kind, (ev) => dispatch(kind, ev as MessageEvent));

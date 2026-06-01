@@ -820,6 +820,13 @@ impl HostClient for HostRegistry {
             entry.value().backend.set_forge_sink(sink.clone());
         }
     }
+
+    fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
+        // Fan out to every registered host, same as `set_forge_sink`.
+        for entry in self.hosts.iter() {
+            entry.value().backend.set_upload_sink(sink.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -974,6 +981,30 @@ mod tests {
         ) -> Result<Vec<engram_core::types::event::PersistedEvent>, engram_core::MetaError>
         {
             Ok(Vec::new())
+        }
+        async fn insert_artifact(
+            &self,
+            _: uuid::Uuid,
+            _: engram_core::SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: Option<&str>,
+        ) -> Result<(), engram_core::MetaError> {
+            Ok(())
+        }
+        async fn get_artifact(
+            &self,
+            _: engram_core::SessionId,
+            _: uuid::Uuid,
+        ) -> Result<Option<engram_core::types::ArtifactRow>, engram_core::MetaError> {
+            Ok(None)
+        }
+        async fn artifact_usage(
+            &self,
+            _: engram_core::SessionId,
+        ) -> Result<(i64, i64), engram_core::MetaError> {
+            Ok((0, 0))
         }
         async fn upsert_registry_credential(
             &self,

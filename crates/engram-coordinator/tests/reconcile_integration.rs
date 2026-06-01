@@ -255,6 +255,27 @@ impl MetadataStore for ReconcileMeta {
     ) -> Result<Vec<PersistedEvent>, MetaError> {
         Ok(Vec::new())
     }
+    async fn insert_artifact(
+        &self,
+        _: uuid::Uuid,
+        _: SessionId,
+        _: &str,
+        _: &str,
+        _: i64,
+        _: Option<&str>,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn get_artifact(
+        &self,
+        _: SessionId,
+        _: uuid::Uuid,
+    ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
+        Ok(None)
+    }
+    async fn artifact_usage(&self, _: SessionId) -> Result<(i64, i64), MetaError> {
+        Ok((0, 0))
+    }
     async fn upsert_registry_credential(
         &self,
         _: engram_core::types::RegistryCredential,

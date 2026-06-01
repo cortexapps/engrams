@@ -19,3 +19,20 @@ pub struct PersistedEvent {
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
+
+/// ADR 0026: one row from the `artifacts` table — a file shared into a
+/// session that surfaces in its conversation history (and persists in
+/// object storage forever, outside the chunk-GC sweep). The serve
+/// endpoint looks this up (scoped to the session) to find the blob key
+/// + the coord-detected media type.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactRow {
+    pub id: uuid::Uuid,
+    /// Object-storage key under the GC-safe `artifacts/<session>/` prefix.
+    pub blob_key: String,
+    /// Coord-detected media type (never the guest-supplied one).
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub caption: Option<String>,
+    pub created_at: DateTime<Utc>,
+}

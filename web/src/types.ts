@@ -241,6 +241,18 @@ export type SessionEvent =
       head_branch: string;
       base_branch: string;
       at: string;
+    }
+  // ADR 0026: a file artifact (agent screenshot/recording, or an
+  // operator file pull) shared into the session. `media_type` is the
+  // coord-detected type; the transcript renders image/video inline and
+  // anything else as a download chip.
+  | {
+      type: 'file_shared';
+      artifact_id: string;
+      media_type: string;
+      size_bytes: number;
+      caption: string | null;
+      at: string;
     };
 
 export type SessionEventKind = SessionEvent['type'];

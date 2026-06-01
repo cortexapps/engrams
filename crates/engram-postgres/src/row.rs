@@ -159,6 +159,17 @@ pub(crate) fn persisted_event_from_row(row: &PgRow) -> Result<PersistedEvent, Me
     })
 }
 
+pub(crate) fn artifact_from_row(row: &PgRow) -> Result<engram_core::types::ArtifactRow, MetaError> {
+    Ok(engram_core::types::ArtifactRow {
+        id: row.try_get("id").map_err(col_err)?,
+        blob_key: row.try_get("blob_key").map_err(col_err)?,
+        media_type: row.try_get("media_type").map_err(col_err)?,
+        size_bytes: row.try_get("size_bytes").map_err(col_err)?,
+        caption: row.try_get("caption").map_err(col_err)?,
+        created_at: row.try_get("created_at").map_err(col_err)?,
+    })
+}
+
 pub(crate) fn registry_credential_from_row(row: &PgRow) -> Result<RegistryCredential, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;

@@ -372,6 +372,54 @@ impl HostAgent {
                 },
             );
             pooled.set_forge_sink(forge_sink);
+
+            // ADR 0026 split-mode artifact forwarding. Like forge above,
+            // the upload sink can't live on the host (needs the coord's
+            // BlobStorage + broker map). But unlike forge it must NOT
+            // buffer — a multi-hundred-MB video would OOM the host. So the
+            // host is a pure byte relay: read the `UploadRequest` header
+            // off the vsock, then stream the raw body straight into a
+            // streaming POST to `/api/hosts/upload`, and write the coord's
+            // `UploadResponse` back to the guest.
+            let coord_client_for_upload = coord_client::CoordClient::new(
+                coord_url.clone(),
+                self.cfg.coordinator_token.clone(),
+            );
+            let upload_sink: engram_core::traits::UploadSink = std::sync::Arc::new(move |stream| {
+                let cc = coord_client_for_upload.clone();
+                tokio::spawn(async move {
+                    // Split so we can stream the body off the read half
+                    // (handed to reqwest) while keeping the write half
+                    // to reply on.
+                    let (mut read_half, mut write_half) = tokio::io::split(stream);
+                    let header: engram_harness_proto::UploadRequest =
+                        match engram_harness_proto::read_msg(&mut read_half).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "upload: malformed header from guest");
+                                return;
+                            }
+                        };
+                    let engram_harness_proto::UploadOp::ShareFile { size_bytes, .. } = &header.op;
+                    // Cap the body read at the declared size so the
+                    // guest can't over-feed the relay; the coord also
+                    // enforces MAX_ARTIFACT_BYTES while draining.
+                    let body = tokio::io::AsyncReadExt::take(read_half, *size_bytes);
+                    let resp = match cc.upload_artifact(&header, body).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "upload: forward to coord failed");
+                            engram_harness_proto::UploadResponse::Error {
+                                message: format!("upload forward to coord failed: {e}"),
+                            }
+                        }
+                    };
+                    if let Err(e) = engram_harness_proto::write_msg(&mut write_half, &resp).await {
+                        tracing::debug!(error = %e, "upload: response write to guest failed");
+                    }
+                });
+            });
+            pooled.set_upload_sink(upload_sink);
             // ADR 0015 M5: warm-pool retired. LocalHostClient is just
             // the cold-create dispatch wrapper now.
             let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(

@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { useMemo } from 'react';
 import { ToolCall } from './ToolCall';
 import { IdleMarker, RunBoundary } from './RunBoundary';
+import { ArtifactCard } from './ArtifactCard';
 import { PullRequestCard } from './PullRequestCard';
 import type { AgentRole, IndexedEvent } from '../types';
 
@@ -24,6 +25,8 @@ import type { AgentRole, IndexedEvent } from '../types';
 
 interface TranscriptProps {
   events: IndexedEvent[];
+  /** Owning session id — needed to build artifact serve URLs. */
+  sessionId: string;
 }
 
 type Block =
@@ -48,9 +51,18 @@ type Block =
       headBranch: string;
       baseBranch: string;
       at: string;
+    }
+  | {
+      kind: 'artifact';
+      key: string;
+      artifactId: string;
+      mediaType: string;
+      sizeBytes: number;
+      caption: string | null;
+      at: string;
     };
 
-export function Transcript({ events }: TranscriptProps) {
+export function Transcript({ events, sessionId }: TranscriptProps) {
   const blocks = useMemo(() => buildBlocks(events), [events]);
 
   if (blocks.length === 0) {
@@ -132,6 +144,18 @@ export function Transcript({ events }: TranscriptProps) {
                 number={b.number}
                 headBranch={b.headBranch}
                 baseBranch={b.baseBranch}
+                at={b.at}
+              />
+            );
+          case 'artifact':
+            return (
+              <ArtifactCard
+                key={b.key}
+                sessionId={sessionId}
+                artifactId={b.artifactId}
+                mediaType={b.mediaType}
+                sizeBytes={b.sizeBytes}
+                caption={b.caption}
                 at={b.at}
               />
             );
@@ -296,6 +320,19 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
           number: ev.number,
           headBranch: ev.head_branch,
           baseBranch: ev.base_branch,
+          at: ev.at,
+        });
+        activeMsg = null;
+        break;
+
+      case 'file_shared':
+        out.push({
+          kind: 'artifact',
+          key: `art:${indexed.idx}`,
+          artifactId: ev.artifact_id,
+          mediaType: ev.media_type,
+          sizeBytes: ev.size_bytes,
+          caption: ev.caption,
           at: ev.at,
         });
         activeMsg = null;

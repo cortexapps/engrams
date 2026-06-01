@@ -299,6 +299,21 @@ pub async fn run_with_registry_and_local(
         state.services.host.set_forge_sink(sink);
     }
 
+    // ADR 0026: register an UploadSink so per-VM artifact-upload vsock
+    // dials are served by the coord (Firecracker in-proc path). Split
+    // mode uses the host-agent's own relay → POST /api/hosts/upload;
+    // ProcessBackend's default no-op is fine.
+    {
+        let upload_state = state.clone();
+        let sink: engram_core::traits::UploadSink = std::sync::Arc::new(move |stream| {
+            let st = upload_state.clone();
+            tokio::spawn(async move {
+                crate::api::upload::handle_vsock_connection(st, stream).await;
+            });
+        });
+        state.services.host.set_upload_sink(sink);
+    }
+
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
         .await

@@ -18,10 +18,12 @@ mod host_http;
 mod hosts;
 mod prompt;
 mod registries;
+pub(crate) mod session_auth;
 mod sessions;
 mod sessions_inspect;
 mod shell;
 pub mod snapshot;
+pub(crate) mod upload;
 
 pub fn router(state: SharedState) -> Router {
     // The protected sub-router gets the bearer-token layer.
@@ -41,6 +43,23 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/exec", post(exec::exec))
         .route("/sessions/:id/exec/stream", post(exec::exec_stream))
         .route("/sessions/:id/events", get(events::events))
+        // ADR 0026: serve a shared artifact to the dashboard. In the
+        // protected group so it inherits IAP/bearer gating (the browser
+        // hits it via the IAP cookie + nginx-stamped bearer); never
+        // world-readable. Hardened headers live in the handler.
+        .route(
+            "/sessions/:id/artifacts/:artifact_id",
+            get(upload::serve_artifact),
+        )
+        // ADR 0026: trusted operator file pull — capture any file by
+        // path from the session (no MIME restriction). Bearer/IAP-authed
+        // (in the protected group), distinct from the untrusted in-guest
+        // push. Static `from-path` segment takes priority over the
+        // `:artifact_id` param above; artifact ids are UUIDs, no clash.
+        .route(
+            "/sessions/:id/artifacts/from-path",
+            post(upload::create_from_path),
+        )
         .route("/sessions/:id/snapshot", post(snapshot::snapshot))
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
@@ -60,6 +79,11 @@ pub fn router(state: SharedState) -> Router {
         // in-guest forge request here (the forge sink can't run on the
         // remote host). Host-authed; the broker token rides in the body.
         .route("/api/hosts/forge", post(forge::forge_forward))
+        // ADR 0026 split-mode artifact forwarding: FC hosts relay each
+        // in-guest upload here (the upload sink can't run on the remote
+        // host). Host-authed; the broker token rides in the base64'd
+        // `X-Engram-Upload` header and is validated by `process_upload`.
+        .route("/api/hosts/upload", post(upload::upload_forward))
         .route(
             "/api/hosts/:id/auth/resolve-registry",
             post(host_http::resolve_registry_auth),

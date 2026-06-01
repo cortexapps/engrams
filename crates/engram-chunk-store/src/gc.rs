@@ -330,6 +330,27 @@ mod tests {
         ) -> Result<Vec<engram_core::types::PersistedEvent>, MetaError> {
             Ok(Vec::new())
         }
+        async fn insert_artifact(
+            &self,
+            _id: uuid::Uuid,
+            _session_id: SessionId,
+            _blob_key: &str,
+            _media_type: &str,
+            _size_bytes: i64,
+            _caption: Option<&str>,
+        ) -> Result<(), MetaError> {
+            Ok(())
+        }
+        async fn get_artifact(
+            &self,
+            _session_id: SessionId,
+            _id: uuid::Uuid,
+        ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
+            Ok(None)
+        }
+        async fn artifact_usage(&self, _session_id: SessionId) -> Result<(i64, i64), MetaError> {
+            Ok((0, 0))
+        }
         async fn upsert_registry_credential(
             &self,
             _cred: engram_core::types::RegistryCredential,

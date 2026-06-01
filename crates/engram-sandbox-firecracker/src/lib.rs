@@ -162,6 +162,12 @@ fn forge_uds_for(base_vsock_uds: &Path) -> PathBuf {
     per_port_uds(base_vsock_uds, engram_harness_proto::FORGE_VSOCK_PORT)
 }
 
+/// ADR 0026: host-side UDS Firecracker proxies the in-guest
+/// `engram-share` helper's `UPLOAD_VSOCK_PORT` dials through.
+fn upload_uds_for(base_vsock_uds: &Path) -> PathBuf {
+    per_port_uds(base_vsock_uds, engram_harness_proto::UPLOAD_VSOCK_PORT)
+}
+
 /// Lowest CID we'll hand out to a guest. CIDs 0/1/2 are reserved
 /// (hypervisor / loopback / host); user-allocatable starts at 3.
 const FIRST_GUEST_CID: u32 = 3;
@@ -624,6 +630,11 @@ pub struct FirecrackerBackend {
     /// until the coord calls `set_forge_sink` (no forge configured →
     /// the per-sandbox forge accept loop closes connections).
     forge_sink: Arc<parking_lot::RwLock<Option<engram_core::traits::ForgeSink>>>,
+    /// ADR 0026: sink for inbound in-guest artifact-upload connections
+    /// (vsock `UPLOAD_VSOCK_PORT`). Same lifecycle as `forge_sink`;
+    /// `None` until the coord/host-agent calls `set_upload_sink` (the
+    /// per-sandbox upload accept loop then closes connections).
+    upload_sink: Arc<parking_lot::RwLock<Option<engram_core::traits::UploadSink>>>,
 }
 
 impl FirecrackerBackend {
@@ -664,6 +675,7 @@ impl FirecrackerBackend {
             net_allocator,
             harness_sink: Arc::new(parking_lot::RwLock::new(None)),
             forge_sink: Arc::new(parking_lot::RwLock::new(None)),
+            upload_sink: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -1420,6 +1432,9 @@ impl FirecrackerBackend {
         // ADR 0023: forge bridge accept loop, alongside the harness one.
         self.spawn_forge_listener(sandbox_id, &vsock_uds_path)
             .await?;
+        // ADR 0026: artifact-upload bridge accept loop.
+        self.spawn_upload_listener(sandbox_id, &vsock_uds_path)
+            .await?;
         let agent_ready_rx = self
             .spawn_agent_ready_listener(sandbox_id, &vsock_uds_path)
             .await?;
@@ -1685,6 +1700,52 @@ impl FirecrackerBackend {
                     },
                     Err(e) => {
                         tracing::debug!(error = %e, %sandbox_id, "forge UDS accept ended");
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// ADR 0026: per-sandbox accept loop for the in-guest `engram-share`
+    /// helper (`UPLOAD_VSOCK_PORT`). Mirrors `spawn_forge_listener` —
+    /// binds `<vsock_uds>_<UPLOAD_VSOCK_PORT>` and fires `upload_sink`
+    /// for each guest dial. Re-stood-up on resume alongside the harness
+    /// and forge listeners.
+    async fn spawn_upload_listener(
+        &self,
+        sandbox_id: SandboxId,
+        vsock_uds_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let path = upload_uds_for(vsock_uds_path);
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "bind upload UDS {} for sandbox {sandbox_id}: {e}",
+                    path.display()
+                )
+                .into(),
+            )
+        })?;
+        let sink_slot = self.upload_sink.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _peer)) => match sink_slot.read().clone() {
+                        Some(sink) => {
+                            sink(Box::pin(stream));
+                        }
+                        None => {
+                            tracing::warn!(
+                                %sandbox_id,
+                                "upload connection arrived but no sink registered; dropping",
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(error = %e, %sandbox_id, "upload UDS accept ended");
                         return;
                     }
                 }
@@ -1995,6 +2056,9 @@ impl FirecrackerBackend {
             .await?;
         // ADR 0023: forge bridge accept loop, alongside the harness one.
         self.spawn_forge_listener(sandbox_id, &vsock_uds_path)
+            .await?;
+        // ADR 0026: artifact-upload bridge accept loop.
+        self.spawn_upload_listener(sandbox_id, &vsock_uds_path)
             .await?;
         let state = SandboxState {
             spec: manifest.spec.clone(),
@@ -3389,6 +3453,10 @@ impl SandboxBackend for FirecrackerBackend {
 
     fn set_forge_sink(&self, sink: engram_core::traits::ForgeSink) {
         *self.forge_sink.write() = Some(sink);
+    }
+
+    fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
+        *self.upload_sink.write() = Some(sink);
     }
 }
 

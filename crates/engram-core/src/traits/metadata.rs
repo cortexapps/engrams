@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::MetaError;
-use crate::types::event::PersistedEvent;
+use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
@@ -390,6 +390,36 @@ pub trait MetadataStore: Send + Sync {
         since: i64,
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError>;
+
+    // ---- file artifacts (ADR 0026) ----
+
+    /// Record a shared file artifact for a session. `id` is the
+    /// server-generated UUID that also names the blob key; the row
+    /// cascades on session delete. `caption` is untrusted text the
+    /// caller has already length-capped + control-char-stripped.
+    async fn insert_artifact(
+        &self,
+        id: uuid::Uuid,
+        session_id: SessionId,
+        blob_key: &str,
+        media_type: &str,
+        size_bytes: i64,
+        caption: Option<&str>,
+    ) -> Result<(), MetaError>;
+
+    /// Fetch one artifact **scoped to its session** (so one session can
+    /// never read another's blob key). `None` if the `(session_id, id)`
+    /// pair doesn't exist. Backs the serve endpoint
+    /// `GET /sessions/:id/artifacts/:artifact_id`.
+    async fn get_artifact(
+        &self,
+        session_id: SessionId,
+        id: uuid::Uuid,
+    ) -> Result<Option<ArtifactRow>, MetaError>;
+
+    /// Per-session artifact usage `(count, total_bytes)` for the upload
+    /// quota check. A fresh session with no artifacts returns `(0, 0)`.
+    async fn artifact_usage(&self, session_id: SessionId) -> Result<(i64, i64), MetaError>;
 
     // ---- registry credentials (Phase 5) ----
 

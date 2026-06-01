@@ -220,6 +220,10 @@ impl HostClient for LocalHostClient {
         self.sandbox.set_forge_sink(sink);
     }
 
+    fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
+        self.sandbox.set_upload_sink(sink);
+    }
+
     async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
         Ok(self.sandbox.cow_state(id).await)
     }
