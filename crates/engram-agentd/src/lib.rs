@@ -20,6 +20,7 @@ pub mod forge;
 pub mod handler;
 pub mod harness_supervisor;
 pub mod proto;
+pub mod share;
 pub mod shell;
 
 pub use cacerts::{CaCertInstaller, CaCertPaths};

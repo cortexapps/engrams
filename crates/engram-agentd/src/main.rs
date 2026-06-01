@@ -36,6 +36,12 @@ fn main() -> ExitCode {
             if sub == "forge-credential" || sub == "forge-pull-request" {
                 return engram_agentd::forge::run(&sub, argv.collect());
             }
+            // ADR 0026: in-guest artifact share. `engram-share` runs
+            // `engram-agentd share-file --file <path>`, dialing the
+            // host's upload vsock port and streaming the file out.
+            if sub == "share-file" {
+                return engram_agentd::share::run(argv.collect());
+            }
         }
     }
 

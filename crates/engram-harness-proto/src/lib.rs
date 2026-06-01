@@ -322,6 +322,80 @@ pub enum ForgeResponse {
     },
 }
 
+// ---- Artifact upload bridge (ADR 0026) ---------------------------------
+//
+// Another *separate* guest→host channel: the in-guest `engram-share`
+// helper dials the host on `UPLOAD_VSOCK_PORT`, sends one
+// [`UploadRequest`] header frame, then streams the **raw file body**
+// (exactly `size_bytes` bytes, NOT length-prefixed or per-chunk framed)
+// on the same connection, then reads one [`UploadResponse`] frame.
+//
+// The raw body is deliberately un-framed: the coord pipes it straight
+// into `BlobStorage::put_streaming`, so wrapping each chunk in bincode
+// only to unwrap it is pure overhead. `size_bytes` from the header is
+// the boundary — the host reads exactly that many bytes, then the
+// response frame. `MAX_MSG_BYTES` still caps the header/response frames;
+// the body is bounded by `MAX_ARTIFACT_BYTES`, which the coord enforces
+// while draining (and aborts + deletes the partial object on exceed).
+//
+// Authenticated by the same per-session broker token as the forge
+// bridge (injected as `ENGRAM_UPLOAD_TOKEN`), but the upload path is NOT
+// git-gated — every baked image gets it.
+
+/// Vsock port the in-guest `engram-share` helper dials (guest→host).
+/// Distinct from agentd exec (1024), harness (1026), agentd ready
+/// (1027), and forge (1028) so the host can demux at accept time.
+pub const UPLOAD_VSOCK_PORT: u32 = 1029;
+
+/// Hard cap on a single artifact's body, enforced host-side by the
+/// coord while draining the stream. 512 MiB gives headroom for short
+/// screen recordings; tune as real usage lands. Distinct from
+/// `MAX_MSG_BYTES` (which still caps the header/response *frames*).
+pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Header frame from the in-guest `engram-share` helper to the host,
+/// sent before the raw body stream. Authenticated by the per-session
+/// broker token (injected into the guest as `ENGRAM_UPLOAD_TOKEN`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadRequest {
+    pub session_id: SessionId,
+    pub broker_token: String,
+    pub op: UploadOp,
+}
+
+/// The artifact operation requested. An enum for symmetry with
+/// [`ForgeOp`] and room for future ops (e.g. delete); v1 has one.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UploadOp {
+    /// Share a file that will surface in the session's conversation
+    /// history. `ext` is the raw filename extension (no leading dot)
+    /// the guest derived — used only to pick a stored object suffix;
+    /// the coord re-derives the persisted media type by sniffing the
+    /// body's magic bytes and never trusts a guest-supplied MIME.
+    /// `size_bytes` is the exact length of the raw body that follows.
+    ShareFile {
+        ext: String,
+        caption: Option<String>,
+        size_bytes: u64,
+    },
+}
+
+/// The host's reply to an [`UploadRequest`] (after the body stream).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UploadResponse {
+    /// Stored. `media_type` is the coord-detected type, `artifact_id`
+    /// the server-generated UUID (string form).
+    Shared {
+        artifact_id: String,
+        media_type: String,
+        size_bytes: u64,
+    },
+    /// Auth failure, unknown session, disallowed media type, over the
+    /// size cap / quota, or a storage error — `message` is safe to
+    /// surface to the guest.
+    Error { message: String },
+}
+
 // ---- Framing -----------------------------------------------------------
 
 /// Read one length-prefixed bincode frame. Mirrors
@@ -494,6 +568,27 @@ mod tests {
         });
         round_trip(ForgeResponse::Error {
             message: "nope".into(),
+        });
+    }
+
+    #[test]
+    fn upload_request_response_round_trip() {
+        round_trip(UploadRequest {
+            session_id: SessionId::new(),
+            broker_token: "tok".into(),
+            op: UploadOp::ShareFile {
+                ext: "png".into(),
+                caption: Some("the dashboard after my change".into()),
+                size_bytes: 4096,
+            },
+        });
+        round_trip(UploadResponse::Shared {
+            artifact_id: "0190f3a2c0f17e2cba12".into(),
+            media_type: "image/png".into(),
+            size_bytes: 4096,
+        });
+        round_trip(UploadResponse::Error {
+            message: "unsupported media type".into(),
         });
     }
 
