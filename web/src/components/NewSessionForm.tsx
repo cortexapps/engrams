@@ -3,14 +3,14 @@ import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { createSession } from '../api';
 import { useEnabledImages } from '../hooks/useEnabledImages';
-import { SectionHead } from './HostManifest';
+import { SectionHead } from './SectionHead';
 import type { SessionMode } from '../types';
 
-// "New session" form rendered inline on the Overview page, between the
-// HostManifest and the SessionManifest. ADR 0005 retired the
-// workspace axis; ADR 0021 P1.3 retired the per-session harness
-// *selection* — the harness is baked into the image at image-bake
-// time. Two axes left: image + mode.
+// "New session" form, revealed inline on the Sessions surface when the
+// `+ new session` action is clicked. ADR 0005 retired the workspace
+// axis; ADR 0021 P1.3 retired the per-session harness *selection* —
+// the harness is baked into the image at image-bake time. Two axes
+// left: image + mode.
 
 export interface NewSessionFormProps {
   onCancel: () => void;

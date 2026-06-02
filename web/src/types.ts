@@ -124,11 +124,6 @@ export interface CowStateView {
   last_snapshot_at: string | null;
 }
 
-export interface HostCowStateResponse {
-  host_id: string;
-  sessions: CowStateView[];
-}
-
 export interface SessionCowStateResponse {
   session_id: string;
   /** `null` when the session has no live sandbox (Idle, HostLost,

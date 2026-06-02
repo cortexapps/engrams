@@ -2,17 +2,20 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-// "Inkstamp" — fixed top-right of every page. The visual model is
-// the section-sign rune (§) embossed in the corner of a notebook
-// page, not the gradient avatar of a generic SaaS. Click reveals a
+// "Inkstamp" — the section-sign rune (§) embossed like a typesetter's
+// mark, not the gradient avatar of a generic SaaS. Click reveals a
 // small popover anchored beneath it.
+//
+// Two placements: `inline` sits in the nav spine's right slot (the
+// four-surface IA); the default keeps the legacy fixed top-right
+// corner for any page rendered outside the spine.
 //
 // Auth isn't wired yet, so the popover just identifies the
 // deployment ("Local development") and links to /settings. When a
 // real user identity lands, the rune gets replaced with the user's
 // initial and the popover gains email + "Sign out".
 
-export function UserChip() {
+export function UserChip({ inline = false }: { inline?: boolean }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
 
@@ -39,7 +42,9 @@ export function UserChip() {
   return (
     <div
       ref={ref}
-      className="fixed top-5 right-5 z-50 select-none"
+      className={
+        inline ? 'relative select-none' : 'fixed top-5 right-5 z-50 select-none'
+      }
       style={{ fontFamily: 'var(--font-display)' }}
     >
       <button

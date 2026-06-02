@@ -1,4 +1,4 @@
-import { Link, useParams } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import { useSession } from '../hooks/useSessions';
 import { useSessionEvents } from '../hooks/useSessionEvents';
@@ -35,15 +35,9 @@ export function SessionDetail() {
 
   return (
     <main className="book py-12">
-      <Link
-        to="/"
-        className="font-mono smallcaps text-[0.7rem]"
-        style={{ color: 'var(--color-ink-quiet)', letterSpacing: '0.18em' }}
-      >
-        ← back to overview
-      </Link>
-
-      <header className="mt-8 mb-12">
+      {/* No `← back` link — the nav spine carries the `↳ <short id>`
+          sub-crumb and keeps the Sessions tab active (ADR 0029). */}
+      <header className="mb-12">
         <div
           className="font-mono smallcaps text-[0.7rem]"
           style={{ color: 'var(--color-ink-quiet)' }}
