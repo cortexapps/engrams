@@ -1,5 +1,13 @@
-import '@fontsource-variable/newsreader/opsz.css';
-import '@fontsource-variable/newsreader/opsz-italic.css';
+// Newsreader and JetBrains Mono are both multi-axis variable fonts.
+// Fontsource splits each into one CSS file per axis and *pins* the
+// other axes, so importing Newsreader's `opsz` (optical-size) axis
+// registers the face at `font-weight: 400` only — every serif element
+// asked for at another weight (`.smallcaps` is 500, bold headings,
+// `<strong>`) has no matching `@font-face` and falls down the stack to
+// a generic serif. Import the `wght` axis on both faces so the full
+// weight range is available (mirrors the JetBrains Mono imports).
+import '@fontsource-variable/newsreader/wght.css';
+import '@fontsource-variable/newsreader/wght-italic.css';
 import '@fontsource-variable/jetbrains-mono/wght.css';
 import '@fontsource-variable/jetbrains-mono/wght-italic.css';
 import { createRoot } from 'react-dom/client';
