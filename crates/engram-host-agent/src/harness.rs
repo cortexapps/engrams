@@ -988,6 +988,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupt_command_reaches_harness() {
+        // ADR 0030: hub.interrupt() must deliver a HarnessCommand::Interrupt
+        // to the attached harness (which SIGINTs its child + emits
+        // RunInterrupted). Mirrors shutdown_command_reaches_harness; the
+        // SIGINT-the-claude-child leaf is Linux + claude-runtime specific
+        // and is covered by the manual spike documented in the ADR.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
+            matches!(frame, HarnessFrame::Command(HarnessCommand::Interrupt))
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach within the 1s deadline"
+        );
+
+        hub.interrupt(sandbox_id).await.expect("interrupt");
+        let received = harness_task.await.unwrap();
+        assert!(received, "harness should receive an Interrupt frame");
+    }
+
+    #[tokio::test]
+    async fn interrupt_returns_not_attached_for_unknown_sandbox() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let err = hub.interrupt(SandboxId::new()).await.unwrap_err();
+        assert!(matches!(err, HarnessError::NotAttached));
+    }
+
+    #[tokio::test]
     async fn checkpoint_returns_not_attached_for_unknown_sandbox() {
         let (sink, _) = collecting_sink();
         let hub = HarnessHub::new(sink);
