@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::extract::{FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
@@ -447,15 +447,19 @@ pub async fn callback(
         Some(rt.config.session_ttl_hours.max(1) * 3600),
     );
     let clear_flow = set_cookie(OIDC_FLOW_COOKIE, "", rt.config.cookie_secure, None);
-    Ok((
-        StatusCode::FOUND,
-        [
-            (header::LOCATION, "/".to_string()),
-            (header::SET_COOKIE, session_cookie),
-            (header::SET_COOKIE, clear_flow),
-        ],
-    )
-        .into_response())
+
+    // Emit BOTH Set-Cookie headers via append — an axum `[(header, value)]`
+    // array collapses same-key entries (the second clobbers the first), which
+    // would drop the session cookie entirely and leave the user in a login
+    // loop. append keeps both.
+    let mut resp = Redirect::to("/").into_response();
+    let headers = resp.headers_mut();
+    for cookie in [session_cookie, clear_flow] {
+        let value = HeaderValue::from_str(&cookie)
+            .map_err(|e| ApiError::Internal(format!("set-cookie: {e}")))?;
+        headers.append(header::SET_COOKIE, value);
+    }
+    Ok(resp)
 }
 
 #[derive(Serialize)]
