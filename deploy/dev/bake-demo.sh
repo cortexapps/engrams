@@ -16,12 +16,15 @@ cd "$(git rev-parse --show-toplevel)"
 
 : "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"
 
-# On macOS, check that e2fsprogs (mke2fs) is available for ext4 image building.
+# Detect the sandbox backend (once, reused below).
+backend="$(bash deploy/dev/detect-backend.sh)"
+
+# On macOS/VZ, check that e2fsprogs (mke2fs) is available for ext4 image building.
 # (Registry pushes require ext4 format; directory format is local-only.)
-if [ "$(uname -s)" = "Darwin" ]; then
+if [ "$backend" = "vz" ]; then
     PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
     if ! command -v mke2fs >/dev/null 2>&1; then
-        echo "Error: mke2fs not found. ext4 image builds require e2fsprogs." >&2
+        echo "Error: mke2fs not found. VZ image builds require e2fsprogs." >&2
         echo "" >&2
         echo "Install it with:" >&2
         echo "  brew install e2fsprogs" >&2
@@ -35,8 +38,6 @@ REGISTRY="localhost:5001"
 # `<repo>:<version>-<platform>` and pulls exactly that).
 HARNESS_REPO_PATH="cortexapps/engrams/harness-claude"
 HARNESS_VERSION="v0.1.0"
-
-backend="$(bash deploy/dev/detect-backend.sh)"
 
 # Dev bakes cross-compile the rootfs for the host's own arch, so guest
 # arch == host arch. Transport depends on the backend (VZ uses
