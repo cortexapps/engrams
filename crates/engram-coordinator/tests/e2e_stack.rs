@@ -135,7 +135,7 @@ impl Driver {
             "mode": "dev_vm",
         });
         let resp = self
-            .req(reqwest::Method::POST, "/sessions")
+            .req(reqwest::Method::POST, "/api/v1/sessions")
             .json(&body)
             .send()
             .await
@@ -173,7 +173,7 @@ impl Driver {
             body["prompt"] = Value::String(p.to_string());
         }
         let resp = self
-            .req(reqwest::Method::POST, "/sessions")
+            .req(reqwest::Method::POST, "/api/v1/sessions")
             .json(&body)
             .send()
             .await
@@ -191,7 +191,7 @@ impl Driver {
 
     async fn exec(&self, sid: SessionId, command: &str) -> ExecResponse {
         let body = serde_json::json!({ "command": command, "timeout_secs": 30 });
-        let path = format!("/sessions/{sid}/exec");
+        let path = format!("/api/v1/sessions/{sid}/exec");
         let resp = self
             .req(reqwest::Method::POST, &path)
             .json(&body)
@@ -208,7 +208,7 @@ impl Driver {
     }
 
     async fn delete(&self, sid: SessionId) {
-        let path = format!("/sessions/{sid}");
+        let path = format!("/api/v1/sessions/{sid}");
         let _ = self
             .req(reqwest::Method::DELETE, &path)
             .send()
@@ -222,7 +222,7 @@ impl Driver {
     /// `sessions.live_disk_manifest_*` in the same coord-side TX.
     /// Returns the parsed response body.
     async fn flush_now(&self, sid: SessionId) -> FlushNowResponse {
-        let path = format!("/api/admin/sessions/{sid}/flush-now");
+        let path = format!("/api/v1/admin/sessions/{sid}/flush-now");
         let resp = self
             .req(reqwest::Method::POST, &path)
             .json(&serde_json::json!({}))
@@ -243,7 +243,7 @@ impl Driver {
     /// discard it for this test — the side effect we care about is
     /// the row existing so resume() has something to find.
     async fn snapshot(&self, sid: SessionId) {
-        let path = format!("/sessions/{sid}/snapshot");
+        let path = format!("/api/v1/sessions/{sid}/snapshot");
         let resp = self
             .req(reqwest::Method::POST, &path)
             .json(&serde_json::json!({}))
@@ -259,7 +259,7 @@ impl Driver {
     /// a snapshot, leaving the session in `Idle`. Required before
     /// resume() will reconstruct a fresh sandbox.
     async fn evict_local(&self, sid: SessionId) {
-        let path = format!("/sessions/{sid}/local");
+        let path = format!("/api/v1/sessions/{sid}/local");
         let resp = self
             .req(reqwest::Method::DELETE, &path)
             .send()
@@ -278,7 +278,7 @@ impl Driver {
     /// one that should appear in `nbd_sandboxes` (per ADR 0016
     /// Phase B commit 5).
     async fn resume(&self, sid: SessionId) {
-        let path = format!("/sessions/{sid}/resume");
+        let path = format!("/api/v1/sessions/{sid}/resume");
         let resp = self
             .req(reqwest::Method::POST, &path)
             .json(&serde_json::json!({}))
@@ -298,7 +298,7 @@ impl Driver {
     /// for whether the chunked-disk-driven assertions are
     /// meaningful in this environment.
     async fn cow_state(&self, sid: SessionId) -> Option<Value> {
-        let path = format!("/sessions/{sid}/cow-state");
+        let path = format!("/api/v1/sessions/{sid}/cow-state");
         let resp = self
             .req(reqwest::Method::GET, &path)
             .send()
@@ -351,7 +351,7 @@ impl Driver {
         expected_substr: &str,
         deadline: Duration,
     ) -> AuthFailureSignal {
-        let path = format!("/sessions/{sid}/events?since=-1");
+        let path = format!("/api/v1/sessions/{sid}/events?since=-1");
         let resp = self
             .req(reqwest::Method::GET, &path)
             .header("accept", "text/event-stream")
@@ -971,7 +971,7 @@ struct ChunkGcCandidatesResponse {
 
 impl Driver {
     async fn chunk_gc_dry_run(&self, grace_secs: Option<u64>) -> ChunkGcSweepResponse {
-        let mut path = "/api/admin/chunk-gc/dry-run".to_string();
+        let mut path = "/api/v1/admin/chunk-gc/dry-run".to_string();
         if let Some(g) = grace_secs {
             path.push_str(&format!("?grace_secs={g}"));
         }
@@ -988,7 +988,7 @@ impl Driver {
     }
 
     async fn chunk_gc_sweep(&self, grace_secs: Option<u64>) -> ChunkGcSweepResponse {
-        let mut path = "/api/admin/chunk-gc/sweep".to_string();
+        let mut path = "/api/v1/admin/chunk-gc/sweep".to_string();
         if let Some(g) = grace_secs {
             path.push_str(&format!("?grace_secs={g}"));
         }
@@ -1006,7 +1006,7 @@ impl Driver {
 
     async fn chunk_gc_candidates(&self) -> ChunkGcCandidatesResponse {
         let resp = self
-            .req(reqwest::Method::GET, "/api/admin/chunk-gc/candidates")
+            .req(reqwest::Method::GET, "/api/v1/admin/chunk-gc/candidates")
             .send()
             .await
             .expect("GET /api/admin/chunk-gc/candidates");
@@ -1214,7 +1214,7 @@ async fn e2e_evac_admin_endpoint_shape() {
 
     // Case 1: 404 on a session that doesn't exist.
     let bogus = SessionId::new();
-    let path = format!("/api/admin/sessions/{bogus}/evacuate");
+    let path = format!("/api/v1/admin/sessions/{bogus}/evacuate");
     let resp = driver
         .req(reqwest::Method::POST, &path)
         .json(&serde_json::json!({}))
@@ -1233,7 +1233,7 @@ async fn e2e_evac_admin_endpoint_shape() {
     // return 202 immediately after marking the session Evacuating.
     // The scanner picks it up from there.
     let sid = driver.create_session_none_harness(&image).await;
-    let path = format!("/api/admin/sessions/{sid}/evacuate");
+    let path = format!("/api/v1/admin/sessions/{sid}/evacuate");
     let resp = driver
         .req(reqwest::Method::POST, &path)
         .json(&serde_json::json!({}))

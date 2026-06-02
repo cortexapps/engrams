@@ -1,3 +1,4 @@
+import { API_BASE } from './api';
 import type { IndexedEvent, SessionEvent, SessionEventKind } from './types';
 
 // The native EventSource does not let us pass a Last-Event-ID header
@@ -22,7 +23,7 @@ export function subscribeSession(
   handlers: SseHandlers,
   since = -1,
 ): () => void {
-  const url = `/sessions/${sessionId}/events?since=${since}`;
+  const url = `${API_BASE}/sessions/${sessionId}/events?since=${since}`;
   const es = new EventSource(url);
 
   const dispatch = (kind: SessionEventKind, ev: MessageEvent) => {

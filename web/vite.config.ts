@@ -5,7 +5,9 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
 // Coordinator binds to 127.0.0.1:8090 in `just dev` / `just dev-vz`.
-// Proxy /sessions and /api straight through so the SPA hits same-origin.
+// The whole coord API lives under /api/v1, so proxy /api straight
+// through to the coord; everything else (incl. the SPA's /sessions/:id
+// deep links) is served by Vite as index.html.
 const COORDINATOR = process.env.ENGRAM_COORDINATOR_URL ?? 'http://127.0.0.1:8090';
 
 // http-proxy defaults to `agent: false`, which forces a fresh TCP
@@ -22,37 +24,17 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // The SPA's URL scheme overlaps the coordinator's REST namespace
-      // (e.g. /sessions/:id is both a SPA route and an API endpoint),
-      // so we differentiate by Accept header. Browser navigation —
-      // refresh, deep link, copy/paste — sends `Accept: text/html`,
-      // which we shunt to /index.html so React Router takes over.
-      // Same-origin fetches from the SPA send `application/json` and
-      // SSE clients send `text/event-stream`; both fall through and
-      // proxy to the coordinator unchanged.
-      '/sessions': {
+      // The entire coord API (REST + SSE + the /shell WebSocket) lives
+      // under /api/v1, which no longer overlaps any SPA route — so a
+      // single prefix proxy suffices and the old Accept-header bypass is
+      // gone. `ws: true` carries the /api/v1/sessions/:id/shell upgrade;
+      // http-proxy streams SSE through unchanged.
+      '/api': {
         target: COORDINATOR,
         changeOrigin: true,
         agent: proxyAgent,
-        // The shell endpoint is a WebSocket; without this flag http-proxy
-        // returns 426 Upgrade Required and the upgrade never completes.
         ws: true,
-        bypass(req) {
-          // WebSocket upgrade requests carry `Upgrade: websocket` —
-          // never shunt those to index.html, no matter what their
-          // Accept header says.
-          const upgrade = (req.headers.upgrade ?? '').toString().toLowerCase();
-          if (upgrade === 'websocket') return undefined;
-          if (
-            req.method === 'GET' &&
-            (req.headers.accept ?? '').includes('text/html')
-          ) {
-            return '/index.html';
-          }
-        },
       },
-      '/api': { target: COORDINATOR, changeOrigin: true, agent: proxyAgent },
-      '/healthz': { target: COORDINATOR, changeOrigin: true, agent: proxyAgent },
     },
   },
   test: {

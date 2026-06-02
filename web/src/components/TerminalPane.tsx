@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
+import { API_BASE } from '../api';
+
 // In-browser shell tab. Lazy-loads `ghostty-web` (~400 KB WASM) on
 // first mount, opens a WebSocket to `/sessions/:id/shell`, and bridges
 // the connection via ttyd's text-prefix protocol (which the
@@ -164,7 +166,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       setStatus('connecting');
       const wsUrl = `${
         location.protocol === 'https:' ? 'wss:' : 'ws:'
-      }//${location.host}/sessions/${encodeURIComponent(sessionId)}/shell`;
+      }//${location.host}${API_BASE}/sessions/${encodeURIComponent(sessionId)}/shell`;
       const localWs = new WebSocket(wsUrl, 'tty');
       ws = localWs;
       localWs.binaryType = 'arraybuffer';

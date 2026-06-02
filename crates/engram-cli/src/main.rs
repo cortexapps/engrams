@@ -505,7 +505,7 @@ async fn admin_flush(
     json: bool,
 ) -> Result<(), CliError> {
     let resp = client
-        .post(format!("{endpoint}/api/admin/sessions/{id}/flush"))
+        .post(format!("{endpoint}/api/v1/admin/sessions/{id}/flush"))
         .send()
         .await?;
     let status = resp.status();
@@ -534,7 +534,7 @@ async fn admin_flush_idle(
     json: bool,
 ) -> Result<(), CliError> {
     let resp = client
-        .post(format!("{endpoint}/api/admin/flush-idle"))
+        .post(format!("{endpoint}/api/v1/admin/flush-idle"))
         .send()
         .await?;
     let status = resp.status();
@@ -585,7 +585,7 @@ async fn session_list(
     endpoint: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/sessions")).await?;
+    let body = get_json(client, &format!("{endpoint}/api/v1/sessions")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -621,7 +621,7 @@ async fn session_get(
     id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/sessions/{id}")).await?;
+    let body = get_json(client, &format!("{endpoint}/api/v1/sessions/{id}")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -652,7 +652,7 @@ async fn session_delete(
     id: &str,
 ) -> Result<(), CliError> {
     let resp = client
-        .delete(format!("{endpoint}/sessions/{id}"))
+        .delete(format!("{endpoint}/api/v1/sessions/{id}"))
         .send()
         .await?;
     let status = resp.status();
@@ -688,7 +688,7 @@ async fn session_create(
         payload.insert("prompt".into(), Value::from(p));
     }
     let resp = client
-        .post(format!("{endpoint}/sessions"))
+        .post(format!("{endpoint}/api/v1/sessions"))
         .json(&Value::Object(payload))
         .send()
         .await?;
@@ -721,7 +721,7 @@ async fn session_exec(
         payload.insert("timeout_secs".into(), Value::from(t));
     }
     let resp = client
-        .post(format!("{endpoint}/sessions/{id}/exec"))
+        .post(format!("{endpoint}/api/v1/sessions/{id}/exec"))
         .json(&Value::Object(payload))
         .send()
         .await?;
@@ -759,7 +759,7 @@ async fn session_exec(
 // ---- host subcommands ---------------------------------------------------
 
 async fn host_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/hosts")).await?;
+    let body = get_json(client, &format!("{endpoint}/api/v1/hosts")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -794,7 +794,7 @@ async fn host_get(
     id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/hosts/{id}")).await?;
+    let body = get_json(client, &format!("{endpoint}/api/v1/hosts/{id}")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -829,7 +829,7 @@ async fn host_get(
 
 async fn host_drain(client: &reqwest::Client, endpoint: &str, id: &str) -> Result<(), CliError> {
     let resp = client
-        .post(format!("{endpoint}/api/hosts/{id}/drain"))
+        .post(format!("{endpoint}/api/v1/hosts/{id}/drain"))
         .send()
         .await?;
     let status = resp.status();
@@ -849,7 +849,7 @@ async fn session_logs(
 ) -> Result<(), CliError> {
     use futures::StreamExt;
 
-    let mut url = format!("{endpoint}/sessions/{id}/events");
+    let mut url = format!("{endpoint}/api/v1/sessions/{id}/events");
     if let Some(s) = since {
         url.push_str(&format!("?since={s}"));
     }
@@ -889,7 +889,7 @@ async fn session_log(
     limit: Option<i64>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut url = format!("{endpoint}/sessions/{id}/log?kind=conversation");
+    let mut url = format!("{endpoint}/api/v1/sessions/{id}/log?kind=conversation");
     if let Some(l) = limit {
         url.push_str(&format!("&limit={l}"));
     }
@@ -947,7 +947,7 @@ async fn session_resume(
     id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let url = format!("{endpoint}/sessions/{id}/resume");
+    let url = format!("{endpoint}/api/v1/sessions/{id}/resume");
     let resp = client.post(url).send().await?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -973,7 +973,7 @@ async fn session_prompt(
 ) -> Result<(), CliError> {
     let payload = serde_json::json!({ "text": text });
     let resp = client
-        .post(format!("{endpoint}/sessions/{id}/prompt"))
+        .post(format!("{endpoint}/api/v1/sessions/{id}/prompt"))
         .json(&payload)
         .send()
         .await?;
@@ -1229,7 +1229,7 @@ async fn registry_add(
 
     let body = serde_json::json!({ "host": host, "auth": auth });
     let resp = client
-        .post(format!("{endpoint}/api/registries"))
+        .post(format!("{endpoint}/api/v1/registries"))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
@@ -1259,7 +1259,7 @@ async fn registry_list(
     endpoint: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/registries")).await?;
+    let body = get_json(client, &format!("{endpoint}/api/v1/registries")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -1286,7 +1286,7 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
     // URL-encode the host so `:` in `localhost:5001` survives the path.
     let encoded = urlencode(host);
     let resp = client
-        .delete(format!("{endpoint}/api/registries/{encoded}"))
+        .delete(format!("{endpoint}/api/v1/registries/{encoded}"))
         .send()
         .await?;
     let status = resp.status();
@@ -1306,7 +1306,7 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
 // ---- enabled-images subcommands ---------------------------------------
 
 async fn image_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/enabled-images")).await?;
+    let body = get_json(client, &format!("{endpoint}/api/v1/enabled-images")).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -1336,7 +1336,7 @@ async fn image_enable(
     json: bool,
 ) -> Result<(), CliError> {
     let resp = client
-        .post(format!("{endpoint}/api/enabled-images"))
+        .post(format!("{endpoint}/api/v1/enabled-images"))
         .json(&serde_json::json!({ "image_uri": uri }))
         .send()
         .await?;
@@ -1364,7 +1364,7 @@ async fn image_disable(
     uri: &str,
 ) -> Result<(), CliError> {
     let resp = client
-        .post(format!("{endpoint}/api/enabled-images/disable"))
+        .post(format!("{endpoint}/api/v1/enabled-images/disable"))
         .json(&serde_json::json!({ "image_uri": uri }))
         .send()
         .await?;
@@ -1384,7 +1384,7 @@ async fn image_refresh(
     json: bool,
 ) -> Result<(), CliError> {
     let resp = client
-        .post(format!("{endpoint}/api/enabled-images/refresh"))
+        .post(format!("{endpoint}/api/v1/enabled-images/refresh"))
         .json(&serde_json::json!({ "image_uri": uri }))
         .send()
         .await?;

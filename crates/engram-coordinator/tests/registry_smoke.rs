@@ -376,7 +376,7 @@ async fn add_static_registry_seals_password_and_returns_summary() {
             "password": "hunter2",
         }
     });
-    let (status, resp) = send(&app, Method::POST, "/api/registries", Some(body)).await;
+    let (status, resp) = send(&app, Method::POST, "/api/v1/registries", Some(body)).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -441,7 +441,7 @@ async fn add_gcp_workload_identity_registry_persists_no_secret_material() {
             "impersonate_sa": "engram@my-project.iam.gserviceaccount.com",
         }
     });
-    let (status, resp) = send(&app, Method::POST, "/api/registries", Some(body)).await;
+    let (status, resp) = send(&app, Method::POST, "/api/v1/registries", Some(body)).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -479,7 +479,7 @@ async fn add_gcp_wi_without_impersonation_uses_ambient_identity() {
         "host": "gcr.io",
         "auth": { "kind": "gcp_workload_identity" }
     });
-    let (status, _) = send(&app, Method::POST, "/api/registries", Some(body)).await;
+    let (status, _) = send(&app, Method::POST, "/api/v1/registries", Some(body)).await;
     assert_eq!(status, StatusCode::CREATED);
 
     let stored = meta
@@ -502,7 +502,7 @@ async fn list_registries_redacts_all_secret_material() {
     let _ = send(
         &app,
         Method::POST,
-        "/api/registries",
+        "/api/v1/registries",
         Some(json!({
             "host": "gcr.io",
             "auth": { "kind": "static", "username": "_json_key", "password": "p1" }
@@ -512,7 +512,7 @@ async fn list_registries_redacts_all_secret_material() {
     let _ = send(
         &app,
         Method::POST,
-        "/api/registries",
+        "/api/v1/registries",
         Some(json!({
             "host": "us-east1-docker.pkg.dev",
             "auth": { "kind": "gcp_workload_identity" }
@@ -520,7 +520,7 @@ async fn list_registries_redacts_all_secret_material() {
     )
     .await;
 
-    let (status, resp) = send(&app, Method::GET, "/api/registries", None).await;
+    let (status, resp) = send(&app, Method::GET, "/api/v1/registries", None).await;
     assert_eq!(status, StatusCode::OK);
     let regs = resp["registries"].as_array().expect("registries: array");
     assert_eq!(regs.len(), 2, "got {regs:?}");
@@ -555,7 +555,7 @@ async fn add_static_rejects_missing_fields() {
     let (status, _) = send(
         &app,
         Method::POST,
-        "/api/registries",
+        "/api/v1/registries",
         Some(json!({
             "host": "gcr.io",
             "auth": { "kind": "static", "password": "x" }
@@ -577,7 +577,7 @@ async fn add_static_rejects_empty_password() {
     let (status, resp) = send(
         &app,
         Method::POST,
-        "/api/registries",
+        "/api/v1/registries",
         Some(json!({
             "host": "gcr.io",
             "auth": { "kind": "static", "username": "u", "password": "" }
@@ -593,7 +593,7 @@ async fn delete_registry_round_trip() {
     let _ = send(
         &app,
         Method::POST,
-        "/api/registries",
+        "/api/v1/registries",
         Some(json!({
             "host": "gcr.io",
             "auth": { "kind": "static", "username": "u", "password": "p" }
@@ -601,11 +601,11 @@ async fn delete_registry_round_trip() {
     )
     .await;
 
-    let (status, _) = send(&app, Method::DELETE, "/api/registries/gcr.io", None).await;
+    let (status, _) = send(&app, Method::DELETE, "/api/v1/registries/gcr.io", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Second delete = NotFound → 404.
-    let (status, _) = send(&app, Method::DELETE, "/api/registries/gcr.io", None).await;
+    let (status, _) = send(&app, Method::DELETE, "/api/v1/registries/gcr.io", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -628,7 +628,7 @@ async fn upsert_replaces_in_place_for_same_host() {
         let (status, _) = send(
             &app,
             Method::POST,
-            "/api/registries",
+            "/api/v1/registries",
             Some(json!({
                 "host": "gcr.io",
                 "auth": { "kind": "static", "username": "u", "password": password }
@@ -689,7 +689,7 @@ async fn list_enabled_images_returns_seeded_rows_sorted() {
         .unwrap();
     }
 
-    let (status, body) = send(&app, Method::GET, "/api/enabled-images", None).await;
+    let (status, body) = send(&app, Method::GET, "/api/v1/enabled-images", None).await;
     assert_eq!(status, StatusCode::OK);
     let images = body["images"].as_array().expect("images array");
     assert_eq!(images.len(), 2);
@@ -711,7 +711,7 @@ async fn disable_enabled_image_404s_when_missing() {
     let (status, body) = send(
         &app,
         Method::POST,
-        "/api/enabled-images/disable",
+        "/api/v1/enabled-images/disable",
         Some(json!({ "image_uri": "ghcr.io/never/enabled:v1" })),
     )
     .await;
@@ -755,7 +755,7 @@ async fn disable_enabled_image_204_then_idempotent_404() {
     let (status, _) = send(
         &app,
         Method::POST,
-        "/api/enabled-images/disable",
+        "/api/v1/enabled-images/disable",
         Some(json!({ "image_uri": "ghcr.io/cortex/api:warm-1" })),
     )
     .await;
@@ -764,7 +764,7 @@ async fn disable_enabled_image_204_then_idempotent_404() {
     let (status, _) = send(
         &app,
         Method::POST,
-        "/api/enabled-images/disable",
+        "/api/v1/enabled-images/disable",
         Some(json!({ "image_uri": "ghcr.io/cortex/api:warm-1" })),
     )
     .await;
@@ -783,7 +783,7 @@ async fn refresh_404s_when_image_was_never_enabled() {
     let (status, body) = send(
         &app,
         Method::POST,
-        "/api/enabled-images/refresh",
+        "/api/v1/enabled-images/refresh",
         Some(json!({ "image_uri": "ghcr.io/cortex/api:never-touched" })),
     )
     .await;
@@ -803,7 +803,7 @@ async fn enable_image_rejects_empty_uri() {
     let (status, _) = send(
         &app,
         Method::POST,
-        "/api/enabled-images",
+        "/api/v1/enabled-images",
         Some(json!({ "image_uri": "" })),
     )
     .await;
@@ -820,7 +820,7 @@ async fn anonymous_registry_round_trips() {
     let (status, _) = send(
         &app,
         Method::POST,
-        "/api/registries",
+        "/api/v1/registries",
         Some(json!({
             "host": "ghcr.io",
             "auth": { "kind": "anonymous" }
@@ -829,7 +829,7 @@ async fn anonymous_registry_round_trips() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, body) = send(&app, Method::GET, "/api/registries", None).await;
+    let (status, body) = send(&app, Method::GET, "/api/v1/registries", None).await;
     assert_eq!(status, StatusCode::OK);
     let regs = body["registries"].as_array().unwrap();
     assert_eq!(regs.len(), 1);

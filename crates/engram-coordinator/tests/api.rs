@@ -544,7 +544,7 @@ async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::Stat
 #[tokio::test]
 async fn forge_git_credential_gated_by_broker_token() {
     let (app, sid, _forge) = build_forge_app().await;
-    let uri = format!("/sessions/{sid}/git-credential");
+    let uri = format!("/api/v1/sessions/{sid}/git-credential");
 
     // No token → 401.
     let resp = app
@@ -590,7 +590,7 @@ async fn forge_create_pull_request_opens_and_records() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/sessions/{sid}/pull-request"))
+                .uri(format!("/api/v1/sessions/{sid}/pull-request"))
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer broker-tok-123")
                 .body(Body::from(
@@ -641,7 +641,7 @@ async fn forge_forward_runs_the_core_for_split_hosts() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/hosts/forge")
+                .uri("/api/v1/hosts/forge")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&req).unwrap()))
                 .unwrap(),
@@ -671,7 +671,7 @@ async fn forge_forward_runs_the_core_for_split_hosts() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/hosts/forge")
+                .uri("/api/v1/hosts/forge")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&bad).unwrap()))
                 .unwrap(),
@@ -888,7 +888,7 @@ async fn api_create_session(app: axum::Router, repo: &str) -> SessionId {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": format!("{repo}:warm-bootstrap"),
                 "workspace": {"kind":"empty"},
@@ -953,7 +953,11 @@ async fn auth_disabled_when_token_list_empty() {
     // disabled. This is the dev-loop and existing-test default.
     let app = build_app(MockMetadataStore::arc());
     let resp = app
-        .oneshot(Request::get("/sessions").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -963,7 +967,11 @@ async fn auth_disabled_when_token_list_empty() {
 async fn auth_rejects_request_without_authorization_header() {
     let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
     let resp = app
-        .oneshot(Request::get("/sessions").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -976,7 +984,7 @@ async fn auth_rejects_wrong_token() {
     let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
-            Request::get("/sessions")
+            Request::get("/api/v1/sessions")
                 .header("authorization", "Bearer beta")
                 .body(Body::empty())
                 .unwrap(),
@@ -997,7 +1005,7 @@ async fn auth_rejects_non_bearer_scheme() {
     let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
-            Request::get("/sessions")
+            Request::get("/api/v1/sessions")
                 .header("authorization", "Basic YWxwaGE=")
                 .body(Body::empty())
                 .unwrap(),
@@ -1017,7 +1025,7 @@ async fn auth_accepts_valid_bearer_token() {
         let resp = app
             .clone()
             .oneshot(
-                Request::get("/sessions")
+                Request::get("/api/v1/sessions")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -1049,7 +1057,7 @@ async fn auth_protects_post_endpoints_too() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": "r:warm-bootstrap",
                 "workspace": {"kind":"empty"},
@@ -1083,7 +1091,7 @@ async fn create_session_requires_image_and_workspace() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({"workspace": {"kind":"empty"}}),
         ))
         .await
@@ -1118,7 +1126,7 @@ async fn create_session_dev_vm_mode_skips_harness_on_harnessed_image() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": "demo/dev-vm-from-harnessed:v1",
                 "mode": "dev_vm",
@@ -1163,7 +1171,7 @@ async fn dev_vm_exec_inherits_image_env() {
 
     let resp = post(
         app.clone(),
-        "/sessions",
+        "/api/v1/sessions",
         json!({ "image": "demo/env-inject:v1", "mode": "dev_vm" }),
     )
     .await;
@@ -1173,7 +1181,7 @@ async fn dev_vm_exec_inherits_image_env() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({ "command": "printenv ENGRAM_TEST_IMAGE_VAR" }),
     )
     .await;
@@ -1201,7 +1209,7 @@ async fn create_session_with_explicit_image_persists_full_row() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": "cortex/api:warm-pinned",
                 "workspace": {"kind":"empty"},
@@ -1233,7 +1241,7 @@ async fn create_session_with_unknown_image_returns_400() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": "never-baked:x",
                 "workspace": {"kind":"empty"},
@@ -1259,7 +1267,7 @@ async fn create_session_prompt_with_dev_vm_mode_is_400() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": "r:warm-bootstrap",
                 "mode": "dev_vm",
@@ -1287,7 +1295,7 @@ async fn get_session_returns_404_for_unknown_id() {
     let unknown = SessionId::new();
     let resp = app
         .oneshot(
-            Request::get(format!("/sessions/{unknown}"))
+            Request::get(format!("/api/v1/sessions/{unknown}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1303,7 +1311,7 @@ async fn get_session_returns_400_for_malformed_id() {
     let app = build_app(MockMetadataStore::arc());
     let resp = app
         .oneshot(
-            Request::get("/sessions/not-a-uuid")
+            Request::get("/api/v1/sessions/not-a-uuid")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1317,7 +1325,11 @@ async fn get_session_returns_400_for_malformed_id() {
 async fn list_sessions_returns_empty_array_when_store_is_empty() {
     let app = build_app(MockMetadataStore::arc());
     let resp = app
-        .oneshot(Request::get("/sessions").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1358,7 +1370,11 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
 
     let app = build_app(store);
     let resp = app
-        .oneshot(Request::get("/sessions").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1394,7 +1410,11 @@ async fn list_sessions_serializes_full_session_record() {
 
     let app = build_app(store);
     let resp = app
-        .oneshot(Request::get("/sessions").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1445,7 +1465,7 @@ async fn delete_session_marks_completed_and_returns_204() {
     let app = build_app(store.clone());
     let resp = app
         .oneshot(
-            Request::delete(format!("/sessions/{id}"))
+            Request::delete(format!("/api/v1/sessions/{id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1463,7 +1483,7 @@ async fn delete_session_404_for_unknown_id() {
     let unknown = SessionId::new();
     let resp = app
         .oneshot(
-            Request::delete(format!("/sessions/{unknown}"))
+            Request::delete(format!("/api/v1/sessions/{unknown}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1585,7 +1605,7 @@ async fn exec_stream_emits_stdout_chunks_then_exit() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec/stream"),
+        &format!("/api/v1/sessions/{id}/exec/stream"),
         json!({"command": "printf hello"}),
     )
     .await;
@@ -1622,7 +1642,7 @@ async fn exec_stream_returns_404_for_unknown_session() {
     let app = build_app(MockMetadataStore::arc());
     let resp = post(
         app,
-        &format!("/sessions/{}/exec/stream", SessionId::new()),
+        &format!("/api/v1/sessions/{}/exec/stream", SessionId::new()),
         json!({"command": "true"}),
     )
     .await;
@@ -1643,7 +1663,7 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
     let app = build_app(store);
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec/stream"),
+        &format!("/api/v1/sessions/{id}/exec/stream"),
         json!({"command": "true"}),
     )
     .await;
@@ -1658,7 +1678,7 @@ async fn exec_stream_chunks_arrive_before_process_exits() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec/stream"),
+        &format!("/api/v1/sessions/{id}/exec/stream"),
         // 500ms gap between chunks. If the API buffered to completion
         // we'd never see chunk-1 inside the STREAMING_PROOF budget.
         json!({"command": "printf chunk-1; sleep 0.5; printf chunk-2"}),
@@ -1687,7 +1707,7 @@ async fn events_endpoint_returns_404_for_unknown_session() {
     let app = build_app(MockMetadataStore::arc());
     let resp = app
         .oneshot(
-            Request::get(format!("/sessions/{}/events", SessionId::new()))
+            Request::get(format!("/api/v1/sessions/{}/events", SessionId::new()))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1703,7 +1723,7 @@ async fn events_endpoint_announces_sse_content_type() {
     let id = api_create_session(app.clone(), "r").await;
     let resp = app
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1733,7 +1753,7 @@ async fn events_subscriber_sees_snapshot_lifecycle() {
     let sub = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1748,7 +1768,7 @@ async fn events_subscriber_sees_snapshot_lifecycle() {
     // state before we publish.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let resp = post(app, &format!("/sessions/{id}/snapshot"), json!({})).await;
+    let resp = post(app, &format!("/api/v1/sessions/{id}/snapshot"), json!({})).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let events = collector.await.unwrap();
@@ -1770,7 +1790,7 @@ async fn events_endpoint_fans_out_to_multiple_subscribers() {
     let sub_a = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1779,7 +1799,7 @@ async fn events_endpoint_fans_out_to_multiple_subscribers() {
     let sub_b = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1790,7 +1810,7 @@ async fn events_endpoint_fans_out_to_multiple_subscribers() {
     let coll_b = tokio::spawn(async move { collect_sse(sub_b.into_body(), BRIEF).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    post(app, &format!("/sessions/{id}/snapshot"), json!({})).await;
+    post(app, &format!("/api/v1/sessions/{id}/snapshot"), json!({})).await;
 
     let events_a = coll_a.await.unwrap();
     let events_b = coll_b.await.unwrap();
@@ -1814,7 +1834,7 @@ async fn events_subscriber_sees_evict_then_resume_lifecycle() {
     let sub = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1823,9 +1843,14 @@ async fn events_subscriber_sees_evict_then_resume_lifecycle() {
     let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
-    post(app, &format!("/sessions/{id}/resume"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
+    post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
 
     let events = collector.await.unwrap();
     let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
@@ -1856,7 +1881,7 @@ async fn exec_via_sync_endpoint_publishes_lifecycle_to_event_bus() {
     let sub = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1867,7 +1892,7 @@ async fn exec_via_sync_endpoint_publishes_lifecycle_to_event_bus() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf wired"}),
     )
     .await;
@@ -1894,7 +1919,12 @@ async fn snapshot_records_a_snapshot_and_keeps_session_active() {
     let app = build_app(store.clone());
     let id = api_create_session(app.clone(), "r").await;
 
-    let resp = post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    let resp = post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp.into_body()).await;
     let snap_id = v["snapshot_id"]
@@ -1918,7 +1948,7 @@ async fn snapshot_records_a_snapshot_and_keeps_session_active() {
     // After snapshot the live sandbox should still respond to exec.
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf still-alive"}),
     )
     .await;
@@ -1932,7 +1962,7 @@ async fn snapshot_returns_404_for_unknown_session() {
     let app = build_app(MockMetadataStore::arc());
     let resp = post(
         app,
-        &format!("/sessions/{}/snapshot", SessionId::new()),
+        &format!("/api/v1/sessions/{}/snapshot", SessionId::new()),
         json!({}),
     )
     .await;
@@ -1951,7 +1981,7 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
         .await
         .unwrap();
     let app = build_app(store);
-    let resp = post(app, &format!("/sessions/{id}/snapshot"), json!({})).await;
+    let resp = post(app, &format!("/api/v1/sessions/{id}/snapshot"), json!({})).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
@@ -1962,7 +1992,7 @@ async fn evict_local_requires_a_snapshot_to_exist() {
     let id = api_create_session(app.clone(), "r").await;
 
     // No snapshot yet: evicting would lose state. Must 409.
-    let resp = delete(app, &format!("/sessions/{id}/local")).await;
+    let resp = delete(app, &format!("/api/v1/sessions/{id}/local")).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // Session must still be Active and registry still bound.
@@ -1979,11 +2009,16 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
     let id = api_create_session(app.clone(), "r").await;
 
     // Snapshot first.
-    let resp = post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    let resp = post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Evict.
-    let resp = delete(app.clone(), &format!("/sessions/{id}/local")).await;
+    let resp = delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
@@ -1995,7 +2030,7 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
     // The session ends up Active again and the exec succeeds.
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "echo back"}),
     )
     .await;
@@ -2026,7 +2061,7 @@ async fn evict_local_409_when_session_not_active() {
         .unwrap();
     // Session is Pending (never created sandbox), can't evict.
     let app = build_app(store);
-    let resp = delete(app, &format!("/sessions/{id}/local")).await;
+    let resp = delete(app, &format!("/api/v1/sessions/{id}/local")).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
@@ -2036,7 +2071,7 @@ async fn resume_409_when_session_not_idle() {
     let app = build_app(store);
     let id = api_create_session(app.clone(), "r").await;
     // Session is Active — resume only valid from Idle.
-    let resp = post(app, &format!("/sessions/{id}/resume"), json!({})).await;
+    let resp = post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
@@ -2057,7 +2092,7 @@ async fn resume_410_gone_when_no_snapshot_exists() {
         .unwrap();
     seed_to(&store, id, SessionState::Idle).await;
     let app = build_app(store);
-    let resp = post(app, &format!("/sessions/{id}/resume"), json!({})).await;
+    let resp = post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
     assert_eq!(resp.status(), StatusCode::GONE);
 }
 
@@ -2074,18 +2109,23 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
     // Write a marker file in the live sandbox.
     let resp = post(
         app.clone(),
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "echo persisted > marker"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Snapshot.
-    let resp = post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    let resp = post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Evict.
-    let resp = delete(app.clone(), &format!("/sessions/{id}/local")).await;
+    let resp = delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
@@ -2093,7 +2133,12 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
     );
 
     // Resume from snapshot.
-    let resp = post(app.clone(), &format!("/sessions/{id}/resume"), json!({})).await;
+    let resp = post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/resume"),
+        json!({}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         store.get_session(id).await.unwrap().status,
@@ -2103,7 +2148,7 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
     // The marker file must still be there in the resumed sandbox.
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "cat marker"}),
     )
     .await;
@@ -2131,7 +2176,7 @@ async fn exec_rejects_request_without_command_or_argv() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({}),
         ))
         .await
@@ -2154,7 +2199,7 @@ async fn exec_rejects_empty_argv() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({"argv": []}),
         ))
         .await
@@ -2185,7 +2230,7 @@ async fn exec_round_trips_stdout_when_session_has_live_sandbox() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({"command": "printf hello-engram"}),
         ))
         .await
@@ -2211,7 +2256,7 @@ async fn exec_returns_rusage_with_nonzero_wall_ms_for_slow_command() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "sleep 0.1"}),
     )
     .await;
@@ -2238,7 +2283,7 @@ async fn exec_stream_includes_rusage_on_exit_event() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec/stream"),
+        &format!("/api/v1/sessions/{id}/exec/stream"),
         json!({"command": "sleep 0.1"}),
     )
     .await;
@@ -2264,7 +2309,7 @@ async fn exec_propagates_nonzero_exit_status() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({"command": "exit 7"}),
         ))
         .await
@@ -2283,7 +2328,7 @@ async fn exec_separates_stdout_and_stderr() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             // Use printf to avoid shells that auto-append trailing
             // newlines differently on macOS vs Linux.
             json!({"command": "printf out; printf err 1>&2"}),
@@ -2305,7 +2350,7 @@ async fn exec_with_explicit_argv_skips_shell() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             // argv path: no `sh -c` wrapper, so glob/redirect chars are
             // literal. Verify by passing a string with shell metachars.
             json!({"argv": ["printf", "lit*ral"]}),
@@ -2324,7 +2369,7 @@ async fn exec_returns_404_for_unknown_session() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{unknown}/exec"),
+            &format!("/api/v1/sessions/{unknown}/exec"),
             json!({"command": "true"}),
         ))
         .await
@@ -2354,7 +2399,7 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({"command": "echo hi"}),
         ))
         .await
@@ -2382,7 +2427,7 @@ async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
         .clone()
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({"command": "printf alive"}),
         ))
         .await
@@ -2393,7 +2438,7 @@ async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
     let resp = app
         .clone()
         .oneshot(
-            Request::delete(format!("/sessions/{id}"))
+            Request::delete(format!("/api/v1/sessions/{id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2409,7 +2454,7 @@ async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            &format!("/sessions/{id}/exec"),
+            &format!("/api/v1/sessions/{id}/exec"),
             json!({"command": "echo nope"}),
         ))
         .await
@@ -2505,7 +2550,7 @@ async fn create_session_failure_returns_503_with_no_row() {
     let resp = app
         .oneshot(json_request(
             Method::POST,
-            "/sessions",
+            "/api/v1/sessions",
             json!({
                 "image": "cortex/api:warm-1",
                 "workspace": {"kind":"empty"},
@@ -2543,7 +2588,11 @@ async fn unknown_route_returns_404() {
 async fn wrong_method_on_known_route_returns_405() {
     let app = build_app(MockMetadataStore::arc());
     let resp = app
-        .oneshot(Request::put("/sessions").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::put("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -2577,7 +2626,7 @@ async fn manifest_env_lands_in_sandbox_environment() {
 
     let resp = post(
         app.clone(),
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2594,7 +2643,7 @@ async fn manifest_env_lands_in_sandbox_environment() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf %s \"$ENGRAM_TEST_MARKER\""}),
     )
     .await;
@@ -2619,7 +2668,7 @@ async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
 
     let resp = post(
         app.clone(),
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2636,7 +2685,7 @@ async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
     // Files from the image's rootfs must be visible in the sandbox cwd.
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "cat README.md && cat scripts/setup.sh | head -1"}),
     )
     .await;
@@ -2668,7 +2717,7 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
 
     let resp = post(
         app.clone(),
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2685,7 +2734,7 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf %s \"$GITHUB_TOKEN\""}),
     )
     .await;
@@ -2712,7 +2761,7 @@ async fn required_secret_missing_in_store_fails_session_create() {
 
     let resp = post(
         app,
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2754,7 +2803,7 @@ async fn optional_secret_absence_is_silently_ok() {
 
     let resp = post(
         app.clone(),
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2772,7 +2821,7 @@ async fn optional_secret_absence_is_silently_ok() {
     // Required is present; optional is silently absent (env var unset).
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "echo \"required=$GITHUB_TOKEN optional=${OPTIONAL_KEY-MISSING}\""}),
     )
     .await;
@@ -2810,7 +2859,7 @@ async fn broker_mode_emits_placeholders_not_real_values() {
 
     let resp = post(
         app.clone(),
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2826,7 +2875,7 @@ async fn broker_mode_emits_placeholders_not_real_values() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf %s \"$GITHUB_TOKEN\""}),
     )
     .await;
@@ -2864,7 +2913,7 @@ async fn manifest_resource_hints_override_defaults() {
     // an Active state (the hints are well-formed integers).
     let resp = post(
         app,
-        "/sessions",
+        "/api/v1/sessions",
         json!({
             "image": "cortex/api:warm-1",
             "workspace": {"kind":"empty"},
@@ -2900,7 +2949,7 @@ async fn back_to_back_session_creates_succeed() {
     for sid in [id_a, id_b] {
         let resp = post(
             app.clone(),
-            &format!("/sessions/{sid}/exec"),
+            &format!("/api/v1/sessions/{sid}/exec"),
             json!({"command": "printf alive"}),
         )
         .await;
@@ -2922,7 +2971,7 @@ async fn engram_session_id_is_injected_per_exec() {
 
     let resp = post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf %s \"$ENGRAM_SESSION_ID\""}),
     )
     .await;
@@ -2946,7 +2995,7 @@ async fn every_persisted_event_carries_a_monotonic_id_on_the_wire() {
     let sub = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2957,7 +3006,7 @@ async fn every_persisted_event_carries_a_monotonic_id_on_the_wire() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     post(
         app,
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf via-bus"}),
     )
     .await;
@@ -2991,14 +3040,24 @@ async fn since_query_replays_history_from_persistent_log() {
     let id = api_create_session(app.clone(), "r").await;
 
     // Generate some history while no one is subscribing.
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
-    post(app.clone(), &format!("/sessions/{id}/resume"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/resume"),
+        json!({}),
+    )
+    .await;
 
     // Now subscribe with since=-1 (start of log).
     let sub = app
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since=-1"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3032,13 +3091,18 @@ async fn since_query_skips_events_already_seen() {
     let id = api_create_session(app.clone(), "r").await;
 
     // First batch.
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
 
     // Read everything-so-far to find the checkpoint idx.
     let baseline = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since=-1"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3052,13 +3116,13 @@ async fn since_query_skips_events_already_seen() {
         .expect("baseline replay produced at least one event");
 
     // Second batch — this is what we want to see in the next replay.
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
 
     // Reconnect with since=checkpoint. Should NOT see anything from
     // the first batch.
     let resume = app
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since={checkpoint}"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since={checkpoint}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3092,11 +3156,16 @@ async fn last_event_id_header_drives_reconnect() {
     let app = build_app(store);
     let id = api_create_session(app.clone(), "r").await;
 
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
     let baseline = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since=-1"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3105,11 +3174,11 @@ async fn last_event_id_header_drives_reconnect() {
     let baseline_events = collect_sse(baseline.into_body(), Duration::from_millis(300)).await;
     let checkpoint = baseline_events.iter().filter_map(|e| e.id).max().unwrap();
 
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
 
     let resume = app
         .oneshot(
-            Request::get(format!("/sessions/{id}/events"))
+            Request::get(format!("/api/v1/sessions/{id}/events"))
                 .header("last-event-id", checkpoint.to_string())
                 .body(Body::empty())
                 .unwrap(),
@@ -3129,12 +3198,17 @@ async fn since_query_wins_when_higher_than_last_event_id_header() {
     let store = MockMetadataStore::arc();
     let app = build_app(store);
     let id = api_create_session(app.clone(), "r").await;
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
 
     let baseline = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since=-1"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3143,12 +3217,12 @@ async fn since_query_wins_when_higher_than_last_event_id_header() {
     let baseline_events = collect_sse(baseline.into_body(), Duration::from_millis(300)).await;
     let high = baseline_events.iter().filter_map(|e| e.id).max().unwrap();
 
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
 
     // Stale header (way back), fresh query (current high water).
     let resume = app
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since={high}"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since={high}"))
                 .header("last-event-id", "-1")
                 .body(Body::empty())
                 .unwrap(),
@@ -3174,13 +3248,18 @@ async fn replay_then_live_seam_is_gap_free_and_dup_free() {
     let id = api_create_session(app.clone(), "r").await;
 
     // Drive some history.
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
 
     // Subscribe at since=-1 and concurrently drive more activity.
     let sub = app
         .clone()
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since=-1"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3189,8 +3268,8 @@ async fn replay_then_live_seam_is_gap_free_and_dup_free() {
     let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
-    post(app, &format!("/sessions/{id}/resume"), json!({})).await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
+    post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
 
     let events = collector.await.unwrap();
     let ids: Vec<i64> = events.iter().filter_map(|e| e.id).collect();
@@ -3233,20 +3312,30 @@ async fn persistent_log_captures_lifecycle_and_exec_kinds() {
     // exec → exec_started, stdout, exec_completed
     post(
         app.clone(),
-        &format!("/sessions/{id}/exec"),
+        &format!("/api/v1/sessions/{id}/exec"),
         json!({"command": "printf hi; printf err 1>&2"}),
     )
     .await;
     // snapshot → snapshot_taken
-    post(app.clone(), &format!("/sessions/{id}/snapshot"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
     // evict → evicted + status_changed
-    delete(app.clone(), &format!("/sessions/{id}/local")).await;
+    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
     // resume → resumed + status_changed
-    post(app.clone(), &format!("/sessions/{id}/resume"), json!({})).await;
+    post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/resume"),
+        json!({}),
+    )
+    .await;
 
     let log = app
         .oneshot(
-            Request::get(format!("/sessions/{id}/events?since=-1"))
+            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3284,8 +3373,8 @@ async fn deleted_git_endpoints_return_404() {
     let id = api_create_session(app.clone(), "r").await;
 
     for path in [
-        format!("/sessions/{id}/checkpoint"),
-        format!("/sessions/{id}/fork"),
+        format!("/api/v1/sessions/{id}/checkpoint"),
+        format!("/api/v1/sessions/{id}/fork"),
     ] {
         let resp = post(app.clone(), &path, json!({})).await;
         assert_eq!(
@@ -3300,7 +3389,7 @@ async fn deleted_git_endpoints_return_404() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/sessions/{id}/diff"))
+                .uri(format!("/api/v1/sessions/{id}/diff"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3319,7 +3408,7 @@ async fn deleted_git_endpoints_return_404() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/sessions/{id}/log?kind=workspace"))
+                .uri(format!("/api/v1/sessions/{id}/log?kind=workspace"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3347,7 +3436,7 @@ async fn admin_reap_materialize_dir_reports_host_not_in_grpc_pool() {
     let store = MockMetadataStore::arc();
     let app = build_app(store);
 
-    let resp = post(app, "/api/admin/reap-materialize-dir", json!({})).await;
+    let resp = post(app, "/api/v1/admin/reap-materialize-dir", json!({})).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp.into_body()).await;
     assert_eq!(v["files_deleted"], 0);
@@ -3424,7 +3513,7 @@ async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
     // Without this override the 1h default would skip them all.
     let resp = post(
         app,
-        "/api/admin/reap-materialize-dir?min_age_secs=0",
+        "/api/v1/admin/reap-materialize-dir?min_age_secs=0",
         json!({}),
     )
     .await;
@@ -3485,7 +3574,7 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
     // -- Applied path: matching sandbox_id, version=7 --
     let resp = post(
         app.clone(),
-        &format!("/api/hosts/{host_id}/live-manifest"),
+        &format!("/api/v1/hosts/{host_id}/live-manifest"),
         json!({
             "session_id": session_id,
             "sandbox_id": sandbox_id,
@@ -3513,7 +3602,7 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
     let stale_sandbox = engram_core::SandboxId::new();
     let resp = post(
         app.clone(),
-        &format!("/api/hosts/{host_id}/live-manifest"),
+        &format!("/api/v1/hosts/{host_id}/live-manifest"),
         json!({
             "session_id": session_id,
             "sandbox_id": stale_sandbox,
@@ -3552,7 +3641,7 @@ async fn flush_now_returns_404_when_session_unknown() {
     let unknown = SessionId::new();
     let resp = post(
         app,
-        &format!("/api/admin/sessions/{unknown}/flush-now"),
+        &format!("/api/v1/admin/sessions/{unknown}/flush-now"),
         json!({}),
     )
     .await;
@@ -3584,7 +3673,7 @@ async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
     let app = build_app(meta);
     let resp = post(
         app,
-        &format!("/api/admin/sessions/{session_id}/flush-now"),
+        &format!("/api/v1/admin/sessions/{session_id}/flush-now"),
         json!({}),
     )
     .await;
@@ -3620,7 +3709,7 @@ async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
     let app = build_app(meta.clone());
     let resp = post(
         app,
-        &format!("/api/admin/sessions/{session_id}/flush-now"),
+        &format!("/api/v1/admin/sessions/{session_id}/flush-now"),
         json!({}),
     )
     .await;
@@ -3669,7 +3758,7 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     // Publish first, so unbinding has something to clear.
     let resp = post(
         app.clone(),
-        &format!("/api/hosts/{host_id}/live-manifest"),
+        &format!("/api/v1/hosts/{host_id}/live-manifest"),
         json!({
             "session_id": session_id,
             "sandbox_id": sandbox_id,

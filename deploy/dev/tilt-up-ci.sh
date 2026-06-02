@@ -60,12 +60,12 @@ echo "    coord up"
 # Same guard integration-up.sh used; omitting it kills the loop instantly.
 echo "==> waiting for host registration"
 for _ in $(seq 1 180); do
-    n=$(curl -fsS http://127.0.0.1:8090/api/hosts 2>/dev/null \
+    n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
         | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
     [ "${n:-0}" -ge 1 ] && break
     sleep 1
 done
-n=$(curl -fsS http://127.0.0.1:8090/api/hosts 2>/dev/null \
+n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
     | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
 if [ "${n:-0}" -lt 1 ]; then
     echo "ERROR: no host-agent registered" >&2

@@ -46,7 +46,7 @@ T0=$(date +%s.%N)
 SESS_RESP=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
     -H "Content-Type: application/json" \
     -d "$SESS_BODY" \
-    "$COORD/sessions")
+    "$COORD/api/v1/sessions")
 T1=$(date +%s.%N)
 SESS_ELAPSED=$(echo "$T1 - $T0" | bc)
 SESS_KIND=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kind","?"))')
@@ -58,7 +58,7 @@ echo "    kind:       $SESS_KIND"
 echo ""
 echo "==> step 5/5: cleanup — DELETE /sessions/$SESS_ID"
 curl -fsS -X DELETE "${AUTH_HEADER[@]}" \
-    "$COORD/sessions/$SESS_ID" >/dev/null || true
+    "$COORD/api/v1/sessions/$SESS_ID" >/dev/null || true
 echo "    session deleted"
 
 trap - ERR

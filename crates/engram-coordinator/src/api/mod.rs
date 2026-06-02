@@ -73,23 +73,23 @@ pub fn router(state: SharedState) -> Router {
         // host-agents register over HTTP, heartbeat over HTTP,
         // forward harness events over HTTP, and the coord
         // dispatches back to them over gRPC.
-        .route("/api/hosts/register", post(host_http::register))
-        .route("/api/hosts/:id/heartbeat", post(host_http::heartbeat))
+        .route("/hosts/register", post(host_http::register))
+        .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
         // ADR 0023 split-mode forge forwarding: FC hosts proxy each
         // in-guest forge request here (the forge sink can't run on the
         // remote host). Host-authed; the broker token rides in the body.
-        .route("/api/hosts/forge", post(forge::forge_forward))
+        .route("/hosts/forge", post(forge::forge_forward))
         // ADR 0026 split-mode artifact forwarding: FC hosts relay each
         // in-guest upload here (the upload sink can't run on the remote
         // host). Host-authed; the broker token rides in the base64'd
         // `X-Engram-Upload` header and is validated by `process_upload`.
-        .route("/api/hosts/upload", post(upload::upload_forward))
+        .route("/hosts/upload", post(upload::upload_forward))
         .route(
-            "/api/hosts/:id/auth/resolve-registry",
+            "/hosts/:id/auth/resolve-registry",
             post(host_http::resolve_registry_auth),
         )
         .route(
-            "/api/hosts/:id/idle-eviction-candidates",
+            "/hosts/:id/idle-eviction-candidates",
             post(host_http::idle_eviction_candidates),
         )
         // ADR 0016 Phase B: host's FlushScheduler publishes
@@ -97,46 +97,46 @@ pub fn router(state: SharedState) -> Router {
         // effective_resume_disk_manifest can see the latest disk
         // lineage between snapshot boundaries.
         .route(
-            "/api/hosts/:id/live-manifest",
+            "/hosts/:id/live-manifest",
             post(host_http::live_manifest_publish),
         )
         .route(
             "/sessions/:id/harness-events",
             post(host_http::harness_event_ingest),
         )
-        .route("/api/hosts", get(hosts::list))
-        .route("/api/hosts/:id", get(hosts::get))
-        .route("/api/hosts/:id/drain", post(hosts::drain))
+        .route("/hosts", get(hosts::list))
+        .route("/hosts/:id", get(hosts::get))
+        .route("/hosts/:id/drain", post(hosts::drain))
         // ADR 0016 Phase A: per-host COW diagnostic.
-        .route("/api/hosts/:id/cow-state", get(hosts::cow_state))
+        .route("/hosts/:id/cow-state", get(hosts::cow_state))
         // ADR 0021 P1.5a retired `/api/harnesses` — see migration
         // 0040 + the deleted `mod harnesses` above.
         .route(
-            "/api/registries",
+            "/registries",
             get(registries::list_registries).post(registries::add_registry),
         )
-        .route("/api/registries/:host", delete(registries::delete_registry))
+        .route("/registries/:host", delete(registries::delete_registry))
         .route(
-            "/api/enabled-images",
+            "/enabled-images",
             get(enabled_images::list_enabled_images).post(enabled_images::enable_image),
         )
         .route(
-            "/api/enabled-images/refresh",
+            "/enabled-images/refresh",
             post(enabled_images::refresh_enabled_image),
         )
         .route(
-            "/api/enabled-images/disable",
+            "/enabled-images/disable",
             post(enabled_images::disable_enabled_image),
         )
         .route(
-            "/api/admin/reap-materialize-dir",
+            "/admin/reap-materialize-dir",
             post(admin::reap_materialize_dir),
         )
         // ADR 0016 Phase B commit 4a: explicit admin trigger for the
         // FlushScheduler primitive. E2E tests + ops use this to drive
         // an immediate flush + publish round-trip without sleeping a
         // 30s scheduler tick.
-        .route("/api/admin/sessions/:id/flush-now", post(admin::flush_now))
+        .route("/admin/sessions/:id/flush-now", post(admin::flush_now))
         // ADR 0018 Phase C: explicit operator + test trigger for the
         // alive-source evacuation primitive. Auto-triggers
         // (dead_host.rs, nbd_loss_trigger) fire the same shape on
@@ -145,16 +145,16 @@ pub fn router(state: SharedState) -> Router {
         // session is marked `Evacuating`; the `evac_resumer` scanner
         // completes the resume on a peer.
         .route(
-            "/api/admin/sessions/:id/evacuate",
+            "/admin/sessions/:id/evacuate",
             post(admin::evacuate_session),
         )
         // ADR 0018 commit 12e: host-level operator drain. Cordon
         // flips `HostState.draining` + PG `hosts.status = draining`
         // so the picker excludes the host. Drain extends cordon by
         // firing Evacuating for every Active session on the host.
-        .route("/api/admin/hosts/:id/cordon", post(admin::cordon_host))
-        .route("/api/admin/hosts/:id/uncordon", post(admin::uncordon_host))
-        .route("/api/admin/hosts/:id/drain", post(admin::drain_host))
+        .route("/admin/hosts/:id/cordon", post(admin::cordon_host))
+        .route("/admin/hosts/:id/uncordon", post(admin::uncordon_host))
+        .route("/admin/hosts/:id/drain", post(admin::drain_host))
         // ADR 0016 Phase C commit 5: explicit admin triggers for the
         // chunk-GC sweep + candidate-table inspection. The background
         // loop is the implicit production driver
@@ -162,10 +162,10 @@ pub fn router(state: SharedState) -> Router {
         // the test seam + operator-driven counterparts. Both POSTs
         // accept `?grace_secs=N` so the e2e test in commit 6a can
         // knock the 24h grace down to 0 without env juggling.
-        .route("/api/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
-        .route("/api/admin/chunk-gc/sweep", post(admin::chunk_gc_sweep))
+        .route("/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
+        .route("/admin/chunk-gc/sweep", post(admin::chunk_gc_sweep))
         .route(
-            "/api/admin/chunk-gc/candidates",
+            "/admin/chunk-gc/candidates",
             get(admin::chunk_gc_candidates),
         )
         .layer(middleware::from_fn_with_state(
@@ -173,18 +173,27 @@ pub fn router(state: SharedState) -> Router {
             auth::require_bearer,
         ));
 
-    Router::new()
-        .route("/healthz", get(health::healthz))
-        .route("/readyz", get(health::readyz))
-        // ADR 0023 in-session forge seam. Authenticated in-handler by
-        // the per-session credential-broker token (not the deployment
-        // bearer), so these live OUTSIDE the `protected` layer — the
-        // in-guest helper holds only its session-scoped token.
+    // ADR 0023 in-session forge seam. Authenticated in-handler by
+    // the per-session credential-broker token (not the deployment
+    // bearer), so these live OUTSIDE the `protected` layer — the
+    // in-guest helper holds only its session-scoped token.
+    let forge_seam = Router::new()
         .route("/sessions/:id/git-credential", get(forge::git_credential))
         .route(
             "/sessions/:id/pull-request",
             post(forge::create_pull_request),
-        )
-        .merge(protected)
+        );
+
+    // The whole HTTP API lives under `/api/v1`. The SPA owns the root
+    // path namespace (`/`, `/sessions/:id`, `/settings/...`), so the
+    // web reverse-proxy can split cleanly on `/api/` vs everything-else
+    // and a browser deep-link to `/sessions/:id` no longer collides
+    // with the `GET /sessions/:id` API route. `/healthz` + `/readyz`
+    // stay at root so k8s + the GCP LB health checks don't have to know
+    // the prefix (and they're liveness/readiness, not API surface).
+    Router::new()
+        .route("/healthz", get(health::healthz))
+        .route("/readyz", get(health::readyz))
+        .nest("/api/v1", forge_seam.merge(protected))
         .with_state(state)
 }
