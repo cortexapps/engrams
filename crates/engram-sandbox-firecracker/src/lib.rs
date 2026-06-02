@@ -1389,30 +1389,34 @@ impl FirecrackerBackend {
         // playwright squashfs). Unlike the rootfs there is NO canonical
         // symlink dance — each `path_on_host` is already the fleet-wide
         // canonical path (present identically on every host once the FC-host
-        // image bakes it), so `state.bin` embeds it directly.
+        // image bakes it), so `state.bin` embeds it directly and restore
+        // re-anchors by mere presence.
         //
-        // ATTACH-IF-PRESENT, don't fail: this cold-create path is the
-        // base-snapshot capture (ADR 0020). If the bundle isn't staged on
-        // THIS host yet — a fresh CI e2e stack, or a host mid-rollout before
-        // the re-baked image lands — skip it and capture a snapshot WITHOUT
-        // the drive, rather than failing the enable. The snapshot then simply
-        // embeds no such drive (so restore never looks for it), and re-
-        // enabling the image once the bundle is staged attaches it. This is
-        // the same best-effort stance agentd takes on activation — a missing
-        // bundle must never brick image-enable or a session.
+        // HARD-FAIL on a missing bundle (no skip-if-absent hedge). This
+        // cold-create path is base-snapshot capture (ADR 0020), which is an
+        // operator-controlled, manual step (POST /api/enabled-images). The
+        // FC-host image bake auto-fires on merge and stages these bundles, so
+        // the correct order is: roll the host image first, THEN enable. If a
+        // bundle is missing here we'd rather 500 the enable loudly — telling
+        // the operator the host fleet isn't ready — than silently capture a
+        // skills-less snapshot every session would then inherit. A snapshot
+        // therefore only ever exists with ALL its declared bundles present,
+        // which is exactly what the restore-side assert relies on.
         for aux in &spec.aux_ro_drives {
             if !tokio::fs::try_exists(&aux.path_on_host)
                 .await
                 .unwrap_or(false)
             {
-                tracing::warn!(
-                    drive_id = %aux.drive_id,
-                    path = %aux.path_on_host.display(),
-                    "ADR 0027: aux RO bundle not present on this capture host; \
-                     skipping — the snapshot won't carry it. Re-enable the image \
-                     once the FC-host image has staged the bundle.",
-                );
-                continue;
+                return Err(SandboxError::Vm(
+                    format!(
+                        "aux RO bundle {:?} ({}) not present on this host — the \
+                         FC-host image hasn't staged it; roll the host image \
+                         before enabling this image",
+                        aux.path_on_host.display(),
+                        aux.drive_id
+                    )
+                    .into(),
+                ));
             }
             api.put_drive(&DriveConfig {
                 drive_id: aux.drive_id.clone(),
@@ -2332,29 +2336,26 @@ async fn restore_canonical_symlinks(
     // re-point.
     let _ = (stub_harness_override, new_sandbox_id, work_dir);
 
-    // ADR 0027: aux RO bundles re-anchor by presence — `state.bin` embeds
-    // each ATTACHED bundle's fleet-canonical path and FC's `load_snapshot`
-    // reopens the drive there. We only WARN on a missing path, never fail:
-    // this list is the *declared* `spec.aux_ro_drives`, but capture attaches
-    // a bundle only if it was present on the capture host (skip-if-absent
-    // above), so a declared-but-not-attached bundle is normal (CI / mid-
-    // rollout) and FC won't try to open it. If a bundle genuinely WAS
-    // attached and is missing here (a host mid-rollout receiving a snapshot
-    // from a bundled host), FC surfaces its own clear "No such file" with the
-    // path; this warn precedes it as a breadcrumb. Failing hard here would
-    // wrongly 500 session-create on hosts that never had the bundle.
+    // ADR 0027: aux RO bundles re-anchor by presence — `state.bin` embedded
+    // each bundle's fleet-canonical path and FC's `load_snapshot` reopens the
+    // drive there, so the path MUST exist on this receiver. Capture hard-fails
+    // unless every declared bundle is present (above), so a snapshot only ever
+    // exists with ALL its `spec.aux_ro_drives` attached — meaning this list is
+    // exactly what `load_snapshot` will open, no false-positives. Assert
+    // presence up front for a clear `SandboxError::Snapshot` instead of an
+    // opaque FC virtio "No such file" on a host the MIG roll hasn't reached.
     for aux in &manifest.spec.aux_ro_drives {
         if !tokio::fs::try_exists(&aux.path_on_host)
             .await
             .unwrap_or(false)
         {
-            tracing::warn!(
-                drive_id = %aux.drive_id,
-                path = %aux.path_on_host.display(),
-                "ADR 0027: declared aux RO bundle absent on this restore host; \
-                 fine if the snapshot didn't attach it (captured without the \
-                 bundle), otherwise load_snapshot will fail on this path.",
-            );
+            return Err(SandboxError::Snapshot(format!(
+                "aux RO bundle {:?} ({}) embedded in the snapshot is not \
+                 present on this host — the FC-host image hasn't staged it \
+                 (wait for the MIG roll to finish)",
+                aux.path_on_host.display(),
+                aux.drive_id
+            )));
         }
     }
     Ok(())
