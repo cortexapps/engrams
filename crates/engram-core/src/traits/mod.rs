@@ -20,6 +20,7 @@ pub mod metadata;
 pub mod sandbox;
 pub mod secrets;
 pub mod storage;
+pub mod users;
 
 pub use cloud::{CloudBackend, PreemptionStream};
 pub use git::{ForgeKind, GitForge, PullRequest, PullRequestSpec, RepoRef, ScopedToken};
@@ -33,3 +34,4 @@ pub use sandbox::{
 };
 pub use secrets::{ResolvedSecret, SecretBundle, SecretContext, SecretStore};
 pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};
+pub use users::{UserStore, WebSessionStore};
