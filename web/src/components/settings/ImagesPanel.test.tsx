@@ -33,13 +33,13 @@ function installFetchMock(initialList: unknown[] = []) {
             : (input as Request).url;
       const method = init?.method ?? 'GET';
 
-      if (url === '/api/enabled-images' && method === 'GET') {
+      if (url === '/api/v1/enabled-images' && method === 'GET') {
         return new Response(JSON.stringify({ images: listSnapshot }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
       }
-      if (url === '/api/enabled-images' && method === 'POST') {
+      if (url === '/api/v1/enabled-images' && method === 'POST') {
         return new Response(
           JSON.stringify({
             id: '00000000-0000-0000-0000-000000000000',
@@ -55,13 +55,13 @@ function installFetchMock(initialList: unknown[] = []) {
         );
       }
       if (
-        url === '/api/enabled-images/disable' &&
+        url === '/api/v1/enabled-images/disable' &&
         method === 'POST'
       ) {
         return new Response(null, { status: 204 });
       }
       if (
-        url === '/api/enabled-images/refresh' &&
+        url === '/api/v1/enabled-images/refresh' &&
         method === 'POST'
       ) {
         return new Response(
@@ -130,7 +130,7 @@ describe('ImagesPanel wire contract', () => {
 
     await waitFor(() => {
       const posts = mock.callsMatching(
-        (c) => c.method === 'POST' && c.url === '/api/enabled-images',
+        (c) => c.method === 'POST' && c.url === '/api/v1/enabled-images',
       );
       expect(posts.length).toBeGreaterThan(0);
       expect(JSON.parse(posts.at(-1)!.body!)).toEqual({
@@ -167,7 +167,7 @@ describe('ImagesPanel wire contract', () => {
 
     await waitFor(() => {
       const posts = mock.callsMatching(
-        (c) => c.method === 'POST' && c.url === '/api/enabled-images/disable',
+        (c) => c.method === 'POST' && c.url === '/api/v1/enabled-images/disable',
       );
       expect(posts.length).toBe(1);
       expect(JSON.parse(posts[0].body!)).toEqual({
@@ -197,7 +197,7 @@ describe('ImagesPanel wire contract', () => {
 
     await waitFor(() => {
       const posts = mock.callsMatching(
-        (c) => c.method === 'POST' && c.url === '/api/enabled-images/refresh',
+        (c) => c.method === 'POST' && c.url === '/api/v1/enabled-images/refresh',
       );
       expect(posts.length).toBe(1);
       expect(JSON.parse(posts[0].body!)).toEqual({

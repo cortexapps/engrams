@@ -16,7 +16,7 @@
 #   PROMPT='hi' HARNESS=claude bash deploy/dev/integration-session.sh
 #
 # Cleanup: `just dev-down` reaps the session along with everything
-# else; or curl -X DELETE $COORD/sessions/$SID directly.
+# else; or curl -X DELETE $COORD/api/v1/sessions/$SID directly.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -41,7 +41,7 @@ LOCAL_REGISTRY="localhost:5001"
 IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 # Already enabled?
-already_enabled=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/enabled-images" \
+already_enabled=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enabled-images" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('image_uri')=='$IMAGE_URI' for i in d.get('images',[])))" 2>/dev/null || echo False)
 
 if [ "$already_enabled" = "True" ]; then
@@ -68,7 +68,7 @@ else
     curl -fsS -X POST "${AUTH_HEADER[@]}" \
         -H "Content-Type: application/json" \
         -d "$ENABLE_BODY" \
-        "$COORD/api/enabled-images" \
+        "$COORD/api/v1/enabled-images" \
         >/dev/null
 fi
 
@@ -77,7 +77,7 @@ fi
 # row doesn't carry a label field, so we filter by image+status and
 # pick the most recent. Best-effort: stale rows from prior runs are
 # possible if `just dev-down` didn't reap.
-existing_sid=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/sessions" 2>/dev/null \
+existing_sid=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/sessions" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -116,7 +116,7 @@ print(json.dumps({
     SESS_RESP=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
         -H "Content-Type: application/json" \
         -d "$SESS_BODY" \
-        "$COORD/sessions")
+        "$COORD/api/v1/sessions")
     SID=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("session_id","?"))')
     KIND=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kind","?"))')
     echo "    session_id=$SID  kind=$KIND"
@@ -126,7 +126,7 @@ echo ""
 echo "✓ session $SID is live — iterate:"
 echo ""
 echo "  # exec a one-shot command"
-echo "  curl -s -XPOST $COORD/sessions/$SID/exec \\"
+echo "  curl -s -XPOST $COORD/api/v1/sessions/$SID/exec \\"
 echo "    -H 'Content-Type: application/json' \\"
 echo "    -d '{\"command\":\"ls /\"}' | jq ."
 echo ""
@@ -134,7 +134,7 @@ echo "  # open the shell (browser, after port-forwarding)"
 echo "  open http://localhost:5173/sessions/$SID"
 echo ""
 echo "  # raw events"
-echo "  curl -s $COORD/sessions/$SID/events | tail"
+echo "  curl -s $COORD/api/v1/sessions/$SID/events | tail"
 echo ""
 echo "  # tear down"
-echo "  curl -s -XDELETE $COORD/sessions/$SID"
+echo "  curl -s -XDELETE $COORD/api/v1/sessions/$SID"

@@ -3,11 +3,11 @@
 //! Five functions that match the five new coord HTTP endpoints
 //! (`engram_coordinator::api::host_http`):
 //!
-//!   - `register` — POST /api/hosts/register, once at startup
-//!   - `heartbeat` — POST /api/hosts/:id/heartbeat, every 5s
-//!   - `resolve_registry_auth` — POST /api/hosts/:id/auth/resolve-registry
-//!   - `harness_event` — POST /sessions/:session_id/harness-events
-//!   - `idle_eviction_candidates` — POST /api/hosts/:id/idle-eviction-candidates
+//!   - `register` — POST /api/v1/hosts/register, once at startup
+//!   - `heartbeat` — POST /api/v1/hosts/:id/heartbeat, every 5s
+//!   - `resolve_registry_auth` — POST /api/v1/hosts/:id/auth/resolve-registry
+//!   - `harness_event` — POST /api/v1/sessions/:session_id/harness-events
+//!   - `idle_eviction_candidates` — POST /api/v1/hosts/:id/idle-eviction-candidates
 //!
 //! The functions exist standalone (dark) in this commit so the
 //! cutover commit can wire them into the dialer / event sink /
@@ -94,8 +94,11 @@ impl CoordClient {
         }
     }
 
+    /// All coord HTTP routes live under the `/api/v1` prefix (the SPA
+    /// owns the root path namespace). `path` is the route below that
+    /// prefix, e.g. `/hosts/register` or `/sessions/:id/harness-events`.
     fn endpoint(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+        format!("{}/api/v1{}", self.base_url, path)
     }
 
     fn auth<R: serde::Serialize>(
@@ -111,12 +114,12 @@ impl CoordClient {
         }
     }
 
-    /// POST /api/hosts/register
+    /// POST /api/v1/hosts/register
     pub async fn register(
         &self,
         req: &RegisterRequest,
     ) -> Result<RegisterResponse, CoordClientError> {
-        let url = self.endpoint("/api/hosts/register");
+        let url = self.endpoint("/hosts/register");
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
@@ -126,13 +129,13 @@ impl CoordClient {
         decode_json(resp, "register").await
     }
 
-    /// POST /api/hosts/:id/heartbeat
+    /// POST /api/v1/hosts/:id/heartbeat
     pub async fn heartbeat(
         &self,
         host_id: HostId,
         req: &HeartbeatRequest,
     ) -> Result<HeartbeatResponse, CoordClientError> {
-        let url = self.endpoint(&format!("/api/hosts/{host_id}/heartbeat"));
+        let url = self.endpoint(&format!("/hosts/{host_id}/heartbeat"));
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
@@ -142,13 +145,13 @@ impl CoordClient {
         decode_json(resp, "heartbeat").await
     }
 
-    /// POST /api/hosts/:id/auth/resolve-registry
+    /// POST /api/v1/hosts/:id/auth/resolve-registry
     pub async fn resolve_registry_auth(
         &self,
         host_id: HostId,
         registry_host: &str,
     ) -> Result<ResolveRegistryAuthResponse, CoordClientError> {
-        let url = self.endpoint(&format!("/api/hosts/{host_id}/auth/resolve-registry"));
+        let url = self.endpoint(&format!("/hosts/{host_id}/auth/resolve-registry"));
         let body = ResolveRegistryAuthRequest {
             registry_host: registry_host.to_string(),
         };
@@ -161,7 +164,7 @@ impl CoordClient {
         decode_json(resp, "resolve_registry_auth").await
     }
 
-    /// POST /sessions/:session_id/harness-events
+    /// POST /api/v1/sessions/:session_id/harness-events
     pub async fn harness_event(
         &self,
         session_id: SessionId,
@@ -184,7 +187,7 @@ impl CoordClient {
         Ok(())
     }
 
-    /// POST /api/hosts/forge
+    /// POST /api/v1/hosts/forge
     ///
     /// ADR 0023 split-mode forge forwarding. The host-agent reads the
     /// in-guest `ForgeRequest` off the forge vsock stream and proxies it
@@ -194,7 +197,7 @@ impl CoordClient {
     /// API error) comes back inside `ForgeResponse::Error` with a 200, so
     /// the guest helper always gets a usable reply.
     pub async fn forge(&self, req: &ForgeRequest) -> Result<ForgeResponse, CoordClientError> {
-        let url = self.endpoint("/api/hosts/forge");
+        let url = self.endpoint("/hosts/forge");
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
@@ -204,7 +207,7 @@ impl CoordClient {
         decode_json(resp, "forge").await
     }
 
-    /// POST /api/hosts/upload
+    /// POST /api/v1/hosts/upload
     ///
     /// ADR 0026 split-mode artifact forwarding. The host-agent reads the
     /// in-guest `UploadRequest` header off the upload vsock stream, then
@@ -224,7 +227,7 @@ impl CoordClient {
     where
         R: tokio::io::AsyncRead + Send + 'static,
     {
-        let url = self.endpoint("/api/hosts/upload");
+        let url = self.endpoint("/hosts/upload");
         let encoded = base64::engine::general_purpose::STANDARD.encode(
             bincode::serialize(header).map_err(|e| CoordClientError::Decode {
                 error: e.to_string(),
@@ -248,7 +251,7 @@ impl CoordClient {
         decode_json(resp, "upload_artifact").await
     }
 
-    /// POST /api/hosts/:id/live-manifest
+    /// POST /api/v1/hosts/:id/live-manifest
     ///
     /// ADR 0016 Phase B: tells coord that the host just flushed
     /// `(sandbox_id, manifest_ref)` so `sessions.live_disk_manifest_*`
@@ -265,7 +268,7 @@ impl CoordClient {
         host_id: HostId,
         req: &LiveManifestPublishRequest,
     ) -> Result<LiveManifestPublishResponse, CoordClientError> {
-        let url = self.endpoint(&format!("/api/hosts/{host_id}/live-manifest"));
+        let url = self.endpoint(&format!("/hosts/{host_id}/live-manifest"));
         let builder = self.http.post(&url);
         let resp = match self.auth(builder, req).send().await {
             Ok(r) => r,
@@ -289,13 +292,13 @@ impl CoordClient {
         decode_json(resp, "publish_live_manifest").await
     }
 
-    /// POST /api/hosts/:id/idle-eviction-candidates
+    /// POST /api/v1/hosts/:id/idle-eviction-candidates
     pub async fn push_idle_eviction_candidates(
         &self,
         host_id: HostId,
         candidates: Vec<IdleCandidate>,
     ) -> Result<IdleEvictionCandidatesResponse, CoordClientError> {
-        let url = self.endpoint(&format!("/api/hosts/{host_id}/idle-eviction-candidates"));
+        let url = self.endpoint(&format!("/hosts/{host_id}/idle-eviction-candidates"));
         let body = IdleEvictionCandidatesRequest { candidates };
         // ADR 0016 §A.1.5a: per-request 120s timeout overrides the
         // shared client's 30s default. Coord-side `evict_idle_session`

@@ -94,7 +94,7 @@ T0=$(date +%s.%N)
 curl -fsS -X POST "${AUTH_HEADER[@]}" \
     -H "Content-Type: application/json" \
     -d "$ENABLE_BODY" \
-    "$COORD/api/enabled-images" \
+    "$COORD/api/v1/enabled-images" \
     >/dev/null
 T1=$(date +%s.%N)
 log "    enable elapsed: $(echo "$T1 - $T0" | bc)s"
@@ -106,7 +106,7 @@ log "==> step 3/3: poll /api/hosts until this image's digest is ready"
 # image's manifest_digest (each bake produces a unique one) to
 # appear in some host's ready_image_digests, not just for the
 # count to be >= 1 — a prior run's image may already be ready.
-EXPECTED_DIGEST=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/enabled-images" \
+EXPECTED_DIGEST=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enabled-images" \
     | python3 -c "import sys,json; rows = json.load(sys.stdin).get('images', []); print(next((r['manifest_digest'] for r in rows if r['image_uri']=='$IMAGE_URI'), ''))")
 if [ -z "$EXPECTED_DIGEST" ]; then
     log "ERROR: couldn't read manifest_digest from /api/enabled-images"
@@ -116,7 +116,7 @@ log "    waiting for digest: $EXPECTED_DIGEST"
 DEADLINE=$(( $(date +%s) + READY_DEADLINE_SECS ))
 T0=$(date +%s.%N)
 while :; do
-    READY=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/hosts" \
+    READY=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/hosts" \
         | python3 -c "import sys,json; rows = json.load(sys.stdin).get('hosts', []); digests = {d for r in rows for d in r.get('ready_image_digests', [])}; print('yes' if '$EXPECTED_DIGEST' in digests else 'no')")
     if [ "$READY" = "yes" ]; then
         T1=$(date +%s.%N)

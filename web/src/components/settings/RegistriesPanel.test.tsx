@@ -37,13 +37,13 @@ function installFetchMock(): ReturnType<typeof vi.spyOn> {
             ? input.toString()
             : (input as Request).url;
       const method = init?.method ?? 'GET';
-    if (url === '/api/registries' && method === 'GET') {
+    if (url === '/api/v1/registries' && method === 'GET') {
       return new Response(JSON.stringify({ registries: [] }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
     }
-    if (url === '/api/registries' && method === 'POST') {
+    if (url === '/api/v1/registries' && method === 'POST') {
       return new Response(
         JSON.stringify({
           id: '00000000-0000-0000-0000-000000000000',

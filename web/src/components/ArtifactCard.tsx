@@ -1,5 +1,7 @@
 import { motion } from 'framer-motion';
 
+import { API_BASE } from '../api';
+
 // A file artifact shared from inside the session (ADR 0026) — an agent
 // screenshot/recording, or an operator file pull. Like the PR card it's
 // a durable thing the session hands back, so it earns a framed notice
@@ -28,7 +30,7 @@ export function ArtifactCard({
 }: ArtifactCardProps) {
   // Same-origin; the browser carries the IAP cookie (prod) / Vite proxy
   // (dev). No bearer needed for a passive <img>/<video> GET.
-  const src = `/sessions/${sessionId}/artifacts/${artifactId}`;
+  const src = `${API_BASE}/sessions/${sessionId}/artifacts/${artifactId}`;
   const isImage = mediaType.startsWith('image/');
   const isVideo = mediaType.startsWith('video/');
 

@@ -39,7 +39,7 @@ note "checking coord reachability"
 curl -fsS "$COORD_URL/healthz" >/dev/null || die "coord unreachable at $COORD_URL"
 
 note "checking host count (expect ≥ 2 for evac to actually relocate)"
-HOSTS_JSON=$(curl -fsS "$COORD_URL/api/hosts")
+HOSTS_JSON=$(curl -fsS "$COORD_URL/api/v1/hosts")
 HOST_COUNT=$(echo "$HOSTS_JSON" | grep -o '"hostname"' | wc -l | tr -d ' ')
 if [ "$HOST_COUNT" -lt 2 ]; then
     die "only $HOST_COUNT host(s) registered. Restart with ENGRAM_INTEG_TWO_HOSTS=1 just dev."
@@ -56,7 +56,7 @@ CREATE_BODY=$(cat <<JSON
 JSON
 )
 CREATE_RESP=$(curl -fsS -X POST -H 'content-type: application/json' \
-    -d "$CREATE_BODY" "$COORD_URL/sessions")
+    -d "$CREATE_BODY" "$COORD_URL/api/v1/sessions")
 SESSION_ID=$(echo "$CREATE_RESP" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)
 [ -n "$SESSION_ID" ] || die "couldn't parse session_id from create response: $CREATE_RESP"
 ok "session $SESSION_ID created"
@@ -65,7 +65,7 @@ ok "session $SESSION_ID created"
 sleep 2
 
 note "fetching pre-evac session row"
-SESSION_BEFORE=$(curl -fsS "$COORD_URL/sessions/$SESSION_ID")
+SESSION_BEFORE=$(curl -fsS "$COORD_URL/api/v1/sessions/$SESSION_ID")
 HOST_BEFORE=$(echo "$SESSION_BEFORE" | grep -o '"host_id":"[^"]*"' | head -1 | cut -d'"' -f4)
 SANDBOX_BEFORE=$(echo "$SESSION_BEFORE" | grep -o '"sandbox_id":"[^"]*"' | head -1 | cut -d'"' -f4)
 STATUS_BEFORE=$(echo "$SESSION_BEFORE" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -77,13 +77,13 @@ note "writing canary file inside guest"
 EXEC_PAYLOAD='dd if=/dev/urandom of=/var/evac-canary.bin bs=64K count=4 status=none && sync && md5sum /var/evac-canary.bin'
 EXEC_RESP=$(curl -fsS -X POST -H 'content-type: application/json' \
     -d "{\"argv\":[\"sh\",\"-c\",\"$EXEC_PAYLOAD\"]}" \
-    "$COORD_URL/sessions/$SESSION_ID/exec")
+    "$COORD_URL/api/v1/sessions/$SESSION_ID/exec")
 MD5_BEFORE=$(echo "$EXEC_RESP" | grep -o '[0-9a-f]\{32\}' | head -1)
 [ -n "$MD5_BEFORE" ] || die "couldn't parse md5 from exec output: $EXEC_RESP"
 ok "canary md5 before: $MD5_BEFORE"
 
 note "forcing flush so live_disk_manifest is published before evac"
-curl -fsS -X POST -H 'authorization: Bearer dev' "$COORD_URL/api/admin/sessions/$SESSION_ID/flush-now" \
+curl -fsS -X POST -H 'authorization: Bearer dev' "$COORD_URL/api/v1/admin/sessions/$SESSION_ID/flush-now" \
     -d '{}' -H 'content-type: application/json' >/dev/null || die "flush-now failed"
 
 # --- step 4: evacuate (async shape, ADR 0018 commit 12) -------------
@@ -91,7 +91,7 @@ note "triggering admin evacuate (async — handler returns 202; scanner resumes 
 HTTP_RESP=$(curl -fsS -X POST -H 'authorization: Bearer dev' \
     -H 'content-type: application/json' -d '{}' \
     -w '\n%{http_code}' \
-    "$COORD_URL/api/admin/sessions/$SESSION_ID/evacuate")
+    "$COORD_URL/api/v1/admin/sessions/$SESSION_ID/evacuate")
 HTTP_CODE=$(echo "$HTTP_RESP" | tail -1)
 EVAC_BODY=$(echo "$HTTP_RESP" | head -n -1)
 [ "$HTTP_CODE" = "202" ] || die "expected 202 Accepted, got $HTTP_CODE body=$EVAC_BODY"
@@ -108,7 +108,7 @@ note "polling session state until Active on new host (scanner-driven)"
 ACTIVE_AT=""
 SAW_EVACUATING=0
 for _ in $(seq 1 120); do
-    SESSION_AFTER=$(curl -fsS "$COORD_URL/sessions/$SESSION_ID")
+    SESSION_AFTER=$(curl -fsS "$COORD_URL/api/v1/sessions/$SESSION_ID")
     STATUS_AFTER=$(echo "$SESSION_AFTER" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
     if [ "$STATUS_AFTER" = "evacuating" ]; then
         SAW_EVACUATING=1
@@ -131,7 +131,7 @@ ok "post-evac: host=$HOST_AFTER sandbox=$SANDBOX_AFTER status=active"
 note "re-reading canary on the new host"
 EXEC_AFTER=$(curl -fsS -X POST -H 'content-type: application/json' \
     -d '{"argv":["sh","-c","md5sum /var/evac-canary.bin"]}' \
-    "$COORD_URL/sessions/$SESSION_ID/exec")
+    "$COORD_URL/api/v1/sessions/$SESSION_ID/exec")
 MD5_AFTER=$(echo "$EXEC_AFTER" | grep -o '[0-9a-f]\{32\}' | head -1)
 [ -n "$MD5_AFTER" ] || die "couldn't parse md5 on new host: $EXEC_AFTER"
 ok "canary md5 after:  $MD5_AFTER"
@@ -144,5 +144,5 @@ fi
 
 # --- cleanup --------------------------------------------------------
 note "deleting test session"
-curl -fsS -X DELETE "$COORD_URL/sessions/$SESSION_ID" >/dev/null || true
+curl -fsS -X DELETE "$COORD_URL/api/v1/sessions/$SESSION_ID" >/dev/null || true
 ok "done"

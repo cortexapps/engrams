@@ -42,32 +42,20 @@ data:
         return 200 "ok\n";
       }
 
-      # SPA: every unknown path falls through to index.html so
-      # client-side routing handles it.
-      #
-      # ADR 0026: a dashboard-wide Content-Security-Policy (defense in
-      # depth for the whole SPA, incl. agent-shared artifacts rendered
-      # inline). Artifacts are served same-origin under /sessions/... so
-      # `img-src`/`media-src 'self'` covers them; `object-src`/
-      # `frame-ancestors 'none'` block embeds + clickjacking. This is the
-      # SPA's own CSP only — the coord sets a stricter `sandbox` CSP on
-      # each artifact response itself (proxied via the location below,
-      # untouched here).
-      location / {
-        add_header Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
-        add_header X-Content-Type-Options "nosniff" always;
-        try_files $uri $uri/ /index.html;
-      }
-
-      # Coord API. WS upgrade headers carried through so /v1/control
-      # works; proxy_buffering off so SSE on /v1/events streams.
+      # Coord API. The entire coord HTTP surface (REST + SSE + the
+      # /shell WebSocket) lives under /api/v1, so this prefix match
+      # claims it and nothing else. The SPA owns every other path.
+      # Matched BEFORE `location /` because a prefix `location` with a
+      # longer match wins over `/`. WS upgrade headers carried through
+      # so the shell works; proxy_buffering off so the SSE event stream
+      # flushes incrementally.
       #
       # Bearer auth: the browser carries the IAP cookie (authenticated
       # at the public LB) but no coord bearer. We stamp it here from
       # an env var rendered by the nginx-alpine envsubst entrypoint —
       # see web-deployment.yaml for the secret wiring. The {{`${...}`}}
       # form survives Helm rendering and is substituted at pod start.
-      location ~ ^/(v1|api|events|sessions)(/|$) {
+      location /api/ {
         proxy_pass http://engram_coord;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -81,6 +69,25 @@ data:
         {{- end }}
         proxy_buffering off;
         proxy_read_timeout 3600s;
+      }
+
+      # SPA: every path the /api/ proxy didn't claim falls through to
+      # index.html so client-side routing handles it — crucially a
+      # browser deep-link / refresh on /sessions/:id now serves the app
+      # shell instead of proxying to the coord's API.
+      #
+      # ADR 0026: a dashboard-wide Content-Security-Policy (defense in
+      # depth for the whole SPA, incl. agent-shared artifacts rendered
+      # inline). Artifacts are served same-origin under
+      # /api/v1/sessions/... so `img-src`/`media-src 'self'` covers them;
+      # `object-src`/`frame-ancestors 'none'` block embeds + clickjacking.
+      # This is the SPA's own CSP only — the coord sets a stricter
+      # `sandbox` CSP on each artifact response itself (proxied via the
+      # /api/ location above, untouched here).
+      location / {
+        add_header Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        try_files $uri $uri/ /index.html;
       }
     }
 {{- end -}}

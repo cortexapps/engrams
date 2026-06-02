@@ -45,7 +45,7 @@ function installFetchMock() {
             : (input as Request).url;
       const method = init?.method ?? 'GET';
 
-      if (url === '/api/enabled-images' && method === 'GET') {
+      if (url === '/api/v1/enabled-images' && method === 'GET') {
         return new Response(JSON.stringify({ images: [ENABLED_IMAGE] }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -54,7 +54,7 @@ function installFetchMock() {
       // ADR 0021 P1.5a: the `/api/harnesses` endpoint doesn't exist
       // anymore. The form no longer hits it; the test only mocks
       // `/api/enabled-images` + `/sessions`.
-      if (url === '/sessions' && method === 'POST') {
+      if (url === '/api/v1/sessions' && method === 'POST') {
         return new Response(
           JSON.stringify({
             session_id: '00000000-0000-0000-0000-000000000000',
@@ -104,8 +104,8 @@ describe('NewSessionForm wire contract', () => {
     await waitFor(() => {
       const gets = mock.callsMatching((c) => c.method === 'GET');
       const urls = gets.map((c) => c.url);
-      expect(urls).toContain('/api/enabled-images');
-      expect(urls).not.toContain('/api/images');
+      expect(urls).toContain('/api/v1/enabled-images');
+      expect(urls).not.toContain('/api/v1/images');
     });
   });
 
@@ -139,7 +139,7 @@ describe('NewSessionForm wire contract', () => {
 
     await waitFor(() => {
       const posts = mock.callsMatching(
-        (c) => c.method === 'POST' && c.url === '/sessions',
+        (c) => c.method === 'POST' && c.url === '/api/v1/sessions',
       );
       expect(posts.length).toBe(1);
       const body = JSON.parse(posts[0].body!);

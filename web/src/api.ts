@@ -14,13 +14,17 @@ import type {
   SessionMode,
 } from './types';
 
-// Same-origin in dev (Vite proxy → :8090). In a hosted prod build,
-// the SPA must run behind something that proxies these paths; we don't
-// support cross-origin auth here.
-const BASE = '';
+// Every coordinator HTTP route lives under `/api/v1`. The SPA owns the
+// root path namespace (`/`, `/sessions/:id`, `/settings/...`), so a
+// browser deep-link to `/sessions/:id` resolves to index.html (the
+// reverse proxy proxies only `/api/` to the coord) instead of colliding
+// with the `GET /sessions/:id` API route. Same-origin in dev (Vite
+// proxy → :8090) and prod (nginx). Exported so the SSE/WS/artifact
+// helpers build on the same base.
+export const API_BASE = '/api/v1';
 
 async function getJSON<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { Accept: 'application/json' },
   });
   if (!res.ok) {
@@ -30,7 +34,7 @@ async function getJSON<T>(path: string): Promise<T> {
 }
 
 async function postJSON<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
@@ -52,7 +56,7 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function deleteEmpty(path: string): Promise<void> {
-  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' });
+  const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
   if (!res.ok) {
     let detail = '';
     try {
@@ -68,7 +72,7 @@ export const fetchSessions = () =>
   getJSON<ListSessionsResponse>('/sessions').then((r) => r.sessions);
 
 export const fetchHosts = () =>
-  getJSON<ListHostsResponse>('/api/hosts').then((r) => r.hosts);
+  getJSON<ListHostsResponse>('/hosts').then((r) => r.hosts);
 
 export const fetchSession = (id: string) =>
   getJSON<Session>(`/sessions/${id}`);
@@ -77,7 +81,7 @@ export const fetchSession = (id: string) =>
 
 /** Per-host COW snapshot. One row per chunk-tracked sandbox. */
 export const fetchHostCowState = (hostId: string) =>
-  getJSON<HostCowStateResponse>(`/api/hosts/${hostId}/cow-state`);
+  getJSON<HostCowStateResponse>(`/hosts/${hostId}/cow-state`);
 
 /** Per-session COW snapshot. `state` is `null` when the session has
  * no live sandbox (Idle / HostLost / Pending / terminal). */
@@ -112,13 +116,13 @@ export const sendPrompt = (sessionId: string, text: string) =>
 // ---- Settings · Registries ---------------------------------------------
 
 export const fetchRegistries = () =>
-  getJSON<ListRegistriesResponse>('/api/registries').then((r) => r.registries);
+  getJSON<ListRegistriesResponse>('/registries').then((r) => r.registries);
 
 export const addRegistry = (req: AddRegistryRequest) =>
-  postJSON<AddRegistryResponse>('/api/registries', req);
+  postJSON<AddRegistryResponse>('/registries', req);
 
 export const deleteRegistry = (host: string) =>
-  deleteEmpty(`/api/registries/${encodeURIComponent(host)}`);
+  deleteEmpty(`/registries/${encodeURIComponent(host)}`);
 
 // ADR 0021 P1.5a retired `fetchHarnessPacks` / `addHarnessPack` /
 // `deleteHarnessPack` with the rest of the `/api/harnesses` surface.
@@ -129,19 +133,19 @@ export const deleteRegistry = (host: string) =>
 // segments; the coordinator takes them in the body for write paths.
 
 export const fetchEnabledImages = () =>
-  getJSON<ListEnabledImagesResponse>('/api/enabled-images').then(
+  getJSON<ListEnabledImagesResponse>('/enabled-images').then(
     (r) => r.images,
   );
 
 export const enableImage = (imageUri: string) =>
-  postJSON<EnabledImageSummary>('/api/enabled-images', {
+  postJSON<EnabledImageSummary>('/enabled-images', {
     image_uri: imageUri,
   });
 
 export const disableImage = (imageUri: string) =>
-  postJSON<void>('/api/enabled-images/disable', { image_uri: imageUri });
+  postJSON<void>('/enabled-images/disable', { image_uri: imageUri });
 
 export const refreshEnabledImage = (imageUri: string) =>
-  postJSON<EnabledImageSummary>('/api/enabled-images/refresh', {
+  postJSON<EnabledImageSummary>('/enabled-images/refresh', {
     image_uri: imageUri,
   });
