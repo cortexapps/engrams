@@ -332,36 +332,36 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
     assert!(matches!(calls[3], Call::RmContainer { .. }));
     assert!(matches!(calls[4], Call::Rmi { .. }));
 
-    // No [git] binding → no forge glue injected.
+    // ADR 0027: the baker no longer plants ANY skill glue — neither the
+    // share-file wrapper/skill nor the forge glue. Delivery moved to the
+    // fleet-wide `skills` RO bundle, activated per-session by agentd (see
+    // `engram-session-bundles`). The rootfs must be clean of all of it.
     assert!(!outcome.rootfs_path.join("opt/engram/git-askpass").exists());
     assert!(!outcome.rootfs_path.join("usr/local/bin/engram-pr").exists());
-
-    // ADR 0026: the artifact-share seam IS baked for every image (not
-    // git-gated) — even this no-`[git]` image gets `engram-share` + the
-    // share-file skill + the Claude Code skills symlink.
     assert!(
-        outcome
+        !outcome
             .rootfs_path
             .join("usr/local/bin/engram-share")
-            .is_file(),
-        "engram-share present without [git]"
+            .exists(),
+        "ADR 0027: engram-share must NOT be baked — it ships in the skills bundle"
     );
     assert!(
-        outcome
-            .rootfs_path
-            .join("root/.agents/skills/share-file/SKILL.md")
-            .is_file(),
-        "share-file skill present without [git]"
+        !outcome.rootfs_path.join("root/.agents/skills").exists(),
+        "ADR 0027: no skills baked into the rootfs"
     );
-    let target = std::fs::read_link(outcome.rootfs_path.join("root/.claude/skills")).unwrap();
-    assert_eq!(target, std::path::Path::new("/root/.agents/skills"));
+    assert!(
+        !outcome.rootfs_path.join("root/.claude/skills").exists(),
+        "ADR 0027: no skills symlink baked into the rootfs"
+    );
 }
 
 #[tokio::test]
-async fn build_injects_forge_helpers_for_git_images() {
-    // ADR 0023: a `[git]` binding makes the baker plant the forge-seam
-    // client glue (askpass + engram-pr + git config + the built-in skill)
-    // into the rootfs — no per-image Dockerfile glue.
+async fn build_does_not_bake_forge_glue_for_git_images() {
+    // ADR 0027: a `[git]` binding no longer makes the baker plant forge
+    // glue (askpass / engram-pr / gitconfig / create-pull-request skill).
+    // The skills bundle carries the wrappers + SKILL.md; agentd writes
+    // /etc/gitconfig and symlinks the create-pull-request skill per-session
+    // when a forge token is present. The baked rootfs stays clean.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     write_source_repo(
@@ -379,29 +379,21 @@ async fn build_injects_forge_helpers_for_git_images() {
     let rootfs = &outcome.rootfs_path;
 
     assert!(
-        rootfs.join("opt/engram/git-askpass").is_file(),
-        "git-askpass"
+        !rootfs.join("opt/engram/git-askpass").exists(),
+        "ADR 0027: git-askpass must NOT be baked"
     );
     assert!(
-        rootfs.join("usr/local/bin/engram-pr").is_file(),
-        "engram-pr"
+        !rootfs.join("usr/local/bin/engram-pr").exists(),
+        "ADR 0027: engram-pr must NOT be baked"
     );
-    assert!(rootfs.join("etc/gitconfig").is_file(), "forge gitconfig");
     assert!(
-        rootfs
-            .join("root/.agents/skills/create-pull-request/SKILL.md")
-            .is_file(),
-        "create-pull-request skill",
+        !rootfs.join("etc/gitconfig").exists(),
+        "ADR 0027: gitconfig is written by agentd at session bind, not baked"
     );
-    // gitconfig wires the askpass; skill teaches engram-pr.
-    let cfg = std::fs::read_to_string(rootfs.join("etc/gitconfig")).unwrap();
     assert!(
-        cfg.contains("askPass = /opt/engram/git-askpass"),
-        "got {cfg:?}"
+        !rootfs.join("root/.agents/skills").exists(),
+        "ADR 0027: no skills baked into the rootfs"
     );
-    // Claude Code loader dir points at the harness-agnostic skills dir.
-    let target = std::fs::read_link(rootfs.join("root/.claude/skills")).unwrap();
-    assert_eq!(target, std::path::Path::new("/root/.agents/skills"));
 }
 
 #[tokio::test]
