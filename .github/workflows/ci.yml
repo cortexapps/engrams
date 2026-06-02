@@ -467,14 +467,14 @@ jobs:
       # total). Without the cache, every CI run pays a ~19 min
       # download from `spec.ccfc.min` (Firecracker's S3 bucket).
       #
-      # On Blacksmith runners, actions/cache@v4 transparently uses
+      # On Blacksmith runners, actions/cache@v5 transparently uses
       # Blacksmith's colocated cache — see
       # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
       # No useblacksmith/* fork needed (those are archived). The
       # cache key hashes the fetch script content, so bumping
       # either URL (kernel or rootfs version) invalidates cleanly.
       - name: Cache FC kernel + rootfs artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/engram-fc-test
           key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
@@ -529,7 +529,7 @@ jobs:
       # tolerates whatever version is in the cache and only
       # re-downloads when the cache misses.
       - name: Cache Claude Code CLI
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/engram-e2e-harness
           # Refresh every ~week — gives some staleness so we
@@ -804,7 +804,7 @@ jobs:
       # Always runs so the artifact exists regardless of whether the
       # GHCR push below ran.
       - name: Upload staged harness as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harness-claude-artifact
           path: ${{ steps.stage.outputs.dir }}
@@ -821,7 +821,7 @@ jobs:
       # demo-claude consumers, future ones) see the same artifact.
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -964,7 +964,7 @@ jobs:
           cp deploy/${{ matrix.variant }}/engram.toml var/${{ matrix.variant }}/
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1113,7 +1113,7 @@ jobs:
               -p engram-agentd
 
       - name: Upload e2e binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-binaries
           path: |
@@ -1238,7 +1238,7 @@ jobs:
           firecracker --version
 
       - name: Cache FC kernel + rootfs artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/engram-fc-test
           key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
@@ -1267,14 +1267,14 @@ jobs:
       # makes the order unambiguous: nothing can prune what hasn't
       # been written yet.
       #
-      # actions/upload-artifact@v4 strips the longest common path
+      # actions/upload-artifact@v7 strips the longest common path
       # prefix shared by all `path:` entries when packing — for the
       # artifacts-e2e-stack upload that's `target/`, so the artifact
       # contents are flattened to `release/...` +
       # `x86_64-unknown-linux-musl/release/...`. Downloading directly
       # into `./target/` reconstructs the expected layout in place.
       - name: Download e2e binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: e2e-binaries
           path: ./target/
@@ -1376,15 +1376,15 @@ jobs:
         # ↑ ensure target exists for download-artifact's path: arg.
 
       - name: Download harness-claude workflow artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: harness-claude-artifact
           path: var/harness-claude-stage
 
       - name: Restore +x on staged binaries
         run: |
-          # actions/upload-artifact@v4 zips the staged directory and
-          # actions/download-artifact@v4 unzips it — the ZIP format
+          # actions/upload-artifact@v7 zips the staged directory and
+          # actions/download-artifact@v8 unzips it — the ZIP format
           # only carries Unix mode bits as a non-standard extension
           # that some unzip implementations drop. Without this, the
           # baker happily packs the harness into the rootfs as

@@ -110,7 +110,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -119,7 +119,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Derive tags
         id: tags
@@ -140,7 +140,7 @@ jobs:
           { echo 'list<<EOF'; cat /tmp/tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Build + push ${{ matrix.image }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/${{ matrix.image }}.Dockerfile
@@ -223,13 +223,13 @@ jobs:
           file dist/engram-host-agent dist/engram-uffd-handler
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish musl binaries to GHCR (oras)
         working-directory: dist
@@ -288,13 +288,13 @@ jobs:
           ls -l dist/
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish bundles to GHCR (oras)
         working-directory: dist
