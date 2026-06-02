@@ -91,24 +91,24 @@ pub struct ImageManifest {
     pub git: Option<GitConfig>,
 
     /// Opt-in browser tooling (ADR 0027). When `enabled`, sessions of this
-    /// image get the read-only `playwright` bundle (chromium-headless-shell
-    /// with the `@playwright/mcp` server) attached as an aux RO drive at
-    /// base-snapshot capture, and agentd wires the `playwright` MCP server
-    /// and `record-demo` skill at session bind. Also raises the memory floor
-    /// (the headless browser needs ~250-400 MB). Off by default — most images
-    /// never open a browser, and the bundle is glibc-linked (musl/alpine
-    /// bases can't use it).
+    /// image get the read-only `playwright` bundle (chromium-headless-shell +
+    /// the `@playwright/cli` browser-automation CLI) attached as an aux RO
+    /// drive at base-snapshot capture, and agentd puts the `playwright-cli`
+    /// wrapper on PATH + wires the `show-your-work` skill at session bind.
+    /// Also raises the memory floor (the headless browser needs ~250-400 MB).
+    /// Off by default — most images never open a browser, and the bundle is
+    /// glibc-linked (musl/alpine bases can't use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserConfig>,
 }
 
 /// Browser-tooling binding for an image (ADR 0027). Gates the opt-in
-/// `playwright` RO bundle + MCP wiring.
+/// `playwright` RO bundle (chromium-headless-shell + `@playwright/cli`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserConfig {
     /// `[browser] enabled = true` attaches the playwright bundle and wires
-    /// the `@playwright/mcp` server for this image's sessions.
+    /// the `playwright-cli` + `show-your-work` skill for this image's sessions.
     pub enabled: bool,
 }
 

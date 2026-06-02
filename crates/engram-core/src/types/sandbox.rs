@@ -53,14 +53,14 @@ pub struct SandboxSpec {
     #[serde(default)]
     pub network: NetworkPolicy,
     /// ADR 0027: extra read-only host-mounted bundles attached as
-    /// virtio-blk drives — the RO-mount skills/MCP engine ADR 0023
+    /// virtio-blk drives — the RO-mount skills/browser engine ADR 0023
     /// deferred. Each entry is a fleet-wide, content-addressed host
     /// asset at a canonical path identical on every host (a stable
     /// symlink), so a snapshot that embeds the path re-anchors on
     /// restore by mere presence — no `patch_drive`. First two
     /// consumers: the always-attached `skills` bundle (the relocated
     /// built-in skill helpers) and the opt-in `playwright` bundle
-    /// (chromium-headless-shell + `@playwright/mcp`).
+    /// (chromium-headless-shell + `@playwright/cli`).
     ///
     /// `#[serde(default)]` covers the legacy-snapshot JSON path (older
     /// sidecars predate this field); the coord ↔ host-agent bincode
@@ -72,7 +72,7 @@ pub struct SandboxSpec {
 
 /// A read-only bundle the host attaches to the guest as an additional
 /// virtio-blk drive (ADR 0027). The guest's init shim RO-mounts it at
-/// [`Self::guest_mount`]; agentd then wires whatever skills/MCP the
+/// [`Self::guest_mount`]; agentd then wires whatever skills/tools the
 /// bundle carries into the harness at `SpawnHarness` time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxRoDrive {
@@ -110,8 +110,9 @@ impl AuxRoDrive {
     }
 
     /// The opt-in `playwright` bundle: chromium-headless-shell + Node +
-    /// `@playwright/mcp` + deps. Mounted at `/opt/engram/browser`; agentd
-    /// wires the `playwright` MCP + `record-demo` skill when present.
+    /// `@playwright/cli` + deps. Mounted at `/opt/engram/browser`; agentd
+    /// puts the `playwright-cli` wrapper on PATH + wires the `show-your-work`
+    /// skill when present.
     pub fn playwright() -> Self {
         Self {
             drive_id: "playwright".into(),

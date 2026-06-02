@@ -1,10 +1,10 @@
 //! ADR 0027: activate read-only host-mounted bundles into the harness's
-//! skill/MCP discovery paths.
+//! skill discovery paths.
 //!
 //! The init shim RO-mounts the fleet-wide `skills` and (opt-in)
 //! `playwright` squashfs bundles at `/opt/engram/skills` and
 //! `/opt/engram/browser`. Those bundles are *static* — the same on every
-//! host. What's *dynamic* is which skills/MCP a given session gets, and
+//! host. What's *dynamic* is which skills/tools a given session gets, and
 //! that's decided here, per session, just before the harness launches,
 //! from the durable session env:
 //!
@@ -12,8 +12,9 @@
 //!   iff the skills bundle mounted.
 //! - `create-pull-request` — iff a forge token is present *and* the skills
 //!   bundle mounted; also writes `/etc/gitconfig`.
-//! - `record-demo` + MCP — iff the playwright bundle mounted; writes
-//!   `~/.mcp.json` pointing the harness at the bundle's `launch-mcp`.
+//! - `show-your-work` — iff the playwright bundle mounted; also symlinks the
+//!   bundle's `playwright-cli` wrapper onto PATH. The agent drives the
+//!   browser via that CLI (bash), so there is no MCP config to wire.
 //!
 //! This is what replaces the bake-time `inject_share_helpers` /
 //! `inject_forge_helpers` (retired): a skill edit now ships fleet-wide by
@@ -40,8 +41,8 @@ const FORGE_TOKEN_ENV: &str = "ENGRAM_FORGE_TOKEN";
 /// What `activate` wired up, for logging + tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ActivationReport {
-    /// Skills/MCP that were activated (e.g. `"share-file"`,
-    /// `"create-pull-request"`, `"playwright-mcp"`).
+    /// Skills that were activated (e.g. `"share-file"`,
+    /// `"create-pull-request"`, `"show-your-work"`).
     pub activated: Vec<String>,
     /// Non-fatal problems (bundle absent, symlink failed). The caller
     /// logs these; none of them fail the session.
@@ -56,7 +57,6 @@ struct Layout {
     claude_skills: PathBuf,  // /root/.claude/skills -> agents_skills
     usr_local_bin: PathBuf,  // /usr/local/bin (on PATH)
     etc_gitconfig: PathBuf,  // /etc/gitconfig
-    mcp_json: PathBuf,       // /root/.mcp.json
 }
 
 impl Layout {
@@ -68,7 +68,6 @@ impl Layout {
             claude_skills: root.join("root/.claude/skills"),
             usr_local_bin: root.join("usr/local/bin"),
             etc_gitconfig: root.join("etc/gitconfig"),
-            mcp_json: root.join("root/.mcp.json"),
         }
     }
 }
@@ -82,13 +81,13 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
     let layout = Layout::under(root);
 
     let skills_mounted = layout.skills_bundle.join("bin/engram-share").exists();
-    let browser_mounted = layout.browser_bundle.join("launch-mcp").exists();
+    let browser_mounted = layout.browser_bundle.join("bin/playwright-cli").exists();
 
     if !skills_mounted && !browser_mounted {
         // Nothing mounted — a plain image with no bundles. Not an error.
         report
             .warnings
-            .push("no RO bundles mounted; skills/MCP not wired".into());
+            .push("no RO bundles mounted; skills not wired".into());
         return report;
     }
 
@@ -146,23 +145,20 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
     }
 
     if browser_mounted {
-        // record-demo skill + the playwright MCP server config.
+        // show-your-work skill + the `playwright-cli` wrapper onto PATH. The
+        // wrapper bakes in the headless-shell config + runtime env, so the
+        // agent drives the browser with plain `playwright-cli` — no MCP
+        // config, no per-harness wiring.
         wire_skill(
             &layout,
-            "record-demo",
-            &layout.browser_bundle.join("skills/record-demo"),
-            &[],
+            "show-your-work",
+            &layout.browser_bundle.join("skills/show-your-work"),
+            &[(
+                "playwright-cli",
+                &layout.browser_bundle.join("bin/playwright-cli"),
+            )],
             &mut report,
         );
-        let launcher = layout.browser_bundle.join("launch-mcp");
-        let mcp = render_mcp_json(&launcher);
-        if let Err(e) = write_file(&layout.mcp_json, &mcp) {
-            report
-                .warnings
-                .push(format!("write {}: {e}", layout.mcp_json.display()));
-        } else {
-            report.activated.push("playwright-mcp".into());
-        }
     }
 
     report
@@ -221,31 +217,6 @@ fn render_gitconfig(askpass: &Path) -> String {
     )
 }
 
-fn render_mcp_json(launcher: &Path) -> String {
-    // Hand-rendered (no serde_json dep) — the shape is fixed. The launcher
-    // sets LD_LIBRARY_PATH / PLAYWRIGHT_BROWSERS_PATH / PATH internally,
-    // so the config stays a bare command + args.
-    format!(
-        "{{\n  \"mcpServers\": {{\n    \"playwright\": {{\n      \"command\": {},\n      \"args\": [\"--headless\", \"--browser\", \"chromium\", \"--caps\", \"vision,pdf\"]\n    }}\n  }}\n}}\n",
-        json_string(&launcher.to_string_lossy())
-    )
-}
-
-/// Minimal JSON string escaper for the one path we emit.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
@@ -290,10 +261,10 @@ mod tests {
         }
         if browser {
             let b = root.join("opt/engram/browser");
-            std::fs::create_dir_all(&b).unwrap();
-            std::fs::write(b.join("launch-mcp"), "#!/bin/sh\n").unwrap();
-            std::fs::create_dir_all(b.join("skills/record-demo")).unwrap();
-            std::fs::write(b.join("skills/record-demo/SKILL.md"), "---\n").unwrap();
+            std::fs::create_dir_all(b.join("bin")).unwrap();
+            std::fs::write(b.join("bin/playwright-cli"), "#!/bin/sh\n").unwrap();
+            std::fs::create_dir_all(b.join("skills/show-your-work")).unwrap();
+            std::fs::write(b.join("skills/show-your-work/SKILL.md"), "---\n").unwrap();
         }
     }
 
@@ -348,17 +319,17 @@ mod tests {
     }
 
     #[test]
-    fn browser_bundle_wires_record_demo_and_mcp_json() {
+    fn browser_bundle_wires_show_your_work_and_playwright_cli() {
         let dir = tempfile::tempdir().unwrap();
         stage_bundles(dir.path(), true, true);
         let report = activate(dir.path(), &env(&[]));
-        assert!(report.activated.contains(&"record-demo".to_string()));
-        assert!(report.activated.contains(&"playwright-mcp".to_string()));
+        assert!(report.activated.contains(&"show-your-work".to_string()));
         let l = Layout::under(dir.path());
-        let mcp = std::fs::read_to_string(&l.mcp_json).unwrap();
-        assert!(mcp.contains("\"playwright\""));
-        assert!(mcp.contains("launch-mcp"));
-        assert!(mcp.contains("vision,pdf"));
+        // The skill is discoverable and the CLI wrapper is on PATH — no MCP
+        // config is written.
+        assert!(l.agents_skills.join("show-your-work").is_symlink());
+        assert!(l.usr_local_bin.join("playwright-cli").is_symlink());
+        assert!(!dir.path().join("root/.mcp.json").exists());
     }
 
     #[test]
@@ -367,11 +338,11 @@ mod tests {
         stage_bundles(dir.path(), false, true); // browser only, no skills
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
         // No skills bundle -> no create-pull-request, but a clear warning,
-        // and the session is NOT failed. Browser MCP still wires.
+        // and the session is NOT failed. The browser skill still wires.
         assert!(!report
             .activated
             .contains(&"create-pull-request".to_string()));
-        assert!(report.activated.contains(&"playwright-mcp".to_string()));
+        assert!(report.activated.contains(&"show-your-work".to_string()));
         assert!(report
             .warnings
             .iter()
@@ -388,6 +359,6 @@ mod tests {
         assert_eq!(first.activated, second.activated);
         let l = Layout::under(dir.path());
         assert!(l.agents_skills.join("share-file").is_symlink());
-        assert!(l.agents_skills.join("record-demo").is_symlink());
+        assert!(l.agents_skills.join("show-your-work").is_symlink());
     }
 }

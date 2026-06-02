@@ -1,6 +1,6 @@
 //! ADR 0027 aux read-only drive mechanism test.
 //!
-//! The RO-mount skills/MCP engine attaches a fleet-wide, content-
+//! The RO-mount skills/browser engine attaches a fleet-wide, content-
 //! addressed bundle (skills / playwright squashfs) as an *additional*
 //! read-only virtio-blk drive. Unlike the per-session harness drive
 //! (ADR 0014 option-D, exercised by `patch_drive_swap`), the bundle

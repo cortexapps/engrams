@@ -121,7 +121,7 @@ impl SandboxBackend for ProcessBackend {
         // ADR 0027 dev parity: ProcessBackend has no virtio-blk drives, so
         // it symlinks each bundle's guest mount (under the materialized cwd)
         // at a host-local unpacked bundle dir. agentd's activation step (run
-        // in `start_agent` below) then wires skills/MCP from these the same
+        // in `start_agent` below) then wires skills from these the same
         // way the FC guest does.
         stage_aux_bundles(&cwd).await;
         self.sandboxes.insert(id, SandboxState { spec, cwd });
@@ -476,7 +476,7 @@ impl SandboxBackend for ProcessBackend {
         // ADR 0027 dev parity: re-stage the bundle symlinks under the NEW
         // cwd. The untarred tree may carry symlinks pointing at the old
         // cwd (now stale); restaging repoints them at the current host
-        // bundle dirs so the resumed harness's skills/MCP resolve.
+        // bundle dirs so the resumed harness's skills resolve.
         stage_aux_bundles(&cwd).await;
 
         // Synthesize a SandboxSpec from the manifest. We don't carry
@@ -574,7 +574,7 @@ async fn spawn_agent(
         }
     }
     // ADR 0027 dev parity: mirror the FC guest so the harness finds the
-    // bundle-activated skills/MCP. In the guest HOME=/root and the skill
+    // bundle-activated skills. In the guest HOME=/root and the skill
     // wrappers live on /usr/local/bin; here both are rooted under the
     // sandbox cwd. Default HOME (don't clobber an explicit one) and
     // prepend the cwd-local bin dir so `engram-share`/`engram-pr` resolve.

@@ -1,7 +1,7 @@
 # RO session bundles (ADR 0027)
 
 Read-only, content-addressed bundles the FC host mounts into guest sessions
-as additional virtio-blk drives — the RO-mount skills/MCP engine ADR 0023
+as additional virtio-blk drives — the RO-mount skills/browser engine ADR 0023
 deferred. agentd activates the right subset per session at `SpawnHarness`
 (see the `engram-session-bundles` crate); the dev `ProcessBackend` symlinks
 the unpacked trees and runs the same activation.
@@ -12,9 +12,11 @@ the unpacked trees and runs the same activation.
   (`engram-share`, `engram-pr`, `git-askpass`) + their `SKILL.md`. The
   unpacked tree *is* this directory. Mounted at `/opt/engram/skills`.
 - **`playwright/`** — opt-in (`[browser] enabled` in an image's
-  `engram.toml`). chromium-headless-shell + Node + `@playwright/mcp` + all
-  `.so` deps + the `record-demo` skill, built by `build.sh` (glibc; **not**
-  usable on musl/alpine bases). Mounted at `/opt/engram/browser`.
+  `engram.toml`). chromium-headless-shell + Node + Microsoft's
+  `@playwright/cli` + all `.so` deps + a `playwright-cli` wrapper + the
+  `show-your-work` skill, built by `build.sh` (glibc; **not** usable on
+  musl/alpine bases). Mounted at `/opt/engram/browser`. The agent drives the
+  browser via the `playwright-cli` CLI (bash) — no MCP server.
 
 ## Building
 
