@@ -146,9 +146,21 @@ jobs:
           file: docker/${{ matrix.image }}.Dockerfile
           push: true
           tags: ${{ steps.tags.outputs.list }}
-          # Use GHA's built-in cache so successive runs are fast.
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+          # No `cache-to/from type=gha`. The expensive layer in each of these
+          # images is a build-local `RUN --mount=type=cache` (cargo
+          # target+registry for coord/host-agent, the pnpm store for web) —
+          # which BuildKit NEVER exports to a registry/gha cache anyway. That
+          # mount stays warm across runs via Blacksmith's colocated BuildKit
+          # cache (the same colocated pool that backs actions/cache@v4 here;
+          # the useblacksmith/* forks are archived). It's why `cargo build`
+          # holds at ~2min instead of a 10-15min cold compile.
+          #
+          # The `type=gha` exporter, by contrast, round-trips to GitHub's REAL
+          # cache service from inside the Blacksmith microVM. Restoring a
+          # single ~290MB apt/COPY layer was clocking ~0.2 MB/s (~24 min/job),
+          # and the repo had blown past GitHub's hard 10GB cache cap and begun
+          # evicting. "Restoring" those cheap layers cost far more than just
+          # rebuilding them cold (~30s of apt-get), so the gha cache is gone.
 
   # Compile the FC-host musl binaries ONCE — the exact, CI-tested binaries —
   # and publish them to GHCR as an OCI artifact keyed by SHA. The downstream
