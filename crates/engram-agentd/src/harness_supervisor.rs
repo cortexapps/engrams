@@ -92,7 +92,13 @@ impl HarnessSupervisor {
         // also see `share-file` et al. `root = /` — we're in the guest.
         // Best-effort: this never returns an error, and we don't let a
         // failure here block the spawn.
-        let report = engram_session_bundles::activate(std::path::Path::new("/"), &req.session_env);
+        //
+        // The forge broker token rides `req.env` (per-spawn extras), NOT
+        // `session_env` (coord keeps it out of the cached env), so gate on
+        // the union — otherwise `create-pull-request` would never wire.
+        let mut gate_env = req.session_env.clone();
+        gate_env.extend(req.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let report = engram_session_bundles::activate(std::path::Path::new("/"), &gate_env);
         if !report.activated.is_empty() {
             tracing::info!(activated = ?report.activated, "ADR 0027: activated session bundles");
         }

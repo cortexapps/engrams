@@ -148,6 +148,23 @@ impl SandboxBackend for ProcessBackend {
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
+        // ADR 0027: wire the staged RO bundles into the harness discovery
+        // paths under the sandbox cwd — the dev mirror of agentd's
+        // SpawnHarness activation. `root = cwd`; spawn_agent sets
+        // HOME=<cwd>/root so the harness resolves ~/.claude/skills there.
+        // Run BEFORE the readiness-probe early return (like agentd) so a
+        // dev_vm session's /exec + shell also see the skills. Gate on the
+        // union of session_env + the per-spawn agent.env, because the forge
+        // broker token rides agent.env, not session_env.
+        let mut gate_env = state.spec.env.clone();
+        gate_env.extend(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let report = engram_session_bundles::activate(&state.cwd, &gate_env);
+        if !report.activated.is_empty() {
+            tracing::info!(activated = ?report.activated, "ADR 0027: activated session bundles (dev)");
+        }
+        for w in &report.warnings {
+            tracing::debug!(warning = %w, "ADR 0027: session bundle activation (dev)");
+        }
         // ADR 0015 M1: empty argv is a readiness probe (no harness
         // to spawn). Mirrors `engram_agentd::HarnessSupervisor::spawn`.
         // Coord's harness=none cold-create path calls us with empty
@@ -161,17 +178,6 @@ impl SandboxBackend for ProcessBackend {
         // call start_agent more than once; we keep the first agent.
         if self.agent_children.contains_key(&id) {
             return Ok(());
-        }
-        // ADR 0027: wire the staged RO bundles into the harness discovery
-        // paths under the sandbox cwd — the dev mirror of agentd's
-        // SpawnHarness activation. `root = cwd`; spawn_agent sets
-        // HOME=<cwd>/root so the harness resolves ~/.claude/skills there.
-        let report = engram_session_bundles::activate(&state.cwd, &state.spec.env);
-        if !report.activated.is_empty() {
-            tracing::info!(activated = ?report.activated, "ADR 0027: activated session bundles (dev)");
-        }
-        for w in &report.warnings {
-            tracing::debug!(warning = %w, "ADR 0027: session bundle activation (dev)");
         }
         spawn_agent(
             &self.agent_children,

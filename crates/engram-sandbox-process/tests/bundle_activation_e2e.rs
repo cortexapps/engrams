@@ -1,0 +1,132 @@
+//! ADR 0027 e2e: a generated session must carry the activated skills + MCP
+//! config.
+//!
+//! Drives the real session-generation path on the dev `ProcessBackend`
+//! (`create` → `start_agent`) with the RO bundles staged, and asserts the
+//! produced session directory contains everything a harness discovers:
+//! the `~/.claude/skills` tree (share-file always; create-pull-request when
+//! a forge token is present), the `engram-share`/`engram-pr` wrappers on
+//! PATH, `/etc/gitconfig`, and the playwright `~/.mcp.json`. This is the
+//! cross-cutting check that the engine actually lands configs in sessions —
+//! the per-unit behavior is covered by `engram-session-bundles` tests.
+//!
+//! Single test in its own integration binary → the `set_var` of the bundle-
+//! dir overrides is process-isolated (no cross-test env race).
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::sandbox::{
+    AgentSpec, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
+};
+use engram_sandbox_process::ProcessBackend;
+
+fn write_exec(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Build fake skills + playwright bundle trees mirroring `deploy/bundles/*`.
+fn stage_fake_bundles(skills: &Path, browser: &Path) {
+    write_exec(&skills.join("bin/engram-share"), "#!/bin/sh\n");
+    write_exec(&skills.join("bin/engram-pr"), "#!/bin/sh\n");
+    write_exec(&skills.join("bin/git-askpass"), "#!/bin/sh\n");
+    std::fs::create_dir_all(skills.join("skills/share-file")).unwrap();
+    std::fs::write(skills.join("skills/share-file/SKILL.md"), "---\n").unwrap();
+    std::fs::create_dir_all(skills.join("skills/create-pull-request")).unwrap();
+    std::fs::write(skills.join("skills/create-pull-request/SKILL.md"), "---\n").unwrap();
+
+    write_exec(&browser.join("launch-mcp"), "#!/bin/sh\n");
+    std::fs::create_dir_all(browser.join("skills/record-demo")).unwrap();
+    std::fs::write(browser.join("skills/record-demo/SKILL.md"), "---\n").unwrap();
+}
+
+#[tokio::test]
+async fn generated_session_has_skills_and_mcp_configs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let skills_dir = tmp.path().join("bundles/skills");
+    let browser_dir = tmp.path().join("bundles/playwright");
+    stage_fake_bundles(&skills_dir, &browser_dir);
+
+    // Point ProcessBackend's dev staging at the fake bundles. Safe: edition
+    // 2021 `set_var` isn't unsafe, and this is the only test in the binary.
+    std::env::set_var("ENGRAM_SKILLS_BUNDLE_DIR", &skills_dir);
+    std::env::set_var("ENGRAM_PLAYWRIGHT_BUNDLE_DIR", &browser_dir);
+
+    let work = tmp.path().join("work");
+    let backend = ProcessBackend::new(&work);
+
+    let spec = SandboxSpec {
+        image: "test".into(),
+        rootfs_source: None,
+        image_uri: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        // Dev staging is spec-independent, but pass them through anyway to
+        // mirror what coord capture records for a browser image.
+        aux_ro_drives: vec![AuxRoDrive::skills(), AuxRoDrive::playwright()],
+    };
+    let id = backend.create(spec).await.expect("create session");
+
+    // A forge-bound session: the broker token rides AgentSpec.env (per-spawn),
+    // which is exactly where the activation gate must look for it.
+    let agent = AgentSpec {
+        argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        env: HashMap::from_iter([("ENGRAM_FORGE_TOKEN".into(), "tok".into())]),
+        session_env: HashMap::new(),
+        host_ca_pem: None,
+    };
+    backend.start_agent(id, agent).await.expect("start_agent");
+
+    // The generated session directory.
+    let cwd = work.join(id.to_string());
+
+    // Skills discovery: ~/.claude/skills -> ~/.agents/skills, populated.
+    assert!(
+        cwd.join("root/.claude/skills").is_symlink(),
+        "~/.claude/skills symlink missing in the generated session",
+    );
+    assert!(
+        cwd.join("root/.agents/skills/share-file").is_symlink(),
+        "share-file skill not wired (should always be present)",
+    );
+    assert!(
+        cwd.join("root/.agents/skills/create-pull-request")
+            .is_symlink(),
+        "create-pull-request not wired despite ENGRAM_FORGE_TOKEN",
+    );
+    assert!(
+        cwd.join("root/.agents/skills/record-demo").is_symlink(),
+        "record-demo not wired despite playwright bundle present",
+    );
+
+    // Wrappers on PATH + git wiring.
+    assert!(cwd.join("usr/local/bin/engram-share").is_symlink());
+    assert!(cwd.join("usr/local/bin/engram-pr").is_symlink());
+    let gitconfig = std::fs::read_to_string(cwd.join("etc/gitconfig")).expect("gitconfig written");
+    assert!(
+        gitconfig.contains("git-askpass"),
+        "gitconfig must point core.askPass at the bundle git-askpass; got {gitconfig:?}",
+    );
+
+    // MCP config: the playwright server pointed at the bundle launcher.
+    let mcp = std::fs::read_to_string(cwd.join("root/.mcp.json")).expect(".mcp.json written");
+    assert!(mcp.contains("\"playwright\""), "got {mcp}");
+    assert!(mcp.contains("launch-mcp"), "got {mcp}");
+    assert!(mcp.contains("vision,pdf"), "got {mcp}");
+
+    // The bundle mounts themselves are symlinked under the session cwd.
+    assert!(cwd.join("opt/engram/skills").is_symlink());
+    assert!(cwd.join("opt/engram/browser").is_symlink());
+}
