@@ -205,6 +205,23 @@ mount -t devtmpfs dev /dev 2>/dev/null || true
 # nodes to materialise here. Standard Linux init does this.
 mkdir -p /dev/pts 2>/dev/null || true
 mount -t devpts devpts /dev/pts 2>/dev/null || true
+# /dev/shm is POSIX shared memory (tmpfs). Standard Linux init mounts it;
+# our minimal devtmpfs /dev doesn't carry it. Chromium (the ADR 0027
+# playwright bundle) allocates its renderer's shared memory here and the
+# page process *crashes* without it — and the `--disable-dev-shm-usage`
+# fallback writes to the system tmpdir, which isn't a world-writable 1777
+# /tmp in our guest, so that path fails too. A real /dev/shm is the fix.
+mkdir -p /dev/shm 2>/dev/null || true
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /dev/shm 2>/dev/null || true
+# /tmp must be the standard world-writable, sticky 1777 dir. Our rootfs
+# ships it as 0755 owned by the session user, which blocks writes from any
+# other uid — e.g. a root `engram exec`, or chromium's renderer running with
+# dropped capabilities. The ADR 0027 browser bundle hits this twice: the
+# chromium shm fallback and playwright's video-artifacts temp dir both land
+# under the system tmpdir and silently fail (renderer crash / "no videos were
+# recorded"). Restore the convention so any uid can use /tmp. (ADR 0027 e2e.)
+mkdir -p /tmp 2>/dev/null || true
+chmod 1777 /tmp 2>/dev/null || true
 mark fs_mounts_done
 # DNS for userspace. The kernel handled IP+routes via `ip=dhcp` (see
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so

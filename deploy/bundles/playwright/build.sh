@@ -129,6 +129,18 @@ FONTS
         # (the guest microVM is the isolation boundary). The playwright-cli
         # daemon reads this via PLAYWRIGHT_MCP_CONFIG (set by the wrapper),
         # so the agent never passes --config.
+        #
+        # ignoreDefaultArgs [--disable-dev-shm-usage] is load-bearing.
+        # Playwright ALWAYS injects --disable-dev-shm-usage into chromium
+        # (a CI/Docker-small-/dev/shm safety default); config `args` are
+        # appended, so it cannot be removed by omission, only by ignoring the
+        # default. That flag pushes the renderer shared memory off /dev/shm
+        # into the system tmpdir; the guest /tmp is not a world-writable 1777
+        # dir, so the renderer shm allocation fails and the page process
+        # crashes (page reset to about:blank, every navigation times out). The
+        # FC guest mounts a real /dev/shm (see engram-init in
+        # engram-image-builder), so we keep chromium on it and the browser
+        # renders. Validated in a live prod dev_vm session (ADR 0027 e2e).
         cat > /out/cli.config.json <<"CFG"
 {
   "browser": {
@@ -136,7 +148,8 @@ FONTS
     "launchOptions": {
       "channel": "chromium-headless-shell",
       "headless": true,
-      "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+      "args": ["--no-sandbox"],
+      "ignoreDefaultArgs": ["--disable-dev-shm-usage"]
     }
   }
 }
