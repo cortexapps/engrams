@@ -1308,6 +1308,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "engram-core",
+ "engram-session-bundles",
  "flate2",
  "futures",
  "nix 0.31.2",
