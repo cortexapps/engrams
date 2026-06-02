@@ -391,8 +391,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         # codesign after build, before exec. No sudo on macOS.
         serve_cmd = (
             build_prefix +
-            ('bash crates/engram-sandbox-vz/scripts/codesign.sh debug && '
-             if not bin_dir else '') +
+            'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
             'exec ' + ha_bin
         )
     else:
