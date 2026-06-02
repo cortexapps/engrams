@@ -153,6 +153,7 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
 
 /// Extractor that admits only admins. Use as an argument on admin-only
 /// handlers — the real authorization gate (the web only hides tabs).
+#[derive(Debug)]
 pub struct AdminOnly(pub Principal);
 
 #[async_trait]
@@ -473,4 +474,46 @@ pub async fn patch_user(
         }
     }
     Ok(Json(UserSummary::from(&user)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts_with(principal: Option<Principal>) -> Parts {
+        let (mut parts, _) = axum::http::Request::builder().body(()).unwrap().into_parts();
+        if let Some(p) = principal {
+            parts.extensions.insert(p);
+        }
+        parts
+    }
+
+    fn principal(role: Role) -> Principal {
+        Principal {
+            user_id: UserId::new(),
+            email: "u@example.com".into(),
+            display_name: None,
+            role,
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn current_user_requires_an_injected_principal() {
+        let mut parts = parts_with(None);
+        let err = CurrentUser::from_request_parts(&mut parts, &()).await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_only_admits_admin_and_rejects_member() {
+        let mut admin = parts_with(Some(principal(Role::Admin)));
+        assert!(AdminOnly::from_request_parts(&mut admin, &()).await.is_ok());
+
+        let mut member = parts_with(Some(principal(Role::Member)));
+        let err = AdminOnly::from_request_parts(&mut member, &())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
 }
