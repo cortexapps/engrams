@@ -3,10 +3,15 @@
 Status: 2026-06-02 — **Proposed.** Incident-driven. Authored before
 code per the team's ADR-bookend norm; the fix lands in three
 independent commits (one per failure below) that can ship and roll
-separately. Supersedes nothing; extends [ADR 0018](0018-session-evacuation.md)
+separately. The core move is to make recovery rest on a **periodic,
+durably-recorded coherent (memory, disk) checkpoint** rather than a
+suspend-only memory snapshot — see "The deeper finding" below.
+Supersedes nothing; extends [ADR 0018](0018-session-evacuation.md)
 (evacuation), [ADR 0016](0016-cow-observability-and-continuous-sync.md)
-(idle-eviction pipeline ordering), and [ADR 0009](0009-state-reconciliation.md)
-(graceful shutdown).
+(continuous disk sync + idle-eviction ordering), and
+[ADR 0009](0009-state-reconciliation.md) (graceful shutdown); the
+checkpoint-cadence lever ties into [ADR 0022](0022-runtime-memory-sharing-and-forking.md)
+(dirty-page tracking).
 
 ## Context: the incident (session `cf4d4afd`, 2026-06-02)
 
@@ -100,10 +105,16 @@ churn + log noise) on a structurally impossible operation, then drops
 to `Idle`, where a manual `/resume` hits the same wall and ultimately
 `transition_to_dead_if_no_snapshot`.
 
-A disk-only session *is* recoverable in principle: cold-boot a fresh
-guest from the image's base snapshot and attach the recovered disk
-(`live_disk_manifest`), accepting in-RAM/process loss. That path
-(base-snapshot cold boot, ADR 0020) exists but is not wired into evac.
+A disk-only session *is* recoverable in principle, but **not** by
+reusing `restore_base_for_session`: that resumes the base **memory**
+snapshot, and pairing base memory with the session's *evolved* disk is
+**incoherent** (the restored RAM's page cache + mounted-fs metadata
+describe the base disk, not the evolved one → corruption). The coherent
+recovery is a **fresh kernel boot** that mounts the recovered rootfs —
+the `live_disk_manifest` is a *full* rootfs, so a cold boot against it
+is coherent (clean mount, fresh harness; in-RAM/process context lost).
+That primitive composes existing parts (materialize manifest → NBD
+rootfs → FC `create`) but is not wired into evac today.
 
 ### Defect C — the deploy terminates hosts without draining sessions
 
@@ -122,60 +133,106 @@ checkpoint can be cut off. There is an operator drain endpoint
 (`POST /api/admin/hosts/:id/drain`) that cordons + evacuates to
 `Evacuating` and waits — but the deploy tooling never calls it.
 
+### The deeper finding — disk is continuous, memory is suspend-only
+
+Underneath all three defects is a **cadence asymmetry**:
+
+- **Disk is continuously synced.** The `FlushScheduler` (ADR 0016
+  Phase B) flushes dirty chunks to GCS on a periodic tick / 256 MiB
+  threshold and publishes an advancing `live_disk_manifest`
+  (`dd030aa5 → v76/v77` in the incident). Disk is durable + recent
+  independent of any snapshot.
+- **Memory is captured only at suspend** — inside `pooled_backend::snapshot()`,
+  which runs *only* at idle-eviction, operator drain, and SIGTERM
+  shutdown. There is **no periodic memory checkpoint**.
+
+So a session in steady state has a recent durable disk but **no
+durable coherent (memory, disk) pair**. The incident is the corner of
+that asymmetry: the one memory capture at eviction never got recorded,
+leaving disk-only state — and disk-only can only ever cold-recover
+(all in-RAM/agent context lost). The fix isn't just "make the eviction
+snapshot crash-safe"; it's to **periodically capture a durable,
+coherent checkpoint** so host loss costs minutes, not the whole session.
+
 ## Decision
 
-Fix all three, smallest-blast-radius first. A, B are in this OSS repo;
-C spans this repo **and** `engrams-internal` (deploy tooling).
+Re-anchor recovery on a **periodic, host-driven, durably-recorded
+coherent checkpoint**, with cold-boot-on-latest-disk as the fallback
+rung and drain-before-delete as prevention. Smallest-blast-radius
+first; A, B are in this OSS repo, C spans `engrams-internal`.
 
-### Fix A — make eviction crash-consistent via host-owned snapshot records + a reconciler
+### Recovery ladder (target end-state)
 
-Principle: the **host** is the durable owner of "a snapshot exists in
-GCS," because the host is what wrote it. Coord's PG row is a cache of
-that fact, not its origin.
+On sandbox/host loss, recover to the best available rung:
 
-1. **Host persists a durable, self-describing record** of every
-   completed snapshot (sandbox_id, session_id, snapshot_id, disk +
-   memory manifest refs, blob keys, recoverable) the moment the upload
-   finishes — before returning from the `snapshot` RPC — in a location
-   that survives the RPC reply being lost (extend the existing
-   `sandbox.json` / a sibling `snapshot.json`, already partially done
-   by the shutdown path).
-2. **Host re-advertises un-acked snapshots** in its heartbeat /
+1. **Last coherent checkpoint → warm resume.** A periodic (memory,
+   disk) pair captured atomically and durably recorded. **Rewind** the
+   disk to that checkpoint's version — discarding the continuous-sync
+   deltas that landed *after* it — to keep the (memory, disk) pair
+   coherent. Cost: minutes of lost work; **agent RAM / conversation /
+   process context preserved.** Best UX.
+2. **Cold boot on the latest disk (Fix B).** No usable coherent
+   checkpoint, but the continuous-sync `live_disk_manifest` is current:
+   fresh kernel boot mounting the recovered rootfs, fresh harness.
+   Newest on-disk files, **memory/context lost.**
+3. **Floor.** Disk in GCS / work already pushed to the forge (the PR).
+
+### Fix A — periodic coherent checkpoint + host-owned durable record + reconcile
+
+The host is the durable owner of "a coherent snapshot exists in GCS";
+coord's PG row is a cache of that fact, not its origin.
+
+1. **Host-driven periodic coherent checkpoint.** On a timer (and at
+   suspend), the host runs the existing atomic `snapshot()` shape
+   (`pause → flush disk post-pause → capture memory → upload both
+   chunked → resume`) so the captured (memory, disk) pair is coherent
+   by construction. Cadence is coarse to start (minutes) because stock
+   FC requires a full pause + full memory capture per checkpoint;
+   chunked-memory content-dedup (ADR 0007/0021) already keeps the
+   *at-rest* cost incremental.
+2. **Host persists a durable, self-describing record** of every
+   completed checkpoint (sandbox_id, session_id, snapshot_id, disk +
+   memory manifest refs, blob keys, recoverable, captured-at) the
+   moment the upload finishes — surviving the RPC reply / coord being
+   lost (extend `sandbox.json` / a sibling `snapshot.json`, partially
+   done by the shutdown path).
+3. **Host re-advertises un-acked checkpoints** in heartbeat /
    registration (`rehydrate_sandboxes` already carries a sandbox
-   inventory; add completed-snapshot inventory). A coord that restarted
-   mid-eviction — or any coord — reconciles these into PG via
-   `record_snapshot` (idempotent on `snapshot_id`).
-3. **Coord reconciler re-drives interrupted evictions.** On the
-   heartbeat path, a session that is still `Active` with a
-   sandbox the host reports as *snapshotted-and-paused* (not running)
-   is completed through the rest of the pipeline (record → transition →
-   destroy) idempotently. This closes the "coord died after
-   `host.snapshot()` returned" window.
+   inventory). Any coord reconciles them into PG via `record_snapshot`
+   (idempotent on `snapshot_id`), so a checkpoint that reached GCS
+   becomes a PG row regardless of which coord (if any) survived —
+   *before* any host-deletion can strand it. This also subsumes the
+   "coord died mid-eviction" window: the interrupted eviction's
+   snapshot is just an un-acked checkpoint the reconciler picks up.
 
-Net: if the snapshot reached GCS, it becomes a PG row regardless of
-which coord pod (if any) survives — *before* any host-deletion can
-strand it.
+Net: every active session always has a recent, coherent, recorded
+checkpoint to rewind to — recovery rung 1 is reachable.
 
-### Fix B — implement disk-only cold-recovery in the evac path
+**Future cadence lever (ADR 0022).** Stock FC forces a full pause +
+full memory dump per checkpoint, capping cadence at minutes. ADR 0022's
+**Option B (`direct-mem`, memfd + `UFFDIO_CONTINUE`)** lists *online
+dirty-page tracking → faster Pause / smaller diff-checkpoints* — exactly
+what makes **frequent, near-zero-pause diff checkpoints** (seconds)
+practical. 0022 is Proposed/parked and its primary thrust (memory
+sharing/forking for density) is orthogonal; the relevance here is the
+shared dirty-tracking primitive. Not a dependency for the first cut.
 
-In `evacuate_dead_source`, when `snapshot.is_none()` but a disk
-manifest is available, take a **base-snapshot cold-boot + disk-attach**
-path instead of a memory restore:
+### Fix B — cold-boot disk recovery (ladder rung 2)
 
-- restore from the session's image **base snapshot** (cold boot, ADR
-  0020) with the recovered `live_disk_manifest` attached as the rootfs
-  overlay;
-- mark the receipt `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`
-  (the variant already exists) so the loss is explicit in events/logs;
-- on the harness side this is a fresh harness against the recovered
-  filesystem — the agent's on-disk work (files, git, pushed PRs)
-  survives; in-RAM conversation context does not.
+In `evacuate_dead_source`, when no coherent checkpoint is usable but a
+disk manifest is current, recover via a **fresh kernel boot mounting
+the recovered rootfs** (new `restore_disk_only_for_session` primitive:
+materialize `live_disk_manifest` → NBD rootfs → FC `create` → inject
+`session_env`; caller runs `start_agent` for a fresh harness). NOT a
+`restore_base_for_session` (base memory + evolved disk is incoherent —
+see Defect B). Mark `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`.
+On-disk work survives; in-RAM context does not.
 
-Plus a **fail-fast guard**: if neither a memory snapshot nor a
-base-snapshot+disk recovery is possible, route to `Idle`/`Dead`
-immediately with a clear reason instead of burning the 20-attempt
-budget on `RestoreFailed`. (`NoRecoverableState` already short-circuits;
-extend it to "no *restorable* state given what's available.")
+Plus a **fail-fast guard**: when neither a coherent checkpoint nor a
+disk-only cold boot is possible, route to `Idle`/`Dead` immediately
+with a clear reason instead of burning the 20-attempt budget on
+`RestoreFailed` (`evac_resumer` classifies structural vs transient
+EvacError).
 
 ### Fix C — drain hosts before the MIG deletes them
 
@@ -199,28 +256,39 @@ the prevention; Fix A/B are the safety net when prevention is bypassed
 
 ## Consequences
 
-- Idle/active sessions survive coord rolls and FC-host MIG rolls with
-  at most a memory-loss (cold) recovery, never an unrecoverable
-  orphan. The user-visible promise of ADR 0018 ("a host dies, the
-  session keeps working") extends to the deploy-roll + interrupted-
-  eviction case.
-- New host→coord surface (snapshot inventory in heartbeat) and a
+- Active/idle sessions survive coord rolls and FC-host MIG rolls with a
+  **warm** recovery to a recent coherent checkpoint (rung 1) — bounded
+  work-loss, agent context preserved — falling back to cold-boot
+  (rung 2) only when no checkpoint is usable. The ADR 0018 promise
+  ("a host dies, the session keeps working") extends to the
+  deploy-roll + interrupted-eviction case, and *keeps memory* in the
+  common case.
+- Periodic checkpointing adds a brief recurring guest **pause** per
+  sandbox (full-memory capture on stock FC). Cadence is a tunable
+  trade (coarse minutes to start); the dirty-page-tracking path
+  (ADR 0022 Option B) is the lever to tighten it without the pause
+  cost. Measure pause overhead before tightening.
+- New host→coord surface (checkpoint inventory in heartbeat) + a
   reconciler tick; both idempotent, both single-coord-pod safe by the
   same lease/CAS patterns as the existing evac scanners.
 - Cross-repo coordination for Fix C (this repo + `engrams-internal`),
   so Fix C ships behind the deploy change; Fixes A + B are
-  independently shippable in this repo.
-- A new prod validation matrix (mirroring ADR 0018's): coord roll
-  during eviction; FC-host MIG roll of an idle session; disk-only
-  cold recovery fidelity (on-disk md5 identical, memory-loss expected).
+  independently shippable here.
+- New prod validation matrix (mirroring ADR 0018's): coord roll during
+  eviction; FC-host MIG roll of an idle session recovering to rung 1
+  (warm, memory intact, disk rewound to checkpoint); rung-2 cold-boot
+  fidelity (on-disk md5 identical, memory-loss expected); checkpoint
+  pause-overhead measurement.
 
 ## Status / commit chain
 
 To be filled as commits land (per the ADR-bookend norm):
 
-- [ ] **A** — host-owned snapshot record + heartbeat re-advertise +
-      coord reconciler for interrupted evictions.
-- [ ] **B** — disk-only base-snapshot cold-recovery in
-      `evacuate_dead_source` + fail-fast guard in `evac_resumer`.
+- [ ] **A** — host-driven periodic coherent checkpoint + host-owned
+      durable record + heartbeat re-advertise + coord reconciler
+      (subsumes interrupted-eviction recovery).
+- [ ] **B** — `restore_disk_only_for_session` cold-boot primitive +
+      `evacuate_dead_source` rung-2 dispatch + fail-fast classification
+      in `evac_resumer`.
 - [ ] **C** — drain-before-roll in `engrams-internal` deploy tooling +
       host SIGTERM checkpoint records-to-PG + grace-period bump.
