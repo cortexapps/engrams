@@ -1,3 +1,7 @@
+import '@fontsource-variable/newsreader/opsz.css';
+import '@fontsource-variable/newsreader/opsz-italic.css';
+import '@fontsource-variable/jetbrains-mono/wght.css';
+import '@fontsource-variable/jetbrains-mono/wght-italic.css';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import './theme.css';
