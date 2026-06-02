@@ -21,7 +21,14 @@ const BOOTING: ReadonlySet<SessionState> = new Set([
   'guest_ready',
 ]);
 
-export function SessionRow({ session }: { session: Session }) {
+export function SessionRow({
+  session,
+  owner,
+}: {
+  session: Session;
+  /** ADR 0031: owner email, shown only in the admin "all sessions" view. */
+  owner?: string | null;
+}) {
   const since = relativeTime(session.last_active_at);
   // ADR 0005: there's no workspace-level repo/branch on a session
   // anymore — the bake image is the whole story. Strip the registry
@@ -68,6 +75,15 @@ export function SessionRow({ session }: { session: Session }) {
         >
           {session.status}
         </span>
+        {owner && (
+          <span
+            className="font-mono text-[0.72rem]"
+            style={{ color: 'var(--color-ink-quiet)' }}
+            title={`owner: ${owner}`}
+          >
+            {owner}
+          </span>
+        )}
         <span
           className="font-mono text-[0.78rem]"
           style={{ color: 'var(--color-ink-quiet)', minWidth: '6ch' }}
