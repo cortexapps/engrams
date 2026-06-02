@@ -58,6 +58,7 @@ macro_rules! id_newtype {
 }
 
 id_newtype!(SessionId);
+id_newtype!(UserId);
 id_newtype!(HostId);
 id_newtype!(SandboxId);
 id_newtype!(SnapshotId);

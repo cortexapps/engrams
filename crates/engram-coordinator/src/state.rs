@@ -414,6 +414,15 @@ pub struct AppState {
     /// endpoints then 501). Kept here rather than on `Services` so the
     /// many test `Services` literals don't need touching.
     pub forge: Option<Arc<dyn engram_core::traits::GitForge>>,
+    /// ADR 0031: the authentication runtime — verifier chain (cookie /
+    /// service-bearer / forward-auth / synthetic), the OIDC authenticator
+    /// for `/auth/*`, the user + web-session stores, and the auth config.
+    /// Set on `main`'s run path via `run_with_registry_and_local`; `None`
+    /// in tests, where the principal layer injects a synthetic admin so the
+    /// suite runs authed-as-admin with zero changes. Kept here (not on
+    /// `Services`) for the same reason as `forge` — the many test `Services`
+    /// literals don't need touching.
+    pub auth: Option<Arc<crate::api::principal::AuthRuntime>>,
 }
 
 impl AppState {
@@ -458,6 +467,7 @@ impl AppState {
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
             forge: None,
+            auth: None,
         }
     }
 

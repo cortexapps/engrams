@@ -1,7 +1,9 @@
 import { motion } from 'framer-motion';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { createSession } from '../api';
+import { useAuth } from '../auth/AuthProvider';
 import { useEnabledImages } from '../hooks/useEnabledImages';
 import { SectionHead } from './SectionHead';
 import type { SessionMode } from '../types';
@@ -55,30 +57,18 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
   // ---- PROMPT ----
   const [prompt, setPrompt] = useState('');
 
-  // ---- CREDENTIALS ----
-  // ADR 0021 P1.3+: the dashboard surfaces per-session credentials
-  // only when the image actually has the harness that needs them.
-  // Today that's only the Claude harness (`harness_name = "claude"`),
-  // which needs either an OAuth token (long-lived, from `claude
-  // setup-token`) or an API key (sk-ant-...).
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [claudeAuthMethod, setClaudeAuthMethod] = useState<'oauth' | 'api_key'>(
-    'oauth',
-  );
-  const [claudeToken, setClaudeToken] = useState('');
-  const claudeTokenName =
-    claudeAuthMethod === 'oauth'
-      ? 'CLAUDE_CODE_OAUTH_TOKEN'
-      : 'ANTHROPIC_API_KEY';
+  // ---- CREDENTIALS (ADR 0031) ----
+  // We never prompt for the Claude token per session. The user saves it once
+  // on their profile and the coordinator auto-injects it for built-in-Claude
+  // sessions. If they haven't saved one yet, route them to the token screen
+  // instead of letting them create a session that would fail to authenticate.
+  const { principal } = useAuth();
+  const needsToken = isClaude && mode === 'agent' && !principal.has_claude_token;
 
-  // Claude needs *some* token to authenticate; the picker only
-  // surfaces (and only blocks submit) on Claude images in agent mode.
-  const claudeTokenMissing =
-    isClaude && mode === 'agent' && claudeToken.trim().length === 0;
-
-  const canSubmit = !!selected && !submitting && !claudeTokenMissing;
+  const canSubmit = !!selected && !submitting && !needsToken;
 
   // Wipe any prior submit error when the image changes — the
   // selection itself is the corrective action.
@@ -94,25 +84,15 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
     try {
       const promptValue = promptMeaningful ? prompt.trim() || undefined : undefined;
 
-      // Harness-level credentials surface only for the image's actual
-      // baked harness. Today: just Claude (one of OAuth or API key
-      // per `claudeAuthMethod`). Image-declared `[secrets.*]` flow
-      // through the deploy layer post-Stage-D, not the dashboard.
-      const mergedSecrets: Record<string, string> = {};
-      if (isClaude && mode === 'agent') {
-        mergedSecrets[claudeTokenName] = claudeToken;
-      }
+      // ADR 0031: no per-session secrets. The Claude token is auto-injected
+      // server-side from the user's profile for built-in-Claude sessions.
       const res = await createSession({
         image: selected.image_uri,
         // Omit `mode` on the default (`agent`) so the wire stays
         // minimal; coord defaults to Agent server-side.
         mode: mode === 'dev_vm' ? 'dev_vm' : undefined,
         prompt: promptValue,
-        secrets:
-          Object.keys(mergedSecrets).length > 0 ? mergedSecrets : undefined,
       });
-      // Wipe sensitive form state immediately on success.
-      setClaudeToken('');
       setPrompt('');
       qc.invalidateQueries({ queryKey: ['sessions'] });
       onCreated(res.session_id);
@@ -247,50 +227,25 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
               )}
             </div>
 
-            {/* HARNESS-LEVEL CREDENTIALS — hard-coded UX for the
-                claude harness. Surfaces only when the *image* has a
-                baked claude harness AND mode is agent (dev-VM
-                doesn't drive the harness, so the credential is
-                inert). Long-term these credential schemas should
-                live alongside the built-in harness artifact and the
-                form learns them from there. */}
-            {isClaude && mode === 'agent' && (
-              <div className="pt-2 space-y-3">
-                <p
-                  className="font-mono smallcaps text-[0.65rem]"
-                  style={{ color: 'var(--color-ink-quiet)' }}
-                >
-                  CLAUDE CREDENTIALS · paste once · never persisted
-                </p>
-                <Field label="auth method">
-                  <select
-                    value={claudeAuthMethod}
-                    onChange={(e) => {
-                      setClaudeAuthMethod(
-                        e.target.value as 'oauth' | 'api_key',
-                      );
-                      // Wipe the previous-method's value so we
-                      // don't ship a stale token under the wrong
-                      // env-var name.
-                      setClaudeToken('');
-                    }}
-                    className="ledger-input font-display"
-                  >
-                    <option value="oauth">
-                      OAuth token — `claude setup-token` (sk-ant-oat01-…)
-                    </option>
-                    <option value="api_key">
-                      API key — sk-ant-api03-…
-                    </option>
-                  </select>
-                </Field>
-                <SecretField
-                  name={claudeTokenName}
-                  required={true}
-                  value={claudeToken}
-                  onChange={setClaudeToken}
-                />
-              </div>
+            {/* ADR 0031: a built-in-Claude session uses the token saved on
+                your profile — no per-session prompt. If none is saved, route
+                to the token screen instead of letting create fail. */}
+            {needsToken && (
+              <p
+                className="font-display italic text-[0.85rem]"
+                style={{ color: 'var(--color-ink-quiet)' }}
+              >
+                this image runs built-in Claude, which uses your saved Claude
+                Code token — you don’t have one yet.
+              </p>
+            )}
+            {isClaude && mode === 'agent' && !needsToken && (
+              <p
+                className="font-display italic text-[0.85rem]"
+                style={{ color: 'var(--color-ink-quiet)' }}
+              >
+                built-in Claude — your saved token is used automatically.
+              </p>
             )}
 
             {error && (
@@ -303,20 +258,30 @@ export function NewSessionForm({ onCancel, onCreated }: NewSessionFormProps) {
             )}
 
             <div className="flex items-center justify-end pt-2">
-              <button
-                type="submit"
-                disabled={!canSubmit}
-                className={`font-mono smallcaps text-[0.78rem] tracking-[0.12em] transition-colors ${
-                  canSubmit ? '' : 'opacity-40 cursor-not-allowed'
-                }`}
-                style={{
-                  color: canSubmit
-                    ? 'var(--color-amber)'
-                    : 'var(--color-ink-quiet)',
-                }}
-              >
-                {submitting ? 'starting…' : 'start →'}
-              </button>
+              {needsToken ? (
+                <Link
+                  to="/settings/tokens"
+                  className="font-mono smallcaps text-[0.78rem] tracking-[0.12em] transition-colors"
+                  style={{ color: 'var(--color-amber)' }}
+                >
+                  save your Claude token to start →
+                </Link>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!canSubmit}
+                  className={`font-mono smallcaps text-[0.78rem] tracking-[0.12em] transition-colors ${
+                    canSubmit ? '' : 'opacity-40 cursor-not-allowed'
+                  }`}
+                  style={{
+                    color: canSubmit
+                      ? 'var(--color-amber)'
+                      : 'var(--color-ink-quiet)',
+                  }}
+                >
+                  {submitting ? 'starting…' : 'start →'}
+                </button>
+              )}
             </div>
           </>
         )}
@@ -360,43 +325,3 @@ function Field({
   );
 }
 
-function SecretField({
-  name,
-  required,
-  value,
-  onChange,
-  disabled,
-}: {
-  name: string;
-  required: boolean;
-  value: string;
-  onChange: (v: string) => void;
-  disabled?: boolean;
-}) {
-  const ref = useRef<HTMLInputElement>(null);
-  return (
-    <label
-      className="grid items-baseline gap-x-4"
-      style={{ gridTemplateColumns: '17rem 1fr' }}
-    >
-      <span
-        className="font-mono text-[0.78rem]"
-        style={{ color: 'var(--color-ink-faded)' }}
-        title={required ? 'required' : 'optional'}
-      >
-        {name}
-      </span>
-      <input
-        ref={ref}
-        type="password"
-        autoComplete="off"
-        spellCheck={false}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        disabled={disabled}
-        className="ledger-input font-mono"
-        placeholder={required ? '••••••••' : 'optional'}
-      />
-    </label>
-  );
-}

@@ -1,6 +1,6 @@
 import { AnimatePresence } from 'framer-motion';
 import { SessionRow } from './SessionManifest';
-import type { Session } from '../types';
+import type { SessionListItem } from '../types';
 
 // A ledger section of the grouped session manifest: a small-caps
 // header with a trailing count, then the rows. An empty group renders
@@ -11,10 +11,13 @@ export function ManifestGroup({
   label,
   sessions,
   keepEmpty = false,
+  showOwner = false,
 }: {
   label: string;
-  sessions: Session[];
+  sessions: SessionListItem[];
   keepEmpty?: boolean;
+  /** ADR 0031: show the owner chip per row (admin "all sessions" view). */
+  showOwner?: boolean;
 }) {
   if (sessions.length === 0 && !keepEmpty) return null;
 
@@ -32,7 +35,11 @@ export function ManifestGroup({
         ) : (
           <AnimatePresence>
             {sessions.map((s) => (
-              <SessionRow key={s.id} session={s} />
+              <SessionRow
+                key={s.id}
+                session={s}
+                owner={showOwner ? s.owner_email : undefined}
+              />
             ))}
           </AnimatePresence>
         )}

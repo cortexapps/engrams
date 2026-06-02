@@ -1,6 +1,7 @@
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { EngramMark } from './EngramMark';
 import { UserChip } from './UserChip';
+import { useIsAdmin } from '../auth/AuthProvider';
 
 // The masthead NAV SPINE for the four-surface IA. One persistent
 // header carrying brand and navigation:
@@ -15,11 +16,15 @@ import { UserChip } from './UserChip';
 // are mono small-caps labels with a 1px amber underline on the active
 // route — never pills. The `§` UserChip routes to Settings.
 
+// ADR 0031: Fleet / Storage / Settings are operator surfaces — admin-only.
+// Members see only Sessions in the spine (they still reach their own user
+// settings via the profile menu). Tab-hiding is UX; the coordinator's
+// require_admin layer is the real gate.
 const SURFACES = [
-  { to: '/', label: 'Sessions', match: (p: string) => p === '/' || p.startsWith('/sessions') },
-  { to: '/fleet', label: 'Fleet', match: (p: string) => p.startsWith('/fleet') },
-  { to: '/storage', label: 'Storage', match: (p: string) => p.startsWith('/storage') },
-  { to: '/settings', label: 'Settings', match: (p: string) => p.startsWith('/settings') },
+  { to: '/', label: 'Sessions', adminOnly: false, match: (p: string) => p === '/' || p.startsWith('/sessions') },
+  { to: '/fleet', label: 'Fleet', adminOnly: true, match: (p: string) => p.startsWith('/fleet') },
+  { to: '/storage', label: 'Storage', adminOnly: true, match: (p: string) => p.startsWith('/storage') },
+  { to: '/settings', label: 'Settings', adminOnly: true, match: (p: string) => p.startsWith('/settings') },
 ];
 
 function shortId(id: string): string {
@@ -29,6 +34,8 @@ function shortId(id: string): string {
 export function NavSpine() {
   const { pathname } = useLocation();
   const params = useParams();
+  const isAdmin = useIsAdmin();
+  const surfaces = SURFACES.filter((s) => !s.adminOnly || isAdmin);
   // Sub-crumb only on the session-detail route (a child of Sessions).
   const sessionId = pathname.startsWith('/sessions/') ? params.id : undefined;
 
@@ -45,7 +52,7 @@ export function NavSpine() {
         </Link>
 
         <nav className="nav-tabs" aria-label="Primary">
-          {SURFACES.map((s) => (
+          {surfaces.map((s) => (
             <Link
               key={s.to}
               to={s.to}

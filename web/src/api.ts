@@ -1,6 +1,7 @@
 import type {
   AddRegistryRequest,
   AddRegistryResponse,
+  AdminUser,
   CreateSessionResponse,
   EnabledImageSummary,
   ImageRef,
@@ -8,6 +9,8 @@ import type {
   ListHostsResponse,
   ListRegistriesResponse,
   ListSessionsResponse,
+  Principal,
+  Role,
   Session,
   SessionCowStateResponse,
   SessionMode,
@@ -23,10 +26,28 @@ import type {
 // helpers build on the same base.
 export const API_BASE = '/api/v1';
 
+// ADR 0031: human auth is purely session-based — the HttpOnly session cookie
+// (OIDC mode), the IAP/forward-auth assertion (forward-auth mode), or nothing
+// (dev synthetic). We send `credentials: 'include'` so the cookie rides every
+// request and add NO Authorization header — the deployment bearer is for
+// machine callers only. A 401 means "not authenticated"; we hard-navigate to
+// the server-driven login (which 302s to the IdP, or straight back in
+// forward-auth/dev). Guard against redirect loops.
+let redirecting = false;
+function redirectToLogin(): never {
+  if (!redirecting) {
+    redirecting = true;
+    window.location.assign(`${API_BASE}/auth/login`);
+  }
+  throw new Error('unauthenticated');
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { Accept: 'application/json' },
+    credentials: 'include',
   });
+  if (res.status === 401) redirectToLogin();
   if (!res.ok) {
     throw new Error(`${path} → ${res.status} ${res.statusText}`);
   }
@@ -37,8 +58,10 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'include',
     body: JSON.stringify(body),
   });
+  if (res.status === 401) redirectToLogin();
   if (!res.ok) {
     // Surface the body as the error message — the coordinator's
     // ApiError serialises a useful message and the form needs it
@@ -56,7 +79,11 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function deleteEmpty(path: string): Promise<void> {
-  const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  if (res.status === 401) redirectToLogin();
   if (!res.ok) {
     let detail = '';
     try {
@@ -68,8 +95,44 @@ async function deleteEmpty(path: string): Promise<void> {
   }
 }
 
-export const fetchSessions = () =>
-  getJSON<ListSessionsResponse>('/sessions').then((r) => r.sessions);
+// ---- ADR 0031: identity ------------------------------------------------
+
+export const fetchMe = () => getJSON<Principal>('/me');
+
+export const saveClaudeToken = (token: string) =>
+  postJSON<void>('/me/claude-token', { token });
+
+/** Revoke the session cookie, then hard-navigate home (which 401s → login). */
+export const logout = async (): Promise<void> => {
+  await postJSON<void>('/auth/logout', {});
+  window.location.assign('/');
+};
+
+/** Admin: list users. The endpoint returns a bare array. */
+export const fetchUsers = () => getJSON<AdminUser[]>('/admin/users');
+
+// PATCH isn't covered by postJSON; do it explicitly.
+export const updateUser = async (
+  id: string,
+  patch: { role?: Role; active?: boolean },
+): Promise<AdminUser> => {
+  const res = await fetch(`${API_BASE}/admin/users/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(patch),
+  });
+  if (res.status === 401) redirectToLogin();
+  if (!res.ok) throw new Error((await res.text()) || `${res.status}`);
+  return res.json() as Promise<AdminUser>;
+};
+
+/** ADR 0031: owner-scoped. Members omit `scope` (their own); admins pass
+ * `'all'` for the fleet-wide view (rows carry owner identity). */
+export const fetchSessions = (scope?: 'mine' | 'all') =>
+  getJSON<ListSessionsResponse>(
+    `/sessions${scope ? `?scope=${scope}` : ''}`,
+  ).then((r) => r.sessions);
 
 export const fetchHosts = () =>
   getJSON<ListHostsResponse>('/hosts').then((r) => r.hosts);
@@ -108,7 +171,8 @@ export interface CreateSessionInput {
    * harnessed image's agent resident-but-undriven and use the
    * session as a shell-only dev VM. */
   mode?: SessionMode;
-  user_id?: string;
+  // ADR 0031: the owner is the authenticated principal (server-stamped); the
+  // client no longer supplies user_id.
   prompt?: string;
   /** Map of env-var name → value. Honored only for SecretMode::Literal images. */
   secrets?: Record<string, string>;

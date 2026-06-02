@@ -1,23 +1,23 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { logout } from '../api';
+import { useAuth } from '../auth/AuthProvider';
 
-// "Inkstamp" — the section-sign rune (§) embossed like a typesetter's
-// mark, not the gradient avatar of a generic SaaS. Click reveals a
-// small popover anchored beneath it.
+// The profile menu (ADR 0031). The chip shows the signed-in user's initial
+// embossed like a typesetter's mark (not a gradient SaaS avatar); click
+// reveals a popover with their display name + email, a link to *user*
+// settings, and a working "Sign out".
 //
 // Two placements: `inline` sits in the nav spine's right slot (the
-// four-surface IA); the default keeps the legacy fixed top-right
-// corner for any page rendered outside the spine.
-//
-// Auth isn't wired yet, so the popover just identifies the
-// deployment ("Local development") and links to /settings. When a
-// real user identity lands, the rune gets replaced with the user's
-// initial and the popover gains email + "Sign out".
+// four-surface IA); the default keeps the legacy fixed top-right corner for
+// any page rendered outside the spine.
 
 export function UserChip({ inline = false }: { inline?: boolean }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
+  const { principal } = useAuth();
+  const initial = (principal.display_name || principal.email).charAt(0).toUpperCase();
 
   // Dismiss on outside click + Escape.
   useEffect(() => {
@@ -65,10 +65,10 @@ export function UserChip({ inline = false }: { inline?: boolean }) {
           cursor: 'pointer',
         }}
       >
-        {/* §  the section sign — a typesetter's mark, fits the
-             notebook aesthetic without committing to an identity yet. */}
+        {/* The user's initial, set in the display face to match the
+            notebook aesthetic. */}
         <span style={{ fontStyle: 'italic', transform: 'translateY(-1px)' }}>
-          §
+          {initial}
         </span>
       </button>
 
@@ -91,26 +91,23 @@ export function UserChip({ inline = false }: { inline?: boolean }) {
           >
             <div className="px-4 pt-3 pb-3">
               <div
-                className="font-mono smallcaps text-[0.66rem]"
-                style={{
-                  color: 'var(--color-ink-quiet)',
-                  letterSpacing: '0.18em',
-                }}
+                className="font-display text-[0.95rem]"
+                style={{ color: 'var(--color-ink)' }}
               >
-                Local development
+                {principal.display_name || principal.email}
               </div>
               <div
-                className="font-display italic text-[0.85rem] mt-1"
-                style={{ color: 'var(--color-ink-faded)' }}
+                className="font-mono text-[0.76rem] mt-1"
+                style={{ color: 'var(--color-ink-quiet)' }}
               >
-                no auth wired
+                {principal.email}
               </div>
             </div>
             <hr />
             <ul className="py-1">
               <li>
                 <Link
-                  to="/settings"
+                  to="/settings/profile"
                   onClick={() => setOpen(false)}
                   className="block px-4 py-2 transition-colors"
                   style={{
@@ -129,17 +126,39 @@ export function UserChip({ inline = false }: { inline?: boolean }) {
                   Settings
                 </Link>
               </li>
-              <li
-                aria-disabled
-                className="block px-4 py-2 italic cursor-not-allowed"
-                style={{
-                  color: 'var(--color-ink-quiet)',
-                  fontSize: '0.92rem',
-                }}
-                title="Auth not wired in this deployment"
-              >
-                Sign out
-              </li>
+              {/* ADR 0031: sign-out is only meaningful in OIDC mode (an
+                  app-owned session cookie to revoke). Behind an edge proxy
+                  (IAP) or in dev synthetic-admin, every request is
+                  re-authenticated upstream, so hide the no-op control. */}
+              {principal.can_sign_out && (
+                <li>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpen(false);
+                      void logout();
+                    }}
+                    className="block w-full text-left px-4 py-2 italic transition-colors"
+                    style={{
+                      color: 'var(--color-ink)',
+                      fontSize: '0.92rem',
+                      background: 'none',
+                      border: 0,
+                      cursor: 'pointer',
+                    }}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLElement).style.backgroundColor =
+                        'var(--color-paper-warm)';
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLElement).style.backgroundColor =
+                        'transparent';
+                    }}
+                  >
+                    Sign out
+                  </button>
+                </li>
+              )}
             </ul>
           </motion.div>
         )}

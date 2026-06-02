@@ -35,6 +35,7 @@ members = [
     "crates/engram-storage-local",
     "crates/engram-storage-s3",
     "crates/engram-storage-gcs",
+    "crates/engram-auth",
     "workspace-hack",
 ]
 
@@ -75,6 +76,7 @@ engram-egress-proxy = { path = "crates/engram-egress-proxy" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-oci = { path = "crates/engram-oci" }
 engram-oci-auth = { path = "crates/engram-oci-auth" }
+engram-auth = { path = "crates/engram-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }
 engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
@@ -104,6 +106,9 @@ hyper = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 http = "1"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
+# JWT / JWKS verification for the auth seam (ADR 0031): OIDC ID-token
+# validation and the forward-auth signed-assertion (GCP IAP etc.) path.
+jsonwebtoken = "9"
 
 # grpc
 tonic = "0.12"

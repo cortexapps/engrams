@@ -1,10 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
 import { fetchSession, fetchSessions } from '../api';
 
-export function useSessions() {
+/** ADR 0031: owner-scoped. Members omit `scope` (their own); admins pass
+ * `'all'` for the fleet-wide view. The scope is part of the query key so the
+ * two views cache independently. */
+export function useSessions(scope?: 'mine' | 'all') {
   return useQuery({
-    queryKey: ['sessions'],
-    queryFn: fetchSessions,
+    queryKey: ['sessions', scope ?? 'mine'],
+    queryFn: () => fetchSessions(scope),
     refetchInterval: 1000,
     refetchOnWindowFocus: false,
     staleTime: 0,
