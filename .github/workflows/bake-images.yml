@@ -34,13 +34,19 @@ permissions:
   contents: read
   packages: write   # push to GHCR under this repo's namespace
 
-concurrency:
-  group: bake-images-${{ github.ref }}
-  cancel-in-progress: true
+# Concurrency is per-JOB, not workflow-wide. A workflow-wide group would
+# cancel an entire in-flight run on the next push to the ref — so a fast
+# web bake would die just because a slow coordinator bake (or any sibling)
+# was still going. Instead each build job owns its own group keyed by ref
+# (and, for the image matrix, by image), so a following SHA cancels only
+# the SAME unit being rebuilt and lets unrelated builds finish + deploy.
 
 jobs:
   detect:
     runs-on: ubuntu-latest
+    concurrency:
+      group: bake-detect-${{ github.ref }}
+      cancel-in-progress: true
     outputs:
       images: ${{ steps.lanes.outputs.images }}
       host_binaries: ${{ steps.lanes.outputs.host_binaries }}
@@ -84,6 +90,13 @@ jobs:
     if: needs.detect.outputs.images == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    # Per-IMAGE concurrency: a following SHA cancels only the same image's
+    # in-flight bake (`matrix.image` is in the group), never a sibling. A
+    # slow/cancelled coordinator bake no longer kills an already-running web
+    # bake — they supersede independently.
+    concurrency:
+      group: bake-image-${{ github.ref }}-${{ matrix.image }}
+      cancel-in-progress: true
 
     strategy:
       # Surface every image's failure independently — easier to debug.
@@ -149,6 +162,9 @@ jobs:
     if: needs.detect.outputs.host_image == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    concurrency:
+      group: bake-host-binaries-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v6
         with:
@@ -234,6 +250,9 @@ jobs:
     if: needs.detect.outputs.bundles == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    concurrency:
+      group: bake-bundles-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
@@ -323,6 +342,12 @@ jobs:
       needs.publish-bundles.result != 'failure' &&
       needs.publish-bundles.result != 'cancelled'
     runs-on: ubuntu-latest
+    # Only the latest run's notify should dispatch — a superseded run must
+    # not fire a stale deploy. (The old workflow-wide concurrency group used
+    # to guarantee this by cancelling the whole prior run.)
+    concurrency:
+      group: bake-notify-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Fire path-aware repository_dispatches at engrams-internal
         env:
