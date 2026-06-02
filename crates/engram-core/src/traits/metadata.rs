@@ -721,6 +721,30 @@ pub trait MetadataStore: Send + Sync {
     async fn bump_evac_attempts(&self, _session_id: SessionId) -> Result<u32, MetaError> {
         Ok(1)
     }
+
+    /// ADR 0029: fleet-wide snapshot totals for the Storage surface —
+    /// the count of `snapshots` rows and the sum of their
+    /// `size_bytes`. A single cheap aggregate query (the Storage page
+    /// polls on a slow cadence). Default zeros so non-PG mocks stay
+    /// quiet; the PG impl runs `SELECT count(*), coalesce(sum(...),0)`.
+    async fn snapshot_totals(&self) -> Result<SnapshotTotals, MetaError> {
+        Ok(SnapshotTotals::default())
+    }
+
+    /// ADR 0029: the number of chunks currently parked in
+    /// `chunk_gc_candidates` awaiting their grace window — the
+    /// "gc pending" rollup on the Storage surface. A cheap
+    /// `SELECT count(*)`; default `0` for non-PG mocks.
+    async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
+        Ok(0)
+    }
+}
+
+/// Fleet-wide snapshot aggregate from [`MetadataStore::snapshot_totals`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotTotals {
+    pub count: u64,
+    pub total_bytes: u64,
 }
 
 /// One row from [`MetadataStore::list_gc_candidates`]. Surfaced

@@ -1,6 +1,7 @@
 import type { CowStateView } from '../types';
 import { useSessionCowState } from '../hooks/useCowState';
 import { useSession } from '../hooks/useSessions';
+import { fmtAgo, fmtBytes, shortId as short } from '../format';
 
 // ADR 0016 Phase A: per-session COW diagnostic.
 //
@@ -13,37 +14,6 @@ import { useSession } from '../hooks/useSessions';
 // ADR 0029 moved the host-wide / fleet-wide COW view (the old
 // `HostCowState` toggle) onto the dedicated Storage surface as a
 // first-class durability ledger; only the per-session view lives here.
-
-function fmtBytes(n: number): string {
-  if (n === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  let value = n;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
-}
-
-function fmtAgo(iso: string | null): string {
-  if (!iso) return 'never';
-  const then = new Date(iso).getTime();
-  const now = Date.now();
-  const seconds = Math.max(0, Math.floor((now - then) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-function short(id: string): string {
-  if (id.length <= 12) return id;
-  return `${id.slice(0, 8)}…`;
-}
 
 function CowStateRow({ view }: { view: CowStateView }) {
   const localPct =

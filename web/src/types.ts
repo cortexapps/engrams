@@ -124,6 +124,38 @@ export interface CowStateView {
   last_snapshot_at: string | null;
 }
 
+// ---- ADR 0029: Storage surface summary --------------------------------
+//
+// Mirrors `engram_coordinator::api::storage::StorageSummaryResponse`.
+// Fleet-wide COW/chunk rollups + a per-sandbox durability ledger,
+// aggregated server-side from the per-host cow-state plus cheap
+// Postgres counts (snapshots, gc-candidates). "chunks stored" and
+// "dedup ratio" are intentionally absent — they'd need an O(objects)
+// blob-store walk, which we don't run on a polled endpoint.
+
+export interface DurabilityRow {
+  sandbox_id: string;
+  session_id: string | null;
+  host_id: string;
+  dirty_chunks: number;
+  dirty_bytes: number;
+  base_chunks: number;
+  base_chunks_local: number;
+  /** ISO-8601 of the last successful flush; `null` = never flushed. */
+  last_flush_at: string | null;
+}
+
+export interface StorageSummaryResponse {
+  snapshots: number;
+  snapshot_bytes: number;
+  gc_pending: number;
+  tracked_sandboxes: number;
+  dirty_chunks: number;
+  unflushed_bytes: number;
+  avg_locality_pct: number;
+  rows: DurabilityRow[];
+}
+
 export interface SessionCowStateResponse {
   session_id: string;
   /** `null` when the session has no live sandbox (Idle, HostLost,

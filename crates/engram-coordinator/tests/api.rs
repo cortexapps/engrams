@@ -1344,6 +1344,37 @@ async fn list_sessions_returns_empty_array_when_store_is_empty() {
 }
 
 #[tokio::test]
+async fn storage_summary_zeros_on_empty_fleet() {
+    // ADR 0029: with no registered hosts and an empty metadata store,
+    // the Storage surface's summary returns a well-formed all-zero
+    // shape — never `NaN`/null — so the page renders cleanly on a
+    // fresh deployment. The mock store's default `snapshot_totals` /
+    // `count_gc_candidates` supply the zeros.
+    let app = build_app(MockMetadataStore::arc());
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/storage/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp.into_body()).await;
+    assert_eq!(v["snapshots"], 0);
+    assert_eq!(v["snapshot_bytes"], 0);
+    assert_eq!(v["gc_pending"], 0);
+    assert_eq!(v["tracked_sandboxes"], 0);
+    assert_eq!(v["dirty_chunks"], 0);
+    assert_eq!(v["unflushed_bytes"], 0);
+    assert_eq!(v["avg_locality_pct"], 0);
+    assert_eq!(
+        v["rows"].as_array().expect("rows must be an array").len(),
+        0,
+    );
+}
+
+#[tokio::test]
 async fn list_sessions_returns_pending_active_and_idle_only() {
     // The endpoint mirrors `list_active_sessions` semantics: pending /
     // active / idle rows show up; completed / failed / evicted rows
