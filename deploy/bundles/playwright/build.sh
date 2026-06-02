@@ -91,14 +91,33 @@ build_tree() {
         shell_bin="$(find /out/ms-playwright -name headless_shell -type f | head -n1)"
         [ -n "$shell_bin" ] && collect "$shell_bin"
 
+        # 3b) Fonts + a minimal fontconfig. `ldd` collects libfontconfig but
+        # NOT the font FILES or config, so without this chromium renders text
+        # as fallback boxes (`Fontconfig error: Cannot load default config`)
+        # — useless for the visual demos this bundle exists for. Ship the
+        # liberation faces + a self-contained fonts.conf that points at them.
+        mkdir -p /out/fonts
+        cp /usr/share/fonts/truetype/liberation/*.ttf /out/fonts/ 2>/dev/null || true
+        cat > /out/fonts.conf <<"FONTS"
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/opt/engram/browser/fonts</dir>
+  <cachedir>/tmp/engram-fontconfig-cache</cachedir>
+  <config></config>
+</fontconfig>
+FONTS
+
         # 4) Launcher: sets the runtime env, then execs the MCP cli.
         cat > /out/launch-mcp <<"LAUNCH"
 #!/bin/sh
 # ADR 0027 playwright bundle launcher. Self-contained: points the dynamic
-# loader + Node + Playwright at the bundle so it runs on any glibc base.
+# loader + Node + Playwright + fontconfig at the bundle so it runs on any
+# glibc base at or above the build base glibc (see manifest.toml).
 here="/opt/engram/browser"
 export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
 export PLAYWRIGHT_BROWSERS_PATH="$here/ms-playwright"
+export FONTCONFIG_FILE="$here/fonts.conf"
 export PATH="$here/node/bin:$PATH"
 exec "$here/node/bin/node" "$here/node_modules/@playwright/mcp/cli.js" "$@"
 LAUNCH
