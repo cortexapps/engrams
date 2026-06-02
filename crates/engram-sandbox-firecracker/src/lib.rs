@@ -1388,25 +1388,31 @@ impl FirecrackerBackend {
         // ADR 0027: extra read-only host-mounted bundles (the skills /
         // playwright squashfs). Unlike the rootfs there is NO canonical
         // symlink dance — each `path_on_host` is already the fleet-wide
-        // canonical path (a stable symlink present identically on every
-        // host), so `state.bin` embeds it directly and restore re-anchors
-        // by mere presence. We assert presence here so a missing bundle
-        // fails with a clear message instead of an opaque FC virtio
-        // "No such file or directory" at InstanceStart.
+        // canonical path (present identically on every host once the FC-host
+        // image bakes it), so `state.bin` embeds it directly.
+        //
+        // ATTACH-IF-PRESENT, don't fail: this cold-create path is the
+        // base-snapshot capture (ADR 0020). If the bundle isn't staged on
+        // THIS host yet — a fresh CI e2e stack, or a host mid-rollout before
+        // the re-baked image lands — skip it and capture a snapshot WITHOUT
+        // the drive, rather than failing the enable. The snapshot then simply
+        // embeds no such drive (so restore never looks for it), and re-
+        // enabling the image once the bundle is staged attaches it. This is
+        // the same best-effort stance agentd takes on activation — a missing
+        // bundle must never brick image-enable or a session.
         for aux in &spec.aux_ro_drives {
             if !tokio::fs::try_exists(&aux.path_on_host)
                 .await
                 .unwrap_or(false)
             {
-                return Err(SandboxError::Vm(
-                    format!(
-                        "aux RO bundle {:?} ({}) not present on this host — \
-                         ensure the FC-host image baked it",
-                        aux.path_on_host.display(),
-                        aux.drive_id
-                    )
-                    .into(),
-                ));
+                tracing::warn!(
+                    drive_id = %aux.drive_id,
+                    path = %aux.path_on_host.display(),
+                    "ADR 0027: aux RO bundle not present on this capture host; \
+                     skipping — the snapshot won't carry it. Re-enable the image \
+                     once the FC-host image has staged the bundle.",
+                );
+                continue;
             }
             api.put_drive(&DriveConfig {
                 drive_id: aux.drive_id.clone(),
@@ -2326,25 +2332,29 @@ async fn restore_canonical_symlinks(
     // re-point.
     let _ = (stub_harness_override, new_sandbox_id, work_dir);
 
-    // ADR 0027: aux RO bundles re-anchor by presence, not by symlink.
-    // `state.bin` embedded each bundle's fleet-canonical path; FC's
-    // `load_snapshot` will reopen the drive there. The path is NOT
-    // per-sandbox (it's a stable host-wide symlink baked into the
-    // FC-host image), so there's nothing to recreate — but it MUST
-    // exist on this receiver or `load_snapshot` fails with an opaque
-    // virtio backend error. Assert presence up front for a clear
-    // message instead.
+    // ADR 0027: aux RO bundles re-anchor by presence — `state.bin` embeds
+    // each ATTACHED bundle's fleet-canonical path and FC's `load_snapshot`
+    // reopens the drive there. We only WARN on a missing path, never fail:
+    // this list is the *declared* `spec.aux_ro_drives`, but capture attaches
+    // a bundle only if it was present on the capture host (skip-if-absent
+    // above), so a declared-but-not-attached bundle is normal (CI / mid-
+    // rollout) and FC won't try to open it. If a bundle genuinely WAS
+    // attached and is missing here (a host mid-rollout receiving a snapshot
+    // from a bundled host), FC surfaces its own clear "No such file" with the
+    // path; this warn precedes it as a breadcrumb. Failing hard here would
+    // wrongly 500 session-create on hosts that never had the bundle.
     for aux in &manifest.spec.aux_ro_drives {
         if !tokio::fs::try_exists(&aux.path_on_host)
             .await
             .unwrap_or(false)
         {
-            return Err(SandboxError::Snapshot(format!(
-                "aux RO bundle {:?} ({}) embedded in the snapshot is not \
-                 present on this host — ensure the FC-host image baked it",
-                aux.path_on_host.display(),
-                aux.drive_id
-            )));
+            tracing::warn!(
+                drive_id = %aux.drive_id,
+                path = %aux.path_on_host.display(),
+                "ADR 0027: declared aux RO bundle absent on this restore host; \
+                 fine if the snapshot didn't attach it (captured without the \
+                 bundle), otherwise load_snapshot will fail on this path.",
+            );
         }
     }
     Ok(())
