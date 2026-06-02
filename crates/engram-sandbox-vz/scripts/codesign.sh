@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ad-hoc codesign engram-coordinator + engram-sandbox-vz test
+# Ad-hoc codesign engram-host-agent + engram-sandbox-vz test
 # binaries with the com.apple.security.virtualization entitlement.
 #
 # Without this, every VZ API call fails with NSError 7 "process
@@ -61,14 +61,7 @@ sign_if_needed() {
 count=0
 examined=0
 
-# Coordinator binary.
-BIN="target/$PROFILE/engram-coordinator"
-if [ -x "$BIN" ] && [ -f "$BIN" ]; then
-    sign_if_needed "$BIN"
-    examined=$((examined + 1))
-fi
-
-# Host-agent binary.
+# Host-agent binary (only component that uses VZ APIs in split mode).
 BIN="target/$PROFILE/engram-host-agent"
 if [ -x "$BIN" ] && [ -f "$BIN" ]; then
     sign_if_needed "$BIN"
