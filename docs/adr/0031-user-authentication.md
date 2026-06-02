@@ -86,6 +86,25 @@ Sessions and their own profile. Enforcement is a coord `AdminOnly` extractor (th
 gate); the web only hides tabs (UX). Now: roles come from a config bootstrap-admin email
 allowlist + manual promotion via `PATCH /admin/users/:id`. Later: SCIM groups.
 
+### 4a. Sessions are private to their owner
+
+A session belongs to the user who created it (`sessions.user_id`, now server-stamped
+from the principal — §6). Visibility is scoped by that ownership:
+
+- A **member** sees and can act on **only their own** sessions. The Sessions list is
+  filtered to `user_id = principal`, and every per-session route (`GET /sessions/:id`,
+  prompt, exec, shell, events, delete, resume) is gated by an ownership check — a member
+  requesting another user's session id gets `404` (not `403`, to avoid confirming the id
+  exists).
+- An **admin** gets two views: **their own** sessions and **everyone's** (or just
+  *others'*). The list endpoint takes a `scope = mine | all | others` query param;
+  `all`/`others` require admin, and per-session access is unrestricted for admins.
+
+Enforcement is server-side (the real gate). The web mirrors it: members see a single
+"My sessions" list; admins get a "Mine / Everyone" switch on the Sessions surface. This is
+an authorization rule, not a convenience — the ownership check lives in the coordinator's
+session handlers, keyed on the resolved `Principal`.
+
 ### 5. Dev runs with a synthetic admin
 
 When no SSO is configured (`AuthMode::None`), the verifier chain ends in `SyntheticAdmin`,
@@ -150,6 +169,9 @@ targets *user* settings. `NavSpine` hides Fleet / Storage / admin-Settings for m
   client-supplied `user_id` (now server-stamped from the principal).
 - `EnabledImageSummary` gains a `harness_builtin` field so the web can gate create on the
   built-in-Claude case reliably.
+- Session list + per-session routes gain owner-scoping: members see only their own
+  sessions (others' ids → 404); admins get a `scope = mine | all | others` switch. The
+  Sessions web surface renders a Mine/Everyone toggle for admins.
 - Risk: forgetting to keep host/internal routes on the bearer path would break the
   control plane; the router split is the mitigation. Cookie `Secure` must be config-gated
   off for http-localhost dev. OIDC state/PKCE/nonce must be validated to prevent CSRF.
