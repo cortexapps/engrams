@@ -45,6 +45,18 @@ built-in-Claude sessions (never prompted per session):
 
 ![Token panel](assets/0031/05-token-panel.png)
 
+**Member (non-admin) view** — the *same* account demoted to `member` via
+`PATCH /admin/users`: the nav collapses to **Sessions only** (no Fleet /
+Storage / Settings), and there's no My/All scope toggle (a member only ever
+sees their own sessions):
+
+![Sessions, member](assets/0031/06-sessions-member.png)
+
+**Member Settings** — only Profile + Claude token (no Images / Registries);
+role reads `member`:
+
+![Settings, member](assets/0031/07-settings-member.png)
+
 ## Context
 
 engrams has no user identity. The coordinator authenticates every request against a
