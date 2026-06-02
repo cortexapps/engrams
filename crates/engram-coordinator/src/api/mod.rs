@@ -16,6 +16,7 @@ pub(crate) mod forge;
 mod health;
 mod host_http;
 mod hosts;
+mod interrupt;
 mod prompt;
 mod registries;
 pub(crate) mod session_auth;
@@ -65,6 +66,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/resume", post(snapshot::resume))
         .route("/sessions/:id/local", delete(snapshot::evict_local))
         .route("/sessions/:id/prompt", post(prompt::prompt))
+        .route("/sessions/:id/interrupt", post(interrupt::interrupt))
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         // ADR 0016 Phase A: per-session COW diagnostic.

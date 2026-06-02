@@ -252,6 +252,10 @@ export type SessionEvent =
       at: string;
     }
   | { type: 'run_completed'; run_id: string; ok: boolean; at: string }
+  // ADR 0030: the in-flight run was stopped by an operator interrupt
+  // (`POST /sessions/:id/interrupt`). The session stays alive; the
+  // transcript renders an "interrupted" receipt and the run closes.
+  | { type: 'run_interrupted'; run_id: string; at: string }
   | { type: 'harness_idle'; at: string }
   | {
       type: 'pull_request_opened';

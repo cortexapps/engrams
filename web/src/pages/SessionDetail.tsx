@@ -1,5 +1,6 @@
 import { useParams } from 'react-router-dom';
 import { useEffect, useState } from 'react';
+import { interruptSession } from '../api';
 import { useSession } from '../hooks/useSessions';
 import { useSessionEvents } from '../hooks/useSessionEvents';
 import { StatusGlyph } from '../components/Glyph';
@@ -104,7 +105,23 @@ export function SessionDetail() {
 
       {tab === 'transcript' && (
         <>
-          <Transcript events={events} sessionId={id ?? ''} />
+          <Transcript
+            events={events}
+            sessionId={id ?? ''}
+            onStop={
+              id
+                ? () => {
+                    // Fire-and-forget: the run_interrupted event arrives
+                    // over the SSE stream and updates the transcript. A
+                    // 409 (no live sandbox) is benign — the run already
+                    // ended — so we just log it.
+                    interruptSession(id).catch((err) =>
+                      console.warn('interrupt failed', err),
+                    );
+                  }
+                : undefined
+            }
+          />
           {id && <PromptComposer sessionId={id} status={session?.status} />}
         </>
       )}

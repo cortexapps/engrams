@@ -123,6 +123,15 @@ export const sendPrompt = (sessionId: string, text: string) =>
     { text },
   );
 
+// ADR 0030: operator interrupt — stop the in-flight run while keeping
+// the session alive. The `run_interrupted` event flows back over the
+// SSE stream; this just triggers the stop.
+export const interruptSession = (sessionId: string) =>
+  postJSON<{ session_id: string; note: string }>(
+    `/sessions/${sessionId}/interrupt`,
+    {},
+  );
+
 // ---- Settings · Registries ---------------------------------------------
 
 export const fetchRegistries = () =>

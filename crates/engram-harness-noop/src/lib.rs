@@ -143,6 +143,11 @@ where
                     // Idle. Tests for the prompt path use
                     // engram-harness-claude or a fixture noop.
                 }
+                Ok(HarnessFrame::Command(HarnessCommand::Interrupt)) => {
+                    // Noop has no in-flight child to SIGINT — nothing
+                    // to interrupt. A real adapter stops its current
+                    // run and emits RunInterrupted + Idle.
+                }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.
                 }

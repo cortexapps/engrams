@@ -60,6 +60,7 @@ export function subscribeSession(
     'tool_call_started',
     'tool_call_completed',
     'run_completed',
+    'run_interrupted',
     'harness_idle',
     'pull_request_opened',
     'file_shared',

@@ -20,6 +20,7 @@ engram-harness-proto.workspace = true
 engram-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 tokio = { workspace = true, features = ["process", "io-util", "rt", "macros", "time", "sync", "fs", "net"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

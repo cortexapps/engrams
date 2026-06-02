@@ -45,6 +45,7 @@
     --border-faint: var(--color-rule-faint);
     --accent-now: var(--color-amber); /* live / recent / primary action */
     --accent-archived: var(--color-verdigris); /* idle / snapshotted / durable */
+    --link: var(--color-amber); /* hyperlinks in rendered Markdown */
 
     /* Motion — calm, paper-like, no bounces. */
     --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -835,4 +836,261 @@ select.ledger-input {
   .rollup-num {
     font-size: 1.4rem;
   }
+}
+
+/* ===== conversation redesign (ADR 0030) ================================= */
+
+/* user turn — a RIGHT-ALIGNED contained block (the familiar "this is you"
+ * signal from chat UIs) but square + flat + paper-warm, not a rounded pill, so
+ * it stays in the lab-notebook system. Assistant prose stays full-width left;
+ * the left/right asymmetry reads the turn-taking at a glance. */
+.user-turn {
+  display: flex;
+  justify-content: flex-end;
+  margin: 1.6rem 0 1.2rem;
+}
+.user-bubble {
+  max-width: min(34rem, 80%);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  padding: 0.7rem 1rem 0.8rem;
+}
+.user-bubble-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 0.4rem;
+}
+.user-turn-label {
+  color: var(--fg-quiet);
+}
+.user-turn-sigil {
+  font-family: var(--font-display);
+  font-style: italic;
+  color: var(--fg-muted);
+}
+.user-bubble-time {
+  font-size: 0.72rem;
+  color: var(--fg-quiet);
+}
+.user-turn-text {
+  font-family: var(--font-display);
+  font-size: 1.04rem;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  text-wrap: pretty;
+}
+
+/* markdown — final assistant output renders as Markdown, styled in-system */
+.prose.md > :first-child {
+  margin-top: 0;
+}
+.prose.md p {
+  margin: 0 0 0.7rem;
+}
+.prose.md p:last-child {
+  margin-bottom: 0;
+}
+.md-h {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 1.1rem 0 0.5rem;
+  color: var(--fg);
+}
+h1.md-h {
+  font-size: 1.4rem;
+  font-style: italic;
+}
+h2.md-h {
+  font-size: 1.2rem;
+}
+h3.md-h,
+h4.md-h,
+h5.md-h,
+h6.md-h {
+  font-size: 1.04rem;
+}
+.md-ul,
+.md-ol {
+  margin: 0 0 0.7rem;
+  padding-left: 1.4rem;
+}
+.md-ul {
+  list-style: square;
+}
+.md-ol {
+  list-style: decimal;
+}
+.md-ul li,
+.md-ol li {
+  margin: 0.15rem 0;
+  padding-left: 0.2rem;
+}
+.md-code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-faint);
+  padding: 0.05em 0.35em;
+}
+.md-pre {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  padding: 0.7rem 0.9rem;
+  margin: 0 0 0.8rem;
+  overflow-x: auto;
+  white-space: pre;
+}
+.md-pre code {
+  font-family: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+.md-link {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.15em;
+}
+.md-quote {
+  margin: 0 0 0.7rem;
+  padding-left: 0.9rem;
+  border-left: 2px solid var(--border);
+  color: var(--fg-muted);
+  font-style: italic;
+}
+.md-hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 1rem 0;
+}
+
+/* run summary — a faint per-run receipt (read N · edited N · ran N · 18s) */
+.run-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0.9rem 0 1.4rem 0.25rem;
+}
+.run-summary-mark {
+  color: var(--fg-quiet);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+.run-summary-text {
+  font-size: 0.72rem;
+  color: var(--fg-quiet);
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+
+/* process — shell vocabulary ($ command), exit dot, duration, expandable output.
+ * Distinct from the bracketed tool-call asides: tools are [ … ], processes $ … */
+.process {
+  margin: 0.5rem 0 0.5rem 0.25rem;
+}
+.process-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  background: none;
+  border: 0;
+  width: 100%;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  color: var(--fg-muted);
+}
+.process-dollar {
+  color: var(--fg-quiet);
+}
+.process-cmd {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.process-meta {
+  color: var(--fg-quiet);
+  white-space: nowrap;
+}
+.process-toggle {
+  color: var(--fg-quiet);
+}
+.process-output {
+  margin: 0.4rem 0 0 1.4rem;
+  padding: 0.6rem 0.8rem;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* durability marker — the snapshot/resume rhythm, centered + faint */
+.durability-marker {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.55rem;
+  margin: 1.4rem 0;
+  color: var(--fg-quiet);
+}
+.durability-label {
+  letter-spacing: 0.14em;
+  color: var(--accent-archived);
+  white-space: nowrap;
+}
+.durability-time {
+  font-size: 0.72rem;
+  color: var(--fg-quiet);
+}
+
+/* harness-waiting indicator — looping mark + context-aware gerund, where the
+ * reply will land, while we wait for the harness to speak. */
+.harness-waiting {
+  position: relative;
+  margin: 1.25rem 0;
+  padding: 0.3rem 0;
+}
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.thinking-mark {
+  display: inline-flex;
+  transform: translateY(1px);
+}
+.thinking-verb {
+  letter-spacing: 0.14em;
+  color: var(--fg-quiet);
+  white-space: nowrap;
+}
+.stop-btn {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--accent-now);
+  letter-spacing: 0.12em;
+  padding: 0 0 0 0.4rem;
+  white-space: nowrap;
+  transition: opacity var(--dur-fast);
+}
+.stop-btn:hover {
+  opacity: 0.7;
 }
