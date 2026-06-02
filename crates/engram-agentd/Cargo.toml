@@ -26,6 +26,8 @@ engram-transport.workspace = true
 # SessionId for the in-guest `forge-*` client subcommands.
 engram-harness-proto.workspace = true
 engram-core.workspace = true
+# ADR 0027: activate RO skill/MCP bundles into the harness discovery paths.
+engram-session-bundles.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

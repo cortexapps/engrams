@@ -797,6 +797,7 @@ dependencies = [
  "clock-steering",
  "engram-core",
  "engram-harness-proto",
+ "engram-session-bundles",
  "engram-telemetry",
  "engram-transport",
  "nix 0.29.0",
@@ -1380,6 +1381,14 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-session-bundles"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
  "workspace-hack",
 ]
 

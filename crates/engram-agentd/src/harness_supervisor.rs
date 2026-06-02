@@ -84,6 +84,22 @@ impl HarnessSupervisor {
         // dev_vm sessions deliver it on an empty-argv probe and never spawn
         // a harness, but their exec/shell processes still inherit it.
         *self.session_env.write().expect("session_env lock poisoned") = req.session_env.clone();
+
+        // ADR 0027: wire whatever RO bundles the init shim mounted (the
+        // skills / playwright squashfs) into the harness's skill/MCP
+        // discovery paths, gated by the session env. Done before the
+        // readiness-probe early return too, so a dev_vm session's exec/shell
+        // also see `share-file` et al. `root = /` — we're in the guest.
+        // Best-effort: this never returns an error, and we don't let a
+        // failure here block the spawn.
+        let report = engram_session_bundles::activate(std::path::Path::new("/"), &req.session_env);
+        if !report.activated.is_empty() {
+            tracing::info!(activated = ?report.activated, "ADR 0027: activated session bundles");
+        }
+        for w in &report.warnings {
+            tracing::warn!(warning = %w, "ADR 0027: session bundle activation");
+        }
+
         if req.argv.is_empty() {
             tracing::debug!("SpawnHarness with empty argv — readiness probe; no spawn");
             return Ok(None);

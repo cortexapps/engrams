@@ -1394,7 +1394,10 @@ impl FirecrackerBackend {
         // fails with a clear message instead of an opaque FC virtio
         // "No such file or directory" at InstanceStart.
         for aux in &spec.aux_ro_drives {
-            if !tokio::fs::try_exists(&aux.path_on_host).await.unwrap_or(false) {
+            if !tokio::fs::try_exists(&aux.path_on_host)
+                .await
+                .unwrap_or(false)
+            {
                 return Err(SandboxError::Vm(
                     format!(
                         "aux RO bundle {:?} ({}) not present on this host — \

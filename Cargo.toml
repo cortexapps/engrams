@@ -15,6 +15,7 @@ members = [
     "crates/engram-sandbox-firecracker",
     "crates/engram-sandbox-process",
     "crates/engram-sandbox-vz",
+    "crates/engram-session-bundles",
     "crates/engram-cloud-gcp",
     "crates/engram-cloud-static",
     "crates/engram-cloud-mock",
@@ -62,6 +63,7 @@ engram-harness-proto = { path = "crates/engram-harness-proto" }
 engram-transport = { path = "crates/engram-transport" }
 engram-host-agent = { path = "crates/engram-host-agent" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
+engram-session-bundles = { path = "crates/engram-session-bundles" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
 engram-git-dev = { path = "crates/engram-git-dev" }

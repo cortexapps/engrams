@@ -191,13 +191,17 @@ async fn run_scenario(env: &common::FcEnv, roll: bool, expected_post_resume: &[u
     } else {
         "AAAA"
     };
-    let want_count = post_resume_lines.iter().filter(|l| l.contains(want)).count();
+    let want_count = post_resume_lines
+        .iter()
+        .filter(|l| l.contains(want))
+        .count();
     let other_count = post_resume_lines
         .iter()
         .filter(|l| l.contains(other))
         .count();
     assert_eq!(
-        want_count, 5,
+        want_count,
+        5,
         "expected all 5 post-resume reads to return {want} (roll={roll}); \
          got want={want_count} other={other_count} in:\n{}",
         post_resume_lines.join("\n"),
