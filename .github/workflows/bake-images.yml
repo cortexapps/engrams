@@ -48,6 +48,7 @@ jobs:
       host_image: ${{ steps.lanes.outputs.host_image }}
       tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
       bundles: ${{ steps.lanes.outputs.bundles }}
+      dev_image: ${{ steps.lanes.outputs.dev_image }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -333,6 +334,7 @@ jobs:
           HOST_BASE_CHANGED: ${{ needs.detect.outputs.host_base }}
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
           BUNDLES_CHANGED: ${{ needs.detect.outputs.bundles }}
+          DEV_IMAGE_CHANGED: ${{ needs.detect.outputs.dev_image }}
         run: |
           set -euo pipefail
           fire() {
@@ -369,10 +371,18 @@ jobs:
           if [[ "$BUNDLES_CHANGED" == "true" ]]; then
             fire engrams-bundles-changed
           fi
+          # ADR 0027: auto-rebake the dev-engrams dogfood session image when
+          # any source it builds moved. This only triggers the bake; ENABLING
+          # the freshly-baked image (POST /api/enabled-images) stays a manual
+          # step by design — auto-enable is a separate decision.
+          if [[ "$DEV_IMAGE_CHANGED" == "true" ]]; then
+            fire engrams-dev-image-changed
+          fi
           if [[ "$CONTAINERS_CHANGED" != "true" \
              && "$HOST_BINARIES_CHANGED" != "true" \
              && "$HOST_BASE_CHANGED" != "true" \
              && "$TF_CHANGED" != "true" \
-             && "$BUNDLES_CHANGED" != "true" ]]; then
+             && "$BUNDLES_CHANGED" != "true" \
+             && "$DEV_IMAGE_CHANGED" != "true" ]]; then
             echo "No deploy-relevant paths changed in this push; skipping dispatches."
           fi
