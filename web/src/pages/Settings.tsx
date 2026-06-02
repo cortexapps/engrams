@@ -1,5 +1,6 @@
 import { motion } from 'framer-motion';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
+import { useIsAdmin } from '../auth/AuthProvider';
 
 // Settings surface — aligned to the nav spine like Fleet / Storage /
 // Sessions (ADR 0030). It uses the same wide measure (`book-wide`) and
@@ -29,30 +30,45 @@ interface Tab {
    * Helps when the page label alone doesn't carry the section's
    * purpose. */
   hint: string;
+  /** ADR 0031: admin-only (global config) vs user settings (everyone). */
+  adminOnly: boolean;
 }
 
 const TABS: Tab[] = [
+  // User settings — every authenticated user.
+  {
+    to: 'profile',
+    label: 'Profile',
+    hint: 'Your signed-in identity',
+    adminOnly: false,
+  },
+  {
+    to: 'tokens',
+    label: 'Claude token',
+    hint: 'Your Claude Code OAuth token — saved once, used for every session',
+    adminOnly: false,
+  },
+  // Admin settings — global config.
   {
     to: 'images',
     label: 'Images',
     hint: 'Curated OCI image URIs sessions may reference',
+    adminOnly: true,
   },
   {
     to: 'registries',
     label: 'Registries',
     hint: 'Docker registry credentials, sealed under the deployment KEK',
-  },
-  {
-    to: 'profile',
-    label: 'Profile',
-    hint: 'Identity for this deployment',
+    adminOnly: true,
   },
 ];
 
 export function Settings() {
   const location = useLocation();
-  const active = TABS.find((t) => location.pathname.endsWith(`/${t.to}`));
-  const sub = active?.hint ?? 'Configuration for this deployment';
+  const isAdmin = useIsAdmin();
+  const tabs = TABS.filter((t) => !t.adminOnly || isAdmin);
+  const active = tabs.find((t) => location.pathname.endsWith(`/${t.to}`));
+  const sub = active?.hint ?? 'Your settings';
 
   return (
     <main className="book-wide surface">
@@ -71,7 +87,7 @@ export function Settings() {
         </div>
       </div>
 
-      <TabRow />
+      <TabRow tabs={tabs} />
 
       <div className="mt-10">
         <Outlet />
@@ -80,14 +96,14 @@ export function Settings() {
   );
 }
 
-function TabRow() {
+function TabRow({ tabs }: { tabs: Tab[] }) {
   return (
     <nav
       aria-label="Settings sections"
       className="flex gap-6 items-baseline"
       style={{ fontFamily: 'var(--font-display)' }}
     >
-      {TABS.map((tab, i) => (
+      {tabs.map((tab, i) => (
         <div key={tab.to} className="flex items-baseline gap-6">
           {i > 0 && (
             <span

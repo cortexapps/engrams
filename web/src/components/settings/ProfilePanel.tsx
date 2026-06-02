@@ -1,15 +1,15 @@
-// Placeholder for the eventual user-profile surface. Today the
-// coordinator has no notion of a logged-in user — the bearer-token
-// auth in `cfg.auth_tokens` is a deployment-wide allowlist, not a
-// per-user identity. When a real auth model lands (GitHub App,
-// OIDC, etc.), this panel grows to show the user's email, group
-// memberships, and any per-user settings (default harness, default
-// image, etc.).
-//
-// For now we just acknowledge the gap so the route doesn't 404 and
-// the navigation feels complete.
+// ADR 0031 user setting: the signed-in identity. Reads the resolved principal
+// (email, display name, role) from the auth context. Role/membership are
+// driven by the IdP (JIT now, SCIM later) + admin promotion, so they're shown
+// read-only here; the Claude token lives on its own sub-tab.
+
+import { Link } from 'react-router-dom';
+import { useAuth } from '../../auth/AuthProvider';
 
 export function ProfilePanel() {
+  const { principal } = useAuth();
+  const initial = (principal.display_name || principal.email).charAt(0).toUpperCase();
+
   return (
     <section>
       <header className="mb-6 flex items-baseline justify-between">
@@ -23,36 +23,79 @@ export function ProfilePanel() {
           className="font-display italic text-[0.8rem]"
           style={{ color: 'var(--color-ink-quiet)' }}
         >
-          deployment-wide auth, not per-user — yet
+          signed in
         </p>
       </header>
 
-      <div className="py-12 text-center" style={{ minHeight: '14rem' }}>
-        <p
-          className="font-display italic"
-          style={{ fontSize: '1.4rem', color: 'var(--color-ink-faded)' }}
-        >
-          no identity yet.
-        </p>
-        <p
-          className="font-display italic text-[0.95rem] mt-3"
-          style={{ color: 'var(--color-ink-quiet)', maxWidth: '36rem' }}
-        >
-          Engram authenticates clients with a deployment-wide bearer token
-          configured at coordinator startup — there's no user identity to
-          render here. Per-user auth (GitHub App / OIDC) lands with the
-          first hosted deployment.
-        </p>
-        <p
-          className="font-mono smallcaps text-[0.7rem] mt-8"
+      <div className="flex items-center gap-4 mb-8">
+        <div
+          className="grid place-items-center font-mono"
           style={{
-            color: 'var(--color-ink-quiet)',
-            letterSpacing: '0.18em',
+            width: '3rem',
+            height: '3rem',
+            borderRadius: '0.4rem',
+            background: 'var(--color-paper-warm)',
+            border: '1px solid var(--color-rule)',
+            color: 'var(--color-ink)',
+            fontSize: '1.2rem',
           }}
+          aria-hidden
         >
-          ENGRAM_AUTH_TOKENS · deployment KEK · Postgres
-        </p>
+          {initial}
+        </div>
+        <div>
+          <div className="font-display" style={{ fontSize: '1.2rem', color: 'var(--color-ink)' }}>
+            {principal.display_name || principal.email}
+          </div>
+          <div
+            className="font-mono text-[0.82rem]"
+            style={{ color: 'var(--color-ink-quiet)' }}
+          >
+            {principal.email}
+          </div>
+        </div>
       </div>
+
+      <dl className="space-y-3" style={{ maxWidth: '34rem' }}>
+        <Row label="role">
+          <span style={{ color: 'var(--color-ink)' }}>{principal.role}</span>
+          {principal.is_admin && (
+            <span
+              className="font-display italic text-[0.8rem] ml-2"
+              style={{ color: 'var(--color-ink-quiet)' }}
+            >
+              · sees fleet, storage &amp; global settings
+            </span>
+          )}
+        </Row>
+        <Row label="Claude token">
+          {principal.has_claude_token ? (
+            <span style={{ color: 'var(--color-ink)' }}>saved</span>
+          ) : (
+            <Link
+              to="/settings/tokens"
+              className="font-display italic"
+              style={{ color: 'var(--color-amber)' }}
+            >
+              not saved — add one →
+            </Link>
+          )}
+        </Row>
+      </dl>
     </section>
+  );
+}
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="grid items-baseline gap-x-4" style={{ gridTemplateColumns: '8rem 1fr' }}>
+      <dt
+        className="font-mono smallcaps text-[0.7rem]"
+        style={{ color: 'var(--color-ink-quiet)', letterSpacing: '0.12em' }}
+      >
+        {label}
+      </dt>
+      <dd className="font-display text-[0.95rem]">{children}</dd>
+    </div>
   );
 }
