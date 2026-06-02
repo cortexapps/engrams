@@ -1,6 +1,15 @@
 # ADR 0026: Session file artifacts — agent media sharing + operator file pull
 
-Status: 2026-06-01 — **Proposed.**
+Status: 2026-06-01 — **Accepted.** Shipped + prod-validated. Merged as `ab16870`
+(#53); the auto-deploy rolled the prod coord (migration 0045 applied, `artifacts`
+table live) and the FC-host MIG (2 new hosts with the `/api/hosts/upload` relay).
+Dogfooded end-to-end on prod against a `dev-engrams` `dev_vm` session: a real
+in-guest `engram-share` stored an `image/png` (→ `artifacts/<session>/<uuid>` in
+GCS + `file_shared` event + servable bytes), the untrusted magic-byte allowlist
+rejected a `.png`-named non-media file, and the trusted operator `from-path` pull
+captured an arbitrary file (`application/octet-stream`). Also verified earlier on
+the dev-VM (real microVM boot, >16 MiB body over vsock) + CI. _Original proposal
+below._
 
 We want autonomous agents to **show their work** — surface a screenshot or screen
 recording in the session's conversation history in the web dashboard — and we want
@@ -155,8 +164,19 @@ but leaves the blob (acceptable for v1; an artifacts-GC is deferred).
   `run-boot-test.sh`); ADR commit chain.
 - `33bfe1d` — phase 8 fixup: rustfmt + clippy `type_complexity` on the
   Linux-gated e2e (only surfaced on the Linux CI runner; see verification note).
-- _(final, post-merge)_ — flip to **Accepted** once prod-validated (dogfood: an
-  agent screenshots a page and it renders in the conversation UI).
+- `ab16870` — squash-merge of #53 to `main`. Auto-deploy rolled the prod coord
+  (helm) + FC-host MIG (bake-fc-host-image → tf-apply; 2 new hosts). The OSS
+  `bake-demo-image` job also republished `demo`/`demo-claude` from the merged code;
+  `dev-engrams` re-baked via engrams-internal `bake-dev-engrams`. Both session
+  images re-enabled on prod (`POST /api/enabled-images`) and prod-dogfooded.
+- _(this commit)_ — flip to **Accepted** + prod-validation note.
+
+**Prod rollout note.** One environmental snag, unrelated to the feature: the cold
+OCI cache on the freshly-rolled hosts threw GHCR 429s during the `dev-engrams`
+enable (9.5 GB image) — converged on retry as the chunk cache filled (known
+behavior). The dev-VM `just dev` path separately needed `modprobe nbd` to serve a
+chunked rootfs (a bootstrap gap; prod hosts already load it) — worth adding to the
+dev-vm `bootstrap-remote`.
 
 **Notes / divergences.**
 - Adding the three `MetadataStore` artifact methods fanned out to **7 impls** (the
