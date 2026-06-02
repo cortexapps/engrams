@@ -262,6 +262,32 @@ pub(crate) async fn resolve_session_env(
             );
         }
     }
+
+    // ADR 0031: re-apply the owner's git attribution + auto-injected Claude
+    // token on resume (the per-resume harness child is a fresh process, so it
+    // needs these in its env again). Keyed on the session's stored owner;
+    // best-effort — an unparseable/legacy user_id or missing auth runtime just
+    // skips it.
+    if let (Some(rt), Some(uid_str)) = (state.auth.as_ref(), session.user_id.as_ref()) {
+        if let Ok(uuid) = uid_str.parse::<uuid::Uuid>() {
+            match rt.users.get_user(engram_core::UserId(uuid)).await {
+                Ok(user) => {
+                    let principal = user.to_principal();
+                    env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+                    env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+                    let harness = bundle.as_ref().and_then(|b| b.manifest.harness.as_ref());
+                    inject_user_claude_token(state, &principal, harness, session.mode, &mut env)
+                        .await;
+                }
+                Err(e) => tracing::warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "resolve_session_env: owner lookup failed; resume env omits attribution + token",
+                ),
+            }
+        }
+    }
+
     (bundle, env)
 }
 
@@ -383,7 +409,9 @@ pub struct CreateSessionRequest {
     /// run is gone (the harness is baked at image-bake time).
     #[serde(default)]
     pub mode: SessionMode,
-    pub user_id: Option<String>,
+    // ADR 0031: `user_id` is no longer client-supplied — the owner is stamped
+    // server-side from the authenticated principal (closes a trivial
+    // impersonation hole).
     /// Initial prompt for the agent. Only meaningful when
     /// `mode = Agent` and the image carries a `[harness]` block;
     /// the API rejects with 400 when set alongside `mode = DevVm`
@@ -419,10 +447,11 @@ pub struct CreateSessionResponse {
 #[tracing::instrument(name = "session.create", skip_all)]
 pub async fn create_session(
     state: State<SharedState>,
+    current: crate::api::principal::CurrentUser,
     req: Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let start = std::time::Instant::now();
-    let result = create_session_inner(state, req).await;
+    let result = create_session_inner(state, current, req).await;
     let elapsed = start.elapsed().as_secs_f64();
     let outcome = match &result {
         Ok(_) => "success",
@@ -456,6 +485,7 @@ pub async fn create_session(
 
 async fn create_session_inner(
     State(state): State<SharedState>,
+    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     // -------- 0. Validate orthogonal axes --------
@@ -543,7 +573,8 @@ async fn create_session_inner(
     let spec = SessionSpec {
         image: req.image.clone(),
         mode: req.mode,
-        user_id: req.user_id,
+        // ADR 0031: owner is the authenticated principal, server-stamped.
+        user_id: Some(principal.user_id.to_string()),
     };
 
     // -------- 3. Mint a SessionId (no DB write yet) --------
@@ -645,6 +676,18 @@ async fn create_session_inner(
     // own env instead of the cached session env. See `AgentSpec::session_env`.
     let mut session_env = spec_env.clone();
     session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
+
+    // ADR 0031: attribute git commits inside the session to the initiating
+    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`.
+    session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+    session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+
+    // ADR 0031: for built-in Claude sessions, auto-inject the user's saved
+    // Claude Code OAuth token — we never prompt per-session. Best-effort: a
+    // missing/unopenable token must not fail create (the harness then falls
+    // back to its own login path; the web gates create on a saved token).
+    inject_user_claude_token(&state, &principal, manifest.harness.as_ref(), req.mode, &mut session_env)
+        .await;
 
     let mut agent_for_session = resolve_harness(
         &state,
@@ -1032,6 +1075,44 @@ async fn try_restore_base_snapshot(
         .host_registry
         .restore_base_for_session(&ctx, metadata, session_env)
         .await
+}
+
+/// ADR 0031: inject the initiating user's saved Claude Code OAuth token into
+/// the session env, but only when the resolved harness is built-in Claude and
+/// the session drives it (agent mode). Best-effort — a missing or unopenable
+/// token is logged, never fatal, so the harness can still fall back to its own
+/// login path. Shared by the create and resume paths.
+async fn inject_user_claude_token(
+    state: &SharedState,
+    principal: &engram_core::types::user::Principal,
+    harness: Option<&engram_core::types::image::HarnessManifest>,
+    mode: SessionMode,
+    session_env: &mut std::collections::HashMap<String, String>,
+) {
+    let is_builtin_claude =
+        harness.and_then(|h| h.name.as_deref()) == Some("claude") && !mode.is_dev_vm();
+    if !is_builtin_claude {
+        return;
+    }
+    let Some(rt) = state.auth.as_ref() else {
+        return;
+    };
+    let kind = engram_core::types::user::UserToken::KIND_CLAUDE_OAUTH;
+    match rt.users.get_user_token(principal.user_id, kind).await {
+        Ok(Some(tok)) => match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await
+        {
+            Ok(plain) => {
+                session_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), plain);
+            }
+            Err(e) => {
+                tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token")
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(user_id = %principal.user_id, error = %e, "could not load saved Claude token")
+        }
+    }
 }
 
 pub async fn get_session(
