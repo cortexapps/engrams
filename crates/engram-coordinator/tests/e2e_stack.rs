@@ -548,6 +548,58 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
     driver.delete(sid).await;
 }
 
+/// ADR 0027: a generated session must actually carry the RO-mounted skills.
+///
+/// Baked skills are retired, so a session's skills come ONLY from the
+/// `skills` squashfs the FC host mounts. The e2e-stack lane stages it at
+/// `/var/lib/engram/shared/skills.squashfs`, so this exercises the WHOLE
+/// chain end-to-end: capture attaches the aux RO drive → the snapshot embeds
+/// it → restore re-anchors by presence → the init shim mounts it at
+/// `/opt/engram/skills` → agentd wires `share-file` at SpawnHarness. (Runs on
+/// the owned 6.1 guest kernel, which has `CONFIG_SQUASHFS_ZSTD=y`.) This is
+/// the integrated counterpart to the `engram-session-bundles` unit tests and
+/// the `aux_ro_drive` FC drive-mechanism test.
+#[tokio::test]
+#[ignore = "requires the e2e-stack lane (stages the skills RO bundle at /var/lib/engram/shared)"]
+async fn e2e_session_has_mounted_skills_bundle() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+    let sid = driver.create_session_none_harness(&image).await;
+
+    // The bundle is mounted read-only at the canonical guest path.
+    let mounted = driver
+        .exec(
+            sid,
+            "test -x /opt/engram/skills/bin/engram-share && echo MOUNTED",
+        )
+        .await;
+    assert!(
+        mounted.stdout.contains("MOUNTED"),
+        "skills RO bundle not mounted at /opt/engram/skills; stdout=<{}> stderr=<{}>",
+        mounted.stdout,
+        mounted.stderr,
+    );
+
+    // agentd activation: the share-file skill is discoverable and its wrapper
+    // is on PATH — i.e. the harness would actually find `share-file`.
+    let wired = driver
+        .exec(
+            sid,
+            "test -e /root/.agents/skills/share-file/SKILL.md \
+             && test -x /usr/local/bin/engram-share && echo WIRED",
+        )
+        .await;
+    assert!(
+        wired.stdout.contains("WIRED"),
+        "agentd did not wire the share-file skill from the mounted bundle; \
+         stdout=<{}> stderr=<{}>",
+        wired.stdout,
+        wired.stderr,
+    );
+
+    driver.delete(sid).await;
+}
+
 #[tokio::test]
 #[ignore = "requires ENGRAM_E2E_COORD_URL + a Claude harness pack registered with the coord"]
 async fn e2e_cold_session_claude_harness_can_exec_ls() {

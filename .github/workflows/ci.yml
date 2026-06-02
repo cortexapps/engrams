@@ -1313,8 +1313,29 @@ jobs:
           # layer.
           ENGRAM_EGRESS_PROXY_PORT: "14443"
         run: |
-          export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
+          # ADR 0025/0027: boot the OWNED guest kernel (6.1.102) the fetch
+          # script provides + prod runs — it carries CONFIG_SQUASHFS_ZSTD=y so
+          # the init-shim can mount the RO bundles. (The stale vmlinux-5.10.223
+          # reference predated ADR 0025 owning the kernel.)
+          export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux"
           bash deploy/dev/tilt-up-ci.sh
+
+      # ADR 0027: stage the skills RO bundle at the fleet-canonical path the
+      # FC backend attaches at base-snapshot capture. Without this the capture
+      # would skip it (attach-if-present), the session would come up with NO
+      # skills (baked skills are retired), and the e2e would never exercise the
+      # RO-mount chain. With it, capture attaches the drive, the init shim
+      # mounts it (the owned 6.1 kernel has squashfs), agentd wires share-file,
+      # and `e2e_session_has_mounted_skills_bundle` asserts the whole path.
+      # (Only `skills` — the demo image isn't `[browser]`-enabled, so coord
+      # doesn't declare the heavy playwright drive.)
+      - name: Stage RO skills bundle (ADR 0027)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
+          deploy/bundles/skills/build.sh /tmp/skills.squashfs
+          sudo mkdir -p /var/lib/engram/shared
+          sudo install -m 0644 /tmp/skills.squashfs /var/lib/engram/shared/skills.squashfs
+          ls -l /var/lib/engram/shared/
 
       # ADR 0013: host-agent doesn't read docker config; it asks
       # the coord per-pull, and the coord reads sealed credentials
@@ -1437,5 +1458,9 @@ jobs:
         run: |
           # `tilt down` re-evaluates the Tiltfile, which fail()s if the
           # FC kernel env isn't set (only the bring-up step exported it).
-          export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux-5.10.223"
+          # ADR 0025/0027: boot the OWNED guest kernel (6.1.102) the fetch
+          # script provides + prod runs — it carries CONFIG_SQUASHFS_ZSTD=y so
+          # the init-shim can mount the RO bundles. (The stale vmlinux-5.10.223
+          # reference predated ADR 0025 owning the kernel.)
+          export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux"
           bash deploy/dev/tilt-down-ci.sh || true
