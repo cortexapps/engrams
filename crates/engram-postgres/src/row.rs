@@ -299,11 +299,14 @@ pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, Me
 pub(crate) fn user_from_row(row: &PgRow) -> Result<User, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let role_text: String = row.try_get("role").map_err(col_err)?;
-    let role = Role::parse(&role_text)
-        .ok_or_else(|| MetaError::Serialization(format!("users.role: unknown value {role_text:?}")))?;
+    let role = Role::parse(&role_text).ok_or_else(|| {
+        MetaError::Serialization(format!("users.role: unknown value {role_text:?}"))
+    })?;
     let role_source_text: String = row.try_get("role_source").map_err(col_err)?;
     let role_source = RoleSource::parse(&role_source_text).ok_or_else(|| {
-        MetaError::Serialization(format!("users.role_source: unknown value {role_source_text:?}"))
+        MetaError::Serialization(format!(
+            "users.role_source: unknown value {role_source_text:?}"
+        ))
     })?;
     // `groups` is a JSONB string array; decode to Vec<String>. A malformed
     // payload fails loud rather than silently dropping group membership.

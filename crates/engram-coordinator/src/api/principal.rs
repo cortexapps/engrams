@@ -25,7 +25,7 @@ use engram_auth::cookie::SESSION_COOKIE;
 use engram_auth::error::AuthError;
 use engram_auth::{
     hash_token, mint_session_token, seal_user_token, AuthConfig, AuthMode, OidcAuthenticator,
-    VerifierChain, VerifiedEmail, VerifyInput,
+    VerifiedEmail, VerifierChain, VerifyInput,
 };
 use engram_core::traits::{UserStore, WebSessionStore};
 use engram_core::types::user::{Principal, Role, RoleSource, User, UserToken, WebSession};
@@ -189,12 +189,16 @@ pub async fn require_session_owner(
     // Pull the `:id` path param (robust to routes that carry extra params,
     // e.g. `/sessions/:id/artifacts/:artifact_id`).
     let (mut parts, body) = req.into_parts();
-    let session_id = axum::extract::Path::<std::collections::HashMap<String, String>>::from_request_parts(
-        &mut parts, &state,
-    )
-    .await
-    .ok()
-    .and_then(|p| p.0.get("id").and_then(|s| s.parse::<engram_core::SessionId>().ok()));
+    let session_id =
+        axum::extract::Path::<std::collections::HashMap<String, String>>::from_request_parts(
+            &mut parts, &state,
+        )
+        .await
+        .ok()
+        .and_then(|p| {
+            p.0.get("id")
+                .and_then(|s| s.parse::<engram_core::SessionId>().ok())
+        });
     let req = Request::from_parts(parts, body);
 
     let Some(session_id) = session_id else {
@@ -310,7 +314,11 @@ pub async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> Res
             let _ = rt.web_sessions.revoke_web_session(&hash_token(token)).await;
         }
     }
-    let secure = state.auth.as_ref().map(|rt| rt.config.cookie_secure).unwrap_or(false);
+    let secure = state
+        .auth
+        .as_ref()
+        .map(|rt| rt.config.cookie_secure)
+        .unwrap_or(false);
     let clear = set_cookie(SESSION_COOKIE, "", secure, None);
     (StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear)]).into_response()
 }
@@ -335,9 +343,13 @@ pub async fn login(State(state): State<SharedState>) -> Result<Response, ApiErro
                 "nonce": start.nonce,
                 "pkce": start.pkce_verifier,
             });
-            let encoded =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(flow.to_string());
-            let cookie = set_cookie(OIDC_FLOW_COOKIE, &encoded, rt.config.cookie_secure, Some(600));
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(flow.to_string());
+            let cookie = set_cookie(
+                OIDC_FLOW_COOKIE,
+                &encoded,
+                rt.config.cookie_secure,
+                Some(600),
+            );
             Ok((
                 StatusCode::FOUND,
                 [
@@ -505,7 +517,10 @@ pub async fn patch_user(
     if let Some(role_str) = req.role {
         let role = Role::parse(&role_str)
             .ok_or_else(|| ApiError::BadRequest(format!("unknown role {role_str:?}")))?;
-        user = rt.users.set_user_role(uid, role, RoleSource::Manual).await?;
+        user = rt
+            .users
+            .set_user_role(uid, role, RoleSource::Manual)
+            .await?;
     }
     if let Some(active) = req.active {
         user = rt.users.set_user_active(uid, active).await?;
@@ -522,7 +537,10 @@ mod tests {
     use super::*;
 
     fn parts_with(principal: Option<Principal>) -> Parts {
-        let (mut parts, _) = axum::http::Request::builder().body(()).unwrap().into_parts();
+        let (mut parts, _) = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts();
         if let Some(p) = principal {
             parts.extensions.insert(p);
         }
@@ -542,7 +560,9 @@ mod tests {
     #[tokio::test]
     async fn current_user_requires_an_injected_principal() {
         let mut parts = parts_with(None);
-        let err = CurrentUser::from_request_parts(&mut parts, &()).await.unwrap_err();
+        let err = CurrentUser::from_request_parts(&mut parts, &())
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
     }
 

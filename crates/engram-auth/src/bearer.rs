@@ -95,7 +95,11 @@ mod tests {
     #[tokio::test]
     async fn wrong_or_absent_token_falls_through() {
         let v = ServiceBearer::new(vec!["s3cret".into()], "svc@engram.local");
-        assert!(v.verify(&input_with_bearer("nope")).await.unwrap().is_none());
+        assert!(v
+            .verify(&input_with_bearer("nope"))
+            .await
+            .unwrap()
+            .is_none());
         assert!(v.verify(&VerifyInput::default()).await.unwrap().is_none());
     }
 }

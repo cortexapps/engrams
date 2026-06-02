@@ -181,9 +181,13 @@ impl Principal {
     /// Best-effort display name for git attribution: the stored display
     /// name, else the email local-part.
     pub fn git_name(&self) -> String {
-        self.display_name
-            .clone()
-            .unwrap_or_else(|| self.email.split('@').next().unwrap_or(&self.email).to_string())
+        self.display_name.clone().unwrap_or_else(|| {
+            self.email
+                .split('@')
+                .next()
+                .unwrap_or(&self.email)
+                .to_string()
+        })
     }
 }
 

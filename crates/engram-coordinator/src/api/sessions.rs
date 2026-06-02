@@ -686,8 +686,14 @@ async fn create_session_inner(
     // Claude Code OAuth token — we never prompt per-session. Best-effort: a
     // missing/unopenable token must not fail create (the harness then falls
     // back to its own login path; the web gates create on a saved token).
-    inject_user_claude_token(&state, &principal, manifest.harness.as_ref(), req.mode, &mut session_env)
-        .await;
+    inject_user_claude_token(
+        &state,
+        &principal,
+        manifest.harness.as_ref(),
+        req.mode,
+        &mut session_env,
+    )
+    .await;
 
     let mut agent_for_session = resolve_harness(
         &state,
@@ -1099,15 +1105,16 @@ async fn inject_user_claude_token(
     };
     let kind = engram_core::types::user::UserToken::KIND_CLAUDE_OAUTH;
     match rt.users.get_user_token(principal.user_id, kind).await {
-        Ok(Some(tok)) => match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await
-        {
-            Ok(plain) => {
-                session_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), plain);
+        Ok(Some(tok)) => {
+            match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await {
+                Ok(plain) => {
+                    session_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), plain);
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token")
+                }
             }
-            Err(e) => {
-                tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token")
-            }
-        },
+        }
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(user_id = %principal.user_id, error = %e, "could not load saved Claude token")

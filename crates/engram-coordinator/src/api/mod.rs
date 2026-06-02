@@ -79,10 +79,7 @@ pub fn router(state: SharedState) -> Router {
         )
         .merge(session_scoped)
         // Read-only list of enabled images — members pick one to launch.
-        .route(
-            "/enabled-images",
-            get(enabled_images::list_enabled_images),
-        )
+        .route("/enabled-images", get(enabled_images::list_enabled_images))
         // ADR 0031 self-service.
         .route("/me", get(principal::me))
         .route("/me/claude-token", post(principal::save_claude_token))
@@ -210,7 +207,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/readyz", get(health::readyz))
         .nest(
             "/api/v1",
-            forge_seam.merge(internal).merge(auth_routes).merge(protected),
+            forge_seam
+                .merge(internal)
+                .merge(auth_routes)
+                .merge(protected),
         )
         .with_state(state)
 }

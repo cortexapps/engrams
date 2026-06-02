@@ -80,7 +80,10 @@ pub fn validate_claims(
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string);
-    Ok(VerifiedEmail { email, display_name })
+    Ok(VerifiedEmail {
+        email,
+        display_name,
+    })
 }
 
 #[cfg(test)]
@@ -115,7 +118,16 @@ mod tests {
         let tok = sign(&json!({
             "email": "ada@example.com", "name": "Ada", "iss": "https://idp", "aud": "client-1", "exp": future(), "nonce": "n1"
         }));
-        let v = validate_claims(&tok, &key(), Algorithm::HS256, Some("https://idp"), Some("client-1"), "email", Some("n1")).unwrap();
+        let v = validate_claims(
+            &tok,
+            &key(),
+            Algorithm::HS256,
+            Some("https://idp"),
+            Some("client-1"),
+            "email",
+            Some("n1"),
+        )
+        .unwrap();
         assert_eq!(v.email, "ada@example.com");
         assert_eq!(v.display_name.as_deref(), Some("Ada"));
     }
@@ -123,28 +135,48 @@ mod tests {
     #[test]
     fn expired_token_is_rejected() {
         let tok = sign(&json!({ "email": "a@b.com", "exp": 1_000_000_000i64 }));
-        let err = validate_claims(&tok, &key(), Algorithm::HS256, None, None, "email", None).unwrap_err();
+        let err =
+            validate_claims(&tok, &key(), Algorithm::HS256, None, None, "email", None).unwrap_err();
         assert!(matches!(err, AuthError::Verify(_)));
     }
 
     #[test]
     fn wrong_audience_is_rejected() {
         let tok = sign(&json!({ "email": "a@b.com", "aud": "other", "exp": future() }));
-        let err = validate_claims(&tok, &key(), Algorithm::HS256, None, Some("client-1"), "email", None).unwrap_err();
+        let err = validate_claims(
+            &tok,
+            &key(),
+            Algorithm::HS256,
+            None,
+            Some("client-1"),
+            "email",
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, AuthError::Verify(_)));
     }
 
     #[test]
     fn missing_email_claim_is_rejected() {
         let tok = sign(&json!({ "sub": "u1", "exp": future() }));
-        let err = validate_claims(&tok, &key(), Algorithm::HS256, None, None, "email", None).unwrap_err();
+        let err =
+            validate_claims(&tok, &key(), Algorithm::HS256, None, None, "email", None).unwrap_err();
         assert!(matches!(err, AuthError::Verify(m) if m.contains("email")));
     }
 
     #[test]
     fn nonce_mismatch_is_rejected() {
         let tok = sign(&json!({ "email": "a@b.com", "exp": future(), "nonce": "real" }));
-        let err = validate_claims(&tok, &key(), Algorithm::HS256, None, None, "email", Some("expected")).unwrap_err();
+        let err = validate_claims(
+            &tok,
+            &key(),
+            Algorithm::HS256,
+            None,
+            None,
+            "email",
+            Some("expected"),
+        )
+        .unwrap_err();
         assert!(matches!(err, AuthError::Verify(m) if m.contains("nonce")));
     }
 
@@ -153,7 +185,16 @@ mod tests {
         // GCP IAP forwards the address in `email`; some IdPs use a different
         // claim — verify the claim name is honoured.
         let tok = sign(&json!({ "preferred_username": "x@y.z", "exp": future() }));
-        let v = validate_claims(&tok, &key(), Algorithm::HS256, None, None, "preferred_username", None).unwrap();
+        let v = validate_claims(
+            &tok,
+            &key(),
+            Algorithm::HS256,
+            None,
+            None,
+            "preferred_username",
+            None,
+        )
+        .unwrap();
         assert_eq!(v.email, "x@y.z");
     }
 }

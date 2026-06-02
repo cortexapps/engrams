@@ -70,9 +70,16 @@ async fn jit_upsert_is_idempotent_and_preserves_role() {
         .upsert_user_by_email(&email, Some("Ada L."), Role::Member, RoleSource::Claim)
         .await
         .unwrap();
-    assert_eq!(u2.id, u1.id, "upsert must be keyed on email, not insert anew");
+    assert_eq!(
+        u2.id, u1.id,
+        "upsert must be keyed on email, not insert anew"
+    );
     assert_eq!(u2.role, Role::Admin, "manual role survives re-login");
-    assert_eq!(u2.display_name.as_deref(), Some("Ada L."), "display name refreshed");
+    assert_eq!(
+        u2.display_name.as_deref(),
+        Some("Ada L."),
+        "display name refreshed"
+    );
 
     // Lookup by email + id agree.
     let by_email = store.get_user_by_email(&email).await.unwrap().unwrap();
@@ -181,7 +188,11 @@ async fn web_session_lookup_honours_expiry_and_active_gate() {
     // hasn't expired.
     store.set_user_active(user.id, false).await.unwrap();
     assert!(
-        store.lookup_web_session(&live.token_hash).await.unwrap().is_none(),
+        store
+            .lookup_web_session(&live.token_hash)
+            .await
+            .unwrap()
+            .is_none(),
         "inactive user must not ride a live cookie"
     );
 

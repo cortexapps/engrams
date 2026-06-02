@@ -28,9 +28,7 @@ use crate::state::SharedState;
 /// `GET /api/hosts` — list all hosts the coordinator knows about,
 /// merging persisted Postgres rows with live in-memory scheduler
 /// state (capacity, local snapshots, draining).
-pub async fn list(
-    State(state): State<SharedState>,
-) -> Result<Json<ListHostsResponse>, ApiError> {
+pub async fn list(State(state): State<SharedState>) -> Result<Json<ListHostsResponse>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
     let hosts = rows
         .into_iter()

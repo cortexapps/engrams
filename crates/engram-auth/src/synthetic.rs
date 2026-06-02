@@ -20,7 +20,9 @@ pub struct SyntheticAdmin {
 impl SyntheticAdmin {
     /// `email` is the dev committer/display identity (`--dev-default-email`).
     pub fn new(email: impl Into<String>) -> Self {
-        Self { email: email.into() }
+        Self {
+            email: email.into(),
+        }
     }
 }
 

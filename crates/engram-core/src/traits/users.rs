@@ -64,8 +64,10 @@ pub trait UserStore: Send + Sync {
 
 #[async_trait]
 pub trait WebSessionStore: Send + Sync {
-    async fn create_web_session(&self, session: crate::types::user::WebSession)
-        -> Result<(), MetaError>;
+    async fn create_web_session(
+        &self,
+        session: crate::types::user::WebSession,
+    ) -> Result<(), MetaError>;
 
     /// Resolve a cookie's token hash to its (still-valid) session + owning
     /// user. Impls must filter out expired and inactive-user rows so a

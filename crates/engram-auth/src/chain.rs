@@ -83,18 +83,21 @@ impl VerifierChain {
         };
         let user = self
             .users
-            .upsert_user_by_email(&e.email, e.display_name.as_deref(), default_role, RoleSource::Claim)
+            .upsert_user_by_email(
+                &e.email,
+                e.display_name.as_deref(),
+                default_role,
+                RoleSource::Claim,
+            )
             .await?;
-        let user = if is_bootstrap
-            && user.role != Role::Admin
-            && user.role_source != RoleSource::Manual
-        {
-            self.users
-                .set_user_role(user.id, Role::Admin, RoleSource::Claim)
-                .await?
-        } else {
-            user
-        };
+        let user =
+            if is_bootstrap && user.role != Role::Admin && user.role_source != RoleSource::Manual {
+                self.users
+                    .set_user_role(user.id, Role::Admin, RoleSource::Claim)
+                    .await?
+            } else {
+                user
+            };
         if !user.active {
             return Err(AuthError::Inactive);
         }

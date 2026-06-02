@@ -206,10 +206,19 @@ struct Cli {
     #[arg(long, env = "ENGRAM_FORWARD_AUTH_EMAIL_CLAIM", default_value = "email")]
     forward_auth_email_claim: String,
     /// Emails promoted to admin on first login (comma-separated).
-    #[arg(long, env = "ENGRAM_BOOTSTRAP_ADMINS", value_delimiter = ',', default_value = "")]
+    #[arg(
+        long,
+        env = "ENGRAM_BOOTSTRAP_ADMINS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
     bootstrap_admins: Vec<String>,
     /// Synthetic-admin (dev) committer/display email.
-    #[arg(long, env = "ENGRAM_DEV_DEFAULT_EMAIL", default_value = "dev@engram.local")]
+    #[arg(
+        long,
+        env = "ENGRAM_DEV_DEFAULT_EMAIL",
+        default_value = "dev@engram.local"
+    )]
     dev_default_email: String,
     /// Set the session cookie `Secure` flag. Leave off for http-localhost dev.
     #[arg(long, env = "ENGRAM_COOKIE_SECURE", default_value_t = false)]
@@ -292,7 +301,10 @@ fn build_auth_config(cli: &Cli) -> Result<engram_auth::AuthConfig, CoordinatorEr
     let oidc = if mode == AuthMode::Oidc {
         let missing = |f: &str| CoordinatorError::Config(format!("--auth-mode=oidc requires {f}"));
         Some(OidcConfig {
-            issuer: cli.oidc_issuer.clone().ok_or_else(|| missing("--oidc-issuer"))?,
+            issuer: cli
+                .oidc_issuer
+                .clone()
+                .ok_or_else(|| missing("--oidc-issuer"))?,
             client_id: cli
                 .oidc_client_id
                 .clone()

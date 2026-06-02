@@ -215,10 +215,12 @@ fn wire_skill(
 /// emitted whenever `user_email` is set. The askpass + credential-helper
 /// blocks (ADR 0027 forge credential wiring) are emitted only when `askpass`
 /// is supplied (a forge-bound session with the skills bundle mounted).
-fn render_gitconfig(askpass: Option<&Path>, user_email: Option<&str>, user_name: Option<&str>) -> String {
-    let mut s = String::from(
-        "# Wired by engram-agentd at session bind (ADR 0027/0031).\n",
-    );
+fn render_gitconfig(
+    askpass: Option<&Path>,
+    user_email: Option<&str>,
+    user_name: Option<&str>,
+) -> String {
+    let mut s = String::from("# Wired by engram-agentd at session bind (ADR 0027/0031).\n");
     if let Some(email) = user_email {
         s.push_str("[user]\n");
         s.push_str(&format!("\temail = {email}\n"));
