@@ -161,6 +161,13 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.harness_hub
+            .interrupt(sandbox_id)
+            .await
+            .map_err(harness_err_to_sandbox)
+    }
+
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub.acquire_shell(sandbox_id);
         Ok(())

@@ -26,10 +26,10 @@ use engram_protocol::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
     CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
-    ListSandboxesResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    InterruptHarnessRequest, ListSandboxesResponse, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -287,6 +287,19 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         self.inner
             .send_prompt(sandbox_id, r.text)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn interrupt_harness(
+        &self,
+        req: Request<InterruptHarnessRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .interrupt(sandbox_id)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

@@ -1,0 +1,52 @@
+//! `POST /sessions/:id/interrupt` — operator stop (ADR 0030).
+//!
+//! Stops the in-flight run on the session's harness while keeping the
+//! session alive. Forwards `interrupt` to the host hub, which sends
+//! `HarnessCommand::Interrupt` to the attached harness; the harness
+//! SIGINTs its current `claude` child, emits `RunInterrupted` + `Idle`,
+//! and stays attached for the next prompt (which resumes via
+//! `--resume`).
+//!
+//! Unlike `prompt`, this does NOT auto-resume an Idle session: there's
+//! no in-flight run to stop on a sleeping session, so a missing live
+//! sandbox is a 409 rather than a resume. The `run_interrupted` event
+//! the transcript renders flows back up the normal harness-event path
+//! (harness → host → `SessionEvent::from_harness` → SSE), not from this
+//! handler.
+
+use axum::extract::{Path, State};
+use axum::Json;
+use engram_core::SessionId;
+use serde::Serialize;
+
+use crate::error::ApiError;
+use crate::state::SharedState;
+
+#[derive(Serialize)]
+pub struct InterruptResponse {
+    pub session_id: SessionId,
+    pub note: &'static str,
+}
+
+pub async fn interrupt(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+) -> Result<Json<InterruptResponse>, ApiError> {
+    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox to interrupt — it is idle or not yet started".into(),
+        )
+    })?;
+
+    state
+        .services
+        .host
+        .interrupt(sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("forward interrupt to harness: {e}")))?;
+
+    Ok(Json(InterruptResponse {
+        session_id: id,
+        note: "interrupt forwarded",
+    }))
+}

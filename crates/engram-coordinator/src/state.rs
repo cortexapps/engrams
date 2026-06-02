@@ -112,6 +112,14 @@ pub enum SessionEvent {
         ok: bool,
         at: DateTime<Utc>,
     },
+    /// ADR 0030: the in-flight run was stopped by an operator interrupt
+    /// (`POST /sessions/:id/interrupt` → the harness SIGINT'd its child).
+    /// Distinct from `HarnessRunCompleted` so the transcript shows an
+    /// "interrupted" marker; the session stays alive and resumable.
+    HarnessRunInterrupted {
+        run_id: String,
+        at: DateTime<Utc>,
+    },
     HarnessIdle {
         at: DateTime<Utc>,
     },
@@ -164,6 +172,7 @@ impl SessionEvent {
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
             Self::HarnessRunCompleted { .. } => "run_completed",
+            Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
             Self::PullRequestOpened { .. } => "pull_request_opened",
             Self::FileShared { .. } => "file_shared",
@@ -225,6 +234,9 @@ impl SessionEvent {
             },
             HarnessEvent::RunCompleted { run_id, ok } => {
                 Self::HarnessRunCompleted { run_id, ok, at }
+            }
+            HarnessEvent::RunInterrupted { run_id } => {
+                Self::HarnessRunInterrupted { run_id, at }
             }
             HarnessEvent::Idle => Self::HarnessIdle { at },
         }
@@ -645,6 +657,24 @@ pub(crate) mod tests {
         SessionEvent::Evicted {
             at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn run_interrupted_maps_from_harness_with_stable_kind() {
+        // ADR 0030: the harness RunInterrupted event maps to the coord
+        // SessionEvent and serialises under the stable `run_interrupted`
+        // kind that the SSE stream + web transcript key on.
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::RunInterrupted {
+                run_id: "r1".into(),
+            },
+            chrono::Utc::now(),
+        );
+        match &ev {
+            SessionEvent::HarnessRunInterrupted { run_id, .. } => assert_eq!(run_id, "r1"),
+            other => panic!("expected HarnessRunInterrupted, got {other:?}"),
+        }
+        assert_eq!(ev.kind(), "run_interrupted");
     }
 
     fn indexed(idx: i64, event: SessionEvent) -> IndexedEvent {

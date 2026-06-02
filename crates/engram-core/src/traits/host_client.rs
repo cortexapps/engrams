@@ -157,6 +157,17 @@ pub trait HostClient: Send + Sync {
     /// mid-send.
     async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError>;
 
+    /// ADR 0030: operator interrupt — stop the in-flight run on the
+    /// attached harness for `sandbox_id` while keeping the session
+    /// alive. The harness SIGINTs its current child and returns to Idle;
+    /// the next prompt resumes the same conversation via `--resume`.
+    /// `SandboxError::NotFound` if no harness is bound. Default is a
+    /// no-op for impls without a real harness (test fakes); the
+    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
+    async fn interrupt(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0013 + ADR 0011 follow-up #3: pin a sandbox against idle
     /// eviction while a shell WebSocket is open. The local hub is the
     /// only source of truth for "is a shell attached to this sandbox?"

@@ -56,6 +56,10 @@ service HostService {
   rpc BindHarnessSession(BindHarnessSessionRequest) returns (Empty);
   rpc UnbindHarnessSession(UnbindHarnessSessionRequest) returns (Empty);
   rpc SendHarnessPrompt(SendHarnessPromptRequest) returns (Empty);
+  // ADR 0030: operator interrupt. Stop the in-flight run on the
+  // attached harness (it SIGINTs its current `claude` child and
+  // returns to Idle); the session stays alive and resumable.
+  rpc InterruptHarness(InterruptHarnessRequest) returns (Empty);
 
   // StartAgent bundles SessionEgressPolicy inline so the host
   // applies the policy to its egress proxy registry *before*
@@ -217,6 +221,10 @@ message UnbindHarnessSessionRequest {
 message SendHarnessPromptRequest {
   bytes sandbox_id = 1; // 16-byte UUID
   string text = 2;
+}
+
+message InterruptHarnessRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
 }
 
 message StartAgentRequest {

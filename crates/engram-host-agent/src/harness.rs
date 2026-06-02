@@ -319,6 +319,28 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// ADR 0030: send an operator `Interrupt`. The harness SIGINTs its
+    /// in-flight child and emits `RunInterrupted` + `Idle`, staying
+    /// attached for the next prompt — unlike `shutdown`, the adapter
+    /// does NOT exit and the sandbox stays live. `NotAttached` if no
+    /// harness is bound. No ack: the `RunInterrupted` event flowing back
+    /// up the harness channel is the signal of completion.
+    pub async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), HarnessError> {
+        let cmd_tx = {
+            let conns = self.inner.connections.lock();
+            conns
+                .get(&sandbox_id)
+                .ok_or(HarnessError::NotAttached)?
+                .cmd_tx
+                .clone()
+        };
+        cmd_tx
+            .send(HarnessFrame::Command(HarnessCommand::Interrupt))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
     /// Push a prompt to the running adapter. Adapter starts a
     /// fresh run (or queues if a run is in flight). Atomically
     /// clears `last_idle_at` so the soft idle-eviction TTL doesn't
