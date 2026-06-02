@@ -68,6 +68,13 @@ if [ -x "$BIN" ] && [ -f "$BIN" ]; then
     examined=$((examined + 1))
 fi
 
+# Host-agent binary.
+BIN="target/$PROFILE/engram-host-agent"
+if [ -x "$BIN" ] && [ -f "$BIN" ]; then
+    sign_if_needed "$BIN"
+    examined=$((examined + 1))
+fi
+
 # Test binaries: target/$PROFILE/deps/engram_sandbox_vz-<16hex>
 # (no extension). Cargo emits .d / .o / .rmeta siblings alongside
 # the executable; filter via `file -b` to sign only the Mach-O
