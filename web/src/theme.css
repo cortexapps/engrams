@@ -21,9 +21,9 @@
   --color-verdigris: #3a6b5c; /* "archived / snapshotted" */
 
   --font-display:
-    "Newsreader", "Iowan Old Style", "Source Serif 4", Georgia, serif;
+    "Newsreader Variable", "Iowan Old Style", "Source Serif 4", Georgia, serif;
   --font-mono:
-    "JetBrains Mono", "Berkeley Mono", "SF Mono", ui-monospace, monospace;
+    "JetBrains Mono Variable", "Berkeley Mono", "SF Mono", ui-monospace, monospace;
 
   --radius-none: 0;
 }

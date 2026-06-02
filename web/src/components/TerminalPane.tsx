@@ -134,7 +134,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       term = new mod.Terminal({
         fontSize: 13,
         fontFamily:
-          '"JetBrains Mono", "Berkeley Mono", "SF Mono", ui-monospace, monospace',
+          '"JetBrains Mono Variable", "Berkeley Mono", "SF Mono", ui-monospace, monospace',
         theme: THEME,
         cursorBlink: true,
         scrollback: 5000,
