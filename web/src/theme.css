@@ -301,7 +301,11 @@ select.ledger-input {
 }
 .navspine-inner {
   display: flex;
-  align-items: baseline;
+  /* Center the row so the large italic wordmark, the mark, and the
+   * small mono tabs share a vertical centerline. (Baseline alignment
+   * pulled the brand's baseline from the icon, riding the wordmark
+   * high relative to the tabs.) */
+  align-items: center;
   gap: 2rem;
   padding-top: 0.9rem;
   padding-bottom: 0.9rem;
@@ -329,7 +333,7 @@ select.ledger-input {
 }
 .nav-tabs {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 1.6rem;
   flex: 1;
 }
@@ -337,8 +341,10 @@ select.ledger-input {
   background: none;
   border: 0;
   cursor: pointer;
-  padding: 0 0 0.45rem;
-  margin-bottom: -0.9rem;
+  /* Underline sits just beneath the label now that the row is
+   * center-aligned (was anchored to the masthead rule via a negative
+   * margin under baseline alignment). */
+  padding: 0 0 0.3rem;
   border-bottom: 1px solid transparent;
   transition: color var(--dur-fast);
   font-family: var(--font-mono);
