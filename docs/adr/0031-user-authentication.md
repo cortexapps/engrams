@@ -15,6 +15,36 @@ attribution → owner-scoped sessions → session-bundles `[user]` gitconfig →
 api client + AuthProvider + profile menu + settings split + never-prompt token
 gating + Sessions My/All views.
 
+## Screenshots
+
+Captured against a real **Google OIDC** login (`--auth-mode=oidc`,
+`issuer=https://accounts.google.com`) on the local dev stack.
+
+**SSO sign-in** — an unauthenticated request bounces to the IdP (Google here;
+any OIDC issuer works):
+
+![Google sign-in](assets/0031/01-google-signin.png)
+
+**Authenticated dashboard (admin)** — real identity in the top-right chip, all
+four surfaces, and the admin-only **My sessions / All sessions** scope toggle:
+
+![Sessions, admin](assets/0031/02-sessions-admin.png)
+
+**Profile menu** — the chip resolves to the signed-in user (name + email) with
+a working Sign out (replaces the old `§` placeholder):
+
+![Profile menu](assets/0031/03-profile-menu.png)
+
+**Settings — user vs admin split** — Profile + Claude token (everyone) alongside
+Images + Registries (admin only); role + Claude-token status shown:
+
+![Settings, admin](assets/0031/04-settings-profile-admin.png)
+
+**My Claude Code token** — saved once, sealed under the KEK, auto-injected into
+built-in-Claude sessions (never prompted per session):
+
+![Token panel](assets/0031/05-token-panel.png)
+
 ## Context
 
 engrams has no user identity. The coordinator authenticates every request against a
