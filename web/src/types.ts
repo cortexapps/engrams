@@ -71,8 +71,40 @@ export interface Session {
   last_active_at: string;
 }
 
+/** ADR 0031: a session list row — the session plus the owner's identity
+ * (present only in the admin "all" view; `null` in the "mine" view). */
+export interface SessionListItem extends Session {
+  owner_email: string | null;
+  owner_name: string | null;
+}
+
 export interface ListSessionsResponse {
-  sessions: Session[];
+  sessions: SessionListItem[];
+}
+
+// ---- ADR 0031: identity ------------------------------------------------
+
+export type Role = 'admin' | 'member';
+
+/** The current principal, from `GET /me`. */
+export interface Principal {
+  email: string;
+  display_name: string | null;
+  role: Role;
+  is_admin: boolean;
+  /** Whether a Claude Code OAuth token is saved (drives create-session
+   * gating). The token itself is never returned. */
+  has_claude_token: boolean;
+}
+
+/** A row from `GET /admin/users`. */
+export interface AdminUser {
+  id: string;
+  email: string;
+  display_name: string | null;
+  role: Role;
+  role_source: 'manual' | 'scim' | 'claim';
+  active: boolean;
 }
 
 export type HostStatus = 'ready' | 'draining' | 'dead';
