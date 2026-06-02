@@ -1,0 +1,18 @@
+# ADR 0027: pinned versions for the `playwright` RO bundle. build.sh reads
+# NODE_VERSION / PLAYWRIGHT_MCP_VERSION from the environment, defaulting to
+# these. Bump here + in build.sh's defaults together; a bundle roll (new
+# squashfs behind the stable symlink) ships fleet-wide without re-baking
+# session images.
+name = "playwright"
+description = "chromium-headless-shell + @playwright/mcp + Node, glibc-linked, self-contained."
+
+[versions]
+node = "20.18.1"
+playwright_mcp = "0.0.41"
+# chromium-headless-shell revision is pinned transitively by @playwright/mcp's
+# playwright dependency — `playwright install chromium-headless-shell` resolves
+# it deterministically for the pinned mcp version.
+
+[guest]
+mount = "/opt/engram/browser"
+launcher = "/opt/engram/browser/launch-mcp"

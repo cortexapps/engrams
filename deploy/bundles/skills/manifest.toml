@@ -1,0 +1,13 @@
+# ADR 0027: the always-attached `skills` RO bundle. Content is our own
+# wrapper scripts (bin/) + SKILL.md (skills/) — the unpacked tree IS this
+# directory, so there's nothing external to pin. A skill edit ships
+# fleet-wide by rolling the bundle (new squashfs behind the stable symlink),
+# no session-image re-bake.
+name = "skills"
+description = "Built-in skill helpers: engram-share / engram-pr / git-askpass + SKILL.md."
+
+[guest]
+mount = "/opt/engram/skills"
+# Wrappers land on PATH (agentd symlinks them into /usr/local/bin); the
+# git-askpass path is referenced by the agentd-written /etc/gitconfig.
+bin = "/opt/engram/skills/bin"
