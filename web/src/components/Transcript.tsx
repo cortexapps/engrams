@@ -4,29 +4,40 @@ import { ToolCall } from './ToolCall';
 import { IdleMarker, RunBoundary } from './RunBoundary';
 import { ArtifactCard } from './ArtifactCard';
 import { PullRequestCard } from './PullRequestCard';
+import { UserTurn } from './UserTurn';
+import { Process } from './Process';
+import { DurabilityMarker } from './DurabilityMarker';
+import { RunSummary, type RunTally } from './RunSummary';
+import { HarnessWaiting } from './HarnessWaiting';
+import { Markdown } from './Markdown';
+import { hms } from './transcriptFmt';
 import type { AgentRole, IndexedEvent } from '../types';
 
-// Render the session's event stream as a continuous transcript. Layout
-// principles, repeated:
+// Render the session's event stream as a continuous transcript (ADR
+// 0030). Layout principles:
 //
-//   - Role labels live in the LEFT MARGIN, not above each message.
-//     Adjacent same-role messages collapse — no repeated label.
-//   - Tool calls are bracketed asides between paragraphs, with a faint
-//     left rule. They are *not* messages; they don't get a role.
-//   - Time stamps live in the right margin, faded.
-//   - The most-recent paragraph briefly tints amber (".ink-settle"),
-//     then fades to ink. It's the only place amber is used here.
-//   - A pull request opened via the forge seam renders as a framed
-//     notice (PullRequestCard) — the session's reviewable artifact.
-//
-// Any event the transcript doesn't recognise (stdout, exec_started,
-// snapshot, …) is dropped. Those still appear in the raw event log
-// sidebar on the detail page.
+//   - The human's prompt is a RIGHT-ALIGNED contained `§ you` block
+//     (UserTurn); the assistant stays open prose, full-width left, with
+//     its role-label in the margin. The asymmetry reads turn-taking.
+//   - Assistant/system text renders as Markdown once complete; user
+//     turns stay plain.
+//   - Tool calls are bracketed `[ … ]` asides; shell execs are `$ …`
+//     Process lines with expandable output (both previously dropped or
+//     bracket-only).
+//   - snapshot/resume render as faint centered ⌑ durability markers.
+//   - Each run closes with a faint `↳ read N · edited N · ran N` receipt.
+//   - While a run is in flight, a trailing HarnessWaiting shows the live
+//     action ("running cargo check…") beside a looping engram mark, with
+//     an optional ✕ stop control (operator interrupt).
 
 interface TranscriptProps {
   events: IndexedEvent[];
   /** Owning session id — needed to build artifact serve URLs. */
   sessionId: string;
+  /** Generic gerund shown between turns (before any tool/exec starts). */
+  busyVerb?: string;
+  /** When provided, the harness-waiting line shows a ✕ stop control. */
+  onStop?: () => void;
 }
 
 type Block =
@@ -38,8 +49,29 @@ type Block =
       argsSummary: string | null;
       completion?: { ok: boolean; durationMs: number; resultSummary: string | null };
     }
-  | { kind: 'run-start'; key: string; runId: string; prompt: string | null }
-  | { kind: 'run-end'; key: string; runId: string; ok: boolean }
+  | {
+      kind: 'exec';
+      key: string;
+      command: string;
+      output: string;
+      completion?: { exit: number | null; durationMs?: number | null };
+    }
+  | {
+      kind: 'durability';
+      key: string;
+      mark: 'snapshot' | 'resumed';
+      sizeBytes?: number;
+      at: string;
+    }
+  | { kind: 'run-start'; key: string; runId: string; prompt: string | null; at: string }
+  | {
+      kind: 'run-end';
+      key: string;
+      runId: string;
+      ok: boolean;
+      summary: RunTally;
+      endAt: string;
+    }
   | { kind: 'idle'; key: string }
   | {
       kind: 'pr';
@@ -62,22 +94,16 @@ type Block =
       at: string;
     };
 
-export function Transcript({ events, sessionId }: TranscriptProps) {
+export function Transcript({
+  events,
+  sessionId,
+  busyVerb = 'thinking',
+  onStop,
+}: TranscriptProps) {
   const blocks = useMemo(() => buildBlocks(events), [events]);
 
-  if (blocks.length === 0) {
-    return (
-      <p
-        className="my-8 font-display italic"
-        style={{ color: 'var(--color-ink-quiet)' }}
-      >
-        Waiting for the agent to speak…
-      </p>
-    );
-  }
-
-  // Mark the last *message* block so it can render with the amber-settle
-  // animation on first mount.
+  // Mark the last assistant/system *message* so it renders with the
+  // amber-settle animation on first mount.
   let lastMsgKey: string | null = null;
   for (let i = blocks.length - 1; i >= 0; i--) {
     if (blocks[i]!.kind === 'message') {
@@ -86,11 +112,8 @@ export function Transcript({ events, sessionId }: TranscriptProps) {
     }
   }
 
-  // Only render the *trailing* idle marker. An "awaiting prompt" sitting
-  // mid-history adds nothing — the user has already responded, so the
-  // event log keeps it for forensics but the transcript doesn't show it.
-  // The trailing idle is the last idle block with no later message /
-  // tool / run-start (run-end blocks render as null and don't count).
+  // Only render the *trailing* idle marker — an "awaiting prompt" sitting
+  // mid-history adds nothing (the user already responded).
   let trailingIdleKey: string | null = null;
   for (let i = blocks.length - 1; i >= 0; i--) {
     const k = blocks[i]!.kind;
@@ -98,20 +121,50 @@ export function Transcript({ events, sessionId }: TranscriptProps) {
       trailingIdleKey = blocks[i]!.key;
       break;
     }
-    if (k === 'message' || k === 'tool' || k === 'run-start') {
+    if (k === 'message' || k === 'tool' || k === 'exec' || k === 'run-start') {
       break;
     }
   }
 
+  const busy = !trailingIdleKey && isBusy(blocks);
+
+  if (blocks.length === 0 && !busy) {
+    return (
+      <p
+        className="my-8 font-display italic"
+        style={{ color: 'var(--color-ink-quiet)' }}
+      >
+        No activity yet.
+      </p>
+    );
+  }
+
   return (
     <div className="space-y-1">
-      {blocks.map((b) => {
+      {blocks.map((b, i) => {
         switch (b.kind) {
-          case 'run-start':
-            return <RunBoundary key={b.key} prompt={b.prompt} />;
+          case 'run-start': {
+            if (b.prompt) return <UserTurn key={b.key} prompt={b.prompt} at={b.at} />;
+            // Our claude harness emits run_started with a null
+            // prompt_summary — the prompt is carried by the preceding
+            // user message (rendered as a UserTurn). Suppress the
+            // redundant boundary rule right after a user turn; otherwise
+            // draw a thin rule to open the run.
+            const prev = blocks[i - 1];
+            if (prev && prev.kind === 'message' && prev.role === 'user') {
+              return null;
+            }
+            return <RunBoundary key={b.key} prompt={null} />;
+          }
           case 'run-end':
-            // Soft separator — the next RunBoundary will draw the rule.
-            return null;
+            return (
+              <RunSummary
+                key={b.key}
+                summary={b.summary}
+                endAt={b.endAt}
+                ok={b.ok}
+              />
+            );
           case 'idle':
             if (b.key !== trailingIdleKey) return null;
             return <IdleMarker key={b.key} />;
@@ -124,8 +177,28 @@ export function Transcript({ events, sessionId }: TranscriptProps) {
                 completion={b.completion}
               />
             );
-          case 'message':
+          case 'exec':
             return (
+              <Process
+                key={b.key}
+                command={b.command}
+                output={b.output}
+                completion={b.completion}
+              />
+            );
+          case 'durability':
+            return (
+              <DurabilityMarker
+                key={b.key}
+                mark={b.mark}
+                sizeBytes={b.sizeBytes}
+                at={b.at}
+              />
+            );
+          case 'message':
+            return b.role === 'user' ? (
+              <UserTurn key={b.key} prompt={b.texts.join('\n')} at={b.at} />
+            ) : (
               <Message
                 key={b.key}
                 role={b.role}
@@ -161,6 +234,9 @@ export function Transcript({ events, sessionId }: TranscriptProps) {
             );
         }
       })}
+      {busy && (
+        <HarnessWaiting verb={contextVerb(blocks, busyVerb)} onStop={onStop} />
+      )}
     </div>
   );
 }
@@ -194,46 +270,46 @@ function Message({
       >
         {hms(at)}
       </span>
-
-      <div
-        className={`font-display ${fresh ? 'ink-settle' : ''}`}
-        style={{
-          fontSize: '1.04rem',
-          lineHeight: 1.62,
-          color: 'var(--color-ink)',
-          whiteSpace: 'pre-wrap',
-        }}
-      >
-        {texts.map((t, i) => (
-          <p key={i} className={i === 0 ? '' : 'mt-3'}>
-            {t}
-          </p>
-        ))}
+      <div className={`prose md font-display ${fresh ? 'ink-settle' : ''}`}>
+        <Markdown text={texts.join('\n\n')} />
       </div>
     </motion.section>
   );
 }
 
-function buildBlocks(events: IndexedEvent[]): Block[] {
-  const out: Block[] = [];
-  // Track open tool calls so a `tool_call_completed` can attach back to
-  // the matching `tool_call_started` in place.
-  const openTools = new Map<string, number>(); // tool_call_id → blocks idx
+// ---- block reduction -------------------------------------------------
 
-  // Coalesce adjacent agent messages with the same role into a single
-  // <Message> with multiple paragraphs. Only adjacent-in-stream;
-  // anything else (a tool call, a run boundary) breaks the run.
+function classifyTool(name: string): 'reads' | 'edits' | 'other' {
+  if (/^(read|grep|glob|ls|list|search|cat|find|notebookread)/i.test(name))
+    return 'reads';
+  if (/^(edit|write|create|apply_?patch|multiedit|notebookedit|update)/i.test(name))
+    return 'edits';
+  return 'other';
+}
+
+export function buildBlocks(events: IndexedEvent[]): Block[] {
+  const out: Block[] = [];
+  const openTools = new Map<string, number>(); // tool_call_id → blocks idx
+  const openExecs = new Map<string, number>(); // exec_id → blocks idx
   let activeMsg: { role: AgentRole; idx: number } | null = null;
+
+  // Per-run tally feeding the run-summary receipt.
+  let run: RunTally | null = null;
+  const bump = (k: 'reads' | 'edits' | 'ran' | 'other') => {
+    if (run) run[k] += 1;
+  };
 
   for (const indexed of events) {
     const ev = indexed.event;
     switch (ev.type) {
       case 'run_started':
+        run = { reads: 0, edits: 0, ran: 0, other: 0, at: ev.at };
         out.push({
           kind: 'run-start',
           key: `rs:${indexed.idx}`,
           runId: ev.run_id,
           prompt: ev.prompt_summary,
+          at: ev.at,
         });
         activeMsg = null;
         break;
@@ -244,7 +320,10 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
           key: `re:${indexed.idx}`,
           runId: ev.run_id,
           ok: ev.ok,
+          summary: run ?? { reads: 0, edits: 0, ran: 0, other: 0 },
+          endAt: ev.at,
         });
+        run = null;
         activeMsg = null;
         break;
 
@@ -266,6 +345,7 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
       }
 
       case 'tool_call_started': {
+        bump(classifyTool(ev.tool_name));
         out.push({
           kind: 'tool',
           key: `t:${ev.tool_call_id}`,
@@ -288,8 +368,6 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
           };
           openTools.delete(ev.tool_call_id);
         } else {
-          // Completion without a matching start (replay window edge):
-          // synthesize a standalone block so it still renders.
           out.push({
             kind: 'tool',
             key: `t:${indexed.idx}`,
@@ -304,6 +382,62 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
         }
         break;
       }
+
+      case 'exec_started':
+        bump('ran');
+        out.push({
+          kind: 'exec',
+          key: `x:${ev.exec_id}`,
+          command: (ev.command ?? []).join(' '),
+          output: '',
+        });
+        openExecs.set(ev.exec_id, out.length - 1);
+        activeMsg = null;
+        break;
+
+      case 'stdout':
+      case 'stderr': {
+        const idx = openExecs.get(ev.exec_id);
+        if (idx != null) {
+          const target = out[idx]! as Extract<Block, { kind: 'exec' }>;
+          target.output += ev.chunk;
+        }
+        break;
+      }
+
+      case 'exec_completed': {
+        const idx = openExecs.get(ev.exec_id);
+        if (idx != null) {
+          const target = out[idx]! as Extract<Block, { kind: 'exec' }>;
+          target.completion = {
+            exit: ev.exit_status,
+            durationMs: ev.rusage?.duration_ms,
+          };
+          openExecs.delete(ev.exec_id);
+        }
+        break;
+      }
+
+      case 'snapshot_taken':
+        out.push({
+          kind: 'durability',
+          key: `snap:${indexed.idx}`,
+          mark: 'snapshot',
+          sizeBytes: ev.size_bytes,
+          at: ev.at,
+        });
+        activeMsg = null;
+        break;
+
+      case 'resumed':
+        out.push({
+          kind: 'durability',
+          key: `res:${indexed.idx}`,
+          mark: 'resumed',
+          at: ev.at,
+        });
+        activeMsg = null;
+        break;
 
       case 'harness_idle':
         out.push({ kind: 'idle', key: `i:${indexed.idx}` });
@@ -339,9 +473,8 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
         break;
 
       default:
-        // status_changed, snapshot_taken, evicted, resumed, exec_*,
-        // checkpoint_* — dropped from the transcript view; the raw
-        // sidebar can show them.
+        // status_changed, evicted, checkpoint_* — not surfaced in the
+        // transcript; the raw event sidebar shows them.
         break;
     }
   }
@@ -349,21 +482,76 @@ function buildBlocks(events: IndexedEvent[]): Block[] {
   return out;
 }
 
-function roleLabel(role: AgentRole): string {
-  switch (role) {
-    case 'assistant':
-      return 'assistant';
-    case 'user':
-      return 'user';
-    case 'system':
-      return 'system';
+// Is the harness mid-run? Walk back from the end, skipping the markers
+// that don't imply work-in-flight (run-end, durability), until we hit a
+// block that decides it.
+export function isBusy(blocks: Block[]): boolean {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]!;
+    if (b.kind === 'run-end' || b.kind === 'durability') continue;
+    if (b.kind === 'message') return b.role === 'user';
+    if (b.kind === 'tool') return !b.completion;
+    if (b.kind === 'exec') return !b.completion;
+    if (b.kind === 'run-start') return true;
+    return false;
   }
+  return false;
 }
 
-function hms(iso: string): string {
-  return new Date(iso).toLocaleTimeString('en-GB', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
+// Derive the harness-waiting verb from whatever's actually in flight, so
+// the indicator reads "running cargo check…" / "reading snapshot_uffd.rs…"
+// rather than a generic gerund. Falls back to `generic` between turns.
+export function contextVerb(blocks: Block[], generic: string): string {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]!;
+    if (b.kind === 'run-end' || b.kind === 'durability') continue;
+    if (b.kind === 'exec' && !b.completion) {
+      return `running ${b.command.split(/\s+/).slice(0, 2).join(' ')}`;
+    }
+    if (b.kind === 'tool' && !b.completion) {
+      const file = argFile(b.argsSummary);
+      if (/^(read|cat|notebookread)/i.test(b.toolName))
+        return file ? `reading ${file}` : 'reading';
+      if (/^(edit|write|create|apply_?patch|multiedit|notebookedit|update)/i.test(b.toolName))
+        return file ? `editing ${file}` : 'editing';
+      if (/^(grep|glob|ls|list|search|find)/i.test(b.toolName)) return 'searching';
+      if (/^(bash|exec|shell|run)/i.test(b.toolName)) {
+        const cmd = argCommand(b.argsSummary);
+        return cmd ? `running ${cmd}` : 'running';
+      }
+      return b.toolName.replace(/_/g, ' ').toLowerCase();
+    }
+    break; // last meaningful block is a message / run-start → generic
+  }
+  return generic;
+}
+
+// The harness sends `args_summary` as the tool input JSON string. Pull a
+// file basename (Read/Edit/Write) for the waiting verb, defensively.
+function argFile(argsSummary: string | null): string | null {
+  if (!argsSummary) return null;
+  try {
+    const o = JSON.parse(argsSummary) as Record<string, unknown>;
+    const p = o.file_path ?? o.path ?? o.notebook_path;
+    if (typeof p === 'string') return p.split('/').pop() ?? null;
+  } catch {
+    /* not JSON — fall through */
+  }
+  return null;
+}
+
+function argCommand(argsSummary: string | null): string | null {
+  if (!argsSummary) return null;
+  try {
+    const o = JSON.parse(argsSummary) as Record<string, unknown>;
+    if (typeof o.command === 'string')
+      return o.command.split(/\s+/).slice(0, 2).join(' ');
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}
+
+function roleLabel(role: AgentRole): string {
+  return role;
 }
