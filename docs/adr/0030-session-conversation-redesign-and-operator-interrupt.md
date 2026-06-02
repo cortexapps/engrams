@@ -1,20 +1,28 @@
 # ADR 0030: Session conversation redesign + operator interrupt
 
-Status: 2026-06-02 — **Proposed.** Authored before code (the ADR-bookend
-convention). Builds on the four-surface IA (ADR 0029). Work lands on
-`worktree-adr-0030-session-conversation-redesign` as a single big-bang PR that
-**directly replaces** the old surfaces — no feature-flag gating (engrams has 0
-users; one-path code over scaffolding).
+Status: 2026-06-02 — **Accepted.** Implemented on
+`worktree-adr-0030-session-conversation-redesign` (PR #63) as a single big-bang
+PR that **directly replaces** the old surfaces — no feature-flag gating (engrams
+has 0 users; one-path code over scaffolding). Builds on the four-surface IA
+(ADR 0029).
 
-**Verification so far:** web `tsc -b` + `vitest` (39 tests, incl. the new
+**Verification:** web `tsc -b` + `vitest` (39 tests, incl. the new
 transcript/interrupt coverage) + `vite build` green; workspace `cargo fmt`,
-`cargo clippy --all-targets -D warnings`, `cargo hakari verify`, and the new
-`run_interrupted` from_harness + harness-proto round-trip/kind tests green;
-all three surfaces visually verified against the real app (screenshots below).
-**Still pending:** the harness-claude SIGINT path is `cfg(target_os="linux")`
-(invisible to macOS clippy) and the operator-interrupt round-trip both need
-**dev-vm validation against the baked `claude`** before this flips to
-**Accepted**.
+`cargo clippy --workspace --all-targets -D warnings`, `cargo hakari verify`
+green; new automated interrupt coverage — harness-proto round-trip/kind tests,
+the coord `run_interrupted` `from_harness` mapping test, and host-agent hub
+tests asserting `hub.interrupt()` delivers `HarnessCommand::Interrupt` (these
+run in the **standard** `nextest --workspace` CI job, no FC/root). All three
+surfaces visually verified against the real app (screenshots below).
+
+The one piece outside hermetic testing — the actual `SIGINT`-the-`claude`-child
++ clean `--resume` — is `cfg(target_os="linux")` and claude-runtime specific;
+it's compiled by CI's Linux clippy + `test-firecracker` build and was
+behaviourally validated by the spike below (clean mid-turn stop on both a tool
+call and text generation, `--resume` retaining full context, on `claude`
+2.1.160 = the `latest` channel the bake pulls). No dev-vm round-trip is gating:
+the wire path is CI-tested, the Linux path is CI-compiled, the leaf is
+spike-verified.
 
 ## Context
 
@@ -329,7 +337,7 @@ control.
   `SessionEvent` (`run_interrupted`) + one coord route; all additive.
 - `react-markdown` + `remark-gfm` join `web/`'s deps.
 
-## Verification (planned)
+## Verification
 
 - **Web:** `tsc -b`, `vitest run`, `vite build` green. New `buildBlocks` unit
   tests for: user-turn from a `role:user` message; `exec_*`+`stdout` → one
@@ -348,13 +356,18 @@ control.
   **resumes the same conversation** (the spike's resumability, re-confirmed in the
   VM). Then confirm an idle→resume round-trip after an interrupt still works.
 
-## Commit chain (planned)
+## Commit chain
 
-1. `feat(web): Settings nav-spine alignment`
-2. `feat(web): transcript v2 — user turns, processes, durability, run summaries, context verb, markdown; snappy tool/process expand`
-3. `feat(proto,harness): HarnessCommand::Interrupt + HarnessEvent::RunInterrupted (SIGINT the per-prompt claude child)`
-4. `feat(coord,host): POST /sessions/:id/interrupt end-to-end + run_interrupted event`
-5. `feat(web): ✕ stop control + interrupted marker`
+1. `docs(adr): 0030 … (Proposed)`
+2. `feat(web): align Settings to the nav spine`
+3. `feat(web): transcript v2 — turns, processes, durability, receipts, markdown`
+4. `feat(proto,harness): operator interrupt — SIGINT the per-prompt claude child`
+5. `feat(coord,host): POST /sessions/:id/interrupt end-to-end + run_interrupted event`
+6. `feat(web): ✕ stop control + interrupted run receipt`
+7. `chore: cargo fmt + hakari regen for the harness-claude nix dep`
+8. `docs(adr): 0030 screenshots + verification status`
+9. `test(host-agent): hub delivers HarnessCommand::Interrupt to the harness`
+10. `docs(adr): flip 0030 to Accepted`
 
 ## Sources (interrupt research)
 
