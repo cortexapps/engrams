@@ -1,6 +1,75 @@
 # ADR 0027: Read-only host-mounted shared bundle engine — Playwright MCP + central built-in skills
 
-Status: 2026-06-01 — **Proposed.**
+Status: 2026-06-01 — **Implemented on branch `adr-0027-ro-mount-bundle-engine`;
+pending dev-vm FC + prod validation.** Full implementation landed (commit chain
+below); macOS `just check` is green (893 tests, incl. the new
+`engram-session-bundles` unit tests + the ProcessBackend bundle-activation
+e2e). **Not yet validated on the dev-vm** — the FC-gated paths
+(`aux_ro_drive` integration test, the init-shim squashfs mount, the real
+glibc playwright bundle build) compile on macOS but only run on Linux+KVM —
+nor rolled to prod. Flip to **Accepted** after dev-vm + prod validation.
+_Original proposal below._
+
+## Implementation notes / divergences from the proposal
+
+- **Activation owner is a new crate, `engram-session-bundles`** (std-only),
+  not a module stuffed into agentd or engram-core (which is I/O-free by
+  charter). Both agentd (FC, `root=/`) and the dev ProcessBackend
+  (`root=<cwd>`) call its `activate(root, env)`.
+- **Forge-token gating fix.** `ENGRAM_FORGE_TOKEN` rides `AgentSpec.env`
+  (per-spawn), NOT `session_env` (coord deliberately keeps it out of the
+  cached env). Activation therefore gates `create-pull-request` on the
+  **union** of `session_env` + the per-spawn env. Caught by the e2e test.
+- **No cold boot at session create** (ADR 0020) → aux drives attach at
+  base-snapshot capture (`enabled_images`), embedded in `state.bin`, and the
+  `[browser]` opt-in is an image-manifest flag (not a session param). Memory
+  floor is a shared `resolved_memory_mib` helper so capture + restore can't
+  drift (FC requires equal `mem_size_mib`).
+- **Restore re-anchors by presence, no `patch_drive`** — bundle paths are
+  fleet-canonical stable symlinks. `restore_canonical_symlinks` asserts
+  presence (clear `SandboxError::Snapshot`) instead of an opaque FC error.
+- **Memory** is a non-issue at the 4 GiB default (the proposal worried it
+  might be ~256 MiB); the 1 GiB browser floor only bites images that lowered
+  `suggested_memory_mib`.
+- **Init-shim mount** marker-probes `/dev/vdb..vde` (squashfs-only, by
+  content marker) rather than hard-coding a device letter — order- and
+  CA-drive-independent.
+- **CI**: a `bundles` lane publishes both squashfs to GHCR
+  (`bundle-{skills,playwright}`) + fires `engrams-bundles-changed`; a
+  `dev_image` lane fires `engrams-dev-image-changed` to auto-rebake the
+  dogfood image. Enable stays manual.
+
+Commit chain (branch `adr-0027-ro-mount-bundle-engine`):
+
+```
+dcc8016 docs(adr): 0027 … Proposed
+d22de3a feat(core): AuxRoDrive + SandboxSpec.aux_ro_drives
+7da7302 feat(firecracker): attach aux RO drives + re-anchor by presence
+58cb86f feat(image-builder): mount RO bundles in the init shim
+52a0a78 feat(session-bundles): new crate — activate bundles in agentd
+e7b9396 refactor(image-builder)!: retire baked skill injectors
+e85216d feat(coordinator): [browser] flag + capture wiring + memory floor
+a12364a feat(sandbox-process): dev parity
+cc8b549 build(bundles): build recipes + manifests + CI publish + just bundles
+20251a4 ci: auto-rebake dev-engrams on source changes
+9cef930 test(session-bundles): e2e + forge-gating fix
+```
+
+## Pending validation (before Accepted)
+
+1. Dev-vm: run the `aux_ro_drive` FC integration test (`--ignored`), boot a
+   `[browser] enabled` session, confirm the init shim mounts both bundles,
+   agentd wires the playwright MCP + skills, and a `browser_navigate` +
+   `browser_take_screenshot` → `engram-share` loop lands media on the event
+   stream. Confirm `share-file` / `create-pull-request` still work on a
+   non-browser git image (post-retirement).
+2. Build the real glibc playwright bundle (`deploy/bundles/playwright/build.sh`)
+   on Linux; confirm chromium-headless-shell runs from the mounted bundle.
+3. engrams-internal: add the `engrams-bundles-changed` +
+   `engrams-dev-image-changed` `repository_dispatch` handlers and the
+   FC-host packer step that stages `/var/lib/engram/shared/*.squashfs`.
+4. Prod roll (re-bake FC-host snapshots so the bundles are present at the
+   canonical paths the new base snapshots embed).
 
 ADR 0026 gave agents a way to *surface* images/videos in the session conversation
 (`engram-share`); it closed by naming the next step: "The end goal is browser tooling
