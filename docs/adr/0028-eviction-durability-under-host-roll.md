@@ -234,6 +234,68 @@ with a clear reason instead of burning the 20-attempt budget on
 `RestoreFailed` (`evac_resumer` classifies structural vs transient
 EvacError).
 
+### Rewinding the conversation log (a rung-1 consequence)
+
+A rung-1 rewind recovers a coherent *guest* state (memory + disk) at
+checkpoint time `T`. But the PG `session_events` log — the user-facing
+transcript and the SSE history — is written in **real time** as the
+agent emits `run_started` / `agent_message` / `tool_call_*` /
+`pull_request_opened`, so at recovery it holds events up to the crash
+time `T+Δ`. The restored guest has no memory of events in `(T, T+Δ]` and
+will resume *from `T`*. Left unhandled, the transcript shows messages
+and tool calls the resumed agent never made (from its perspective) and
+may now re-do or diverge from — confusing, and a duplicate-work hazard.
+
+So coherence is a **triple**, not a pair: a checkpoint must capture
+`(memory, disk, event-log cursor)` atomically. Concretely:
+
+1. **Watermark the checkpoint.** At pause, record the session's
+   `session_events` high-water-mark (last event seq/id) alongside the
+   memory + disk manifests. The checkpoint row gains an
+   `events_cursor`.
+2. **Rewind the log on resume, don't destroy it.** On a rung-1 restore,
+   events after `events_cursor` are **tombstoned** (a `rewound_at` /
+   recovery-epoch marker), not hard-deleted — the full history stays
+   for audit. The live head (what the transcript renders as the
+   continuing thread, and what new events append after) resets to the
+   cursor. Subsequent events carry an incremented recovery epoch so the
+   timeline is unambiguous.
+3. **External side-effects are NOT rewound — and must be surfaced.**
+   Only local guest memory + disk roll back. Anything the agent did in
+   `(T, T+Δ]` that touched the outside world — `git push`, an opened PR,
+   a sent message, a non-idempotent API call — *already happened* and
+   survives the rewind. The resumed agent doesn't know it did them and
+   may repeat them. This is the genuinely hard part; the platform can't
+   undo it, so it must make it **visible** (see UX).
+
+Rung-2 (cold boot on the latest disk) does **not** have this mismatch:
+the newest disk is paired with the newest transcript, so no rewind is
+needed there — but it loses all in-RAM context. (Open question for
+implementation: where the harness's *conversation* context actually
+lives — in guest RAM only, persisted to the rootfs, or replayable from
+PG — determines whether rung-2 resumes "remembering" the thread or
+starts fresh against the recovered files. This informs how much of the
+log a rung-2 recovery should replay vs. present as a fresh segment.)
+
+### UX for a rewind
+
+The recovery must be **honest and legible**, not silent:
+
+- Render a clear boundary in the transcript: *"↩ Recovered from a
+  checkpoint after a host failure. ~M minutes / N messages after this
+  point were rolled back; the agent resumed from here."* The rolled-back
+  span stays viewable (collapsed/greyed) for transparency, not deleted.
+- Call out **surviving side-effects** explicitly when detectable from
+  the rolled-back events (e.g. *"A pull request was opened in the
+  rolled-back span and still exists"* from a tombstoned
+  `pull_request_opened`). The agent itself should be told, on resume,
+  that it recovered from a checkpoint and that some prior actions may
+  have completed externally — so it can re-check state (e.g. `git
+  status`, "does my branch already exist?") rather than blindly redo.
+- Prefer rung-1 only when the rolled-back window is small; a tunable
+  checkpoint cadence (Fix A) bounds `Δ`, so the worst-case rewind the
+  user ever sees is one checkpoint interval.
+
 ### Fix C — drain hosts before the MIG deletes them
 
 Two layers, defense in depth:
@@ -271,6 +333,14 @@ the prevention; Fix A/B are the safety net when prevention is bypassed
 - New host→coord surface (checkpoint inventory in heartbeat) + a
   reconciler tick; both idempotent, both single-coord-pod safe by the
   same lease/CAS patterns as the existing evac scanners.
+- The `session_events` log becomes **epoch-versioned**: a rung-1 rewind
+  tombstones a tail span rather than appending monotonically. Consumers
+  (transcript render, SSE replay, any analytics over the event stream)
+  must honor the recovery epoch / live head. Audit history is retained.
+- Side-effects in the rolled-back window survive the rewind; the
+  platform surfaces them but cannot undo them — a deliberate
+  at-least-once posture for agent actions, made legible rather than
+  hidden.
 - Cross-repo coordination for Fix C (this repo + `engrams-internal`),
   so Fix C ships behind the deploy change; Fixes A + B are
   independently shippable here.
@@ -287,6 +357,10 @@ To be filled as commits land (per the ADR-bookend norm):
 - [ ] **A** — host-driven periodic coherent checkpoint + host-owned
       durable record + heartbeat re-advertise + coord reconciler
       (subsumes interrupted-eviction recovery).
+- [ ] **A.log** — `events_cursor` on the checkpoint; rung-1 rewind
+      tombstones post-cursor `session_events` (recovery epoch) + resets
+      the live head; transcript/SSE rewind boundary + surviving-side-
+      effect surfacing; resumed agent is told it recovered.
 - [ ] **B** — `restore_disk_only_for_session` cold-boot primitive +
       `evacuate_dead_source` rung-2 dispatch + fail-fast classification
       in `evac_resumer`.
