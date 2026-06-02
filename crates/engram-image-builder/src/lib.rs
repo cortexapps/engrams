@@ -688,6 +688,15 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // skill edit ships fleet-wide by rolling the bundle, no re-bake.
         // The wrapper scripts + SKILL.md now live in `deploy/bundles/skills/`.
 
+        // ADR 0027: the playwright bundle is glibc-linked. If this image
+        // opted into browser tooling on a musl base (alpine), the bundle
+        // mounts fine but its binaries won't run. Warn loudly at bake — the
+        // rootfs is right here to probe. Best-effort: a missed detection
+        // doesn't fail the bake.
+        if effective_manifest.browser_enabled() {
+            warn_if_musl_base(&rootfs_dir).await;
+        }
+
         // Fold the built image's Docker config (its `ENV` + `WORKDIR`)
         // into the manifest as defaults — the author's `engram.toml`
         // [env]/workdir wins. The platform doesn't otherwise read the
@@ -1080,6 +1089,34 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
     }
 
     Ok(())
+}
+
+/// ADR 0027: best-effort musl-base detection for `[browser] enabled`
+/// images. The playwright bundle is glibc-linked; on a musl rootfs
+/// (alpine) the binaries won't run. We look for the musl dynamic loader
+/// (`lib/ld-musl-*.so.1`) under the usual locations; finding it means the
+/// browser bundle will be useless for this image. Warn, don't fail —
+/// detection is heuristic and a false negative shouldn't block a bake.
+async fn warn_if_musl_base(rootfs_dir: &Path) {
+    for dir in ["lib", "usr/lib"] {
+        let mut rd = match tokio::fs::read_dir(rootfs_dir.join(dir)).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("ld-musl-") {
+                tracing::warn!(
+                    loader = %name,
+                    "[browser] enabled on what looks like a musl base ({dir}/{name}); \
+                     the glibc-linked playwright bundle will mount but its binaries \
+                     won't run — use a glibc base (debian/ubuntu) for browser tooling",
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// Copy `src` to `dst` and chmod 0755. `label` is a short tag ("agent",

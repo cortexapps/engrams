@@ -90,6 +90,38 @@ pub struct AuxRoDrive {
     pub fs_type: String,
 }
 
+impl AuxRoDrive {
+    /// Fleet-canonical directory where the FC-host image stages the RO
+    /// bundles (stable symlinks → content-addressed `<name>-<sha>.squashfs`).
+    /// Identical on every host so a snapshot-embedded path re-anchors on
+    /// restore by presence.
+    pub const SHARED_DIR: &'static str = "/var/lib/engram/shared";
+
+    /// The always-attached `skills` bundle: the relocated built-in skill
+    /// helpers (`engram-share` / `engram-pr` / `git-askpass` + SKILL.md).
+    /// Mounted at `/opt/engram/skills`; agentd activates the active subset.
+    pub fn skills() -> Self {
+        Self {
+            drive_id: "skills".into(),
+            path_on_host: PathBuf::from(Self::SHARED_DIR).join("skills.squashfs"),
+            guest_mount: PathBuf::from("/opt/engram/skills"),
+            fs_type: "squashfs".into(),
+        }
+    }
+
+    /// The opt-in `playwright` bundle: chromium-headless-shell + Node +
+    /// `@playwright/mcp` + deps. Mounted at `/opt/engram/browser`; agentd
+    /// wires the `playwright` MCP + `record-demo` skill when present.
+    pub fn playwright() -> Self {
+        Self {
+            drive_id: "playwright".into(),
+            path_on_host: PathBuf::from(Self::SHARED_DIR).join("playwright.squashfs"),
+            guest_mount: PathBuf::from("/opt/engram/browser"),
+            fs_type: "squashfs".into(),
+        }
+    }
+}
+
 /// Argv + env for the long-running "agent" process (Claude Code,
 /// the dev noop harness, future adapters). Passed to
 /// `SandboxBackend::start_agent` at session-bind time — *not*

@@ -18,6 +18,30 @@ use crate::state::{SessionEvent, SharedState};
 pub(crate) const DEFAULT_VCPUS: u32 = 2;
 pub(crate) const DEFAULT_MEMORY_MIB: u32 = 4096;
 pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
+/// ADR 0027: memory floor for browser-enabled images. chromium-headless-shell
+/// needs ~250-400 MB resident; floor at 1 GiB for headroom. The 4 GiB default
+/// already exceeds this, so it only bites images that lowered
+/// `suggested_memory_mib`. Capture (base snapshot) and restore must agree on
+/// `mem_size_mib` (FC requires it), so both paths apply this same floor.
+pub(crate) const BROWSER_MEMORY_FLOOR_MIB: u32 = 1024;
+
+/// Resolved guest memory (MiB) for an image: its `suggested_memory_mib` (or
+/// the default), floored for `[browser] enabled` images (ADR 0027). The
+/// single source of truth shared by base-snapshot capture
+/// (`enabled_images`) and session restore — FC requires the restore
+/// `mem_size_mib` to equal the snapshot's, so they MUST compute it
+/// identically. Don't inline the floor; call this.
+pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) -> u32 {
+    manifest
+        .resources
+        .suggested_memory_mib
+        .unwrap_or(DEFAULT_MEMORY_MIB)
+        .max(if manifest.browser_enabled() {
+            BROWSER_MEMORY_FLOOR_MIB
+        } else {
+            0
+        })
+}
 
 /// Inject resolved secrets into the sandbox env according to the
 /// manifest's `secret_mode`.
@@ -676,10 +700,10 @@ async fn create_session_inner(
             req.image
         ))
     })?;
-    let memory_mib = manifest
-        .resources
-        .suggested_memory_mib
-        .unwrap_or(DEFAULT_MEMORY_MIB);
+    // ADR 0027: must match the floor `capture_and_record_base_snapshot`
+    // applied — FC requires the restore `mem_size_mib` to equal the
+    // snapshot's. The shared helper guarantees they agree.
+    let memory_mib = resolved_memory_mib(&manifest);
 
     let (host_id, sandbox_id) = try_restore_base_snapshot(
         &state,
@@ -1316,8 +1340,40 @@ pub(crate) fn resolve_harness(
 mod tests {
     use super::*;
     use engram_core::traits::ResolvedSecret;
-    use engram_core::types::image::{NetworkPolicy, SecretSchema};
+    use engram_core::types::image::{BrowserConfig, NetworkPolicy, SecretSchema};
+    use engram_core::types::ImageManifest;
     use engram_core::SandboxId;
+
+    /// ADR 0027: the browser memory floor is applied identically by base-
+    /// snapshot capture and session restore (both call `resolved_memory_mib`),
+    /// so FC's "restore mem_size must equal snapshot mem_size" holds. It only
+    /// raises memory for browser images that asked for less than the floor.
+    #[test]
+    fn resolved_memory_mib_floors_only_browser_images_below_floor() {
+        let mk = |browser: bool, mem: Option<u32>| {
+            let mut m = ImageManifest {
+                name: "x".into(),
+                ..Default::default()
+            };
+            m.resources.suggested_memory_mib = mem;
+            if browser {
+                m.browser = Some(BrowserConfig { enabled: true });
+            }
+            m
+        };
+        // Non-browser: suggestion (or default) honored verbatim.
+        assert_eq!(resolved_memory_mib(&mk(false, None)), DEFAULT_MEMORY_MIB);
+        assert_eq!(resolved_memory_mib(&mk(false, Some(256))), 256);
+        // Browser + below floor: floored up.
+        assert_eq!(
+            resolved_memory_mib(&mk(true, Some(256))),
+            BROWSER_MEMORY_FLOOR_MIB
+        );
+        // Browser + already above floor: honored.
+        assert_eq!(resolved_memory_mib(&mk(true, Some(8192))), 8192);
+        // Browser + default (4 GiB): already above the floor.
+        assert_eq!(resolved_memory_mib(&mk(true, None)), DEFAULT_MEMORY_MIB);
+    }
 
     /// ADR 0016 §A.1.7 regression guard. The pure assembly path
     /// must:
@@ -1369,6 +1425,7 @@ mod tests {
             secret_mode: SecretMode::Broker,
             harness: None,
             git: None,
+            browser: None,
         };
 
         // Bundle: one resolved secret; the schema's allow_hosts must
@@ -1451,6 +1508,7 @@ mod tests {
             secret_mode: SecretMode::Broker,
             harness: None,
             git: None,
+            browser: None,
         };
 
         let mut bundle_inner = HashMap::new();

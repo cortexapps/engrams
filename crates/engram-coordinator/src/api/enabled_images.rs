@@ -42,7 +42,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{EnabledImage, EnabledImageSummary, ImageManifest};
 use engram_core::MetaError;
@@ -433,14 +433,22 @@ async fn capture_and_record_base_snapshot(
         .resources
         .suggested_vcpus
         .unwrap_or(crate::api::sessions::DEFAULT_VCPUS);
-    let memory_mib = manifest
-        .resources
-        .suggested_memory_mib
-        .unwrap_or(crate::api::sessions::DEFAULT_MEMORY_MIB);
+    // ADR 0027: floor memory for browser-enabled images (the headless
+    // browser needs ~250-400 MB). Shared helper so capture + restore agree.
+    let memory_mib = crate::api::sessions::resolved_memory_mib(manifest);
     let disk_gib = manifest
         .resources
         .suggested_disk_gib
         .unwrap_or(crate::api::sessions::DEFAULT_DISK_GIB);
+
+    // ADR 0027: attach the read-only bundles as aux virtio-blk drives so
+    // they're embedded in the base snapshot (the only cold boot per image)
+    // and re-anchor on every restore. The `skills` bundle is universal;
+    // `playwright` rides only when the image opted in.
+    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
+    if manifest.browser_enabled() {
+        aux_ro_drives.push(AuxRoDrive::playwright());
+    }
 
     // Anonymous capture spec — no session env, no harness pack (the
     // host substitutes its stub harness so the snapshot carries a
@@ -458,7 +466,7 @@ async fn capture_and_record_base_snapshot(
         env: manifest.env.clone(),
         workdir: None,
         network: manifest.network.clone(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives,
     };
 
     let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {
