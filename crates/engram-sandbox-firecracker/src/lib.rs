@@ -1385,6 +1385,35 @@ impl FirecrackerBackend {
         // harness binary travels in the rootfs at the manifest-
         // declared `[harness] exec` path.
 
+        // ADR 0027: extra read-only host-mounted bundles (the skills /
+        // playwright squashfs). Unlike the rootfs there is NO canonical
+        // symlink dance — each `path_on_host` is already the fleet-wide
+        // canonical path (a stable symlink present identically on every
+        // host), so `state.bin` embeds it directly and restore re-anchors
+        // by mere presence. We assert presence here so a missing bundle
+        // fails with a clear message instead of an opaque FC virtio
+        // "No such file or directory" at InstanceStart.
+        for aux in &spec.aux_ro_drives {
+            if !tokio::fs::try_exists(&aux.path_on_host).await.unwrap_or(false) {
+                return Err(SandboxError::Vm(
+                    format!(
+                        "aux RO bundle {:?} ({}) not present on this host — \
+                         ensure the FC-host image baked it",
+                        aux.path_on_host.display(),
+                        aux.drive_id
+                    )
+                    .into(),
+                ));
+            }
+            api.put_drive(&DriveConfig {
+                drive_id: aux.drive_id.clone(),
+                path_on_host: aux.path_on_host.to_string_lossy().into_owned(),
+                is_root_device: false,
+                is_read_only: true,
+            })
+            .await?;
+        }
+
         // virtio-net: bind FC to the TAP we provisioned above. The
         // TAP already has the host-side gateway IP and is admin-up,
         // so FC just opens it and bridges the virtio-net frontend
@@ -2293,6 +2322,28 @@ async fn restore_canonical_symlinks(
     // `[harness] exec` path, so there's nothing for the host to
     // re-point.
     let _ = (stub_harness_override, new_sandbox_id, work_dir);
+
+    // ADR 0027: aux RO bundles re-anchor by presence, not by symlink.
+    // `state.bin` embedded each bundle's fleet-canonical path; FC's
+    // `load_snapshot` will reopen the drive there. The path is NOT
+    // per-sandbox (it's a stable host-wide symlink baked into the
+    // FC-host image), so there's nothing to recreate — but it MUST
+    // exist on this receiver or `load_snapshot` fails with an opaque
+    // virtio backend error. Assert presence up front for a clear
+    // message instead.
+    for aux in &manifest.spec.aux_ro_drives {
+        if !tokio::fs::try_exists(&aux.path_on_host)
+            .await
+            .unwrap_or(false)
+        {
+            return Err(SandboxError::Snapshot(format!(
+                "aux RO bundle {:?} ({}) embedded in the snapshot is not \
+                 present on this host — ensure the FC-host image baked it",
+                aux.path_on_host.display(),
+                aux.drive_id
+            )));
+        }
+    }
     Ok(())
 }
 

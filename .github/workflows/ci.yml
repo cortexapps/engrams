@@ -639,18 +639,22 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain, proxy_e2e)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, aux_ro_drive, netns_isolation, warm_proxy_chain, proxy_e2e)
         run: |
           # ADR 0021 P1.6: `proxy_e2e` came back in the e2e
           # resurrection — baked-in harness path, CA delivered via
           # `InstallHostCa` vsock RPC instead of the retired
           # `.engram-host/ca.pem` substrate file. `option_d_warm_lease`
           # stays deleted (it was specifically about option-D).
+          # ADR 0027: `aux_ro_drive` exercises the read-only bundle
+          # drive (skills / playwright squashfs) surviving snapshot +
+          # restore by presence — needs sudo mount like patch_drive_swap.
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
             --test snapshot_net \
             --test patch_drive_swap \
+            --test aux_ro_drive \
             --test netns_isolation \
             --test warm_proxy_chain \
             --test proxy_e2e \
