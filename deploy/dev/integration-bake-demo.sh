@@ -48,9 +48,6 @@ if ! curl -fsS "$COORD/healthz" >/dev/null 2>&1; then
     exit 1
 fi
 
-backend="$(bash deploy/dev/detect-backend.sh)"
-if [ "$backend" = "vz" ]; then FORMAT=directory; else FORMAT=ext4; fi
-
 SHORT=$(git rev-parse --short HEAD)
 LOCAL_REGISTRY="localhost:5001"
 # ADR 0021: bake the harnessed variant (`demo-claude`) so the
@@ -82,7 +79,7 @@ T0=$(date +%s.%N)
     --repo integration-test/demo-claude \
     --tag "warm-$SHORT" \
     --source deploy/demo-claude \
-    --format "$FORMAT" \
+    --format ext4 \
     --images-dir ./var/integration/images \
     --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
     --push "$IMAGE_URI" \
