@@ -22,6 +22,7 @@ const DEFAULT_PRINCIPAL: Principal = {
   role: 'admin',
   is_admin: true,
   has_claude_token: true,
+  can_sign_out: true,
 };
 
 export interface RenderWithProvidersOptions extends Omit<RenderOptions, 'wrapper'> {

@@ -126,33 +126,39 @@ export function UserChip({ inline = false }: { inline?: boolean }) {
                   Settings
                 </Link>
               </li>
-              <li>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setOpen(false);
-                    void logout();
-                  }}
-                  className="block w-full text-left px-4 py-2 italic transition-colors"
-                  style={{
-                    color: 'var(--color-ink)',
-                    fontSize: '0.92rem',
-                    background: 'none',
-                    border: 0,
-                    cursor: 'pointer',
-                  }}
-                  onMouseEnter={(e) => {
-                    (e.currentTarget as HTMLElement).style.backgroundColor =
-                      'var(--color-paper-warm)';
-                  }}
-                  onMouseLeave={(e) => {
-                    (e.currentTarget as HTMLElement).style.backgroundColor =
-                      'transparent';
-                  }}
-                >
-                  Sign out
-                </button>
-              </li>
+              {/* ADR 0031: sign-out is only meaningful in OIDC mode (an
+                  app-owned session cookie to revoke). Behind an edge proxy
+                  (IAP) or in dev synthetic-admin, every request is
+                  re-authenticated upstream, so hide the no-op control. */}
+              {principal.can_sign_out && (
+                <li>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpen(false);
+                      void logout();
+                    }}
+                    className="block w-full text-left px-4 py-2 italic transition-colors"
+                    style={{
+                      color: 'var(--color-ink)',
+                      fontSize: '0.92rem',
+                      background: 'none',
+                      border: 0,
+                      cursor: 'pointer',
+                    }}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLElement).style.backgroundColor =
+                        'var(--color-paper-warm)';
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLElement).style.backgroundColor =
+                        'transparent';
+                    }}
+                  >
+                    Sign out
+                  </button>
+                </li>
+              )}
             </ul>
           </motion.div>
         )}

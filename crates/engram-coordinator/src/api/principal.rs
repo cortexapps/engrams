@@ -251,6 +251,11 @@ pub struct MeResponse {
     /// Whether the user has saved a Claude Code OAuth token (drives the
     /// never-prompt create-session gating). Never returns the token itself.
     pub has_claude_token: bool,
+    /// Whether interactive sign-out is meaningful. Only in OIDC mode does the
+    /// app own a revocable session cookie; behind a forward-auth proxy (IAP)
+    /// the proxy re-authenticates every request, and dev synthetic-admin has
+    /// no session — so the web hides the Sign-out control in those modes.
+    pub can_sign_out: bool,
 }
 
 /// `GET /me` — the current principal + whether they have a saved Claude token.
@@ -267,12 +272,18 @@ pub async fn me(
             .unwrap_or(false),
         None => false,
     };
+    let can_sign_out = state
+        .auth
+        .as_ref()
+        .map(|rt| rt.config.mode == AuthMode::Oidc)
+        .unwrap_or(false);
     Ok(Json(MeResponse {
         email: p.email,
         display_name: p.display_name,
         role: p.role.as_str().to_string(),
         is_admin: p.role.is_admin(),
         has_claude_token,
+        can_sign_out,
     }))
 }
 

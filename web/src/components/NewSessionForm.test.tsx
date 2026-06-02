@@ -165,7 +165,7 @@ describe('NewSessionForm wire contract', () => {
     installFetchMock(CLAUDE_IMAGE);
     renderWithProviders(
       <NewSessionForm onCancel={() => {}} onCreated={() => {}} />,
-      { principal: { email: 'm@x.io', display_name: null, role: 'member', is_admin: false, has_claude_token: false } },
+      { principal: { email: 'm@x.io', display_name: null, role: 'member', is_admin: false, has_claude_token: false, can_sign_out: true } },
     );
     await screen.findByRole('option', {
       name: /ghcr\.io\/cortex\/api:warm-1/,
@@ -180,7 +180,7 @@ describe('NewSessionForm wire contract', () => {
     const mock = installFetchMock(CLAUDE_IMAGE);
     renderWithProviders(
       <NewSessionForm onCancel={() => {}} onCreated={() => {}} />,
-      { principal: { email: 'm@x.io', display_name: null, role: 'member', is_admin: false, has_claude_token: true } },
+      { principal: { email: 'm@x.io', display_name: null, role: 'member', is_admin: false, has_claude_token: true, can_sign_out: true } },
     );
     await screen.findByRole('option', { name: /ghcr\.io\/cortex\/api:warm-1/ });
     const user = userEvent.setup();
