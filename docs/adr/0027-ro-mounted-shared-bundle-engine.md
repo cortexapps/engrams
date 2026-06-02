@@ -224,6 +224,53 @@ unconditionally.
   harness-drive mechanism) but needlessly revives the page-cache-invalidation subtlety;
   the stable symlink makes re-anchor a presence check.
 
+## Future: dynamic per-session skill/MCP selection (deferred)
+
+Today the *set* of RO mounts a session gets is **frozen at image-enable**
+(base-snapshot capture): the FC backend `put_drive`s the declared
+`aux_ro_drives` before the snapshot, and FC can only attach drives *before*
+boot — never after `load_snapshot`. So a session inherits exactly the device
+model its base snapshot was captured with. Two consequences, by axis:
+
+- **Adding a new mount to an image** (flip on `[browser]`, add a third bundle)
+  → re-enable that image (re-capture the base snapshot).
+- **Updating a mounted bundle's content** (edit a skill, bump the browser) →
+  re-bake the FC-host image + MIG roll; **no re-enable** — the snapshot embeds
+  the path, not the bytes, so restore picks up new content at the same path.
+
+This matches ADR 0023's deliberate "fixed-at-boot, no mid-session hot-add"
+semantics. But if we later want **a session-start UX where the user picks
+skills/MCPs from a library**, here's the design space (we do NOT need to solve
+it now):
+
+- **Curated, heavy, shared (e.g. the browser).** FC's fixed device model means
+  per-session arbitrary drives aren't possible, so either (a) keep per-image
+  opt-in (re-enable to add), or (b) attach a *superset* at capture — including
+  one **single "library" squashfs** holding the whole curated catalog at one
+  canonical path — and have agentd activate only the user-selected subset per
+  session (activation is already per-session). (b) gives library-wide
+  selection with no re-enable and no device-model bloat, at the cost of every
+  host staging the full library and the catalog being build-time/curated.
+- **Light, dynamic, or user-uploaded (skills, small MCP configs).** These
+  shouldn't ride a capture-time drive at all. agentd already *materializes*
+  skills into `~/.agents/skills` at `SpawnHarness` from a source dir — that
+  source needn't be a mounted drive. It could instead **fetch the user's
+  selected skills over a vsock seam** (the forge/upload-bridge pattern) from
+  coord/BlobStorage into the writable rootfs at session start. That sidesteps
+  the FC drive constraint entirely: arbitrary per-session selection, no
+  re-enable, no device-model change — paying a small per-session fetch instead
+  of the RO drive's page-cache sharing (fine for KB-scale skills, wrong for a
+  hundreds-of-MB browser). This is the natural home for ADR 0023's still-
+  deferred *user-uploaded skills* (registry + `skills` PG table + upload API).
+
+So the likely end state is a **hybrid**: heavy curated tooling stays an RO
+host drive (this ADR); light/dynamic/user-selected skills arrive via a
+session-start fetch seam, with `engram-session-bundles::activate` as the shared
+delivery-agnostic materialization layer. The session-create API would carry
+the selection (`skills: [...]`, `mcp: [...]`); coord resolves it and streams
+the dynamic set to agentd on the `SpawnHarness` frame. Parked here as the
+design north star; not in scope for 0027.
+
 ## Implementation phases
 
 1. ADR 0027 (Proposed — this doc).
