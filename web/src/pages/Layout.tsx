@@ -1,20 +1,15 @@
 import { Outlet } from 'react-router-dom';
 import { NavSpine } from '../components/NavSpine';
-import { useSessions } from '../hooks/useSessions';
 
 // The shell shared by every surface: the sticky nav spine on top, the
 // active surface in the middle (via <Outlet/>), a quiet footer at the
-// foot. The sessions poll lives here so the masthead mark can render
-// live status globally — it loops while anything is booting and
-// strikes once per refetch tick otherwise.
+// foot. The masthead mark is the static brand logo; per-session boot
+// loaders carry the "something is happening" signal where it belongs.
 
 export function Layout() {
-  const { data: sessions, dataUpdatedAt } = useSessions();
-  const booting = (sessions ?? []).some((s) => s.status === 'created');
-
   return (
     <>
-      <NavSpine booting={booting} tick={dataUpdatedAt} />
+      <NavSpine />
       <Outlet />
       <Footer />
     </>

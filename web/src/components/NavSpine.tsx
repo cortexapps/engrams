@@ -3,16 +3,17 @@ import { EngramMark } from './EngramMark';
 import { UserChip } from './UserChip';
 
 // The masthead NAV SPINE for the four-surface IA. One persistent
-// header carrying brand, navigation, and live status:
+// header carrying brand and navigation:
 //
 //   [mark] engrams   Sessions · Fleet · Storage · Settings      [§]
 //                    ↳ a3f9c1b2…   (sub-crumb when drilled into a session)
 //
-// The wordmark links home (Sessions). Tabs are mono small-caps labels
-// with a 1px amber underline on the active route — never pills. The
-// `§` UserChip stays top-right and routes to Settings. The mark is the
-// living-status indicator: it loops while a session is booting and
-// strikes once per poll tick otherwise (wired by the Layout).
+// The mark here is the *static* canonical logo — the brand, not a
+// status light. The growing-trace animation is reserved for loaders
+// (the inline boot loaders on booting session rows), so the masthead
+// stays a stable identity. The wordmark links home (Sessions); tabs
+// are mono small-caps labels with a 1px amber underline on the active
+// route — never pills. The `§` UserChip routes to Settings.
 
 const SURFACES = [
   { to: '/', label: 'Sessions', match: (p: string) => p === '/' || p.startsWith('/sessions') },
@@ -25,14 +26,7 @@ function shortId(id: string): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
 }
 
-export interface NavSpineProps {
-  /** True while any session is created/booting — loops the mark. */
-  booting?: boolean;
-  /** Poll tick: each change fires one mark strike (when not booting). */
-  tick?: number;
-}
-
-export function NavSpine({ booting = false, tick = 0 }: NavSpineProps) {
+export function NavSpine() {
   const { pathname } = useLocation();
   const params = useParams();
   // Sub-crumb only on the session-detail route (a child of Sessions).
@@ -43,11 +37,9 @@ export function NavSpine({ booting = false, tick = 0 }: NavSpineProps) {
       <div className="navspine-inner book-wide">
         <Link to="/" className="nav-brand" aria-label="engrams — sessions">
           <span className="nav-mark">
-            <EngramMark
-              size={26}
-              mode={booting ? 'loop' : 'static'}
-              pulseKey={booting ? 0 : tick}
-            />
+            {/* The static canonical mark — the brand, not a status
+                light. Animation is reserved for loaders. */}
+            <EngramMark size={26} mode="static" />
           </span>
           <span className="nav-wordmark">engrams</span>
         </Link>
