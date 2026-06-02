@@ -215,9 +215,36 @@ The **engrams-internal** deploy repo carries the FC-host packer step that stages
 `engrams-dev-image-changed` dispatch handlers, and `[browser] enabled` on the
 dev-engrams dogfood image.
 
-Still pending before prod use: a full in-session dogfood (the `show-your-work`
-loop against the engrams dev server, confirming guest-localhost reachability)
-and the prod FC-host roll.
+### Prod e2e (post-roll dogfood)
+
+After the FC-host roll + dev-engrams re-enable, a live prod `dev_vm` session
+exercised the full path: the `skills` + `playwright` squashfs attach as aux
+drives (`/dev/vdb`, `/dev/vdc`), agentd activates them (`playwright-cli` +
+`engram-share` on PATH, `show-your-work` + `share-file` wired), the base
+snapshot presence-anchors both drives. **`open → snapshot → screenshot →
+engram-share`** and **`open → video-start → chapters → video-stop → engram-share`**
+both produce + share real artifacts (PNG + WebM).
+
+Getting there surfaced three FC-guest environment bugs the clean-container dev-vm
+spike couldn't (the guest is not a stock distro init), all now fixed:
+
+1. **No `/dev/shm`.** Our minimal `devtmpfs` `/dev` carried no POSIX shared-memory
+   mount, so chromium's renderer crashed (`Page crashed → about:blank`, every nav
+   timed out). `engram-init` now mounts a tmpfs `/dev/shm`.
+2. **Playwright force-injects `--disable-dev-shm-usage`** as a default launch arg
+   (config `args` are *appended*, so it can't be removed by omission). It pushes
+   the renderer's shared memory into the system tmpdir instead of `/dev/shm`. The
+   bundle `cli.config.json` now sets `ignoreDefaultArgs: ["--disable-dev-shm-usage"]`
+   so chromium uses the real `/dev/shm` from fix #1.
+3. **Non-standard `/tmp`** (`0755`, owned by the session uid, not the conventional
+   sticky `1777`). Playwright's video-artifacts temp dir + chromium's tmpdir shm
+   fallback both land under `/tmp` and fail for any other uid (e.g. a root `engram
+   exec`, or a caps-dropped renderer) — manifesting as "no videos were recorded."
+   `engram-init` now `chmod 1777 /tmp`.
+
+The render fixes (#1/#2) are required for *any* browser use; #3 is required for
+video. Re-baking the FC-host image (init-shim) + the playwright bundle (config)
++ re-enabling rolls them.
 
 Out of scope (still deferred from ADR 0023): user-uploaded skills (registry +
 upload API/UI + PG `skills` table + org enable/disable). This ADR delivers only
