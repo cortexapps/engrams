@@ -275,6 +275,34 @@ if [ -b /dev/vdb ]; then
     rmdir /run/engram/.ca-stage 2>/dev/null || true
 fi
 mark ca_staged
+# ADR 0027: mount read-only host bundles (skills / playwright squashfs)
+# the host attached as extra virtio-blk drives. The device letter
+# depends on attach order (and whether the legacy CA ext4 drive above
+# took /dev/vdb), so we PROBE the non-root block devices and identify
+# each bundle by a content marker rather than hard-coding a letter —
+# order-independent and robust across snapshot/restore. squashfs-only,
+# so a probe never accidentally mounts the ext4 CA drive. The mounts are
+# captured in the base snapshot's VFS and resume unchanged (same bytes,
+# same fleet-canonical path). Best-effort: a missing/absent bundle just
+# leaves the mount point empty; agentd degrades gracefully.
+for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde; do
+    [ -b "$dev" ] || continue
+    mkdir -p /opt/engram/.probe 2>/dev/null || true
+    mount -t squashfs -o ro "$dev" /opt/engram/.probe 2>/dev/null || continue
+    if [ -x /opt/engram/.probe/bin/engram-share ]; then
+        umount /opt/engram/.probe 2>/dev/null || true
+        mkdir -p /opt/engram/skills 2>/dev/null || true
+        mount -t squashfs -o ro "$dev" /opt/engram/skills 2>/dev/null || true
+    elif [ -x /opt/engram/.probe/launch-mcp ]; then
+        umount /opt/engram/.probe 2>/dev/null || true
+        mkdir -p /opt/engram/browser 2>/dev/null || true
+        mount -t squashfs -o ro "$dev" /opt/engram/browser 2>/dev/null || true
+    else
+        umount /opt/engram/.probe 2>/dev/null || true
+    fi
+done
+rmdir /opt/engram/.probe 2>/dev/null || true
+mark bundles_mounted
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
