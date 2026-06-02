@@ -16,6 +16,19 @@ cd "$(git rev-parse --show-toplevel)"
 
 : "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"
 
+# On macOS, check that e2fsprogs (mke2fs) is available for ext4 image building.
+# (Registry pushes require ext4 format; directory format is local-only.)
+if [ "$(uname -s)" = "Darwin" ]; then
+    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+    if ! command -v mke2fs >/dev/null 2>&1; then
+        echo "Error: mke2fs not found. ext4 image builds require e2fsprogs." >&2
+        echo "" >&2
+        echo "Install it with:" >&2
+        echo "  brew install e2fsprogs" >&2
+        exit 1
+    fi
+fi
+
 REGISTRY="localhost:5001"
 # Local mirror of the GHCR repo path; the version MUST match
 # deploy/demo-claude/engram.toml's [harness] version (the baker resolves
@@ -95,11 +108,9 @@ if [ "$ARM" = "1" ]; then
 fi
 
 echo "==> bake demo-claude -> $REGISTRY/demo-claude:warm-1 (harness $HARNESS_PLATFORM)"
-# `e2fsprogs` (mke2fs) is keg-only on Apple Silicon; prepend it like the
-# generic `bake` recipe does. ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO points
-# the baker's catalog at the artifact we just published locally.
-PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
-    ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO="$REGISTRY/$HARNESS_REPO_PATH" \
+# ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO points the baker's catalog at the
+# artifact we just published locally.
+ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO="$REGISTRY/$HARNESS_REPO_PATH" \
     ./target/release/engram-cli image build \
     --repo demo-claude \
     --tag warm-1 \
