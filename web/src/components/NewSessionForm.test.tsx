@@ -16,6 +16,7 @@ import { cleanup, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '../test-utils';
 import { NewSessionForm } from './NewSessionForm';
+import type { EnabledImageSummary } from '../types';
 
 interface FetchCall {
   url: string;
@@ -23,7 +24,7 @@ interface FetchCall {
   body?: string;
 }
 
-const ENABLED_IMAGE = {
+const ENABLED_IMAGE: EnabledImageSummary = {
   id: 'img-1',
   image_uri: 'ghcr.io/cortex/api:warm-1',
   manifest_digest: 'sha256:abc',
@@ -34,7 +35,9 @@ const ENABLED_IMAGE = {
   created_at: new Date().toISOString(),
 };
 
-function installFetchMock() {
+const CLAUDE_IMAGE = { ...ENABLED_IMAGE, harness_name: 'claude' };
+
+function installFetchMock(image = ENABLED_IMAGE) {
   const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const url =
@@ -46,7 +49,7 @@ function installFetchMock() {
       const method = init?.method ?? 'GET';
 
       if (url === '/api/v1/enabled-images' && method === 'GET') {
-        return new Response(JSON.stringify({ images: [ENABLED_IMAGE] }), {
+        return new Response(JSON.stringify({ images: [image] }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -153,6 +156,43 @@ describe('NewSessionForm wire contract', () => {
       // the default arm to keep the payload minimal.
       expect(body.harness).toBeUndefined();
       expect(body.mode).toBeUndefined();
+    });
+  });
+
+  // ADR 0031: built-in-Claude sessions use the token saved on the profile —
+  // never a per-session prompt.
+  test('built-in Claude without a saved token routes to the token screen', async () => {
+    installFetchMock(CLAUDE_IMAGE);
+    renderWithProviders(
+      <NewSessionForm onCancel={() => {}} onCreated={() => {}} />,
+      { principal: { email: 'm@x.io', display_name: null, role: 'member', is_admin: false, has_claude_token: false } },
+    );
+    await screen.findByRole('option', {
+      name: /ghcr\.io\/cortex\/api:warm-1/,
+    });
+    // No submit button — a link to the token screen instead.
+    const link = await screen.findByRole('link', { name: /save your claude token/i });
+    expect(link.getAttribute('href')).toBe('/settings/tokens');
+    expect(screen.queryByRole('button', { name: /start/i })).toBeNull();
+  });
+
+  test('built-in Claude WITH a saved token submits without secrets', async () => {
+    const mock = installFetchMock(CLAUDE_IMAGE);
+    renderWithProviders(
+      <NewSessionForm onCancel={() => {}} onCreated={() => {}} />,
+      { principal: { email: 'm@x.io', display_name: null, role: 'member', is_admin: false, has_claude_token: true } },
+    );
+    await screen.findByRole('option', { name: /ghcr\.io\/cortex\/api:warm-1/ });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /start/i }));
+    await waitFor(() => {
+      const posts = mock.callsMatching(
+        (c) => c.method === 'POST' && c.url === '/api/v1/sessions',
+      );
+      expect(posts.length).toBe(1);
+      const body = JSON.parse(posts[0].body!);
+      // The token is auto-injected server-side — the form sends no secrets.
+      expect(body.secrets).toBeUndefined();
     });
   });
 });
