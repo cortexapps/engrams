@@ -71,6 +71,7 @@ type Block =
       ok: boolean;
       summary: RunTally;
       endAt: string;
+      interrupted?: boolean;
     }
   | { kind: 'idle'; key: string }
   | {
@@ -163,6 +164,7 @@ export function Transcript({
                 summary={b.summary}
                 endAt={b.endAt}
                 ok={b.ok}
+                interrupted={b.interrupted}
               />
             );
           case 'idle':
@@ -320,6 +322,20 @@ export function buildBlocks(events: IndexedEvent[]): Block[] {
           key: `re:${indexed.idx}`,
           runId: ev.run_id,
           ok: ev.ok,
+          summary: run ?? { reads: 0, edits: 0, ran: 0, other: 0 },
+          endAt: ev.at,
+        });
+        run = null;
+        activeMsg = null;
+        break;
+
+      case 'run_interrupted':
+        out.push({
+          kind: 'run-end',
+          key: `re:${indexed.idx}`,
+          runId: ev.run_id,
+          ok: false,
+          interrupted: true,
           summary: run ?? { reads: 0, edits: 0, ran: 0, other: 0 },
           endAt: ev.at,
         });

@@ -115,6 +115,18 @@ describe('buildBlocks', () => {
       summary: { reads: 1, edits: 1, ran: 1, other: 0 },
     });
   });
+
+  test('run_interrupted closes the run as interrupted', () => {
+    const blocks = buildBlocks(
+      indexed([
+        { type: 'run_started', run_id: 'r1', prompt_summary: null, at: AT },
+        { type: 'exec_started', exec_id: 'x1', command: ['cargo', 'test'], at: AT },
+        { type: 'run_interrupted', run_id: 'r1', at: AT2 },
+      ]),
+    );
+    const end = blocks.find((b) => b.kind === 'run-end');
+    expect(end).toMatchObject({ ok: false, interrupted: true });
+  });
 });
 
 describe('isBusy', () => {
@@ -289,6 +301,17 @@ describe('Transcript rendering', () => {
       { type: 'run_completed', run_id: 'r1', ok: true, at: AT2 },
     ]);
     expect(container.querySelector('.run-summary-text')?.textContent).toContain('read 1');
+  });
+
+  test('an interrupted run renders an "interrupted" receipt', () => {
+    const { container } = renderIdle([
+      { type: 'run_started', run_id: 'r1', prompt_summary: null, at: AT },
+      { type: 'exec_started', exec_id: 'x1', command: ['cargo', 'test'], at: AT },
+      { type: 'run_interrupted', run_id: 'r1', at: AT2 },
+    ]);
+    expect(container.querySelector('.run-summary-text')?.textContent).toContain(
+      'interrupted',
+    );
   });
 
   test('assistant message renders Markdown in-system', () => {
