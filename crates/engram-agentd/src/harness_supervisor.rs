@@ -86,7 +86,7 @@ impl HarnessSupervisor {
         *self.session_env.write().expect("session_env lock poisoned") = req.session_env.clone();
 
         // ADR 0027: wire whatever RO bundles the init shim mounted (the
-        // skills / playwright squashfs) into the harness's skill/MCP
+        // skills / playwright squashfs) into the harness's skill
         // discovery paths, gated by the session env. Done before the
         // readiness-probe early return too, so a dev_vm session's exec/shell
         // also see `share-file` et al. `root = /` — we're in the guest.

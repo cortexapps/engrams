@@ -293,7 +293,7 @@ for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde; do
         umount /opt/engram/.probe 2>/dev/null || true
         mkdir -p /opt/engram/skills 2>/dev/null || true
         mount -t squashfs -o ro "$dev" /opt/engram/skills 2>/dev/null || true
-    elif [ -x /opt/engram/.probe/launch-mcp ]; then
+    elif [ -x /opt/engram/.probe/bin/playwright-cli ]; then
         umount /opt/engram/.probe 2>/dev/null || true
         mkdir -p /opt/engram/browser 2>/dev/null || true
         mount -t squashfs -o ro "$dev" /opt/engram/browser 2>/dev/null || true

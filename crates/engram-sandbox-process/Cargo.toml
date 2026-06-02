@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 engram-core.workspace = true
-# ADR 0027: dev parity — activate the same RO skill/MCP bundles agentd does.
+# ADR 0027: dev parity — activate the same RO skill/browser bundles agentd does.
 engram-session-bundles.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

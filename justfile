@@ -166,7 +166,7 @@ pull-kernel:
 # under var/bundles/ for the dev ProcessBackend, which symlinks them in
 # instead of mounting a squashfs. `skills` is a plain copy; `playwright`
 # needs Docker (glibc browser build) and is best-effort — skip it and only
-# skills get wired (no browser MCP in dev). Re-run after editing a skill.
+# skills get wired (no browser tooling in dev). Re-run after editing a skill.
 bundles:
     deploy/bundles/skills/build.sh --stage var/bundles/skills
     deploy/bundles/playwright/build.sh --stage var/bundles/playwright \

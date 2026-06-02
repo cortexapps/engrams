@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ADR 0027: activate read-only host-mounted skill/MCP bundles into a session's harness discovery paths. Shared by agentd (FC guest) and the dev ProcessBackend."
+description = "ADR 0027: activate read-only host-mounted skill/browser bundles into a session's harness discovery paths. Shared by agentd (FC guest) and the dev ProcessBackend."
 
 [lints]
 workspace = true
