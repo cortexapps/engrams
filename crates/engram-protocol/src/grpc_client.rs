@@ -30,11 +30,11 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
-    CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, ProxyShellBinary,
-    ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong,
-    InterruptHarnessRequest, ProxyShellText, ReapMaterializeDirRequest,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    StartAgentRequest, UnbindHarnessSessionRequest,
+    CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};

@@ -585,10 +585,7 @@ mod adapter {
         // promptly. If a signalled child doesn't go within the grace
         // window, escalate to SIGKILL so we never wedge the harness
         // loop waiting on a stuck process.
-        if timeout(Duration::from_secs(5), child.wait())
-            .await
-            .is_err()
-        {
+        if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
             tracing::warn!("claude didn't exit within grace window; SIGKILL");
             let _ = child.start_kill();
             let _ = child.wait().await;

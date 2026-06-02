@@ -235,9 +235,7 @@ impl SessionEvent {
             HarnessEvent::RunCompleted { run_id, ok } => {
                 Self::HarnessRunCompleted { run_id, ok, at }
             }
-            HarnessEvent::RunInterrupted { run_id } => {
-                Self::HarnessRunInterrupted { run_id, at }
-            }
+            HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
         }
     }
