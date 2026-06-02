@@ -559,6 +559,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
     let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
@@ -627,6 +628,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
 
     // Cold create → wait → snapshot → destroy → restore. The settle
@@ -741,6 +743,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
     let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;

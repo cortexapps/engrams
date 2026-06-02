@@ -121,6 +121,7 @@ async fn run_scenario(
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
 
     eprintln!("[diag] backend.create — booting VM");

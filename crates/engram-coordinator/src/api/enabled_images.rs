@@ -458,6 +458,7 @@ async fn capture_and_record_base_snapshot(
         env: manifest.env.clone(),
         workdir: None,
         network: manifest.network.clone(),
+        aux_ro_drives: Vec::new(),
     };
 
     let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {

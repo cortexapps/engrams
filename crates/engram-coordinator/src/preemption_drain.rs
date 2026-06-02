@@ -378,6 +378,7 @@ mod tests {
             env: Default::default(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         }
     }
 

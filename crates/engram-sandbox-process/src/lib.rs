@@ -422,6 +422,7 @@ impl SandboxBackend for ProcessBackend {
                     env: HashMap::new(),
                     workdir: None,
                     network: Default::default(),
+                    aux_ro_drives: Vec::new(),
                 };
                 self.sandboxes.insert(id, SandboxState { spec, cwd });
                 return Ok(id);
@@ -465,6 +466,7 @@ impl SandboxBackend for ProcessBackend {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -683,6 +685,7 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         }
     }
 

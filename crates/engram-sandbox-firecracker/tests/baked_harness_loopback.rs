@@ -173,6 +173,7 @@ exec = "/opt/noop/harness"
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
 
