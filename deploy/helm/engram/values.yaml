@@ -61,12 +61,46 @@ database:
   existingSecret: engram-coordinator-secrets
   secretKey: DATABASE_URL
 
-# Bearer tokens that gate the API. Comma-separated list lives in the
-# secret; an empty value (default) leaves auth disabled — fine for
-# dev/staging, NOT for production. The values overlay flips this on.
+# Authentication (ADR 0031).
+#
+# `existingSecret`/`secretKey` carry the deployment bearer token(s) for the
+# MACHINE path — the host-agent's coord→internal-router calls. This stays set
+# in every real deploy regardless of how humans authenticate. An empty value
+# disables the bearer entirely (dev only).
+#
+# `mode` selects how HUMANS authenticate:
+#   ""/none      → synthetic admin for every request (dev; zero setup)
+#   oidc         → coord runs the Authorization-Code+PKCE flow (set `oidc.*`)
+#   forward-auth → trust a signed JWT from an edge proxy (GCP IAP / Cloudflare
+#                  Access / oauth2-proxy); set `forwardAuth.*`
+#
+# `bootstrapAdmins` are promoted to admin on first login. NOTE: when humans use
+# forward-auth/OIDC, the web pod must NOT stamp a bearer onto browser requests
+# (set web.coordinatorToken.existingSecret: "") — otherwise the service-bearer
+# verifier short-circuits and every user resolves to the admin service principal.
 auth:
   existingSecret: ""
   secretKey: ENGRAM_AUTH_TOKENS
+  mode: ""
+  bootstrapAdmins: []
+  # Set true in HTTPS prod (only affects the OIDC session cookie; inert in
+  # forward-auth, which mints no cookie).
+  cookieSecure: false
+  # forward-auth (edge proxy) — GCP IAP preset shown in comments:
+  forwardAuth:
+    header: ""      # X-Goog-IAP-JWT-Assertion
+    jwksUrl: ""     # https://www.gstatic.com/iap/verify/public_key-jwk
+    issuer: ""      # https://cloud.google.com/iap
+    audience: ""    # /projects/<PROJECT_NUMBER>/global/backendServices/<BACKEND_SERVICE_ID>
+    emailClaim: email
+  # OIDC (when mode=oidc). The client secret comes from a K8s secret.
+  oidc:
+    issuer: ""
+    clientId: ""
+    redirectUrl: ""   # https://<host>/api/v1/auth/callback
+    clientSecret:
+      existingSecret: ""
+      secretKey: ENGRAM_OIDC_CLIENT_SECRET
 
 # Git forge (ADR 0023). Lets in-session agents fetch short-lived git
 # credentials and open pull/merge requests through the platform — no
