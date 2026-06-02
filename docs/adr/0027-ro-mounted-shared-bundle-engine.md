@@ -1,14 +1,28 @@
 # ADR 0027: Read-only host-mounted shared bundle engine — Playwright MCP + central built-in skills
 
-Status: 2026-06-01 — **Implemented on branch `adr-0027-ro-mount-bundle-engine`;
-pending dev-vm FC + prod validation.** Full implementation landed (commit chain
-below); macOS `just check` is green (893 tests, incl. the new
-`engram-session-bundles` unit tests + the ProcessBackend bundle-activation
-e2e). **Not yet validated on the dev-vm** — the FC-gated paths
-(`aux_ro_drive` integration test, the init-shim squashfs mount, the real
-glibc playwright bundle build) compile on macOS but only run on Linux+KVM —
-nor rolled to prod. Flip to **Accepted** after dev-vm + prod validation.
-_Original proposal below._
+Status: 2026-06-01 — **Implemented + dev-vm-validated on branch
+`adr-0027-ro-mount-bundle-engine`; pending full-session e2e + prod roll.**
+Full implementation landed (commit chain below); macOS `just check` green
+(893 tests). **Dev-vm validated (Linux + KVM):**
+- Linux `cargo clippy --workspace --all-targets -- -D warnings` clean (the
+  FC-gated paths + `aux_ro_drive.rs` body that macOS clippy can't see).
+- `aux_ro_drive` FC integration test — both variants pass on real microVMs
+  (44.9s): RO drive re-anchors by presence across snapshot/restore, and a
+  symlink-roll serves new bytes to a restored VM.
+- Real glibc playwright bundle builds (`build.sh`, ~528 MB) and
+  chromium-headless-shell **runs (exit 0) in a clean `debian:bookworm-slim`
+  guest** with only the bundled libs/fonts. Confirmed the glibc-floor
+  limitation empirically: it segfaults on the Ubuntu-22.04 dev-VM *host*
+  (glibc 2.35 < the bundle's bookworm 2.36) — so the bundle requires a guest
+  glibc ≥ its build base. Bundling fonts + fontconfig (a fix found here)
+  cleared chromium's `Fontconfig error` so screenshots render real text.
+
+**Still pending before Accepted:** (a) full in-session e2e — a real
+`[browser] enabled` session boot where the init shim mounts the squashfs,
+agentd wires the MCP, and a navigate→screenshot→`engram-share` loop lands
+media on the event stream; (b) the engrams-internal half (dispatch handlers
++ FC-host packer staging `/var/lib/engram/shared/*.squashfs`); (c) prod roll
+(re-bake FC-host snapshots). _Original proposal below._
 
 ## Implementation notes / divergences from the proposal
 
@@ -55,20 +69,26 @@ cc8b549 build(bundles): build recipes + manifests + CI publish + just bundles
 9cef930 test(session-bundles): e2e + forge-gating fix
 ```
 
-## Pending validation (before Accepted)
+## Validation status
 
-1. Dev-vm: run the `aux_ro_drive` FC integration test (`--ignored`), boot a
-   `[browser] enabled` session, confirm the init shim mounts both bundles,
-   agentd wires the playwright MCP + skills, and a `browser_navigate` +
-   `browser_take_screenshot` → `engram-share` loop lands media on the event
-   stream. Confirm `share-file` / `create-pull-request` still work on a
-   non-browser git image (post-retirement).
-2. Build the real glibc playwright bundle (`deploy/bundles/playwright/build.sh`)
-   on Linux; confirm chromium-headless-shell runs from the mounted bundle.
-3. engrams-internal: add the `engrams-bundles-changed` +
-   `engrams-dev-image-changed` `repository_dispatch` handlers and the
-   FC-host packer step that stages `/var/lib/engram/shared/*.squashfs`.
-4. Prod roll (re-bake FC-host snapshots so the bundles are present at the
+Done (dev-vm, Linux + KVM):
+- [x] `aux_ro_drive` FC integration test — both variants pass on real microVMs.
+- [x] Linux clippy `-D warnings` clean (FC-gated paths).
+- [x] Real glibc playwright bundle builds; chromium-headless-shell runs
+      (exit 0) in a clean `debian:bookworm-slim` guest, fonts render.
+
+Pending (before Accepted):
+1. Full in-session e2e: boot a `[browser] enabled` session, confirm the init
+   shim mounts both bundles, agentd wires the playwright MCP + skills, and a
+   `browser_navigate` + `browser_take_screenshot` → `engram-share` loop lands
+   media on the event stream. Confirm `share-file` / `create-pull-request`
+   still work on a non-browser git image (post-retirement). This needs a
+   baked `[browser]` image + the bundles staged at the canonical host path +
+   a running stack — i.e. it rides on (2).
+2. engrams-internal (separate repo): add the `engrams-bundles-changed` +
+   `engrams-dev-image-changed` `repository_dispatch` handlers and the FC-host
+   packer step that stages `/var/lib/engram/shared/*.squashfs`.
+3. Prod roll (re-bake FC-host snapshots so the bundles are present at the
    canonical paths the new base snapshots embed).
 
 ADR 0026 gave agents a way to *surface* images/videos in the session conversation
