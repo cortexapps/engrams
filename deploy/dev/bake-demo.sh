@@ -46,7 +46,7 @@ case "$(uname -m)" in
         exit 1
         ;;
 esac
-if [ "$backend" = "vz" ]; then TRANSPORT=console; else TRANSPORT=vsock; fi
+if [ "$backend" = "vz" ]; then TRANSPORT=console; FORMAT=directory; else TRANSPORT=vsock; FORMAT=ext4; fi
 
 rustup target add "$TARGET" >/dev/null 2>&1 || true
 
@@ -98,13 +98,15 @@ echo "==> bake demo-claude -> $REGISTRY/demo-claude:warm-1 (harness $HARNESS_PLA
 # `e2fsprogs` (mke2fs) is keg-only on Apple Silicon; prepend it like the
 # generic `bake` recipe does. ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO points
 # the baker's catalog at the artifact we just published locally.
+# On VZ (macOS), use directory format; ext4 requires mke2fs which is
+# unavailable on macOS. Firecracker requires ext4 to support NBD chunking.
 PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
     ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO="$REGISTRY/$HARNESS_REPO_PATH" \
     ./target/release/engram-cli image build \
     --repo demo-claude \
     --tag warm-1 \
     --source "$STAGING" \
-    --format ext4 \
+    --format "$FORMAT" \
     --images-dir ./var/bake/_staging \
     --transport "$TRANSPORT" \
     --harness-platform "$HARNESS_PLATFORM" \
