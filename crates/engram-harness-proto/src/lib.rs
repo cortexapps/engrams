@@ -155,6 +155,13 @@ pub enum HarnessEvent {
     /// Run finished cleanly (or failed terminally). After this, the
     /// adapter MUST emit `Idle` to mark "awaiting user input."
     RunCompleted { run_id: String, ok: bool },
+    /// ADR 0030: the in-flight run was stopped by an operator
+    /// interrupt (the adapter SIGINT'd its current child in response
+    /// to `HarnessCommand::Interrupt`). Distinct from a clean/failed
+    /// `RunCompleted` so the transcript can show an "interrupted"
+    /// marker. Like `RunCompleted`, the adapter MUST follow this with
+    /// `Idle` — the session stays alive and the next prompt resumes it.
+    RunInterrupted { run_id: String },
     /// Explicit "I'm awaiting user input." Engram's idle-eviction
     /// soft TTL fires N seconds after this. Adapters MUST emit it
     /// after every `RunCompleted`; emitting redundantly (no run in
@@ -187,6 +194,7 @@ impl HarnessEvent {
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallCompleted { .. } => "tool_call_completed",
             Self::RunCompleted { .. } => "run_completed",
+            Self::RunInterrupted { .. } => "run_interrupted",
             Self::Idle => "harness_idle",
         }
     }
@@ -224,6 +232,14 @@ pub enum HarnessCommand {
     /// OpenCode POSTs to its server. Engram is opaque to the agent's
     /// internal session shape — `text` is just plumbed through.
     Prompt { text: String },
+    /// ADR 0030: operator interrupt — stop the in-flight run but keep
+    /// the session alive. The adapter SIGINTs its current child (for
+    /// Claude: the per-prompt `claude` process), emits
+    /// `HarnessEvent::RunInterrupted` + `Idle`, and stays attached to
+    /// accept the next prompt (which resumes via `--resume`). A no-op
+    /// if no run is in flight. NOT a process kill — unlike `Shutdown`,
+    /// the adapter does not exit.
+    Interrupt,
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`
@@ -516,6 +532,9 @@ mod tests {
             run_id: "r1".into(),
             ok: true,
         }));
+        round_trip(HarnessFrame::Event(HarnessEvent::RunInterrupted {
+            run_id: "r1".into(),
+        }));
         round_trip(HarnessFrame::Event(HarnessEvent::Idle));
     }
 
@@ -533,6 +552,7 @@ mod tests {
         round_trip(HarnessFrame::Command(HarnessCommand::Prompt {
             text: "do the thing".into(),
         }));
+        round_trip(HarnessFrame::Command(HarnessCommand::Interrupt));
     }
 
     #[test]
@@ -674,6 +694,10 @@ mod tests {
             }
             .kind(),
             "run_completed"
+        );
+        assert_eq!(
+            HarnessEvent::RunInterrupted { run_id: "x".into() }.kind(),
+            "run_interrupted"
         );
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
     }

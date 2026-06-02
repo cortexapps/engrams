@@ -1056,6 +1056,7 @@ dependencies = [
  "engram-core",
  "engram-harness-proto",
  "engram-transport",
+ "nix 0.31.2",
  "serde",
  "serde_json",
  "tokio",

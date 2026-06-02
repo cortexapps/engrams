@@ -42,6 +42,8 @@ mod adapter {
         read_msg, write_msg, AgentRole, HarnessAttach, HarnessAttachAck, HarnessCommand,
         HarnessEvent, HarnessFrame,
     };
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
     use serde_json::Value;
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
     use tokio::process::Command;
@@ -346,6 +348,12 @@ mod adapter {
                             // synchronously per message — nothing to
                             // flush.
                         }
+                        Some(HarnessCommand::Interrupt) => {
+                            // Idle between runs — there's no child to
+                            // SIGINT. Operator stop with nothing in
+                            // flight is a no-op; keep waiting.
+                            tracing::debug!("interrupt while idle; nothing to stop");
+                        }
                         None => {
                             // Reader task ended → connection died.
                             // Reconnect rather than exit.
@@ -367,18 +375,25 @@ mod adapter {
 
             // Successful (or at least delivered) run — clear the
             // pending prompt so we don't re-run it on the next turn.
+            // This also covers the interrupt case: an operator stop
+            // must NOT auto-re-run the interrupted prompt.
             *next_prompt = None;
 
-            if write_event(
-                &writer,
+            // An operator interrupt closes the run with RunInterrupted
+            // (distinct marker in the transcript); everything else with
+            // RunCompleted. Both are followed by the mandatory Idle, and
+            // the loop continues to await the next prompt either way —
+            // the session stays alive.
+            let run_id = outcome.run_id.clone().unwrap_or_else(|| "unknown".into());
+            let end_event = if outcome.interrupted {
+                HarnessEvent::RunInterrupted { run_id }
+            } else {
                 HarnessEvent::RunCompleted {
-                    run_id: outcome.run_id.clone().unwrap_or_else(|| "unknown".into()),
+                    run_id,
                     ok: outcome.ok,
-                },
-            )
-            .await
-            .is_err()
-            {
+                }
+            };
+            if write_event(&writer, end_event).await.is_err() {
                 reader_task.abort();
                 return Outcome::Reconnect {
                     reason: "run_completed_write",
@@ -402,6 +417,23 @@ mod adapter {
         ok: bool,
         run_id: Option<String>,
         queued_prompt: Option<String>,
+        /// The run was stopped by an operator `HarnessCommand::Interrupt`
+        /// (we SIGINT'd the child). The caller emits `RunInterrupted`
+        /// rather than `RunCompleted` for this.
+        interrupted: bool,
+    }
+
+    /// SIGINT a running `claude` child — the graceful "stop the current
+    /// turn" signal (mirrors a Ctrl-C / ESC). Claude flushes its
+    /// conversation file per message synchronously, so the session stays
+    /// cleanly `--resume`-able after this. We escalate to SIGKILL only as
+    /// a grace-timeout fallback in the reap below.
+    fn sigint_child(child: &tokio::process::Child) {
+        if let Some(pid) = child.id() {
+            if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGINT) {
+                tracing::warn!(pid, error = %e, "SIGINT to claude child failed");
+            }
+        }
     }
 
     async fn run_one_claude_prompt<W>(
@@ -470,6 +502,7 @@ mod adapter {
         let mut run_id: Option<String> = None;
         let mut queued_prompt: Option<String> = None;
         let mut ok = true;
+        let mut interrupted = false;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -524,6 +557,22 @@ mod adapter {
                             ok = false;
                             break;
                         }
+                        Some(HarnessCommand::Interrupt) => {
+                            // Operator stop: SIGINT the current claude
+                            // child (graceful — it flushes its
+                            // conversation file per message, so the
+                            // session stays cleanly --resume-able). We
+                            // break and let the bounded reap below
+                            // escalate to SIGKILL if it doesn't go. The
+                            // run closes as RunInterrupted, NOT a kill —
+                            // the adapter stays attached for the next
+                            // prompt.
+                            tracing::info!("interrupt mid-run; SIGINT-ing claude");
+                            sigint_child(&child);
+                            ok = false;
+                            interrupted = true;
+                            break;
+                        }
                         Some(HarnessCommand::Checkpoint { .. }) => {}
                         None => break,
                     }
@@ -531,11 +580,24 @@ mod adapter {
             }
         }
 
-        let _ = child.wait().await;
+        // Bounded reap: the SIGINT (interrupt), SIGKILL (shutdown /
+        // max_run_secs), or EOF paths should all let the child exit
+        // promptly. If a signalled child doesn't go within the grace
+        // window, escalate to SIGKILL so we never wedge the harness
+        // loop waiting on a stuck process.
+        if timeout(Duration::from_secs(5), child.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("claude didn't exit within grace window; SIGKILL");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
         RunOutcome {
             ok,
             run_id,
             queued_prompt,
+            interrupted,
         }
     }
 
