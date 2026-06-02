@@ -75,7 +75,6 @@ pub struct ListRegistriesResponse {
 
 pub async fn add_registry(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Json(req): Json<AddRegistryRequest>,
 ) -> Result<(StatusCode, Json<AddRegistryResponse>), ApiError> {
     if req.host.trim().is_empty() {
@@ -145,7 +144,6 @@ pub async fn add_registry(
 
 pub async fn list_registries(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
 ) -> Result<Json<ListRegistriesResponse>, ApiError> {
     let creds = state.services.meta.list_registry_credentials().await?;
     let registries = creds
@@ -157,7 +155,6 @@ pub async fn list_registries(
 
 pub async fn delete_registry(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     match state.services.meta.delete_registry_credential(&host).await {

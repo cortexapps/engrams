@@ -34,7 +34,11 @@ pub fn router(state: SharedState) -> Router {
     // Postgres) are grafted on outside the layer so k8s and GCP LB
     // probes don't have to be told a token.
     let auth_state = auth::AuthState::new(state.cfg.auth_tokens.clone());
-    let protected = Router::new()
+
+    // ADR 0031 MEMBER surface: any authenticated principal. Session routes are
+    // owner-scoped per-handler; `/me*` is self-service; GET /enabled-images is
+    // needed by the create-session form.
+    let member = Router::new()
         .route(
             "/sessions",
             get(sessions::list_sessions).post(sessions::create_session),
@@ -46,19 +50,13 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/exec", post(exec::exec))
         .route("/sessions/:id/exec/stream", post(exec::exec_stream))
         .route("/sessions/:id/events", get(events::events))
-        // ADR 0026: serve a shared artifact to the dashboard. In the
-        // protected group so it inherits IAP/bearer gating (the browser
-        // hits it via the IAP cookie + nginx-stamped bearer); never
-        // world-readable. Hardened headers live in the handler.
+        // ADR 0026: serve a shared artifact to the dashboard. Owner-scoped in
+        // the handler; hardened headers live there. Static `from-path` segment
+        // takes priority over `:artifact_id` (UUIDs, no clash).
         .route(
             "/sessions/:id/artifacts/:artifact_id",
             get(upload::serve_artifact),
         )
-        // ADR 0026: trusted operator file pull — capture any file by
-        // path from the session (no MIME restriction). Bearer/IAP-authed
-        // (in the protected group), distinct from the untrusted in-guest
-        // push. Static `from-path` segment takes priority over the
-        // `:artifact_id` param above; artifact ids are UUIDs, no clash.
         .route(
             "/sessions/:id/artifacts/from-path",
             post(upload::create_from_path),
@@ -70,32 +68,36 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/interrupt", post(interrupt::interrupt))
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
-        // ADR 0016 Phase A: per-session COW diagnostic.
         .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
-        // ADR 0031: the host → coord ingestion routes (register,
-        // heartbeat, forge/upload forwarding, resolve-registry,
-        // idle-eviction-candidates, live-manifest, harness-events) moved to
-        // the `internal` bearer-only router below — they are machine traffic
-        // and must NOT go through the human cookie/OIDC verifier chain.
+        // Read-only list of enabled images — members pick one to launch.
+        .route(
+            "/enabled-images",
+            get(enabled_images::list_enabled_images),
+        )
+        // ADR 0031 self-service.
+        .route("/me", get(principal::me))
+        .route("/me/claude-token", post(principal::save_claude_token))
+        .route("/auth/logout", post(principal::logout));
+
+    // ADR 0031 ADMIN surface: operator + global-config routes. Gated by the
+    // `require_admin` route layer (the real authorization gate); the principal
+    // it reads is inserted by `resolve_principal` (the outer layer below).
+    let admin = Router::new()
+        // Fleet.
         .route("/hosts", get(hosts::list))
         .route("/hosts/:id", get(hosts::get))
         .route("/hosts/:id/drain", post(hosts::drain))
-        // ADR 0016 Phase A: per-host COW diagnostic.
         .route("/hosts/:id/cow-state", get(hosts::cow_state))
-        // ADR 0029: fleet-wide COW/chunk rollups + durability ledger
-        // for the web app's Storage surface.
+        // Storage.
         .route("/storage/summary", get(storage::summary))
-        // ADR 0021 P1.5a retired `/api/harnesses` — see migration
-        // 0040 + the deleted `mod harnesses` above.
+        // Registries (global config).
         .route(
             "/registries",
             get(registries::list_registries).post(registries::add_registry),
         )
         .route("/registries/:host", delete(registries::delete_registry))
-        .route(
-            "/enabled-images",
-            get(enabled_images::list_enabled_images).post(enabled_images::enable_image),
-        )
+        // Enabled-image *mutations* (GET is on the member router).
+        .route("/enabled-images", post(enabled_images::enable_image))
         .route(
             "/enabled-images/refresh",
             post(enabled_images::refresh_enabled_image),
@@ -104,59 +106,41 @@ pub fn router(state: SharedState) -> Router {
             "/enabled-images/disable",
             post(enabled_images::disable_enabled_image),
         )
+        // Operator admin triggers.
         .route(
             "/admin/reap-materialize-dir",
             post(admin::reap_materialize_dir),
         )
-        // ADR 0016 Phase B commit 4a: explicit admin trigger for the
-        // FlushScheduler primitive. E2E tests + ops use this to drive
-        // an immediate flush + publish round-trip without sleeping a
-        // 30s scheduler tick.
         .route("/admin/sessions/:id/flush-now", post(admin::flush_now))
-        // ADR 0018 Phase C: explicit operator + test trigger for the
-        // alive-source evacuation primitive. Auto-triggers
-        // (dead_host.rs, nbd_loss_trigger) fire the same shape on
-        // host-loss / NBD-loss; this endpoint exposes the operator
-        // drain path. Async shape (commit 12): returns 202 once the
-        // session is marked `Evacuating`; the `evac_resumer` scanner
-        // completes the resume on a peer.
         .route(
             "/admin/sessions/:id/evacuate",
             post(admin::evacuate_session),
         )
-        // ADR 0018 commit 12e: host-level operator drain. Cordon
-        // flips `HostState.draining` + PG `hosts.status = draining`
-        // so the picker excludes the host. Drain extends cordon by
-        // firing Evacuating for every Active session on the host.
         .route("/admin/hosts/:id/cordon", post(admin::cordon_host))
         .route("/admin/hosts/:id/uncordon", post(admin::uncordon_host))
         .route("/admin/hosts/:id/drain", post(admin::drain_host))
-        // ADR 0016 Phase C commit 5: explicit admin triggers for the
-        // chunk-GC sweep + candidate-table inspection. The background
-        // loop is the implicit production driver
-        // (per [explicit_admin_triggers_for_testability]); these are
-        // the test seam + operator-driven counterparts. Both POSTs
-        // accept `?grace_secs=N` so the e2e test in commit 6a can
-        // knock the 24h grace down to 0 without env juggling.
         .route("/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
         .route("/admin/chunk-gc/sweep", post(admin::chunk_gc_sweep))
         .route(
             "/admin/chunk-gc/candidates",
             get(admin::chunk_gc_candidates),
         )
-        // ADR 0031 auth surface (handlers in commit "auth + /me endpoints").
-        .route("/me", get(principal::me))
-        .route("/me/claude-token", post(principal::save_claude_token))
-        .route("/auth/logout", post(principal::logout))
+        // User administration.
         .route("/admin/users", get(principal::list_users))
-        .route("/admin/users/:id", axum::routing::patch(principal::patch_user))
-        // ADR 0031: human traffic resolves a Principal via the verifier chain
-        // (cookie → service-bearer → forward-auth → synthetic). Admin-only
-        // routes are gated per-handler by the `AdminOnly` extractor.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            principal::resolve_principal,
-        ));
+        .route(
+            "/admin/users/:id",
+            axum::routing::patch(principal::patch_user),
+        )
+        .layer(middleware::from_fn(principal::require_admin));
+
+    // ADR 0031: human traffic resolves a Principal via the verifier chain
+    // (cookie → service-bearer → forward-auth → synthetic). This outer layer
+    // runs first for both member + admin routes, inserting the principal that
+    // `require_admin` (inner, admin-only) then reads.
+    let protected = member.merge(admin).layer(middleware::from_fn_with_state(
+        state.clone(),
+        principal::resolve_principal,
+    ));
 
     // ADR 0031 internal control-plane: host → coord ingestion. Machine
     // traffic authenticated by the deployment bearer (`require_bearer`),

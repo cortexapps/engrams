@@ -73,7 +73,6 @@ pub struct ListEnabledImagesResponse {
 
 pub async fn enable_image(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Json(req): Json<EnableImageRequest>,
 ) -> Result<(StatusCode, Json<EnabledImageSummary>), ApiError> {
     if req.image_uri.trim().is_empty() {
@@ -115,7 +114,6 @@ pub async fn list_enabled_images(
 
 pub async fn refresh_enabled_image(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Json(req): Json<ImageUriRequest>,
 ) -> Result<Json<EnabledImageSummary>, ApiError> {
     if req.image_uri.trim().is_empty() {
@@ -183,7 +181,6 @@ pub struct BlockingSession {
 
 pub async fn disable_enabled_image(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Json(req): Json<ImageUriRequest>,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;

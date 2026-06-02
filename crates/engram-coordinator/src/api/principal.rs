@@ -3,8 +3,9 @@
 //! The [`resolve_principal`] middleware runs the [`VerifierChain`] over each
 //! request (cookie → service-bearer → forward-auth → synthetic) and stashes
 //! the resolved [`Principal`] in request extensions. Handlers pull it out via
-//! the [`CurrentUser`] extractor; admin-only routes use [`AdminOnly`] (the
-//! real authorization gate). When no auth runtime is configured (tests /
+//! the [`CurrentUser`] extractor; admin-only routes are gated once by the
+//! [`require_admin`] route layer (the real authorization gate). When no auth
+//! runtime is configured (tests /
 //! `AppState::new` without wiring), the layer injects a synthetic admin so
 //! the suite runs authed-as-admin unchanged.
 
@@ -151,21 +152,21 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
     }
 }
 
-/// Extractor that admits only admins. Use as an argument on admin-only
-/// handlers — the real authorization gate (the web only hides tabs).
-#[derive(Debug)]
-pub struct AdminOnly(pub Principal);
-
-#[async_trait]
-impl<S: Send + Sync> FromRequestParts<S> for AdminOnly {
-    type Rejection = ApiError;
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let CurrentUser(p) = CurrentUser::from_request_parts(parts, state).await?;
-        if p.is_admin() {
-            Ok(AdminOnly(p))
-        } else {
-            Err(ApiError::Forbidden("admin role required".into()))
-        }
+/// Route-layer guard for admin-only endpoints (the real authorization gate;
+/// the web only hides tabs). Applied once via `middleware::from_fn` to the
+/// admin sub-router rather than repeated as a per-handler extractor — the
+/// principal it reads is the one [`resolve_principal`] (an outer layer)
+/// already inserted.
+pub async fn require_admin(req: Request, next: Next) -> Response {
+    let is_admin = req
+        .extensions()
+        .get::<Principal>()
+        .map(Principal::is_admin)
+        .unwrap_or(false);
+    if is_admin {
+        next.run(req).await
+    } else {
+        ApiError::Forbidden("admin role required".into()).into_response()
     }
 }
 
@@ -427,10 +428,10 @@ impl From<&User> for UserSummary {
     }
 }
 
-/// `GET /admin/users` — list users (admin only).
+/// `GET /admin/users` — list users. Admin-gated by the `require_admin` route
+/// layer (these routes live on the admin sub-router).
 pub async fn list_users(
     State(state): State<SharedState>,
-    _: AdminOnly,
 ) -> Result<Json<Vec<UserSummary>>, ApiError> {
     let rt = state
         .auth
@@ -451,7 +452,6 @@ pub struct PatchUserRequest {
 /// Deactivating a user also revokes their live sessions.
 pub async fn patch_user(
     State(state): State<SharedState>,
-    _: AdminOnly,
     Path(id): Path<Uuid>,
     Json(req): Json<PatchUserRequest>,
 ) -> Result<Json<UserSummary>, ApiError> {
@@ -505,15 +505,49 @@ mod tests {
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
     }
 
-    #[tokio::test]
-    async fn admin_only_admits_admin_and_rejects_member() {
-        let mut admin = parts_with(Some(principal(Role::Admin)));
-        assert!(AdminOnly::from_request_parts(&mut admin, &()).await.is_ok());
+    /// Drive `require_admin` through a minimal router, injecting a principal
+    /// via an outer layer the way `resolve_principal` would.
+    async fn require_admin_status(principal: Option<Principal>) -> StatusCode {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
 
-        let mut member = parts_with(Some(principal(Role::Member)));
-        let err = AdminOnly::from_request_parts(&mut member, &())
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let app = Router::new()
+            .route("/admin", get(ok))
+            .layer(axum::middleware::from_fn(require_admin))
+            .layer(axum::middleware::from_fn(
+                move |mut req: Request, next: Next| {
+                    let p = principal.clone();
+                    async move {
+                        if let Some(p) = p {
+                            req.extensions_mut().insert(p);
+                        }
+                        next.run(req).await
+                    }
+                },
+            ));
+        app.oneshot(Request::get("/admin").body(Body::empty()).unwrap())
             .await
-            .unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn require_admin_admits_admin_and_rejects_others() {
+        assert_eq!(
+            require_admin_status(Some(principal(Role::Admin))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            require_admin_status(Some(principal(Role::Member))).await,
+            StatusCode::FORBIDDEN
+        );
+        // Missing principal (a wiring bug behind resolve_principal) is treated
+        // as non-admin, not admitted.
+        assert_eq!(require_admin_status(None).await, StatusCode::FORBIDDEN);
     }
 }

@@ -98,7 +98,6 @@ pub struct PerHostReapStats {
 ///   bringing down the whole sweep.
 pub async fn reap_materialize_dir(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     axum::extract::Query(params): axum::extract::Query<ReapMaterializeDirParams>,
 ) -> Result<Json<ReapMaterializeDirResult>, ApiError> {
     let min_age_secs = params.min_age_secs.unwrap_or(3600);
@@ -291,7 +290,6 @@ pub enum FlushNowOutcome {
 ///   scheduler-publish path's sandbox_id guard catches).
 pub async fn flush_now(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(session_id): Path<SessionId>,
 ) -> Result<Json<FlushNowResult>, ApiError> {
     // Look up the session's bound sandbox. NotFound on the session
@@ -409,7 +407,6 @@ pub struct EvacuateSessionResponse {
 /// the session events stream to observe the resume completing.
 pub async fn evacuate_session(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(session_id): Path<SessionId>,
     Json(_req): Json<EvacuateSessionRequest>,
 ) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
@@ -476,7 +473,6 @@ pub struct CordonResponse {
 /// session by hand).
 pub async fn cordon_host(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<Json<CordonResponse>, ApiError> {
     if !state.host_registry.cordon(host_id) {
@@ -513,7 +509,6 @@ pub async fn cordon_host(
 /// host returns to the picker's view immediately.
 pub async fn uncordon_host(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<Json<CordonResponse>, ApiError> {
     if !state.host_registry.uncordon(host_id) {
@@ -565,7 +560,6 @@ pub struct DrainFailure {
 /// lease guard.
 pub async fn drain_host(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<(StatusCode, Json<DrainHostResponse>), ApiError> {
     if !state.host_registry.cordon(host_id) {
@@ -716,7 +710,6 @@ impl From<(crate::chunk_gc::SweepReport, u64)> for ChunkGcSweepResult {
 /// writes. Operator-safe to fire any time.
 pub async fn chunk_gc_dry_run(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
 ) -> Result<Json<ChunkGcSweepResult>, ApiError> {
     let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
@@ -736,7 +729,6 @@ pub async fn chunk_gc_dry_run(
 /// the operator-driven path for "I want this to drain *now*."
 pub async fn chunk_gc_sweep(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
 ) -> Result<Json<ChunkGcSweepResult>, ApiError> {
     let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
@@ -779,7 +771,6 @@ pub struct ChunkGcCandidatesResult {
 /// of the promote-pass queue.
 pub async fn chunk_gc_candidates(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     axum::extract::Query(params): axum::extract::Query<ChunkGcCandidatesParams>,
 ) -> Result<Json<ChunkGcCandidatesResult>, ApiError> {
     let limit = params.limit.unwrap_or(100).clamp(1, 10_000);

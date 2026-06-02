@@ -73,7 +73,6 @@ pub struct StorageSummaryResponse {
 
 pub async fn summary(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
 ) -> Result<Json<StorageSummaryResponse>, ApiError> {
     let hosts = state.services.meta.list_active_hosts().await?;
 

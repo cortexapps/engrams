@@ -30,7 +30,6 @@ use crate::state::SharedState;
 /// state (capacity, local snapshots, draining).
 pub async fn list(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
 ) -> Result<Json<ListHostsResponse>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
     let hosts = rows
@@ -46,7 +45,6 @@ pub async fn list(
 /// `GET /api/hosts/:id`. NotFound if the row isn't in Postgres.
 pub async fn get(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host_id): Path<HostId>,
 ) -> Result<Json<HostView>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
@@ -67,7 +65,6 @@ pub async fn get(
 /// request.
 pub async fn cow_state(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host_id): Path<HostId>,
 ) -> Result<Json<HostCowStateResponse>, ApiError> {
     let backend = state
@@ -151,7 +148,6 @@ async fn enrichment_for_session(
 /// assigned to this host. In-flight sessions stay put.
 pub async fn drain(
     State(state): State<SharedState>,
-    _admin: crate::api::principal::AdminOnly,
     Path(host_id): Path<HostId>,
 ) -> Result<StatusCode, ApiError> {
     state
