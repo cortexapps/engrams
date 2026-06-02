@@ -98,8 +98,17 @@ build_tree() {
                 done
         }
         collect /out/node/bin/node
-        shell_bin="$(find /out/ms-playwright -name headless_shell -type f | head -n1)"
-        [ -n "$shell_bin" ] && collect "$shell_bin"
+        # The headless-shell binary was renamed `headless_shell` ->
+        # `chrome-headless-shell` (Chrome 149 / playwright v1224+); match both
+        # so we always ldd-collect chromium'"'"'s .so deps. If this finds
+        # nothing the bundle ships without chromium'"'"'s libs and the browser
+        # crashes at launch — fail loud instead.
+        shell_bin="$(find /out/ms-playwright -type f \( -name chrome-headless-shell -o -name headless_shell \) | head -n1)"
+        if [ -z "$shell_bin" ]; then
+            echo "FATAL: headless-shell binary not found under /out/ms-playwright" >&2
+            exit 1
+        fi
+        collect "$shell_bin"
 
         # 3b) Fonts + a minimal fontconfig. `ldd` collects libfontconfig but
         # NOT the font FILES or config, so without this chromium renders text
