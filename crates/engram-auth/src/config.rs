@@ -150,7 +150,16 @@ pub fn build_chain(
         verifiers.push(Box::new(SyntheticAdmin::new(cfg.dev_default_email.clone())));
     }
 
-    VerifierChain::new(verifiers, users, cfg.bootstrap_admins.clone())
+    // The service-bearer and synthetic-admin identities resolve to real
+    // `users` rows via JIT; fold their emails into the admin allowlist so
+    // they're provisioned as admin (machine callers + the dev admin).
+    let mut admins = cfg.bootstrap_admins.clone();
+    admins.push(cfg.service_email.clone());
+    if cfg.mode == AuthMode::None {
+        admins.push(cfg.dev_default_email.clone());
+    }
+
+    VerifierChain::new(verifiers, users, admins)
 }
 
 #[cfg(test)]

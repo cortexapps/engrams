@@ -59,6 +59,13 @@ impl VerifierChain {
         Ok(None)
     }
 
+    /// JIT-provision a verified email into a principal — public so the OIDC
+    /// `/auth/callback` handler resolves its email through the same path as
+    /// the chain's forward-auth/synthetic verifiers.
+    pub async fn provision(&self, e: VerifiedEmail) -> Result<Principal, AuthError> {
+        self.jit_upsert(e).await
+    }
+
     /// JIT-provision a user from a verified email and project to a principal.
     /// New bootstrap-admin emails are created as admin; an already-present
     /// allowlisted email that isn't admin (and wasn't *manually* set) is

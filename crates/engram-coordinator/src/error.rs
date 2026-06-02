@@ -29,8 +29,12 @@ pub enum ApiError {
     Unavailable(String),
     /// 401 — the caller's credential is missing or invalid. Used by the
     /// ADR 0023 in-session forge endpoints, authenticated by the
-    /// per-session credential-broker token.
+    /// per-session credential-broker token, and by the ADR 0031 principal
+    /// layer when no verifier authenticates the request.
     Unauthorized(String),
+    /// 403 — the caller is authenticated but lacks the role for this
+    /// operation. ADR 0031: a `member` hitting an admin-only route.
+    Forbidden(String),
     /// 413 — the request body exceeded a hard size cap. ADR 0026:
     /// an artifact upload over `MAX_ARTIFACT_BYTES` (or the session's
     /// remaining byte budget).
@@ -57,6 +61,7 @@ impl ApiError {
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -73,6 +78,7 @@ impl ApiError {
             Self::Unsupported(_) => "unsupported",
             Self::Unavailable(_) => "unavailable",
             Self::Unauthorized(_) => "unauthorized",
+            Self::Forbidden(_) => "forbidden",
             Self::PayloadTooLarge(_) => "payload_too_large",
             Self::TooManyRequests(_) => "too_many_requests",
             Self::Internal(_) => "internal",
@@ -89,6 +95,7 @@ impl ApiError {
             | Self::Unsupported(m)
             | Self::Unavailable(m)
             | Self::Unauthorized(m)
+            | Self::Forbidden(m)
             | Self::PayloadTooLarge(m)
             | Self::TooManyRequests(m)
             | Self::Internal(m) => m,

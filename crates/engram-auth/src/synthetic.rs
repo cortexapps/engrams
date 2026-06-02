@@ -1,39 +1,36 @@
-//! `SyntheticAdmin` — the no-SSO-configured fallback. Returns one built-in
-//! admin principal for every request so `just dev` runs with zero auth setup
+//! `SyntheticAdmin` — the no-SSO-configured fallback. Authenticates every
+//! request as one built-in admin so `just dev` runs with zero auth setup
 //! while still exercising the real authed code paths.
+//!
+//! It emits a [`VerifiedEmail`] (not a bare principal) so the chain
+//! JIT-upserts a real `users` row for the dev identity — that row is what
+//! lets a dev save a Claude token (FK-backed) and own sessions with a real
+//! user id, exactly like a production user. `build_chain` adds the dev email
+//! to the bootstrap-admin allowlist so the upsert resolves to `admin`.
 
 use async_trait::async_trait;
-use engram_core::types::user::{Principal, Role};
 
 use crate::error::AuthError;
-use crate::verify::{IdentityVerifier, Verified, VerifyInput};
-use crate::SYNTHETIC_USER_ID;
+use crate::verify::{IdentityVerifier, Verified, VerifiedEmail, VerifyInput};
 
 pub struct SyntheticAdmin {
-    principal: Principal,
+    email: String,
 }
 
 impl SyntheticAdmin {
-    /// `email` is the dev committer/display identity (configurable via
-    /// `--dev-default-email`).
+    /// `email` is the dev committer/display identity (`--dev-default-email`).
     pub fn new(email: impl Into<String>) -> Self {
-        let email = email.into();
-        Self {
-            principal: Principal {
-                user_id: SYNTHETIC_USER_ID.into(),
-                display_name: Some("Local Admin".to_string()),
-                email,
-                role: Role::Admin,
-                active: true,
-            },
-        }
+        Self { email: email.into() }
     }
 }
 
 #[async_trait]
 impl IdentityVerifier for SyntheticAdmin {
     async fn verify(&self, _input: &VerifyInput) -> Result<Option<Verified>, AuthError> {
-        Ok(Some(Verified::Principal(self.principal.clone())))
+        Ok(Some(Verified::Email(VerifiedEmail {
+            email: self.email.clone(),
+            display_name: Some("Local Admin".to_string()),
+        })))
     }
 
     fn name(&self) -> &'static str {

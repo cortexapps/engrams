@@ -21,6 +21,11 @@ pub struct CoordinatorConfig {
     /// expected to source tokens from a secret manager and rotate
     /// the process; for v1 we don't hot-reload.
     pub auth_tokens: Vec<String>,
+    /// ADR 0031 human authentication config (OIDC / forward-auth / synthetic).
+    /// `AuthMode::None` (the default) → synthetic admin, so `just dev` and the
+    /// test harness run with zero auth setup. `auth_tokens` above is folded
+    /// into `auth.service_tokens` at startup for the machine-caller path.
+    pub auth: engram_auth::AuthConfig,
     /// Local address the harness-channel TCP listener binds to.
     /// Harnesses spawned via `start_agent` on the Process backend dial
     /// this from the same host. `127.0.0.1:0` (default) lets the OS
@@ -43,6 +48,7 @@ impl Default for CoordinatorConfig {
             // this from `ENGRAM_AUTH_TOKENS` (or a future secret-store
             // hookup) at startup.
             auth_tokens: Vec::new(),
+            auth: engram_auth::AuthConfig::default(),
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),

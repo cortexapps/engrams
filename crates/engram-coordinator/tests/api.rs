@@ -963,15 +963,20 @@ async fn auth_disabled_when_token_list_empty() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ADR 0031: the deployment bearer no longer gates *human* routes — those are
+// authenticated by the principal layer (cookie / service-bearer / synthetic).
+// The bearer now guards only the `internal` control-plane router (host →
+// coord ingestion). These tests target an internal route (`/hosts/register`)
+// to exercise that gate. A separate test below confirms human routes are
+// principal-authed (synthetic admin → 200) regardless of the bearer.
+
+const INTERNAL_ROUTE: &str = "/api/v1/hosts/register";
+
 #[tokio::test]
-async fn auth_rejects_request_without_authorization_header() {
+async fn auth_rejects_internal_request_without_authorization_header() {
     let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
     let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(json_request(Method::POST, INTERNAL_ROUTE, json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -980,34 +985,32 @@ async fn auth_rejects_request_without_authorization_header() {
 }
 
 #[tokio::test]
-async fn auth_rejects_wrong_token() {
+async fn auth_rejects_wrong_token_on_internal_route() {
     let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
-            Request::get("/api/v1/sessions")
+            Request::post(INTERNAL_ROUTE)
                 .header("authorization", "Bearer beta")
-                .body(Body::empty())
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let v = body_json(resp.into_body()).await;
-    assert_eq!(v["error"], "unauthorized");
     assert!(v["message"].as_str().unwrap().contains("invalid"));
 }
 
 #[tokio::test]
-async fn auth_rejects_non_bearer_scheme() {
-    // Other schemes (Basic, Digest, ...) aren't supported. Mismatched
-    // scheme is a misconfigured client; surface 401, not a confusing
-    // 200 from a permissive header parser.
+async fn auth_rejects_non_bearer_scheme_on_internal_route() {
     let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
-            Request::get("/api/v1/sessions")
+            Request::post(INTERNAL_ROUTE)
                 .header("authorization", "Basic YWxwaGE=")
-                .body(Body::empty())
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
@@ -1016,24 +1019,42 @@ async fn auth_rejects_non_bearer_scheme() {
 }
 
 #[tokio::test]
-async fn auth_accepts_valid_bearer_token() {
-    let app = build_app_with_tokens(
-        MockMetadataStore::arc(),
-        vec!["alpha".into(), "beta".into()],
+async fn auth_valid_bearer_passes_internal_gate() {
+    // A valid token clears the bearer layer; the handler then runs (and may
+    // reject the empty body) — the point is it is NOT 401.
+    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let resp = app
+        .oneshot(
+            Request::post(INTERNAL_ROUTE)
+                .header("authorization", "Bearer alpha")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "valid bearer must clear the internal gate"
     );
-    for token in ["alpha", "beta"] {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::get("/api/v1/sessions")
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "token {token} must pass");
-    }
+}
+
+#[tokio::test]
+async fn human_routes_are_principal_authed_not_bearer_gated() {
+    // ADR 0031: even with deployment tokens set, a human route resolves via
+    // the principal layer. With no auth runtime wired (test default), that's
+    // the synthetic admin → 200, with or without an Authorization header.
+    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1046,26 +1067,6 @@ async fn auth_lets_healthz_through_without_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn auth_protects_post_endpoints_too() {
-    // The middleware applies to every method on every protected path,
-    // not just GETs. POST /sessions without a token must 401 before
-    // the body is parsed.
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": "r:warm-bootstrap",
-                "workspace": {"kind":"empty"},
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

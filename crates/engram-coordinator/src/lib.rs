@@ -98,7 +98,7 @@ pub async fn run_with_registry(
     services: Services,
     host_registry: Arc<HostRegistry>,
 ) -> Result<(), CoordinatorError> {
-    run_with_registry_and_local(cfg, services, host_registry, None, None).await
+    run_with_registry_and_local(cfg, services, host_registry, None, None, None).await
 }
 
 /// Variant of [`run_with_registry`] that also accepts a local VMM
@@ -119,10 +119,14 @@ pub async fn run_with_registry_and_local(
     // ADR 0023: configured git forge authority, or `None`. Set onto
     // `AppState.forge` for the in-session forge endpoints.
     forge: Option<Arc<dyn GitForge>>,
+    // ADR 0031: the authentication runtime, or `None` (→ synthetic admin).
+    // Set onto `AppState.auth` for the principal layer + `/auth` endpoints.
+    auth: Option<Arc<crate::api::principal::AuthRuntime>>,
 ) -> Result<(), CoordinatorError> {
     let meta_for_listener = services.meta.clone();
     let mut app = AppState::new_with_registry(cfg.clone(), services, host_registry);
     app.forge = forge;
+    app.auth = auth;
     let state = Arc::new(app);
     if let Some((host_id, backend)) = in_proc_local {
         state.register_local_host(host_id, backend);

@@ -932,6 +932,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "engram-auth",
  "engram-chunk-store",
  "engram-cloud-gcp",
  "engram-cloud-mock",

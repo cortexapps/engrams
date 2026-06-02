@@ -78,6 +78,14 @@ browser-held JWT) so deprovision/logout = delete the row, with no JWT-expiry rep
 window. The existing deployment bearer token stays for host-agent / CLI / internal calls;
 coord auth resolves *either* a valid cookie *or* a service bearer.
 
+**The browser no longer carries the deployment bearer.** Before 0031 the web app reached
+coord behind a proxy-stamped `ENGRAM_AUTH_TOKENS` bearer; now human auth is purely
+session-based — the session cookie (OIDC mode), the IAP/forward-auth assertion
+(forward-auth mode), or nothing (dev synthetic). The web client sends `credentials:
+'include'` and **no `Authorization` header**. `ENGRAM_AUTH_TOKENS` is retained solely for
+machine callers on the `internal` router; the prod deploy's nginx no longer needs to stamp
+a bearer for browser traffic.
+
 ### 4. Roles
 
 Two roles: `admin` and `member`. Admins see Fleet / Storage / admin-Settings and the

@@ -17,6 +17,7 @@ mod health;
 mod host_http;
 mod hosts;
 mod interrupt;
+pub mod principal;
 mod prompt;
 mod registries;
 pub(crate) mod session_auth;
@@ -71,42 +72,11 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/log", get(sessions_inspect::log))
         // ADR 0016 Phase A: per-session COW diagnostic.
         .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
-        // ADR 0013 host → coord HTTP endpoints. The old
-        // `/api/hosts/connect` WS handler has been retired —
-        // host-agents register over HTTP, heartbeat over HTTP,
-        // forward harness events over HTTP, and the coord
-        // dispatches back to them over gRPC.
-        .route("/hosts/register", post(host_http::register))
-        .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
-        // ADR 0023 split-mode forge forwarding: FC hosts proxy each
-        // in-guest forge request here (the forge sink can't run on the
-        // remote host). Host-authed; the broker token rides in the body.
-        .route("/hosts/forge", post(forge::forge_forward))
-        // ADR 0026 split-mode artifact forwarding: FC hosts relay each
-        // in-guest upload here (the upload sink can't run on the remote
-        // host). Host-authed; the broker token rides in the base64'd
-        // `X-Engram-Upload` header and is validated by `process_upload`.
-        .route("/hosts/upload", post(upload::upload_forward))
-        .route(
-            "/hosts/:id/auth/resolve-registry",
-            post(host_http::resolve_registry_auth),
-        )
-        .route(
-            "/hosts/:id/idle-eviction-candidates",
-            post(host_http::idle_eviction_candidates),
-        )
-        // ADR 0016 Phase B: host's FlushScheduler publishes
-        // freshly-flushed disk manifests so cow-state +
-        // effective_resume_disk_manifest can see the latest disk
-        // lineage between snapshot boundaries.
-        .route(
-            "/hosts/:id/live-manifest",
-            post(host_http::live_manifest_publish),
-        )
-        .route(
-            "/sessions/:id/harness-events",
-            post(host_http::harness_event_ingest),
-        )
+        // ADR 0031: the host → coord ingestion routes (register,
+        // heartbeat, forge/upload forwarding, resolve-registry,
+        // idle-eviction-candidates, live-manifest, harness-events) moved to
+        // the `internal` bearer-only router below — they are machine traffic
+        // and must NOT go through the human cookie/OIDC verifier chain.
         .route("/hosts", get(hosts::list))
         .route("/hosts/:id", get(hosts::get))
         .route("/hosts/:id/drain", post(hosts::drain))
@@ -174,10 +144,55 @@ pub fn router(state: SharedState) -> Router {
             "/admin/chunk-gc/candidates",
             get(admin::chunk_gc_candidates),
         )
+        // ADR 0031 auth surface (handlers in commit "auth + /me endpoints").
+        .route("/me", get(principal::me))
+        .route("/me/claude-token", post(principal::save_claude_token))
+        .route("/auth/logout", post(principal::logout))
+        .route("/admin/users", get(principal::list_users))
+        .route("/admin/users/:id", axum::routing::patch(principal::patch_user))
+        // ADR 0031: human traffic resolves a Principal via the verifier chain
+        // (cookie → service-bearer → forward-auth → synthetic). Admin-only
+        // routes are gated per-handler by the `AdminOnly` extractor.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            principal::resolve_principal,
+        ));
+
+    // ADR 0031 internal control-plane: host → coord ingestion. Machine
+    // traffic authenticated by the deployment bearer (`require_bearer`),
+    // NOT the human verifier chain — so the host-agent never needs a cookie
+    // and a 401 here never tries to redirect a browser to /auth/login.
+    let internal = Router::new()
+        .route("/hosts/register", post(host_http::register))
+        .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
+        .route("/hosts/forge", post(forge::forge_forward))
+        .route("/hosts/upload", post(upload::upload_forward))
+        .route(
+            "/hosts/:id/auth/resolve-registry",
+            post(host_http::resolve_registry_auth),
+        )
+        .route(
+            "/hosts/:id/idle-eviction-candidates",
+            post(host_http::idle_eviction_candidates),
+        )
+        .route(
+            "/hosts/:id/live-manifest",
+            post(host_http::live_manifest_publish),
+        )
+        .route(
+            "/sessions/:id/harness-events",
+            post(host_http::harness_event_ingest),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,
         ));
+
+    // ADR 0031 unauthenticated auth-flow entrypoints (you can't be authed to
+    // log in). OIDC redirect + callback set/consume the session cookie.
+    let auth_routes = Router::new()
+        .route("/auth/login", get(principal::login))
+        .route("/auth/callback", get(principal::callback));
 
     // ADR 0023 in-session forge seam. Authenticated in-handler by
     // the per-session credential-broker token (not the deployment
@@ -200,6 +215,9 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
-        .nest("/api/v1", forge_seam.merge(protected))
+        .nest(
+            "/api/v1",
+            forge_seam.merge(internal).merge(auth_routes).merge(protected),
+        )
         .with_state(state)
 }

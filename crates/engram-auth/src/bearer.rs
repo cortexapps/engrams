@@ -5,30 +5,24 @@
 //! used for `require_bearer`.
 
 use async_trait::async_trait;
-use engram_core::types::user::{Principal, Role};
 
 use crate::error::AuthError;
-use crate::verify::{IdentityVerifier, Verified, VerifyInput};
-use crate::SERVICE_USER_ID;
+use crate::verify::{IdentityVerifier, Verified, VerifiedEmail, VerifyInput};
 
 pub struct ServiceBearer {
     tokens: Vec<String>,
-    principal: Principal,
+    service_email: String,
 }
 
 impl ServiceBearer {
     /// `service_email` is the identity stamped for machine-created sessions /
-    /// git attribution.
+    /// git attribution. Like the synthetic admin it resolves to a real
+    /// `users` row via JIT (the chain folds this email into the admin
+    /// allowlist), so machine-created sessions own a real user id.
     pub fn new(tokens: Vec<String>, service_email: impl Into<String>) -> Self {
         Self {
             tokens,
-            principal: Principal {
-                user_id: SERVICE_USER_ID.into(),
-                display_name: Some("Engram Service".to_string()),
-                email: service_email.into(),
-                role: Role::Admin,
-                active: true,
-            },
+            service_email: service_email.into(),
         }
     }
 }
@@ -57,7 +51,10 @@ impl IdentityVerifier for ServiceBearer {
             .iter()
             .any(|t| ct_eq(t.as_bytes(), presented.as_bytes()));
         if matched {
-            Ok(Some(Verified::Principal(self.principal.clone())))
+            Ok(Some(Verified::Email(VerifiedEmail {
+                email: self.service_email.clone(),
+                display_name: Some("Engram Service".to_string()),
+            })))
         } else {
             // A bearer token was presented but didn't match. Fall through
             // (Ok(None)) rather than hard-failing: the same Authorization
@@ -86,15 +83,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_token_resolves_admin_service_principal() {
+    async fn valid_token_resolves_service_email() {
         let v = ServiceBearer::new(vec!["s3cret".into()], "svc@engram.local");
         let got = v.verify(&input_with_bearer("s3cret")).await.unwrap();
         match got {
-            Some(Verified::Principal(p)) => {
-                assert!(p.is_admin());
-                assert_eq!(p.email, "svc@engram.local");
-            }
-            other => panic!("expected service principal, got {other:?}"),
+            Some(Verified::Email(e)) => assert_eq!(e.email, "svc@engram.local"),
+            other => panic!("expected service email, got {other:?}"),
         }
     }
 
