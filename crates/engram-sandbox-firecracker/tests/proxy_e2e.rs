@@ -306,6 +306,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
     let sandbox_id = backend.create(spec).await.expect("create");
     // Poll for guest_ip — the in-VM agent takes a few seconds to

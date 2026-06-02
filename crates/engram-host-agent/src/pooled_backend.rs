@@ -2489,6 +2489,7 @@ mod tests {
             env: Default::default(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         }
     }
 
@@ -3502,6 +3503,7 @@ mod tests {
             env: Default::default(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         };
         spec.image_uri = Some("test:1".into());
         let _id = pooled.create(spec).await.unwrap();

@@ -210,6 +210,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
 
     // FC backend assumes spec.rootfs_source is a regular file by

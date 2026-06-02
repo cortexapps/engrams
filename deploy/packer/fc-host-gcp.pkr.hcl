@@ -81,6 +81,16 @@ variable "uffd_handler_local_path" {
   description = "Local filesystem path to the pre-built static engram-uffd-handler binary (ADR 0020 Route B; spawned by host-agent on a UFFD restore)."
 }
 
+variable "skills_bundle_local_path" {
+  type        = string
+  description = "ADR 0027: local path to the skills RO bundle squashfs (CI pulls bundle-skills from GHCR). Baked at /var/lib/engram/shared/skills.squashfs — the fleet-canonical path session base snapshots embed; the FC backend asserts its presence on restore."
+}
+
+variable "playwright_bundle_local_path" {
+  type        = string
+  description = "ADR 0027: local path to the playwright RO bundle squashfs (CI pulls bundle-playwright from GHCR). Baked at /var/lib/engram/shared/playwright.squashfs; attached only to [browser]-enabled sessions, but staged on every host so the path is always present."
+}
+
 variable "firecracker_version" {
   type        = string
   description = "Firecracker release tag — for the image label only; the binary already lives in the base image."
@@ -149,6 +159,19 @@ build {
     destination = "/tmp/engram-uffd-handler"
   }
 
+  # ADR 0027: the read-only session bundles (skills always; playwright for
+  # [browser] images). Uploaded from the CI runner (which pulled them from
+  # GHCR via oras) and baked at the fleet-canonical path session base
+  # snapshots embed.
+  provisioner "file" {
+    source      = var.skills_bundle_local_path
+    destination = "/tmp/skills.squashfs"
+  }
+  provisioner "file" {
+    source      = var.playwright_bundle_local_path
+    destination = "/tmp/playwright.squashfs"
+  }
+
   # 2. Install both into /usr/local/bin. The systemd unit (baked into the
   #    base image, already `enable`d) picks up engram-host-agent on the next
   #    boot of a real FC host once the MIG startup-script drops the env file.
@@ -159,6 +182,26 @@ build {
       "file /tmp/engram-host-agent /tmp/engram-uffd-handler",
       "sudo install -m 0755 /tmp/engram-host-agent  /usr/local/bin/engram-host-agent",
       "sudo install -m 0755 /tmp/engram-uffd-handler /usr/local/bin/engram-uffd-handler",
+    ]
+  }
+
+  # 2b. ADR 0027: stage the RO bundles at the fleet-canonical path. Baked as
+  #     regular files (not the dynamic symlink) — a bundle change re-bakes
+  #     this image + rolls the MIG, so every host carries the current bundle
+  #     at /var/lib/engram/shared/<name>.squashfs, which is the path the
+  #     base snapshots embed and the FC backend re-anchors against on restore.
+  provisioner "shell" {
+    inline_shebang = "/usr/bin/env bash"
+    inline = [
+      "set -euo pipefail",
+      # Assert the squashfs magic so a corrupt/empty pull fails the bake.
+      # `file` is standard; the host only STORES these (the guest kernel
+      # mounts them — CONFIG_SQUASHFS_ZSTD=y), so no squashfs-tools needed.
+      "file /tmp/skills.squashfs     | grep -qi squashfs",
+      "file /tmp/playwright.squashfs | grep -qi squashfs",
+      "sudo mkdir -p /var/lib/engram/shared",
+      "sudo install -m 0644 /tmp/skills.squashfs     /var/lib/engram/shared/skills.squashfs",
+      "sudo install -m 0644 /tmp/playwright.squashfs /var/lib/engram/shared/playwright.squashfs",
     ]
   }
 

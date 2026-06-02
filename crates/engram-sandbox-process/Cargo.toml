@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 engram-core.workspace = true
+# ADR 0027: dev parity — activate the same RO skill/MCP bundles agentd does.
+engram-session-bundles.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -35,3 +37,7 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 [dev-dependencies]
 futures = { workspace = true }
 tempfile = "3"
+# ADR 0027 bundle-activation e2e (tests/ are separate crates — they can't
+# reach the lib's normal deps directly).
+engram-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

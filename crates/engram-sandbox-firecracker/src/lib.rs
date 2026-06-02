@@ -977,6 +977,51 @@ impl FirecrackerBackend {
         vsock_uds_path: &Path,
         port: u32,
     ) -> Result<UnixStream, SandboxError> {
+        // Post-`load_snapshot`, FC's vsock muxer has a brief window where it
+        // accepts a host CONNECT and returns OK, then closes the connection
+        // before the guest's accept-loop wakes — surfacing as `early eof` on
+        // the CONNECT-response read 3-5 ms in (the same window InstallHostCa
+        // documents and retries). It widens with the device count a restore
+        // has to kick (ADR 0027 added the RO bundle drive), which tipped the
+        // previously-lucky post-resume `/exec` dial into it. The CONNECT
+        // handshake is PRE-APPLICATION — no bytes have reached the guest
+        // service yet — so re-dialing is safe for every caller (exec, forge,
+        // upload, shell tunnel, CA). Retry EOF/RST-shaped handshake failures
+        // with a short backoff; a genuinely-dead agentd EOFs every attempt
+        // and the final error propagates.
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match Self::connect_fc_vsock_once(vsock_uds_path, port).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let retryable = msg.contains("early eof")
+                        || msg.contains("unexpected end of file")
+                        || msg.contains("connection reset")
+                        || msg.contains("broken pipe");
+                    if !retryable || attempt >= MAX_ATTEMPTS {
+                        return Err(e);
+                    }
+                    tracing::debug!(
+                        attempt,
+                        port,
+                        error = %e,
+                        "FC vsock CONNECT transient (muxer settle); retrying after 50 ms",
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// One CONNECT-handshake attempt. See [`Self::connect_fc_vsock`] for the
+    /// retry wrapper and why a fresh dial is always safe.
+    async fn connect_fc_vsock_once(
+        vsock_uds_path: &Path,
+        port: u32,
+    ) -> Result<UnixStream, SandboxError> {
         let mut conn = UnixStream::connect(vsock_uds_path).await.map_err(|e| {
             vm_err(format!(
                 "connect to FC vsock UDS {}: {e}",
@@ -1384,6 +1429,48 @@ impl FirecrackerBackend {
         // ADR 0021 P1.5: no second virtio-blk for the harness — the
         // harness binary travels in the rootfs at the manifest-
         // declared `[harness] exec` path.
+
+        // ADR 0027: extra read-only host-mounted bundles (the skills /
+        // playwright squashfs). Unlike the rootfs there is NO canonical
+        // symlink dance — each `path_on_host` is already the fleet-wide
+        // canonical path (present identically on every host once the FC-host
+        // image bakes it), so `state.bin` embeds it directly and restore
+        // re-anchors by mere presence.
+        //
+        // HARD-FAIL on a missing bundle (no skip-if-absent hedge). This
+        // cold-create path is base-snapshot capture (ADR 0020), which is an
+        // operator-controlled, manual step (POST /api/enabled-images). The
+        // FC-host image bake auto-fires on merge and stages these bundles, so
+        // the correct order is: roll the host image first, THEN enable. If a
+        // bundle is missing here we'd rather 500 the enable loudly — telling
+        // the operator the host fleet isn't ready — than silently capture a
+        // skills-less snapshot every session would then inherit. A snapshot
+        // therefore only ever exists with ALL its declared bundles present,
+        // which is exactly what the restore-side assert relies on.
+        for aux in &spec.aux_ro_drives {
+            if !tokio::fs::try_exists(&aux.path_on_host)
+                .await
+                .unwrap_or(false)
+            {
+                return Err(SandboxError::Vm(
+                    format!(
+                        "aux RO bundle {:?} ({}) not present on this host — the \
+                         FC-host image hasn't staged it; roll the host image \
+                         before enabling this image",
+                        aux.path_on_host.display(),
+                        aux.drive_id
+                    )
+                    .into(),
+                ));
+            }
+            api.put_drive(&DriveConfig {
+                drive_id: aux.drive_id.clone(),
+                path_on_host: aux.path_on_host.to_string_lossy().into_owned(),
+                is_root_device: false,
+                is_read_only: true,
+            })
+            .await?;
+        }
 
         // virtio-net: bind FC to the TAP we provisioned above. The
         // TAP already has the host-side gateway IP and is admin-up,
@@ -2293,6 +2380,29 @@ async fn restore_canonical_symlinks(
     // `[harness] exec` path, so there's nothing for the host to
     // re-point.
     let _ = (stub_harness_override, new_sandbox_id, work_dir);
+
+    // ADR 0027: aux RO bundles re-anchor by presence — `state.bin` embedded
+    // each bundle's fleet-canonical path and FC's `load_snapshot` reopens the
+    // drive there, so the path MUST exist on this receiver. Capture hard-fails
+    // unless every declared bundle is present (above), so a snapshot only ever
+    // exists with ALL its `spec.aux_ro_drives` attached — meaning this list is
+    // exactly what `load_snapshot` will open, no false-positives. Assert
+    // presence up front for a clear `SandboxError::Snapshot` instead of an
+    // opaque FC virtio "No such file" on a host the MIG roll hasn't reached.
+    for aux in &manifest.spec.aux_ro_drives {
+        if !tokio::fs::try_exists(&aux.path_on_host)
+            .await
+            .unwrap_or(false)
+        {
+            return Err(SandboxError::Snapshot(format!(
+                "aux RO bundle {:?} ({}) embedded in the snapshot is not \
+                 present on this host — the FC-host image hasn't staged it \
+                 (wait for the MIG roll to finish)",
+                aux.path_on_host.display(),
+                aux.drive_id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3503,6 +3613,7 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         }
     }
 

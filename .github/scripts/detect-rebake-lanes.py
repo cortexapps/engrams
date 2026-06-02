@@ -60,6 +60,16 @@ HOST_BINARIES_PATHS = ["rust-toolchain.toml"] + BINARY_COMMON
 HOST_BASE_PATHS = ["deploy/packer/", "deploy/otel/"]
 IMAGES_PATHS = ["docker/", "web/", "deploy/migrations/"] + BINARY_COMMON
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
+# ADR 0027: the RO session bundles (skills / playwright). A change here means
+# the bundle artifacts must be rebuilt + republished, and the FC-host image
+# re-baked to pull the new squashfs. Independent of the Rust/OS lanes.
+BUNDLES_PATHS = ["deploy/bundles/"]
+# ADR 0027: the `dev-engrams` dogfood session image runs the REAL `just dev`
+# (whole-repo build) inside a sandbox, so it's stale on essentially any source
+# change. We trip its rebake on the union of what it builds — the container +
+# host source closures (computed below) plus the dev-orchestration inputs
+# here. Doc/TF-only pushes don't rebake it.
+DEV_IMAGE_PATHS = ["justfile", "flake.nix", "flake.lock", "Tiltfile", "deploy/dev/"]
 
 
 def cargo_meta():
@@ -153,11 +163,17 @@ def main():
     # at this SHA for whichever downstream bake (thin and/or base) fires.
     host_image = host_binaries or host_base
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
+    bundles = any_path(changed, BUNDLES_PATHS)
+    # The dogfood image builds the whole repo via `just dev`, so it's stale on
+    # any source the container/host bakes consume, plus the dev-orchestration
+    # inputs. Union of those — NOT tripped by doc/TF/helm-only pushes.
+    dev_image = images or host_binaries or host_base or any_path(changed, DEV_IMAGE_PATHS)
 
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
-          f"host_base={host_base} host_image={host_image} tf_or_helm={tf_or_helm}", file=sys.stderr)
+          f"host_base={host_base} host_image={host_image} tf_or_helm={tf_or_helm} "
+          f"bundles={bundles} dev_image={dev_image}", file=sys.stderr)
 
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
@@ -167,6 +183,8 @@ def main():
             f.write(f"host_base={'true' if host_base else 'false'}\n")
             f.write(f"host_image={'true' if host_image else 'false'}\n")
             f.write(f"tf_or_helm={'true' if tf_or_helm else 'false'}\n")
+            f.write(f"bundles={'true' if bundles else 'false'}\n")
+            f.write(f"dev_image={'true' if dev_image else 'false'}\n")
 
 
 if __name__ == "__main__":

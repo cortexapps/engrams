@@ -78,6 +78,7 @@ async fn serial_restore_from_one_canonical_n_times() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
 
     // Step 1: Create source + let it settle + snapshot + destroy.

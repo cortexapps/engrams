@@ -171,6 +171,7 @@ async fn share_file_round_trips_over_vsock() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");

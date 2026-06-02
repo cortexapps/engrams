@@ -108,6 +108,7 @@ async fn chained_restore_snapshot_lineage_holds() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
+        aux_ro_drives: Vec::new(),
     };
 
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the

@@ -47,6 +47,8 @@ jobs:
       host_base: ${{ steps.lanes.outputs.host_base }}
       host_image: ${{ steps.lanes.outputs.host_image }}
       tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
+      bundles: ${{ steps.lanes.outputs.bundles }}
+      dev_image: ${{ steps.lanes.outputs.dev_image }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -223,6 +225,66 @@ jobs:
           fi
           echo "Published host-binaries -> $REPO:{$SHA,$SHORT}"
 
+  # ADR 0027: build the RO session bundles (skills, playwright) and publish
+  # each as an OCI artifact to GHCR, mirroring publish-host-binaries. The
+  # FC-host image bake (engrams-internal) pulls them and stages each at the
+  # fleet-canonical /var/lib/engram/shared/<name>.squashfs symlink.
+  publish-bundles:
+    needs: detect
+    if: needs.detect.outputs.bundles == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install squashfs-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
+
+      - name: Build bundles
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # skills: pure pack of our wrapper scripts + SKILL.md.
+          deploy/bundles/skills/build.sh dist/skills.squashfs
+          # playwright: glibc Docker build (chromium-headless-shell + node +
+          # @playwright/mcp + deps), then squashfs.
+          deploy/bundles/playwright/build.sh dist/playwright.squashfs
+          ls -l dist/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Publish bundles to GHCR (oras)
+        working-directory: dist
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="${SHA:0:7}"
+          for name in skills playwright; do
+            REPO="ghcr.io/${{ github.repository }}/bundle-$name"
+            # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
+            oras push "$REPO:$SHA" \
+              --artifact-type "application/vnd.engrams.ro-bundle.v1" \
+              "$name.squashfs:application/octet-stream"
+            oras tag "$REPO:$SHA" "$SHORT"
+            if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+              oras tag "$REPO:$SHA" "main"
+            fi
+            echo "Published bundle-$name -> $REPO:{$SHA,$SHORT}"
+          done
+
   # Fires on EVERY push to main where the `bake` job didn't fail.
   # Fans path-aware repository_dispatches into engrams-internal so
   # each downstream workflow only runs when its inputs actually
@@ -249,7 +311,7 @@ jobs:
   # the downstream FC-host bakes pull that GHCR artifact, so firing
   # them without it would 404 on the pull.
   notify:
-    needs: [detect, bake, publish-host-binaries]
+    needs: [detect, bake, publish-host-binaries, publish-bundles]
     if: |
       always() &&
       github.event_name == 'push' &&
@@ -257,7 +319,9 @@ jobs:
       needs.bake.result != 'failure' &&
       needs.bake.result != 'cancelled' &&
       needs.publish-host-binaries.result != 'failure' &&
-      needs.publish-host-binaries.result != 'cancelled'
+      needs.publish-host-binaries.result != 'cancelled' &&
+      needs.publish-bundles.result != 'failure' &&
+      needs.publish-bundles.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - name: Fire path-aware repository_dispatches at engrams-internal
@@ -269,6 +333,8 @@ jobs:
           HOST_BINARIES_CHANGED: ${{ needs.detect.outputs.host_binaries }}
           HOST_BASE_CHANGED: ${{ needs.detect.outputs.host_base }}
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
+          BUNDLES_CHANGED: ${{ needs.detect.outputs.bundles }}
+          DEV_IMAGE_CHANGED: ${{ needs.detect.outputs.dev_image }}
         run: |
           set -euo pipefail
           fire() {
@@ -299,9 +365,24 @@ jobs:
           if [[ "$TF_CHANGED" == "true" ]]; then
             fire engrams-tf-changed
           fi
+          # ADR 0027: a bundle change republished the squashfs artifacts above;
+          # the FC-host image must re-bake to pull them onto every host. The
+          # engrams-internal handler for this re-stages /var/lib/engram/shared.
+          if [[ "$BUNDLES_CHANGED" == "true" ]]; then
+            fire engrams-bundles-changed
+          fi
+          # ADR 0027: auto-rebake the dev-engrams dogfood session image when
+          # any source it builds moved. This only triggers the bake; ENABLING
+          # the freshly-baked image (POST /api/enabled-images) stays a manual
+          # step by design — auto-enable is a separate decision.
+          if [[ "$DEV_IMAGE_CHANGED" == "true" ]]; then
+            fire engrams-dev-image-changed
+          fi
           if [[ "$CONTAINERS_CHANGED" != "true" \
              && "$HOST_BINARIES_CHANGED" != "true" \
              && "$HOST_BASE_CHANGED" != "true" \
-             && "$TF_CHANGED" != "true" ]]; then
+             && "$TF_CHANGED" != "true" \
+             && "$BUNDLES_CHANGED" != "true" \
+             && "$DEV_IMAGE_CHANGED" != "true" ]]; then
             echo "No deploy-relevant paths changed in this push; skipping dispatches."
           fi

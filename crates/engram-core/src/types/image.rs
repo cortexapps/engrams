@@ -89,6 +89,34 @@ pub struct ImageManifest {
     /// mismatch fails the forge request, not session create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitConfig>,
+
+    /// Opt-in browser tooling (ADR 0027). When `enabled`, sessions of this
+    /// image get the read-only `playwright` bundle (chromium-headless-shell
+    /// with the `@playwright/mcp` server) attached as an aux RO drive at
+    /// base-snapshot capture, and agentd wires the `playwright` MCP server
+    /// and `record-demo` skill at session bind. Also raises the memory floor
+    /// (the headless browser needs ~250-400 MB). Off by default — most images
+    /// never open a browser, and the bundle is glibc-linked (musl/alpine
+    /// bases can't use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserConfig>,
+}
+
+/// Browser-tooling binding for an image (ADR 0027). Gates the opt-in
+/// `playwright` RO bundle + MCP wiring.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserConfig {
+    /// `[browser] enabled = true` attaches the playwright bundle and wires
+    /// the `@playwright/mcp` server for this image's sessions.
+    pub enabled: bool,
+}
+
+impl ImageManifest {
+    /// Whether this image opted into browser tooling (`[browser] enabled`).
+    pub fn browser_enabled(&self) -> bool {
+        self.browser.as_ref().is_some_and(|b| b.enabled)
+    }
 }
 
 impl ImageManifest {
@@ -404,6 +432,47 @@ mod tests {
             [git]
             provider = "github"
             repo = "cortexapps/engrams"
+        "#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifest_parses_browser_block() {
+        // No [browser] block → browser tooling off.
+        let m: ImageManifest = toml::from_str(r#"name = "plain""#).unwrap();
+        assert!(m.browser.is_none());
+        assert!(!m.browser_enabled());
+
+        // Opt-in.
+        let on: ImageManifest = toml::from_str(
+            r#"
+            name = "demo"
+            [browser]
+            enabled = true
+        "#,
+        )
+        .unwrap();
+        assert!(on.browser_enabled());
+
+        // Explicit off.
+        let off: ImageManifest = toml::from_str(
+            r#"
+            name = "demo"
+            [browser]
+            enabled = false
+        "#,
+        )
+        .unwrap();
+        assert!(!off.browser_enabled());
+
+        // deny_unknown_fields guards typos in the block.
+        assert!(toml::from_str::<ImageManifest>(
+            r#"
+            name = "x"
+            [browser]
+            enabled = true
+            headed = true
         "#
         )
         .is_err());

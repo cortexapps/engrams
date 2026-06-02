@@ -1,0 +1,8 @@
+#!/bin/sh
+# ADR 0026 artifact-share helper. Shipped in the fleet-wide `skills` RO
+# bundle (ADR 0027) and symlinked onto PATH by agentd at session bind.
+# Thin wrapper over the baked `engram-agentd share-file` subcommand,
+# which dials the host's upload vsock bridge -> coordinator BlobStorage.
+# Flags: --file <path> [--caption <text>]. The shared image/video shows
+# up in the session's conversation history. No tokens needed.
+exec engram-agentd share-file "$@"

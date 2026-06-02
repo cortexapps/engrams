@@ -162,6 +162,16 @@ bake-demo:
 pull-kernel:
     bash deploy/dev/pull-kernel.sh
 
+# Stage the ADR 0027 RO bundles (skills, playwright) as UNPACKED trees
+# under var/bundles/ for the dev ProcessBackend, which symlinks them in
+# instead of mounting a squashfs. `skills` is a plain copy; `playwright`
+# needs Docker (glibc browser build) and is best-effort — skip it and only
+# skills get wired (no browser MCP in dev). Re-run after editing a skill.
+bundles:
+    deploy/bundles/skills/build.sh --stage var/bundles/skills
+    deploy/bundles/playwright/build.sh --stage var/bundles/playwright \
+        || echo "playwright bundle skipped (needs Docker) — dev sessions get skills only"
+
 # ------------------------------------------------------------------
 # Smoke / e2e helpers — run against a stack brought up by `just dev`
 # (ADR 0024 retired the standalone `integration-up.sh`; the prod-shape

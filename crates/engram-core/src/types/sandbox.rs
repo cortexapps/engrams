@@ -52,6 +52,74 @@ pub struct SandboxSpec {
     /// non-empty.
     #[serde(default)]
     pub network: NetworkPolicy,
+    /// ADR 0027: extra read-only host-mounted bundles attached as
+    /// virtio-blk drives — the RO-mount skills/MCP engine ADR 0023
+    /// deferred. Each entry is a fleet-wide, content-addressed host
+    /// asset at a canonical path identical on every host (a stable
+    /// symlink), so a snapshot that embeds the path re-anchors on
+    /// restore by mere presence — no `patch_drive`. First two
+    /// consumers: the always-attached `skills` bundle (the relocated
+    /// built-in skill helpers) and the opt-in `playwright` bundle
+    /// (chromium-headless-shell + `@playwright/mcp`).
+    ///
+    /// `#[serde(default)]` covers the legacy-snapshot JSON path (older
+    /// sidecars predate this field); the coord ↔ host-agent bincode
+    /// wire rolls coord+host together, so the positional encode/decode
+    /// stay in lockstep (an empty `Vec` still encodes as length 0).
+    #[serde(default)]
+    pub aux_ro_drives: Vec<AuxRoDrive>,
+}
+
+/// A read-only bundle the host attaches to the guest as an additional
+/// virtio-blk drive (ADR 0027). The guest's init shim RO-mounts it at
+/// [`Self::guest_mount`]; agentd then wires whatever skills/MCP the
+/// bundle carries into the harness at `SpawnHarness` time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuxRoDrive {
+    /// Firecracker `drive_id` (e.g. `"skills"`, `"playwright"`). Stable
+    /// across snapshot/restore — embedded in `state.bin`.
+    pub drive_id: String,
+    /// Canonical fleet-wide host path, a stable symlink (e.g.
+    /// `/var/lib/engram/shared/playwright.squashfs`). Identical on every
+    /// host so the snapshot-embedded path re-anchors on restore.
+    pub path_on_host: PathBuf,
+    /// Fixed guest mount point the init shim mounts the drive at (e.g.
+    /// `/opt/engram/browser`).
+    pub guest_mount: PathBuf,
+    /// Filesystem type for the guest mount (`"squashfs"` | `"erofs"`).
+    pub fs_type: String,
+}
+
+impl AuxRoDrive {
+    /// Fleet-canonical directory where the FC-host image stages the RO
+    /// bundles (stable symlinks → content-addressed `<name>-<sha>.squashfs`).
+    /// Identical on every host so a snapshot-embedded path re-anchors on
+    /// restore by presence.
+    pub const SHARED_DIR: &'static str = "/var/lib/engram/shared";
+
+    /// The always-attached `skills` bundle: the relocated built-in skill
+    /// helpers (`engram-share` / `engram-pr` / `git-askpass` + SKILL.md).
+    /// Mounted at `/opt/engram/skills`; agentd activates the active subset.
+    pub fn skills() -> Self {
+        Self {
+            drive_id: "skills".into(),
+            path_on_host: PathBuf::from(Self::SHARED_DIR).join("skills.squashfs"),
+            guest_mount: PathBuf::from("/opt/engram/skills"),
+            fs_type: "squashfs".into(),
+        }
+    }
+
+    /// The opt-in `playwright` bundle: chromium-headless-shell + Node +
+    /// `@playwright/mcp` + deps. Mounted at `/opt/engram/browser`; agentd
+    /// wires the `playwright` MCP + `record-demo` skill when present.
+    pub fn playwright() -> Self {
+        Self {
+            drive_id: "playwright".into(),
+            path_on_host: PathBuf::from(Self::SHARED_DIR).join("playwright.squashfs"),
+            guest_mount: PathBuf::from("/opt/engram/browser"),
+            fs_type: "squashfs".into(),
+        }
+    }
 }
 
 /// Argv + env for the long-running "agent" process (Claude Code,
@@ -248,6 +316,78 @@ mod tests {
         let bytes = bincode::serialize(&some).expect("bincode encode Some");
         let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode Some");
         assert_eq!(back.host_ca_pem, some.host_ca_pem);
+    }
+
+    fn spec_with_aux_drives(drives: Vec<AuxRoDrive>) -> SandboxSpec {
+        SandboxSpec {
+            image: "warm-1".into(),
+            rootfs_source: None,
+            image_uri: None,
+            cpu: CpuLimit { vcpus: 2 },
+            memory: MemoryLimit { max_mib: 4096 },
+            disk: DiskLimit { max_gib: 8 },
+            ttl: None,
+            env: HashMap::new(),
+            workdir: None,
+            network: NetworkPolicy::default(),
+            aux_ro_drives: drives,
+        }
+    }
+
+    /// `SandboxSpec` crosses the coord ↔ host-agent boundary as bincode
+    /// (positional) and is persisted as JSON in snapshot sidecars. Pin
+    /// both round-trips for the ADR-0027 `aux_ro_drives` field so a
+    /// future wire change can't silently break either path.
+    #[test]
+    fn sandbox_spec_aux_ro_drives_round_trip_bincode_and_json() {
+        let spec = spec_with_aux_drives(vec![
+            AuxRoDrive {
+                drive_id: "skills".into(),
+                path_on_host: "/var/lib/engram/shared/skills.squashfs".into(),
+                guest_mount: "/opt/engram/skills".into(),
+                fs_type: "squashfs".into(),
+            },
+            AuxRoDrive {
+                drive_id: "playwright".into(),
+                path_on_host: "/var/lib/engram/shared/playwright.squashfs".into(),
+                guest_mount: "/opt/engram/browser".into(),
+                fs_type: "squashfs".into(),
+            },
+        ]);
+
+        let bytes = bincode::serialize(&spec).expect("bincode encode");
+        let back: SandboxSpec = bincode::deserialize(&bytes).expect("bincode decode");
+        assert_eq!(back.aux_ro_drives, spec.aux_ro_drives);
+
+        let json = serde_json::to_string(&spec).expect("json encode");
+        let back: SandboxSpec = serde_json::from_str(&json).expect("json decode");
+        assert_eq!(back.aux_ro_drives, spec.aux_ro_drives);
+
+        // Empty is the common case (no bundles attached) — must encode as
+        // a zero-length vec and decode cleanly.
+        let bytes =
+            bincode::serialize(&spec_with_aux_drives(vec![])).expect("bincode encode empty");
+        let back: SandboxSpec = bincode::deserialize(&bytes).expect("bincode decode empty");
+        assert!(back.aux_ro_drives.is_empty());
+    }
+
+    /// `#[serde(default)]` lets a legacy snapshot sidecar that predates
+    /// `aux_ro_drives` decode (JSON path) — the field comes back empty.
+    #[test]
+    fn sandbox_spec_legacy_json_without_aux_ro_drives_defaults_empty() {
+        let legacy = r#"{
+            "image": "warm-1",
+            "rootfs_source": null,
+            "image_uri": null,
+            "cpu": { "vcpus": 2 },
+            "memory": { "max_mib": 4096 },
+            "disk": { "max_gib": 8 },
+            "ttl": null,
+            "env": {},
+            "workdir": null
+        }"#;
+        let spec: SandboxSpec = serde_json::from_str(legacy).expect("legacy json decode");
+        assert!(spec.aux_ro_drives.is_empty());
     }
 
     #[test]

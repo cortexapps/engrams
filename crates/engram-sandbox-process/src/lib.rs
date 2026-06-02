@@ -118,6 +118,12 @@ impl SandboxBackend for ProcessBackend {
                 .await
                 .map_err(|e| SandboxError::Vm(format!("materialize rootfs: {e}").into()))?;
         }
+        // ADR 0027 dev parity: ProcessBackend has no virtio-blk drives, so
+        // it symlinks each bundle's guest mount (under the materialized cwd)
+        // at a host-local unpacked bundle dir. agentd's activation step (run
+        // in `start_agent` below) then wires skills/MCP from these the same
+        // way the FC guest does.
+        stage_aux_bundles(&cwd).await;
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
     }
@@ -142,6 +148,23 @@ impl SandboxBackend for ProcessBackend {
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
+        // ADR 0027: wire the staged RO bundles into the harness discovery
+        // paths under the sandbox cwd — the dev mirror of agentd's
+        // SpawnHarness activation. `root = cwd`; spawn_agent sets
+        // HOME=<cwd>/root so the harness resolves ~/.claude/skills there.
+        // Run BEFORE the readiness-probe early return (like agentd) so a
+        // dev_vm session's /exec + shell also see the skills. Gate on the
+        // union of session_env + the per-spawn agent.env, because the forge
+        // broker token rides agent.env, not session_env.
+        let mut gate_env = state.spec.env.clone();
+        gate_env.extend(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let report = engram_session_bundles::activate(&state.cwd, &gate_env);
+        if !report.activated.is_empty() {
+            tracing::info!(activated = ?report.activated, "ADR 0027: activated session bundles (dev)");
+        }
+        for w in &report.warnings {
+            tracing::debug!(warning = %w, "ADR 0027: session bundle activation (dev)");
+        }
         // ADR 0015 M1: empty argv is a readiness probe (no harness
         // to spawn). Mirrors `engram_agentd::HarnessSupervisor::spawn`.
         // Coord's harness=none cold-create path calls us with empty
@@ -422,6 +445,7 @@ impl SandboxBackend for ProcessBackend {
                     env: HashMap::new(),
                     workdir: None,
                     network: Default::default(),
+                    aux_ro_drives: Vec::new(),
                 };
                 self.sandboxes.insert(id, SandboxState { spec, cwd });
                 return Ok(id);
@@ -449,6 +473,12 @@ impl SandboxBackend for ProcessBackend {
         .map_err(|e| SandboxError::Snapshot(format!("restore tar join: {e}")))?
         .map_err(|e| SandboxError::Snapshot(format!("restore tar: {e}")))?;
 
+        // ADR 0027 dev parity: re-stage the bundle symlinks under the NEW
+        // cwd. The untarred tree may carry symlinks pointing at the old
+        // cwd (now stale); restaging repoints them at the current host
+        // bundle dirs so the resumed harness's skills/MCP resolve.
+        stage_aux_bundles(&cwd).await;
+
         // Synthesize a SandboxSpec from the manifest. We don't carry
         // CPU/memory/etc. through the snapshot — the next launch is a
         // fresh process, so those don't apply. `rootfs_source` is also
@@ -465,6 +495,7 @@ impl SandboxBackend for ProcessBackend {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         };
         self.sandboxes.insert(id, SandboxState { spec, cwd });
         Ok(id)
@@ -542,6 +573,24 @@ async fn spawn_agent(
             env.insert("PATH".into(), p);
         }
     }
+    // ADR 0027 dev parity: mirror the FC guest so the harness finds the
+    // bundle-activated skills/MCP. In the guest HOME=/root and the skill
+    // wrappers live on /usr/local/bin; here both are rooted under the
+    // sandbox cwd. Default HOME (don't clobber an explicit one) and
+    // prepend the cwd-local bin dir so `engram-share`/`engram-pr` resolve.
+    env.entry("HOME".into())
+        .or_insert_with(|| cwd.join("root").to_string_lossy().into_owned());
+    let local_bin = cwd.join("usr/local/bin");
+    let local_bin = local_bin.to_string_lossy();
+    match env.get("PATH") {
+        Some(p) if !p.split(':').any(|seg| seg == local_bin) => {
+            env.insert("PATH".into(), format!("{local_bin}:{p}"));
+        }
+        None => {
+            env.insert("PATH".into(), local_bin.into_owned());
+        }
+        _ => {}
+    }
 
     let mut cmd = Command::new(argv0);
     cmd.args(agent.argv.iter().skip(1))
@@ -569,6 +618,59 @@ struct Manifest {
 
 fn env_iter<'a>(env: &'a HashMap<String, String>) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
     env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+}
+
+/// ADR 0027 dev parity. Symlink each bundle's guest mount (relative to the
+/// materialized `cwd`) at a host-local unpacked bundle dir, so
+/// `engram_session_bundles::activate(cwd, ..)` finds the bundle there.
+/// `just bundles` populates the defaults; override per drive via
+/// `ENGRAM_<DRIVE_ID>_BUNDLE_DIR`.
+///
+/// We stage the canonical set (`skills` always, `playwright` when its host
+/// dir exists) rather than reading `spec.aux_ro_drives`, because the
+/// ProcessBackend restore path synthesizes a spec without them — staging
+/// the same way for create and restore keeps a resumed dev session's
+/// symlinks valid. Best-effort + spec-independent is fine here: this is the
+/// non-isolated dev backend, and `activate` only wires what's actually
+/// present (the `[browser]` opt-in is still authoritative in production FC).
+async fn stage_aux_bundles(cwd: &Path) {
+    use engram_core::types::sandbox::AuxRoDrive;
+    for drive in [AuxRoDrive::skills(), AuxRoDrive::playwright()] {
+        let Some(host_dir) = bundle_host_dir(&drive.drive_id) else {
+            continue;
+        };
+        if !host_dir.exists() {
+            tracing::debug!(
+                drive = %drive.drive_id,
+                host_dir = %host_dir.display(),
+                "ADR 0027 dev: bundle dir absent; skipping (run `just bundles`)",
+            );
+            continue;
+        }
+        let rel = drive
+            .guest_mount
+            .strip_prefix("/")
+            .unwrap_or(&drive.guest_mount);
+        let link = cwd.join(rel);
+        if let Some(parent) = link.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::remove_file(&link).await; // replace stale symlink
+        if let Err(e) = tokio::fs::symlink(&host_dir, &link).await {
+            tracing::debug!(drive = %drive.drive_id, error = %e, "ADR 0027 dev: bundle symlink failed");
+        }
+    }
+}
+
+/// Resolve the host-local unpacked bundle dir for a dev aux drive:
+/// `ENGRAM_<DRIVE_ID>_BUNDLE_DIR` if set, else `var/bundles/<drive_id>`
+/// relative to the process cwd (the repo root under `just dev`).
+fn bundle_host_dir(drive_id: &str) -> Option<PathBuf> {
+    let key = format!("ENGRAM_{}_BUNDLE_DIR", drive_id.to_uppercase());
+    if let Ok(p) = std::env::var(&key) {
+        return Some(PathBuf::from(p));
+    }
+    Some(PathBuf::from("var/bundles").join(drive_id))
 }
 
 /// Copy the contents of `src` into the (already-empty) `dst` directory.
@@ -683,6 +785,7 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
+            aux_ro_drives: Vec::new(),
         }
     }
 
