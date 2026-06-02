@@ -1123,20 +1123,96 @@ pub async fn get_session(
     Ok(Json(s))
 }
 
+/// One row of the session list. Flattens the `Session` (so existing
+/// consumers see the same fields) and adds the owner's identity for the
+/// admin "All sessions" view's owner chips. `owner_*` is `None` in the
+/// "mine" view (the owner is implicit — you).
 #[derive(Serialize)]
-pub struct ListSessionsResponse {
-    pub sessions: Vec<Session>,
+pub struct SessionListItem {
+    #[serde(flatten)]
+    pub session: Session,
+    pub owner_email: Option<String>,
+    pub owner_name: Option<String>,
 }
 
-/// `GET /sessions` — list sessions. Today this only returns sessions
-/// in `pending` / `active` / `idle` status (the rows
-/// `list_active_sessions` selects); evicted/completed/failed rows are
-/// hidden. A `?status=` filter for richer queries can be layered on
-/// without a wire-format break — `sessions` stays the array key.
+#[derive(Serialize)]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionListItem>,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ListSessionsParams {
+    /// `mine` (default) — the caller's own sessions. `all` — every session
+    /// (admin only); rows carry owner identity for attribution.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// `GET /sessions` — owner-scoped (ADR 0031). A member sees only their own
+/// sessions; an admin sees their own (`scope=mine`, default) or everyone's
+/// (`scope=all`). Returns only `pending`/`active`/`idle` rows (what
+/// `list_active_sessions` selects).
 pub async fn list_sessions(
     State(state): State<SharedState>,
+    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
+    axum::extract::Query(params): axum::extract::Query<ListSessionsParams>,
 ) -> Result<Json<ListSessionsResponse>, ApiError> {
-    let sessions = state.services.meta.list_active_sessions().await?;
+    let show_all = match params.scope.as_deref().unwrap_or("mine") {
+        "all" => {
+            if !principal.is_admin() {
+                return Err(ApiError::Forbidden(
+                    "scope=all requires the admin role".into(),
+                ));
+            }
+            true
+        }
+        // "mine" or anything else → own sessions only.
+        _ => false,
+    };
+
+    let all = state.services.meta.list_active_sessions().await?;
+    let mine = principal.user_id.to_string();
+    let filtered: Vec<Session> = if show_all {
+        all
+    } else {
+        all.into_iter()
+            .filter(|s| s.user_id.as_deref() == Some(mine.as_str()))
+            .collect()
+    };
+
+    // For the All view, attach owner identity (one batch lookup → map).
+    let owners: HashMap<String, (Option<String>, String)> = if show_all {
+        match state.auth.as_ref() {
+            Some(rt) => rt
+                .users
+                .list_users()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|u| (u.id.to_string(), (u.display_name, u.email)))
+                .collect(),
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let sessions = filtered
+        .into_iter()
+        .map(|s| {
+            let (owner_name, owner_email) = s
+                .user_id
+                .as_ref()
+                .and_then(|uid| owners.get(uid))
+                .map(|(name, email)| (name.clone(), Some(email.clone())))
+                .unwrap_or((None, None));
+            SessionListItem {
+                session: s,
+                owner_email,
+                owner_name,
+            }
+        })
+        .collect();
     Ok(Json(ListSessionsResponse { sessions }))
 }
 

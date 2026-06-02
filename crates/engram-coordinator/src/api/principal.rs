@@ -170,6 +170,47 @@ pub async fn require_admin(req: Request, next: Next) -> Response {
     }
 }
 
+/// Route-layer guard for `/sessions/:id*`: a member may only touch their own
+/// sessions; another user's id (or an unknown one) returns 404 — the same
+/// status, so it never confirms a session exists. Admins bypass. Applied once
+/// to the session-scoped sub-router rather than checked in each handler.
+pub async fn require_session_owner(
+    State(state): State<SharedState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(principal) = req.extensions().get::<Principal>().cloned() else {
+        return ApiError::Unauthorized("authentication required".into()).into_response();
+    };
+    if principal.is_admin() {
+        return next.run(req).await;
+    }
+
+    // Pull the `:id` path param (robust to routes that carry extra params,
+    // e.g. `/sessions/:id/artifacts/:artifact_id`).
+    let (mut parts, body) = req.into_parts();
+    let session_id = axum::extract::Path::<std::collections::HashMap<String, String>>::from_request_parts(
+        &mut parts, &state,
+    )
+    .await
+    .ok()
+    .and_then(|p| p.0.get("id").and_then(|s| s.parse::<engram_core::SessionId>().ok()));
+    let req = Request::from_parts(parts, body);
+
+    let Some(session_id) = session_id else {
+        return ApiError::BadRequest("missing session id".into()).into_response();
+    };
+
+    match state.services.meta.get_session(session_id).await {
+        Ok(s) if s.user_id.as_deref() == Some(principal.user_id.to_string().as_str()) => {
+            next.run(req).await
+        }
+        // Owner mismatch OR not found → 404 (don't reveal another user's
+        // session even exists).
+        _ => ApiError::NotFound("session not found".into()).into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Endpoint handlers (ADR 0031): /me, /me/claude-token, /auth/*, /admin/users
 // ---------------------------------------------------------------------

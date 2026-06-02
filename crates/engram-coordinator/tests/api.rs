@@ -1401,9 +1401,11 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
     seed_to(&store, dead_id, SessionState::Completed).await;
 
     let app = build_app(store);
+    // ADR 0031: list is owner-scoped; the test caller is the synthetic admin,
+    // so `scope=all` returns every session (the pre-scoping behaviour).
     let resp = app
         .oneshot(
-            Request::get("/api/v1/sessions")
+            Request::get("/api/v1/sessions?scope=all")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1443,7 +1445,7 @@ async fn list_sessions_serializes_full_session_record() {
     let app = build_app(store);
     let resp = app
         .oneshot(
-            Request::get("/api/v1/sessions")
+            Request::get("/api/v1/sessions?scope=all")
                 .body(Body::empty())
                 .unwrap(),
         )

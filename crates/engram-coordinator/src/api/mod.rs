@@ -35,14 +35,9 @@ pub fn router(state: SharedState) -> Router {
     // probes don't have to be told a token.
     let auth_state = auth::AuthState::new(state.cfg.auth_tokens.clone());
 
-    // ADR 0031 MEMBER surface: any authenticated principal. Session routes are
-    // owner-scoped per-handler; `/me*` is self-service; GET /enabled-images is
-    // needed by the create-session form.
-    let member = Router::new()
-        .route(
-            "/sessions",
-            get(sessions::list_sessions).post(sessions::create_session),
-        )
+    // ADR 0031: per-session routes, owner-scoped by the `require_session_owner`
+    // layer (a member may only touch their own sessions; others' ids → 404).
+    let session_scoped = Router::new()
         .route(
             "/sessions/:id",
             get(sessions::get_session).delete(sessions::delete_session),
@@ -50,9 +45,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/exec", post(exec::exec))
         .route("/sessions/:id/exec/stream", post(exec::exec_stream))
         .route("/sessions/:id/events", get(events::events))
-        // ADR 0026: serve a shared artifact to the dashboard. Owner-scoped in
-        // the handler; hardened headers live there. Static `from-path` segment
-        // takes priority over `:artifact_id` (UUIDs, no clash).
+        // Static `from-path` segment takes priority over `:artifact_id`
+        // (UUIDs, no clash).
         .route(
             "/sessions/:id/artifacts/:artifact_id",
             get(upload::serve_artifact),
@@ -69,6 +63,21 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            principal::require_session_owner,
+        ));
+
+    // ADR 0031 MEMBER surface: any authenticated principal. `/sessions`
+    // list+create (list self-scopes; create stamps the owner), the
+    // owner-scoped per-session routes, self-service `/me*`, and GET
+    // /enabled-images (needed by the create-session form).
+    let member = Router::new()
+        .route(
+            "/sessions",
+            get(sessions::list_sessions).post(sessions::create_session),
+        )
+        .merge(session_scoped)
         // Read-only list of enabled images — members pick one to launch.
         .route(
             "/enabled-images",
