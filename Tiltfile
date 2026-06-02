@@ -7,7 +7,6 @@
 #   │  registry   :5000   (OCI Distribution Spec)      │
 #   └──────────────────────────────────────────────────┘
 #   ┌─ local processes ────────────────────────────────┐
-#   │  bootstrap          one-shot — writes KEK to .env │
 #   │  coordinator        cargo run (Linux) or          │
 #   │                     build+codesign+exec (Mac)     │
 #   │  web                pnpm dev, vite HMR in-process │
@@ -59,6 +58,15 @@ def read_env_file(path):
                 v = v[1:-1]
         out[k.strip()] = v
     return out
+
+# The KEK (and any other parse-time secret) must already be in .env
+# before we read it: Tilt evaluates this at load time, so a value a
+# runtime resource writes later arrives too late — the coordinator
+# would boot with an empty ENGRAM_KEK_MASTER_KEY (the chicken-and-egg
+# that forced a kill-Tilt-and-restart). `just bootstrap` generates the
+# KEK on first run and no-ops if present, so run it HERE, at parse time,
+# ahead of the read — not as a runtime resource.
+local('just bootstrap', echo_off=True, quiet=True)
 
 env_file = read_env_file('.env')
 
@@ -150,16 +158,16 @@ dc_resource('jaeger',
     links=[link('http://localhost:16686', 'jaeger UI')])
 
 # ----------------------------------------------------------------
-# Setup one-shots: KEK + GCS bucket seed + (Mac only) codesign.
+# Setup one-shots: GCS bucket seed + (Mac only) codesign.
+#
+# (The KEK one-shot moved to a parse-time `just bootstrap` above — it
+# has to land in .env before the parse-time read, so it can't be a
+# runtime resource.)
 #
 # Built-in harnesses are baked into the image (ADR 0021); `just
 # bake-demo` builds the Claude harness from source, publishes it to the
 # local registry, and bakes deploy/demo-claude/ against it.
 # ----------------------------------------------------------------
-
-local_resource('bootstrap',
-    cmd='just bootstrap',
-    labels=['setup'])
 
 # Seed the cold-tier blob bucket in fake-gcs-server. Idempotent: the
 # script POSTs the bucket and treats 200, 409, and "already exists"
@@ -262,7 +270,7 @@ else:
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    resource_deps=['postgres', 'registry', 'fake-gcs-server', 'jaeger', 'seed-buckets', 'bootstrap'],
+    resource_deps=['postgres', 'registry', 'fake-gcs-server', 'jaeger', 'seed-buckets'],
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
@@ -454,6 +462,6 @@ if not skip_web:
         auto_init=True)
 
 # Resources are grouped in the Tilt UI by `labels` above:
-# infra (postgres, registry) → setup (bootstrap) → app (coordinator,
+# infra (postgres, registry) → setup (seed-buckets) → app (coordinator,
 # web). Click any one to jump to its log stream / readiness state /
 # restart button.

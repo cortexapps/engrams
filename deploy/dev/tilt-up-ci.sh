@@ -23,13 +23,10 @@ cd "$(git rev-parse --show-toplevel)"
 mkdir -p var/integration
 LOG=var/integration/tilt.log
 
-# The Tiltfile reads .env at parse time (for ENGRAM_KEK_MASTER_KEY etc.),
-# but its `bootstrap` resource only writes the KEK at runtime — too late
-# for the coord's serve_env, which is captured at load. Seed it here so a
-# fresh CI runner's coordinator gets a real KEK. Idempotent.
-if ! grep -q '^ENGRAM_KEK_MASTER_KEY=' .env 2>/dev/null; then
-    printf 'ENGRAM_KEK_MASTER_KEY=%s\n' "$(head -c 32 /dev/urandom | base64)" >>.env
-fi
+# (KEK seeding used to live here: the Tiltfile read .env at parse time
+# but its bootstrap resource wrote the KEK only at runtime, too late for
+# the coord's load-time serve_env. The Tiltfile now runs `just bootstrap`
+# at parse time, ahead of the read, so CI no longer needs to pre-seed.)
 
 # Background tilt. `--stream` is the headless, no-TUI log mode. `setsid`
 # detaches it into its own session so it outlives this step (the e2e
