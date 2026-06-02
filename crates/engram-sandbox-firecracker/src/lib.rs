@@ -977,6 +977,51 @@ impl FirecrackerBackend {
         vsock_uds_path: &Path,
         port: u32,
     ) -> Result<UnixStream, SandboxError> {
+        // Post-`load_snapshot`, FC's vsock muxer has a brief window where it
+        // accepts a host CONNECT and returns OK, then closes the connection
+        // before the guest's accept-loop wakes — surfacing as `early eof` on
+        // the CONNECT-response read 3-5 ms in (the same window InstallHostCa
+        // documents and retries). It widens with the device count a restore
+        // has to kick (ADR 0027 added the RO bundle drive), which tipped the
+        // previously-lucky post-resume `/exec` dial into it. The CONNECT
+        // handshake is PRE-APPLICATION — no bytes have reached the guest
+        // service yet — so re-dialing is safe for every caller (exec, forge,
+        // upload, shell tunnel, CA). Retry EOF/RST-shaped handshake failures
+        // with a short backoff; a genuinely-dead agentd EOFs every attempt
+        // and the final error propagates.
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match Self::connect_fc_vsock_once(vsock_uds_path, port).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let retryable = msg.contains("early eof")
+                        || msg.contains("unexpected end of file")
+                        || msg.contains("connection reset")
+                        || msg.contains("broken pipe");
+                    if !retryable || attempt >= MAX_ATTEMPTS {
+                        return Err(e);
+                    }
+                    tracing::debug!(
+                        attempt,
+                        port,
+                        error = %e,
+                        "FC vsock CONNECT transient (muxer settle); retrying after 50 ms",
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// One CONNECT-handshake attempt. See [`Self::connect_fc_vsock`] for the
+    /// retry wrapper and why a fresh dial is always safe.
+    async fn connect_fc_vsock_once(
+        vsock_uds_path: &Path,
+        port: u32,
+    ) -> Result<UnixStream, SandboxError> {
         let mut conn = UnixStream::connect(vsock_uds_path).await.map_err(|e| {
             vm_err(format!(
                 "connect to FC vsock UDS {}: {e}",
