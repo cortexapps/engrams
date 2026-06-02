@@ -12,13 +12,13 @@
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@fontsource-variable/newsreader": "^5.2.10",
-    "@tanstack/react-query": "^5.100.9",
-    "framer-motion": "^12.38.0",
+    "@tanstack/react-query": "^5.101.0",
+    "framer-motion": "^12.40.0",
     "ghostty-web": "^0.4.0",
-    "react": "^19.2.6",
-    "react-dom": "^19.2.6",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "^7.15.0",
+    "react-router-dom": "^7.16.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
@@ -26,14 +26,14 @@
     "@testing-library/dom": "^10.4.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
-    "@types/react": "^19.0.2",
+    "@types/react": "^19.2.16",
     "@types/react-dom": "^19.0.2",
     "@vitejs/plugin-react": "^5.2.0",
     "jsdom": "^29.1.1",
     "tailwindcss": "^4.3.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
-    "vitest": "^4.1.5",
-    "ws": "^8.20.0"
+    "vitest": "^4.1.8",
+    "ws": "^8.21.0"
   }
 }
