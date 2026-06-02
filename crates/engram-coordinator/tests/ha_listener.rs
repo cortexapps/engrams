@@ -66,9 +66,6 @@ async fn cross_replica_event_fan_out() {
     // explicitly against the shared meta+events.
     let mut rx = coord_a.events.subscribe(session_id);
 
-    // Give pg_listener a moment to actually start listening.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
     // Producer-side: emit through coord-B. This persists + fires
     // pg_notify; coord-A's listener picks it up and re-broadcasts.
     let test_chunk = format!("ha-test-{}", uuid::Uuid::new_v4().simple());
@@ -76,15 +73,29 @@ async fn cross_replica_event_fan_out() {
         exec_id: "test-exec".into(),
         chunk: test_chunk.clone(),
     };
-    coord_b.emit(session_id, event).await.expect("coord-b emit");
 
-    // Coord-A's subscriber should see the same event within a
-    // generous bound. LISTEN delivery is sub-100ms locally; we
-    // give 2s to absorb test-runner jitter without flaking.
-    let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("event arrived within timeout")
-        .expect("subscriber wasn't dropped");
+    // coord-A's pg_listener may still be establishing its `LISTEN` when we
+    // emit — and Postgres only delivers a `NOTIFY` to channels listening AT
+    // notify time, so a single emit can race the listener startup and be
+    // silently lost (the old fixed 150ms sleep flaked on slow CI runners).
+    // Re-emit on a short interval until coord-A receives the chunk, or a
+    // generous deadline. Re-emitting is safe: duplicate same-chunk events
+    // just queue on `rx`, and we assert on the first one we read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let received = loop {
+        coord_b
+            .emit(session_id, event.clone())
+            .await
+            .expect("coord-b emit");
+        match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+            Ok(r) => break r.expect("subscriber wasn't dropped"),
+            Err(_) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "coord-A never received the cross-replica event within 10s — \
+                 LISTEN/NOTIFY fan-out is broken (not just slow)",
+            ),
+        }
+    };
 
     match received.event {
         engram_coordinator::state::SessionEvent::Stdout { chunk, .. } => {
