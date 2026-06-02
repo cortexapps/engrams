@@ -163,7 +163,11 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
         </span>
         <span
           className="font-mono"
-          style={{ fontSize: '0.95rem', color: 'var(--color-ink)' }}
+          style={{
+            fontSize: '0.95rem',
+            color: 'var(--color-ink)',
+            whiteSpace: 'nowrap',
+          }}
         >
           {row.image_uri}
         </span>
