@@ -126,22 +126,32 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
                 &[("engram-pr", &layout.skills_bundle.join("bin/engram-pr"))],
                 &mut report,
             );
-            // git's askpass + credential wiring. The askpass binary lives
-            // in the bundle; git invokes it by the absolute path below.
-            let askpass = layout.skills_bundle.join("bin/git-askpass");
-            let gitconfig = render_gitconfig(&askpass);
-            if let Err(e) = write_file(&layout.etc_gitconfig, &gitconfig) {
-                report
-                    .warnings
-                    .push(format!("write {}: {e}", layout.etc_gitconfig.display()));
-            } else {
-                report.activated.push("gitconfig".into());
-            }
         }
     } else if session_env.contains_key(FORGE_TOKEN_ENV) {
         report.warnings.push(
             "forge session but skills bundle not mounted; create-pull-request unavailable".into(),
         );
+    }
+
+    // ADR 0031 + 0027: write /etc/gitconfig when there's anything to put in
+    // it. The `[user]` block (committer attribution) applies to EVERY session
+    // with a known initiator — not just forge sessions, so local commits are
+    // attributed too. The `[core] askPass` + `[credential]` blocks need the
+    // askpass binary from the skills bundle, so they're added only for a
+    // forge-bound session with the bundle mounted.
+    let user_email = session_env.get("ENGRAM_USER_EMAIL").map(String::as_str);
+    let user_name = session_env.get("ENGRAM_USER_NAME").map(String::as_str);
+    let askpass = (skills_mounted && session_env.contains_key(FORGE_TOKEN_ENV))
+        .then(|| layout.skills_bundle.join("bin/git-askpass"));
+    if user_email.is_some() || askpass.is_some() {
+        let gitconfig = render_gitconfig(askpass.as_deref(), user_email, user_name);
+        if let Err(e) = write_file(&layout.etc_gitconfig, &gitconfig) {
+            report
+                .warnings
+                .push(format!("write {}: {e}", layout.etc_gitconfig.display()));
+        } else {
+            report.activated.push("gitconfig".into());
+        }
     }
 
     if browser_mounted {
@@ -201,20 +211,36 @@ fn wire_skill(
     report.activated.push(name.to_string());
 }
 
-fn render_gitconfig(askpass: &Path) -> String {
-    format!(
-        "# Wired by engram-agentd at session bind (ADR 0027) for a [git]-bound\n\
-         # session. git consults the askpass for the password; the username is\n\
-         # the GitHub App x-access-token convention; the empty credential.helper\n\
-         # forces the askpass on every operation.\n\
-         [core]\n\
-         \taskPass = {}\n\
-         [credential \"https://github.com\"]\n\
-         \tusername = x-access-token\n\
-         [credential]\n\
-         \thelper =\n",
-        askpass.display()
-    )
+/// Render `/etc/gitconfig`. The user block (ADR 0031 committer attribution) is
+/// emitted whenever `user_email` is set. The askpass + credential-helper
+/// blocks (ADR 0027 forge credential wiring) are emitted only when `askpass`
+/// is supplied (a forge-bound session with the skills bundle mounted).
+fn render_gitconfig(askpass: Option<&Path>, user_email: Option<&str>, user_name: Option<&str>) -> String {
+    let mut s = String::from(
+        "# Wired by engram-agentd at session bind (ADR 0027/0031).\n",
+    );
+    if let Some(email) = user_email {
+        s.push_str("[user]\n");
+        s.push_str(&format!("\temail = {email}\n"));
+        if let Some(name) = user_name {
+            s.push_str(&format!("\tname = {name}\n"));
+        }
+    }
+    if let Some(askpass) = askpass {
+        // git consults the askpass for the password; the username is the
+        // GitHub App x-access-token convention; the empty credential.helper
+        // forces the askpass on every operation.
+        s.push_str(&format!(
+            "[core]\n\
+             \taskPass = {}\n\
+             [credential \"https://github.com\"]\n\
+             \tusername = x-access-token\n\
+             [credential]\n\
+             \thelper =\n",
+            askpass.display()
+        ));
+    }
+    s
 }
 
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
@@ -316,6 +342,50 @@ mod tests {
         assert!(l.usr_local_bin.join("engram-pr").is_symlink());
         let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
         assert!(gc.contains("opt/engram/skills/bin/git-askpass"));
+    }
+
+    #[test]
+    fn user_email_writes_gitconfig_user_block_without_forge() {
+        // ADR 0031: committer attribution applies to every session — a
+        // non-forge session with an initiator still gets /etc/gitconfig with a
+        // [user] block (and no askpass/credential wiring).
+        let dir = tempfile::tempdir().unwrap();
+        stage_bundles(dir.path(), true, false);
+        let report = activate(
+            dir.path(),
+            &env(&[
+                ("ENGRAM_USER_EMAIL", "ada@example.com"),
+                ("ENGRAM_USER_NAME", "Ada Lovelace"),
+            ]),
+        );
+        assert!(report.activated.contains(&"gitconfig".to_string()));
+        let l = Layout::under(dir.path());
+        let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
+        assert!(gc.contains("[user]"));
+        assert!(gc.contains("email = ada@example.com"));
+        assert!(gc.contains("name = Ada Lovelace"));
+        // No forge token → no askpass / credential wiring.
+        assert!(!gc.contains("askPass"));
+        assert!(!gc.contains("x-access-token"));
+    }
+
+    #[test]
+    fn forge_and_user_writes_both_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        stage_bundles(dir.path(), true, false);
+        let report = activate(
+            dir.path(),
+            &env(&[
+                ("ENGRAM_FORGE_TOKEN", "tok"),
+                ("ENGRAM_USER_EMAIL", "ada@example.com"),
+                ("ENGRAM_USER_NAME", "Ada"),
+            ]),
+        );
+        assert!(report.activated.contains(&"gitconfig".to_string()));
+        let l = Layout::under(dir.path());
+        let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
+        assert!(gc.contains("[user]") && gc.contains("ada@example.com"));
+        assert!(gc.contains("git-askpass") && gc.contains("x-access-token"));
     }
 
     #[test]
