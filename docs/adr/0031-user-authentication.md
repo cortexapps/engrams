@@ -96,14 +96,28 @@ from the principal — §6). Visibility is scoped by that ownership:
   prompt, exec, shell, events, delete, resume) is gated by an ownership check — a member
   requesting another user's session id gets `404` (not `403`, to avoid confirming the id
   exists).
-- An **admin** gets two views: **their own** sessions and **everyone's** (or just
-  *others'*). The list endpoint takes a `scope = mine | all | others` query param;
-  `all`/`others` require admin, and per-session access is unrestricted for admins.
+- An **admin** can view **their own** sessions or **all** sessions. The list endpoint
+  takes a `scope = mine | all` query param; `all` requires admin. Per-session access is
+  unrestricted for admins.
 
-Enforcement is server-side (the real gate). The web mirrors it: members see a single
-"My sessions" list; admins get a "Mine / Everyone" switch on the Sessions surface. This is
-an authorization rule, not a convenience — the ownership check lives in the coordinator's
-session handlers, keyed on the resolved `Principal`.
+Enforcement is server-side (the real gate), keyed on the resolved `Principal` in the
+coordinator's session handlers — this is an authorization rule, not a convenience.
+
+**Product design of the Sessions surface (great, not just correct):**
+
+- **Members get no scope UI at all** — just their list. No toggle hinting at other
+  people's sessions, no tab that 403s, no flash of admin chrome during load.
+- **Admins default to "My sessions,"** not the fleet-wide firehose. "All sessions" is an
+  oversight mode they opt into via a segmented control (`My sessions | All sessions`) in
+  the surface header, styled to the four-surface brand.
+- **Owner attribution is the load-bearing element of the All view:** every row carries an
+  owner chip (initial/avatar + email). In "My sessions" the owner is implicit — no
+  self-chip clutter.
+- **Two segments, not three.** `all` includes the admin's own (with owner labels); a
+  separate `others` scope adds cognitive load for no real benefit.
+- **Situational awareness:** live counts on the segments ("My sessions 3 / All 27"), an
+  optional filter-by-owner in the All view for scale, and distinct empty states per scope
+  ("No sessions yet" vs "No active sessions across the fleet").
 
 ### 5. Dev runs with a synthetic admin
 
@@ -170,8 +184,9 @@ targets *user* settings. `NavSpine` hides Fleet / Storage / admin-Settings for m
 - `EnabledImageSummary` gains a `harness_builtin` field so the web can gate create on the
   built-in-Claude case reliably.
 - Session list + per-session routes gain owner-scoping: members see only their own
-  sessions (others' ids → 404); admins get a `scope = mine | all | others` switch. The
-  Sessions web surface renders a Mine/Everyone toggle for admins.
+  sessions (others' ids → 404); admins get a `scope = mine | all` switch (default `mine`).
+  The Sessions web surface renders a `My sessions | All sessions` segmented control for
+  admins only, with owner chips + counts in the All view; members see no scope UI.
 - Risk: forgetting to keep host/internal routes on the bearer path would break the
   control plane; the router split is the mitigation. Cookie `Secure` must be config-gated
   off for http-localhost dev. OIDC state/PKCE/nonce must be validated to prevent CSRF.
