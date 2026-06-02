@@ -15,7 +15,7 @@ export function VitalSigns({ hosts, sessions }: VitalSignsProps) {
   const stats = computeStats(hosts, sessions);
 
   return (
-    <div className="grid grid-cols-3 gap-y-6 gap-x-8 sm:grid-cols-5 mb-12">
+    <div className="grid grid-cols-2 gap-y-6 gap-x-8 sm:grid-cols-4 mb-12">
       {stats.map((s) => (
         <Stat key={s.label} label={s.label} value={s.value} />
       ))}
@@ -85,19 +85,14 @@ function computeStats(
   const snapshots = h.reduce((acc, host) => acc + host.local_snapshots, 0);
   const active = s.filter((x) => x.status === 'active').length;
   const idle = s.filter((x) => x.status === 'idle').length;
-  // ADR 0014: WARM replaces DEAD. Dead sessions are terminal and
-  // out of operator interest once they roll past the recent-list
-  // (still queryable via `engram session log`); the warm pool's
-  // depth, on the other hand, is the load-bearing signal for
-  // "next session will be sub-second" and worth a permanent
-  // header slot.
-  const warm = h.reduce((acc, host) => acc + host.warm_pool_available, 0);
+  // The warm pool was removed from the backend — `HostView` no longer
+  // carries `warm_pool_available`, so the old WARM stat summed
+  // `undefined` and rendered `WARM · NaN`. Dropped entirely.
 
   return [
     { label: 'HOSTS', value: h.length },
     { label: 'SNAPSHOTS', value: snapshots },
     { label: 'ACTIVE', value: active },
     { label: 'IDLE', value: idle },
-    { label: 'WARM', value: warm },
   ];
 }

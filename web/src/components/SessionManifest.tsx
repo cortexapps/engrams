@@ -1,85 +1,33 @@
-import { AnimatePresence, motion } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import { StatusGlyph } from './Glyph';
-import type { Session } from '../types';
+import { EngramMark } from './EngramMark';
+import type { Session, SessionState } from '../types';
 
-const STATUS_ORDER: Session['status'][] = [
-  'active',
+// A single session manifest row: status glyph · short id · image ·
+// status · age, laid out on the `.session-row` grid (which the
+// responsive rules collapse to two lines on phones). Shared by the
+// grouped manifest on the Sessions surface.
+//
+// While a session is transitioning toward Active (created / pending /
+// guest_ready, and the brief states a resume passes through) the
+// status glyph is replaced by the inline trace loader — the same
+// growing-bolt motion as the masthead mark, scaled down to glyph size.
+
+// States that read as "booting / resuming" — show the inline loader.
+const BOOTING: ReadonlySet<SessionState> = new Set([
   'created',
-  'guest_ready',
   'pending',
-  'idle',
-  'host_lost',
-  'failed',
-  'completed',
-  'dead',
-];
+  'guest_ready',
+]);
 
-export function SessionManifest({
-  sessions,
-  onNewClick,
-}: {
-  sessions: Session[] | undefined;
-  /** When defined, render a "+ new session" link in the section head. */
-  onNewClick?: () => void;
-}) {
-  const sorted = sortSessions(sessions ?? []);
-
-  return (
-    <section className="mb-12">
-      <div
-        className="flex items-baseline justify-between mb-4 pb-2"
-        style={{ borderBottom: '1px solid var(--color-rule)' }}
-      >
-        <h2
-          className="font-mono smallcaps text-[0.7rem]"
-          style={{
-            color: 'var(--color-ink-quiet)',
-            letterSpacing: '0.18em',
-          }}
-        >
-          SESSIONS
-        </h2>
-        {onNewClick && (
-          <button
-            type="button"
-            onClick={onNewClick}
-            className="font-mono smallcaps text-[0.7rem] transition-colors hover:[opacity:0.75]"
-            style={{
-              color: 'var(--color-amber)',
-              letterSpacing: '0.12em',
-            }}
-          >
-            + new session
-          </button>
-        )}
-      </div>
-      <div className="space-y-1">
-        <AnimatePresence>
-          {sorted.map((s) => (
-            <SessionRow key={s.id} session={s} />
-          ))}
-        </AnimatePresence>
-        {sessions && sessions.length === 0 && (
-          <p
-            className="font-display italic"
-            style={{ color: 'var(--color-ink-quiet)' }}
-          >
-            no sessions yet
-            {onNewClick && ' — start one with the link above'}.
-          </p>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function SessionRow({ session }: { session: Session }) {
+export function SessionRow({ session }: { session: Session }) {
   const since = relativeTime(session.last_active_at);
   // ADR 0005: there's no workspace-level repo/branch on a session
   // anymore — the bake image is the whole story. Strip the registry
   // host + tag for visual density.
   const imageLabel = stripImageHost(session.image);
+  const booting = BOOTING.has(session.status);
 
   return (
     <motion.div
@@ -89,14 +37,19 @@ function SessionRow({ session }: { session: Session }) {
       exit={{ opacity: 0, y: -2 }}
       transition={{ duration: 0.35 }}
     >
-      <Link
-        to={`/sessions/${session.id}`}
-        className="grid items-baseline gap-x-4 py-1 px-2 -mx-2 hover:[background-color:var(--color-paper-warm)] transition-colors"
-        style={{
-          gridTemplateColumns: 'min-content min-content 1fr min-content min-content',
-        }}
-      >
-        <StatusGlyph status={session.status} />
+      <Link to={`/sessions/${session.id}`} className="session-row">
+        {booting ? (
+          <span className="row-loader" aria-label={session.status}>
+            <EngramMark
+              size={15}
+              mode="loop"
+              period={1600}
+              title={session.status}
+            />
+          </span>
+        ) : (
+          <StatusGlyph status={session.status} />
+        )}
         <span
           className="font-mono text-[0.85rem]"
           style={{ color: 'var(--color-ink)' }}
@@ -127,22 +80,10 @@ function SessionRow({ session }: { session: Session }) {
   );
 }
 
-function sortSessions(sessions: Session[]): Session[] {
-  return [...sessions].sort((a, b) => {
-    const ra = STATUS_ORDER.indexOf(a.status);
-    const rb = STATUS_ORDER.indexOf(b.status);
-    if (ra !== rb) return ra - rb;
-    return (
-      new Date(b.last_active_at).getTime() -
-      new Date(a.last_active_at).getTime()
-    );
-  });
-}
-
 /** Drop the leading `<host>/` and trailing `:<tag>` from an OCI URI,
  * leaving the repo segment ("ghcr.io/cortex/api:warm-1" → "cortex/api").
  * Falls back to the input verbatim if either delimiter is missing. */
-function stripImageHost(uri: string): string {
+export function stripImageHost(uri: string): string {
   const slash = uri.indexOf('/');
   const colon = uri.lastIndexOf(':');
   const start = slash >= 0 ? slash + 1 : 0;

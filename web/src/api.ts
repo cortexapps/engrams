@@ -3,7 +3,6 @@ import type {
   AddRegistryResponse,
   CreateSessionResponse,
   EnabledImageSummary,
-  HostCowStateResponse,
   ImageRef,
   ListEnabledImagesResponse,
   ListHostsResponse,
@@ -12,6 +11,7 @@ import type {
   Session,
   SessionCowStateResponse,
   SessionMode,
+  StorageSummaryResponse,
 } from './types';
 
 // Every coordinator HTTP route lives under `/api/v1`. The SPA owns the
@@ -74,19 +74,29 @@ export const fetchSessions = () =>
 export const fetchHosts = () =>
   getJSON<ListHostsResponse>('/hosts').then((r) => r.hosts);
 
+/** Cordon a host: flips it to `draining` so the scheduler stops
+ * assigning new sessions to it (in-flight sessions stay put). The
+ * coordinator returns `204 No Content`. */
+export const drainHost = (hostId: string) =>
+  postJSON<void>(`/hosts/${hostId}/drain`, {});
+
 export const fetchSession = (id: string) =>
   getJSON<Session>(`/sessions/${id}`);
 
 // ---- ADR 0016 Phase A: COW state diagnostic --------------------------
 
-/** Per-host COW snapshot. One row per chunk-tracked sandbox. */
-export const fetchHostCowState = (hostId: string) =>
-  getJSON<HostCowStateResponse>(`/hosts/${hostId}/cow-state`);
-
 /** Per-session COW snapshot. `state` is `null` when the session has
- * no live sandbox (Idle / HostLost / Pending / terminal). */
+ * no live sandbox (Idle / HostLost / Pending / terminal). The
+ * host-wide / fleet-wide COW view is served by `fetchStorageSummary`
+ * below (ADR 0029) rather than a per-host fan-out from the browser. */
 export const fetchSessionCowState = (sessionId: string) =>
   getJSON<SessionCowStateResponse>(`/sessions/${sessionId}/cow-state`);
+
+// ---- ADR 0029: Storage surface ---------------------------------------
+
+/** Fleet-wide COW/chunk rollups + the per-sandbox durability ledger. */
+export const fetchStorageSummary = () =>
+  getJSON<StorageSummaryResponse>('/storage/summary');
 
 // ADR 0021 P1.5a retired `fetchHarnesses` + the `/api/harnesses`
 // endpoint. The harness (if any) is an image property baked at

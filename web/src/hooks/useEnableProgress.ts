@@ -2,20 +2,20 @@ import { useEffect, useState } from 'react';
 
 // Stage labels for the multi-second `POST /api/enabled-images` wait.
 // The backend is monolithically synchronous (it pulls the OCI
-// artifact, slices the chunks blob into BlobStorage, then blocks
-// on a host's first warm-pool fill before returning), but the
-// user staring at a spinner needs to know *something* is moving.
-// We don't have real progress events from the server — instead
-// we drive a stage marker off elapsed time, with thresholds
-// calibrated against the observed wall-clock on a typical 350 MB
-// demo image. Each stage's copy is intentionally a present-tense
-// verb so it reads like a thing happening, not a thing planned.
+// artifact, slices the chunks blob into BlobStorage, then materializes
+// the canonical snapshot before returning), but the user staring at a
+// spinner needs to know *something* is moving. We don't have real
+// progress events from the server — instead we drive a stage marker
+// off elapsed time, with thresholds calibrated against the observed
+// wall-clock on a typical 350 MB demo image. Each stage's copy is
+// intentionally a present-tense verb so it reads like a thing
+// happening, not a thing planned.
 const STAGES: { at_ms: number; label: string }[] = [
   { at_ms: 0, label: 'fetching manifest' },
   { at_ms: 1500, label: 'reading bundle' },
   { at_ms: 3000, label: 'rehydrating chunks into blob storage' },
   { at_ms: 9000, label: 'reconstructing canonical snapshot' },
-  { at_ms: 15000, label: 'warming the pool on every host' },
+  { at_ms: 15000, label: 'prefetching base layers on every host' },
   { at_ms: 25000, label: 'almost there' },
 ];
 

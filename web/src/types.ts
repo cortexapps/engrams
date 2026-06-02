@@ -85,12 +85,6 @@ export interface HostView {
   capacity_used_mib: number;
   running_sandboxes: number;
   local_snapshots: number;
-  /** ADR 0014: sum of `available` warm slots across every template
-   * this host keeps warm. Live-only, not persisted — reads 0 on a
-   * coord replica that hasn't received a heartbeat from this host
-   * yet. Surfaced in `VitalSigns` so operators can see the warm
-   * pool's depth at a glance. */
-  warm_pool_available: number;
   last_heartbeat_at: string;
 }
 
@@ -130,9 +124,36 @@ export interface CowStateView {
   last_snapshot_at: string | null;
 }
 
-export interface HostCowStateResponse {
+// ---- ADR 0029: Storage surface summary --------------------------------
+//
+// Mirrors `engram_coordinator::api::storage::StorageSummaryResponse`.
+// Fleet-wide COW/chunk rollups + a per-sandbox durability ledger,
+// aggregated server-side from the per-host cow-state plus cheap
+// Postgres counts (snapshots, gc-candidates). "chunks stored" and
+// "dedup ratio" are intentionally absent — they'd need an O(objects)
+// blob-store walk, which we don't run on a polled endpoint.
+
+export interface DurabilityRow {
+  sandbox_id: string;
+  session_id: string | null;
   host_id: string;
-  sessions: CowStateView[];
+  dirty_chunks: number;
+  dirty_bytes: number;
+  base_chunks: number;
+  base_chunks_local: number;
+  /** ISO-8601 of the last successful flush; `null` = never flushed. */
+  last_flush_at: string | null;
+}
+
+export interface StorageSummaryResponse {
+  snapshots: number;
+  snapshot_bytes: number;
+  gc_pending: number;
+  tracked_sandboxes: number;
+  dirty_chunks: number;
+  unflushed_bytes: number;
+  avg_locality_pct: number;
+  rows: DurabilityRow[];
 }
 
 export interface SessionCowStateResponse {

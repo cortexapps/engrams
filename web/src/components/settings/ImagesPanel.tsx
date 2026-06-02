@@ -343,7 +343,7 @@ function EnableImageForm({
 // while `POST /api/enabled-images` is in flight. The backend doesn't
 // stream events — we just shape time-into-text so the operator sees
 // movement instead of a frozen button. Stages are calibrated against
-// the observed 7-30s window of materialize + warm-pool fill.
+// the observed 7-30s window of materialize + base-layer prefetch.
 function EnableProgress({
   progress,
 }: {

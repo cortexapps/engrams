@@ -23,6 +23,7 @@ mod sessions;
 mod sessions_inspect;
 mod shell;
 pub mod snapshot;
+mod storage;
 pub(crate) mod upload;
 
 pub fn router(state: SharedState) -> Router {
@@ -109,6 +110,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/hosts/:id/drain", post(hosts::drain))
         // ADR 0016 Phase A: per-host COW diagnostic.
         .route("/hosts/:id/cow-state", get(hosts::cow_state))
+        // ADR 0029: fleet-wide COW/chunk rollups + durability ledger
+        // for the web app's Storage surface.
+        .route("/storage/summary", get(storage::summary))
         // ADR 0021 P1.5a retired `/api/harnesses` — see migration
         // 0040 + the deleted `mod harnesses` above.
         .route(

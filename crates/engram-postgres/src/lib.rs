@@ -1851,4 +1851,29 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         Ok(())
     }
+
+    /// ADR 0029: one cheap aggregate over `snapshots` for the Storage
+    /// surface's `snapshots` + `snapshot_bytes` rollups.
+    async fn snapshot_totals(&self) -> Result<engram_core::traits::SnapshotTotals, MetaError> {
+        let (count, total_bytes): (i64, i64) = sqlx::query_as(
+            "SELECT count(*)::bigint, coalesce(sum(size_bytes), 0)::bigint FROM snapshots",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(engram_core::traits::SnapshotTotals {
+            count: count.max(0) as u64,
+            total_bytes: total_bytes.max(0) as u64,
+        })
+    }
+
+    /// ADR 0029: count of chunks parked in `chunk_gc_candidates`
+    /// awaiting their grace window — the Storage surface's "gc pending".
+    async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
+        let count: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM chunk_gc_candidates")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(count.max(0) as u64)
+    }
 }
