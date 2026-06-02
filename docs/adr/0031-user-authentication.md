@@ -1,8 +1,19 @@
 # ADR 0031: User authentication — SSO + per-user identity (SCIM-ready)
 
-Status: 2026-06-02 — **Proposed.** Authored before code per the ADR-bookend norm.
-Branches off `worktree-adr-0030-session-conversation-redesign` (ADR 0030 is in flight);
-ships as one big-bang PR with screenshots.
+Status: 2026-06-02 — **Accepted.** Implemented on `worktree-adr-0031-user-auth`
+(stacked on the in-flight ADR 0030 branch). `just check` green (fmt + clippy +
+hakari + 914 workspace tests), live-PG `users_live_pg` green, web `tsc` +
+`vitest` (41) + `vite build` green. Ships as one big-bang PR; PR base = the
+0030 branch, re-target to `main` once 0030 merges.
+
+Commit chain (oldest → newest): core user types + store traits → migrations
+0046–0048 → engram-postgres impls (+live-PG tests) → engram-auth crate
+(IdentityVerifier + chain + OIDC/forward-auth/bearer/synthetic) → coord
+config/CLI + principal layer + router split + /me + /auth endpoints →
+require_admin layer → session-create owner-stamp + token inject + git
+attribution → owner-scoped sessions → session-bundles `[user]` gitconfig → web
+api client + AuthProvider + profile menu + settings split + never-prompt token
+gating + Sessions My/All views.
 
 ## Context
 
@@ -201,5 +212,47 @@ targets *user* settings. `NavSpine` hides Fleet / Storage / admin-Settings for m
 - Deferred: SCIM 2.0 server; per-image `[secrets]` rendering for custom harnesses in the
   create form (needs the secrets schema on `EnabledImageSummary`).
 
-This status section is updated between phases with divergences/pitfalls and flipped to
-**Accepted** with the commit chain when the work lands.
+## Appendix: deployment presets
+
+All auth is config — these are flag/env sets, no code differences.
+
+**Dev (default, zero setup):** no auth flags → `AuthMode::None` → synthetic
+admin. `just dev` and the test harness run as one local admin; the dev
+committer email is `--dev-default-email` (default `dev@engram.local`).
+
+**OSS / direct OIDC (any IdP — Okta, Auth0, Rippling-OIDC, …):**
+
+```
+--auth-mode=oidc
+--oidc-issuer=https://<issuer>            # ENGRAM_OIDC_ISSUER
+--oidc-client-id=<id>                      # ENGRAM_OIDC_CLIENT_ID
+--oidc-client-secret=<secret>              # ENGRAM_OIDC_CLIENT_SECRET
+--oidc-redirect-url=https://<host>/api/v1/auth/callback
+--bootstrap-admin=you@corp.com             # comma-sep; promoted to admin on first login
+--cookie-secure                            # prod (HTTPS)
+```
+
+**Behind GCP IAP (the Cortex internal deployment) — no double login:** IAP
+already authenticated the user with Google; coord verifies its signed
+assertion. This is a preset of the five generic forward-auth fields, not a
+Google code path — Cloudflare Access / oauth2-proxy use the same flags with
+their own values.
+
+```
+--auth-mode=forward-auth
+--forward-auth-header=X-Goog-IAP-JWT-Assertion
+--forward-auth-jwks-url=https://www.gstatic.com/iap/verify/public_key-jwk
+--forward-auth-issuer=https://cloud.google.com/iap
+--forward-auth-audience=/projects/<PROJECT_NUMBER>/global/backendServices/<BACKEND_ID>
+--forward-auth-email-claim=email
+--bootstrap-admin=you@cortex.io
+--cookie-secure
+```
+
+Provisioning is independent of the login path and reconciles on email: today
+JIT (the user row is upserted from the verified email on first request); when
+the SCIM 2.0 server lands (deferred), Rippling provisions/deprovisions users +
+groups, authoritative-with-manual-override.
+
+This status section is updated between phases with divergences/pitfalls and was flipped to
+**Accepted** with the commit chain when the work landed.
