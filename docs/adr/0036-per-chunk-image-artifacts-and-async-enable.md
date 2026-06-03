@@ -1,6 +1,50 @@
 # ADR 0036: Per-chunk OCI image artifacts + async enable pipeline
 
-Status: 2026-06-03 — **Proposed.**
+Status: 2026-06-03 — **Proposed; implemented** (commit chain below).
+Flips to Accepted after prod validation: first re-bake pushing a
+delta, first async enable driven to `ready` through the job API.
+
+Implementation (one commit per phase, this branch):
+
+- `d9df23d` ADR authored (Proposed)
+- `8db73dc` P1: per-chunk OCI artifacts — delta push/pull, monolithic
+  blob + Range-GET path + parent-bootstrap machinery deleted,
+  shared-client token reuse, `blob_exists` HEAD probe,
+  `per_chunk_roundtrip` wire test
+- `e50f937` P2: `enable_jobs` state machine (migration 0052 — 0050/
+  0051 were taken by ADRs 0034/0035 mid-flight), enable_scanner,
+  202 + progress API, real web progress bar, CLI polling,
+  `enable_jobs_live_pg`
+- `de6f479` P3: deterministic ext4 (`-U`/`hash_seed`/
+  `SOURCE_DATE_EPOCH`, each verified load-bearing empirically),
+  cross-tree determinism test
+- `bf197ff` P4: content-derived `ManifestRef` + content-keyed
+  base-snapshot reuse (`find_enabled_image_by_content`), live-PG
+  lookup tests
+- `ef3a09c` P4 e2e: moved-tag test — two tags, identical content,
+  exactly one capture VM, shared `base_snapshot_id`
+
+Divergences from the original proposal, found while implementing:
+
+- **Migration renumbered 0050 → 0052**: ADR 0034 (idle-eviction state
+  machine) and ADR 0035 (content-addressed bundle generations) merged
+  to main mid-implementation and took 0050/0051; this branch rebased
+  onto both.
+- **P4 was nearly dropped, then un-dropped**: the first read of
+  ADR 0035 suggested capture-skip would freeze bundle freshness
+  (capture being the only bundle delivery path). Closer reading of
+  `restore_in_jail` showed Invariant 2's `swap_aux_to_current`
+  already delivers current bundles at session-create, making
+  content-keyed reuse sound. Decision 4 documents the full
+  reasoning so the next reader doesn't re-walk the same maze.
+- **Docker-level determinism is the remaining delta-limiter**: the
+  ext4 pack is deterministic *given the same rootfs tree*, but
+  `docker build` on cache-less CI runners re-runs every layer and
+  may embed timestamps. Cross-bake dedup ratios in prod therefore
+  depend on adding buildx layer caching to the engrams-internal bake
+  workflows (follow-up there, not here). Same-artifact re-enables
+  (the moved-tag case) are unaffected — those are byte-identical by
+  construction.
 
 ## Context: every image transfer is all-or-nothing, and both directions fail
 
