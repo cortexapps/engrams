@@ -287,6 +287,9 @@ Either way, fetch the kernel once and run the dev stack:
 just pull-kernel  # backend-specific guest kernel → ~/.cache (one-time)
 just dev          # full stack via Tilt; backend auto-detected per host (ADR 0024):
                   # VZ on macOS/Apple Silicon, Firecracker on Linux+KVM, else subprocess
+                  # Tilt dashboard: http://localhost:10350
+                  # Web UI:         http://localhost:5173
+                  # Coordinator API: http://localhost:8090
 ```
 
 In another shell:
