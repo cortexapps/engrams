@@ -473,7 +473,15 @@ mod adapter {
             .env("IS_SANDBOX", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Inherit stderr rather than piping it: the wrapper never
+            // reads a stderr pipe, so a chatty child (API retry spew,
+            // stack traces) would block on write(2) once the 64KiB
+            // pipe buffer fills and wedge the run forever. agentd
+            // points the wrapper's stderr at the in-guest harness log
+            // (`/var/log/engram/harness.log`, an append handle that
+            // never blocks), so inheriting lands claude's stderr there
+            // — visible via `/exec` for debugging, deadlock-free.
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
         {
