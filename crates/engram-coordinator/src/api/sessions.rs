@@ -1253,6 +1253,12 @@ pub async fn delete_session(
     // If a sibling path (preemption drain, dead-host detector) flipped
     // the row first, our transition fails with Conflict — treat that
     // as idempotent success, the session is already on its way out.
+    //
+    // ADR 0034: deleting mid-eviction works the same way —
+    // Evicting → Completed is legal, and the eviction scanner's
+    // racing pipeline then fails its own transition_session(Idle)
+    // against the terminal row, fires abort_inflight_snapshot, and
+    // releases the session lease. No special-casing needed here.
     match state
         .services
         .meta

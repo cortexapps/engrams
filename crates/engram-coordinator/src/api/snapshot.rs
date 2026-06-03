@@ -1126,3 +1126,151 @@ mod effective_resume_disk_manifest_tests {
         assert_eq!(effective_resume_disk_manifest(None, None), None);
     }
 }
+
+#[cfg(test)]
+mod evicting_gate_tests {
+    use super::*;
+    use crate::config::CoordinatorConfig;
+    use crate::host_registry::HostRegistry;
+    use crate::state::tests::MiniMeta;
+    use crate::state::AppState;
+    use crate::Services;
+    use engram_cloud_mock::MockCloud;
+    use engram_core::traits::SandboxBackend;
+    use engram_core::types::session::SessionMode;
+    use engram_sandbox_process::ProcessBackend;
+    use engram_secrets_dev::InMemorySecretStore;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
+        let local = TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(engram_core::HostId::new(), local_host);
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-blobs-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: local.path().to_path_buf(),
+            ..CoordinatorConfig::default()
+        };
+        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        (state, local)
+    }
+
+    fn evicting_session(id: SessionId) -> Session {
+        Session {
+            id,
+            user_id: None,
+            status: SessionState::Evicting,
+            host_id: None,
+            sandbox_id: Some(SandboxId::new()),
+            image: "test/repo:evicting-gate".into(),
+            mode: SessionMode::Agent,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            live_disk_manifest: None,
+        }
+    }
+
+    /// ADR 0034: a prompt/exec arriving mid-eviction must get the
+    /// retryable 409 — NOT the Idle|Evacuating auto-resume arm (the
+    /// sandbox may still be live; a restore would race the pipeline).
+    #[tokio::test]
+    async fn ensure_active_during_evicting_is_retryable_conflict() {
+        let id = SessionId::new();
+        let (state, _local) = build_state_for_session(evicting_session(id));
+
+        let err = ensure_active(&state, id)
+            .await
+            .expect_err("Evicting must not pass ensure_active");
+        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        // The session must be untouched — in particular NOT resumed
+        // and NOT transitioned.
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Evicting);
+    }
+
+    /// A direct /resume mid-eviction gets the same honest 409.
+    #[tokio::test]
+    async fn resume_during_evicting_is_retryable_conflict() {
+        let id = SessionId::new();
+        let (state, _local) = build_state_for_session(evicting_session(id));
+
+        let err = match resume(State(state.clone()), Path(id)).await {
+            Err(e) => e,
+            Ok(_) => panic!("Evicting must not resume"),
+        };
+        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Evicting);
+    }
+
+    /// DELETE mid-eviction: Evicting → Completed is legal, and the
+    /// eviction scanner's racing pipeline then fails its own
+    /// transition against the terminal row and exits via the abort
+    /// path — the session stays Completed.
+    #[tokio::test]
+    async fn delete_during_evicting_completes_and_pipeline_backs_off() {
+        let id = SessionId::new();
+        let (state, _local) = build_state_for_session(evicting_session(id));
+        let sandbox_id = state
+            .services
+            .meta
+            .get_session(id)
+            .await
+            .unwrap()
+            .sandbox_id
+            .unwrap();
+
+        let code = crate::api::sessions::delete_session(State(state.clone()), Path(id))
+            .await
+            .expect("delete mid-eviction");
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Completed);
+
+        // The racing pipeline (a scanner tick that already swept the
+        // row) backs off harmlessly: delete_session unbound the
+        // registry, so the pipeline's registry guard short-circuits
+        // to an idempotent no-op before touching the (gone) sandbox.
+        // (If it had already passed the guard, its later
+        // transition_session(Idle) would fail legality against the
+        // terminal row and exit via abort_inflight_snapshot — that
+        // arm is covered by the idle_evictor abort tests.) Either
+        // way the terminal state is untouched.
+        crate::idle_evictor::evict_idle_session(&state, id, sandbox_id)
+            .await
+            .expect("registry-guard no-op");
+        let still = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(still.status, SessionState::Completed);
+    }
+}
