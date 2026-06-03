@@ -3849,6 +3849,90 @@ mod tests {
         }
     }
 
+    /// ADR 0035: a spec requesting aux drives on a host without a
+    /// bundle stamp must fail loudly at the resolve step — capturing a
+    /// skills-less snapshot silently is the incident's setup.
+    #[tokio::test]
+    async fn create_with_aux_drives_requires_bundle_stamp() {
+        let (b, d) = backend();
+        // Satisfy the kernel + rootfs existence checks (they precede
+        // the resolve step) so create reaches aux-drive resolution.
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs);
+        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                assert!(msg.contains("bundle stamp"), "{msg}");
+            }
+            other => panic!("expected InvalidSpec(bundle stamp), got {other:?}"),
+        }
+    }
+
+    /// ADR 0035: a stamp that doesn't carry the requested drive_id is
+    /// equally loud (host image staged playwright but not skills, say).
+    #[tokio::test]
+    async fn create_with_aux_drive_missing_from_stamp_errors() {
+        let (b, d) = backend();
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let bundle_dir = d.path().join("bundles");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
+            br#"{"playwright": "aaaa"}"#,
+        )
+        .unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs);
+        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                assert!(msg.contains("doesn't carry it"), "{msg}");
+            }
+            other => panic!("expected InvalidSpec(missing entry), got {other:?}"),
+        }
+    }
+
+    /// ADR 0035: with a valid stamp entry the resolve step passes —
+    /// create proceeds past it (and fails much later on the
+    /// nonexistent firecracker binary, which is the negative-path
+    /// fixture's expected terminal error). Distinguishing the error
+    /// kind proves resolution consumed the stamp.
+    #[tokio::test]
+    async fn create_with_resolvable_aux_drive_passes_resolution() {
+        let (b, d) = backend();
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let bundle_dir = d.path().join("bundles");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let sha = "a".repeat(64);
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
+            format!("{{\"skills\": \"{sha}\"}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::staged_file_name("skills", &sha)),
+            b"squashfs-bytes",
+        )
+        .unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs);
+        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                panic!("resolution should have passed, got InvalidSpec: {msg}")
+            }
+            Err(_) => {} // FC spawn failure — past the resolve step.
+            Ok(_) => panic!("create can't succeed without a real firecracker"),
+        }
+    }
+
     /// The stub honours the "trait shape stays valid" contract — list
     /// of an empty backend returns an empty vec, not an error.
     #[tokio::test]

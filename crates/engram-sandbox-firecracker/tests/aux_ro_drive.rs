@@ -1,28 +1,36 @@
-//! ADR 0027 aux read-only drive mechanism test.
+//! ADR 0027 → ADR 0035 aux read-only drive mechanism tests.
 //!
-//! The RO-mount skills/browser engine attaches a fleet-wide, content-
-//! addressed bundle (skills / playwright squashfs) as an *additional*
-//! read-only virtio-blk drive. Unlike the per-session harness drive
-//! (ADR 0014 option-D, exercised by `patch_drive_swap`), the bundle
-//! path is the SAME on every host — a stable host-wide symlink baked
-//! into the FC-host image. So the snapshot embeds that path and restore
-//! re-anchors by mere presence: NO `patch_drive`, just "the file is
-//! there." This test pins that property and the design choice that
-//! makes a version roll safe.
+//! The RO-mount skills/browser engine attaches a fleet-wide bundle
+//! (skills / playwright squashfs) as an *additional* read-only
+//! virtio-blk drive. ADR 0027 shipped this with a fixed fleet-canonical
+//! path and "re-anchor by presence"; the 2026-06-03 incident proved
+//! that contract unsound — a host roll swapped the bytes under the
+//! fixed path while live base snapshots still re-anchored against it,
+//! and every bundle read in the guest EIO'd (frozen squashfs
+//! superblock ↔ different backing bytes). An earlier revision of THIS
+//! file pinned that behavior as a feature ("symlink roll serves new
+//! bytes"); ADR 0035 inverts it. Three properties, one per test:
 //!
-//! Two variants:
-//!
-//!   - `aux_ro_drive_reopens_at_embedded_path`: attach an RO drive at a
-//!     plain host path, boot, snapshot, load-paused on a SECOND FC,
-//!     resume WITHOUT patching. The guest's post-resume read of the
-//!     drive returns the original bytes — FC reopened the embedded path
-//!     on its own.
-//!   - `aux_ro_drive_symlink_roll_serves_new_bytes`: the embedded path
-//!     is a symlink. Repoint it at a different backing file BETWEEN
-//!     snapshot and restore (a bundle version roll), resume without
-//!     patching, and the guest sees the NEW bytes — FC resolves the
-//!     symlink at load_snapshot open time. This is why we embed the
-//!     stable symlink rather than a digest-pinned filename.
+//!   - `aux_ro_drive_reopens_pinned_generation`: the snapshot embeds a
+//!     content-addressed path (`skills-<sha>.squashfs`); a newer
+//!     generation appearing alongside changes nothing — restore
+//!     reopens the pinned file and the guest reads the ORIGINAL bytes.
+//!     (Resume flavor: an in-flight session keeps its world.)
+//!   - `aux_ro_drive_content_swap_under_snapshot_is_the_incident`: the
+//!     negative control. Mutate the bytes at the SAME path between
+//!     snapshot and restore and the guest silently reads the NEW bytes
+//!     through its capture-time device state — which at the
+//!     filesystem layer is the EIO corruption. This is exactly what a
+//!     pre-0035 host roll did; content-addressed filenames make it
+//!     unconstructable in production (nothing ever writes to an
+//!     existing `<name>-<sha>` path).
+//!   - `aux_ro_drive_patch_then_resume_serves_new_generation`: the
+//!     fresh-create flavor (ADR 0035 §3): load PAUSED, `patch_drive`
+//!     the aux drive to a newer generation, resume — the guest reads
+//!     the NEW bytes. (The in-guest squashfs re-mount half of §3 lives
+//!     in agentd; the stock FC test kernel has no squashfs, so these
+//!     tests pin the block-device layer and the dev-vm e2e covers the
+//!     mount layer.)
 //!
 //! Same gating as the other ignored FC integration tests (Linux + KVM +
 //! firecracker on PATH + fetched test artifacts), plus mount(8) for the
@@ -57,11 +65,24 @@ const SENTINEL_B: &[u8] = b"BBBB";
 /// geometry log and no "capacity change from 0" quirk.
 const BUNDLE_SIZE: u64 = 16 * 1024 * 1024;
 
-/// Production-shape: the bundle path is present and identical on the
-/// receiver, so restore re-anchors with no PATCH.
+/// What happens to the aux drive between snapshot and restore.
+enum Mutation {
+    /// Nothing: a newer generation lands ALONGSIDE the pinned file
+    /// (content-addressed roll); the pinned path is untouched.
+    NewGenerationAlongside,
+    /// The incident: the bytes at the embedded path are replaced
+    /// in-place (what a pre-0035 host roll effectively did).
+    SwapContentInPlace,
+    /// ADR 0035 §3 fresh-create flavor: load paused, `patch_drive`
+    /// to the new generation's file, then resume.
+    PatchToNewGeneration,
+}
+
+/// Resume flavor (ADR 0035 §3): the pinned generation is what the
+/// guest keeps reading, no matter what newer generations exist.
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + sudo mount; run with --ignored on the dev VM"]
-async fn aux_ro_drive_reopens_at_embedded_path() {
+async fn aux_ro_drive_reopens_pinned_generation() {
     let env = match common::fc_preflight() {
         Some(e) => e,
         None => return,
@@ -69,17 +90,19 @@ async fn aux_ro_drive_reopens_at_embedded_path() {
     if !common::require_bin("mount") || !common::require_bin("umount") {
         return;
     }
-    // No symlink roll: the same file backs the drive across both FCs.
-    run_scenario(&env, /*roll=*/ false, SENTINEL_A).await;
+    run_scenario(&env, Mutation::NewGenerationAlongside, SENTINEL_A).await;
 }
 
-/// Version-roll shape: the embedded path is a symlink; we repoint it at
-/// a new backing file between snapshot and restore. The guest must see
-/// the new bytes — proving the stable-symlink indirection lets a bundle
-/// roll without invalidating existing snapshots.
+/// Negative control — the incident, reproduced. FC reopens the
+/// embedded path at `load_snapshot` and happily serves whatever bytes
+/// are there now; the guest's capture-time view of the device is
+/// silently violated. If this test ever needs "fixing" to expect the
+/// OLD bytes, something upstream started pinning content for us; if a
+/// production path ever recreates this shape (mutating an existing
+/// staged file), THIS is the corruption it causes.
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + sudo mount; run with --ignored on the dev VM"]
-async fn aux_ro_drive_symlink_roll_serves_new_bytes() {
+async fn aux_ro_drive_content_swap_under_snapshot_is_the_incident() {
     let env = match common::fc_preflight() {
         Some(e) => e,
         None => return,
@@ -87,33 +110,37 @@ async fn aux_ro_drive_symlink_roll_serves_new_bytes() {
     if !common::require_bin("mount") || !common::require_bin("umount") {
         return;
     }
-    // Symlink roll: boot reads A, restore reads B after the repoint.
-    run_scenario(&env, /*roll=*/ true, SENTINEL_B).await;
+    run_scenario(&env, Mutation::SwapContentInPlace, SENTINEL_B).await;
 }
 
-async fn run_scenario(env: &common::FcEnv, roll: bool, expected_post_resume: &[u8]) {
+/// Fresh-create flavor (ADR 0035 §3): the deliberate, paused-window
+/// swap to the host's current generation. The proven option-D
+/// mechanism (`patch_drive_swap`) applied to the bundle drive.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + sudo mount; run with --ignored on the dev VM"]
+async fn aux_ro_drive_patch_then_resume_serves_new_generation() {
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !common::require_bin("mount") || !common::require_bin("umount") {
+        return;
+    }
+    run_scenario(&env, Mutation::PatchToNewGeneration, SENTINEL_B).await;
+}
+
+async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_resume: &[u8]) {
     let work = tempfile::tempdir().expect("tempdir");
     let work = work.path();
 
-    // ── prepare the RO bundle backing file(s) + the path FC opens ──
+    // ── content-addressed generation files (production shape) ──
     //
-    // Non-roll: `bundle_path` is a plain file with SENTINEL_A.
-    // Roll: `bundle_path` is a symlink → bundle-A.img at boot; we
-    // repoint it → bundle-B.img before restore.
-    let bundle_path = work.join("bundle.squashfs");
-    let bundle_a = work.join("bundle-A.img");
-    write_padded_file(&bundle_a, SENTINEL_A, BUNDLE_SIZE).await;
-    let bundle_b = work.join("bundle-B.img");
-    if roll {
-        write_padded_file(&bundle_b, SENTINEL_B, BUNDLE_SIZE).await;
-        tokio::fs::symlink(&bundle_a, &bundle_path)
-            .await
-            .expect("symlink bundle -> A");
-    } else {
-        tokio::fs::copy(&bundle_a, &bundle_path)
-            .await
-            .expect("copy bundle A -> path");
-    }
+    // `gen_a` is the pinned generation the snapshot embeds; `gen_b`
+    // is the newer generation a roll stages alongside it.
+    let gen_a = work.join(format!("skills-{}.squashfs", "a".repeat(64)));
+    write_padded_file(&gen_a, SENTINEL_A, BUNDLE_SIZE).await;
+    let gen_b = work.join(format!("skills-{}.squashfs", "b".repeat(64)));
+    write_padded_file(&gen_b, SENTINEL_B, BUNDLE_SIZE).await;
 
     // ── prepare rootfs copy with init.experiment ──
     let rootfs = work.join("rootfs.ext4");
@@ -122,14 +149,14 @@ async fn run_scenario(env: &common::FcEnv, roll: bool, expected_post_resume: &[u
         .expect("copy rootfs");
     install_init_script(&rootfs, work).await;
 
-    // ── FC #1: boot with the RO bundle attached, snapshot ──
+    // ── FC #1: boot with the pinned generation attached, snapshot ──
     let fc1_log = work.join("fc1.log");
     let fc1_api = work.join("fc1.sock");
     let mut fc1 = spawn_firecracker(&fc1_api, &fc1_log).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let client1 = FirecrackerClient::new(&fc1_api);
-    configure_boot(&client1, &env.kernel, &rootfs, &bundle_path).await;
+    configure_boot(&client1, &env.kernel, &rootfs, &gen_a).await;
     client1
         .put_action(ActionType::InstanceStart)
         .await
@@ -145,17 +172,15 @@ async fn run_scenario(env: &common::FcEnv, roll: bool, expected_post_resume: &[u
     let _ = fc1.start_kill();
     let _ = fc1.wait().await;
 
-    // ── version roll: repoint the embedded symlink at the new file ──
-    if roll {
-        tokio::fs::remove_file(&bundle_path)
-            .await
-            .expect("rm old symlink");
-        tokio::fs::symlink(&bundle_b, &bundle_path)
-            .await
-            .expect("symlink bundle -> B");
+    // ── the between-snapshot-and-restore mutation under test ──
+    if matches!(mutation, Mutation::SwapContentInPlace) {
+        // The incident: same path, different bytes. (Production can no
+        // longer construct this — generations are immutable files —
+        // but the test pins what FC does if anything ever regresses.)
+        write_padded_file(&gen_a, SENTINEL_B, BUNDLE_SIZE).await;
     }
 
-    // ── FC #2: load paused, resume WITHOUT patching ──
+    // ── FC #2: load paused, optionally patch, resume ──
     let fc2_log = work.join("fc2.log");
     let fc2_api = work.join("fc2.sock");
     let mut fc2 = spawn_firecracker(&fc2_api, &fc2_log).await;
@@ -167,7 +192,14 @@ async fn run_scenario(env: &common::FcEnv, roll: bool, expected_post_resume: &[u
         .await
         .expect("load_snapshot_paused");
 
-    // *** No patch_drive — re-anchor by presence is the whole point. ***
+    if matches!(mutation, Mutation::PatchToNewGeneration) {
+        // ADR 0035 §3: the fresh-create swap happens in the paused
+        // window, exactly like the production restore path.
+        client2
+            .patch_drive("skills", &gen_b)
+            .await
+            .expect("patch_drive to new generation");
+    }
 
     client2
         .patch_vm_state(VmState::Resumed)
@@ -202,7 +234,7 @@ async fn run_scenario(env: &common::FcEnv, roll: bool, expected_post_resume: &[u
     assert_eq!(
         want_count,
         5,
-        "expected all 5 post-resume reads to return {want} (roll={roll}); \
+        "expected all 5 post-resume reads to return {want}; \
          got want={want_count} other={other_count} in:\n{}",
         post_resume_lines.join("\n"),
     );
@@ -238,7 +270,7 @@ async fn install_init_script(rootfs: &Path, work: &Path) {
          sleep 12\n\
          echo \"[VM] post-resume reads (5x)\"\n\
          for i in 1 2 3 4 5; do\n\
-           dd if=/dev/vdb bs=4 count=1 2>/dev/null\n\
+           dd if=/dev/vdb bs=4 count=1 iflag=direct 2>/dev/null || dd if=/dev/vdb bs=4 count=1 2>/dev/null\n\
            echo \" <- post_resume_iter_$i\"\n\
            sleep 1\n\
          done\n\
@@ -321,14 +353,14 @@ async fn spawn_firecracker(api_sock: &Path, log_path: &Path) -> Child {
         .expect("spawn firecracker")
 }
 
-/// Boot config: rootfs (RW root device) + the aux bundle as a
-/// read-only second drive. The aux drive carries `is_read_only: true`,
-/// matching the production attach in `create_in_jail_after_net`.
+/// Boot config: rootfs (RW root device) + the pinned bundle generation
+/// as a read-only second drive — matching the production attach in
+/// `create_in_jail_after_net` (content-addressed `path_on_host`).
 async fn configure_boot(
     client: &FirecrackerClient,
     kernel: &Path,
     rootfs: &Path,
-    bundle_path: &Path,
+    pinned_generation: &Path,
 ) {
     client
         .put_machine_config(&MachineConfig {
@@ -359,7 +391,7 @@ async fn configure_boot(
     client
         .put_drive(&DriveConfig {
             drive_id: "skills".into(),
-            path_on_host: bundle_path.to_string_lossy().into_owned(),
+            path_on_host: pinned_generation.to_string_lossy().into_owned(),
             is_root_device: false,
             is_read_only: true,
         })

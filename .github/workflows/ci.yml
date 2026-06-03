@@ -288,6 +288,7 @@ jobs:
             --test ha_listener \
             --test snapshot_disk_manifest_persistence \
             --test chunk_gc_helpers_live_pg \
+            --test bundle_gc_live_pg \
             --test admin_chunk_gc_live_pg \
             --test admin_evac_live_pg \
             --test users_live_pg \
@@ -579,6 +580,7 @@ jobs:
             --test multi_restore \
             --test cross_host_restore \
             --test restore_chain \
+            --test aux_ro_drive \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

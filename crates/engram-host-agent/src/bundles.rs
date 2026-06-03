@@ -265,3 +265,198 @@ impl BundleStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_storage_local::LocalBlobStorage;
+
+    fn sha_of(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn store(tmp: &tempfile::TempDir) -> BundleStore {
+        BundleStore::new(
+            Arc::new(LocalBlobStorage::new(tmp.path().join("blob"))),
+            tmp.path().join("shared"),
+        )
+    }
+
+    fn aux(drive_id: &str, body: &[u8]) -> AuxBundleRef {
+        AuxBundleRef {
+            drive_id: drive_id.into(),
+            sha256: sha_of(body),
+        }
+    }
+
+    async fn stage(s: &BundleStore, r: &AuxBundleRef, body: &[u8]) {
+        let p = s.staged_path(r);
+        tokio::fs::create_dir_all(p.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&p, body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_uploads_once_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let body = b"skills-generation-1";
+        let r = aux("skills", body);
+        stage(&s, &r, body).await;
+
+        s.publish(std::slice::from_ref(&r)).await.unwrap();
+        let key = AuxRoDrive::blob_key(&r.sha256);
+        assert_eq!(s.blob.get(&key).await.unwrap().as_ref(), body);
+
+        // Second publish: HEAD-hit, no error (and doesn't need the
+        // staged file re-read — but proving "no rewrite" cheaply:
+        // delete the staged file; an idempotent publish still passes).
+        tokio::fs::remove_file(s.staged_path(&r)).await.unwrap();
+        s.publish(std::slice::from_ref(&r)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_fails_loud_when_staged_file_missing() {
+        // A pin nothing can satisfy must fail the snapshot pipeline,
+        // not record silently (the restore would fail much later,
+        // on another host, with less context).
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let r = aux("skills", b"never-staged");
+        let err = s.publish(std::slice::from_ref(&r)).await.unwrap_err();
+        assert!(format!("{err}").contains("open staged"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn materialize_fetches_verifies_and_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let body = b"playwright-generation-7";
+        let r = aux("playwright", body);
+        s.blob
+            .put(
+                &AuxRoDrive::blob_key(&r.sha256),
+                bytes::Bytes::from_static(body),
+            )
+            .await
+            .unwrap();
+
+        s.materialize_if_missing(std::slice::from_ref(&r))
+            .await
+            .unwrap();
+        let staged = s.staged_path(&r);
+        assert_eq!(tokio::fs::read(&staged).await.unwrap(), body);
+        // Idempotent: present file short-circuits (no blob hit needed).
+        s.materialize_if_missing(std::slice::from_ref(&r))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialize_rejects_digest_mismatch() {
+        // Corrupt blob bytes (or a ref/key mixup) must never land in
+        // the staging dir — a wrong-content staged file is exactly the
+        // incident's failure mode.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let r = AuxBundleRef {
+            drive_id: "skills".into(),
+            sha256: sha_of(b"expected-bytes"),
+        };
+        s.blob
+            .put(
+                &AuxRoDrive::blob_key(&r.sha256),
+                bytes::Bytes::from_static(b"DIFFERENT-bytes"),
+            )
+            .await
+            .unwrap();
+        let err = s
+            .materialize_if_missing(std::slice::from_ref(&r))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("digest mismatch"), "{err}");
+        assert!(!s.staged_path(&r).exists());
+        // The temp file was cleaned up too — staging dir holds nothing.
+        let mut entries = std::fs::read_dir(tmp.path().join("shared"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        // (dir exists because fetch_one mkdir'd it)
+        let _ = &mut entries;
+        assert_eq!(entries, 0);
+    }
+
+    #[tokio::test]
+    async fn materialize_fails_loud_on_blob_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let r = aux("skills", b"unpublished");
+        let err = s
+            .materialize_if_missing(std::slice::from_ref(&r))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("neither staged on this host nor in BlobStorage"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_pinned_and_current_deletes_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let pinned = aux("skills", b"old-but-pinned");
+        let current = aux("skills", b"the-baked-current");
+        let garbage = aux("skills", b"unreferenced");
+        for (r, body) in [
+            (&pinned, b"old-but-pinned" as &[u8]),
+            (&current, b"the-baked-current"),
+            (&garbage, b"unreferenced"),
+        ] {
+            stage(&s, r, body).await;
+        }
+        // The stamp file must survive the sweep.
+        tokio::fs::write(
+            tmp.path().join("shared").join(AuxRoDrive::CURRENT_STAMP),
+            b"{}",
+        )
+        .await
+        .unwrap();
+
+        s.sweep_unpinned(
+            std::slice::from_ref(&pinned),
+            std::slice::from_ref(&current),
+        )
+        .await;
+
+        assert!(s.staged_path(&pinned).exists());
+        assert!(s.staged_path(&current).exists());
+        assert!(!s.staged_path(&garbage).exists());
+        assert!(tmp
+            .path()
+            .join("shared")
+            .join(AuxRoDrive::CURRENT_STAMP)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn read_stamp_missing_and_malformed_degrade_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_stamp(tmp.path()).await.is_empty());
+        tokio::fs::write(tmp.path().join(AuxRoDrive::CURRENT_STAMP), b"not-json")
+            .await
+            .unwrap();
+        assert!(read_stamp(tmp.path()).await.is_empty());
+        tokio::fs::write(
+            tmp.path().join(AuxRoDrive::CURRENT_STAMP),
+            br#"{"skills": "abc", "playwright": "def"}"#,
+        )
+        .await
+        .unwrap();
+        let refs = read_stamp(tmp.path()).await;
+        assert_eq!(refs.len(), 2);
+        // Sorted by drive_id for deterministic heartbeats.
+        assert_eq!(refs[0].drive_id, "playwright");
+        assert_eq!(refs[1].drive_id, "skills");
+    }
+}
