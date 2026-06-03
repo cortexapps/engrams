@@ -66,6 +66,17 @@
             mold
           ] ++ lib.optionals stdenv.isDarwin [
             libiconv                # required by some macOS-aarch64 crates
+            # `just bake-demo` cross-compiles the in-guest musl binaries
+            # (agentd, harness-claude) and mke2fs's the rootfs into ext4.
+            # On macOS those used to come from Homebrew (`musl-cross`,
+            # `e2fsprogs`); provide them here so `nix develop -c just
+            # bake-demo` needs no brew. e2fsprogs ships `mke2fs`; the cross
+            # stdenvs ship `<target>-cc` linkers wired below in the shellHook
+            # (.cargo/config.toml hard-codes the brew binary names, so we
+            # override the linker via CARGO_TARGET_*_LINKER instead).
+            e2fsprogs
+            pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+            pkgs.pkgsCross.musl64.stdenv.cc
           ];
 
           # OPENSSL_DIR / PKG_CONFIG_PATH so `cargo build` finds the
@@ -120,6 +131,21 @@
             if [ "$(uname -s)" = "Linux" ]; then
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            fi
+
+            # macOS cross-compile to the musl guest targets (`just bake-demo`).
+            # `.cargo/config.toml` names the brew linkers (aarch64-linux-musl-gcc);
+            # point cargo + the `cc` crate (ring's C/asm) at the nix cross
+            # toolchains instead, so no Homebrew is needed. Env overrides
+            # `.cargo/config.toml`'s `linker=`; the `relocation-model=static`
+            # rustflags there still apply.
+            if [ "$(uname -s)" = "Darwin" ]; then
+              ARM64_CC="${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-cc"
+              X86_CC="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-cc"
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$ARM64_CC"
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$X86_CC"
+              export CC_aarch64_unknown_linux_musl="$ARM64_CC"
+              export CC_x86_64_unknown_linux_musl="$X86_CC"
             fi
           '';
         };
