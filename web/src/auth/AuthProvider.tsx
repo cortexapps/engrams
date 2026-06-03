@@ -10,6 +10,8 @@ import { createContext, useContext, type ReactNode } from 'react';
 import { fetchMe, logout, NotMemberError } from '../api';
 import type { Principal } from '../types';
 import { EngramMark } from '../components/EngramMark';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
 
 export interface AuthState {
   /** Always present for children — the provider only renders them once the
@@ -82,18 +84,24 @@ export function useIsAdmin(): boolean {
 }
 
 // ---- Auth state screens --------------------------------------------------
-// Full-viewport, centered on --bg, 32rem card, engram mark, lowercase em-dash voice.
+// Full-viewport, centered on the shadcn background, engram mark, quiet voice.
+
+function AuthStage({ children }: { children: ReactNode }) {
+  return (
+    <div className="grid min-h-svh place-items-center bg-background p-8 text-foreground">
+      {children}
+    </div>
+  );
+}
 
 function BootScreen() {
   return (
-    <div className="auth-stage">
-      <div className="auth-card">
-        <span className="auth-mark">
-          <EngramMark size={72} mode="loop" />
-        </span>
-        <div className="auth-line">authenticating…</div>
+    <AuthStage>
+      <div className="flex flex-col items-center gap-3 text-center">
+        <EngramMark size={72} mode="loop" />
+        <p className="text-sm italic text-muted-foreground">authenticating…</p>
       </div>
-    </div>
+    </AuthStage>
   );
 }
 
@@ -105,53 +113,35 @@ function AuthErrorScreen({
   onRetry: () => void;
 }) {
   return (
-    <div className="auth-stage">
-      <div className="auth-card">
-        <span className="auth-mark">
+    <AuthStage>
+      <Card className="w-full max-w-md">
+        <CardContent className="flex flex-col items-center gap-4 py-8 text-center">
           <EngramMark size={72} mode="static" />
-        </span>
-        <div className="auth-strong">
-          could not reach the coordinator —<br />retrying…
-        </div>
-        {message && <div className="auth-detail">{message}</div>}
-        <div className="auth-actions">
-          <button
-            type="button"
-            className="members-act"
-            onClick={onRetry}
-          >
-            retry now
-          </button>
-        </div>
-      </div>
-    </div>
+          <p className="text-base font-medium">
+            Could not reach the coordinator — retrying…
+          </p>
+          {message && <p className="text-sm text-muted-foreground">{message}</p>}
+          <Button variant="outline" onClick={onRetry}>Retry now</Button>
+        </CardContent>
+      </Card>
+    </AuthStage>
   );
 }
 
 function NotMemberScreen({ email }: { email: string }) {
   return (
-    <div className="auth-stage">
-      <div className="auth-card">
-        <span className="auth-mark">
+    <AuthStage>
+      <Card className="w-full max-w-md">
+        <CardContent className="flex flex-col items-center gap-3 py-8 text-center">
           <EngramMark size={72} mode="static" />
-        </span>
-        <div className="auth-strong">
-          you're signed in — but not yet<br />a member of this deployment.
-        </div>
-        {email && <div className="auth-detail">{email}</div>}
-        <div className="auth-line">
-          ask an admin to add you, then reload.
-        </div>
-        <div className="auth-actions">
-          <button
-            type="button"
-            className="members-act act-quiet"
-            onClick={() => void logout()}
-          >
-            sign out
-          </button>
-        </div>
-      </div>
-    </div>
+          <p className="text-base font-medium">
+            You're signed in — but not yet a member of this deployment.
+          </p>
+          {email && <p className="font-mono text-sm text-muted-foreground">{email}</p>}
+          <p className="text-sm text-muted-foreground">Ask an admin to add you, then reload.</p>
+          <Button variant="ghost" onClick={() => void logout()}>Sign out</Button>
+        </CardContent>
+      </Card>
+    </AuthStage>
   );
 }
