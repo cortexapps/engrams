@@ -191,4 +191,28 @@ amnesia, hub bookkeeping bugs — not just the incident's specific hole.
 
 ## Commit chain
 
-(To be filled in as commits land; flipped to Accepted at the end.)
+- `SessionState::Evicting` + legality edges + status gates
+  (ensure_active / resume 409; delete interplay)
+- migration 0050 (`'evicting'` CHECK, `evict_attempts`, partial
+  index, `session_events(session_id, created_at DESC)`) +
+  `list_evicting_sessions` / `bump_evict_attempts` /
+  `list_active_sessions_idle_past` (trait, PG, MiniMeta) + live-PG
+  round-trips wired into CI's Postgres lane
+- candidates handler → fast Active→Evicting nomination (+ metric
+  constants, eviction-pipeline histogram buckets to 300s)
+- eviction scanner (evac_resumer shape; budget fallback HostLost;
+  startup sweep = deploy recovery)
+- L3 PG-derived detection backstop (60s, hard-TTL,
+  `ENGRAM_IDLE_BACKSTOP_TTL_SECS`)
+- gate tests (prompt/resume/delete during Evicting)
+- host: 120s POST override retired; web: `evicting`/`evacuating`
+  rendering (◑, ACTIVE-ish bucket — they previously matched no
+  filter and vanished from the list)
+- fix: engram-postgres row parser learns `'evicting'` (caught by the
+  live-PG round-trip)
+
+Validation: workspace `just check` + 135 coordinator lib tests + 26
+live-PG tests green. Pending before Accepted: dev-vm/FC end-to-end
+(idle → nominate → Evicting → Idle → /resume; forced-detach →
+backstop fires) and the prod watch (pipeline-seconds completions,
+nominated{source} split, budget-exhausted ≈ 0).
