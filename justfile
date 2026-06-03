@@ -172,6 +172,34 @@ bundles:
     deploy/bundles/playwright/build.sh --stage var/bundles/playwright \
         || echo "playwright bundle skipped (needs Docker) — dev sessions get skills only"
 
+# ADR 0035: build + stage the squashfs bundles CONTENT-ADDRESSED
+# (<name>-<sha256>.squashfs + current.json stamp) under var/shared/, the
+# dev mirror of the FC-host image's /var/lib/engram/shared. Run the
+# host-agent with ENGRAM_BUNDLE_DIR=$PWD/var/shared so FC dev sessions
+# resolve/capture against it. Linux-only (mksquashfs; FC is Linux-only
+# anyway). Re-run after editing a skill — the stamp repoints and new
+# sessions pick the fresh generation up via the §3 swap.
+bundles-squashfs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p var/shared
+    stamp="{"
+    sep=""
+    for name in skills playwright; do
+        tmp="var/shared/.$name.build.squashfs"
+        if ! "deploy/bundles/$name/build.sh" "$tmp"; then
+            echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
+            rm -f "$tmp"
+            continue
+        fi
+        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        mv "$tmp" "var/shared/$name-$sha.squashfs"
+        stamp="$stamp$sep\"$name\": \"$sha\""
+        sep=", "
+    done
+    echo "$stamp}" > var/shared/current.json
+    cat var/shared/current.json
+
 # ------------------------------------------------------------------
 # Smoke / e2e helpers — run against a stack brought up by `just dev`
 # (ADR 0024 retired the standalone `integration-up.sh`; the prod-shape

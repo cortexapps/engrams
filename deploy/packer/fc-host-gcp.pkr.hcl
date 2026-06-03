@@ -185,11 +185,17 @@ build {
     ]
   }
 
-  # 2b. ADR 0027: stage the RO bundles at the fleet-canonical path. Baked as
-  #     regular files (not the dynamic symlink) — a bundle change re-bakes
-  #     this image + rolls the MIG, so every host carries the current bundle
-  #     at /var/lib/engram/shared/<name>.squashfs, which is the path the
-  #     base snapshots embed and the FC backend re-anchors against on restore.
+  # 2b. ADR 0035: stage the RO bundles content-addressed —
+  #     /var/lib/engram/shared/<name>-<sha256>.squashfs — plus the
+  #     current.json stamp ("which generation this host image carries").
+  #     The hash is computed HERE so the engrams-internal bake workflow
+  #     needs no change. There is deliberately NO fixed <name>.squashfs
+  #     path: the 2026-06-03 incident was a MIG roll swapping bytes under
+  #     a fixed path while live base snapshots still re-anchored against
+  #     it (guest squashfs superblock ↔ backing file mismatch → EIO on
+  #     every bundle read, fleet-wide). The FC backend resolves "current"
+  #     via the stamp at capture; snapshots pin the exact generation;
+  #     missing generations materialize from BlobStorage on demand.
   provisioner "shell" {
     inline_shebang = "/usr/bin/env bash"
     inline = [
@@ -200,8 +206,12 @@ build {
       "file /tmp/skills.squashfs     | grep -qi squashfs",
       "file /tmp/playwright.squashfs | grep -qi squashfs",
       "sudo mkdir -p /var/lib/engram/shared",
-      "sudo install -m 0644 /tmp/skills.squashfs     /var/lib/engram/shared/skills.squashfs",
-      "sudo install -m 0644 /tmp/playwright.squashfs /var/lib/engram/shared/playwright.squashfs",
+      "SKILLS_SHA=$(sha256sum /tmp/skills.squashfs | cut -d' ' -f1)",
+      "PLAYWRIGHT_SHA=$(sha256sum /tmp/playwright.squashfs | cut -d' ' -f1)",
+      "sudo install -m 0644 /tmp/skills.squashfs     \"/var/lib/engram/shared/skills-$SKILLS_SHA.squashfs\"",
+      "sudo install -m 0644 /tmp/playwright.squashfs \"/var/lib/engram/shared/playwright-$PLAYWRIGHT_SHA.squashfs\"",
+      "printf '{\"skills\": \"%s\", \"playwright\": \"%s\"}\n' \"$SKILLS_SHA\" \"$PLAYWRIGHT_SHA\" | sudo tee /var/lib/engram/shared/current.json >/dev/null",
+      "cat /var/lib/engram/shared/current.json",
     ]
   }
 
