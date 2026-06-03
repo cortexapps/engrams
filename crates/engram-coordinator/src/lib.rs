@@ -18,6 +18,7 @@ pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
 pub mod dead_host;
+pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
 pub mod evacuation;
@@ -202,6 +203,15 @@ pub async fn run_with_registry_and_local(
     // require its own PgPool — it goes through MetadataStore.
     let _evac_resumer =
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
+
+    // ADR 0036: the enable-job scanner drives async image enables
+    // (pending → materializing → capturing → ready) recorded by
+    // POST /api/enabled-images. Lease-claimed per job, so multiple
+    // coord pods cooperate instead of duplicating pipelines.
+    let _enable_scanner = enable_scanner::spawn(
+        enable_scanner::EnableScannerConfig::default(),
+        state.clone(),
+    );
 
     // ADR 0016 §A.1.5c: stale-lease reaper for the
     // `session_lease` PG table. Any lease whose RAII Drop was

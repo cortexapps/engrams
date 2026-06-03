@@ -241,6 +241,10 @@ enum ImageCmd {
         /// Full OCI URI: `<host>[:port]/<repo>:<tag>`.
         #[arg(long)]
         uri: String,
+        /// Don't poll the enable job to completion — print the job id
+        /// and return immediately (ADR 0036: enabling is async).
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Disable an image. Removes the row; the artifact in the
     /// registry is untouched.
@@ -454,7 +458,9 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 .await
             }
             ImageCmd::List => image_list(&client, &cli.endpoint, cli.json).await,
-            ImageCmd::Enable { uri } => image_enable(&client, &cli.endpoint, uri, cli.json).await,
+            ImageCmd::Enable { uri, no_wait } => {
+                image_enable(&client, &cli.endpoint, uri, cli.json, *no_wait).await
+            }
             ImageCmd::Disable { uri } => image_disable(&client, &cli.endpoint, uri).await,
             ImageCmd::Refresh { uri } => image_refresh(&client, &cli.endpoint, uri, cli.json).await,
         },
@@ -1332,7 +1338,11 @@ async fn image_enable(
     endpoint: &str,
     uri: &str,
     json: bool,
+    no_wait: bool,
 ) -> Result<(), CliError> {
+    // ADR 0036: POST returns 202 + an enable job; the coordinator's
+    // scanner drives the pipeline. Default UX polls the job to a
+    // terminal state with a live chunk progress line.
     let resp = client
         .post(format!("{endpoint}/api/v1/enabled-images"))
         .json(&serde_json::json!({ "image_uri": uri }))
@@ -1343,17 +1353,74 @@ async fn image_enable(
     if !status.is_success() {
         return Err(CliError::Http(status.as_u16(), body));
     }
-    if json {
-        println!("{body}");
-    } else {
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        println!(
-            "enabled: uri={} digest={}",
-            v["image_uri"].as_str().unwrap_or(uri),
-            v["manifest_digest"].as_str().unwrap_or(""),
-        );
+    let job: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let job_id = job["id"].as_str().unwrap_or_default().to_string();
+    if no_wait {
+        if json {
+            println!("{body}");
+        } else {
+            println!(
+                "enable job {job_id} accepted; poll with \
+                 `GET {endpoint}/api/v1/enable-jobs/{job_id}`"
+            );
+        }
+        return Ok(());
     }
-    Ok(())
+    poll_enable_job(client, endpoint, &job_id, json).await
+}
+
+/// Poll an enable job until `ready`/`failed`, rendering progress.
+async fn poll_enable_job(
+    client: &reqwest::Client,
+    endpoint: &str,
+    job_id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let url = format!("{endpoint}/api/v1/enable-jobs/{job_id}");
+    let mut last_line_len = 0usize;
+    loop {
+        let job = get_json(client, &url).await?;
+        let state = job["state"].as_str().unwrap_or("unknown").to_string();
+        let done = job["chunks_done"].as_u64().unwrap_or(0);
+        let total = job["chunks_total"].as_u64();
+        match state.as_str() {
+            "ready" => {
+                if last_line_len > 0 {
+                    eprintln!();
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&job)?);
+                } else {
+                    println!(
+                        "enabled: uri={} digest={}",
+                        job["image_uri"].as_str().unwrap_or(""),
+                        job["manifest_digest"].as_str().unwrap_or(""),
+                    );
+                }
+                return Ok(());
+            }
+            "failed" => {
+                if last_line_len > 0 {
+                    eprintln!();
+                }
+                let err = job["error"].as_str().unwrap_or("unknown error");
+                return Err(CliError::Other(format!(
+                    "enable job {job_id} failed: {err} \
+                     (retry: POST {endpoint}/api/v1/enable-jobs/{job_id}/retry)"
+                )));
+            }
+            _ => {
+                let progress = match total {
+                    Some(t) if t > 0 => format!("{done}/{t} chunks"),
+                    _ => String::new(),
+                };
+                let line = format!("\r{state:<14} {progress:<24}");
+                eprint!("{line}");
+                last_line_len = line.len();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
 }
 
 async fn image_disable(
@@ -1391,17 +1458,10 @@ async fn image_refresh(
     if !status.is_success() {
         return Err(CliError::Http(status.as_u16(), body));
     }
-    if json {
-        println!("{body}");
-    } else {
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        println!(
-            "refreshed: uri={} digest={}",
-            v["image_uri"].as_str().unwrap_or(uri),
-            v["manifest_digest"].as_str().unwrap_or(""),
-        );
-    }
-    Ok(())
+    // ADR 0036: refresh is an enable job too — poll it like enable.
+    let job: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let job_id = job["id"].as_str().unwrap_or_default().to_string();
+    poll_enable_job(client, endpoint, &job_id, json).await
 }
 
 /// Minimal percent-encoder for the path components that registry/host

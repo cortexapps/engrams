@@ -3,8 +3,9 @@ import type {
   AddRegistryResponse,
   AdminUser,
   CreateSessionResponse,
-  EnabledImageSummary,
+  EnableJob,
   ImageRef,
+  ListEnableJobsResponse,
   ListEnabledImagesResponse,
   ListHostsResponse,
   ListRegistriesResponse,
@@ -250,8 +251,11 @@ export const fetchEnabledImages = () =>
     (r) => r.images,
   );
 
+// ADR 0036: enable/refresh are asynchronous — both return 202 with an
+// EnableJob; the coordinator's scanner drives the pipeline and the
+// panel polls `/enable-jobs` for real progress.
 export const enableImage = (imageUri: string) =>
-  postJSON<EnabledImageSummary>('/enabled-images', {
+  postJSON<EnableJob>('/enabled-images', {
     image_uri: imageUri,
   });
 
@@ -259,6 +263,12 @@ export const disableImage = (imageUri: string) =>
   postJSON<void>('/enabled-images/disable', { image_uri: imageUri });
 
 export const refreshEnabledImage = (imageUri: string) =>
-  postJSON<EnabledImageSummary>('/enabled-images/refresh', {
+  postJSON<EnableJob>('/enabled-images/refresh', {
     image_uri: imageUri,
   });
+
+export const fetchEnableJobs = () =>
+  getJSON<ListEnableJobsResponse>('/enable-jobs').then((r) => r.jobs);
+
+export const retryEnableJob = (jobId: string) =>
+  postJSON<EnableJob>(`/enable-jobs/${jobId}/retry`, {});

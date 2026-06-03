@@ -133,7 +133,7 @@ fails with a clear error until re-baked.
 - The enable handler's three stages move to `enable_scanner` largely
   unchanged — `materialize_chunk_blob`'s bounded-concurrency
   exists?-fetch-put shape and verify-on-populate (ADR 0021) survive.
-- New `enable_jobs` table (migration 0050); terminal rows retained.
+- New `enable_jobs` table (migration 0052); terminal rows retained.
 - e2fsprogs version becomes a (soft) reproducibility input to chunk
   digests; it's pinned via the Nix flake. A version bump may produce one
   full re-upload — acceptable.

@@ -71,38 +71,101 @@ pub struct ListEnabledImagesResponse {
     pub images: Vec<EnabledImageSummary>,
 }
 
+/// ADR 0036: enabling is asynchronous. The handler validates the URI
+/// with a cheap metadata pull (KBs — manifest layer descriptors, no
+/// chunk bytes), records an `enable_jobs` row, and returns **202**
+/// with the job. The coordinator's [`crate::enable_scanner`] drives
+/// the heavy pipeline (chunk materialize → capture-VM boot +
+/// snapshot → enabled_images upsert) off the request path — the old
+/// synchronous shape took minutes for a 10 GB image and was killed
+/// by the external LB at ~30 s.
+///
+/// Re-POSTing while a job is in flight returns the existing job
+/// (resume/no-op, enforced by a partial unique index).
 pub async fn enable_image(
     State(state): State<SharedState>,
     Json(req): Json<EnableImageRequest>,
-) -> Result<(StatusCode, Json<EnabledImageSummary>), ApiError> {
+) -> Result<impl axum::response::IntoResponse, ApiError> {
     if req.image_uri.trim().is_empty() {
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    let (mut row, manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    // ADR 0016 Phase C commit 3a: stamp the bake's ManifestRef on
-    // the row so the GC pin-set can read it back without re-pulling
-    // bundle.json from OCI on every sweep. `None` for harness-only.
-    row.disk_manifest = materialize_disk_chunks(&state, &req.image_uri, &artifacts).await?;
-    // ADR 0020 P1: an image is not enabled unless its per-image base
-    // snapshot was captured + recorded. This blocks on a host-side
-    // capture; on failure we return before writing the enabled_images
-    // row, so a failed snapshot leaves zero rows (the NOT NULL FK on
-    // base_snapshot_id makes that a schema invariant, not just a
-    // convention).
-    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_and_record_base_snapshot(&state, &row, &manifest).await?;
-    row.base_snapshot_id = Some(base_snapshot_id);
-    row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
-    row.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
-    state
+    // Cheap validation pull: bad URI / missing credential / malformed
+    // manifest fail synchronously with a 4xx — the operator gets
+    // immediate feedback rather than a job that fails on first tick.
+    let (_row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
+
+    let job = state
         .services
         .meta
-        .upsert_enabled_image(row.clone())
+        .create_or_get_enable_job(&req.image_uri, Some(artifacts.manifest_digest.as_str()))
         .await?;
 
-    Ok((StatusCode::CREATED, Json(EnabledImageSummary::from(row))))
+    tracing::info!(
+        image_uri = %req.image_uri,
+        job_id = %job.id,
+        state = job.state.as_str(),
+        "enable job recorded; scanner will drive the pipeline",
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        [(
+            axum::http::header::LOCATION,
+            format!("/api/v1/enable-jobs/{}", job.id),
+        )],
+        Json(job),
+    ))
+}
+
+/// `GET /api/v1/enable-jobs/:id` — poll an enable job. The
+/// `chunks_done/chunks_total` counters are the progress bar.
+pub async fn get_enable_job(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<engram_core::types::EnableJob>, ApiError> {
+    let job = state
+        .services
+        .meta
+        .get_enable_job(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("enable job {id} not found")))?;
+    Ok(Json(job))
+}
+
+#[derive(Serialize)]
+pub struct ListEnableJobsResponse {
+    pub jobs: Vec<engram_core::types::EnableJob>,
+}
+
+/// `GET /api/v1/enable-jobs` — recent jobs, newest first. The
+/// dashboard's images panel reads this so an in-flight enable
+/// survives a page reload.
+pub async fn list_enable_jobs(
+    State(state): State<SharedState>,
+) -> Result<Json<ListEnableJobsResponse>, ApiError> {
+    let jobs = state.services.meta.list_enable_jobs(50).await?;
+    Ok(Json(ListEnableJobsResponse { jobs }))
+}
+
+/// `POST /api/v1/enable-jobs/:id/retry` (admin) — re-queue a
+/// `failed` job to `pending`. The explicit trigger pairing for the
+/// scanner's implicit retry budget.
+pub async fn retry_enable_job(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<engram_core::types::EnableJob>, ApiError> {
+    let job = state
+        .services
+        .meta
+        .retry_enable_job(id)
+        .await
+        .map_err(|e| match e {
+            MetaError::NotFound => ApiError::NotFound(format!("enable job {id} not found")),
+            MetaError::Conflict(msg) => ApiError::Conflict(msg),
+            other => other.into(),
+        })?;
+    tracing::info!(job_id = %id, image_uri = %job.image_uri, "enable job re-queued by admin");
+    Ok(Json(job))
 }
 
 pub async fn list_enabled_images(
@@ -113,19 +176,21 @@ pub async fn list_enabled_images(
     Ok(Json(ListEnabledImagesResponse { images }))
 }
 
+/// ADR 0036: refresh is asynchronous too — it runs the identical
+/// pipeline (the enabled_images upsert preserves `id`/`created_at`
+/// via ON CONFLICT, so "refresh" and "enable" converge). The only
+/// difference is the guard: the URI must already be enabled, so an
+/// operator can't accidentally enable something via /refresh that
+/// they didn't enable via the auditable POST path.
 pub async fn refresh_enabled_image(
     State(state): State<SharedState>,
     Json(req): Json<ImageUriRequest>,
-) -> Result<Json<EnabledImageSummary>, ApiError> {
+) -> Result<impl axum::response::IntoResponse, ApiError> {
     if req.image_uri.trim().is_empty() {
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    // Refresh = "this URI must already be enabled, re-pull and update."
-    // We require the row to exist so an operator can't accidentally
-    // enable something via /refresh that they didn't enable via the
-    // explicit POST path (which is the place that's auditable).
-    let existing = state
+    state
         .services
         .meta
         .get_enabled_image(&req.image_uri)
@@ -137,28 +202,25 @@ pub async fn refresh_enabled_image(
             ))
         })?;
 
-    let (mut refreshed, manifest, artifacts) =
-        fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    refreshed.id = existing.id;
-    refreshed.created_at = existing.created_at;
-    refreshed.updated_at = Some(Utc::now());
-
-    refreshed.disk_manifest = materialize_disk_chunks(&state, &req.image_uri, &artifacts).await?;
-    // ADR 0020 P1: a moved tag is new content — capture a fresh base
-    // snapshot for the new digest before the refreshed row goes live.
-    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
-    refreshed.base_snapshot_id = Some(base_snapshot_id);
-    refreshed.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
-    refreshed.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
-    state
+    let (_row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
+    let job = state
         .services
         .meta
-        .upsert_enabled_image(refreshed.clone())
+        .create_or_get_enable_job(&req.image_uri, Some(artifacts.manifest_digest.as_str()))
         .await?;
-
-    Ok(Json(EnabledImageSummary::from(refreshed)))
+    tracing::info!(
+        image_uri = %req.image_uri,
+        job_id = %job.id,
+        "refresh recorded as enable job",
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        [(
+            axum::http::header::LOCATION,
+            format!("/api/v1/enable-jobs/{}", job.id),
+        )],
+        Json(job),
+    ))
 }
 
 /// ADR 0021 P1.8: response body for a refused disable.
@@ -245,7 +307,7 @@ pub async fn disable_enabled_image(
 /// Returns the `EnabledImage` row ready to upsert, the parsed
 /// `ImageManifest`, and the full `TemplateArtifacts` (so the
 /// caller can push chunked-rootfs layers into BlobStorage).
-async fn fetch_and_seal_manifest(
+pub(crate) async fn fetch_and_seal_manifest(
     state: &SharedState,
     image_uri: &str,
 ) -> Result<(EnabledImage, ImageManifest, engram_oci::TemplateArtifacts), ApiError> {
@@ -311,10 +373,11 @@ async fn fetch_and_seal_manifest(
 /// Bundle without disk chunks (`disk_bootstrap_json` and
 /// `bundle_json` both `None`) is silently accepted — that's the
 /// harness-builder pattern (bake produced just a manifest layer).
-async fn materialize_disk_chunks(
+pub(crate) async fn materialize_disk_chunks(
     state: &SharedState,
     image_uri: &str,
     artifacts: &engram_oci::TemplateArtifacts,
+    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 ) -> Result<Option<engram_core::types::manifest::ManifestRef>, ApiError> {
     let (Some(boot), Some(bundle_json)) = (
         artifacts.disk_bootstrap_json.as_deref(),
@@ -361,6 +424,7 @@ async fn materialize_disk_chunks(
         &bootstrap,
         &manifest,
         &source,
+        progress,
     )
     .await?;
     tracing::info!(
@@ -387,7 +451,7 @@ async fn materialize_disk_chunks(
 /// portability — ADR 0020). The host attaches its local stub harness,
 /// boots to agentd-ready, snapshots (chunked memory + uploaded
 /// state/sidecar), and tears the capture VM down.
-async fn capture_and_record_base_snapshot(
+pub(crate) async fn capture_and_record_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
     manifest: &ImageManifest,
@@ -662,6 +726,7 @@ async fn materialize_chunk_blob(
     bootstrap: &engram_chunk_store::Bootstrap,
     manifest: &engram_chunk_store::Manifest,
     source: &ChunkSource<'_>,
+    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 ) -> Result<(usize, usize), ApiError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut tasks = FuturesUnordered::new();
@@ -706,6 +771,12 @@ async fn materialize_chunk_blob(
         match res? {
             true => written += 1,
             false => deduped += 1,
+        }
+        // ADR 0036: progress counter for the enable job's
+        // chunks_done — counts every settled chunk (fetched or
+        // dedup-skipped); the scanner's checkpoint task persists it.
+        if let Some(p) = &progress {
+            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(entry) = iter.next() {
             tasks.push(process_one(blob, source, entry.clone()));
@@ -805,6 +876,7 @@ mod tests {
             &bootstrap,
             &manifest,
             &ChunkSource::Map(&chunk_map),
+            None,
         )
         .await
         .expect("materialize");
@@ -836,6 +908,7 @@ mod tests {
             &bootstrap,
             &manifest,
             &ChunkSource::Map(&chunk_map),
+            None,
         )
         .await
         .expect("materialize again");

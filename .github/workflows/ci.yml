@@ -293,6 +293,7 @@ jobs:
             --test admin_evac_live_pg \
             --test users_live_pg \
             --test eviction_live_pg \
+            --test enable_jobs_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
