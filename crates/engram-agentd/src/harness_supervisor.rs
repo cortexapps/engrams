@@ -20,12 +20,49 @@
 //! kill+respawn.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::proto::SpawnHarnessRequest;
+
+/// Where the harness child's stdout/stderr land in the guest.
+/// Overridable via `ENGRAM_HARNESS_LOG` (tests point it at a tempdir).
+///
+/// The harness must NEVER inherit agentd's stdio: agentd runs as pid 1
+/// with fds 0/1/2 on `/dev/console`, and after an FC snapshot restore
+/// nothing drains the emulated serial port — once the TTY output buffer
+/// fills, the next `write(2)` to the console blocks *forever*. A harness
+/// whose `tracing` output went to the console deadlocked mid-log-line in
+/// prod (session 5665bdd3, 2026-06-03): the prompt was never processed
+/// and the session sat "thinking" indefinitely. File writes can't block
+/// that way, and the log stays readable in-guest via `/exec`.
+const HARNESS_LOG_PATH: &str = "/var/log/engram/harness.log";
+
+/// stdout/stderr `Stdio` pair for the harness child: append handles on
+/// [`HARNESS_LOG_PATH`]. Falls back to `Stdio::null()` if the log file
+/// can't be opened — losing logs is acceptable; inheriting the blocking
+/// console is not.
+fn harness_log_stdio() -> (Stdio, Stdio) {
+    let path = std::env::var("ENGRAM_HARNESS_LOG").unwrap_or_else(|_| HARNESS_LOG_PATH.to_string());
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|f| f.try_clone().map(|c| (f, c)));
+    match opened {
+        Ok((out, err)) => (Stdio::from(out), Stdio::from(err)),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path, "harness log open failed; using null stdio");
+            (Stdio::null(), Stdio::null())
+        }
+    }
+}
 
 /// Owns the harness child process handle. Cheap to clone via `Arc`;
 /// shared across all `serve_connection` tasks so a fresh
@@ -170,7 +207,16 @@ impl HarnessSupervisor {
             let _ = prev.wait().await;
         }
 
+        // Detach the child from agentd's stdio (= /dev/console, which
+        // blocks forever once full in a restored VM — see
+        // `HARNESS_LOG_PATH`). stdout/stderr append to the in-guest
+        // harness log; stdin is closed (the harness takes input over
+        // vsock, never the console).
+        let (h_out, h_err) = harness_log_stdio();
         let child = cmd
+            .stdin(Stdio::null())
+            .stdout(h_out)
+            .stderr(h_err)
             .spawn()
             .map_err(|e| std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv0)))?;
         let pid = child.id();
@@ -261,6 +307,41 @@ mod tests {
             let _ = c.kill().await;
             let _ = c.wait().await;
         }
+    }
+
+    #[tokio::test]
+    async fn child_stdio_goes_to_harness_log_not_inherited() {
+        // The harness must never inherit agentd's stdio (= /dev/console in
+        // the guest, which blocks forever once the restored VM's TTY buffer
+        // fills). Assert the child's stdout+stderr land in the harness log
+        // file instead.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("harness.log");
+        std::env::set_var("ENGRAM_HARNESS_LOG", &log_path);
+        let sup = HarnessSupervisor::new();
+        let pid = sup
+            .spawn(SpawnHarnessRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo out-line; echo err-line >&2".into(),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        assert!(pid.is_some());
+        // Reap the child so the writes are flushed before we read.
+        let mut guard = sup.inner.lock().await;
+        if let Some(mut c) = guard.current_child.take() {
+            let _ = c.wait().await;
+        }
+        drop(guard);
+        std::env::remove_var("ENGRAM_HARNESS_LOG");
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("out-line"), "stdout missing: {logged:?}");
+        assert!(logged.contains("err-line"), "stderr missing: {logged:?}");
     }
 
     #[tokio::test]
