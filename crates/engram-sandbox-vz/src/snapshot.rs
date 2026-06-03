@@ -102,6 +102,7 @@ pub(crate) async fn build_metadata(
         sidecar_blob_key: None,
         rootfs_blob_key: None,
         working_set_blob_key: None,
+        aux_bundles: vec![],
     })
 }
 

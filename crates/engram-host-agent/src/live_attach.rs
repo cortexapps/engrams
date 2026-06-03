@@ -278,6 +278,7 @@ mod tests {
             working_set_trace_output: None,
             uffd_blob_root: None,
             cpu_template: None,
+            bundle_dir: work_dir.join("bundles"),
         };
         Arc::new(FirecrackerBackend::new(work_dir, cfg))
     }

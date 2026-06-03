@@ -188,6 +188,7 @@ pub async fn evacuate_dead_source(
             sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         },
         None => SnapshotMetadata {
             id: engram_core::SnapshotId::new(),
@@ -201,6 +202,7 @@ pub async fn evacuate_dead_source(
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         },
     };
 
@@ -329,6 +331,7 @@ mod tests {
                 sidecar_blob_key: None,
                 rootfs_blob_key: None,
                 working_set_blob_key: None,
+                aux_bundles: vec![],
             })
         }
         async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {

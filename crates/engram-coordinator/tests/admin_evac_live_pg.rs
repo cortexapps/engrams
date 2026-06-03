@@ -125,6 +125,7 @@ impl HostClient for FakeBackend {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         })
     }
     async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {

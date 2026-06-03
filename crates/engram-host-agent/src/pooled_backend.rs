@@ -2657,6 +2657,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -2793,6 +2794,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -2929,6 +2931,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -3158,6 +3161,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -3284,6 +3288,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -3768,6 +3773,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
