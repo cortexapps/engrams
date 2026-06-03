@@ -722,6 +722,54 @@ pub trait MetadataStore: Send + Sync {
         Ok(1)
     }
 
+    // ----------------------------------------------------------------
+    // ADR 0034 — eviction scanner + idle-detection backstop support.
+    //
+    // Mirrors the 12b evac shape above: `Evicting` rows carry a
+    // side-car retry counter (column `evict_attempts`, migration
+    // 0050) that `transition_session(Evicting)` resets in the same
+    // UPDATE, and the coord-side eviction scanner sweeps the state on
+    // a 10s tick. The backstop query is the L3 detector: it asks PG —
+    // not the host's in-memory hub — which Active sessions have gone
+    // silent, catching harness-detach / host-amnesia classes the hub
+    // structurally cannot see.
+    // ----------------------------------------------------------------
+
+    /// Sessions currently in `Evicting`, paired with their current
+    /// `evict_attempts` count. The eviction scanner uses this on
+    /// every tick (and on its first tick after coord startup, which
+    /// is what recovers rows wedged across a deploy). Default
+    /// `Ok(vec![])` keeps in-memory mocks quiet; PG impl runs the
+    /// partial-indexed `WHERE status = 'evicting'` query.
+    async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically `evict_attempts = evict_attempts + 1 RETURNING
+    /// evict_attempts`. The eviction scanner calls this before each
+    /// pipeline attempt; past the budget it falls back to HostLost
+    /// (see ADR 0034 for why not Active/Idle/Dead). Default returns 1
+    /// so test mocks can observe the bump without persisting state.
+    async fn bump_evict_attempts(&self, _session_id: SessionId) -> Result<u32, MetaError> {
+        Ok(1)
+    }
+
+    /// ADR 0034 L3 backstop: `Active` sessions with a bound sandbox
+    /// whose newest `session_events` row is older than
+    /// `idle_for_secs` (falling back to the session's `created_at`
+    /// when no events exist yet). These are sessions the host-side
+    /// idle detector has gone blind to — harness detached, host-agent
+    /// restarted, hub bookkeeping lost — and they would otherwise sit
+    /// Active forever. Returns `(session_id, sandbox_id,
+    /// last_event_at)`; the caller nominates them into the Evicting
+    /// lane. Default empty for non-PG mocks.
+    async fn list_active_sessions_idle_past(
+        &self,
+        _idle_for_secs: i64,
+    ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// ADR 0029: fleet-wide snapshot totals for the Storage surface —
     /// the count of `snapshots` rows and the sum of their
     /// `size_bytes`. A single cheap aggregate query (the Storage page

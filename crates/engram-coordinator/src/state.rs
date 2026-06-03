@@ -833,6 +833,10 @@ pub(crate) mod tests {
         /// `bump_evac_attempts`; observed by the scanner via
         /// `list_evacuating_sessions`.
         pub(crate) evac_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
+        /// ADR 0034: in-memory mirror of `sessions.evict_attempts`.
+        /// Same lifecycle as `evac_attempts`, for the eviction
+        /// scanner.
+        pub(crate) evict_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
     }
 
     /// Alias so the `clippy::type_complexity` lint stays happy on
@@ -861,6 +865,7 @@ pub(crate) mod tests {
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
                 chunk_generation: PlMutex::new(0),
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
+                evict_attempts: PlMutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -913,6 +918,11 @@ pub(crate) mod tests {
             // `engram_postgres::transition_session`.
             if matches!(target, engram_core::types::SessionState::Evacuating) {
                 self.evac_attempts.lock().insert(id, 0);
+            }
+            // ADR 0034: same reset-on-entry for Evicting. Mirrors the
+            // PG `CASE WHEN $2 = 'evicting' THEN 0` branch.
+            if matches!(target, engram_core::types::SessionState::Evicting) {
+                self.evict_attempts.lock().insert(id, 0);
             }
             Ok(prev)
         }
@@ -1234,6 +1244,68 @@ pub(crate) mod tests {
             let entry = map.entry(session_id).or_insert(0);
             *entry += 1;
             Ok(*entry)
+        }
+
+        // ADR 0034: eviction-scanner support, mirroring the 12b evac
+        // trio above. MiniMeta carries one session, so the list-sweep
+        // is trivially "is it Evicting?".
+        async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+            let s = self.session.lock().clone();
+            if matches!(s.status, engram_core::types::SessionState::Evicting) {
+                let attempts = self.evict_attempts.lock().get(&s.id).copied().unwrap_or(0);
+                Ok(vec![(s, attempts)])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn bump_evict_attempts(
+            &self,
+            session_id: engram_core::SessionId,
+        ) -> Result<u32, MetaError> {
+            let mut map = self.evict_attempts.lock();
+            let entry = map.entry(session_id).or_insert(0);
+            *entry += 1;
+            Ok(*entry)
+        }
+
+        // ADR 0034 L3 backstop. MiniMeta's one session is "idle past
+        // TTL" when its newest event (falling back to the session's
+        // created_at — same COALESCE the PG query uses) is older than
+        // the cutoff. Tests backdate by pushing a PersistedEvent with
+        // an old `created_at` into `events`, or by rewinding
+        // `session.created_at` directly (both fields are pub(crate)).
+        async fn list_active_sessions_idle_past(
+            &self,
+            idle_for_secs: i64,
+        ) -> Result<
+            Vec<(
+                engram_core::SessionId,
+                engram_core::SandboxId,
+                chrono::DateTime<chrono::Utc>,
+            )>,
+            MetaError,
+        > {
+            let s = self.session.lock().clone();
+            if !matches!(s.status, engram_core::types::SessionState::Active) {
+                return Ok(Vec::new());
+            }
+            let Some(sandbox_id) = s.sandbox_id else {
+                return Ok(Vec::new());
+            };
+            let last_event_at = self
+                .events
+                .lock()
+                .iter()
+                .map(|e| e.created_at)
+                .max()
+                .unwrap_or(s.created_at);
+            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(idle_for_secs);
+            if last_event_at < cutoff {
+                Ok(vec![(s.id, sandbox_id, last_event_at)])
+            } else {
+                Ok(Vec::new())
+            }
         }
     }
 
