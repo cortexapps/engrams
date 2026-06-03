@@ -111,7 +111,9 @@ async fn evicting_round_trip_counter_and_sweep() {
         .await
         .expect("active->evicting again");
     assert_eq!(
-        meta.bump_evict_attempts(id).await.expect("bump after reset"),
+        meta.bump_evict_attempts(id)
+            .await
+            .expect("bump after reset"),
         1,
         "transition_session(Evicting) must reset evict_attempts to 0"
     );
@@ -164,9 +166,7 @@ async fn backstop_query_filters_on_ttl_and_sandbox() {
 
     // Unbinding the sandbox removes it from the backstop's view
     // (nothing to evict; other lifecycle paths own bare rows).
-    meta.assign_session_sandbox(id, None)
-        .await
-        .expect("unbind");
+    meta.assign_session_sandbox(id, None).await.expect("unbind");
     assert!(
         !meta
             .list_active_sessions_idle_past(0)

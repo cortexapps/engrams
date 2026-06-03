@@ -184,8 +184,7 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         // eviction lands at Idle within a scanner tick or two, after
         // which the next call auto-resumes.
         SessionState::Evicting => Err(ApiError::Conflict(
-            "session is mid-eviction; retry shortly (it will land at idle and auto-resume)"
-                .into(),
+            "session is mid-eviction; retry shortly (it will land at idle and auto-resume)".into(),
         )),
         SessionState::Created | SessionState::GuestReady => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
