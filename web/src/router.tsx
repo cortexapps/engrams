@@ -1,10 +1,15 @@
-// Code-based TanStack Router tree for engrams-web. Mirrors the four-surface
-// IA 1:1 (was src/App.tsx's <Routes>). Admin surfaces guard via a shared
-// `requireAdmin` beforeLoad reading `isAdmin` from typed router context; the
-// context's `auth` is populated at <RouterProvider/> time (see App.tsx), and
-// AuthProvider gates rendering until the principal resolves, so `context.auth`
-// is always present when beforeLoad runs. The coordinator's require_admin
-// layer remains the real gate — these guards are UX-only.
+// Code-based TanStack Router tree for engrams-web. The shell is RootLayout (the
+// primary destinations rail + inset). `/sessions` and `/settings` are nested
+// LAYOUT routes that each render their own second sidebar + <Outlet/>;
+// Fleet/Storage render full-bleed in the inset. SessionDetail lives OUTSIDE the
+// sessions layout (full-bleed, keeps its old transcript styling).
+//
+// Admin surfaces guard via a shared `requireAdmin` beforeLoad reading `isAdmin`
+// from typed router context; the context's `auth` is populated at
+// <RouterProvider/> time (see App.tsx), and AuthProvider gates rendering until
+// the principal resolves, so `context.auth` is always present when beforeLoad
+// runs. The coordinator's require_admin layer remains the real gate — these
+// guards are UX-only.
 import {
   createRootRouteWithContext,
   createRoute,
@@ -12,12 +17,14 @@ import {
   redirect,
 } from '@tanstack/react-router';
 import type { AuthState } from './auth/AuthProvider';
-import { Layout } from './pages/Layout';
-import { Sessions } from './pages/Sessions';
+import { RootLayout } from './pages/RootLayout';
+import { SessionsLayout } from './pages/sessions/SessionsLayout';
+import { MySessions } from './pages/sessions/MySessions';
+import { AllSessions } from './pages/sessions/AllSessions';
 import { SessionDetail } from './pages/SessionDetail';
 import { Fleet } from './pages/Fleet';
 import { Storage } from './pages/Storage';
-import { Settings } from './pages/Settings';
+import { SettingsLayout } from './pages/settings/SettingsLayout';
 import { Members } from './pages/Members';
 import { ImagesPanel } from './components/settings/ImagesPanel';
 import { ProfilePanel } from './components/settings/ProfilePanel';
@@ -37,14 +44,35 @@ function requireAdmin({ context }: { context: RouterContext }) {
 }
 
 const createRootRoute = createRootRouteWithContext<RouterContext>();
-const rootRoute = createRootRoute({ component: Layout });
+const rootRoute = createRootRoute({ component: RootLayout });
 
-const sessionsRoute = createRoute({
+const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
-  component: Sessions,
+  beforeLoad: () => {
+    throw redirect({ to: '/sessions' });
+  },
 });
 
+// /sessions layout route (second sidebar) ----------------------------------
+const sessionsLayoutRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/sessions',
+  component: SessionsLayout,
+});
+const mySessionsRoute = createRoute({
+  getParentRoute: () => sessionsLayoutRoute,
+  path: '/',
+  component: MySessions,
+});
+const allSessionsRoute = createRoute({
+  getParentRoute: () => sessionsLayoutRoute,
+  path: 'all',
+  beforeLoad: requireAdmin,
+  component: AllSessions,
+});
+// Session detail is OUTSIDE the sessions layout (full-bleed, no 2nd sidebar,
+// keeps its old styling). It is a child of root at /sessions/$id.
 const sessionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/sessions/$id',
@@ -57,7 +85,6 @@ const fleetRoute = createRoute({
   beforeLoad: requireAdmin,
   component: Fleet,
 });
-
 const storageRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/storage',
@@ -65,65 +92,33 @@ const storageRoute = createRoute({
   component: Storage,
 });
 
-const settingsRoute = createRoute({
+// /settings layout route (second sidebar) ----------------------------------
+const settingsLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
-  component: Settings,
+  component: SettingsLayout,
 });
-
 const settingsIndexRoute = createRoute({
-  getParentRoute: () => settingsRoute,
+  getParentRoute: () => settingsLayoutRoute,
   path: '/',
   beforeLoad: () => {
     throw redirect({ to: '/settings/profile' });
   },
 });
-
-const profileRoute = createRoute({
-  getParentRoute: () => settingsRoute,
-  path: 'profile',
-  component: ProfilePanel,
-});
-
-const tokensRoute = createRoute({
-  getParentRoute: () => settingsRoute,
-  path: 'tokens',
-  component: TokensPanel,
-});
-
-const membersRoute = createRoute({
-  getParentRoute: () => settingsRoute,
-  path: 'members',
-  beforeLoad: requireAdmin,
-  component: Members,
-});
-
-const imagesRoute = createRoute({
-  getParentRoute: () => settingsRoute,
-  path: 'images',
-  beforeLoad: requireAdmin,
-  component: ImagesPanel,
-});
-
-const registriesRoute = createRoute({
-  getParentRoute: () => settingsRoute,
-  path: 'registries',
-  beforeLoad: requireAdmin,
-  component: RegistriesPanel,
-});
+const profileRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'profile', component: ProfilePanel });
+const tokensRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'tokens', component: TokensPanel });
+const membersRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'members', beforeLoad: requireAdmin, component: Members });
+const imagesRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'images', beforeLoad: requireAdmin, component: ImagesPanel });
+const registriesRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'registries', beforeLoad: requireAdmin, component: RegistriesPanel });
 
 const routeTree = rootRoute.addChildren([
-  sessionsRoute,
+  indexRoute,
+  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute]),
   sessionDetailRoute,
   fleetRoute,
   storageRoute,
-  settingsRoute.addChildren([
-    settingsIndexRoute,
-    profileRoute,
-    tokensRoute,
-    membersRoute,
-    imagesRoute,
-    registriesRoute,
+  settingsLayoutRoute.addChildren([
+    settingsIndexRoute, profileRoute, tokensRoute, membersRoute, imagesRoute, registriesRoute,
   ]),
 ]);
 
