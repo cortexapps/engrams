@@ -407,8 +407,12 @@ impl HarnessHub {
     /// `hard_ttl` is the operator's safety net; default 30 min.
     ///
     /// Only returns sandboxes with an attached harness; bare
-    /// sandboxes (no adapter) aren't tracked here. Other lifecycle
-    /// paths handle them (dead-host detector, operator drain).
+    /// sandboxes (no adapter) aren't tracked here — deliberately.
+    /// A running-but-detached sandbox (harness vsock dropped, hub
+    /// maps wiped at reader-loop exit) is caught by the coord's
+    /// PG-derived detection backstop (ADR 0034,
+    /// `engram_coordinator::idle_detect_backstop`), which reads the
+    /// durable session_events record instead of this in-memory view.
     pub fn idle_sandboxes(
         &self,
         soft_ttl: std::time::Duration,

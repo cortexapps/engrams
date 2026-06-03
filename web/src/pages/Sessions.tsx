@@ -23,6 +23,11 @@ const ACTIVEISH = new Set<Session['status']>([
   'guest_ready',
   'pending',
   'host_lost',
+  // Transitional suspend/relocate (ADR 0018 / ADR 0034): still
+  // "happening now" — they land in idle (or back in active) within
+  // a couple of minutes, at which point they re-bucket themselves.
+  'evacuating',
+  'evicting',
 ]);
 const ARCHIVED = new Set<Session['status']>(['completed', 'dead', 'failed']);
 
