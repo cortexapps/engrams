@@ -1,17 +1,26 @@
 # ADR 0028: Eviction durability under coord restart + host roll
 
-Status: 2026-06-02 — **Proposed.** Incident-driven. Authored before
-code per the team's ADR-bookend norm; the fix lands in three
-independent commits (one per failure below) that can ship and roll
-separately. The core move is to make recovery rest on a **periodic,
-durably-recorded coherent (memory, disk) checkpoint** rather than a
-suspend-only memory snapshot — see "The deeper finding" below.
-Supersedes nothing; extends [ADR 0018](0018-session-evacuation.md)
-(evacuation), [ADR 0016](0016-cow-observability-and-continuous-sync.md)
-(continuous disk sync + idle-eviction ordering), and
-[ADR 0009](0009-state-reconciliation.md) (graceful shutdown); the
-checkpoint-cadence lever ties into [ADR 0022](0022-runtime-memory-sharing-and-forking.md)
-(dirty-page tracking).
+Status: 2026-06-03 — **Proposed (revised).** Incident-driven. Authored
+before code per the team's ADR-bookend norm; revised before
+implementation after (a) [ADR 0034](0034-idle-eviction-control-plane-and-detection.md)
+landed and closed the **control-plane** half of Defect A, and (b) design
+review settled the checkpoint mechanics on **diff-first periodic
+checkpoints on stock Firecracker** — KVM dirty-page tracking + Diff
+snapshots + the content-addressed chunk store — rather than the original
+"coarse cadence, full pause + full dump" first cut. That same review
+concluded the checkpoint artifacts should be **fork-ready by
+construction** (forking sessions is on the product horizon) and that
+[ADR 0022](0022-runtime-memory-sharing-and-forking.md)'s Option B (the
+`direct-mem` FC fork) is **rejected for now** — see "Relation to
+ADR 0022". The fix lands as independently shippable phases (commit
+chain at the end). The core move is unchanged: make recovery rest on a
+**periodic, durably-recorded coherent (memory, disk) checkpoint** rather
+than a suspend-only memory snapshot. Supersedes nothing; extends
+[ADR 0018](0018-session-evacuation.md) (evacuation),
+[ADR 0016](0016-cow-observability-and-continuous-sync.md) (continuous
+disk sync + idle-eviction ordering), [ADR 0009](0009-state-reconciliation.md)
+(graceful shutdown), and [ADR 0034](0034-idle-eviction-control-plane-and-detection.md)
+(the `Evicting` lane this slots into).
 
 ## Context: the incident (session `cf4d4afd`, 2026-06-02)
 
@@ -50,32 +59,42 @@ returned `forward prompt to harness: sandbox not found`. Investigation
 
 ### Defect A — coord-orchestrated eviction is not restart-safe
 
-`idle_evictor::evict_session_to_state` (`crates/engram-coordinator/src/idle_evictor.rs:63`)
-runs the whole pipeline synchronously in one coord task:
-`host.snapshot()` (the long RPC, line 146) → `record_snapshot()` (PG,
-line 176) → `transition_session` (line 223) → `destroy()` (line 240).
+> **Post-0034 status:** ADR 0034 (PR #71) closed the **control-plane**
+> half of this defect: nomination now flips `Active → Evicting` (a
+> durable PG intent marker) and a coord-side scanner re-drives the
+> pipeline after any coord restart, with a retry budget falling back to
+> `HostLost`. What remains open — and what Fix A addresses — is the
+> **data-plane** half: the scanner *re-runs the whole snapshot from
+> scratch* because nothing reconciles a snapshot that already reached
+> GCS but never got its PG row. The analysis below describes the
+> original incident-time code; the durability hole it identifies is the
+> unrecorded-artifact window, which 0034 deliberately left to this ADR.
+
+`idle_evictor::evict_session_to_state`
+(`crates/engram-coordinator/src/idle_evictor.rs`) runs the pipeline
+synchronously in one coord task: `host.snapshot()` (the long RPC) →
+`record_snapshot()` (PG) → `transition_session` → `destroy()`.
 
 The ordering within the pipeline is careful and correct (record-before-
-destroy, PG-before-destroy, in-flight commit/abort tracking). But the
-pipeline as a whole has **no durability across a coord process exit**.
-If coord receives SIGTERM during the ~2-minute `host.snapshot()` RPC
-(exactly what a deploy roll does), the task is dropped:
+destroy, PG-before-destroy, in-flight commit/abort tracking). But if
+coord exits during the ~2-minute `host.snapshot()` RPC (exactly what a
+deploy roll does):
 
 - the host *completed* the snapshot and uploaded the chunks to GCS,
   but coord never reached `record_snapshot` → **no PG row**;
 - coord never reached `destroy` → the **source VM is left paused**
   (orphaned, as observed);
-- the `SessionLeaseGuard` Drop release is a detached `tokio::spawn`
-  that may not run during runtime shutdown;
 - the host's in-flight-snapshot tracking is neither committed nor
   aborted.
 
 The uploaded GCS artifacts are keyed by a `SnapshotId` that only ever
 existed on the now-dead host and in the dropped coord task — they are
 unreferenceable. The session is left with only its `live_disk_manifest`.
-
-There is no reconciliation that re-records or re-drives an
-eviction that was in flight when a coord pod died.
+Post-0034 the *eviction intent* survives, but there is still no
+reconciliation that re-records artifacts already in GCS — the re-driven
+pipeline pays the full snapshot again, and if the *host* (not just
+coord) is gone before any attempt completes, the artifacts are stranded
+exactly as in the incident.
 
 ### Defect B — disk-only evacuation is unimplemented (silently fails 20×)
 
@@ -125,7 +144,7 @@ by deletion; nothing drains their live/idle sessions first.
 The host-agent *has* a SIGTERM checkpoint pipeline
 (`engram-host-agent/src/shutdown.rs`, ADR 0009 Phase 7) that snapshots
 each live sandbox on signal — but (a) it updates the local
-`sandbox.json` and may not durably *record the snapshot in coord/PG*,
+`sandbox.json` and does not durably *record the snapshot in coord/PG*,
 so it has the same unreferenceable-artifact problem as Defect A when
 the host is then deleted; and (b) the GCE shutdown grace period is far
 shorter than the ~2-minute snapshot+upload observed here, so the
@@ -169,53 +188,131 @@ On sandbox/host loss, recover to the best available rung:
    disk) pair captured atomically and durably recorded. **Rewind** the
    disk to that checkpoint's version — discarding the continuous-sync
    deltas that landed *after* it — to keep the (memory, disk) pair
-   coherent. Cost: minutes of lost work; **agent RAM / conversation /
-   process context preserved.** Best UX.
+   coherent. Cost: ≤ one checkpoint interval of lost work; **agent
+   RAM / conversation / process context preserved.** Best UX.
 2. **Cold boot on the latest disk (Fix B).** No usable coherent
    checkpoint, but the continuous-sync `live_disk_manifest` is current:
    fresh kernel boot mounting the recovered rootfs, fresh harness.
    Newest on-disk files, **memory/context lost.**
 3. **Floor.** Disk in GCS / work already pushed to the forge (the PR).
 
+**Coherence rule for rung 1 (load-bearing, easy to get wrong):** a
+rung-1 restore must pair the checkpoint's memory with the checkpoint's
+**own** disk manifest version — explicitly *not* the newer
+`live_disk_manifest`. The existing live-wins preference in
+`pick_evac_disk_manifest` stays correct only for rung 2, where a fresh
+kernel mounts whatever disk it's given. Pairing checkpoint memory with
+a newer disk reproduces Defect B's corruption in miniature.
+
+### Checkpoint mechanics — diff-first on stock Firecracker
+
+The original draft assumed every checkpoint costs a full pause + full
+memory dump, capping cadence at minutes and deferring anything better
+to ADR 0022's FC fork. Design review found stock FC already has the
+needed primitive, and our chunk store already has the rebase mechanism:
+
+- **Dirty-page tracking is stock.** `track_dirty_pages` at boot /
+  `enable_diff_snapshots` at `snapshot/load` turns on KVM dirty-log
+  tracking; `PUT /snapshot/create` with `snapshot_type: Diff` writes
+  *only pages dirtied since the last capture* to a sparse local file
+  and resets the bitmap. Chained diffs are supported.
+- **The chunk store is the rebase.** The host keeps a **rolling
+  per-session `memory.bin`** on NVMe (the diff-apply target). After
+  each capture it overlays the sparse diff onto the rolling file,
+  re-chunks **only the chunks the dirty pages touched**, uploads
+  content-addressed (already-present hashes skipped), and publishes
+  memory manifest vN+1. Manifests remain **full-image chunk lists** —
+  every checkpoint is independently restorable with no chain replay;
+  deltas exist only at capture time. At-rest cost per checkpoint ≈ the
+  dirty delta (same property the disk side has had since ADR 0016).
+- **Pause covers capture, never upload.** The atomic window is the
+  proven ADR 0018 12m ordering, unchanged:
+  `pause → drain FlushScheduler dirty disk chunks (manifest vK) →
+  FC Diff capture → resume`. Everything slow — chunk/hash/dedup/upload/
+  record — runs async off the immutable local staging copy after
+  resume. If the async tail fails, manifest vN+1 simply isn't
+  published and the previous checkpoint remains the anchor; nothing is
+  torn. Expected pause ≈ O(dirty set) ≈ O(100 ms) at minute-scale
+  cadence (FC requires the pause for `snapshot/create` regardless, and
+  the (memory, disk) pair needs a frozen instant anyway).
+- **Baselines:** the first checkpoint after a fresh kernel boot is a
+  Full capture (no baseline); after a snapshot restore, diffs compose
+  against the restored manifest as baseline.
+- **Eviction becomes "final diff checkpoint + destroy".** The
+  eviction-time snapshot is just the last checkpoint in the chain — a
+  small delta, not a multi-GiB dump. The `Evicting` 409 window a user
+  can hit when prompting mid-eviction collapses from ~2 minutes to
+  seconds. The 0034 pipeline's invariants are untouched.
+- **Chunk-amplification knob.** Dirty tracking is 4 KiB pages; chunks
+  are far coarser, so one stray dirty page re-uploads its whole chunk.
+  Memory chunk size is a tunable measured in the spike (Phase 1) —
+  smaller chunks trade per-chunk overhead against amplification.
+- **Clock discipline (new steady-state requirement).** Paused vCPUs
+  don't tick; ~100 ms lost per checkpoint *accumulates* (unlike the
+  one-shot restore skew the clock-steering crate already fixes at
+  resume). agentd gains a periodic re-step of `CLOCK_REALTIME` from the
+  host's KVM PTP clock (`/dev/ptp0`) — same crate, new cadence — so the
+  drip never reaches SigV4/TLS-breaking territory.
+
 ### Fix A — periodic coherent checkpoint + host-owned durable record + reconcile
 
 The host is the durable owner of "a coherent snapshot exists in GCS";
 coord's PG row is a cache of that fact, not its origin.
 
-1. **Host-driven periodic coherent checkpoint.** On a timer (and at
-   suspend), the host runs the existing atomic `snapshot()` shape
-   (`pause → flush disk post-pause → capture memory → upload both
-   chunked → resume`) so the captured (memory, disk) pair is coherent
-   by construction. Cadence is coarse to start (minutes) because stock
-   FC requires a full pause + full memory capture per checkpoint;
-   chunked-memory content-dedup (ADR 0007/0021) already keeps the
-   *at-rest* cost incremental.
+1. **Host-driven periodic coherent checkpoint** per the mechanics
+   above, on an env-tunable cadence (start ~60 s; the pause cost makes
+   tighter cadences viable, measured before tightening). The same
+   capture path runs at suspend (eviction, drain, SIGTERM) as the final
+   chain entry.
 2. **Host persists a durable, self-describing record** of every
    completed checkpoint (sandbox_id, session_id, snapshot_id, disk +
-   memory manifest refs, blob keys, recoverable, captured-at) the
-   moment the upload finishes — surviving the RPC reply / coord being
-   lost (extend `sandbox.json` / a sibling `snapshot.json`, partially
-   done by the shutdown path).
+   memory manifest refs, blob keys, `events_cursor`, recoverable,
+   captured-at) the moment the upload finishes — a `snapshot.json`
+   sibling of `sandbox.json`, extending the partial shape the SIGTERM
+   path already writes — surviving the RPC reply / coord being lost.
 3. **Host re-advertises un-acked checkpoints** in heartbeat /
-   registration (`rehydrate_sandboxes` already carries a sandbox
-   inventory). Any coord reconciles them into PG via `record_snapshot`
-   (idempotent on `snapshot_id`), so a checkpoint that reached GCS
-   becomes a PG row regardless of which coord (if any) survived —
-   *before* any host-deletion can strand it. This also subsumes the
-   "coord died mid-eviction" window: the interrupted eviction's
-   snapshot is just an un-acked checkpoint the reconciler picks up.
+   registration (extending the existing `LocalSnapshotReport` /
+   `rehydrate_sandboxes` surfaces). Any coord reconciles them into PG
+   via `record_snapshot` (idempotent on `snapshot_id`), so a checkpoint
+   that reached GCS becomes a PG row regardless of which coord (if any)
+   survived — *before* any host-deletion can strand it. This subsumes
+   the "coord died mid-eviction" window (the interrupted eviction's
+   snapshot is just an un-acked checkpoint the reconciler picks up) and
+   makes the SIGTERM path durable for free.
+4. **Retention + GC.** Checkpoint manifests join the existing pin-set
+   GC (ADR 0016 Phase C): the **latest checkpoint per live session is
+   always pinned** (the rung-1 anchor); older checkpoints stay pinned
+   through an env-tunable retention window, then age out — only chunks
+   *not shared with a newer checkpoint* ever become GC candidates, so
+   the window's true cost is the divergence between checkpoints, not
+   full images.
 
 Net: every active session always has a recent, coherent, recorded
-checkpoint to rewind to — recovery rung 1 is reachable.
+checkpoint to rewind to — recovery rung 1 is reachable — and the
+checkpoint chain is cheap enough to run continuously.
 
-**Future cadence lever (ADR 0022).** Stock FC forces a full pause +
-full memory dump per checkpoint, capping cadence at minutes. ADR 0022's
-**Option B (`direct-mem`, memfd + `UFFDIO_CONTINUE`)** lists *online
-dirty-page tracking → faster Pause / smaller diff-checkpoints* — exactly
-what makes **frequent, near-zero-pause diff checkpoints** (seconds)
-practical. 0022 is Proposed/parked and its primary thrust (memory
-sharing/forking for density) is orthogonal; the relevance here is the
-shared dirty-tracking primitive. Not a dependency for the first cut.
+### Fork-readiness (deliberate shaping, not scope)
+
+Session forking is on the product horizon, and the checkpoint chain is
+its natural substrate: a **zero-disturbance fork** restores N children
+from the latest checkpoint without touching the parent (staleness ≤ one
+cadence interval), and a **fresh fork** takes an on-demand diff
+checkpoint first (~tens-of-ms pause, zero staleness). Three Fix A
+artifacts are therefore shaped fork-ready from day one, at near-zero
+extra cost:
+
+- the **rolling per-session `memory.bin`** doubles as the future
+  fork / File-backend-restore source (and, sooner, a same-host
+  idle-resume fast path that skips chunk re-materialization);
+- the **`events_cursor` watermark** on every checkpoint is also the
+  fork's transcript cut-point;
+- the **retention window** is also the forkable-history window, and a
+  fork pins its fork-point via the child's snapshot row with no new GC
+  machinery.
+
+Fork itself — session re-identity (agentd bind / `session_env`
+re-stamp, network identity, mid-run duplicate-side-effect semantics) —
+is explicitly out of scope here and gets its own ADR.
 
 ### Fix B — cold-boot disk recovery (ladder rung 2)
 
@@ -252,7 +349,7 @@ So coherence is a **triple**, not a pair: a checkpoint must capture
 1. **Watermark the checkpoint.** At pause, record the session's
    `session_events` high-water-mark (last event seq/id) alongside the
    memory + disk manifests. The checkpoint row gains an
-   `events_cursor`.
+   `events_cursor`. (Fork-ready: this is also the fork cut-point.)
 2. **Rewind the log on resume, don't destroy it.** On a rung-1 restore,
    events after `events_cursor` are **tombstoned** (a `rewound_at` /
    recovery-epoch marker), not hard-deleted — the full history stays
@@ -292,9 +389,9 @@ The recovery must be **honest and legible**, not silent:
   that it recovered from a checkpoint and that some prior actions may
   have completed externally — so it can re-check state (e.g. `git
   status`, "does my branch already exist?") rather than blindly redo.
-- Prefer rung-1 only when the rolled-back window is small; a tunable
-  checkpoint cadence (Fix A) bounds `Δ`, so the worst-case rewind the
-  user ever sees is one checkpoint interval.
+- Diff-first cadence bounds `Δ`: the worst-case rewind the user ever
+  sees is one checkpoint interval (~a minute), which also keeps the
+  rolled-back span — and the surviving-side-effect surface — small.
 
 ### Fix C — drain hosts before the MIG deletes them
 
@@ -305,31 +402,58 @@ Two layers, defense in depth:
   outgoing instance and wait for its sessions to reach a terminal
   evac state (or a timeout), so sessions relocate to a peer *while
   both hosts are alive* (the path ADR 0018 proved works in ~24s).
-- **Host-agent SIGTERM (this repo):** ensure the Phase-7 checkpoint
-  *records snapshots in coord/PG* (via Fix A's host-owned record +
-  reconcile), and lengthen the GCE shutdown grace to cover a realistic
-  snapshot+upload, so an *ungraceful* termination still leaves
-  recoverable, recorded state.
+- **Host-agent SIGTERM (this repo):** the Phase-7 checkpoint now rides
+  Fix A's capture + durable-record + re-advertise path, so an
+  *ungraceful* termination still leaves recoverable, **recorded**
+  state; the shutdown deadline only needs to cover a diff capture +
+  local staging (small), with the GCE grace period sized accordingly.
 
 Reliability-first ([reliability_and_latency_first]): the deploy must
 not be able to silently eat a live session. Draining-before-delete is
 the prevention; Fix A/B are the safety net when prevention is bypassed
 (crash, preemption, partition).
 
+## Relation to ADR 0022
+
+The original draft deferred cheap checkpoints to 0022 Option B
+(`direct-mem`: memfd + `UFFDIO_CONTINUE`, a maintained FC fork) for its
+online dirty-page tracking. Design review **rejects Option B for now**,
+from two directions at once:
+
+- **Diff snapshots take its dirty-tracking pitch.** Stock FC's KVM
+  dirty-log + Diff capture + our chunk store deliver O(dirty-set)
+  checkpoints without owning the security-sensitive VMM memory manager.
+- **Checkpoint-anchored snapshot-fork takes most of its fork pitch.**
+  With a continuous checkpoint chain, "fork session X" is a restore off
+  X's latest (or an on-demand) checkpoint — zero-disturbance at ≤ one
+  cadence staleness, or ~tens-of-ms parent pause at zero staleness.
+  Option B's residual exclusive is zero-pause *and* zero-staleness
+  simultaneously — revisit only if that becomes a hard product
+  requirement.
+
+0022's **Option A** (File-backend `MAP_PRIVATE` density) is untouched
+by this and proceeds as the follow-on arc; it consumes the artifacts
+Fix A builds (rolling memfiles, manifest chains, memfile-granularity
+pinning). The Phase 1 spike below measures both ADRs' load-bearing
+assumptions in one harness.
+
 ## Consequences
 
 - Active/idle sessions survive coord rolls and FC-host MIG rolls with a
   **warm** recovery to a recent coherent checkpoint (rung 1) — bounded
-  work-loss, agent context preserved — falling back to cold-boot
-  (rung 2) only when no checkpoint is usable. The ADR 0018 promise
-  ("a host dies, the session keeps working") extends to the
-  deploy-roll + interrupted-eviction case, and *keeps memory* in the
-  common case.
-- Periodic checkpointing adds a brief recurring guest **pause** per
-  sandbox (full-memory capture on stock FC). Cadence is a tunable
-  trade (coarse minutes to start); the dirty-page-tracking path
-  (ADR 0022 Option B) is the lever to tighten it without the pause
-  cost. Measure pause overhead before tightening.
+  work-loss (≤ one cadence interval), agent context preserved — falling
+  back to cold-boot (rung 2) only when no checkpoint is usable. The
+  ADR 0018 promise ("a host dies, the session keeps working") extends
+  to the deploy-roll + interrupted-eviction case, and *keeps memory* in
+  the common case.
+- Periodic checkpointing adds a recurring guest **pause** per sandbox of
+  O(dirty set) — expected ~100 ms at minute cadence, not the original
+  full-dump minutes — plus a steady-state KVM dirty-tracking overhead
+  while the VM runs. Both are measured in the spike before the cadence
+  is fixed; cadence stays env-tunable.
+- Eviction itself gets fast (final-diff + destroy), collapsing the
+  `Evicting` 409 window from ~2 min to seconds — a user-visible latency
+  win that falls out of the durability work.
 - New host→coord surface (checkpoint inventory in heartbeat) + a
   reconciler tick; both idempotent, both single-coord-pod safe by the
   same lease/CAS patterns as the existing evac scanners.
@@ -341,28 +465,52 @@ the prevention; Fix A/B are the safety net when prevention is bypassed
   platform surfaces them but cannot undo them — a deliberate
   at-least-once posture for agent actions, made legible rather than
   hidden.
+- Guests need steady-state clock discipline (periodic PTP re-step in
+  agentd) — a session-image re-bake + enable to roll out.
+- Storage: checkpoint chains are dedup-incremental at rest; the
+  retention window is a storage-cost knob (and, later, the forkable
+  history), with GC riding the existing pin-set machinery.
 - Cross-repo coordination for Fix C (this repo + `engrams-internal`),
-  so Fix C ships behind the deploy change; Fixes A + B are
+  so Fix C ships behind the deploy change; everything else is
   independently shippable here.
-- New prod validation matrix (mirroring ADR 0018's): coord roll during
-  eviction; FC-host MIG roll of an idle session recovering to rung 1
-  (warm, memory intact, disk rewound to checkpoint); rung-2 cold-boot
-  fidelity (on-disk md5 identical, memory-loss expected); checkpoint
-  pause-overhead measurement.
 
-## Status / commit chain
+## Status / phase chain
 
-To be filled as commits land (per the ADR-bookend norm):
+To be checked off as phases land (per the ADR-bookend norm); spike and
+prod-validation numbers recorded here as they arrive:
 
-- [ ] **A** — host-driven periodic coherent checkpoint + host-owned
-      durable record + heartbeat re-advertise + coord reconciler
-      (subsumes interrupted-eviction recovery).
-- [ ] **A.log** — `events_cursor` on the checkpoint; rung-1 rewind
-      tombstones post-cursor `session_events` (recovery epoch) + resets
-      the live head; transcript/SSE rewind boundary + surviving-side-
-      effect surfacing; resumed agent is told it recovered.
+- [ ] **P0** — this revision (Proposed, diff-first design).
+- [ ] **P1 (spike, dev-vm)** — diff snapshots on our FC version
+      (enable after UFFD- and File-mode restores; bitmap chaining;
+      dirty-tracking overhead; pause vs dirty-set size), File-backend
+      shared-RSS + restore latency (the 0022 go/no-go), memory
+      chunk-size / amplification choice. **Numbers: TBD.**
 - [ ] **B** — `restore_disk_only_for_session` cold-boot primitive +
       `evacuate_dead_source` rung-2 dispatch + fail-fast classification
-      in `evac_resumer`.
-- [ ] **C** — drain-before-roll in `engrams-internal` deploy tooling +
-      host SIGTERM checkpoint records-to-PG + grace-period bump.
+      in `evac_resumer`. CI: disk-only recovery e2e (the `cf4d4afd`
+      shape), fail-fast budget tests.
+- [ ] **A** — FC diff plumbing; host periodic checkpoint task + rolling
+      `memory.bin` + durable `snapshot.json` record + heartbeat
+      re-advertise; coord reconciler; migration(s) incl.
+      `snapshots.events_cursor`; GC retention pinning; agentd periodic
+      clock re-step; eviction = final-diff. CI: checkpoint correctness
+      + chained-diff restores, reconciler idempotency, coord-SIGKILL
+      mid-eviction e2e, clock tolerance, GC retention.
+- [ ] **A.log** — rung-1 rewind tombstones post-cursor `session_events`
+      (recovery epoch) + resets the live head; transcript/SSE rewind
+      boundary + surviving-side-effect surfacing; resumed agent is told
+      it recovered. CI: rewind + epoch-consistent SSE + live-PG
+      round-trips.
+- [ ] **Rung-1 wiring** — evac prefers latest coherent checkpoint;
+      rung-aware disk pick (checkpoint's own version, never newer
+      live); ladder fall-through. CI: two-host host-kill e2e (memory
+      intact, disk rewound, transcript rewound), corrupted-checkpoint
+      fall-through, coherence guard.
+- [ ] **C** — SIGTERM path rides Fix A record/re-advertise + deadline
+      sizing (this repo); drain-before-roll in `engrams-internal`
+      deploy tooling + GCE grace bump.
+- [ ] **Bookend** — flip to Accepted with the commit chain + prod
+      validation matrix results (coord roll during eviction; MIG roll →
+      rung-1 with memory intact + disk rewound; rung-2 fidelity;
+      pause/dirty-tracking overhead; `Evicting` 409 window in seconds);
+      hand off measured context to ADR 0022.
