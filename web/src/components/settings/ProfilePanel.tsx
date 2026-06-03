@@ -1,112 +1,80 @@
-// ADR 0031 redesign: signed-in identity, role & provenance, access legend.
-// Square person mark (fixes the shipped border-radius:0.4rem avatar),
-// RoleTag + Provenance in the definition list, and an access legend that
-// makes the role model legible at a glance.
-
+import type { ReactNode } from 'react';
 import { Link } from '@tanstack/react-router';
+import { Check, X } from 'lucide-react';
 import { useAuth } from '../../auth/AuthProvider';
-import { PersonMark, RoleTag, Provenance } from '../Identity';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
 export function ProfilePanel() {
   const { principal } = useAuth();
+  const label = principal.display_name || principal.email;
+  const isAdmin = principal.role === 'admin';
+  const can = isAdmin
+    ? ['Launch & manage your own sessions', 'Oversee every session across the fleet',
+       'Inspect host capacity & drain hosts', 'Read storage durability & snapshots',
+       'Curate images & registry credentials', 'Manage members & their roles']
+    : ['Launch & manage your own sessions', 'Save your own Claude Code token'];
+  const cannot = isAdmin ? [] : ['The fleet, storage & deployment settings — admin only'];
 
   return (
-    <section>
-      <header className="mb-6 flex items-baseline justify-between">
-        <h2 className="section-label">Profile</h2>
-        <p className="font-display italic text-[0.8rem]" style={{ color: 'var(--color-ink-quiet)' }}>
-          signed in
-        </p>
-      </header>
+    <div className="max-w-2xl space-y-6">
+      <h1 className="text-2xl font-semibold tracking-tight">Profile</h1>
 
-      {/* Square person mark + name + email — the bug fix: no border-radius */}
-      <div className="profile-head">
-        <PersonMark name={principal.display_name} email={principal.email} size="md" />
-        <div>
-          <div className="font-display" style={{ fontSize: '1.2rem', color: 'var(--color-ink)' }}>
-            {principal.display_name || principal.email}
+      <Card>
+        <CardHeader className="flex flex-row items-center gap-3 space-y-0">
+          <Avatar className="size-12 rounded-md"><AvatarFallback className="rounded-md text-lg">
+            {label.charAt(0).toUpperCase()}
+          </AvatarFallback></Avatar>
+          <div>
+            <CardTitle>{label}</CardTitle>
+            <p className="font-mono text-sm text-muted-foreground">{principal.email}</p>
           </div>
-          <div className="font-mono text-[0.82rem]" style={{ color: 'var(--color-ink-quiet)' }}>
-            {principal.email}
-          </div>
-        </div>
-      </div>
-
-      <dl style={{ maxWidth: '40rem' }}>
-        <div className="profile-row">
-          <dt>role</dt>
-          <dd className="flex items-baseline gap-3" style={{ flexWrap: 'wrap' }}>
-            <RoleTag role={principal.role} />
-            {principal.role_source && <Provenance source={principal.role_source} />}
-          </dd>
-        </div>
-        <div className="profile-row">
-          <dt>tokens</dt>
-          <dd>
-            {principal.has_claude_token ? (
-              <span>
-                Claude Code saved{' '}
-                <span style={{ color: 'var(--color-ink-quiet)' }}>
-                  · managed under{' '}
-                  <Link to="/settings/tokens" style={{ color: 'var(--color-ink-quiet)' }}>
-                    Tokens
-                  </Link>
-                </span>
-              </span>
-            ) : (
-              <Link
-                to="/settings/tokens"
-                className="font-display italic"
-                style={{ color: 'var(--color-amber)' }}
-              >
-                none saved — add one under Tokens →
-              </Link>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Row label="Role">
+            <Badge variant={isAdmin ? 'default' : 'secondary'}>{principal.role}</Badge>
+            {principal.role_source && (
+              <span className="text-sm text-muted-foreground">· set by {principal.role_source}</span>
             )}
-          </dd>
-        </div>
-      </dl>
+          </Row>
+          <Row label="Tokens">
+            {principal.has_claude_token ? (
+              <span className="text-sm">Claude Code saved · managed under{' '}
+                <Link to="/settings/tokens" className="underline">Tokens</Link></span>
+            ) : (
+              <Link to="/settings/tokens" className="text-sm underline">None saved — add one under Tokens →</Link>
+            )}
+          </Row>
+        </CardContent>
+      </Card>
 
-      <AccessLegend role={principal.role} />
-    </section>
+      <Card>
+        <CardHeader><CardTitle className="text-sm">What your role can do</CardTitle></CardHeader>
+        <CardContent>
+          <ul className="space-y-1.5 text-sm">
+            {can.map((c) => (
+              <li key={c} className="flex items-center gap-2">
+                <Check className="size-4 text-primary" /> {c}
+              </li>
+            ))}
+            {cannot.map((c) => (
+              <li key={c} className="flex items-center gap-2 text-muted-foreground">
+                <X className="size-4" /> {c}
+              </li>
+            ))}
+          </ul>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 
-function AccessLegend({ role }: { role: string }) {
-  const isAdmin = role === 'admin';
-  const can = isAdmin
-    ? [
-        'launch & manage your own sessions',
-        'oversee every session across the fleet',
-        'inspect host capacity & drain hosts',
-        'read storage durability & snapshots',
-        'curate images & registry credentials',
-        'manage members & their roles',
-      ]
-    : [
-        'launch & manage your own sessions',
-        'save your own Claude Code token',
-      ];
-  const cannot = isAdmin
-    ? []
-    : ['the fleet, storage & deployment settings — admin only'];
-
+function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="access-legend">
-      <span className="section-label">what your role can do</span>
-      <ul className="access-list">
-        {can.map((c) => (
-          <li key={c}>
-            <span className="glyph" style={{ color: 'var(--accent-archived)' }}>✓</span>
-            {c}
-          </li>
-        ))}
-        {cannot.map((c) => (
-          <li key={c} className="denied">
-            <span className="glyph">✕</span>
-            {c}
-          </li>
-        ))}
-      </ul>
+    <div className="grid grid-cols-[8rem_1fr] items-baseline gap-2">
+      <span className="text-xs uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className="flex flex-wrap items-baseline gap-2">{children}</span>
     </div>
   );
 }
