@@ -1,15 +1,13 @@
 // ADR 0031 auth context. Owns the `GET /me` query and gates the app behind a
 // resolved principal. A 401 is handled in the api client (hard redirect to
-// /auth/login), so it never reaches here; this provider only renders a boot
-// state while `/me` is in flight and an inline error for non-401 failures
-// (e.g. the coordinator is down — redirecting would loop).
-//
-// In dev (synthetic admin) `/me` always resolves to a local admin, so there is
-// no login wall locally — the boot screen flashes and the app renders.
+// /auth/login), so it never reaches here; this provider renders:
+//   - boot screen while `/me` is in flight
+//   - "not a member" screen for a 403 (authenticated but not provisioned)
+//   - error screen for non-401/403 failures (coordinator down, etc.)
 
 import { useQuery } from '@tanstack/react-query';
 import { createContext, useContext, type ReactNode } from 'react';
-import { fetchMe } from '../api';
+import { fetchMe, logout, NotMemberError } from '../api';
 import type { Principal } from '../types';
 import { EngramMark } from '../components/EngramMark';
 
@@ -50,8 +48,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return <BootScreen />;
   }
 
+  if (error instanceof NotMemberError) {
+    return <NotMemberScreen email={error.email} />;
+  }
+
   if (error || !principal) {
-    return <AuthErrorScreen message={error?.message} onRetry={() => void refetch()} />;
+    return (
+      <AuthErrorScreen
+        message={error?.message}
+        onRetry={() => void refetch()}
+      />
+    );
   }
 
   const value: AuthState = {
@@ -74,65 +81,76 @@ export function useIsAdmin(): boolean {
   return useAuth().isAdmin;
 }
 
+// ---- Auth state screens --------------------------------------------------
+// Full-viewport, centered on --bg, 32rem card, engram mark, lowercase em-dash voice.
+
 function BootScreen() {
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        display: 'grid',
-        placeItems: 'center',
-        background: 'var(--color-paper)',
-      }}
-    >
-      <div style={{ textAlign: 'center' }}>
-        <EngramMark mode="loop" size={72} />
-        <div
-          style={{
-            marginTop: '1rem',
-            fontStyle: 'italic',
-            color: 'var(--color-ink-quiet)',
-          }}
-        >
-          authenticating…
+    <div className="auth-stage">
+      <div className="auth-card">
+        <span className="auth-mark">
+          <EngramMark size={72} mode="loop" />
+        </span>
+        <div className="auth-line">authenticating…</div>
+      </div>
+    </div>
+  );
+}
+
+function AuthErrorScreen({
+  message,
+  onRetry,
+}: {
+  message?: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="auth-stage">
+      <div className="auth-card">
+        <span className="auth-mark">
+          <EngramMark size={72} mode="static" />
+        </span>
+        <div className="auth-strong">
+          could not reach the coordinator —<br />retrying…
+        </div>
+        {message && <div className="auth-detail">{message}</div>}
+        <div className="auth-actions">
+          <button
+            type="button"
+            className="members-act"
+            onClick={onRetry}
+          >
+            retry now
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
-function AuthErrorScreen({ message, onRetry }: { message?: string; onRetry: () => void }) {
+function NotMemberScreen({ email }: { email: string }) {
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        display: 'grid',
-        placeItems: 'center',
-        background: 'var(--color-paper)',
-      }}
-    >
-      <div style={{ textAlign: 'center', maxWidth: '28rem' }}>
-        <EngramMark mode="static" size={72} />
-        <div style={{ marginTop: '1rem', color: 'var(--color-ink)' }}>
-          Couldn’t reach the coordinator.
+    <div className="auth-stage">
+      <div className="auth-card">
+        <span className="auth-mark">
+          <EngramMark size={72} mode="static" />
+        </span>
+        <div className="auth-strong">
+          you're signed in — but not yet<br />a member of this deployment.
         </div>
-        {message ? (
-          <div
-            style={{
-              marginTop: '0.5rem',
-              fontSize: '0.85rem',
-              color: 'var(--color-ink-quiet)',
-            }}
+        {email && <div className="auth-detail">{email}</div>}
+        <div className="auth-line">
+          ask an admin to add you, then reload.
+        </div>
+        <div className="auth-actions">
+          <button
+            type="button"
+            className="members-act act-quiet"
+            onClick={() => void logout()}
           >
-            {message}
-          </div>
-        ) : null}
-        <button
-          type="button"
-          onClick={onRetry}
-          style={{ marginTop: '1rem', cursor: 'pointer' }}
-        >
-          retry
-        </button>
+            sign out
+          </button>
+        </div>
       </div>
     </div>
   );

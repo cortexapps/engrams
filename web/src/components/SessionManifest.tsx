@@ -2,19 +2,19 @@ import { motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import { StatusGlyph } from './Glyph';
 import { EngramMark } from './EngramMark';
-import type { Session, SessionState } from '../types';
+import { OwnerCell } from './Identity';
+import type { SessionListItem, SessionState } from '../types';
 
 // A single session manifest row: status glyph · short id · image ·
-// status · age, laid out on the `.session-row` grid (which the
-// responsive rules collapse to two lines on phones). Shared by the
-// grouped manifest on the Sessions surface.
+// status · (owner) · age, laid out on the `.session-row` grid.
+//
+// ADR 0031: the grid bug fix — adding a 6th child (owner) to a 5-column grid
+// caused the age cell to wrap onto a second line. The `has-owner` class switches
+// in an explicit 17rem owner track between status and age.
 //
 // While a session is transitioning toward Active (created / pending /
-// guest_ready, and the brief states a resume passes through) the
-// status glyph is replaced by the inline trace loader — the same
-// growing-bolt motion as the masthead mark, scaled down to glyph size.
+// guest_ready) the status glyph is replaced by the inline trace loader.
 
-// States that read as "booting / resuming" — show the inline loader.
 const BOOTING: ReadonlySet<SessionState> = new Set([
   'created',
   'pending',
@@ -23,16 +23,13 @@ const BOOTING: ReadonlySet<SessionState> = new Set([
 
 export function SessionRow({
   session,
-  owner,
+  showOwner = false,
 }: {
-  session: Session;
-  /** ADR 0031: owner email, shown only in the admin "all sessions" view. */
-  owner?: string | null;
+  session: SessionListItem;
+  /** ADR 0031: show the owner chip per row (admin "all sessions" view). */
+  showOwner?: boolean;
 }) {
   const since = relativeTime(session.last_active_at);
-  // ADR 0005: there's no workspace-level repo/branch on a session
-  // anymore — the bake image is the whole story. Strip the registry
-  // host + tag for visual density.
   const imageLabel = stripImageHost(session.image);
   const booting = BOOTING.has(session.status);
 
@@ -44,7 +41,10 @@ export function SessionRow({
       exit={{ opacity: 0, y: -2 }}
       transition={{ duration: 0.35 }}
     >
-      <Link to={`/sessions/${session.id}`} className="session-row">
+      <Link
+        to={`/sessions/${session.id}`}
+        className={`session-row${showOwner ? ' has-owner' : ''}`}
+      >
         {booting ? (
           <span className="row-loader" aria-label={session.status}>
             <EngramMark
@@ -75,18 +75,16 @@ export function SessionRow({
         >
           {session.status}
         </span>
-        {owner && (
-          <span
-            className="font-mono text-[0.72rem]"
-            style={{ color: 'var(--color-ink-quiet)' }}
-            title={`owner: ${owner}`}
-          >
-            {owner}
-          </span>
+        {showOwner && (
+          <OwnerCell
+            ownerKind={session.owner_kind}
+            ownerName={session.owner_name}
+            ownerEmail={session.owner_email}
+          />
         )}
         <span
           className="font-mono text-[0.78rem]"
-          style={{ color: 'var(--color-ink-quiet)', minWidth: '6ch' }}
+          style={{ color: 'var(--color-ink-quiet)', minWidth: '6ch', textAlign: 'right' }}
           data-tabular
         >
           {since}
@@ -96,9 +94,7 @@ export function SessionRow({
   );
 }
 
-/** Drop the leading `<host>/` and trailing `:<tag>` from an OCI URI,
- * leaving the repo segment ("ghcr.io/cortex/api:warm-1" → "cortex/api").
- * Falls back to the input verbatim if either delimiter is missing. */
+/** Drop the leading `<host>/` and trailing `:<tag>` from an OCI URI. */
 export function stripImageHost(uri: string): string {
   const slash = uri.indexOf('/');
   const colon = uri.lastIndexOf(':');

@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useHosts } from '../hooks/useHosts';
 import { useSessions } from '../hooks/useSessions';
-import { useIsAdmin } from '../auth/AuthProvider';
+import { useAuth, useIsAdmin } from '../auth/AuthProvider';
 import { VitalStrip } from '../components/VitalStrip';
 import { ManifestGroup } from '../components/ManifestGroup';
 import { NewSessionForm } from '../components/NewSessionForm';
@@ -13,7 +13,8 @@ import type { Session, SessionListItem } from '../types';
 // "+ new session" affordance, and the session manifest grouped by
 // lifecycle: ACTIVE (pinned top) → IDLE — RESUMABLE → ARCHIVED.
 //
-// ADR 0031: owner-scoped. Members see only their own sessions (no scope UI).
+// ADR 0031: owner-scoped. Members see only their own sessions (no scope UI)
+// and see a token nudge if they have no Claude token saved.
 // Admins default to "My sessions" and can switch to "All sessions" (the
 // fleet-wide oversight view, with an owner chip per row).
 
@@ -31,9 +32,8 @@ const byRecent = (a: Session, b: Session) =>
 
 export function Sessions() {
   const isAdmin = useIsAdmin();
+  const { principal } = useAuth();
   const [scope, setScope] = useState<'mine' | 'all'>('mine');
-  // Members are always implicitly "mine" (the server scopes them anyway);
-  // only admins get to request "all".
   const effectiveScope = isAdmin ? scope : 'mine';
 
   const { data: hosts } = useHosts();
@@ -46,6 +46,8 @@ export function Sessions() {
   const active = all.filter((s) => ACTIVEISH.has(s.status)).sort(byRecent);
   const idle = all.filter((s) => s.status === 'idle').sort(byRecent);
   const archived = all.filter((s) => ARCHIVED.has(s.status)).sort(byRecent);
+
+  const showTokenNudge = !isAdmin && !principal.has_claude_token;
 
   return (
     <main className="book-wide surface">
@@ -97,6 +99,22 @@ export function Sessions() {
         </div>
       )}
 
+      {/* Member token nudge — shown when no Claude token is saved */}
+      {showTokenNudge && (
+        <div className="token-nudge">
+          <span className="nudge-text">
+            no Claude Code token saved yet — built-in Claude sessions need one.
+          </span>
+          <button
+            type="button"
+            className="nudge-act"
+            onClick={() => navigate('/settings/tokens')}
+          >
+            add token →
+          </button>
+        </div>
+      )}
+
       <VitalStrip hosts={hosts} sessions={sessions} />
 
       <AnimatePresence>
@@ -120,7 +138,7 @@ export function Sessions() {
         <p className="font-display italic" style={{ color: 'var(--color-ink-quiet)' }}>
           {showOwner
             ? 'no active sessions across the fleet.'
-            : 'no sessions yet — start one with “+ new session”.'}
+            : 'no sessions yet — start one with "+ new session".'}
         </p>
       )}
     </main>

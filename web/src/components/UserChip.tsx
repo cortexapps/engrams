@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { logout } from '../api';
 import { useAuth } from '../auth/AuthProvider';
+import { RoleTag } from './Identity';
 
 // The profile menu (ADR 0031). The chip shows the signed-in user's initial
 // embossed like a typesetter's mark (not a gradient SaaS avatar); click
@@ -90,11 +91,14 @@ export function UserChip({ inline = false }: { inline?: boolean }) {
             }}
           >
             <div className="px-4 pt-3 pb-3">
-              <div
-                className="font-display text-[0.95rem]"
-                style={{ color: 'var(--color-ink)' }}
-              >
-                {principal.display_name || principal.email}
+              <div className="flex items-center gap-2">
+                <span
+                  className="font-display text-[0.95rem]"
+                  style={{ color: 'var(--color-ink)' }}
+                >
+                  {principal.display_name || principal.email}
+                </span>
+                <RoleTag role={principal.role} />
               </div>
               <div
                 className="font-mono text-[0.76rem] mt-1"

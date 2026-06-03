@@ -97,10 +97,46 @@ async function deleteEmpty(path: string): Promise<void> {
 
 // ---- ADR 0031: identity ------------------------------------------------
 
-export const fetchMe = () => getJSON<Principal>('/me');
+/** Thrown by fetchMe when the user is authenticated but not yet a member
+ * of this deployment (coordinator returns 403). The UI shows the
+ * "not a member" auth screen with the signed-in email + a sign-out link. */
+export class NotMemberError extends Error {
+  readonly email: string;
+  constructor(email: string) {
+    super('not a member');
+    this.name = 'NotMemberError';
+    this.email = email;
+  }
+}
+
+export const fetchMe = async (): Promise<Principal> => {
+  const res = await fetch(`${API_BASE}/me`, {
+    headers: { Accept: 'application/json' },
+    credentials: 'include',
+  });
+  if (res.status === 401) redirectToLogin();
+  if (res.status === 403) {
+    let email = '';
+    try {
+      const body = (await res.json()) as { email?: string };
+      email = body.email ?? '';
+    } catch {
+      // ignore — email may not be in the body
+    }
+    throw new NotMemberError(email);
+  }
+  if (!res.ok) throw new Error(`/me → ${res.status} ${res.statusText}`);
+  return res.json() as Promise<Principal>;
+};
 
 export const saveClaudeToken = (token: string) =>
   postJSON<void>('/me/claude-token', { token });
+
+export const saveGithubToken = (token: string) =>
+  postJSON<void>('/me/github-token', { token });
+
+export const deleteToken = (service: 'claude' | 'github') =>
+  deleteEmpty(`/me/${service}-token`);
 
 /** Revoke the session cookie, then hard-navigate home (which 401s → login). */
 export const logout = async (): Promise<void> => {

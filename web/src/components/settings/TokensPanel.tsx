@@ -1,108 +1,215 @@
-// ADR 0031 user setting: "My Claude Code OAuth token". Saved once, sealed
-// server-side under the deployment KEK, and auto-injected into every built-in
-// Claude session — so we never prompt per session. The token is write-only:
-// the API never returns it, we only know whether one is saved
-// (`principal.has_claude_token`). This is also the screen the create-session
-// flow routes to when a built-in-Claude image is selected with no token saved.
+// ADR 0031 redesign: a per-service token ledger (not a single-service form).
+// Each row: service name + italic "what it's for" left; status + actions right.
+// Saved rows → replace / remove. Unsaved → "add →" reveals an inline password
+// field + hint + save / cancel. Tokens are sealed on save and never shown again.
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
-import { saveClaudeToken } from '../../api';
+import { saveClaudeToken, saveGithubToken, deleteToken } from '../../api';
 import { useAuth } from '../../auth/AuthProvider';
-import { Field, FormError, PressButton, SubHead } from './_form';
+
+interface Service {
+  id: 'claude' | 'github';
+  name: string;
+  use: string;
+  hint: string;
+  placeholder: string;
+}
+
+const SERVICES: Service[] = [
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    use: 'built-in Claude sessions authenticate with this',
+    hint: 'from `claude setup-token` — stored encrypted, never shown again',
+    placeholder: 'sk-ant-oat…',
+  },
+  {
+    id: 'github',
+    name: 'GitHub',
+    use: 'clone private repositories into a session',
+    hint: 'a fine-grained PAT with repo scope',
+    placeholder: 'github_pat_…',
+  },
+];
 
 export function TokensPanel() {
   const { principal, refresh } = useAuth();
   const queryClient = useQueryClient();
-  const [token, setToken] = useState('');
 
-  const save = useMutation({
-    mutationFn: (t: string) => saveClaudeToken(t),
-    onSuccess: () => {
-      setToken('');
-      // Flip has_claude_token → unblocks the create-session button.
-      void queryClient.invalidateQueries({ queryKey: ['me'] });
-      refresh();
+  // Which service row is in the editing state.
+  const [editing, setEditing] = useState<'claude' | 'github' | null>(null);
+
+  // Local "github saved" state (server doesn't surface it on /me yet).
+  const [githubSaved, setGithubSaved] = useState(false);
+
+  const savedState: Record<string, boolean> = {
+    claude: principal.has_claude_token,
+    github: githubSaved,
+  };
+
+  const saveMutation = useMutation({
+    mutationFn: async ({ id, token }: { id: 'claude' | 'github'; token: string }) => {
+      if (id === 'claude') {
+        await saveClaudeToken(token);
+      } else {
+        await saveGithubToken(token);
+      }
+      return id;
+    },
+    onSuccess: (id) => {
+      setEditing(null);
+      if (id === 'claude') {
+        void queryClient.invalidateQueries({ queryKey: ['me'] });
+        refresh();
+      } else {
+        setGithubSaved(true);
+      }
     },
   });
 
-  const trimmed = token.trim();
+  const deleteMutation = useMutation({
+    mutationFn: (id: 'claude' | 'github') => deleteToken(id),
+    onSuccess: (_, id) => {
+      if (id === 'claude') {
+        void queryClient.invalidateQueries({ queryKey: ['me'] });
+        refresh();
+      } else {
+        setGithubSaved(false);
+      }
+    },
+  });
 
   return (
-    <section>
+    <section style={{ maxWidth: '46rem' }}>
       <header className="mb-6 flex items-baseline justify-between">
-        <h2
-          className="font-mono smallcaps text-[0.7rem]"
-          style={{ color: 'var(--color-ink-quiet)', letterSpacing: '0.18em' }}
-        >
-          Claude Code token
-        </h2>
-        <p
-          className="font-display italic text-[0.8rem]"
-          style={{ color: 'var(--color-ink-quiet)' }}
-        >
-          saved once · sealed · auto-used for every session
+        <h2 className="section-label">Tokens</h2>
+        <p className="font-display italic text-[0.8rem]" style={{ color: 'var(--color-ink-quiet)' }}>
+          sealed · auto-used per session
         </p>
       </header>
 
-      <p
-        className="font-display italic text-[0.92rem] mb-6"
-        style={{ color: 'var(--color-ink-faded)', maxWidth: '40rem' }}
-      >
-        {principal.has_claude_token
-          ? 'A token is saved. Built-in Claude sessions use it automatically — you’ll never be prompted. Paste a new one below to replace it.'
-          : 'Save your Claude Code OAuth token to launch built-in Claude sessions. It’s sealed under the deployment key and used automatically — you’re never prompted per session.'}
-      </p>
-
-      <form
-        className="space-y-5"
-        style={{ maxWidth: '40rem' }}
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (trimmed) save.mutate(trimmed);
-        }}
-      >
-        <Field
-          label="OAuth token"
-          hint="From `claude setup-token`. Stored encrypted; never shown again."
-        >
-          <input
-            type="password"
-            value={token}
-            autoComplete="off"
-            spellCheck={false}
-            placeholder={principal.has_claude_token ? '•••••••• (saved)' : 'sk-ant-oat…'}
-            onChange={(e) => setToken(e.target.value)}
-            className="font-mono text-[0.85rem] bg-transparent outline-none"
-            style={{
-              borderBottom: '1px solid var(--color-rule)',
-              color: 'var(--color-ink)',
-              padding: '0.15rem 0',
-            }}
+      <div className="tokens-ledger">
+        {SERVICES.map((svc) => (
+          <ServiceRow
+            key={svc.id}
+            svc={svc}
+            isSaved={savedState[svc.id] ?? false}
+            isEditing={editing === svc.id}
+            isMutating={saveMutation.isPending || deleteMutation.isPending}
+            onEdit={() => setEditing(svc.id)}
+            onCancel={() => setEditing(null)}
+            onSave={(token) => saveMutation.mutate({ id: svc.id, token })}
+            onRemove={() => deleteMutation.mutate(svc.id)}
           />
-        </Field>
+        ))}
+      </div>
 
-        <div className="flex items-center gap-6">
-          <PressButton
-            type="submit"
-            tone="primary"
-            disabled={!trimmed || save.isPending}
-          >
-            {save.isPending
-              ? 'sealing & saving…'
-              : principal.has_claude_token
-              ? 'replace token'
-              : 'save token'}
-          </PressButton>
-          {save.isSuccess && (
-            <SubHead>saved · sessions will use it</SubHead>
-          )}
-        </div>
-
-        {save.isError && (
-          <FormError message={`could not save — ${(save.error as Error).message}`} />
-        )}
-      </form>
+      <p className="ledger-note">
+        every token is sealed under the deployment key the moment you save it —
+        the plaintext never touches Postgres, and it's used automatically so
+        you're never prompted per session. new services land here as their own row.
+      </p>
     </section>
+  );
+}
+
+function ServiceRow({
+  svc,
+  isSaved,
+  isEditing,
+  isMutating,
+  onEdit,
+  onCancel,
+  onSave,
+  onRemove,
+}: {
+  svc: Service;
+  isSaved: boolean;
+  isEditing: boolean;
+  isMutating: boolean;
+  onEdit: () => void;
+  onCancel: () => void;
+  onSave: (token: string) => void;
+  onRemove: () => void;
+}) {
+  const [token, setToken] = useState('');
+  const trimmed = token.trim();
+
+  const handleSave = () => {
+    if (trimmed) {
+      onSave(trimmed);
+      setToken('');
+    }
+  };
+  const handleCancel = () => {
+    setToken('');
+    onCancel();
+  };
+
+  return (
+    <div className="token-row">
+      <div className="token-svc">
+        <span className="token-name">{svc.name}</span>
+        <span className="token-use">{svc.use}</span>
+        {isEditing && (
+          <div className="token-edit">
+            <input
+              type="password"
+              className="ledger-input font-mono"
+              autoFocus
+              placeholder={svc.placeholder}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSave();
+                if (e.key === 'Escape') handleCancel();
+              }}
+              style={{ fontSize: '0.85rem' }}
+            />
+            <span className="token-hint">{svc.hint}</span>
+            <div className="token-edit-actions">
+              <button
+                type="button"
+                className="members-act"
+                disabled={!trimmed || isMutating}
+                onClick={handleSave}
+                style={{ opacity: !trimmed || isMutating ? 0.4 : 1 }}
+              >
+                save
+              </button>
+              <button
+                type="button"
+                className="members-act act-quiet"
+                onClick={handleCancel}
+              >
+                cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <span className={`token-status${isSaved ? ' is-saved' : ''}`}>
+        {isSaved ? 'saved · sealed' : 'not connected'}
+      </span>
+
+      <div className="token-row-actions">
+        {isSaved ? (
+          <>
+            <button type="button" className="members-act" onClick={onEdit}>
+              replace
+            </button>
+            <button type="button" className="members-act act-quiet" onClick={onRemove}>
+              remove
+            </button>
+          </>
+        ) : (
+          <button type="button" className="members-act act-primary" onClick={onEdit}>
+            add →
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
