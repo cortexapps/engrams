@@ -254,12 +254,39 @@ nix develop      # drops you into a shell with everything pinned
 
 If you use [direnv](https://direnv.net), `direnv allow` once and the shell auto-activates whenever you `cd` in. Don't have Nix? The [Determinate Systems installer](https://install.determinate.systems) is one line and uninstalls cleanly.
 
-**Without Nix** — install Rust >= 1.80, Docker, and `just` ([install](https://github.com/casey/just)) yourself.
+With Nix you get the **full** toolchain — including the macOS-only bake
+dependencies (`e2fsprogs` for `mke2fs`, the `aarch64`/`x86_64` musl cross
+compilers for the in-guest binaries). Nothing else to install.
 
-Either way, run the dev stack:
+**Without Nix (macOS)** — on Apple Silicon `just dev` runs the
+Virtualization.framework (VZ) backend (ADR 0024 auto-detects it), and
+`just bake-demo` cross-compiles the in-guest musl binaries and builds an ext4
+rootfs. You need the full set:
 
 ```bash
-just dev          # postgres + coordinator with the subprocess backend
+# Rust toolchain (matches rust-toolchain.toml) + the guest musl target:
+#   https://rustup.rs   then:  rustup target add aarch64-unknown-linux-musl
+brew install just                                   # task runner
+brew install tilt-dev/tap/tilt                      # `just dev` orchestrator
+brew install jq                                     # smoke-test helpers
+brew install protobuf pkg-config openssl            # build deps (tonic / openssl-sys)
+brew install node pnpm                              # web SPA (skip with ENGRAM_SKIP_WEB=1)
+brew install e2fsprogs                              # mke2fs — ext4 rootfs bake
+brew install FiloSottile/musl-cross/musl-cross --with-aarch64   # aarch64-linux-musl-gcc
+# Docker Desktop (or colima): the registry/postgres/jaeger/fake-gcs containers
+# and the image-bake buildx step. Xcode Command Line Tools for `codesign`.
+```
+
+**Without Nix (Linux + KVM)** — Rust (per `rust-toolchain.toml`), Docker, `just`,
+`tilt`, `jq`. The Firecracker backend + kernel are covered under
+[Running on real Firecracker](#running-on-real-firecracker).
+
+Either way, fetch the kernel once and run the dev stack:
+
+```bash
+just pull-kernel  # backend-specific guest kernel → ~/.cache (one-time)
+just dev          # full stack via Tilt; backend auto-detected per host (ADR 0024):
+                  # VZ on macOS/Apple Silicon, Firecracker on Linux+KVM, else subprocess
 ```
 
 In another shell:
@@ -272,20 +299,21 @@ just smoke-create
 End-to-end exec round-trip:
 
 ```bash
-# Enable an image first (one-time setup; replace with your bake's URI):
-curl -X POST http://localhost:8090/api/enabled-images \
+# The HTTP API lives under /api/v1 (ADR 0031). Enable an image first
+# (one-time; replace with your bake's URI — e.g. localhost:5001/demo-claude:warm-1):
+curl -X POST http://localhost:8090/api/v1/enabled-images \
   -H 'content-type: application/json' \
   -d '{"image_uri":"localhost:5001/cortex/api:warm-1"}'
 
-SID=$(curl -s -X POST http://localhost:8090/sessions \
+SID=$(curl -s -X POST http://localhost:8090/api/v1/sessions \
   -H 'content-type: application/json' \
   -d '{"image":"localhost:5001/cortex/api:warm-1"}' | jq -r .session_id)
 
-curl -s -X POST "http://localhost:8090/sessions/$SID/exec" \
+curl -s -X POST "http://localhost:8090/api/v1/sessions/$SID/exec" \
   -H 'content-type: application/json' \
   -d '{"command":"uname -a && echo \"session=$ENGRAM_SESSION_ID\""}' | jq
 
-curl -X DELETE "http://localhost:8090/sessions/$SID"
+curl -X DELETE "http://localhost:8090/api/v1/sessions/$SID"
 ```
 
 You'll see real `uname` output and the session id env var injected by the coordinator.
@@ -400,7 +428,7 @@ For ADR 0007 chunked storage, the bake also emits a `bundle.json` sidecar pointi
 Then create a session against it (the coordinator picks up the new tag automatically):
 
 ```bash
-SID=$(curl -s -X POST http://localhost:8090/sessions \
+SID=$(curl -s -X POST http://localhost:8090/api/v1/sessions \
   -H 'content-type: application/json' \
   -d '{"repo":"cortex/api","branch":"main"}' | jq -r .session_id)
 ```
