@@ -303,6 +303,7 @@ fn legal_path_from_pending(target: SessionState) -> &'static [SessionState] {
         Idle => &[Created, Active, Idle],
         HostLost => &[Created, Active, HostLost],
         Evacuating => &[Created, Active, Evacuating],
+        Evicting => &[Created, Active, Evicting],
         Failed => &[Failed],
         Completed => &[Created, Active, Completed],
         Dead => &[Created, Active, Dead],

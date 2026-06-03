@@ -68,6 +68,23 @@ pub enum SessionState {
     /// nulled out same as `Idle` — the session is recoverable but
     /// not running.
     Evacuating,
+    /// ADR 0034: durable idle-eviction intent marker. The candidates
+    /// handler (or the PG detection backstop) transitions
+    /// `Active → Evicting` and returns immediately; the coord-side
+    /// eviction scanner sweeps this state and drives the snapshot
+    /// pipeline (`evict_session_to_state`) to its terminal
+    /// `Evicting → Idle`. A *pre-pipeline* marker, not the pipeline's
+    /// target: the pipeline's internals (lease, registry guard,
+    /// abort-on-failure) are unchanged, and a coord restart
+    /// mid-eviction leaves a row the next pod's scanner picks up on
+    /// its first tick. Unlike `Idle`/`Evacuating`, the sandbox is
+    /// (usually) still RUNNING — `sandbox_id` stays bound until the
+    /// pipeline nulls it, and `/exec`/`/prompt`/`/resume` return a
+    /// retryable 409 rather than auto-resuming. After 20 failed
+    /// pipeline attempts (~3 min) falls back to `HostLost` (honest:
+    /// "coord can't reconcile this runtime"; loop-free — see the ADR
+    /// for why Active/Idle/Dead are each wrong).
+    Evicting,
     /// Terminal: create failed mid-flight (insert failed,
     /// `start_agent` failed, or scheduling collapsed after row
     /// insertion).
@@ -93,6 +110,7 @@ impl SessionState {
             Self::Idle => "idle",
             Self::HostLost => "host_lost",
             Self::Evacuating => "evacuating",
+            Self::Evicting => "evicting",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Dead => "dead",
@@ -107,19 +125,25 @@ impl SessionState {
     }
 
     /// Single source of truth for legal transitions. Per ADR 0015 M2
-    /// + ADR 0018 commit 12 (Evacuating):
+    /// + ADR 0018 commit 12 (Evacuating) + ADR 0034 (Evicting):
     ///
     /// ```text
     /// Pending     -> Created | Failed
     /// Created     -> GuestReady | Active | Failed | HostLost
     /// GuestReady  -> Active | Failed | HostLost
-    /// Active      -> Idle | HostLost | Evacuating | Failed | Completed | Dead
+    /// Active      -> Idle | HostLost | Evacuating | Evicting | Failed
+    ///              | Completed | Dead
     /// Idle        -> Created (resume) | Dead | Completed
     /// HostLost    -> Created | Idle | Evacuating | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
     ///              | Completed (user delete mid-evac)
+    /// Evicting    -> Idle (eviction pipeline success)
+    ///              | HostLost (scanner exhausted retries; host died
+    ///                mid-eviction via the dead-host sweep)
+    ///              | Dead (chunks unreferenceable)
+    ///              | Completed (user delete mid-eviction)
     /// Failed      -> (terminal)
     /// Completed   -> (terminal)
     /// Dead        -> (terminal)
@@ -141,11 +165,12 @@ impl SessionState {
             GuestReady => matches!(target, Active | Failed | HostLost),
             Active => matches!(
                 target,
-                Idle | HostLost | Evacuating | Failed | Completed | Dead
+                Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
             ),
             Idle => matches!(target, Created | Dead | Completed),
             HostLost => matches!(target, Created | Idle | Evacuating | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
+            Evicting => matches!(target, Idle | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
         }
     }
@@ -364,6 +389,8 @@ mod tests {
             SessionState::Active,
             SessionState::Idle,
             SessionState::HostLost,
+            SessionState::Evacuating,
+            SessionState::Evicting,
             SessionState::Completed,
             SessionState::Failed,
             SessionState::Dead,
@@ -395,6 +422,7 @@ mod tests {
             (Active, Idle),
             (Active, HostLost),
             (Active, Evacuating),
+            (Active, Evicting),
             (Active, Failed),
             (Active, Completed),
             (Active, Dead),
@@ -410,10 +438,14 @@ mod tests {
             (Evacuating, Idle),
             (Evacuating, Dead),
             (Evacuating, Completed),
+            (Evicting, Idle),
+            (Evicting, HostLost),
+            (Evicting, Dead),
+            (Evicting, Completed),
         ];
         let all_states = [
-            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Failed, Completed,
-            Dead,
+            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting, Failed,
+            Completed, Dead,
         ];
         for &from in &all_states {
             for &to in &all_states {
@@ -439,7 +471,7 @@ mod tests {
         for terminal in [Failed, Completed, Dead] {
             assert!(terminal.is_terminal());
             for target in [
-                Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating,
+                Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
             ] {
                 assert_eq!(
                     terminal.try_transition_to(target),

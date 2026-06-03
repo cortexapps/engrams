@@ -176,6 +176,17 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
             resume_session(state.clone(), id).await?;
             Ok(())
         }
+        // ADR 0034: mid-eviction. The sandbox may still be live (the
+        // eviction scanner is snapshotting it), so this is explicitly
+        // NOT the auto-resume arm above — kicking off a restore here
+        // would race the pipeline (the session lease would 409 the
+        // loser anyway, but only after a wasted restore attempt). The
+        // eviction lands at Idle within a scanner tick or two, after
+        // which the next call auto-resumes.
+        SessionState::Evicting => Err(ApiError::Conflict(
+            "session is mid-eviction; retry shortly (it will land at idle and auto-resume)"
+                .into(),
+        )),
         SessionState::Created | SessionState::GuestReady => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \
@@ -246,6 +257,14 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
         SessionState::Created => resume_from_created(state, session).await,
         SessionState::Dead => Err(ApiError::Gone(
             "snapshot_invalidated: session is terminal; chunked manifests are gone or never existed".into(),
+        )),
+        // ADR 0034: a direct /resume mid-eviction gets the same
+        // honest retryable 409 as ensure_active (between pipeline
+        // attempts the session lease is free, so the status gate —
+        // not the lease — is what catches this).
+        SessionState::Evicting => Err(ApiError::Conflict(
+            "session is mid-eviction; retry shortly (it will land at idle and become resumable)"
+                .into(),
         )),
         other => Err(ApiError::Conflict(format!(
             "session is {} — only Idle / Created sessions can be resumed",
