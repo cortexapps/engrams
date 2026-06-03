@@ -255,11 +255,18 @@ async fn prefetch_one(
     // ~2.84 s on a freshly-rolled host. Folding both into readiness means an
     // image isn't "warm" until BOTH its disk and memory working sets are
     // resident — so a host serves its first session warm, not just its second.
-    let memory_manifest: Manifest = chunk_store
-        .get_manifest(image.base_snapshot_memory_manifest)
-        .await
-        .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
-    total += prefetch_manifest_chunks(memory_manifest, chunk_store, chunk_cache, semaphore).await?;
+    //
+    // `None` for cold-boot backends (VZ, migration 0049): a disk-only base
+    // snapshot has no memory image to warm. Disk residency above is the whole
+    // working set — readiness folds in only what exists.
+    if let Some(memory_ref) = image.base_snapshot_memory_manifest {
+        let memory_manifest: Manifest = chunk_store
+            .get_manifest(memory_ref)
+            .await
+            .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
+        total +=
+            prefetch_manifest_chunks(memory_manifest, chunk_store, chunk_cache, semaphore).await?;
+    }
 
     Ok(total)
 }

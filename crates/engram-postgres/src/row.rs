@@ -245,18 +245,24 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         manifest_id: base_snapshot_disk_manifest_id,
         version: base_snapshot_disk_manifest_version as u64,
     });
-    // ADR 0021 P2 (memory residency): NOT NULL in the DB (migration 0043),
-    // same clean-break decode as the disk manifest above.
-    let base_snapshot_memory_manifest_id: Uuid = row
+    // ADR 0021 P2 (memory residency): nullable since migration 0049 — cold-boot
+    // backends (VZ) capture a disk-only base snapshot with no memory image, so
+    // both columns are NULL. FC populates them. Decode as Option; the residency
+    // advertisement + prefetch skip the memory tier when absent.
+    let base_snapshot_memory_manifest_id: Option<Uuid> = row
         .try_get("base_snapshot_memory_manifest_id")
         .map_err(col_err)?;
-    let base_snapshot_memory_manifest_version: i64 = row
+    let base_snapshot_memory_manifest_version: Option<i64> = row
         .try_get("base_snapshot_memory_manifest_version")
         .map_err(col_err)?;
-    let base_snapshot_memory_manifest = Some(engram_core::types::manifest::ManifestRef {
-        manifest_id: base_snapshot_memory_manifest_id,
-        version: base_snapshot_memory_manifest_version as u64,
-    });
+    let base_snapshot_memory_manifest = base_snapshot_memory_manifest_id
+        .zip(base_snapshot_memory_manifest_version)
+        .map(
+            |(manifest_id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id,
+                version: version as u64,
+            },
+        );
     // ADR 0021 P1.8: nullable soft-delete marker (migration 0041).
     // Missing-column-tolerant via try_get → `Ok(None)` from the
     // generic decode path so a row pulled before the migration runs

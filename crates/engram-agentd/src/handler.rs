@@ -128,6 +128,20 @@ where
             write_msg(&mut writer, &WireResponse::GuestIp(ip)).await?;
             return Ok(());
         }
+        WireRequest::Sync => {
+            // Flush the guest page cache to the virtio-blk disk so a
+            // clone-snapshot backend (VZ) captures just-written state.
+            // `sync(2)` can block on slow I/O, so run it off the async
+            // runtime. It cannot fail (POSIX `sync` returns void); the
+            // safe `nix` wrapper keeps the crate's no-unsafe policy.
+            // Linux-gated like the rest of the in-guest syscalls (nix is
+            // a Linux-only dep) — agentd only ever runs in the guest, so
+            // on non-Linux the reply is a no-op satisfying the wire shape.
+            #[cfg(target_os = "linux")]
+            let _ = tokio::task::spawn_blocking(nix::unistd::sync).await;
+            write_msg(&mut writer, &WireResponse::Synced).await?;
+            return Ok(());
+        }
         WireRequest::StartShell { port } => {
             let port = port.unwrap_or(crate::shell::DEFAULT_TTYD_PORT);
             // The interactive shell inherits the same durable session env

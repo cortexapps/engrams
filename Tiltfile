@@ -259,9 +259,11 @@ if bin_dir:
     # CI: run the downloaded release binary, no compile.
     coord_serve_cmd = 'exec ' + bin_dir + '/engram-coordinator'
 elif needs_codesign:
+    # VZ (macOS) requires codesigning for host-agent, but the
+    # coordinator in split mode doesn't use VZ. We still build it
+    # separately but don't codesign since it has no VZ entitlements.
     coord_serve_cmd = (
         'cargo build -p engram-coordinator && ' +
-        'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
         'exec ./target/debug/engram-coordinator'
     )
 else:
@@ -391,8 +393,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         # codesign after build, before exec. No sudo on macOS.
         serve_cmd = (
             build_prefix +
-            ('bash crates/engram-sandbox-vz/scripts/codesign.sh debug && '
-             if not bin_dir else '') +
+            'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
             'exec ' + ha_bin
         )
     else:

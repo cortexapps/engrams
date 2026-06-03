@@ -1983,7 +1983,12 @@ impl SandboxBackend for PooledBackend {
         let captured = async {
             // Wait for the guest to reach agentd-ready (bootstrap on
             // accept(), harness unmounted — the option-D capture point).
-            self.inner.wait_agent_ready(id).await?;
+            // VZ backend doesn't support this (FC-only), so ignore InvalidSpec.
+            match self.inner.wait_agent_ready(id).await {
+                Ok(()) => {}
+                Err(SandboxError::InvalidSpec(_)) => {}
+                Err(e) => return Err(e),
+            }
             // Close the cold-boot window (mirrors `start_agent`) before the
             // snapshot flush opens its own `snapshot` operation scope.
             #[cfg(target_os = "linux")]

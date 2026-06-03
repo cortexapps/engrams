@@ -1362,6 +1362,7 @@ dependencies = [
  "engram-agentd",
  "engram-chunk-store",
  "engram-core",
+ "engram-storage-local",
  "futures",
  "libc",
  "objc2",

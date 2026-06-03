@@ -100,12 +100,15 @@ pub struct EnabledImageRef {
     pub base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef,
     /// ADR 0021 P2 (memory residency): the base snapshot's memory manifest,
     /// advertised so the host warms the chunked memory image on NVMe at
-    /// host-boot — symmetric with the disk manifest above. Without it, the
-    /// first session on a freshly rolled host pays a cold per-restore memory
-    /// prefetch from GCS (~2.84 s, measured). Always present (`enabled_images`
-    /// column is `NOT NULL`, migration 0043); no `serde(default)` — clean
-    /// break, coord + hosts deploy together.
-    pub base_snapshot_memory_manifest: engram_core::types::manifest::ManifestRef,
+    /// host-boot — symmetric with the disk manifest above. When present, the
+    /// first session on a freshly rolled host restores warm instead of paying a
+    /// cold per-restore memory prefetch from GCS (~2.84 s, measured).
+    ///
+    /// `None` for cold-boot backends (VZ): Apple's arm64 save/restore is broken
+    /// (ADR 0003), so VZ clone-snapshots the disk and cold-boots — there is no
+    /// memory image to warm. Nullable since migration 0049. No `serde(default)`
+    /// — clean break, coord + hosts deploy together.
+    pub base_snapshot_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
 }
 
 /// Newtype over the OCI manifest digest string (`sha256:<hex>`).
@@ -211,10 +214,10 @@ mod tests {
                     manifest_id: uuid::Uuid::nil(),
                     version: 1,
                 },
-                base_snapshot_memory_manifest: engram_core::types::manifest::ManifestRef {
+                base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
                     manifest_id: uuid::Uuid::nil(),
                     version: 1,
-                },
+                }),
             }],
         };
         let json = serde_json::to_string(&original).unwrap();

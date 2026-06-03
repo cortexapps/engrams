@@ -191,6 +191,39 @@ impl VzBackend {
             .join("snapshots")
             .join(snapshot_id.to_string())
     }
+
+    /// Ask the in-guest agentd to `sync(2)` so dirty page-cache writes
+    /// land in the virtio-blk-backed rootfs file before `snapshot()`
+    /// clones it. Best-effort + bounded: the round-trip shares the
+    /// single virtio-console agentd port (1024) with exec, so it
+    /// serializes behind any in-flight exec; a 5 s cap keeps a wedged
+    /// guest from stalling the snapshot indefinitely. On any failure we
+    /// log and proceed — the clone then reflects the last ext4 commit,
+    /// the pre-existing behaviour.
+    async fn flush_guest_fs(&self, id: SandboxId, vsock_uds_path: &Path) {
+        let agent_uds = port_uds_path(vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let fut = async {
+            let conn = UnixStream::connect(&agent_uds).await.ok()?;
+            let (mut reader, mut writer) = tokio::io::split(conn);
+            write_msg(&mut writer, &WireRequest::Sync).await.ok()?;
+            let resp: WireResponse = read_msg(&mut reader).await.ok()?;
+            Some(resp)
+        };
+        match tokio::time::timeout(Duration::from_secs(5), fut).await {
+            Ok(Some(WireResponse::Synced)) => {
+                tracing::debug!(sandbox_id = %id, "vz: guest fs flushed before snapshot");
+            }
+            Ok(Some(other)) => {
+                tracing::warn!(sandbox_id = %id, ?other, "vz: unexpected reply to Sync; snapshot will use last ext4 commit");
+            }
+            Ok(None) => {
+                tracing::warn!(sandbox_id = %id, "vz: guest fs flush dial failed; snapshot will use last ext4 commit");
+            }
+            Err(_) => {
+                tracing::warn!(sandbox_id = %id, "vz: guest fs flush timed out after 5s; snapshot will use last ext4 commit");
+            }
+        }
+    }
 }
 
 /// Adapter that runs the engram-agentd wire protocol against a
@@ -477,10 +510,26 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        let (vm, spec, rootfs_path) = {
+        let (vm, spec, rootfs_path, vsock_uds_path) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            (live.vm.clone(), live.spec.clone(), live.rootfs_path.clone())
+            (
+                live.vm.clone(),
+                live.spec.clone(),
+                live.rootfs_path.clone(),
+                live.vsock_uds_path.clone(),
+            )
         };
+
+        // Flush the guest filesystem BEFORE pausing + cloning. The clone
+        // captures only on-disk state (cold-boot restore, no memory image),
+        // so any write still in the guest's page cache would be silently
+        // lost from the snapshot — unlike FC, whose memory snapshot carries
+        // the dirty pages. Ask agentd to `sync(2)` while the VM is still
+        // running so the bytes land in the virtio-blk-backed rootfs file the
+        // clone is about to copy. Best-effort: a flush failure (agent not
+        // up, slow boot) shouldn't abort the snapshot — we fall back to the
+        // last ext4 commit, same as before this call existed.
+        self.flush_guest_fs(id, &vsock_uds_path).await;
 
         // ADR 0007 Phase 6: allocate snapshot id + derive staging
         // dir from it. Coord no longer dictates layout.
@@ -496,9 +545,9 @@ impl SandboxBackend for VzBackend {
         // arm64 Linux guests on macOS (see UTM #6654, Apple
         // Developer Forum thread 745168, and Apple's own
         // `containerization` framework which avoids it entirely
-        // — sub-second cold-boot is the canonical path). We
-        // pause the VM (so the guest's page cache settles and
-        // ext4's journal is consistent), APFS-clone the
+        // — sub-second cold-boot is the canonical path). With the
+        // guest FS already flushed above, we pause the VM (freeze
+        // vCPUs so no new writes race the clone), APFS-clone the
         // per-sandbox rootfs into the snapshot dir, and resume.
         // The clone IS the snapshot — restore re-clones it back
         // to a fresh per-sandbox file and cold-boots a new VM.
@@ -705,6 +754,56 @@ impl SandboxBackend for VzBackend {
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|kv| *kv.key()).collect())
+    }
+
+    /// Ensure the in-guest `ttyd` is running, returning the port it
+    /// accepted on. Forwards to agentd's `StartShell` RPC (which lazily
+    /// spawns ttyd and only replies once a loopback probe succeeds) —
+    /// the same contract the FC backend implements. Without this
+    /// override VZ would inherit the trait default `Ok(7681)`, which
+    /// promises a listener that nothing started: the coordinator's
+    /// `proxy_shell` then dials the guest IP and hits `connection
+    /// refused` (the SHELL tab never opens). agentd carries the ttyd
+    /// binary + the StartShell handler in every bake, so this is a
+    /// host-side-only change.
+    async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "connect agentd UDS for StartShell {}: {e}",
+                    agent_uds.display()
+                )
+                .into(),
+            )
+        })?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        // `port: None` → agentd's default (7681). Bound the round-trip:
+        // ttyd spawn + the in-guest readiness probe are normally
+        // sub-second, and the console port serializes behind any
+        // in-flight exec, so 30 s is generous headroom without hanging
+        // a wedged guest forever.
+        write_msg(&mut writer, &WireRequest::StartShell { port: None })
+            .await
+            .map_err(|e| SandboxError::Vm(format!("write StartShell: {e}").into()))?;
+        let resp: WireResponse =
+            tokio::time::timeout(Duration::from_secs(30), read_msg(&mut reader))
+                .await
+                .map_err(|_| SandboxError::Vm("StartShell timed out after 30s".into()))?
+                .map_err(|e| SandboxError::Vm(format!("read StartShell response: {e}").into()))?;
+        match resp {
+            WireResponse::ShellReady { port, .. } => Ok(port),
+            WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                format!("StartShell rejected ({kind}): {message}").into(),
+            )),
+            other => Err(SandboxError::Vm(
+                format!("StartShell: unexpected response: {other:?}").into(),
+            )),
+        }
     }
 
     /// Discover the guest's primary IPv4 address by asking agentd

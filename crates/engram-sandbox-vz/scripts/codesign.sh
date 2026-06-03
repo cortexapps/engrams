@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ad-hoc codesign engram-coordinator + engram-sandbox-vz test
+# Ad-hoc codesign engram-host-agent + engram-sandbox-vz test
 # binaries with the com.apple.security.virtualization entitlement.
 #
 # Without this, every VZ API call fails with NSError 7 "process
@@ -61,19 +61,21 @@ sign_if_needed() {
 count=0
 examined=0
 
-# Coordinator binary.
-BIN="target/$PROFILE/engram-coordinator"
+# Host-agent binary (only component that uses VZ APIs in split mode).
+BIN="target/$PROFILE/engram-host-agent"
 if [ -x "$BIN" ] && [ -f "$BIN" ]; then
     sign_if_needed "$BIN"
     examined=$((examined + 1))
 fi
 
 # Test binaries: target/$PROFILE/deps/engram_sandbox_vz-<16hex>
-# (no extension). Cargo emits .d / .o / .rmeta siblings alongside
-# the executable; filter via `file -b` to sign only the Mach-O
-# executable.
+# (the crate's unit/lib tests) and e2e_vz-<16hex> (the live
+# lifecycle integration test in tests/e2e_vz.rs — a separate test
+# target, so a separate binary name). Cargo emits .d / .o / .rmeta
+# siblings alongside the executable; filter via `file -b` to sign
+# only the Mach-O executable.
 shopt -s nullglob
-for T in target/"$PROFILE"/deps/engram_sandbox_vz-*; do
+for T in target/"$PROFILE"/deps/engram_sandbox_vz-* target/"$PROFILE"/deps/e2e_vz-*; do
     if [ -x "$T" ] && [ -f "$T" ]; then
         case "$(file -b "$T")" in
             "Mach-O 64-bit executable"*)
