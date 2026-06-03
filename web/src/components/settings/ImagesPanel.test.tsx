@@ -162,8 +162,9 @@ describe('ImagesPanel wire contract', () => {
     await screen.findByText('ghcr.io/cortex/api:warm-1');
 
     await user.click(screen.getByRole('button', { name: /^disable$/i }));
-    // Confirmation prompt.
-    await user.click(screen.getByRole('button', { name: /^yes$/i }));
+    // Confirmation prompt (shadcn AlertDialog) — the confirm action is labelled
+    // "Disable image" to disambiguate it from the row's "Disable" trigger.
+    await user.click(await screen.findByRole('button', { name: /disable image/i }));
 
     await waitFor(() => {
       const posts = mock.callsMatching(

@@ -1,4 +1,3 @@
-import { AnimatePresence, motion } from 'framer-motion';
 import { useState } from 'react';
 import {
   useDisableImage,
@@ -8,400 +7,176 @@ import {
 } from '../../hooks/useEnabledImages';
 import { useEnableProgress } from '../../hooks/useEnableProgress';
 import type { EnabledImageSummary } from '../../types';
-import { Field, FormError, PressButton, SubHead } from './_form';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
+  DialogTitle, DialogTrigger,
+} from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from '@/components/ui/table';
 
-// Enabled-images panel — Stage D. Operators curate the OCI URIs
-// sessions may reference. The list reads `GET /api/enabled-images`
-// (Postgres-backed); enable hits the registry to fetch + cache the
-// manifest.toml, so session-create has zero registry I/O on the hot
-// path.
-//
-// Layout mirrors RegistriesPanel exactly:
-//   • A list of rows, one per enabled URI. Each row shows a status
-//     glyph, the URI, the parsed manifest name, the digest, and
-//     refresh + disable controls.
-//   • Inline expand "+ enable a new image" form with one input.
-//   • Empty state with an italic prompt.
-
+// Enabled-images panel — operators curate the OCI URIs sessions may reference.
+// The list reads `GET /api/enabled-images` (Postgres-backed); enable hits the
+// registry to fetch + cache the manifest.toml, so session-create has zero
+// registry I/O on the hot path.
 export function ImagesPanel() {
   const { data, isLoading, error } = useEnabledImages();
-  const [addOpen, setAddOpen] = useState(false);
+  const rows = data ?? [];
 
   return (
-    <section>
-      <SectionHeader />
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Images</h1>
+          <p className="text-sm text-muted-foreground">
+            OCI URIs sessions may reference. The manifest is cached on enable; refresh when tags move.
+          </p>
+        </div>
+        <EnableImageDialog />
+      </div>
 
       {error && (
-        <p
-          className="font-display italic text-[0.9rem] mb-4"
-          style={{ color: 'var(--color-amber)' }}
-        >
-          could not load enabled images — {String(error)}
-        </p>
+        <p className="text-sm text-destructive">could not load enabled images — {String(error)}</p>
       )}
 
-      {isLoading && <ListLoadingSkeleton />}
-
-      {!isLoading && data && data.length > 0 && (
-        <ul className="space-y-0">
-          {data.map((row) => (
-            <ImageRow key={row.id} row={row} />
-          ))}
-        </ul>
+      {isLoading ? (
+        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+      ) : rows.length === 0 ? (
+        <Card><CardContent className="py-10 text-center text-sm text-muted-foreground">
+          No images enabled. Bake + push an image with{' '}
+          <code className="font-mono">engram image build --push</code>, then enable its URI here.
+        </CardContent></Card>
+      ) : (
+        <Table>
+          <TableHeader><TableRow>
+            <TableHead>Image</TableHead><TableHead>Manifest</TableHead>
+            <TableHead>Digest</TableHead><TableHead>Refreshed</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
+          </TableRow></TableHeader>
+          <TableBody>
+            {rows.map((row) => <ImageRow key={row.id} row={row} />)}
+          </TableBody>
+        </Table>
       )}
-
-      {!isLoading && data && data.length === 0 && !addOpen && <EmptyState />}
-
-      <AnimatePresence initial={false}>
-        {addOpen && (
-          <motion.div
-            key="add-form"
-            layout
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.25, ease: 'easeOut' }}
-            style={{ overflow: 'hidden' }}
-            className="mt-8"
-          >
-            <EnableImageForm
-              onCancel={() => setAddOpen(false)}
-              onAdded={() => setAddOpen(false)}
-            />
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {!addOpen && (
-        <div className="mt-8 flex justify-center">
-          <PressButton onClick={() => setAddOpen(true)} tone="primary">
-            + enable a new image
-          </PressButton>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function SectionHeader() {
-  return (
-    <header className="mb-6 flex items-baseline justify-between">
-      <h2
-        className="font-mono smallcaps text-[0.7rem]"
-        style={{ color: 'var(--color-ink-quiet)', letterSpacing: '0.18em' }}
-      >
-        Enabled Images
-      </h2>
-      <p
-        className="font-display italic text-[0.8rem]"
-        style={{ color: 'var(--color-ink-quiet)' }}
-      >
-        manifest cached on enable, refresh when tags move
-      </p>
-    </header>
-  );
-}
-
-function ListLoadingSkeleton() {
-  return (
-    <p
-      className="font-display italic text-[0.9rem] py-3"
-      style={{ color: 'var(--color-ink-quiet)' }}
-    >
-      loading…
-    </p>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="py-10 text-center" style={{ minHeight: '8rem' }}>
-      <p
-        className="font-display italic text-[1.05rem]"
-        style={{ color: 'var(--color-ink-faded)' }}
-      >
-        no images enabled.
-      </p>
-      <p
-        className="font-display italic text-[0.9rem] mt-2"
-        style={{ color: 'var(--color-ink-quiet)' }}
-      >
-        bake + push an image with{' '}
-        <code className="font-mono">engram image build --push</code>, then
-        enable
-        <br />
-        the URI here so sessions can reference it.
-      </p>
     </div>
   );
 }
 
-// ---------- Row -----------------------------------------------------
-
 function ImageRow({ row }: { row: EnabledImageSummary }) {
-  const [confirming, setConfirming] = useState(false);
   const del = useDisableImage();
   const refresh = useRefreshEnabledImage();
+  const shortDigest = row.manifest_digest.length > 19
+    ? `${row.manifest_digest.slice(0, 19)}…` : row.manifest_digest;
 
   return (
-    <motion.li
-      layout
-      initial={{ opacity: 0, y: 4 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.25, ease: 'easeOut' }}
-      className="py-4"
-      style={{ borderBottom: '1px solid var(--color-rule-faint)' }}
-    >
-      <div className="flex items-baseline gap-3 flex-wrap">
-        <span
-          aria-hidden
-          className="glyph"
-          style={{ color: 'var(--color-ink-faded)' }}
-        >
-          ●
-        </span>
-        <span
-          className="font-mono"
-          style={{
-            fontSize: '0.95rem',
-            color: 'var(--color-ink)',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {row.image_uri}
-        </span>
-        {row.manifest_name && (
-          <span
-            className="font-display italic"
-            style={{ fontSize: '0.85rem', color: 'var(--color-ink-faded)' }}
-          >
-            {row.manifest_name}
-          </span>
+    <TableRow>
+      <TableCell className="font-mono text-sm whitespace-nowrap">{row.image_uri}</TableCell>
+      <TableCell className="text-sm text-muted-foreground">
+        {row.manifest_name || '—'}
+        {row.manifest_description && (
+          <span className="block text-xs">{row.manifest_description}</span>
         )}
-        <DigestChip digest={row.manifest_digest} />
-        <span className="ml-auto flex items-baseline gap-4">
-          <span
-            className="font-mono text-[0.72rem]"
-            style={{ color: 'var(--color-ink-quiet)' }}
-            title={new Date(row.last_refreshed_at).toLocaleString()}
-          >
-            refreshed {timeAgo(row.last_refreshed_at)}
-          </span>
-          <PressButton
-            onClick={() => refresh.mutate(row.image_uri)}
-            disabled={refresh.isPending}
-          >
-            {refresh.isPending ? 'refreshing…' : 'refresh'}
-          </PressButton>
-          {!confirming ? (
-            <PressButton onClick={() => setConfirming(true)}>
-              disable
-            </PressButton>
-          ) : (
-            <span className="flex items-baseline gap-3">
-              <span
-                className="font-display italic"
-                style={{
-                  color: 'var(--color-ink-faded)',
-                  fontSize: '0.85rem',
-                }}
-              >
-                sure?
-              </span>
-              <PressButton
-                onClick={() => del.mutate(row.image_uri)}
-                tone="danger"
-                disabled={del.isPending}
-              >
-                {del.isPending ? 'disabling…' : 'yes'}
-              </PressButton>
-              <PressButton onClick={() => setConfirming(false)}>no</PressButton>
-            </span>
-          )}
-        </span>
-      </div>
-      {row.manifest_description && (
-        <p
-          className="font-display italic text-[0.82rem] mt-1"
-          style={{ color: 'var(--color-ink-quiet)', marginLeft: '1.4rem' }}
-        >
-          {row.manifest_description}
-        </p>
-      )}
-      {refresh.error && (
-        <p
-          className="font-display italic text-[0.85rem] mt-2"
-          style={{ color: 'var(--color-amber)', marginLeft: '1.4rem' }}
-        >
-          could not refresh — {String(refresh.error)}
-        </p>
-      )}
-      {del.error && (
-        <p
-          className="font-display italic text-[0.85rem] mt-2"
-          style={{ color: 'var(--color-amber)', marginLeft: '1.4rem' }}
-        >
-          could not disable — {String(del.error)}
-        </p>
-      )}
-    </motion.li>
+      </TableCell>
+      <TableCell>
+        <Badge variant="outline" className="font-mono text-[0.65rem]" title={row.manifest_digest}>
+          {shortDigest}
+        </Badge>
+      </TableCell>
+      <TableCell className="font-mono text-xs text-muted-foreground"
+        title={new Date(row.last_refreshed_at).toLocaleString()}>
+        {timeAgo(row.last_refreshed_at)}
+      </TableCell>
+      <TableCell>
+        <div className="flex items-center justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={() => refresh.mutate(row.image_uri)} disabled={refresh.isPending}>
+            {refresh.isPending ? 'Refreshing…' : 'Refresh'}
+          </Button>
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="ghost" size="sm" disabled={del.isPending}>Disable</Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Disable {row.image_uri}?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Sessions can no longer reference this URI. The artifact in the registry is untouched.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={() => del.mutate(row.image_uri)}>Disable image</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+        {refresh.error && <p className="mt-1 text-right text-xs text-destructive">could not refresh — {String(refresh.error)}</p>}
+        {del.error && <p className="mt-1 text-right text-xs text-destructive">could not disable — {String(del.error)}</p>}
+      </TableCell>
+    </TableRow>
   );
 }
 
-/** sha256:abcd1234… digest, abbreviated to the prefix and styled as
- * a chip. The full digest sits in `title=` for hover. */
-function DigestChip({ digest }: { digest: string }) {
-  const short = digest.length > 19 ? `${digest.slice(0, 19)}…` : digest;
-  return (
-    <span
-      className="font-mono"
-      title={digest}
-      style={{
-        fontSize: '0.65rem',
-        color: 'var(--color-ink-faded)',
-        border: '1px solid var(--color-rule)',
-        padding: '0.1rem 0.5rem',
-        letterSpacing: '0.04em',
-      }}
-    >
-      {short}
-    </span>
-  );
-}
-
-// ---------- Enable form ---------------------------------------------
-
-function EnableImageForm({
-  onCancel,
-  onAdded,
-}: {
-  onCancel: () => void;
-  onAdded: () => void;
-}) {
+function EnableImageDialog() {
+  const [open, setOpen] = useState(false);
   const [imageUri, setImageUri] = useState('');
-  const enable = useEnableImage();
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const enable = useEnableImage();
   const progress = useEnableProgress(enable.isPending);
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const submit = async () => {
     setSubmitError(null);
-    if (!imageUri.trim()) {
-      setSubmitError('image URI is required');
-      return;
-    }
+    if (!imageUri.trim()) { setSubmitError('image URI is required'); return; }
     try {
       await enable.mutateAsync(imageUri.trim());
       setImageUri('');
-      onAdded();
+      setOpen(false);
     } catch (err) {
       setSubmitError(String(err));
     }
   };
 
   return (
-    <form
-      onSubmit={submit}
-      className="space-y-6 pt-2 pb-4"
-      style={{
-        borderTop: '1px solid var(--color-rule)',
-        borderBottom: '1px solid var(--color-rule)',
-        paddingTop: '1.5rem',
-      }}
-    >
-      <SubHead>NEW ENABLED IMAGE</SubHead>
-
-      <Field
-        label="image uri"
-        hint="full OCI reference: <host>[:port]/<repo>:<tag>. The coordinator pulls the manifest layer from this URI on enable; subsequent session-create reads from the cached row."
-      >
-        <input
-          type="text"
-          value={imageUri}
-          autoFocus
-          onChange={(e) => setImageUri(e.target.value)}
-          className="ledger-input font-mono"
-          placeholder="ghcr.io/cortex/api:warm-1"
-          spellCheck={false}
-          autoCapitalize="off"
-        />
-      </Field>
-
-      {submitError && <FormError message={submitError} />}
-
-      <div className="flex items-baseline gap-6 pt-2">
-        <PressButton type="submit" tone="primary" disabled={enable.isPending}>
-          {enable.isPending ? 'enabling…' : 'enable'}
-        </PressButton>
-        <PressButton onClick={onCancel} disabled={enable.isPending}>
-          cancel
-        </PressButton>
-        <EnableProgress progress={progress} />
-      </div>
-    </form>
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild><Button>Enable a new image</Button></DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Enable a new image</DialogTitle>
+          <DialogDescription>
+            Full OCI reference: <code className="font-mono">&lt;host&gt;[:port]/&lt;repo&gt;:&lt;tag&gt;</code>.
+            The coordinator pulls the manifest layer on enable.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-2">
+          <Label htmlFor="image-uri">Image URI</Label>
+          <Input id="image-uri" autoFocus value={imageUri}
+            onChange={(e) => setImageUri(e.target.value)}
+            className="font-mono" placeholder="ghcr.io/cortex/api:warm-1"
+            spellCheck={false} autoCapitalize="off" />
+          {submitError && <p className="text-sm text-destructive">{submitError}</p>}
+        </div>
+        <DialogFooter className="sm:items-center">
+          {progress && (
+            <span className="mr-auto text-xs text-muted-foreground">{progress.label}…</span>
+          )}
+          <Button variant="ghost" onClick={() => setOpen(false)} disabled={enable.isPending}>Cancel</Button>
+          <Button onClick={submit} disabled={enable.isPending}>
+            {enable.isPending ? 'Enabling…' : 'Enable'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
-
-// Multi-stage progress copy that cycles based on elapsed wall-clock
-// while `POST /api/enabled-images` is in flight. The backend doesn't
-// stream events — we just shape time-into-text so the operator sees
-// movement instead of a frozen button. Stages are calibrated against
-// the observed 7-30s window of materialize + base-layer prefetch.
-function EnableProgress({
-  progress,
-}: {
-  progress: ReturnType<typeof useEnableProgress>;
-}) {
-  if (!progress) return null;
-  return (
-    <span
-      className="font-mono text-xs smallcaps inline-flex items-baseline gap-2"
-      style={{ color: 'var(--color-ink-quiet)' }}
-    >
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.span
-          key={progress.label}
-          initial={{ opacity: 0, y: 4 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -4 }}
-          transition={{ duration: 0.25, ease: 'easeOut' }}
-        >
-          {progress.label}
-          <DotPulse />
-        </motion.span>
-      </AnimatePresence>
-    </span>
-  );
-}
-
-// Three dots that fade-pulse in sequence. Cheap, lightweight,
-// matches the ledger aesthetic — no spinning gradients or
-// material wheels.
-function DotPulse() {
-  return (
-    <span className="inline-flex items-baseline" aria-hidden>
-      {[0, 1, 2].map((i) => (
-        <motion.span
-          key={i}
-          initial={{ opacity: 0.2 }}
-          animate={{ opacity: [0.2, 1, 0.2] }}
-          transition={{
-            duration: 1.2,
-            repeat: Infinity,
-            delay: i * 0.18,
-            ease: 'easeInOut',
-          }}
-          style={{ display: 'inline-block', marginLeft: '0.15ch' }}
-        >
-          .
-        </motion.span>
-      ))}
-    </span>
-  );
-}
-
-// ---------- helpers -------------------------------------------------
 
 function timeAgo(iso: string): string {
   const then = new Date(iso).getTime();
