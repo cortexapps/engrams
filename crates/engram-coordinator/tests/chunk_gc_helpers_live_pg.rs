@@ -59,6 +59,7 @@ async fn seed_base_snapshot(meta: &Arc<dyn MetadataStore>) -> SnapshotId {
         disk_manifest: None,
         memory_manifest: None,
         recoverable: true,
+        aux_bundles: vec![],
     })
     .await
     .expect("seed base snapshot");
@@ -273,6 +274,7 @@ async fn record_snapshot_bumps_chunk_generation() {
         }),
         memory_manifest: None,
         recoverable: false,
+        aux_bundles: vec![],
     };
     meta.record_snapshot(snap).await.expect("record snapshot");
 
@@ -296,6 +298,7 @@ async fn record_snapshot_bumps_chunk_generation() {
         disk_manifest: None,
         memory_manifest: None,
         recoverable: false,
+        aux_bundles: vec![],
     };
     meta.record_snapshot(snap2)
         .await

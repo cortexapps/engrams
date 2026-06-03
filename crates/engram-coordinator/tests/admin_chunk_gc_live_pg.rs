@@ -199,6 +199,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,
+            aux_bundles: vec![],
         })
         .await
         .expect("seed base snapshot");
@@ -267,6 +268,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             disk_manifest: Some(snap_disk),
             memory_manifest: Some(snap_mem),
             recoverable: true,
+            aux_bundles: vec![],
         })
         .await
         .expect("record snapshot");
@@ -356,6 +358,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,
+            aux_bundles: vec![],
         })
         .await
         .expect("seed base snapshot");
@@ -570,6 +573,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
             disk_manifest: Some(unrec_mref),
             memory_manifest: None,
             recoverable: false, // ← the load-bearing field
+            aux_bundles: vec![],
         })
         .await
         .expect("record snapshot");

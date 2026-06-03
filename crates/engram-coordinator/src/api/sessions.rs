@@ -1066,7 +1066,10 @@ async fn try_restore_base_snapshot(
         // P1 leaves working-set prefetch off; P2 (ADR 0020) publishes the
         // bake-time trace and points UFFD prefetch at it.
         working_set_blob_key: None,
-        aux_bundles: vec![],
+        // ADR 0035: the generations this base snapshot pins; the host
+        // materializes any it's missing and (fresh flavor) swaps to
+        // its current generation post-load.
+        aux_bundles: record.aux_bundles,
     };
     let ctx = ScheduleContext {
         repo: image_repo,

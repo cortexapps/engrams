@@ -300,6 +300,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         disk_manifest: Some(proto_to_core_manifest(disk)),
         memory_manifest: Some(proto_to_core_manifest(memory)),
         recoverable: true,
+        aux_bundles: vec![],
     })
     .await
     .expect("record snapshot");

@@ -522,6 +522,8 @@ async fn capture_and_record_base_snapshot(
             size_bytes: meta.size_bytes,
             created_at: meta.created_at,
             last_accessed_at: now,
+            // ADR 0035: pin the capture's bundle generations.
+            aux_bundles: meta.aux_bundles.clone(),
             disk_manifest: meta.disk_manifest,
             memory_manifest: meta.memory_manifest,
             recoverable,

@@ -138,4 +138,9 @@ pub struct SnapshotRecord {
     /// promising an Idle/resume path that can't be delivered.
     #[serde(default)]
     pub recoverable: bool,
+    /// ADR 0035: bundle generations this snapshot's device model
+    /// references (from `SnapshotMetadata::aux_bundles`). Persisted as
+    /// jsonb; the union across all rows is the bundle-GC pin set.
+    #[serde(default)]
+    pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
 }

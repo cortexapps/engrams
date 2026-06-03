@@ -188,7 +188,9 @@ pub async fn evacuate_dead_source(
             sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
             rootfs_blob_key: None,
             working_set_blob_key: None,
-            aux_bundles: vec![],
+            // ADR 0035: evac-dest restore is resume-flavored — keep the
+            // pinned generations; the target host materializes them.
+            aux_bundles: s.aux_bundles.clone(),
         },
         None => SnapshotMetadata {
             id: engram_core::SnapshotId::new(),
@@ -691,6 +693,7 @@ mod tests {
             disk_manifest: disk,
             memory_manifest: memory,
             recoverable: true,
+            aux_bundles: vec![],
         }
     }
 
