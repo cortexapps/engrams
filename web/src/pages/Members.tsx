@@ -1,5 +1,6 @@
 // ADR 0031: Members admin surface. Lists all users in the deployment with
-// inline role and activation controls. Gated by RequireAdmin.
+// inline role and activation controls. Gated by the route's requireAdmin
+// beforeLoad guard.
 //
 // Grid: person | role | source | status · actions
 // Columns: 2.4fr 0.8fr 1.3fr 1.7fr
