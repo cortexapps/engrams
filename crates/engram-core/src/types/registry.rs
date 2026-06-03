@@ -292,6 +292,68 @@ impl From<EnabledImage> for EnabledImageSummary {
     }
 }
 
+/// ADR 0036: state of an async image-enable job. The coordinator's
+/// `enable_scanner` drives `Pending → Materializing → Capturing →
+/// Ready`, with `Failed` as the give-up terminal after its retry
+/// budget. See migration 0052.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnableJobState {
+    /// Recorded by `POST /api/enabled-images`; not yet picked up.
+    Pending,
+    /// Scanner is verifying/fetching chunks into BlobStorage
+    /// (`chunks_done/chunks_total` advance during this state).
+    Materializing,
+    /// Chunks durable; capture VM boots + snapshots on a host.
+    Capturing,
+    /// Terminal: enabled_images row upserted; image usable.
+    Ready,
+    /// Terminal: retry budget exhausted; `error` says why. An admin
+    /// retry re-queues to `Pending`.
+    Failed,
+}
+
+impl EnableJobState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Materializing => "materializing",
+            Self::Capturing => "capturing",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Ready | Self::Failed)
+    }
+}
+
+/// One row in `enable_jobs` (ADR 0036): an asynchronous image-enable
+/// in flight (or terminal, kept for audit). The wire shape of
+/// `GET /api/enable-jobs/:id` — `chunks_done/chunks_total` is the
+/// operator-facing progress bar and the scanner's resume high-water
+/// mark.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnableJob {
+    pub id: Uuid,
+    pub image_uri: String,
+    /// OCI manifest digest observed at POST time (informational —
+    /// the scanner re-pulls at materialize time).
+    pub manifest_digest: Option<String>,
+    pub state: EnableJobState,
+    /// Total chunks in the image's bootstrap; `None` until the
+    /// scanner has pulled + parsed the artifact metadata.
+    pub chunks_total: Option<u32>,
+    pub chunks_done: u32,
+    /// Pipeline failures so far; the scanner flips to `Failed` once
+    /// this exceeds its budget.
+    pub attempts: u32,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

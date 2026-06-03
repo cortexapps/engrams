@@ -241,8 +241,6 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            parent_disk_bootstrap_path: None,
-            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("bake ext4");

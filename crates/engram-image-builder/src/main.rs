@@ -121,8 +121,6 @@ async fn run_build(opts: BuildOpts) -> Result<(), Box<dyn std::error::Error>> {
         // real-microVM exec test drives it via the library. Adding a
         // `--inject-agent` flag is a CLI ergonomics task for later.
         agent_injection: None,
-        parent_disk_bootstrap_path: None,
-        parent_disk_chunks_blob_digest: None,
     };
 
     let docker = match opts.docker_bin {

@@ -63,13 +63,26 @@ else
     # Base snapshot is captured at enable time (ADR 0020), not at bake — the
     # old --capture-canonical-* flags were removed from `engram-cli image build`.
 
-    echo "==> POST /api/enabled-images (cascade)"
+    echo "==> POST /api/enabled-images (ADR 0036: async — poll the job)"
     ENABLE_BODY=$(printf '{"image_uri": "%s"}' "$IMAGE_URI")
-    curl -fsS -X POST "${AUTH_HEADER[@]}" \
+    JOB_ID=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
         -H "Content-Type: application/json" \
         -d "$ENABLE_BODY" \
         "$COORD/api/v1/enabled-images" \
-        >/dev/null
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+    while :; do
+        JOB_STATE=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enable-jobs/$JOB_ID" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
+        case "$JOB_STATE" in
+            ready) echo "    enable job ready"; break ;;
+            failed)
+                echo "ERROR: enable job $JOB_ID failed" >&2
+                curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enable-jobs/$JOB_ID" >&2 || true
+                exit 1
+                ;;
+            *) sleep 2 ;;
+        esac
+    done
 fi
 
 # Look for an existing dev-session row (status=active, this image,

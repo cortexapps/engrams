@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore, UserStore, WebSessionStore};
 use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
-    ArtifactRow, EnabledImage, HostCapacity, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostCapacity, HostRecord, HostStatus,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
+    SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, UserId};
 use row::col_err;
@@ -1496,6 +1497,273 @@ impl MetadataStore for PostgresStore {
             return Err(MetaError::NotFound);
         }
         Ok(())
+    }
+
+    async fn find_enabled_image_by_content(
+        &self,
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+        manifest_toml: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        // Soft-deleted rows are deliberately INCLUDED: their base
+        // snapshots remain GC-pinned and restorable, and content
+        // equality is what makes the reuse sound — liveness of the
+        // *row* is irrelevant to the snapshot's validity.
+        let row = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_toml, manifest_digest,
+                   disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
+                   base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
+              FROM enabled_images
+             WHERE disk_manifest_id = $1
+               AND disk_manifest_version = $2
+               AND manifest_toml = $3
+               AND base_snapshot_id IS NOT NULL
+             ORDER BY COALESCE(updated_at, created_at) DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(disk_manifest.manifest_id)
+        .bind(disk_manifest.version as i64)
+        .bind(manifest_toml)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enabled_image_from_row(&r)).transpose()
+    }
+
+    // ---- enable jobs (ADR 0036) ----
+
+    async fn create_or_get_enable_job(
+        &self,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+    ) -> Result<EnableJob, MetaError> {
+        // INSERT guarded by the partial unique index (one non-terminal
+        // job per image_uri); on conflict fall through to SELECTing
+        // the in-flight job. Re-POST = resume, never duplicate work.
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO enable_jobs (id, image_uri, manifest_digest)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
+            DO NOTHING
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(image_uri)
+        .bind(manifest_digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if let Some(row) = inserted {
+            return row::enable_job_from_row(&row);
+        }
+        let existing = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+              FROM enable_jobs
+             WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
+            "#,
+        )
+        .bind(image_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match existing {
+            Some(row) => row::enable_job_from_row(&row),
+            // Raced with the active job reaching a terminal state
+            // between INSERT and SELECT — retry the insert once.
+            None => {
+                let row = sqlx::query(
+                    r#"
+                    INSERT INTO enable_jobs (id, image_uri, manifest_digest)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
+                    DO NOTHING
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(image_uri)
+                .bind(manifest_digest)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    MetaError::Conflict(format!(
+                        "enable job for `{image_uri}` raced two creates; retry"
+                    ))
+                })?;
+                row::enable_job_from_row(&row)
+            }
+        }
+    }
+
+    async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
+        let row = sqlx::query(
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enable_job_from_row(&r)).transpose()
+    }
+
+    async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+              FROM enable_jobs
+             ORDER BY created_at DESC
+             LIMIT $1
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::enable_job_from_row).collect()
+    }
+
+    async fn claim_enable_jobs(
+        &self,
+        claimant: &str,
+        lease_secs: u32,
+        limit: u32,
+    ) -> Result<Vec<EnableJob>, MetaError> {
+        // Atomic claim: stamp (claimed_by, claimed_at) on non-terminal
+        // jobs whose lease is free or expired. The inner SELECT ...
+        // FOR UPDATE SKIP LOCKED keeps two pods' simultaneous sweeps
+        // from blocking on each other — each claims a disjoint set.
+        let rows = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW()
+             WHERE id IN (
+                   SELECT id FROM enable_jobs
+                    WHERE state NOT IN ('ready', 'failed')
+                      AND (claimed_at IS NULL OR claimed_at < NOW() - make_interval(secs => $2))
+                    ORDER BY created_at
+                    LIMIT $3
+                      FOR UPDATE SKIP LOCKED
+             )
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+            "#,
+        )
+        .bind(claimant)
+        .bind(lease_secs as f64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::enable_job_from_row).collect()
+    }
+
+    async fn update_enable_job_progress(
+        &self,
+        id: Uuid,
+        chunks_done: u32,
+        chunks_total: Option<u32>,
+    ) -> Result<(), MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET chunks_done = $2,
+                   chunks_total = COALESCE($3, chunks_total),
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(chunks_done as i32)
+        .bind(chunks_total.map(|v| v as i32))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_enable_job_state(&self, id: Uuid, state: EnableJobState) -> Result<(), MetaError> {
+        // Terminal states release the claim; non-failed targets clear
+        // any stale error from a prior retried attempt.
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET state = $2,
+                   error = CASE WHEN $2 = 'failed' THEN error ELSE NULL END,
+                   claimed_by = CASE WHEN $2 IN ('ready', 'failed') THEN NULL ELSE claimed_by END,
+                   claimed_at = CASE WHEN $2 IN ('ready', 'failed') THEN NULL ELSE NOW() END,
+                   updated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(state.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn record_enable_job_failure(&self, id: Uuid, error: &str) -> Result<u32, MetaError> {
+        // Release the claim so ANY pod's next tick can retry — the
+        // failing pod holds no special ownership of the retry.
+        let attempts: i32 = sqlx::query_scalar(
+            r#"
+            UPDATE enable_jobs
+               SET attempts = attempts + 1,
+                   error = $2,
+                   claimed_by = NULL,
+                   claimed_at = NULL,
+                   updated_at = NOW()
+             WHERE id = $1
+            RETURNING attempts
+            "#,
+        )
+        .bind(id)
+        .bind(error)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        Ok(attempts.max(0) as u32)
+    }
+
+    async fn retry_enable_job(&self, id: Uuid) -> Result<EnableJob, MetaError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET state = 'pending', attempts = 0, error = NULL,
+                   claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+             WHERE id = $1 AND state = 'failed'
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(r) => row::enable_job_from_row(&r),
+            None => match self.get_enable_job(id).await? {
+                Some(job) => Err(MetaError::Conflict(format!(
+                    "enable job {id} is `{}`, not `failed`; only failed jobs can be retried",
+                    job.state.as_str()
+                ))),
+                None => Err(MetaError::NotFound),
+            },
+        }
     }
 
     async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError> {

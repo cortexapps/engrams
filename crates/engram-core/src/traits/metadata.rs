@@ -5,7 +5,9 @@ use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
-use crate::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
+use crate::types::registry::{
+    EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
+};
 use crate::types::session::{Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
 
@@ -497,6 +499,141 @@ pub trait MetadataStore: Send + Sync {
     /// row's chunks have been confirmed unreferenced and removed
     /// from BlobStorage.
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
+
+    /// ADR 0036 P4: content-keyed base-snapshot reuse. Find an
+    /// enabled image (INCLUDING soft-deleted rows — their snapshots
+    /// stay GC-pinned and restorable) whose bake produced the same
+    /// disk content (`disk_manifest_*`, content-derived since ADR
+    /// 0036) AND the same `manifest_toml`, and which carries a base
+    /// snapshot. The enable pipeline reuses that snapshot instead of
+    /// booting a capture VM: with both inputs equal, a fresh capture
+    /// is equivalent for every session created from it (bundle
+    /// generations are swapped to the host's current staging at
+    /// session create — ADR 0035 Invariant 2 — so reuse does not
+    /// freeze bundle freshness).
+    ///
+    /// Default `None`: stores without the query surface (test mocks)
+    /// simply never reuse.
+    async fn find_enabled_image_by_content(
+        &self,
+        disk_manifest: ManifestRef,
+        manifest_toml: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        let _ = (disk_manifest, manifest_toml);
+        Ok(None)
+    }
+
+    // ---- enable jobs (ADR 0036) ----
+    //
+    // Async image-enable state machine: `POST /api/enabled-images`
+    // records a row and returns 202; the coordinator's
+    // `enable_scanner` claims jobs via a lease and drives
+    // `pending → materializing → capturing → ready | failed`.
+    // Default implementations error — only the Postgres store (the
+    // one the scanner runs against) supports jobs; the many test
+    // mocks of this trait don't need to stub them out.
+
+    /// Insert a `pending` job for `image_uri`, or — when a
+    /// non-terminal job for the same URI already exists (the partial
+    /// unique index) — return that job instead. Re-POSTing an
+    /// in-flight enable is a resume/no-op, never duplicate work.
+    async fn create_or_get_enable_job(
+        &self,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+    ) -> Result<EnableJob, MetaError> {
+        let _ = (image_uri, manifest_digest);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    async fn get_enable_job(&self, id: uuid::Uuid) -> Result<Option<EnableJob>, MetaError> {
+        let _ = id;
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Most-recent-first, bounded. The dashboard's images panel reads
+    /// this to surface in-flight + recently-finished enables.
+    async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
+        let _ = limit;
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Atomically claim up to `limit` non-terminal jobs whose lease
+    /// is free or expired (`claimed_at < now() - lease_secs`),
+    /// stamping `(claimed_by, claimed_at)`. Multi-coordinator safety:
+    /// one pod owns a job at a time; a crashed pod's claim expires
+    /// and a peer re-claims. Progress checkpoints renew the claim.
+    async fn claim_enable_jobs(
+        &self,
+        claimant: &str,
+        lease_secs: u32,
+        limit: u32,
+    ) -> Result<Vec<EnableJob>, MetaError> {
+        let _ = (claimant, lease_secs, limit);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Checkpoint materialize progress. Also renews the claim
+    /// (`claimed_at = NOW()`) so a long materialize isn't stolen by
+    /// a peer mid-run. `chunks_total` is stamped on first call.
+    async fn update_enable_job_progress(
+        &self,
+        id: uuid::Uuid,
+        chunks_done: u32,
+        chunks_total: Option<u32>,
+    ) -> Result<(), MetaError> {
+        let _ = (id, chunks_done, chunks_total);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Move the job's state forward (also renews the claim, clears
+    /// `error` on non-failed targets, and releases the claim on
+    /// terminal states).
+    async fn set_enable_job_state(
+        &self,
+        id: uuid::Uuid,
+        state: EnableJobState,
+    ) -> Result<(), MetaError> {
+        let _ = (id, state);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Record a pipeline failure: bump `attempts`, store `error`,
+    /// release the claim (so any pod's next tick can retry), keep
+    /// the current state. Returns the post-bump attempt count — the
+    /// scanner flips to `failed` once it exceeds the budget.
+    async fn record_enable_job_failure(
+        &self,
+        id: uuid::Uuid,
+        error: &str,
+    ) -> Result<u32, MetaError> {
+        let _ = (id, error);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Admin retry: `failed → pending`, resetting attempts/error/
+    /// claim. Errors `NotFound` for unknown ids; `Conflict` when the
+    /// job isn't in `failed`.
+    async fn retry_enable_job(&self, id: uuid::Uuid) -> Result<EnableJob, MetaError> {
+        let _ = id;
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
 
     // ---- session secrets ----
     //

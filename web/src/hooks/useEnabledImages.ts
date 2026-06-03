@@ -21,15 +21,16 @@ export function useEnabledImages(enabled = true) {
   });
 }
 
-/** Mutation: enable an image. Hits the registry to fetch + cache the
- * manifest, so latency varies with the registry. Errors propagate the
- * coordinator's message verbatim — the panel renders them inline. */
+/** Mutation: enable an image (ADR 0036: async). The POST validates
+ * the URI with a cheap metadata pull and returns 202 + an EnableJob;
+ * progress arrives via `useEnableJobs`' polling. Errors from the
+ * validation pull propagate verbatim — the panel renders them inline. */
 export function useEnableImage() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (imageUri: string) => enableImage(imageUri),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: KEY });
+      qc.invalidateQueries({ queryKey: ['enable-jobs'] });
     },
   });
 }
@@ -47,15 +48,16 @@ export function useDisableImage() {
   });
 }
 
-/** Mutation: refresh — re-pull the manifest layer for an already-
- * enabled URI. Useful when a moved tag (e.g. `:latest`) now resolves
- * to a new digest. The row's `id` and `created_at` are preserved. */
+/** Mutation: refresh — re-runs the enable pipeline for an already-
+ * enabled URI (ADR 0036: async, returns 202 + an EnableJob). Useful
+ * when a moved tag (e.g. `:latest`) now resolves to a new digest.
+ * The row's `id` and `created_at` are preserved by the upsert. */
 export function useRefreshEnabledImage() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (imageUri: string) => refreshEnabledImage(imageUri),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: KEY });
+      qc.invalidateQueries({ queryKey: ['enable-jobs'] });
     },
   });
 }

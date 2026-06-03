@@ -20,18 +20,17 @@
 //! it only when the registry host is `localhost`, `127.0.0.1`, or
 //! `::1` — same heuristic Docker uses for `--insecure-registry`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
-use futures::TryStreamExt;
-use oci_client::client::{
-    BlobResponse, ClientConfig, ClientProtocol, Config, ImageLayer, PushResponse,
-};
-use oci_client::manifest::OCI_IMAGE_MEDIA_TYPE;
+use bytes::Bytes;
+use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer, PushResponse};
+use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest, OCI_IMAGE_MEDIA_TYPE};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference, RegistryOperation};
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -75,39 +74,55 @@ impl RegistryAuthResolver for AnonymousResolver {
 /// and credential resolution.
 #[derive(Clone)]
 pub struct OciClient {
+    /// Client for HTTPS registries (everything except loopback).
     inner: Client,
+    /// Client for plaintext loopback registries (`localhost:5001`).
+    inner_http: Client,
+    /// Plain HTTP client for the blob-existence HEAD probe (the one
+    /// OCI Distribution verb `oci-client` doesn't expose).
+    http: reqwest::Client,
+    /// Bearer tokens for [`Self::blob_exists`]'s HEAD probes, keyed
+    /// by `(registry, repository)`. Independent of `oci-client`'s
+    /// internal token cache (which it doesn't expose).
+    head_tokens: Arc<Mutex<HashMap<(String, String), String>>>,
     auth: Arc<dyn RegistryAuthResolver>,
 }
 
 impl OciClient {
     pub fn new(auth: Arc<dyn RegistryAuthResolver>) -> Self {
-        // We can't know per-call which registries are HTTP vs HTTPS at
-        // construction time (the user passes URIs as strings). Set
-        // `Https` as the default; we re-pick the protocol per push/pull
-        // by reconstructing the client config when the host looks
-        // plaintext-eligible (loopback). This is mildly inefficient but
-        // simple — registries are pulled from infrequently relative to
-        // session creation throughput.
+        // Two cached inner clients, one per protocol. They MUST be
+        // cached on the struct rather than rebuilt per call: the
+        // bearer-token cache lives inside `Client`, so a fresh client
+        // per operation re-mints a token from the registry's token
+        // endpoint on every call. ADR 0036: that per-chunk token
+        // minting (~625 extra requests per enable) is what tripped
+        // GitHub's secondary rate limiting during image enables.
         let inner = Client::new(ClientConfig {
             protocol: ClientProtocol::Https,
             ..Default::default()
         });
-        Self { inner, auth }
+        let inner_http = Client::new(ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        });
+        Self {
+            inner,
+            inner_http,
+            http: reqwest::Client::new(),
+            head_tokens: Arc::new(Mutex::new(HashMap::new())),
+            auth,
+        }
     }
 
-    /// Build a client whose protocol matches `reference`'s registry
-    /// host: `Http` for loopback, `Https` otherwise. Used per-operation
-    /// because plaintext is the wrong default everywhere except dev.
-    fn client_for(reference: &Reference) -> Client {
-        let proto = if is_loopback_host(reference.registry()) {
-            ClientProtocol::Http
+    /// The cached client whose protocol matches `reference`'s registry
+    /// host: `Http` for loopback, `Https` otherwise. Plaintext is the
+    /// wrong default everywhere except dev.
+    fn client_for(&self, reference: &Reference) -> &Client {
+        if is_loopback_host(reference.registry()) {
+            &self.inner_http
         } else {
-            ClientProtocol::Https
-        };
-        Client::new(ClientConfig {
-            protocol: proto,
-            ..Default::default()
-        })
+            &self.inner
+        }
     }
 
     async fn auth_for(&self, reference: &Reference) -> Result<RegistryAuth, OciError> {
@@ -155,7 +170,7 @@ impl OciClient {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
+        let client = self.client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
         let manifest_layer = ImageLayer::new(
@@ -196,29 +211,33 @@ impl OciClient {
         Ok(Digest256(resp.manifest_url))
     }
 
-    /// Pull a bake image artifact. Writes
-    /// `<dest>/manifest.toml` and `<dest>/rootfs.ext4`. Returns the
-    /// digest of the OCI manifest (a content address — a re-pull of
-    /// the same tag with unchanged layers yields the same digest).
+    /// Pull a bake image artifact's *metadata* layers to disk:
+    /// `<dest>/manifest.toml`, plus `bundle.json` /
+    /// `bootstrap.disk.json` / `rootfs.ext4` when the artifact
+    /// carries them. Returns the digest of the OCI manifest (a
+    /// content address — a re-pull of the same tag with unchanged
+    /// layers yields the same digest).
+    ///
+    /// ADR 0036: descriptor-driven. Chunk layers
+    /// ([`ENGRAM_CHUNK_MEDIA_TYPE`]) are **never** downloaded here —
+    /// a chunked image carries one OCI blob per 16 MiB chunk and the
+    /// runtime fetches individual chunks on fault via
+    /// [`Self::pull_chunk`]. The legacy `rootfs.ext4` layer (dev-only
+    /// non-chunked bakes) streams straight to disk rather than
+    /// through memory.
     pub async fn pull_image(&self, uri: &str, dest: &Path) -> Result<PulledImage, OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
+        let client = self.client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
-        let accepted = vec![
-            ENGRAM_MANIFEST_MEDIA_TYPE,
-            ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
-            ENGRAM_BUNDLE_MEDIA_TYPE,
-            ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
-            ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
-            OCI_IMAGE_MEDIA_TYPE,
-        ];
-        let data = client
-            .pull(&reference, &auth, accepted)
+        // Manifest only — layer descriptors, no bodies. Also primes
+        // the client's token cache for the per-layer pulls below.
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
             .await
-            .map_err(|e| OciError::Distribution(e.to_string()))?;
+            .map_err(|e| OciError::Distribution(format!("pull manifest for {uri}: {e}")))?;
 
         tokio::fs::create_dir_all(dest)
             .await
@@ -228,37 +247,32 @@ impl OciClient {
         let mut rootfs_path = None;
         let mut bundle_path = None;
         let mut disk_bootstrap_path = None;
-        let mut disk_chunks_blob_digest = None;
-        for layer in &data.layers {
-            match layer.media_type.as_str() {
+        for desc in &manifest.layers {
+            match desc.media_type.as_str() {
                 ENGRAM_MANIFEST_MEDIA_TYPE => {
                     let p = dest.join("manifest.toml");
-                    write_file_bytes(&p, &layer.data).await?;
+                    pull_layer_to_file(client, &reference, desc, &p).await?;
                     manifest_path = Some(p);
                 }
                 ENGRAM_ROOTFS_EXT4_MEDIA_TYPE => {
                     let p = dest.join("rootfs.ext4");
-                    write_file_bytes(&p, &layer.data).await?;
+                    pull_layer_to_file(client, &reference, desc, &p).await?;
                     rootfs_path = Some(p);
                 }
                 ENGRAM_BUNDLE_MEDIA_TYPE => {
                     let p = dest.join("bundle.json");
-                    write_file_bytes(&p, &layer.data).await?;
+                    pull_layer_to_file(client, &reference, desc, &p).await?;
                     bundle_path = Some(p);
                 }
                 ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE => {
                     let p = dest.join("bootstrap.disk.json");
-                    write_file_bytes(&p, &layer.data).await?;
+                    pull_layer_to_file(client, &reference, desc, &p).await?;
                     disk_bootstrap_path = Some(p);
                 }
-                ENGRAM_CHUNKS_DISK_MEDIA_TYPE => {
-                    // We deliberately do *not* write the chunk blob
-                    // to disk. The whole point of Nydus-shaped
-                    // artifacts is that chunks are Range-GETted
-                    // lazily — pulling the full blob defeats that.
-                    // Record the layer digest so the resolver can
-                    // address it later.
-                    disk_chunks_blob_digest = Some(sha256_digest(&layer.data).0);
+                ENGRAM_CHUNK_MEDIA_TYPE => {
+                    // Chunks are fetched individually on fault
+                    // (tiered resolver) or at enable-time materialize
+                    // — never as part of a metadata pull.
                 }
                 other => {
                     tracing::debug!(media_type = %other, "skipping unrecognized layer");
@@ -285,97 +299,32 @@ impl OciClient {
             rootfs_path,
             bundle_path,
             disk_bootstrap_path,
-            disk_chunks_blob_digest,
-            manifest_digest: Digest256(data.digest.unwrap_or_default()),
+            manifest_digest: Digest256(manifest_digest),
         })
     }
 
-    /// Fetch the engram manifest.toml layer and the optional
-    /// bundle.json layer of an engram image artifact, plus the
-    /// top-level manifest digest. Skips writing the rootfs.ext4
-    /// layer entirely.
-    ///
-    /// Used by the coordinator's `/api/enabled-images` POST handler:
-    /// when an operator enables an image, we cache its parsed
-    /// manifest on the row so session-create has zero registry I/O.
-    /// ADR 0014 M1.11 added the bundle.json extraction so the same
-    /// pull also drives the templates-cascade — when the bundle
-    /// carries a `canonical_snapshot` block, the handler inserts
-    /// `snapshots` + `templates` rows in one PG transaction.
-    ///
-    /// `oci-distribution`'s `pull` is a single round-trip for the
-    /// index + all layer blobs, so we still pay one fetch for the
-    /// rootfs bytes — but we don't write them anywhere. The
-    /// savings vs. a full `pull_image()` are storage (no rootfs.ext4
-    /// file written) and cleanup (no temp dir to manage).
-    pub async fn pull_engram_metadata(&self, uri: &str) -> Result<EngramMetadataLayers, OciError> {
-        let reference: Reference = uri
-            .parse()
-            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
-        let auth = self.auth_for(&reference).await?;
-
-        // Must list every media type the artifact may carry —
-        // oci-client validates each pulled layer against this set and
-        // errors on the first mismatch (even though we only consume
-        // the manifest + bundle layers here). Keep this in sync with
-        // [`Self::pull_image`]'s accepted list.
-        let accepted = vec![
-            ENGRAM_MANIFEST_MEDIA_TYPE,
-            ENGRAM_ROOTFS_EXT4_MEDIA_TYPE,
-            ENGRAM_BUNDLE_MEDIA_TYPE,
-            ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
-            ENGRAM_CHUNKS_DISK_MEDIA_TYPE,
-            OCI_IMAGE_MEDIA_TYPE,
-        ];
-        let data = client
-            .pull(&reference, &auth, accepted)
-            .await
-            .map_err(|e| OciError::Distribution(e.to_string()))?;
-
-        let manifest_layer = data
-            .layers
-            .iter()
-            .find(|l| l.media_type == ENGRAM_MANIFEST_MEDIA_TYPE)
-            .ok_or_else(|| {
-                OciError::Distribution("pulled artifact missing engram manifest layer".into())
-            })?;
-        let bundle_bytes = data
-            .layers
-            .iter()
-            .find(|l| l.media_type == ENGRAM_BUNDLE_MEDIA_TYPE)
-            .map(|l| l.data.clone());
-
-        Ok(EngramMetadataLayers {
-            manifest_toml: manifest_layer.data.clone(),
-            manifest_digest: Digest256(data.digest.unwrap_or_default()),
-            bundle_json: bundle_bytes,
-        })
-    }
-
-    /// ADR 0014 M1.11 / ADR 0007: pull the *metadata* layers of the
-    /// engram artifact at `uri` — manifest, bundle, disk-bootstrap (all
-    /// small) — into memory, and record the disk-chunks layer's OCI
-    /// digest **without downloading it**. The coord's `enable_image`
-    /// materializer then Range-GETs each chunk it actually needs via
-    /// [`OciClient::fetch_blob_range`], so the coord's RAM stays bounded
-    /// regardless of rootfs size — mirroring what `pull_image` /
-    /// `OciChunkResolver` already do on the host.
+    /// ADR 0014 M1.11 / ADR 0007 / ADR 0036: pull the *metadata*
+    /// layers of the engram artifact at `uri` — manifest, bundle,
+    /// disk-bootstrap (all small) — into memory. Chunk layers are
+    /// **never** downloaded here; the coord's `enable_image`
+    /// materializer fetches each chunk it actually needs via
+    /// [`OciClient::pull_chunk`], so the coord's RAM stays bounded
+    /// regardless of rootfs size.
     ///
     /// This replaces an earlier variant that pulled the whole chunk blob
     /// into memory ("fine for a demo image; we'd stream multi-GiB ones
     /// later"): a 7.6 GiB dogfood image OOM-killed the 2 GiB coord pod
-    /// during enable. This is that streaming variant.
+    /// during enable.
     pub async fn pull_template_metadata(&self, uri: &str) -> Result<TemplateArtifacts, OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
+        let client = self.client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
         // Manifest only — layer descriptors, no bodies. This also
         // populates the client's token cache so the per-layer pulls
-        // below (and the materializer's later Range GETs) authenticate.
+        // below (and the materializer's later chunk pulls) authenticate.
         let (manifest, manifest_digest) = client
             .pull_image_manifest(&reference, &auth)
             .await
@@ -386,25 +335,23 @@ impl OciClient {
             manifest_toml: Vec::new(),
             bundle_json: None,
             disk_bootstrap_json: None,
-            disk_chunks_blob_digest: None,
         };
         for desc in &manifest.layers {
             match desc.media_type.as_str() {
                 ENGRAM_MANIFEST_MEDIA_TYPE => {
-                    out.manifest_toml = pull_layer_to_vec(&client, &reference, desc).await?;
+                    out.manifest_toml = pull_layer_to_vec(client, &reference, desc).await?;
                 }
                 ENGRAM_BUNDLE_MEDIA_TYPE => {
-                    out.bundle_json = Some(pull_layer_to_vec(&client, &reference, desc).await?);
+                    out.bundle_json = Some(pull_layer_to_vec(client, &reference, desc).await?);
                 }
                 ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE => {
                     out.disk_bootstrap_json =
-                        Some(pull_layer_to_vec(&client, &reference, desc).await?);
+                        Some(pull_layer_to_vec(client, &reference, desc).await?);
                 }
-                // The big one: record its digest, never download the bytes.
-                // `enable_image` Range-GETs chunks via `fetch_blob_range`.
-                ENGRAM_CHUNKS_DISK_MEDIA_TYPE => {
-                    out.disk_chunks_blob_digest = Some(desc.digest.clone());
-                }
+                // Chunk layers: deliberately skipped — the bootstrap
+                // carries every chunk's digest; the materializer pulls
+                // only the chunks missing from BlobStorage.
+                ENGRAM_CHUNK_MEDIA_TYPE => {}
                 _ => {}
             }
         }
@@ -422,7 +369,7 @@ impl OciClient {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
+        let client = self.client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
         let tar_gz = tar_gz_dir(pack_dir).await?;
@@ -447,7 +394,7 @@ impl OciClient {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
+        let client = self.client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
         let accepted = vec![ENGRAM_HARNESS_TAR_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE];
@@ -483,155 +430,368 @@ impl OciClient {
         &self.inner
     }
 
-    /// Push a Nydus-shaped chunked image artifact (ADR 0008 Phase 3).
+    /// Prime the cached client's bearer-token cache for **push**
+    /// operations against `uri`'s registry/repo. Call once per push
+    /// run before [`Self::blob_exists`] / [`Self::push_chunk_blob`] /
+    /// [`Self::push_chunked_image_manifest`] — `oci-client`'s
+    /// `apply_auth` only *reads* its token cache; it never mints.
+    pub async fn auth_for_push(&self, uri: &str) -> Result<(), OciError> {
+        let reference: Reference = uri
+            .parse()
+            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
+        let client = self.client_for(&reference);
+        let auth = self.auth_for(&reference).await?;
+        client
+            .auth(&reference, &auth, RegistryOperation::Push)
+            .await
+            .map_err(|e| OciError::Distribution(format!("auth (push): {e}")))?;
+        Ok(())
+    }
+
+    /// HEAD `/v2/<repo>/blobs/<digest>` — does the registry already
+    /// have this blob? The delta-push primitive (ADR 0036): the bake
+    /// probes every chunk digest and uploads only the missing ones,
+    /// exactly like `docker push` skips layers the registry has.
     ///
-    /// Layers pushed (in order):
+    /// `oci-client` doesn't expose HEAD-blob, so this speaks the
+    /// token dance directly: HEAD → 401 + `WWW-Authenticate` → mint
+    /// a bearer token (Basic creds from the resolver when present) →
+    /// retry. Tokens are cached per `(registry, repo)` on the client,
+    /// so a 625-chunk sweep costs one mint.
+    pub async fn blob_exists(&self, uri: &str, digest: &str) -> Result<bool, OciError> {
+        let reference: Reference = uri
+            .parse()
+            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
+        let registry = reference.registry().to_string();
+        let repo = reference.repository().to_string();
+        let scheme = if is_loopback_host(&registry) {
+            "http"
+        } else {
+            "https"
+        };
+        let url = format!("{scheme}://{registry}/v2/{repo}/blobs/{digest}");
+
+        let cached = self
+            .head_tokens
+            .lock()
+            .get(&(registry.clone(), repo.clone()))
+            .cloned();
+        let mut req = self.http.head(&url);
+        if let Some(tok) = &cached {
+            req = req.bearer_auth(tok);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| OciError::Distribution(format!("HEAD {url}: {e}")))?;
+
+        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    OciError::Distribution(format!("HEAD {url}: 401 without WWW-Authenticate"))
+                })?
+                .to_string();
+            let token = self.mint_head_token(&registry, &challenge).await?;
+            self.head_tokens
+                .lock()
+                .insert((registry.clone(), repo.clone()), token.clone());
+            self.http
+                .head(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map_err(|e| OciError::Distribution(format!("HEAD {url} (authed): {e}")))?
+        } else {
+            resp
+        };
+
+        match resp.status() {
+            s if s.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            s => Err(OciError::Distribution(format!(
+                "HEAD {url}: unexpected status {s}"
+            ))),
+        }
+    }
+
+    /// Mint a bearer token from the realm advertised in a
+    /// `WWW-Authenticate: Bearer realm="…",service="…",scope="…"`
+    /// challenge, using Basic creds from the resolver when present.
+    async fn mint_head_token(&self, registry: &str, challenge: &str) -> Result<String, OciError> {
+        let params = parse_bearer_challenge(challenge).ok_or_else(|| {
+            OciError::Distribution(format!(
+                "unparseable WWW-Authenticate challenge from {registry}: {challenge}"
+            ))
+        })?;
+        let mut req = self.http.get(&params.realm);
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(service) = &params.service {
+            query.push(("service", service));
+        }
+        if let Some(scope) = &params.scope {
+            query.push(("scope", scope));
+        }
+        req = req.query(&query);
+        if let Some(creds) = self.auth.resolve(registry).await? {
+            req = req.basic_auth(creds.username, Some(creds.password));
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| OciError::Distribution(format!("token mint from {}: {e}", params.realm)))?
+            .error_for_status()
+            .map_err(|e| {
+                OciError::Distribution(format!("token mint from {}: {e}", params.realm))
+            })?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| OciError::Distribution(format!("token body: {e}")))?;
+        body.get("token")
+            .or_else(|| body.get("access_token"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                OciError::Distribution(format!(
+                    "token response from {} has neither `token` nor `access_token`",
+                    params.realm
+                ))
+            })
+    }
+
+    /// Push one content-addressed chunk blob (ADR 0036). `digest`
+    /// MUST be `sha256:` over `bytes` — the registry verifies it at
+    /// upload, which is exactly the property that makes the chunk
+    /// hash and the OCI digest the same address.
     ///
-    /// - `manifest.toml` (always)
-    /// - `bundle.json` v2 (always — carries the bootstrap layer
-    ///   digests so consumers can locate them)
-    /// - `bootstrap.disk.v1+json` (always)
-    /// - `chunks.disk.v1` (always)
-    /// - `bootstrap.memory.v1+json` (when canonical memory was
-    ///   captured at bake time)
-    /// - `chunks.memory.v1` (paired with the memory bootstrap)
-    ///
-    /// The bake is expected to have pre-computed the bootstrap +
-    /// chunk-blob bytes via `engram_chunk_store::Bootstrap::build_from_manifest`
-    /// and to have written their sha256 digests into `bundle.json`
-    /// before passing the bytes here. The OCI registry verifies the
-    /// digests at push time.
-    ///
-    /// Note on memory cost: chunk-blob layers are passed as
-    /// `Vec<u8>`; a 4 GiB ext4 image gives a 4 GiB allocation. v1
-    /// accepts this; the obvious follow-up is a streaming push that
-    /// reads from a temp file. The `oci-client` API doesn't expose
-    /// streaming pushes today (`ImageLayer::new` takes owned bytes),
-    /// so this is non-trivial — leave for when bakes hit memory
-    /// pressure on a real builder.
-    pub async fn push_chunked_image(
+    /// Call [`Self::auth_for_push`] once before a push run to avoid
+    /// a thundering herd of first-401 re-auths from concurrent
+    /// pushes; mid-run token expiry (GHCR bearer tokens live ~5 min;
+    /// big pushes run longer) is handled here by a re-auth + retry.
+    /// Skip-if-present is the caller's job via [`Self::blob_exists`].
+    pub async fn push_chunk_blob(
         &self,
         uri: &str,
-        payload: ChunkedPushPayload,
+        digest: &str,
+        bytes: &[u8],
+    ) -> Result<(), OciError> {
+        let reference: Reference = uri
+            .parse()
+            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
+        let client = self.client_for(&reference);
+        self.push_blob_reauth(client, &reference, bytes, digest)
+            .await
+    }
+
+    /// `push_blob` with one re-auth + retry on 401 — the bearer
+    /// token minted at the start of a push run expires mid-run for
+    /// large images. `oci-client`'s `apply_auth` only reads its
+    /// token cache (it never re-mints), so expiry must be handled
+    /// at this layer.
+    async fn push_blob_reauth(
+        &self,
+        client: &Client,
+        reference: &Reference,
+        bytes: &[u8],
+        digest: &str,
+    ) -> Result<(), OciError> {
+        match client.push_blob(reference, bytes, digest).await {
+            Ok(_) => Ok(()),
+            Err(oci_client::errors::OciDistributionError::UnauthorizedError { .. }) => {
+                let auth = self.auth_for(reference).await?;
+                client
+                    .auth(reference, &auth, RegistryOperation::Push)
+                    .await
+                    .map_err(|e| OciError::Distribution(format!("re-auth (push): {e}")))?;
+                client
+                    .push_blob(reference, bytes, digest)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        OciError::Distribution(format!("push blob {digest} (re-authed): {e}"))
+                    })
+            }
+            Err(e) => Err(OciError::Distribution(format!("push blob {digest}: {e}"))),
+        }
+    }
+
+    /// Push the manifest of a chunked image artifact (ADR 0036):
+    /// the small metadata layers (pushed here as blobs) plus one
+    /// layer descriptor per chunk (whose blobs the caller already
+    /// pushed via [`Self::push_chunk_blob`] / skipped via
+    /// [`Self::blob_exists`]).
+    ///
+    /// Layer order: manifest.toml, bundle.json, bootstrap.disk.json,
+    /// then every chunk in bootstrap-entry order. Consumers dispatch
+    /// on mediaType, not position.
+    pub async fn push_chunked_image_manifest(
+        &self,
+        uri: &str,
+        layers: ChunkedImageLayers,
+        chunks: &[ChunkLayerRef],
     ) -> Result<Digest256, OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
-        let auth = self.auth_for(&reference).await?;
+        let client = self.client_for(&reference);
 
-        let layers = vec![
-            ImageLayer::new(
-                payload.manifest_toml,
-                ENGRAM_MANIFEST_MEDIA_TYPE.to_string(),
-                None,
+        // Push the small layers + config as blobs, collecting
+        // descriptors as we go.
+        let mut descriptors = Vec::with_capacity(3 + chunks.len());
+        for (bytes, media_type) in [
+            (&layers.manifest_toml, ENGRAM_MANIFEST_MEDIA_TYPE),
+            (&layers.bundle_json, ENGRAM_BUNDLE_MEDIA_TYPE),
+            (
+                &layers.disk_bootstrap_json,
+                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
             ),
-            ImageLayer::new(
-                payload.bundle_json,
-                ENGRAM_BUNDLE_MEDIA_TYPE.to_string(),
-                None,
-            ),
-            ImageLayer::new(
-                payload.disk_bootstrap_json,
-                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE.to_string(),
-                None,
-            ),
-            ImageLayer::new(
-                payload.disk_chunks_blob,
-                ENGRAM_CHUNKS_DISK_MEDIA_TYPE.to_string(),
-                None,
-            ),
-        ];
+        ] {
+            let digest = sha256_digest(bytes);
+            self.push_blob_reauth(client, &reference, bytes, digest.as_str())
+                .await?;
+            descriptors.push(OciDescriptor {
+                media_type: media_type.to_string(),
+                digest: digest.0,
+                size: bytes.len() as i64,
+                ..Default::default()
+            });
+        }
+        for c in chunks {
+            descriptors.push(OciDescriptor {
+                media_type: ENGRAM_CHUNK_MEDIA_TYPE.to_string(),
+                digest: c.digest.clone(),
+                size: c.size as i64,
+                ..Default::default()
+            });
+        }
 
-        let config = Config::new(
-            payload.config_json,
-            ENGRAM_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            None,
-        );
+        let config_digest = sha256_digest(&layers.config_json);
+        self.push_blob_reauth(
+            client,
+            &reference,
+            &layers.config_json,
+            config_digest.as_str(),
+        )
+        .await?;
 
-        let resp: PushResponse = client
-            .push(&reference, &layers, config, &auth, None)
+        let manifest = OciImageManifest {
+            media_type: Some(OCI_IMAGE_MEDIA_TYPE.to_string()),
+            config: OciDescriptor {
+                media_type: ENGRAM_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+                digest: config_digest.0,
+                size: layers.config_json.len() as i64,
+                ..Default::default()
+            },
+            layers: descriptors,
+            ..Default::default()
+        };
+        let url = match client
+            .push_manifest(&reference, &OciManifest::Image(manifest.clone()))
             .await
-            .map_err(|e| OciError::Distribution(e.to_string()))?;
-        Ok(Digest256(resp.manifest_url))
+        {
+            Ok(url) => url,
+            Err(oci_client::errors::OciDistributionError::UnauthorizedError { .. }) => {
+                let auth = self.auth_for(&reference).await?;
+                client
+                    .auth(&reference, &auth, RegistryOperation::Push)
+                    .await
+                    .map_err(|e| OciError::Distribution(format!("re-auth (push): {e}")))?;
+                client
+                    .push_manifest(&reference, &OciManifest::Image(manifest))
+                    .await
+                    .map_err(|e| {
+                        OciError::Distribution(format!("push manifest (re-authed): {e}"))
+                    })?
+            }
+            Err(e) => return Err(OciError::Distribution(format!("push manifest: {e}"))),
+        };
+        Ok(Digest256(url))
     }
 
-    /// Fetch a byte range from an OCI blob via an HTTP `Range`
-    /// request. Used by [`OciChunkResolver`] (ADR 0008 Phase 2) to
-    /// pull a single chunk out of a chunked OCI blob layer without
-    /// downloading the entire layer.
+    /// Pull one chunk blob by digest (ADR 0036). `oci-client`
+    /// verifies the response body hashes to `digest` before this
+    /// returns, so the bytes are trustworthy as-is; callers that
+    /// address chunks by `ChunkHash` get verify-on-fetch for free
+    /// because the OCI digest *is* the chunk hash.
     ///
-    /// `uri` identifies the registry/repo (the OCI image URI; the
-    /// tag portion is ignored for blob lookup). `blob_digest` is the
-    /// OCI layer digest (`sha256:<hex>`). `offset` + `length` define
-    /// the byte range; the registry returns
-    /// `[offset, offset+length)`.
+    /// Auth is lazy: the first pull (or one whose bearer token
+    /// expired mid-run) hits a 401, re-auths once, and retries.
+    /// Crucially the token then lives in the **cached** client's
+    /// token cache, so subsequent pulls are a single GET — not the
+    /// fresh-client-per-chunk token-mint storm that tripped GitHub's
+    /// rate limiting (ADR 0036).
     ///
-    /// The returned bytes are **not** verified — the OCI layer
-    /// digest covers the whole blob, not arbitrary ranges, so
-    /// oci-client can't verify a partial response. Callers must
-    /// hash-verify against their per-chunk expectation; that's
-    /// exactly what `OciChunkResolver` does using the per-chunk
-    /// `sha256` from the bootstrap layer.
-    ///
-    /// Fails with `OciError::Distribution` if the registry doesn't
-    /// honor the `Range` request (returns the full blob instead) —
-    /// ADR 0008's chunked-OCI fault path requires partial responses
-    /// to be viable; downloading a GB-scale chunk blob per fault is
-    /// not acceptable. ECR / GAR / GHCR / Harbor are known to
-    /// honor Range; some self-hosted registries don't.
-    pub async fn fetch_blob_range(
-        &self,
-        uri: &str,
-        blob_digest: &str,
-        offset: u64,
-        length: u64,
-    ) -> Result<Bytes, OciError> {
-        if length == 0 {
-            return Ok(Bytes::new());
-        }
+    /// `size` pre-sizes the buffer (the bootstrap entry's `length`).
+    pub async fn pull_chunk(&self, uri: &str, digest: &str, size: u64) -> Result<Bytes, OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = Self::client_for(&reference);
-        let auth = self.auth_for(&reference).await?;
+        let client = self.client_for(&reference);
 
-        // Populate the token cache for this registry/repo. Without
-        // this, pull_blob_stream_partial's internal `apply_auth`
-        // doesn't have a bearer token to apply.
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|e| OciError::Distribution(format!("auth: {e}")))?;
-
-        let response = client
-            .pull_blob_stream_partial(&reference, blob_digest, offset, Some(length))
-            .await
-            .map_err(|e| OciError::Distribution(format!("pull_blob_stream_partial: {e}")))?;
-
-        let stream = match response {
-            BlobResponse::Partial(s) => s,
-            BlobResponse::Full(_) => {
-                return Err(OciError::Distribution(format!(
-                    "registry returned full blob for Range request on {blob_digest}; \
-                     ADR 0008 chunked-OCI fault path requires Range support \
-                     (known-good: ECR, GAR, GHCR, Harbor)"
-                )));
-            }
+        let desc = OciDescriptor {
+            media_type: ENGRAM_CHUNK_MEDIA_TYPE.to_string(),
+            digest: digest.to_string(),
+            size: size as i64,
+            ..Default::default()
         };
-
-        // Drain the stream into a single Bytes. Pre-size to length so
-        // the registry can give us a single allocation.
-        let mut buf = BytesMut::with_capacity(length as usize);
-        let chunks: Vec<Bytes> = stream
-            .try_collect()
-            .await
-            .map_err(|e| OciError::Distribution(format!("stream: {e}")))?;
-        for c in chunks {
-            buf.extend_from_slice(&c);
+        let mut buf = Vec::with_capacity(size as usize);
+        match client.pull_blob(&reference, &desc, &mut buf).await {
+            Ok(()) => {}
+            Err(oci_client::errors::OciDistributionError::UnauthorizedError { .. }) => {
+                let auth = self.auth_for(&reference).await?;
+                client
+                    .auth(&reference, &auth, RegistryOperation::Pull)
+                    .await
+                    .map_err(|e| OciError::Distribution(format!("re-auth (pull): {e}")))?;
+                buf.clear();
+                client
+                    .pull_blob(&reference, &desc, &mut buf)
+                    .await
+                    .map_err(|e| {
+                        OciError::Distribution(format!("pull chunk {digest} (re-authed): {e}"))
+                    })?;
+            }
+            Err(e) => {
+                return Err(OciError::Distribution(format!("pull chunk {digest}: {e}")));
+            }
         }
-        Ok(buf.freeze())
+        Ok(Bytes::from(buf))
     }
+}
+
+/// Parameters of a `WWW-Authenticate: Bearer …` challenge.
+struct BearerChallengeParams {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+/// Parse `Bearer realm="…",service="…",scope="…"` (any order,
+/// quoted values). Returns `None` for non-Bearer or realm-less
+/// challenges.
+fn parse_bearer_challenge(challenge: &str) -> Option<BearerChallengeParams> {
+    let rest = challenge.trim().strip_prefix("Bearer ")?;
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+    for part in rest.split(',') {
+        let (k, v) = part.trim().split_once('=')?;
+        let v = v.trim().trim_matches('"').to_string();
+        match k.trim() {
+            "realm" => realm = Some(v),
+            "service" => service = Some(v),
+            "scope" => scope = Some(v),
+            _ => {}
+        }
+    }
+    Some(BearerChallengeParams {
+        realm: realm?,
+        service,
+        scope,
+    })
 }
 
 /// `sha256:...` content digest of an OCI manifest.
@@ -649,40 +809,20 @@ impl Digest256 {
     }
 }
 
-/// Result of `pull_engram_metadata`. Carries the manifest.toml
-/// layer bytes plus, when present, the bundle.json layer bytes —
-/// both layers are small (manifest is hundreds of bytes; bundle is
-/// tens of KiB). The caller (coord's `/api/enabled-images` handler)
-/// decodes each as needed.
-#[derive(Clone, Debug)]
-pub struct EngramMetadataLayers {
-    pub manifest_toml: Vec<u8>,
-    pub manifest_digest: Digest256,
-    /// `None` for artifacts that pre-date ADR 0014 M1.3 (no
-    /// `bundle.json` layer was attached at bake). Older bakes
-    /// still enable cleanly; they just don't cascade into a
-    /// templates row.
-    pub bundle_json: Option<Vec<u8>>,
-}
-
 /// ADR 0014 M1.11: the metadata view of an engram OCI artifact, consumed
 /// by the coord's `enable_image` materializer. The small layers (manifest
-/// / bundle / disk-bootstrap) are pulled into memory; the potentially
-/// multi-GiB disk-chunks layer is **not** — we record only its OCI digest
-/// and the materializer Range-GETs each chunk it actually needs (mirroring
-/// the host's `pull_image` / `OciChunkResolver`). That keeps the coord's
-/// RAM bounded regardless of image size — without it, enabling a large
-/// image OOM-kills the coord pod.
+/// / bundle / disk-bootstrap) are pulled into memory; chunk layers are
+/// **not** — the bootstrap carries every chunk's digest and the
+/// materializer pulls each chunk it actually needs via
+/// [`OciClient::pull_chunk`]. That keeps the coord's RAM bounded
+/// regardless of image size — without it, enabling a large image
+/// OOM-kills the coord pod.
 #[derive(Clone, Debug)]
 pub struct TemplateArtifacts {
     pub manifest_toml: Vec<u8>,
     pub manifest_digest: Digest256,
     pub bundle_json: Option<Vec<u8>>,
     pub disk_bootstrap_json: Option<Vec<u8>>,
-    /// OCI digest (`sha256:<hex>`) of the disk-chunks layer — `Some` when
-    /// the bake emitted chunked-disk layers. The blob is never pulled
-    /// whole; `fetch_blob_range` reads per-chunk slices on demand.
-    pub disk_chunks_blob_digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -699,33 +839,37 @@ pub struct PulledImage {
     /// storage rollout, absent for older artifacts (we still
     /// accept those during the transition window).
     pub bundle_path: Option<PathBuf>,
-    /// ADR 0008 Phase 3: bootstrap layer for the disk side
-    /// (Nydus-shaped chunked artifact). When `Some`, the artifact
-    /// carries chunks as OCI layers and the host's tiered fault
-    /// path can Range-GET them from the registry directly.
+    /// ADR 0008 Phase 3 / ADR 0036: bootstrap layer for the disk
+    /// side. When `Some`, the artifact carries one OCI blob per
+    /// chunk and the host's tiered fault path can pull individual
+    /// chunks from the registry directly (the bootstrap entries
+    /// carry each chunk's blob digest).
     pub disk_bootstrap_path: Option<PathBuf>,
-    /// ADR 0008 Phase 3: disk chunk-blob layer digest. The actual
-    /// blob bytes are *not* pulled by `pull_image` — the host fetches
-    /// individual chunks via Range GET on fault. We record only the
-    /// layer digest here so the runtime resolver can address the
-    /// blob.
-    pub disk_chunks_blob_digest: Option<String>,
     pub manifest_digest: Digest256,
 }
 
-/// Payload for [`OciClient::push_chunked_image`]. All-bytes shape
-/// keeps the call-site obvious; the image-builder constructs this
-/// after running `Bootstrap::build_from_manifest` to produce the
-/// per-kind bootstrap + chunk-blob bytes.
+/// Small (non-chunk) layers of a chunked image artifact (ADR 0036),
+/// passed to [`OciClient::push_chunked_image_manifest`]. All a few
+/// KB; chunk bytes never ride through this struct — they're pushed
+/// individually via [`OciClient::push_chunk_blob`].
 #[derive(Clone, Debug)]
-pub struct ChunkedPushPayload {
+pub struct ChunkedImageLayers {
     pub manifest_toml: Vec<u8>,
     pub config_json: Vec<u8>,
-    /// `bundle.json` v2 — carries the disk bootstrap/chunks layer
-    /// digests so the host's `image_cache` can resolve them.
+    /// `bundle.json` v2 — carries the bake's `disk_manifest` ref so
+    /// consumers can resolve chunks through the chunk store.
     pub bundle_json: Vec<u8>,
     pub disk_bootstrap_json: Vec<u8>,
-    pub disk_chunks_blob: Vec<u8>,
+}
+
+/// One chunk layer of a chunked image artifact (ADR 0036): its OCI
+/// blob digest (`sha256:<chunk-hash>`) and size in bytes. The
+/// manifest push records one descriptor per entry; the blobs
+/// themselves were pushed (or HEAD-skipped) beforehand.
+#[derive(Clone, Debug)]
+pub struct ChunkLayerRef {
+    pub digest: String,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -793,13 +937,6 @@ async fn read_file_bytes(path: &Path) -> Result<Vec<u8>, OciError> {
     Ok(buf)
 }
 
-async fn write_file_bytes(path: &Path, bytes: &[u8]) -> Result<(), OciError> {
-    let mut f = tokio::fs::File::create(path).await.map_err(OciError::Io)?;
-    f.write_all(bytes).await.map_err(OciError::Io)?;
-    f.flush().await.map_err(OciError::Io)?;
-    Ok(())
-}
-
 async fn tar_gz_dir(dir: &Path) -> Result<Vec<u8>, OciError> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<Vec<u8>, std::io::Error> {
@@ -820,8 +957,8 @@ async fn tar_gz_dir(dir: &Path) -> Result<Vec<u8>, OciError> {
 }
 
 /// Pull one (small) OCI layer fully into a Vec. Used only for the
-/// metadata layers in `pull_template_metadata` — never the multi-GiB
-/// chunk blob, which is Range-GETted per-chunk instead.
+/// metadata layers in `pull_template_metadata` — never chunk layers,
+/// which are pulled individually on demand via `pull_chunk`.
 async fn pull_layer_to_vec(
     client: &Client,
     reference: &Reference,
@@ -841,6 +978,31 @@ async fn pull_layer_to_vec(
         buf.extend_from_slice(&p);
     }
     Ok(buf)
+}
+
+/// Pull one OCI layer straight to a file, streaming — bounded
+/// memory regardless of layer size (the legacy `rootfs.ext4` layer
+/// can be multi-GB). `pull_blob` verifies the bytes against the
+/// descriptor digest before this returns.
+async fn pull_layer_to_file(
+    client: &Client,
+    reference: &Reference,
+    desc: &oci_client::manifest::OciDescriptor,
+    dest: &Path,
+) -> Result<(), OciError> {
+    let mut file = tokio::fs::File::create(dest).await.map_err(OciError::Io)?;
+    client
+        .pull_blob(reference, desc, &mut file)
+        .await
+        .map_err(|e| {
+            OciError::Distribution(format!(
+                "pull layer {} to {}: {e}",
+                desc.digest,
+                dest.display()
+            ))
+        })?;
+    file.flush().await.map_err(OciError::Io)?;
+    Ok(())
 }
 
 async fn untar_gz_to_dir(bytes: &[u8], dest: &Path) -> Result<(), OciError> {

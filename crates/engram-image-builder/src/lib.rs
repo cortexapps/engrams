@@ -75,20 +75,6 @@ pub struct BuildRequest {
     /// `default_boot_args = "... init=/sbin/engram-init"` and the
     /// host's `exec_stream` reaches the in-guest agent over vsock.
     pub agent_injection: Option<AgentInjection>,
-    /// ADR 0008 Phase 4: parent image's bootstrap, for cross-image
-    /// chunk dedup. When `Some`, the disk-side bootstrap walks the
-    /// parent's entries and reuses any chunk hashes that match —
-    /// the child's diff blob then only contains chunks unique to
-    /// this image. Must be paired with `parent_chunks_blob_digest`
-    /// — the OCI layer digest of the parent's chunks blob, which
-    /// the child's bootstrap entries inherit for shared chunks.
-    ///
-    /// `None` (default) produces a fully self-contained chunk blob
-    /// (today's behavior).
-    pub parent_disk_bootstrap_path: Option<PathBuf>,
-    /// OCI layer digest of the parent's disk chunks blob. Required
-    /// when `parent_disk_bootstrap_path` is set; ignored otherwise.
-    pub parent_disk_chunks_blob_digest: Option<String>,
 }
 
 /// How to put `engram-agentd` inside the rootfs at bake time. Optional
@@ -393,16 +379,13 @@ pub struct BuildOutcome {
     pub disk_manifest: Option<engram_chunk_store::ManifestRef>,
     /// Size of `rootfs_path` on disk.
     pub size_bytes: u64,
-    /// ADR 0008 Phase 3: bootstrap JSON for the disk side of a
-    /// Nydus-shaped artifact. Sits next to `rootfs.ext4` in
-    /// `image_dir` (e.g. `image_dir/bootstrap.disk.json`). `None`
-    /// for non-Ext4 bakes (Directory) or when chunked-OCI emission
-    /// was skipped. `push_to_registry` reads both this and
-    /// `disk_chunks_blob_path` to construct a chunked OCI push.
+    /// ADR 0008 Phase 3 / ADR 0036: per-chunk bootstrap JSON for
+    /// the disk side. Sits next to `rootfs.ext4` in `image_dir`
+    /// (e.g. `image_dir/bootstrap.disk.json`). `None` for non-Ext4
+    /// bakes (Directory) or when chunked-OCI emission was skipped.
+    /// `push_to_registry` reads it to drive the per-chunk delta
+    /// push (chunk bytes come from the bake's chunk store).
     pub disk_bootstrap_path: Option<PathBuf>,
-    /// ADR 0008 Phase 3: path to the concatenated disk chunk blob.
-    /// Paired with `disk_bootstrap_path`.
-    pub disk_chunks_blob_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -775,8 +758,26 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                         None, // default 16 MiB
                     )
                     .await?;
-                let manifest_ref = engram_chunk_store::ManifestRef::new();
-                self.chunk_store.put_manifest(manifest_ref, &m).await?;
+                // ADR 0036 P4: the bake's manifest identity is derived
+                // from its content, not minted at random. Deterministic
+                // re-bakes of unchanged content therefore reproduce the
+                // SAME ManifestRef — bundle.json stays byte-identical,
+                // and the enable pipeline can recognize "already
+                // captured this exact rootfs" and reuse the base
+                // snapshot. Content-derived also means the same ref ⇒
+                // the same manifest bytes, so an already-present
+                // manifest (a prior identical bake) is success, not a
+                // VersionConflict.
+                let manifest_ref = m.content_ref();
+                match self.chunk_store.get_manifest(manifest_ref).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            manifest = %manifest_ref,
+                            "content-identical manifest already in store; skipping put"
+                        );
+                    }
+                    Err(_) => self.chunk_store.put_manifest(manifest_ref, &m).await?,
+                }
 
                 // Sidecar bundle.json so image_cache + tooling can
                 // find the manifest ref without hitting Postgres.
@@ -807,85 +808,37 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             }
         };
 
-        // ADR 0008 Phase 3: produce Nydus-shaped artifacts
-        // alongside the existing bundle.json. For each kind that
-        // has a chunked manifest, build (bootstrap, chunk_blob)
-        // and write them to image_dir. push_to_registry uploads
-        // both as new OCI layers; the runtime resolver indexes
-        // them at pull time.
-        //
-        // The disk_manifest in BlobStorage stays — image_cache's
-        // legacy path still resolves through it for v1 artifacts
-        // and dev workflows. v2 consumers prefer the bootstrap
-        // layers because they enable Range-GET-on-fault.
+        // ADR 0008 Phase 3 / ADR 0036: produce the per-chunk
+        // bootstrap alongside the existing bundle.json. Pure
+        // metadata — every entry addresses its chunk by the chunk's
+        // own sha256 (also its OCI blob digest and its BlobStorage
+        // key), so no concatenated chunk blob is built or written.
+        // `push_to_registry` pushes each chunk the registry is
+        // missing as its own blob; the runtime resolver indexes the
+        // bootstrap at pull time.
         let mut disk_bootstrap_path = None;
-        let mut disk_chunks_blob_path = None;
         if let Some(disk_ref) = disk_manifest {
             let manifest = self
                 .chunk_store
                 .get_manifest(disk_ref)
                 .await
                 .map_err(|e| BuildError::Config(format!("re-read disk manifest: {e}")))?;
-
-            // ADR 0008 Phase 4: if a parent bootstrap is supplied,
-            // dedup against it. Shared chunks travel by reference;
-            // the child's diff blob only contains chunks unique to
-            // this image.
-            let parent_bs_owned: Option<engram_chunk_store::Bootstrap> =
-                if let Some(p) = &req.parent_disk_bootstrap_path {
-                    let bytes = tokio::fs::read(p).await.map_err(BuildError::Io)?;
-                    let bs: engram_chunk_store::Bootstrap = serde_json::from_slice(&bytes)
-                        .map_err(|e| BuildError::Config(format!("parent bootstrap parse: {e}")))?;
-                    Some(bs)
-                } else {
-                    None
-                };
-            let parent_ref = match (
-                parent_bs_owned.as_ref(),
-                req.parent_disk_chunks_blob_digest.as_deref(),
-            ) {
-                (Some(bs), Some(digest)) => Some(engram_chunk_store::ParentBootstrap {
-                    bootstrap: bs,
-                    primary_blob_digest: digest,
-                }),
-                (Some(_), None) => {
-                    return Err(BuildError::Config(
-                        "parent_disk_bootstrap_path requires parent_disk_chunks_blob_digest".into(),
-                    ));
-                }
-                (None, Some(_)) => {
-                    return Err(BuildError::Config(
-                        "parent_disk_chunks_blob_digest requires parent_disk_bootstrap_path".into(),
-                    ));
-                }
-                (None, None) => None,
-            };
-
-            let (bootstrap, blob) = engram_chunk_store::Bootstrap::build_from_manifest_with_parent(
-                &self.chunk_store,
-                &manifest,
-                parent_ref.as_ref(),
-            )
-            .await
-            .map_err(|e| BuildError::Config(format!("disk bootstrap build: {e}")))?;
+            let bootstrap = engram_chunk_store::Bootstrap::build_per_chunk(&manifest);
             let bs_path = image_dir.join("bootstrap.disk.json");
-            let blob_path = image_dir.join("chunks.disk.blob");
             tokio::fs::write(
                 &bs_path,
                 serde_json::to_vec(&bootstrap)
                     .map_err(|e| BuildError::Config(format!("disk bootstrap json: {e}")))?,
             )
             .await?;
-            tokio::fs::write(&blob_path, &blob).await?;
             disk_bootstrap_path = Some(bs_path);
-            disk_chunks_blob_path = Some(blob_path);
         }
 
         // Re-write bundle.json with the disk_manifest now that the
         // ext4 branch (above) wrote a baseline. Schema bumps to v2
-        // when chunked-OCI artifacts were produced — v1 readers
+        // when the chunked-OCI bootstrap was produced — v1 readers
         // still see `disk_manifest` and work; v2 readers also
-        // consult `bootstrap_disk_available` for Range-GET-on-fault.
+        // consult `bootstrap_disk_available` for chunk-on-fault.
         if let Some(disk_ref) = disk_manifest {
             let schema_version = if disk_bootstrap_path.is_some() { 2 } else { 1 };
             let mut bundle = serde_json::json!({
@@ -893,8 +846,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 "disk_manifest": disk_ref,
             });
             if disk_bootstrap_path.is_some() {
-                // OCI layer digests are computed at push time; we
-                // just flag that the chunked-OCI shape is available.
                 bundle["bootstrap_disk_available"] = serde_json::Value::Bool(true);
             }
             tokio::fs::write(
@@ -912,7 +863,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             disk_manifest,
             size_bytes: total_size,
             disk_bootstrap_path,
-            disk_chunks_blob_path,
         })
     }
 
@@ -991,31 +941,56 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             None
         };
 
-        // ADR 0008 Phase 3: when the bake produced Nydus-shaped
-        // outputs (bootstrap + chunk_blob), push them as a
-        // chunked OCI artifact. Consumers with chunked-OCI
-        // support Range-GET individual chunks on fault; legacy
-        // consumers fall back to BlobStorage via bundle.json's
-        // disk_manifest. Both code paths see the same manifest
-        // toml + bundle.json.
-        if let (Some(bs_path), Some(blob_path), Some(bundle)) = (
-            outcome.disk_bootstrap_path.as_ref(),
-            outcome.disk_chunks_blob_path.as_ref(),
-            bundle_bytes.as_ref(),
-        ) {
+        // ADR 0036: when the bake produced a per-chunk bootstrap,
+        // push a chunked OCI artifact — one blob per chunk, delta
+        // style. HEAD each chunk digest and upload only the blobs
+        // the registry is missing (a deterministic re-bake re-pushes
+        // only its delta), then push the manifest referencing every
+        // chunk layer. Failures cost one 16 MiB blob retry, never a
+        // monolithic multi-GB upload session (the pre-ADR-0036
+        // failure mode), and the artifact stays clear of registries'
+        // per-layer size ceilings.
+        if let (Some(bs_path), Some(bundle)) =
+            (outcome.disk_bootstrap_path.as_ref(), bundle_bytes.as_ref())
+        {
             let disk_bootstrap_json = tokio::fs::read(bs_path).await.map_err(BuildError::Io)?;
-            let disk_chunks_blob = tokio::fs::read(blob_path).await.map_err(BuildError::Io)?;
+            let bootstrap: engram_chunk_store::Bootstrap =
+                serde_json::from_slice(&disk_bootstrap_json)
+                    .map_err(|e| BuildError::Config(format!("re-read disk bootstrap: {e}")))?;
 
-            let payload = engram_oci::ChunkedPushPayload {
+            let (pushed, skipped) = self.push_chunk_blobs(oci, &full_uri, &bootstrap).await?;
+            tracing::info!(
+                uri = %full_uri,
+                pushed,
+                skipped,
+                total = bootstrap.entries.len(),
+                "chunk blobs delta-pushed to registry"
+            );
+
+            let chunk_refs: Vec<engram_oci::ChunkLayerRef> = bootstrap
+                .entries
+                .iter()
+                .map(|e| {
+                    Ok(engram_oci::ChunkLayerRef {
+                        digest: e.blob_digest.clone().ok_or_else(|| {
+                            BuildError::Config(format!(
+                                "bootstrap entry {} missing per-chunk blob digest",
+                                e.sha256
+                            ))
+                        })?,
+                        size: e.length as u64,
+                    })
+                })
+                .collect::<Result<_, BuildError>>()?;
+
+            let layers = engram_oci::ChunkedImageLayers {
                 manifest_toml: manifest_bytes,
                 config_json: config_bytes,
                 bundle_json: bundle.clone(),
                 disk_bootstrap_json,
-                disk_chunks_blob,
             };
-
             let digest = oci
-                .push_chunked_image(&full_uri, payload)
+                .push_chunked_image_manifest(&full_uri, layers, &chunk_refs)
                 .await
                 .map_err(|e| BuildError::Docker(format!("oci chunked push: {e}")))?;
 
@@ -1053,6 +1028,130 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             uri: full_uri,
             manifest_digest: digest,
         })
+    }
+
+    /// ADR 0036: delta-push every chunk in `bootstrap` as its own
+    /// content-addressed OCI blob. For each entry: HEAD the digest
+    /// (skip when the registry already has it — the cross-bake dedup
+    /// that makes deterministic re-bakes upload only their delta),
+    /// else read the chunk from the bake's chunk store and push it.
+    ///
+    /// Bounded concurrency keeps peak memory at
+    /// `CONCURRENCY × chunk_size` (~128 MiB) regardless of image
+    /// size; per-blob retry with backoff means a transient blip
+    /// costs one 16 MiB re-upload, not the whole push.
+    ///
+    /// Returns `(pushed, skipped)` counts.
+    async fn push_chunk_blobs(
+        &self,
+        oci: &engram_oci::OciClient,
+        uri: &str,
+        bootstrap: &engram_chunk_store::Bootstrap,
+    ) -> Result<(usize, usize), BuildError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // One token mint for the whole run; concurrent first-pushes
+        // would otherwise each eat a 401 + re-auth.
+        oci.auth_for_push(uri)
+            .await
+            .map_err(|e| BuildError::Docker(format!("registry auth: {e}")))?;
+
+        const CONCURRENCY: usize = 8;
+        const MAX_ATTEMPTS: u32 = 5;
+
+        async fn push_one(
+            oci: &engram_oci::OciClient,
+            chunk_store: &engram_chunk_store::ChunkStore,
+            uri: &str,
+            entry: engram_chunk_store::BootstrapEntry,
+            total: usize,
+            done_so_far: usize,
+        ) -> Result<bool, BuildError> {
+            let digest = entry.blob_digest.as_deref().ok_or_else(|| {
+                BuildError::Config(format!(
+                    "bootstrap entry {} missing per-chunk blob digest",
+                    entry.sha256
+                ))
+            })?;
+            if oci
+                .blob_exists(uri, digest)
+                .await
+                .map_err(|e| BuildError::Docker(format!("HEAD {digest}: {e}")))?
+            {
+                return Ok(false);
+            }
+            let bytes = chunk_store
+                .get_chunk(entry.sha256)
+                .await
+                .map_err(|e| BuildError::Config(format!("read chunk {}: {e}", entry.sha256)))?;
+            let mut attempt = 1u32;
+            loop {
+                match oci.push_chunk_blob(uri, digest, &bytes).await {
+                    Ok(()) => break,
+                    Err(e) if attempt < MAX_ATTEMPTS => {
+                        // 429s want a politer pause than transient
+                        // connection blips.
+                        let rate_limited = e.to_string().contains("429");
+                        let backoff_ms = if rate_limited { 5_000 } else { 500 } * attempt as u64;
+                        tracing::warn!(
+                            chunk = %entry.sha256,
+                            attempt,
+                            rate_limited,
+                            error = %e,
+                            "chunk blob push failed; retrying with backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        attempt += 1;
+                    }
+                    Err(e) => {
+                        return Err(BuildError::Docker(format!(
+                            "push chunk {} after {attempt} attempts: {e}",
+                            entry.sha256
+                        )));
+                    }
+                }
+            }
+            // Progress is operator-facing: bakes run in CI where this
+            // log line is the only signal the push is alive.
+            if done_so_far.is_multiple_of(25) {
+                tracing::info!(done = done_so_far, total, "chunk push progress");
+            }
+            Ok(true)
+        }
+
+        let mut iter = bootstrap.entries.iter().enumerate();
+        let mut tasks = FuturesUnordered::new();
+        let mut pushed = 0usize;
+        let mut skipped = 0usize;
+        for _ in 0..CONCURRENCY {
+            if let Some((i, entry)) = iter.next() {
+                tasks.push(push_one(
+                    oci,
+                    &self.chunk_store,
+                    uri,
+                    entry.clone(),
+                    bootstrap.entries.len(),
+                    i,
+                ));
+            }
+        }
+        while let Some(res) = tasks.next().await {
+            match res? {
+                true => pushed += 1,
+                false => skipped += 1,
+            }
+            if let Some((i, entry)) = iter.next() {
+                tasks.push(push_one(
+                    oci,
+                    &self.chunk_store,
+                    uri,
+                    entry.clone(),
+                    bootstrap.entries.len(),
+                    i,
+                ));
+            }
+        }
+        Ok((pushed, skipped))
     }
 }
 

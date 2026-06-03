@@ -36,6 +36,7 @@ engram-sandbox-firecracker.workspace = true
 engram-agentd.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+futures.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -51,4 +52,5 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 [dev-dependencies]
 engram-storage-local.workspace = true
 parking_lot.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

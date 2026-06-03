@@ -6,15 +6,19 @@ import {
   useEnabledImages,
   useRefreshEnabledImage,
 } from '../../hooks/useEnabledImages';
-import { useEnableProgress } from '../../hooks/useEnableProgress';
-import type { EnabledImageSummary } from '../../types';
+import {
+  isJobActive,
+  useEnableJobs,
+  useRetryEnableJob,
+} from '../../hooks/useEnableJobs';
+import type { EnableJob, EnabledImageSummary } from '../../types';
 import { Field, FormError, PressButton, SubHead } from './_form';
 
-// Enabled-images panel — Stage D. Operators curate the OCI URIs
-// sessions may reference. The list reads `GET /api/enabled-images`
-// (Postgres-backed); enable hits the registry to fetch + cache the
-// manifest.toml, so session-create has zero registry I/O on the hot
-// path.
+// Enabled-images panel — Stage D + ADR 0036. Operators curate the OCI
+// URIs sessions may reference. The list reads `GET /api/enabled-images`
+// (Postgres-backed); enabling POSTs a job (202) and the panel polls
+// `GET /api/enable-jobs` to render REAL pipeline progress
+// (materializing chunks → capturing snapshot → ready).
 //
 // Layout mirrors RegistriesPanel exactly:
 //   • A list of rows, one per enabled URI. Each row shows a status
@@ -25,11 +29,29 @@ import { Field, FormError, PressButton, SubHead } from './_form';
 
 export function ImagesPanel() {
   const { data, isLoading, error } = useEnabledImages();
+  const { data: jobs } = useEnableJobs();
   const [addOpen, setAddOpen] = useState(false);
+
+  // ADR 0036: in-flight enables (and fresh failures, kept visible
+  // for an hour so the error + retry affordance doesn't vanish).
+  const visibleJobs = (jobs ?? []).filter(
+    (j) =>
+      isJobActive(j) ||
+      (j.state === 'failed' &&
+        Date.now() - new Date(j.updated_at).getTime() < 60 * 60 * 1000),
+  );
 
   return (
     <section>
       <SectionHeader />
+
+      {visibleJobs.length > 0 && (
+        <ul className="space-y-0 mb-6">
+          {visibleJobs.map((job) => (
+            <EnableJobRow key={job.id} job={job} />
+          ))}
+        </ul>
+      )}
 
       {error && (
         <p
@@ -282,7 +304,6 @@ function EnableImageForm({
   const [imageUri, setImageUri] = useState('');
   const enable = useEnableImage();
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const progress = useEnableProgress(enable.isPending);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -332,46 +353,117 @@ function EnableImageForm({
 
       <div className="flex items-baseline gap-6 pt-2">
         <PressButton type="submit" tone="primary" disabled={enable.isPending}>
-          {enable.isPending ? 'enabling…' : 'enable'}
+          {enable.isPending ? 'validating…' : 'enable'}
         </PressButton>
         <PressButton onClick={onCancel} disabled={enable.isPending}>
           cancel
         </PressButton>
-        <EnableProgress progress={progress} />
       </div>
     </form>
   );
 }
 
-// Multi-stage progress copy that cycles based on elapsed wall-clock
-// while `POST /api/enabled-images` is in flight. The backend doesn't
-// stream events — we just shape time-into-text so the operator sees
-// movement instead of a frozen button. Stages are calibrated against
-// the observed 7-30s window of materialize + base-layer prefetch.
-function EnableProgress({
-  progress,
-}: {
-  progress: ReturnType<typeof useEnableProgress>;
-}) {
-  if (!progress) return null;
+// ---------- Enable-job progress (ADR 0036) ---------------------------
+//
+// Real progress from the server: the coordinator's scanner drives the
+// job through pending → materializing → capturing → ready, updating
+// chunks_done/chunks_total as it materializes. We render a thin bar +
+// the state label; failed jobs keep their error visible with a retry
+// affordance.
+
+const JOB_STATE_LABEL: Record<EnableJob['state'], string> = {
+  pending: 'queued',
+  materializing: 'materializing chunks',
+  capturing: 'capturing canonical snapshot',
+  ready: 'ready',
+  failed: 'failed',
+};
+
+function EnableJobRow({ job }: { job: EnableJob }) {
+  const retry = useRetryEnableJob();
+  const failed = job.state === 'failed';
+  const pct =
+    job.chunks_total && job.chunks_total > 0
+      ? Math.min(100, Math.round((job.chunks_done / job.chunks_total) * 100))
+      : null;
+
   return (
-    <span
-      className="font-mono text-xs smallcaps inline-flex items-baseline gap-2"
-      style={{ color: 'var(--color-ink-quiet)' }}
+    <motion.li
+      layout
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.25, ease: 'easeOut' }}
+      className="py-3"
+      style={{ borderBottom: '1px solid var(--color-rule-faint)' }}
     >
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.span
-          key={progress.label}
-          initial={{ opacity: 0, y: 4 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -4 }}
-          transition={{ duration: 0.25, ease: 'easeOut' }}
+      <div className="flex items-baseline gap-3 flex-wrap">
+        <span
+          aria-hidden
+          className="glyph"
+          style={{ color: failed ? 'var(--color-amber)' : 'var(--color-ink-faded)' }}
         >
-          {progress.label}
-          <DotPulse />
-        </motion.span>
-      </AnimatePresence>
-    </span>
+          {failed ? '✕' : '◌'}
+        </span>
+        <span
+          className="font-mono"
+          style={{
+            fontSize: '0.95rem',
+            color: 'var(--color-ink)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {job.image_uri}
+        </span>
+        <span
+          className="font-mono text-xs smallcaps inline-flex items-baseline gap-1"
+          style={{ color: failed ? 'var(--color-amber)' : 'var(--color-ink-quiet)' }}
+        >
+          {JOB_STATE_LABEL[job.state]}
+          {job.state === 'materializing' && job.chunks_total ? (
+            <span>
+              · {job.chunks_done}/{job.chunks_total} chunks
+            </span>
+          ) : null}
+          {!failed && <DotPulse />}
+        </span>
+        {failed && (
+          <span className="ml-auto">
+            <PressButton
+              onClick={() => retry.mutate(job.id)}
+              disabled={retry.isPending}
+            >
+              {retry.isPending ? 'retrying…' : 'retry'}
+            </PressButton>
+          </span>
+        )}
+      </div>
+      {pct !== null && !failed && (
+        <div
+          className="mt-2"
+          style={{
+            marginLeft: '1.4rem',
+            height: '3px',
+            background: 'var(--color-rule-faint)',
+            maxWidth: '28rem',
+          }}
+        >
+          <motion.div
+            animate={{ width: `${pct}%` }}
+            transition={{ duration: 0.4, ease: 'easeOut' }}
+            style={{ height: '100%', background: 'var(--color-ink-faded)' }}
+          />
+        </div>
+      )}
+      {failed && job.error && (
+        <p
+          className="font-display italic text-[0.85rem] mt-2"
+          style={{ color: 'var(--color-amber)', marginLeft: '1.4rem' }}
+        >
+          {job.error}
+        </p>
+      )}
+    </motion.li>
   );
 }
 

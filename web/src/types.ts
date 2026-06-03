@@ -419,6 +419,34 @@ export interface EnabledImageSummary {
   created_at: string;
 }
 
+/** ADR 0036: state of an async image-enable job. */
+export type EnableJobState =
+  | 'pending'
+  | 'materializing'
+  | 'capturing'
+  | 'ready'
+  | 'failed';
+
+/** ADR 0036: one row of `GET /api/enable-jobs` — an asynchronous
+ * image enable in flight (or terminal). `chunks_done/chunks_total`
+ * drive the progress bar. */
+export interface EnableJob {
+  id: string;
+  image_uri: string;
+  manifest_digest: string | null;
+  state: EnableJobState;
+  chunks_total: number | null;
+  chunks_done: number;
+  attempts: number;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ListEnableJobsResponse {
+  jobs: EnableJob[];
+}
+
 export interface ListEnabledImagesResponse {
   images: EnabledImageSummary[];
 }

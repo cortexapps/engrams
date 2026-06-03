@@ -6,7 +6,7 @@ use crate::state::SharedState;
 
 mod admin;
 pub mod auth;
-mod enabled_images;
+pub(crate) mod enabled_images;
 mod events;
 mod exec;
 pub(crate) mod forge;
@@ -80,6 +80,10 @@ pub fn router(state: SharedState) -> Router {
         .merge(session_scoped)
         // Read-only list of enabled images — members pick one to launch.
         .route("/enabled-images", get(enabled_images::list_enabled_images))
+        // ADR 0036: enable-job polling (progress bars). Read-only —
+        // mutations (POST enable / retry) live on the admin router.
+        .route("/enable-jobs", get(enabled_images::list_enable_jobs))
+        .route("/enable-jobs/:id", get(enabled_images::get_enable_job))
         // ADR 0031 self-service.
         .route("/me", get(principal::me))
         .route("/me/claude-token", post(principal::save_claude_token))
@@ -111,6 +115,11 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/enabled-images/disable",
             post(enabled_images::disable_enabled_image),
+        )
+        // ADR 0036: re-queue a failed enable job.
+        .route(
+            "/enable-jobs/:id/retry",
+            post(enabled_images::retry_enable_job),
         )
         // Operator admin triggers.
         .route(

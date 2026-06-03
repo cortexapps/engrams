@@ -1187,9 +1187,11 @@ dependencies = [
  "engram-sandbox-firecracker",
  "engram-storage-gcs",
  "engram-storage-local",
+ "futures",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml",
@@ -1204,12 +1206,16 @@ name = "engram-oci"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "engram-chunk-store",
  "flate2",
  "futures",
+ "http",
  "oci-client",
+ "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1217,6 +1223,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "workspace-hack",
 ]
 

@@ -88,14 +88,32 @@ T1=$(date +%s.%N)
 log "    bake+push elapsed: $(echo "$T1 - $T0" | bc)s"
 
 log ""
-log "==> step 2/3: POST /api/enabled-images"
+log "==> step 2/3: POST /api/enabled-images (ADR 0036: async — poll the job)"
 ENABLE_BODY=$(printf '{"image_uri": "%s"}' "$IMAGE_URI")
 T0=$(date +%s.%N)
-curl -fsS -X POST "${AUTH_HEADER[@]}" \
+JOB_ID=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
     -H "Content-Type: application/json" \
     -d "$ENABLE_BODY" \
     "$COORD/api/v1/enabled-images" \
-    >/dev/null
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+log "    enable job: $JOB_ID"
+ENABLE_DEADLINE=$(( $(date +%s) + READY_DEADLINE_SECS ))
+while :; do
+    JOB=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enable-jobs/$JOB_ID")
+    JOB_STATE=$(echo "$JOB" | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
+    case "$JOB_STATE" in
+        ready) break ;;
+        failed)
+            log "ERROR: enable job failed: $(echo "$JOB" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error'))")"
+            exit 1
+            ;;
+        *) sleep 2 ;;
+    esac
+    if [ "$(date +%s)" -ge "$ENABLE_DEADLINE" ]; then
+        log "ERROR: enable job $JOB_ID not ready within ${READY_DEADLINE_SECS}s (state=$JOB_STATE)"
+        exit 1
+    fi
+done
 T1=$(date +%s.%N)
 log "    enable elapsed: $(echo "$T1 - $T0" | bc)s"
 

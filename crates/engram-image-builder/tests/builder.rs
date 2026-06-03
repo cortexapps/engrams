@@ -190,8 +190,6 @@ fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest 
         images_dir: images_dir.to_path_buf(),
         format: Format::Directory,
         agent_injection: None,
-        parent_disk_bootstrap_path: None,
-        parent_disk_chunks_blob_digest: None,
     }
 }
 
@@ -863,11 +861,11 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     // so downstream consumers (host-agent image cache, NBD daemon,
     // VZ materialize) can resolve content through the chunk store.
     //
-    // ADR 0008 Phase 3: bake also emits Nydus-shaped sidecars
-    // (bootstrap.disk.json + chunks.disk.blob) and bumps the
+    // ADR 0008 Phase 3 / ADR 0036: bake also emits the per-chunk
+    // bootstrap sidecar (bootstrap.disk.json) and bumps the
     // bundle schema to v2. v1 readers still see `disk_manifest`
     // and work; v2 readers additionally consult the bootstrap
-    // file for Range-GET-on-fault.
+    // file for chunk-on-fault.
     let manifest_ref = outcome
         .disk_manifest
         .expect("ext4 bake must produce a disk manifest");
@@ -880,26 +878,33 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     assert_eq!(bundle["disk_manifest"], serialized);
     assert_eq!(bundle["bootstrap_disk_available"], true);
 
-    // ADR 0008: the disk-side bootstrap + chunk blob must be on
-    // disk and reachable via BuildOutcome.
+    // ADR 0036: the disk-side per-chunk bootstrap must be on disk
+    // and reachable via BuildOutcome. No concatenated chunk blob is
+    // produced — every entry addresses its chunk by its own digest
+    // (the contract the delta push relies on).
     let bs_path = outcome
         .disk_bootstrap_path
         .as_ref()
         .expect("disk bootstrap path");
-    let blob_path = outcome
-        .disk_chunks_blob_path
-        .as_ref()
-        .expect("disk chunks blob path");
     assert!(bs_path.is_file(), "bootstrap.disk.json must exist");
-    assert!(blob_path.is_file(), "chunks.disk.blob must exist");
-    // The bootstrap's chunk_blob_len must equal the actual blob
-    // file size — the contract the OCI push relies on.
+    assert!(
+        !outcome.image_dir.join("chunks.disk.blob").exists(),
+        "ADR 0036: no monolithic chunk blob may be written"
+    );
     let bs_bytes = std::fs::read(bs_path).unwrap();
     let parsed: engram_chunk_store::Bootstrap = serde_json::from_slice(&bs_bytes).unwrap();
-    assert_eq!(
-        parsed.chunk_blob_len(),
-        std::fs::metadata(blob_path).unwrap().len()
+    assert!(
+        parsed.is_per_chunk(),
+        "bootstrap must be the ADR 0036 per-chunk shape"
     );
+    for entry in &parsed.entries {
+        assert_eq!(
+            entry.blob_digest.as_deref(),
+            Some(format!("sha256:{}", entry.sha256.to_hex()).as_str()),
+            "each chunk's blob digest must be its own hash"
+        );
+        assert_eq!(entry.blob_offset, 0);
+    }
 
     // Docker orchestration unchanged: build → create → export → rm → rmi.
     let calls = docker.calls();
@@ -1101,6 +1106,76 @@ async fn build_with_init_script_override_uses_provided_script() {
 // ---------------------------------------------------------------------
 // Real mke2fs end-to-end. Linux + e2fsprogs only.
 // ---------------------------------------------------------------------
+
+/// ADR 0036: packing the same logical tree twice — including via two
+/// separately-created directories with different file-creation order —
+/// must produce byte-identical images. This is the keystone of the
+/// delta push/pull pipeline: identical bytes → identical 16 MiB chunk
+/// hashes → HEAD-skip on push and exists()-skip on enable. Runs
+/// wherever mke2fs is on PATH (Linux CI; macOS dev via the justfile's
+/// e2fsprogs PATH entry).
+#[tokio::test]
+async fn ext4_pack_is_deterministic_across_rebuilds() {
+    use engram_image_builder::ext4::Mke2fsPacker;
+
+    let mke2fs_on_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))
+        .unwrap_or(false);
+    if !mke2fs_on_path {
+        eprintln!("mke2fs not on PATH; skipping determinism test");
+        return;
+    }
+
+    fn write_tree(root: &std::path::Path, order_flipped: bool) {
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::create_dir_all(root.join("sbin")).unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("etc/hostname", b"engram\n".to_vec()),
+            ("sbin/engram-agentd", vec![0xAAu8; 256 * 1024]),
+            ("greeting", b"hello-from-ext4".to_vec()),
+        ];
+        // Different creation order across the two trees — catches
+        // readdir-order leaking into block allocation.
+        let iter: Box<dyn Iterator<Item = &(&str, Vec<u8>)>> = if order_flipped {
+            Box::new(files.iter().rev())
+        } else {
+            Box::new(files.iter())
+        };
+        for (path, body) in iter {
+            std::fs::write(root.join(path), body).unwrap();
+        }
+    }
+
+    let src_a = tempfile::tempdir().unwrap();
+    let src_b = tempfile::tempdir().unwrap();
+    write_tree(src_a.path(), false);
+    write_tree(src_b.path(), true);
+
+    let img_a = tempfile::NamedTempFile::new().unwrap();
+    let img_b = tempfile::NamedTempFile::new().unwrap();
+    let packer = Mke2fsPacker::default();
+    packer
+        .pack(src_a.path(), img_a.path(), 64 * 1024 * 1024)
+        .await
+        .expect("pack a");
+    packer
+        .pack(src_b.path(), img_b.path(), 64 * 1024 * 1024)
+        .await
+        .expect("pack b");
+
+    let hash = |p: &std::path::Path| {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(std::fs::read(p).unwrap());
+        format!("{:x}", h.finalize())
+    };
+    assert_eq!(
+        hash(img_a.path()),
+        hash(img_b.path()),
+        "ADR 0036: identical trees must pack to byte-identical ext4 images \
+         (fixed UUID + hash_seed + SOURCE_DATE_EPOCH)"
+    );
+}
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
