@@ -22,6 +22,7 @@ pub mod evac_resumer;
 pub mod evacuation;
 pub mod harness_paths;
 pub mod host_registry;
+pub mod idle_detect_backstop;
 pub mod idle_evictor;
 pub mod metrics;
 pub mod nbd_loss_trigger;
@@ -227,6 +228,17 @@ pub async fn run_with_registry_and_local(
     // wedged across a coord deploy.
     let _eviction_scanner = idle_evictor::spawn_eviction_scanner(
         idle_evictor::EvictionScannerConfig::default(),
+        state.clone(),
+    );
+
+    // ADR 0034 L3: PG-derived idle-detection backstop. Catches
+    // Active sessions whose harness the host has gone blind to
+    // (vsock detach wipes the hub's tracking; `idle_sandboxes` only
+    // nominates attached harnesses) by reading the durable activity
+    // record — session_events — instead. Hard-TTL only; nominates
+    // into the same Evicting lane the host path uses.
+    let _idle_backstop = idle_detect_backstop::spawn(
+        idle_detect_backstop::BackstopConfig::from_env(),
         state.clone(),
     );
 
