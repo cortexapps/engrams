@@ -16,15 +16,15 @@ import { useIsAdmin } from '../auth/AuthProvider';
 // are mono small-caps labels with a 1px amber underline on the active
 // route — never pills. The `§` UserChip routes to Settings.
 
-// ADR 0031: Fleet / Storage / Settings are operator surfaces — admin-only.
-// Members see only Sessions in the spine (they still reach their own user
-// settings via the profile menu). Tab-hiding is UX; the coordinator's
-// require_admin layer is the real gate.
+// ADR 0031: Fleet and Storage are admin-only operator surfaces. Settings is
+// visible to everyone — it holds the user's own Profile + Tokens; admin-only
+// config (Members, Images, Registries) is filtered inside the Settings page.
+// Tab-hiding is UX only; the coordinator's require_admin is the real gate.
 const SURFACES = [
   { to: '/', label: 'Sessions', adminOnly: false, match: (p: string) => p === '/' || p.startsWith('/sessions') },
   { to: '/fleet', label: 'Fleet', adminOnly: true, match: (p: string) => p.startsWith('/fleet') },
   { to: '/storage', label: 'Storage', adminOnly: true, match: (p: string) => p.startsWith('/storage') },
-  { to: '/settings', label: 'Settings', adminOnly: true, match: (p: string) => p.startsWith('/settings') },
+  { to: '/settings', label: 'Settings', adminOnly: false, match: (p: string) => p.startsWith('/settings') },
 ];
 
 function shortId(id: string): string {

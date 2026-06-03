@@ -76,6 +76,9 @@ export interface Session {
 export interface SessionListItem extends Session {
   owner_email: string | null;
   owner_name: string | null;
+  /** `'system'` for warm-pool / automated sessions; `'user'` or absent for
+   * human-launched sessions. Drives the OwnerCell badge choice. */
+  owner_kind?: 'user' | 'system' | null;
 }
 
 export interface ListSessionsResponse {
@@ -99,6 +102,9 @@ export interface Principal {
    * edge proxy (IAP) or in dev synthetic-admin there's no app session to
    * revoke, so the UI hides the Sign-out control. */
   can_sign_out: boolean;
+  /** ADR 0031: how the role was assigned. `claim` = IdP claim on sign-in;
+   * `scim` = SCIM push; `manual` = admin promoted/revoked in the Members UI. */
+  role_source?: 'manual' | 'scim' | 'claim';
 }
 
 /** A row from `GET /admin/users`. */

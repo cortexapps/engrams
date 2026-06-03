@@ -495,7 +495,8 @@ select.ledger-input {
 }
 .session-row {
   display: grid;
-  grid-template-columns: min-content min-content 1fr min-content min-content;
+  /* glyph · id · image · status · age */
+  grid-template-columns: 1ch 13ch 1fr 5rem 4ch;
   align-items: baseline;
   gap: 1rem;
   padding: 0.25rem 0.5rem;
@@ -1058,6 +1059,436 @@ h6.md-h {
 .durability-time {
   font-size: 0.72rem;
   color: var(--fg-quiet);
+}
+
+/* ===== identity vocabulary (ADR 0031) =================================== */
+
+/* Person mark — typesetter's initial embossed on warm paper inside a square
+ * hairline frame. Square at every size — this is the fix for the shipped
+ * border-radius:0.4rem profile avatar. */
+.person-mark {
+  display: grid;
+  place-items: center;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-family: var(--font-display);
+  line-height: 1;
+  flex: none;
+}
+.person-mark > span { font-style: italic; transform: translateY(-1px); }
+.person-mark.pm-xs { width: 1.6rem; height: 1.6rem; font-size: 0.82rem; }
+.person-mark.pm-sm { width: 2.1rem; height: 2.1rem; font-size: 1.05rem; }
+.person-mark.pm-md { width: 3rem;   height: 3rem;   font-size: 1.25rem; }
+.person-mark.pm-off { color: var(--fg-quiet); border-color: var(--border-faint); }
+.person-mark.pm-system { padding: 0; }
+.person-mark.pm-system svg { display: block; }
+
+/* Role tag — square hairline box, weight not hue */
+.role-tag {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.1em;
+  font-size: 0.62rem;
+  line-height: 1;
+  padding: 0.2rem 0.42rem 0.14rem;
+  border: 1px solid var(--border);
+  color: var(--fg-quiet);
+  white-space: nowrap;
+}
+.role-tag.role-admin { color: var(--fg); border-color: var(--fg); }
+
+/* Provenance — serif italic "why" behind the role */
+.provenance {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.82rem;
+  color: var(--fg-quiet);
+  white-space: nowrap;
+}
+
+/* Member status — ink only; ✕ for disabled */
+.member-status {
+  font-family: var(--font-mono);
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.1em;
+  font-size: 0.66rem;
+  color: var(--fg-quiet);
+  white-space: nowrap;
+}
+.member-status .x { margin-right: 0.35rem; }
+
+/* Owner cell in session rows — badge + label */
+.owner-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  overflow: hidden;
+}
+.owner-cell .person-mark { flex: none; }
+.owner-sys {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.owner-email {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--fg-quiet);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22ch;
+}
+
+/* Session row with owner column — the bug fix. Admin "all sessions" adds a
+ * 6th child; without an explicit column the owner wraps the age onto line 2.
+ * The `has-owner` class switches in a fixed 17rem owner track. */
+.session-row.has-owner {
+  grid-template-columns: 1ch 13ch 1fr 5rem 17rem 4ch;
+}
+
+/* ===== grouped Settings tabs (You · Deployment) ========================= */
+.settings-groups {
+  display: flex;
+  align-items: stretch;
+  gap: 1.9rem;
+  flex-wrap: wrap;
+}
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.settings-group-label {
+  font-family: var(--font-mono);
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.18em;
+  font-size: 0.58rem;
+  color: var(--fg-quiet);
+}
+.settings-group-tabs {
+  display: flex;
+  align-items: baseline;
+  gap: 1.2rem;
+}
+.settings-tab {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  text-decoration: none;
+  padding-bottom: 0.25rem;
+  transition: color var(--dur-fast);
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  cursor: pointer;
+}
+.settings-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin-top: 0.15rem;
+}
+
+/* ===== Profile + access legend ========================================== */
+.profile-head {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.8rem;
+}
+.profile-row {
+  display: grid;
+  grid-template-columns: 8rem 1fr;
+  align-items: baseline;
+  gap: 0 1rem;
+  padding: 0.35rem 0;
+}
+.profile-row dt {
+  font-family: var(--font-mono);
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.12em;
+  font-size: 0.68rem;
+  color: var(--fg-quiet);
+}
+.profile-row dd {
+  font-family: var(--font-display);
+  font-size: 0.96rem;
+  color: var(--fg);
+}
+.access-legend {
+  border-top: 1px solid var(--border);
+  margin-top: 1.6rem;
+  padding-top: 1.2rem;
+  max-width: 40rem;
+}
+.access-legend .section-label { display: block; margin-bottom: 0.7rem; }
+.access-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.access-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-family: var(--font-display);
+  font-size: 0.96rem;
+  color: var(--fg);
+}
+.access-list li .glyph { color: var(--accent-archived); flex: none; }
+.access-list li.denied { color: var(--fg-quiet); }
+.access-list li.denied .glyph { color: var(--fg-quiet); }
+
+/* ===== Members ledger (admin users surface) ============================= */
+.people-rollup {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  font-size: 0.84rem;
+  color: var(--fg-muted);
+  padding-bottom: 1.4rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.4rem;
+}
+.people-rollup b { font-weight: 600; color: var(--fg); }
+.people-rollup .dot { color: var(--fg-quiet); }
+.members-ledger { display: flex; flex-direction: column; }
+.members-row {
+  display: grid;
+  grid-template-columns: 2.4fr 0.8fr 1.3fr 1.7fr;
+  gap: 1.25rem;
+  align-items: center;
+  padding: 0.85rem 0;
+  border-bottom: 1px dotted var(--border);
+  font-size: 0.84rem;
+}
+.members-row.members-head {
+  border-bottom: 1px solid var(--border);
+  align-items: baseline;
+  padding: 0 0 0.55rem;
+}
+.members-row.is-off { opacity: 0.78; }
+.person { display: flex; align-items: center; gap: 0.7rem; min-width: 0; }
+.person-id { min-width: 0; line-height: 1.25; }
+.person-name {
+  font-family: var(--font-display);
+  font-size: 0.98rem;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.person-name .you {
+  font-style: italic;
+  color: var(--fg-quiet);
+  margin-left: 0.4rem;
+  font-size: 0.8rem;
+}
+.person-email {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-quiet);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.person.is-off .person-name { color: var(--fg-quiet); }
+.members-actions {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 1.1rem;
+  min-width: 0;
+}
+.members-act {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.9rem;
+  color: var(--fg);
+  white-space: nowrap;
+  text-underline-offset: 0.18em;
+  transition: opacity var(--dur-fast);
+}
+.members-act:hover { text-decoration: underline; }
+.members-act.act-primary { color: var(--accent-now); }
+.members-act.act-quiet { color: var(--fg-quiet); }
+.members-self {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.86rem;
+  color: var(--fg-quiet);
+}
+
+/* ===== Tokens ledger (per-service credentials) ========================== */
+.tokens-ledger { display: flex; flex-direction: column; }
+.token-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 1.5rem;
+  align-items: baseline;
+  padding: 0.9rem 0;
+  border-bottom: 1px dotted var(--border);
+}
+.token-svc { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
+.token-name { font-family: var(--font-display); font-size: 1.05rem; color: var(--fg); }
+.token-use { font-family: var(--font-display); font-style: italic; font-size: 0.86rem; color: var(--fg-quiet); }
+.token-status {
+  font-family: var(--font-mono);
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.08em;
+  font-size: 0.66rem;
+  color: var(--fg-quiet);
+  white-space: nowrap;
+}
+.token-status.is-saved { color: var(--fg-muted); }
+.token-row-actions {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  justify-content: flex-end;
+  white-space: nowrap;
+}
+.token-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.7rem;
+  max-width: 26rem;
+}
+.token-hint {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.78rem;
+  color: var(--fg-quiet);
+}
+.token-edit-actions {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-top: 0.3rem;
+}
+
+/* Member token nudge on the Sessions surface */
+.token-nudge {
+  display: flex;
+  align-items: baseline;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  padding: 0.7rem 0 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.6rem;
+}
+.token-nudge .nudge-text {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.95rem;
+  color: var(--fg-muted);
+}
+.token-nudge .nudge-act {
+  font-family: var(--font-display);
+  font-style: italic;
+  color: var(--accent-now);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.token-nudge .nudge-act:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+/* ===== Auth states (boot / error / not-a-member) ======================== */
+.auth-stage {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  z-index: 50;
+  padding: 2rem;
+}
+.auth-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.7rem;
+  text-align: center;
+  width: 32rem;
+  max-width: 100%;
+}
+.auth-mark { margin-bottom: 0.5rem; }
+.auth-line {
+  font-family: var(--font-display);
+  font-style: italic;
+  color: var(--fg-quiet);
+  font-size: 1rem;
+}
+.auth-strong {
+  font-family: var(--font-display);
+  color: var(--fg);
+  font-size: 1.2rem;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+.auth-detail {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--fg-quiet);
+}
+.auth-actions {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 1.4rem;
+  margin-top: 0.9rem;
+}
+
+/* ===== Responsive: new ADR 0031 surfaces ================================ */
+@media (max-width: 760px) {
+  /* Grouped Settings tabs → stack vertically */
+  .settings-groups { flex-direction: column; gap: 1.4rem; }
+  .settings-divider { display: none; }
+  .settings-group { border-top: 1px solid var(--border); padding-top: 1rem; }
+  .settings-group:first-child { border-top: 0; padding-top: 0; }
+  .settings-group-tabs { flex-wrap: wrap; gap: 1rem 1.2rem; }
+
+  /* Members ledger → stacked records */
+  .members-row { grid-template-columns: 1fr; gap: 0.6rem; padding: 1rem 0; }
+  .members-row.members-head { display: none; }
+  .members-row .members-actions { justify-content: flex-start; flex-wrap: wrap; gap: 0.8rem 1.1rem; }
+  .members-row > .provenance { font-size: 0.78rem; }
+
+  /* Tokens ledger → stacked */
+  .token-row { grid-template-columns: 1fr; gap: 0.5rem; }
+  .token-row-actions { justify-content: flex-start; }
+
+  /* Profile rows: label above value */
+  .profile-row { grid-template-columns: 1fr; gap: 0.15rem; padding: 0.5rem 0; }
+}
+
+/* Phone: owner row in session rows (has-owner variant) */
+@media (max-width: 600px) {
+  .session-row.has-owner {
+    grid-template-areas: 'g id age' 'g img st' 'g own own';
+  }
+  .session-row.has-owner > .owner-cell { grid-area: own; justify-self: start; margin-top: 0.15rem; }
+  .session-row.has-owner > :nth-child(6) { grid-area: age; justify-self: end; }
 }
 
 /* harness-waiting indicator — looping mark + context-aware gerund, where the

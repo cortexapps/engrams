@@ -38,7 +38,7 @@ export function ManifestGroup({
               <SessionRow
                 key={s.id}
                 session={s}
-                owner={showOwner ? s.owner_email : undefined}
+                showOwner={showOwner}
               />
             ))}
           </AnimatePresence>

@@ -2,73 +2,63 @@ import { motion } from 'framer-motion';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useIsAdmin } from '../auth/AuthProvider';
 
-// Settings surface — aligned to the nav spine like Fleet / Storage /
-// Sessions (ADR 0030). It uses the same wide measure (`book-wide`) and
-// the same `surface-head` header (big italic `surface-title` +
-// `surface-sub`) as the other admin surfaces, so tabbing in from the
-// spine no longer shifts the content's left edge or jumps to the old
-// standalone layout. The old narrow `book` column and the
-// `engrams › settings` breadcrumb-h1 are gone — the spine already
-// provides home + location.
+// Settings surface — ADR 0031 redesign. Grouped into two sections:
+//   You         → Profile · Tokens        (everyone)
+//   Deployment  → Members · Images · Registries  (admin only)
 //
-// The `surface-sub` carries the per-tab hint (Images / Registries /
-// Profile) and fades on tab change. The tab row below stays as typeset
-// section labels separated by middle dots; the active tab gets a 1px
-// ink underline (a notebook "page-marker" flag, not a button pill).
-//
-// Sub-routes nest under /settings: /settings/images (default),
-// /settings/registries, /settings/profile — each renders via <Outlet/>.
-//
-// ADR 0021 P1.5a retired the `/settings/harnesses` tab — the
-// `/api/harnesses` registry doesn't exist anymore (harnesses are an
-// image property baked at image-bake time).
+// Settings is now visible to ALL users (it holds profile + tokens).
+// Admin-only config is filtered inside, not by hiding the whole tab.
+// A vertical hairline separates the two groups; on narrow viewports
+// they stack with per-group hairline-tops.
 
 interface Tab {
   to: string;
   label: string;
-  /** Short hint rendered as the surface sub-line for the active tab.
-   * Helps when the page label alone doesn't carry the section's
-   * purpose. */
   hint: string;
-  /** ADR 0031: admin-only (global config) vs user settings (everyone). */
-  adminOnly: boolean;
 }
 
-const TABS: Tab[] = [
-  // User settings — every authenticated user.
+const YOU_TABS: Tab[] = [
   {
     to: 'profile',
     label: 'Profile',
-    hint: 'Your signed-in identity',
-    adminOnly: false,
+    hint: 'Your signed-in identity & what your role can do',
   },
   {
     to: 'tokens',
-    label: 'Claude token',
-    hint: 'Your Claude Code OAuth token — saved once, used for every session',
-    adminOnly: false,
+    label: 'Tokens',
+    hint: 'Your service tokens — sealed & used automatically for every session',
   },
-  // Admin settings — global config.
+];
+
+const DEPLOYMENT_TABS: Tab[] = [
+  {
+    to: 'members',
+    label: 'Members',
+    hint: 'Everyone in this deployment — roles & access',
+  },
   {
     to: 'images',
     label: 'Images',
     hint: 'Curated OCI image URIs sessions may reference',
-    adminOnly: true,
   },
   {
     to: 'registries',
     label: 'Registries',
     hint: 'Docker registry credentials, sealed under the deployment KEK',
-    adminOnly: true,
   },
 ];
+
+const ALL_HINTS: Record<string, string> = {
+  ...Object.fromEntries(YOU_TABS.map((t) => [t.to, t.hint])),
+  ...Object.fromEntries(DEPLOYMENT_TABS.map((t) => [t.to, t.hint])),
+};
 
 export function Settings() {
   const location = useLocation();
   const isAdmin = useIsAdmin();
-  const tabs = TABS.filter((t) => !t.adminOnly || isAdmin);
-  const active = tabs.find((t) => location.pathname.endsWith(`/${t.to}`));
-  const sub = active?.hint ?? 'Your settings';
+
+  const activeSegment = location.pathname.split('/').pop() ?? '';
+  const sub = ALL_HINTS[activeSegment] ?? 'Your settings';
 
   return (
     <main className="book-wide surface">
@@ -76,7 +66,7 @@ export function Settings() {
         <div>
           <h1 className="surface-title">settings</h1>
           <motion.p
-            key={sub} // remount on tab change → fade
+            key={sub}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.25 }}
@@ -87,7 +77,32 @@ export function Settings() {
         </div>
       </div>
 
-      <TabRow tabs={tabs} />
+      <nav className="settings-groups" aria-label="Settings sections">
+        {/* You group — everyone */}
+        <div className="settings-group">
+          <span className="settings-group-label">you</span>
+          <div className="settings-group-tabs">
+            {YOU_TABS.map((tab) => (
+              <SettingsTab key={tab.to} to={tab.to} label={tab.label} />
+            ))}
+          </div>
+        </div>
+
+        {/* Vertical hairline + Deployment group — admin only */}
+        {isAdmin && (
+          <>
+            <span className="settings-divider" aria-hidden />
+            <div className="settings-group">
+              <span className="settings-group-label">deployment</span>
+              <div className="settings-group-tabs">
+                {DEPLOYMENT_TABS.map((tab) => (
+                  <SettingsTab key={tab.to} to={tab.to} label={tab.label} />
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+      </nav>
 
       <div className="mt-10">
         <Outlet />
@@ -96,41 +111,21 @@ export function Settings() {
   );
 }
 
-function TabRow({ tabs }: { tabs: Tab[] }) {
+function SettingsTab({ to, label }: { to: string; label: string }) {
   return (
-    <nav
-      aria-label="Settings sections"
-      className="flex gap-6 items-baseline"
-      style={{ fontFamily: 'var(--font-display)' }}
+    <NavLink
+      to={to}
+      className={({ isActive }) =>
+        `settings-tab${isActive ? ' tab-active' : ' tab-inactive'}`
+      }
+      style={({ isActive }) => ({
+        color: isActive ? 'var(--color-ink)' : 'var(--color-ink-quiet)',
+        borderBottom: isActive
+          ? '1px solid var(--color-ink)'
+          : '1px solid transparent',
+      })}
     >
-      {tabs.map((tab, i) => (
-        <div key={tab.to} className="flex items-baseline gap-6">
-          {i > 0 && (
-            <span
-              aria-hidden
-              className="font-mono"
-              style={{ color: 'var(--color-rule)', fontSize: '0.7rem' }}
-            >
-              ·
-            </span>
-          )}
-          <NavLink
-            to={tab.to}
-            className={({ isActive }) =>
-              `transition-colors pb-1 ${isActive ? 'tab-active' : 'tab-inactive'}`
-            }
-            style={({ isActive }) => ({
-              color: isActive ? 'var(--color-ink)' : 'var(--color-ink-quiet)',
-              fontSize: '1rem',
-              borderBottom: isActive
-                ? '1px solid var(--color-ink)'
-                : '1px solid transparent',
-            })}
-          >
-            {tab.label}
-          </NavLink>
-        </div>
-      ))}
-    </nav>
+      {label}
+    </NavLink>
   );
 }
