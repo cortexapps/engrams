@@ -222,6 +222,18 @@ async fn main() -> Result<(), HostAgentError> {
     // by host A becomes restoreable on host B with B reusing A's
     // recorded trace.
     let host_id = engram_core::HostId::new();
+
+    // ADR 0007: blob backend + chunk store. Created before the backend
+    // match so the inner VZ backend can be wired with its own chunk
+    // store (snapshots chunk the rootfs clone and report the manifest
+    // ref). Misconfiguration fails closed at startup — better than
+    // pretending to be ready and failing every session create. Shares
+    // the same `BlobStorage` the coordinator's image-builder writes to
+    // (a shared GCS bucket in prod, a shared `local_path` in dev).
+    let blob = engram_host_agent::blob::from_env()
+        .await
+        .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
+
     // ADR 0009 §6: when the backend is FC, keep a typed Arc on the
     // side so the host-agent's startup live-attach pass can call
     // `reattach_sandbox` (the trait can't downcast `dyn`). `None`
@@ -340,9 +352,17 @@ async fn main() -> Result<(), HostAgentError> {
                     })?;
                 let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
                 fc_for_reattach = None;
+                // ADR 0007: attach the chunk store so `snapshot()` chunks
+                // the rootfs clone and reports the manifest ref. Without
+                // this the base-snapshot capture produces a disk_manifest
+                // of None, and the coordinator's HEAD-verify rejects the
+                // enable ("chunked manifests failed HEAD-verify"). Shares
+                // the same `blob` Arc as the PooledBackend wrapper below.
+                let cs = engram_chunk_store::ChunkStore::new(blob.clone());
                 Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
-                        .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?,
+                        .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?
+                        .with_chunk_store(cs),
                 )
             }
             #[cfg(not(target_os = "macos"))]
@@ -358,15 +378,9 @@ async fn main() -> Result<(), HostAgentError> {
     };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
-    // ADR 0007: blob backend + chunk store. The chunk store needs
-    // to point at the same `BlobStorage` the coordinator's
-    // image-builder writes to (typically a shared GCS bucket in
-    // production, a shared `local_path` in single-machine dev).
-    // Misconfiguration fails closed at startup — better than
-    // pretending to be ready and failing every session create.
-    let blob = engram_host_agent::blob::from_env()
-        .await
-        .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
+    // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
+    // base-snapshot residency). `blob` was created above the backend
+    // match so the inner VZ backend could share it; reuse it here.
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
     // ADR 0007 #3a: NVMe-backed chunk cache. Budget defaults to
