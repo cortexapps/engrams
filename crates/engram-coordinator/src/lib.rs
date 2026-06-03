@@ -214,12 +214,21 @@ pub async fn run_with_registry_and_local(
         std::time::Duration::from_secs(30),
     );
 
-    // ADR 0013 + ADR 0011 #2: the idle-eviction *driver* runs on
-    // each host-agent (its local HarnessHub is authoritative for
-    // "is this sandbox idle?"). The host POSTs candidates to
-    // `/api/hosts/:id/idle-eviction-candidates`; the receiving
-    // coord pod runs the pipeline (`evict_idle_session` below).
-    // No background task lives here anymore.
+    // ADR 0013 + ADR 0011 #2: the idle-eviction *detection driver*
+    // runs on each host-agent (its local HarnessHub is authoritative
+    // for "is this sandbox idle?"). The host POSTs candidates to
+    // `/api/hosts/:id/idle-eviction-candidates`.
+    //
+    // ADR 0034: the receiving handler only flips Active → Evicting;
+    // this scanner sweeps `status='evicting'` and runs the snapshot
+    // pipeline detached from any request lifetime (the pre-0034
+    // inline pipeline died by cancellation at the host's POST
+    // timeout). Its first tick after startup also recovers rows
+    // wedged across a coord deploy.
+    let _eviction_scanner = idle_evictor::spawn_eviction_scanner(
+        idle_evictor::EvictionScannerConfig::default(),
+        state.clone(),
+    );
 
     // Phase 4 Track D: preemption best-effort drain. Subscribes to
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE
