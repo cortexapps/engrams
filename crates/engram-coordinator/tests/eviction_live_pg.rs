@@ -119,6 +119,35 @@ async fn evicting_round_trip_counter_and_sweep() {
     );
 }
 
+/// Evicting sessions must appear in `list_active_sessions` with the
+/// sandbox binding intact — it's the rehydration source for startup's
+/// `repopulate_routing`. When `evicting` was missing from the status
+/// filter, a coord roll mid-eviction left the new pod's
+/// SandboxRegistry empty for the session; every scanner attempt then
+/// no-op'd on the "sandbox no longer bound" guard until the budget
+/// exhausted into a spurious HostLost with the VM still running
+/// (prod session 5cfb90b8, 2026-06-03).
+#[tokio::test]
+#[ignore]
+async fn evicting_sessions_listed_active_with_binding() {
+    let Some(meta) = pg().await else { return };
+    let (id, sandbox) = seed_active(&meta).await;
+    meta.transition_session(id, SessionState::Evicting)
+        .await
+        .expect("active->evicting");
+
+    let listed = meta.list_active_sessions().await.expect("list");
+    let row = listed
+        .iter()
+        .find(|s| s.id == id)
+        .expect("evicting session must be in list_active_sessions");
+    assert_eq!(
+        row.sandbox_id,
+        Some(sandbox),
+        "evicting row must keep its sandbox binding (repopulate_routing rebinds from it)",
+    );
+}
+
 /// Budget-exhaustion fallback edge: Evicting → HostLost must pass the
 /// legality table AND the live CHECK constraint.
 #[tokio::test]
