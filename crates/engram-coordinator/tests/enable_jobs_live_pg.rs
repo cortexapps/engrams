@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::EnableJobState;
-use engram_core::MetaError;
+use engram_core::types::manifest::ManifestRef;
+use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::{EnableJobState, EnabledImage};
+use engram_core::{MetaError, SnapshotId};
 use uuid::Uuid;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
@@ -198,4 +201,89 @@ async fn progress_state_failure_and_retry_round_trip() {
     meta.set_enable_job_state(job.id, EnableJobState::Failed)
         .await
         .expect("park");
+}
+
+/// ADR 0036 P4: content-keyed base-snapshot reuse lookup. Seeds an
+/// enabled image whose `disk_manifest_*` is a (simulated)
+/// content-derived ref + a base snapshot, then asserts the lookup
+/// finds it by content — including after soft-delete — and misses on
+/// a different manifest.toml or different content.
+#[tokio::test]
+#[ignore]
+async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
+    let Some(meta) = connect().await else { return };
+
+    let snapshot_id = SnapshotId::new();
+    meta.record_snapshot(SnapshotRecord {
+        id: snapshot_id,
+        session_id: None,
+        host_id: None,
+        image_version: "p4-fixture".into(),
+        size_bytes: 0,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: true,
+        aux_bundles: vec![],
+    })
+    .await
+    .expect("seed base snapshot");
+
+    let content_ref = ManifestRef::new(); // stands in for a content-derived ref
+    let toml = format!("name = \"p4-{}\"\n", Uuid::new_v4());
+    let uri = unique_uri("content-reuse");
+    let now = Utc::now();
+    meta.upsert_enabled_image(EnabledImage {
+        id: Uuid::new_v4(),
+        image_uri: uri.clone(),
+        manifest_toml: toml.clone(),
+        manifest_digest: "sha256:p4-digest".into(),
+        disk_manifest: Some(content_ref),
+        base_snapshot_id: Some(snapshot_id),
+        base_snapshot_disk_manifest: Some(ManifestRef::new()),
+        base_snapshot_memory_manifest: None,
+        last_refreshed_at: now,
+        created_at: now,
+        updated_at: None,
+        soft_deleted_at: None,
+    })
+    .await
+    .expect("seed enabled image");
+
+    // Hit: same content + same toml → the row, regardless of URI.
+    let found = meta
+        .find_enabled_image_by_content(content_ref, &toml)
+        .await
+        .expect("lookup")
+        .expect("content match must be found");
+    assert_eq!(found.image_uri, uri);
+    assert_eq!(found.base_snapshot_id, Some(snapshot_id));
+
+    // Miss: same content, different manifest.toml (env change must
+    // force a fresh capture).
+    assert!(meta
+        .find_enabled_image_by_content(content_ref, "name = \"other\"\n")
+        .await
+        .expect("lookup other toml")
+        .is_none());
+
+    // Miss: different content.
+    assert!(meta
+        .find_enabled_image_by_content(ManifestRef::new(), &toml)
+        .await
+        .expect("lookup other content")
+        .is_none());
+
+    // Still a hit after soft-delete — the snapshot lineage stays
+    // pinned and reusable even when the row is disabled.
+    meta.soft_delete_enabled_image(&uri)
+        .await
+        .expect("soft delete");
+    let found = meta
+        .find_enabled_image_by_content(content_ref, &toml)
+        .await
+        .expect("lookup post-delete")
+        .expect("soft-deleted rows must still match");
+    assert_eq!(found.image_uri, uri);
 }

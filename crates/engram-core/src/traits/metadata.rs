@@ -500,6 +500,29 @@ pub trait MetadataStore: Send + Sync {
     /// from BlobStorage.
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
 
+    /// ADR 0036 P4: content-keyed base-snapshot reuse. Find an
+    /// enabled image (INCLUDING soft-deleted rows — their snapshots
+    /// stay GC-pinned and restorable) whose bake produced the same
+    /// disk content (`disk_manifest_*`, content-derived since ADR
+    /// 0036) AND the same `manifest_toml`, and which carries a base
+    /// snapshot. The enable pipeline reuses that snapshot instead of
+    /// booting a capture VM: with both inputs equal, a fresh capture
+    /// is equivalent for every session created from it (bundle
+    /// generations are swapped to the host's current staging at
+    /// session create — ADR 0035 Invariant 2 — so reuse does not
+    /// freeze bundle freshness).
+    ///
+    /// Default `None`: stores without the query surface (test mocks)
+    /// simply never reuse.
+    async fn find_enabled_image_by_content(
+        &self,
+        disk_manifest: ManifestRef,
+        manifest_toml: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        let _ = (disk_manifest, manifest_toml);
+        Ok(None)
+    }
+
     // ---- enable jobs (ADR 0036) ----
     //
     // Async image-enable state machine: `POST /api/enabled-images`

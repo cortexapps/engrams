@@ -89,10 +89,41 @@ Adopt Docker's own model for the same problem, end to end:
    chunks, not 625.
 
 4. **Base-snapshot capture reuse keyed on content.** The reuse check
-   currently keys on the OCI manifest digest, so a moved tag with
-   identical bytes re-captures. Re-key on the disk manifest (a pure
-   function of rootfs bytes once builds are deterministic): unchanged
-   content jumps `materializing → ready` without booting a capture VM.
+   used to key on `(image_uri, OCI manifest digest)`, so the common
+   prod case — a re-bake under a fresh `warm-<sha>` tag with
+   byte-identical content — always re-captured: a new VM boot, a new
+   snapshot lineage (memory snapshots are boot-nondeterministic and
+   never dedup, hundreds of MB per capture), and a fleet-wide
+   re-prefetch of the new chunks. Two changes make identical content
+   *recognizable* and reusable:
+   - The bake's disk `ManifestRef` is **content-derived**
+     (`Manifest::content_ref`, sha256 over the chunk layout) instead
+     of `Uuid::new_v4()` — a random id that polluted `bundle.json`
+     and made even deterministic re-bakes look like new content at
+     every layer above. (Snapshot manifests keep random ids; their
+     content is nondeterministic per capture.)
+   - The reuse check becomes content-keyed
+     (`find_enabled_image_by_content`): any enabled image —
+     soft-deleted included, its snapshot stays GC-pinned — with the
+     same `disk_manifest` AND the same `manifest_toml` donates its
+     base snapshot, and the enable job jumps straight to `ready`.
+     The legacy URI+digest check remains only for harness-only
+     images without a chunked disk.
+
+   **Why reuse is sound despite bundle drives** (this was nearly a
+   landmine): a base snapshot embeds a third input besides rootfs +
+   manifest — the aux bundle generations (skills/playwright squashfs)
+   staged on the capture host at that moment, which the coordinator
+   can't see. Under ADR 0027 that made capture the only bundle
+   delivery path, and skipping it would have frozen bundle freshness.
+   ADR 0035's Invariant 2 dissolved this: session-create loads the
+   snapshot paused and `patch_drive`s any stale-pinned aux drive to
+   the host's **current** staged generation before resuming (resumes
+   keep their pins — live guests hold fds). The embedded generation
+   is only the durable fallback, so a reused snapshot is equivalent
+   to a fresh capture for every session created from it. A
+   manifest.toml change (env, resources, bundle opt-ins) still forces
+   a fresh capture by key construction.
 
 Zero users → clean break: the monolithic `chunks.disk.v1` layer, the
 `disk_chunks_blob` fields, and the Range-GET materialize path are deleted,

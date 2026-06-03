@@ -758,8 +758,26 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                         None, // default 16 MiB
                     )
                     .await?;
-                let manifest_ref = engram_chunk_store::ManifestRef::new();
-                self.chunk_store.put_manifest(manifest_ref, &m).await?;
+                // ADR 0036 P4: the bake's manifest identity is derived
+                // from its content, not minted at random. Deterministic
+                // re-bakes of unchanged content therefore reproduce the
+                // SAME ManifestRef — bundle.json stays byte-identical,
+                // and the enable pipeline can recognize "already
+                // captured this exact rootfs" and reuse the base
+                // snapshot. Content-derived also means the same ref ⇒
+                // the same manifest bytes, so an already-present
+                // manifest (a prior identical bake) is success, not a
+                // VersionConflict.
+                let manifest_ref = m.content_ref();
+                match self.chunk_store.get_manifest(manifest_ref).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            manifest = %manifest_ref,
+                            "content-identical manifest already in store; skipping put"
+                        );
+                    }
+                    Err(_) => self.chunk_store.put_manifest(manifest_ref, &m).await?,
+                }
 
                 // Sidecar bundle.json so image_cache + tooling can
                 // find the manifest ref without hitting Postgres.

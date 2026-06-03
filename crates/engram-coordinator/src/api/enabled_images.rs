@@ -466,9 +466,53 @@ pub(crate) async fn capture_and_record_base_snapshot(
     ),
     ApiError,
 > {
-    // Idempotency: if this image is already enabled at the same content
-    // digest and carries a base snapshot, reuse it — re-enabling
-    // shouldn't re-boot a capture VM.
+    // ADR 0036 P4: content-keyed reuse. A base snapshot is a function
+    // of (rootfs bytes, manifest.toml) — the bundle generations it
+    // embeds are only the fallback pin, because session-create swaps
+    // aux drives to the host's CURRENT staged generation (ADR 0035
+    // Invariant 2; `restore_in_jail`'s `swap_aux_to_current`). So if
+    // ANY enabled image (soft-deleted included — its snapshot stays
+    // GC-pinned) was captured from the same disk content with the
+    // same manifest.toml, that snapshot is equivalent to what a fresh
+    // capture would produce: reuse it instead of booting a capture
+    // VM. With deterministic bakes + content-derived ManifestRefs,
+    // this is what makes a no-op re-bake's enable near-instant — and
+    // hosts already hold the reused snapshot's chunks on NVMe, so no
+    // fleet-wide re-prefetch either.
+    if let Some(disk_ref) = row.disk_manifest {
+        if let Some(existing) = state
+            .services
+            .meta
+            .find_enabled_image_by_content(disk_ref, &row.manifest_toml)
+            .await?
+        {
+            if let Some(id) = existing.base_snapshot_id {
+                tracing::info!(
+                    image_uri = %row.image_uri,
+                    reused_from = %existing.image_uri,
+                    disk_manifest = %disk_ref,
+                    snapshot_id = %id,
+                    "content-identical image already captured; reusing base snapshot",
+                );
+                let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "enabled image `{}` reuses base snapshot {id} but carries no \
+                         base_snapshot_disk_manifest (NOT NULL since migration 0042); \
+                         refresh the image to re-stamp it",
+                        existing.image_uri
+                    ))
+                })?;
+                // Memory manifest is nullable since migration 0049 — `None`
+                // for cold-boot backends (VZ). Reuse whatever the row carries.
+                let memory_manifest = existing.base_snapshot_memory_manifest;
+                return Ok((id, disk_manifest, memory_manifest));
+            }
+        }
+    }
+
+    // Legacy idempotency for rows without a chunked-disk manifest
+    // (harness-only images): same URI at the same OCI digest with a
+    // recorded snapshot — re-enabling shouldn't re-boot a capture VM.
     if let Some(existing) = state
         .services
         .meta

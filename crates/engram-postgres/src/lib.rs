@@ -1499,6 +1499,40 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn find_enabled_image_by_content(
+        &self,
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+        manifest_toml: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        // Soft-deleted rows are deliberately INCLUDED: their base
+        // snapshots remain GC-pinned and restorable, and content
+        // equality is what makes the reuse sound — liveness of the
+        // *row* is irrelevant to the snapshot's validity.
+        let row = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_toml, manifest_digest,
+                   disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
+                   base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
+              FROM enabled_images
+             WHERE disk_manifest_id = $1
+               AND disk_manifest_version = $2
+               AND manifest_toml = $3
+               AND base_snapshot_id IS NOT NULL
+             ORDER BY COALESCE(updated_at, created_at) DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(disk_manifest.manifest_id)
+        .bind(disk_manifest.version as i64)
+        .bind(manifest_toml)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enabled_image_from_row(&r)).transpose()
+    }
+
     // ---- enable jobs (ADR 0036) ----
 
     async fn create_or_get_enable_job(
