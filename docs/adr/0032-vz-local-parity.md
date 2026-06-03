@@ -99,4 +99,7 @@ write with **no** explicit `sync` → snapshot → evict-local → resume reads 
 intact. A macOS-only e2e test (`crates/engram-host-agent/tests/e2e_vz.rs`) locks
 this lifecycle in.
 
-**Commit chain.** _(to be filled in on merge)_
+**Commit chain.** PR #67 (`vz-local-parity`): host-agent chunk-store wiring →
+memory-manifest optional (migration 0049) → ready-port skip on console → VZ
+flush-before-snapshot + shell ttyd → flake macOS bake deps → docs → the
+`e2e_vz` live lifecycle test.
