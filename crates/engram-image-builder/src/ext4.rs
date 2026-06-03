@@ -127,6 +127,30 @@ impl Ext4Packer for Mke2fsPacker {
     }
 }
 
+/// ADR 0036: fixed inputs that make `mke2fs` output a pure function
+/// of the source tree, so a re-bake with unchanged content reproduces
+/// identical 16 MiB chunk hashes — the property that turns the
+/// content-addressed chunk store and the per-chunk OCI push into
+/// *delta* transfers. Without these, mke2fs salts every image with a
+/// random filesystem UUID, a random htree directory-hash seed, and
+/// wall-clock timestamps, and cross-bake dedup never fires (~100% new
+/// chunks per re-bake of 95%-identical content).
+///
+/// Sharing one filesystem UUID across all engram images is safe:
+/// guests mount the rootfs by virtio device path, never by UUID, and
+/// the images are block devices inside dedicated microVMs (no host
+/// blkid involvement).
+const DETERMINISTIC_FS_UUID: &str = "00000000-e9a4-4a11-8036-000000000036";
+const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
+/// 2024-01-01T00:00:00Z. e2fsprogs (≥1.45) reads `SOURCE_DATE_EPOCH`
+/// and (a) stamps superblock mkfs/write times from it instead of the
+/// wall clock, and (b) clamps inode timestamps newer than it — which
+/// covers the bake-time-injected files (agentd, init shim) without a
+/// separate mtime-normalization pass over the exported tree.
+/// Verified empirically: same tree packed twice (and two
+/// separately-created identical trees) → byte-identical images.
+const DETERMINISTIC_EPOCH: &str = "1704067200";
+
 impl Mke2fsPacker {
     /// Inner mke2fs invocation, factored out so the caller can wrap
     /// the failure path in tmp-file cleanup without duplicating
@@ -137,6 +161,13 @@ impl Mke2fsPacker {
             .arg("ext4")
             .arg("-F")
             .arg("-q")
+            // ADR 0036 determinism: fixed FS UUID + directory-hash
+            // seed + epoch (see the consts above).
+            .arg("-U")
+            .arg(DETERMINISTIC_FS_UUID)
+            .arg("-E")
+            .arg(format!("hash_seed={DETERMINISTIC_HASH_SEED}"))
+            .env("SOURCE_DATE_EPOCH", DETERMINISTIC_EPOCH)
             .arg("-d")
             .arg(src_dir)
             .arg(dst_image)
