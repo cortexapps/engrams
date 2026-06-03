@@ -41,7 +41,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # available. On non-Linux (the supervisor's mount_harness is a stub)
 # nix is harmless.
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", features = ["mount"] }
+nix = { version = "0.29", features = ["mount", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"
