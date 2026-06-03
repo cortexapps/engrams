@@ -45,6 +45,18 @@ fn main() -> ExitCode {
         }
     }
 
+    // agentd is pid 1 with stdout on /dev/console. After an FC snapshot
+    // restore nothing drains the emulated serial port, so once the TTY
+    // output buffer fills, a blocking write to the console wedges the
+    // writing thread FOREVER (prod incident 2026-06-03, session 5665bdd3:
+    // the harness froze mid-tracing-line and its prompt was never
+    // processed). Flip stdout to O_NONBLOCK before the first tracing line:
+    // log writes to a full console then fail with EAGAIN and the fmt layer
+    // drops them — lossy under pressure, but agentd (and /exec, eviction,
+    // the flush path) stays alive. Cold-boot console logging is unaffected
+    // (the console drains normally until the first restore).
+    unblock_console_stdout();
+
     // ADR 0019: the host injects the OTLP collector endpoint + parent trace
     // context into the kernel cmdline on cold boot (BootSource.boot_args).
     // Adopt the endpoint into the env *before* telemetry init so the guest
@@ -216,6 +228,34 @@ fn kernel_cmdline_value(key: &str) -> Option<String> {
 fn token_from_kernel_cmdline() -> Option<String> {
     kernel_cmdline_value("engram_token")
 }
+
+/// Make writes to agentd's stdout non-blocking when it's a TTY (i.e. the
+/// guest `/dev/console`). A snapshot-restored FC VM stops draining the
+/// emulated serial port, so a *blocking* console write hangs forever once
+/// the TTY output buffer fills; with `O_NONBLOCK` the write fails with
+/// `EAGAIN` instead and `tracing`'s fmt layer drops the line. Best-effort:
+/// a failed fcntl just leaves the (current, blocking) behavior in place.
+/// stderr stays blocking on purpose — `eprintln!` panics on write failure,
+/// and agentd only writes stderr during startup, when the console drains.
+#[cfg(target_os = "linux")]
+fn unblock_console_stdout() {
+    use std::io::IsTerminal;
+    use std::os::fd::AsRawFd;
+
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return;
+    }
+    let fd = stdout.as_raw_fd();
+    let Ok(flags) = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL) else {
+        return;
+    };
+    let flags = nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+    let _ = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unblock_console_stdout() {}
 
 /// Seconds since kernel boot (`/proc/uptime` field 1), Linux only. At
 /// agentd's start this is ≈ the whole pre-agentd cold-boot window (kernel

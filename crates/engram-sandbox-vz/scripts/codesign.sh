@@ -69,11 +69,13 @@ if [ -x "$BIN" ] && [ -f "$BIN" ]; then
 fi
 
 # Test binaries: target/$PROFILE/deps/engram_sandbox_vz-<16hex>
-# (no extension). Cargo emits .d / .o / .rmeta siblings alongside
-# the executable; filter via `file -b` to sign only the Mach-O
-# executable.
+# (the crate's unit/lib tests) and e2e_vz-<16hex> (the live
+# lifecycle integration test in tests/e2e_vz.rs — a separate test
+# target, so a separate binary name). Cargo emits .d / .o / .rmeta
+# siblings alongside the executable; filter via `file -b` to sign
+# only the Mach-O executable.
 shopt -s nullglob
-for T in target/"$PROFILE"/deps/engram_sandbox_vz-*; do
+for T in target/"$PROFILE"/deps/engram_sandbox_vz-* target/"$PROFILE"/deps/e2e_vz-*; do
     if [ -x "$T" ] && [ -f "$T" ]; then
         case "$(file -b "$T")" in
             "Mach-O 64-bit executable"*)
