@@ -1,132 +1,96 @@
 import { useStorageSummary } from '../hooks/useStorageSummary';
 import { fmtAgo, fmtBytes, secondsSince, shortId } from '../format';
+import { Card, CardContent } from '@/components/ui/card';
+import { Progress } from '@/components/ui/progress';
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from '@/components/ui/table';
 import type { DurabilityRow } from '../types';
 
-// Storage — COW state's real home (`/storage`). The chunk/durability
-// layer as a first-class diagnostics surface: fleet-wide rollups + a
-// per-sandbox durability ledger (dirty chunks, unflushed bytes, base-
-// chunk locality, RPO). All values come from the coordinator's
-// /storage/summary endpoint — no synthesized numbers.
+export function Storage() {
+  const { data, isPending, error } = useStorageSummary();
+  const rows = data?.rows ?? [];
+  const rollups: [string, string | number][] = [
+    ['Snapshots', data?.snapshots ?? 0],
+    ['Snapshot bytes', fmtBytes(data?.snapshot_bytes ?? 0)],
+    ['Tracked sandboxes', data?.tracked_sandboxes ?? 0],
+    ['Unflushed', fmtBytes(data?.unflushed_bytes ?? 0)],
+    ['Avg locality', `${data?.avg_locality_pct ?? 0}%`],
+    ['GC pending', data?.gc_pending ?? 0],
+  ];
 
-function LocalityCell({ row }: { row: DurabilityRow }) {
-  const pct =
-    row.base_chunks > 0
-      ? Math.round((row.base_chunks_local / row.base_chunks) * 100)
-      : null;
-  if (pct === null) return <span data-label="base locality">—</span>;
   return (
-    <span
-      data-label="base locality"
-      title={`${row.base_chunks_local}/${row.base_chunks} base chunks resident`}
-    >
-      <span className="locality-bar">
-        <span className="locality-fill" style={{ width: `${pct}%` }} />
-      </span>
-      {pct}%
-    </span>
-  );
-}
+    <div className="space-y-6 p-4 md:p-6">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Storage</h1>
+        <p className="text-sm text-muted-foreground">
+          Content-addressed chunk store, snapshots, and copy-on-write durability.
+        </p>
+      </div>
 
-function LedgerRow({ row }: { row: DurabilityRow }) {
-  // RPO goes amber when the last flush is recent (≤10s) — the window
-  // in which unflushed work is most exposed.
-  const rpoHot = secondsSince(row.last_flush_at) <= 10;
-  return (
-    <div className="ledger-row">
-      <span className="ld-session" data-label="session">
-        {row.session_id ? shortId(row.session_id) : shortId(row.sandbox_id)}
-      </span>
-      <span data-label="host">{shortId(row.host_id)}</span>
-      <span data-tabular data-label="dirty">
-        {row.dirty_chunks}
-      </span>
-      <span data-tabular data-label="unflushed">
-        {fmtBytes(row.dirty_bytes)}
-      </span>
-      <LocalityCell row={row} />
-      <span
-        data-tabular
-        data-label="rpo"
-        style={{ color: rpoHot ? 'var(--color-amber)' : 'var(--color-ink-faded)' }}
-      >
-        {fmtAgo(row.last_flush_at)}
-      </span>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {rollups.map(([label, value]) => (
+          <Card key={label}><CardContent className="py-4">
+            <div className="font-mono text-xl tabular-nums">{value}</div>
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
+          </CardContent></Card>
+        ))}
+      </div>
+
+      <div>
+        <div className="mb-2 flex items-baseline justify-between">
+          <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Durability ledger · per-sandbox copy-on-write
+          </h2>
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">{rows.length}</span>
+        </div>
+        <Table>
+          <TableHeader><TableRow>
+            <TableHead>Session</TableHead><TableHead>Host</TableHead>
+            <TableHead className="text-right">Dirty</TableHead>
+            <TableHead className="text-right">Unflushed</TableHead>
+            <TableHead>Base locality</TableHead>
+            <TableHead className="text-right">RPO</TableHead>
+          </TableRow></TableHeader>
+          <TableBody>
+            {error ? (
+              <TableRow><TableCell colSpan={6} className="text-sm text-destructive">{(error as Error).message}</TableCell></TableRow>
+            ) : rows.length === 0 ? (
+              <TableRow><TableCell colSpan={6} className="text-sm text-muted-foreground">
+                {isPending ? 'Loading…' : 'No chunk-tracked sandboxes'}
+              </TableCell></TableRow>
+            ) : rows.map((r) => <LedgerRow key={r.sandbox_id} row={r} />)}
+          </TableBody>
+        </Table>
+        <p className="mt-3 max-w-prose text-sm text-muted-foreground">
+          Dirty chunks flush to the content-addressed store on the snapshot cadence; base locality is the
+          share of a sandbox’s base chunks resident on its host. RPO is time since the last flush.
+        </p>
+      </div>
     </div>
   );
 }
 
-export function Storage() {
-  const { data, isPending, error } = useStorageSummary();
-
-  const rollups: [string, string | number][] = [
-    ['snapshots', data?.snapshots ?? 0],
-    ['snapshot bytes', fmtBytes(data?.snapshot_bytes ?? 0)],
-    ['tracked sandboxes', data?.tracked_sandboxes ?? 0],
-    ['unflushed', fmtBytes(data?.unflushed_bytes ?? 0)],
-    ['avg locality', `${data?.avg_locality_pct ?? 0}%`],
-    ['gc pending', data?.gc_pending ?? 0],
-  ];
-
-  const rows = data?.rows ?? [];
-
+function LedgerRow({ row }: { row: DurabilityRow }) {
+  const pct = row.base_chunks > 0 ? Math.round((row.base_chunks_local / row.base_chunks) * 100) : null;
+  const rpoHot = secondsSince(row.last_flush_at) <= 10;
   return (
-    <main className="book-wide surface">
-      <div className="surface-head">
-        <div>
-          <h1 className="surface-title">storage</h1>
-          <p className="surface-sub">
-            content-addressed chunk store, snapshots, and copy-on-write
-            durability.
-          </p>
-        </div>
-      </div>
-
-      <div className="storage-rollup">
-        {rollups.map(([label, value]) => (
-          <div key={label} className="rollup-cell">
-            <span className="rollup-num stat-figure" data-tabular>
-              {value}
-            </span>
-            <span className="rollup-lbl section-label">{label}</span>
-          </div>
-        ))}
-      </div>
-
-      <section className="manifest-group">
-        <div className="manifest-group-head">
-          <span className="section-label">
-            DURABILITY LEDGER · per-sandbox copy-on-write
+    <TableRow>
+      <TableCell className="font-mono text-sm">{shortId(row.session_id ?? row.sandbox_id)}</TableCell>
+      <TableCell className="font-mono text-xs text-muted-foreground">{shortId(row.host_id)}</TableCell>
+      <TableCell className="text-right font-mono tabular-nums">{row.dirty_chunks}</TableCell>
+      <TableCell className="text-right font-mono tabular-nums">{fmtBytes(row.dirty_bytes)}</TableCell>
+      <TableCell>
+        {pct === null ? '—' : (
+          <span className="flex items-center gap-2">
+            <Progress value={pct} className="h-1.5 w-16" />
+            <span className="font-mono text-xs tabular-nums">{pct}%</span>
           </span>
-          <span className="section-label manifest-count" data-tabular>
-            {rows.length}
-          </span>
-        </div>
-        <div className="ledger">
-          <div className="ledger-row ledger-head section-label">
-            <span>session</span>
-            <span>host</span>
-            <span>dirty</span>
-            <span>unflushed</span>
-            <span>base locality</span>
-            <span>rpo</span>
-          </div>
-          {error ? (
-            <p className="manifest-empty">{(error as Error).message}</p>
-          ) : rows.length === 0 ? (
-            <p className="manifest-empty">
-              {isPending ? 'loading…' : 'no chunk-tracked sandboxes'}
-            </p>
-          ) : (
-            rows.map((r) => <LedgerRow key={r.sandbox_id} row={r} />)
-          )}
-        </div>
-        <p className="ledger-note">
-          dirty chunks flush to the content-addressed store on the snapshot
-          cadence; base locality is the share of a sandbox’s base chunks
-          resident on its host (the rest stream on restore). RPO is time since
-          the last flush.
-        </p>
-      </section>
-    </main>
+        )}
+      </TableCell>
+      <TableCell className={`text-right font-mono text-xs tabular-nums ${rpoHot ? 'text-destructive' : 'text-muted-foreground'}`}>
+        {fmtAgo(row.last_flush_at)}
+      </TableCell>
+    </TableRow>
   );
 }
