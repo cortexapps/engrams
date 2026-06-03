@@ -144,6 +144,14 @@ pub struct WireHandshakeAck {
 /// [`MAX_MSG_BYTES`] (16 MiB) per the existing framing layer; for
 /// Upload / Download that bounds payload size at 16 MiB. Multi-
 /// frame chunked uploads are a follow-up.
+///
+/// **APPEND-ONLY.** The wire is bincode, which encodes enums by
+/// variant *index*. agentd is baked into session images / base
+/// snapshots, so the host-agent routinely speaks to agentds built
+/// from older trees. Inserting a variant mid-enum shifts every
+/// later index and desyncs that pair (the host's `SpawnHarness`
+/// decodes as the old agentd's `InstallHostCa`, …). New variants go
+/// at the END of the enum — same rule for [`WireResponse`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WireRequest {
     /// Run a command in the sandbox and stream its output. Wraps
@@ -183,17 +191,6 @@ pub enum WireRequest {
     /// Replies [`WireResponse::GuestIp`] with `None` if no eligible
     /// non-loopback address could be determined.
     GuestIp,
-    /// Flush the guest's filesystem buffers to the virtio-blk disk.
-    /// Replies [`WireResponse::Synced`] once `sync(2)` returns.
-    ///
-    /// Used by clone-snapshot backends (VZ) before they pause + clone
-    /// the rootfs: those backends capture only on-disk state (cold-boot
-    /// restore, no memory image), so any write still sitting in the
-    /// guest's page cache would be lost from the snapshot. Flushing
-    /// first makes the clone capture the guest's just-written state.
-    /// FC doesn't need this — its memory snapshot carries the dirty
-    /// pages — so only the console/VZ path sends it.
-    Sync,
     /// Ensure `ttyd` is running and bound to `port` (defaults to
     /// 7681). On first call after VM boot the agent spawns ttyd; on
     /// subsequent calls it checks the existing handle is still
@@ -253,6 +250,19 @@ pub enum WireRequest {
     /// fresh / rotated cert, or [`WireResponse::Error`] if the
     /// guest filesystem write fails.
     InstallHostCa(InstallHostCaRequest),
+    /// Flush the guest's filesystem buffers to the virtio-blk disk.
+    /// Replies [`WireResponse::Synced`] once `sync(2)` returns.
+    ///
+    /// Used by clone-snapshot backends (VZ) before they pause + clone
+    /// the rootfs: those backends capture only on-disk state (cold-boot
+    /// restore, no memory image), so any write still sitting in the
+    /// guest's page cache would be lost from the snapshot. Flushing
+    /// first makes the clone capture the guest's just-written state.
+    /// FC doesn't need this — its memory snapshot carries the dirty
+    /// pages — so only the console/VZ path sends it. (Sent to an older
+    /// baked agentd that predates the variant, the decode fails and the
+    /// host's flush degrades to best-effort/logged — by design.)
+    Sync,
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -308,9 +318,6 @@ pub enum WireResponse {
     /// could not determine a non-loopback address (e.g. networking
     /// not configured, all interfaces down).
     GuestIp(Option<String>),
-    /// Reply to [`WireRequest::Sync`] — `sync(2)` has returned, so the
-    /// guest's dirty page cache is now on the virtio-blk disk.
-    Synced,
     /// Reply to [`WireRequest::StartShell`]. ttyd is alive AND a
     /// TCP probe to `127.0.0.1:port` from inside the VM completed
     /// successfully — when the host dials the guest IP on this
@@ -343,6 +350,10 @@ pub enum WireResponse {
         kind: String,
         message: String,
     },
+    /// Reply to [`WireRequest::Sync`] — `sync(2)` has returned, so the
+    /// guest's dirty page cache is now on the virtio-blk disk.
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    Synced,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
