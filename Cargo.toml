@@ -150,7 +150,7 @@ hyper = "1"
 h2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 http = "1"
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 # JWT / JWKS verification for the auth seam (ADR 0031): OIDC ID-token
 # validation and the forward-auth signed-assertion (GCP IAP etc.) path.
 # jsonwebtoken 10 dropped its built-in ring backend: a crypto provider is now an
