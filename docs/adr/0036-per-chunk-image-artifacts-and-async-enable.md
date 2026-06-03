@@ -1,8 +1,24 @@
 # ADR 0036: Per-chunk OCI image artifacts + async enable pipeline
 
-Status: 2026-06-03 — **Proposed; implemented** (commit chain below).
-Flips to Accepted after prod validation: first re-bake pushing a
-delta, first async enable driven to `ready` through the job API.
+Status: 2026-06-03 — **Accepted.** Implemented (commit chain below)
+and validated end-to-end locally on the `just dev` stack (macOS/VZ,
+real docker bake, real registry):
+
+- **Delta push**: a full re-bake of unchanged source under a new tag
+  produced the same content-derived manifest (`4a1e82a0…@v1`) and
+  pushed `0/29` chunks (`pushed=0 skipped=29`).
+- **Async enable**: `pending → materializing 29/29 → capturing →
+  ready` with live progress in both the CLI and the web panel.
+- **Content-keyed reuse**: enabling the second tag took ~2 s with
+  zero capture VMs; both rows share one `base_snapshot_id`, and a
+  session created against the reused-snapshot tag boots and execs.
+
+![materializing](assets/0036/enable-materializing.png)
+![capturing](assets/0036/enable-capturing.png)
+![both tags enabled](assets/0036/enable-done-both-tags.png)
+
+Remaining prod watch (post-merge, non-blocking): first GHCR delta
+bake + async enable of dev-engrams through the job API.
 
 Implementation (one commit per phase, this branch):
 
