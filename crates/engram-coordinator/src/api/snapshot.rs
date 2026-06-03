@@ -518,7 +518,12 @@ pub async fn finish_resume_to_active(
         )
         .ok()
         .flatten()?;
-        crate::api::sessions::inject_forge_env(state, id, b.manifest.git.as_ref(), &mut agent.env);
+        crate::api::sessions::inject_harness_env(
+            state,
+            id,
+            b.manifest.git.as_ref(),
+            &mut agent.env,
+        );
         Some(agent)
     });
     let mut start_agent_failed = false;

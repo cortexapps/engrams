@@ -709,10 +709,7 @@ async fn create_session_inner(
     // session_env). dev_vm sessions have no harness; their `/exec` path
     // mints the token per request instead.
     if let Some(agent) = agent_for_session.as_mut() {
-        inject_forge_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
-        // ADR 0026: artifact-upload token, injected for every image
-        // (not git-gated) so the baked `engram-share` skill always works.
-        inject_upload_env(&state, session_id, &mut agent.env);
+        inject_harness_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
     }
 
     // Network policy: image manifest's `[network]` block, verbatim.
@@ -1367,6 +1364,28 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Every env a freshly-spawned harness needs beyond `session_env`:
+/// the forge broker token (git-gated) and the artifact-upload token
+/// (universal — the `engram-share` skill is baked into every image).
+///
+/// This is THE injector for both harness-spawn paths — session
+/// create and resume's harness rebuild. They diverged once (resume
+/// missed the upload env, so `engram-share` broke after every
+/// idle→resume hop until the next cold create — prod session
+/// 5cfb90b8); a single shared entry point makes that class of skew
+/// impossible. If you add an env here, both paths get it.
+pub(crate) fn inject_harness_env(
+    state: &SharedState,
+    session_id: SessionId,
+    git: Option<&engram_core::types::image::GitConfig>,
+    env: &mut HashMap<String, String>,
+) {
+    inject_forge_env(state, session_id, git, env);
+    // ADR 0026: artifact-upload token, injected for every image
+    // (not git-gated) so the baked `engram-share` skill always works.
+    inject_upload_env(state, session_id, env);
 }
 
 pub(crate) fn inject_forge_env(
