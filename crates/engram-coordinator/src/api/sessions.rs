@@ -1158,8 +1158,8 @@ pub struct ListSessionsParams {
 
 /// `GET /sessions` — owner-scoped (ADR 0031). A member sees only their own
 /// sessions; an admin sees their own (`scope=mine`, default) or everyone's
-/// (`scope=all`). Returns only `pending`/`active`/`idle` rows (what
-/// `list_active_sessions` selects).
+/// (`scope=all`). Returns only live rows — terminal states and
+/// `host_lost` are excluded (what `list_active_sessions` selects).
 pub async fn list_sessions(
     State(state): State<SharedState>,
     crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,

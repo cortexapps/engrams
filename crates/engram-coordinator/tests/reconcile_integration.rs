@@ -132,12 +132,7 @@ impl MetadataStore for ReconcileMeta {
             .sessions
             .lock()
             .values()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    SessionState::Pending | SessionState::Active | SessionState::Idle
-                )
-            })
+            .filter(|s| s.status.is_live())
             .cloned()
             .collect())
     }

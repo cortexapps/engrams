@@ -150,6 +150,16 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        // Every non-terminal state except `host_lost` (limbo pending the
+        // reconciler; its bindings are stale by definition).
+        // `evicting` matters most: it keeps `sandbox_id` BOUND
+        // while the pipeline runs, and startup's `repopulate_routing`
+        // rebuilds the in-memory SandboxRegistry from this query — when
+        // `evicting` was missing, a coord roll mid-eviction left the new
+        // pod's registry empty for that session, every scanner attempt
+        // no-op'd on the "sandbox no longer bound" guard, and the budget
+        // exhausted into a spurious HostLost with the VM still running
+        // (prod session 5cfb90b8, 2026-06-03).
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
@@ -157,7 +167,8 @@ impl MetadataStore for PostgresStore {
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
-            WHERE status IN ('pending','active','idle')
+            WHERE status IN ('pending','created','guest_ready','active',
+                             'idle','evacuating','evicting')
             "#,
         )
         .fetch_all(&self.pool)

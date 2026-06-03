@@ -85,6 +85,15 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError>;
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
+
+    /// Every live (non-terminal, non-`host_lost`) session: `pending`,
+    /// `created`, `guest_ready`, `active`, `idle`, `evacuating`,
+    /// `evicting`. This is the rehydration source for the coord's
+    /// in-memory routing maps (`repopulate_routing`) — every state
+    /// that can carry a live `sandbox_id` binding (`evicting`
+    /// included: the sandbox stays bound while the eviction pipeline
+    /// runs) MUST be listed here, or a coord restart strands the
+    /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
