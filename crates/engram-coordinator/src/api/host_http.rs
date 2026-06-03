@@ -417,21 +417,15 @@ fn enabled_image_refs_from_rows(
                 );
                 return None;
             };
-            // ADR 0021 P2 (memory residency): NOT NULL (migration 0043), same
-            // build-then-stamp Option shape — skip the impossible None rather
-            // than panic so one malformed row can't break the advertisement.
-            let Some(base_snapshot_memory_manifest) = row.base_snapshot_memory_manifest else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_memory_manifest (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
+            // ADR 0021 P2 (memory residency): nullable since migration 0049.
+            // `None` for cold-boot backends (VZ) that capture a disk-only base
+            // snapshot — advertise the row anyway; the host's prefetch warms
+            // only the disk tier when memory is absent.
             Some(EnabledImageRef {
                 image_uri: row.image_uri,
                 manifest_digest: ManifestDigest(row.manifest_digest),
                 base_snapshot_disk_manifest,
-                base_snapshot_memory_manifest,
+                base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
             })
         })
         .collect()

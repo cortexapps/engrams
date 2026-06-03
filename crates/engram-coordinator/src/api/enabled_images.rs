@@ -94,7 +94,8 @@ pub async fn enable_image(
         capture_and_record_base_snapshot(&state, &row, &manifest).await?;
     row.base_snapshot_id = Some(base_snapshot_id);
     row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    row.base_snapshot_memory_manifest = Some(base_snapshot_memory_manifest);
+    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
+    row.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
     state
         .services
         .meta
@@ -149,7 +150,8 @@ pub async fn refresh_enabled_image(
         capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
     refreshed.base_snapshot_id = Some(base_snapshot_id);
     refreshed.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    refreshed.base_snapshot_memory_manifest = Some(base_snapshot_memory_manifest);
+    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
+    refreshed.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
     state
         .services
         .meta
@@ -385,9 +387,11 @@ async fn capture_and_record_base_snapshot(
 ) -> Result<
     (
         engram_core::types::SnapshotId,
-        // (disk manifest, memory manifest) of the base snapshot.
+        // Disk manifest of the base snapshot (always present).
         engram_core::types::manifest::ManifestRef,
-        engram_core::types::manifest::ManifestRef,
+        // Memory manifest — `None` for cold-boot backends (VZ) that capture a
+        // disk-only base snapshot; `Some` for FC's chunked memory snapshot.
+        Option<engram_core::types::manifest::ManifestRef>,
     ),
     ApiError,
 > {
@@ -416,14 +420,9 @@ async fn capture_and_record_base_snapshot(
                         row.image_uri
                     ))
                 })?;
-                let memory_manifest = existing.base_snapshot_memory_manifest.ok_or_else(|| {
-                    ApiError::Internal(format!(
-                        "enabled image `{}` reuses base snapshot {id} but carries no \
-                         base_snapshot_memory_manifest (NOT NULL since migration 0043); \
-                         refresh the image to re-stamp it",
-                        row.image_uri
-                    ))
-                })?;
+                // Memory manifest is nullable since migration 0049 — `None`
+                // for cold-boot backends (VZ). Reuse whatever the row carries.
+                let memory_manifest = existing.base_snapshot_memory_manifest;
                 return Ok((id, disk_manifest, memory_manifest));
             }
         }
@@ -542,14 +541,10 @@ async fn capture_and_record_base_snapshot(
             row.image_uri
         ))
     })?;
-    let memory_manifest = meta.memory_manifest.ok_or_else(|| {
-        ApiError::Internal(format!(
-            "base snapshot for `{}` was captured without a chunked memory manifest; \
-             memory residency requires one — not enabling",
-            row.image_uri
-        ))
-    })?;
-    Ok((meta.id, disk_manifest, memory_manifest))
+    // Memory manifest is optional (migration 0049): FC produces a chunked
+    // memory snapshot, VZ cold-boots and captures disk only. Pass through
+    // whatever the backend produced — `None` skips memory residency.
+    Ok((meta.id, disk_manifest, meta.memory_manifest))
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`
