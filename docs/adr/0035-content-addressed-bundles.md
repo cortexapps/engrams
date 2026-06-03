@@ -210,7 +210,43 @@ can't be collected in the window between MIG roll and first capture.
 
 ## Divergences found during implementation
 
-(To be filled in as phases land.)
+- **`path_on_host` is gone entirely, not rewritten.** `AuxRoDrive` now
+  carries `sha256: Option<String>` and the host path is *derived* from
+  `(drive_id, sha256)` — path and content structurally cannot disagree.
+  Symbolic (`None`, coord request) vs resolved (`Some`, recorded
+  manifest) replaced the planned in-place path rewrite.
+- **Eviction snapshots publish too.** A fresh-create swap pins the
+  host's *baked* generation, which no base capture ever published —
+  so `BundleStore::publish` runs idempotently on **every** snapshot
+  with aux refs, not just base captures.
+- **Hosts' current generations don't join the blob-GC pin set.**
+  Publish-on-first-reference means an unreferenced current generation
+  isn't in blob storage at all; the host-side sweep protects its own
+  stamp locally. The heartbeat's `current_bundles` is therefore pure
+  fleet-skew visibility (kept on `HostState`).
+- **Bundle GC has no knobs of its own.** It rides the chunk-GC loop,
+  the `chunk_generation` barrier (which already ticks on
+  `record_snapshot` — exactly when bundle pins change), and
+  `ChunkGcConfig`'s grace/batch settings. Admin mirrors:
+  `POST /api/admin/bundle-gc/{dry-run,sweep}`.
+- **`live_bundles` is deliberately not `serde(default)`** on the host's
+  ack decode: an old coord's ack (mid-deploy) must fail decode — and
+  the heartbeat retry it — rather than read as an *empty pin set*,
+  which is an instruction to sweep generations resumes still need. A
+  coord-side PG failure likewise fails the heartbeat instead of
+  degrading to an empty set. Pinned by a wire-contract test.
+- **The swap mutates the live spec.** After a fresh-create
+  `patch_drive`, the restored sandbox's in-memory spec records the
+  *current* sha, so a later eviction `snapshot()` pins what's actually
+  attached (and the swept test kernel can't mount squashfs, so the FC
+  integration tests pin the block layer; the agentd umount/remount
+  half is covered by dev-vm e2e).
+- **`tests/aux_ro_drive.rs`'s symlink-roll variant was the incident,
+  encoded as a feature** ("the guest sees the NEW bytes — this is why
+  we embed the stable symlink"). It's replaced by a pinned-reopen
+  test, an explicit incident-reproduction negative control, and a §3
+  swap test — and the file is now wired into ci.yml's FC test list
+  (it was dev-vm-only).
 
 ## Commit chain
 
