@@ -211,7 +211,10 @@ build {
       "sudo install -m 0644 /tmp/skills.squashfs     \"/var/lib/engram/shared/skills-$SKILLS_SHA.squashfs\"",
       "sudo install -m 0644 /tmp/playwright.squashfs \"/var/lib/engram/shared/playwright-$PLAYWRIGHT_SHA.squashfs\"",
       "printf '{\"skills\": \"%s\", \"playwright\": \"%s\"}\n' \"$SKILLS_SHA\" \"$PLAYWRIGHT_SHA\" | sudo tee /var/lib/engram/shared/current.json >/dev/null",
-      "cat /var/lib/engram/shared/current.json",
+      # sudo: /var/lib/engram/shared is root-only and the stamp was
+      # sudo-tee'd; a bare cat as the packer SSH user fails with
+      # "Permission denied" and killed every thin bake since #72.
+      "sudo cat /var/lib/engram/shared/current.json",
     ]
   }
 
