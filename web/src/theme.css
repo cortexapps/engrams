@@ -60,11 +60,10 @@
   }
 
   body {
-    background-color: var(--color-paper);
-    color: var(--color-ink);
-    font-family: var(--font-display);
-    font-feature-settings: "kern", "liga", "onum";
-    font-variant-numeric: oldstyle-nums proportional-nums;
+    /* The shadcn shell owns the app background/foreground (index.css sets
+       bg-background / text-foreground) and default sans typography. The
+       still-old SessionDetail transcript subtree keeps its own paper styling
+       via the .stratum-* / transcript classes below. */
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     line-height: 1.55;
