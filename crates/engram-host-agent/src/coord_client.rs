@@ -452,6 +452,12 @@ pub struct HeartbeatRequest {
     /// upgrade.
     #[serde(default)]
     pub nbd_unhealthy: Vec<engram_core::SandboxId>,
+    /// ADR 0035: the bake stamp's `drive_id` → sha256 set — which
+    /// bundle generation this host image carries as *current*. Ops
+    /// visibility (fleet skew mid-roll) + a defensive member of the
+    /// coord's bundle-GC pin set.
+    #[serde(default)]
+    pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
 }
 
 #[derive(Deserialize)]
@@ -464,6 +470,14 @@ pub struct HeartbeatResponse {
     /// ready.
     #[serde(default)]
     pub enabled_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
+    /// ADR 0035 §5: the coord's bundle pin set (every generation some
+    /// snapshot row references). The host's bundle supervisor
+    /// prefetches missing pinned generations and sweeps staged files
+    /// outside pin-set ∪ bake-stamp. Deliberately NOT
+    /// `serde(default)`: an old coord's ack must fail decode (heartbeat
+    /// retries until the coord roll completes) rather than read as an
+    /// empty pin set and sweep generations resumes still need.
+    pub live_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
 }
 
 #[derive(Serialize)]

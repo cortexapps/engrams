@@ -21,6 +21,7 @@ use crate::image_cache::ImageCache;
 
 pub mod admin_handler;
 pub mod blob;
+pub mod bundles;
 pub mod config;
 pub mod coord_client;
 pub mod disk_daemon;
@@ -594,6 +595,19 @@ impl HostAgent {
                 }
             };
 
+            // ADR 0035: bundle store + supervisor. The stamp is read once
+            // (hosts are immutable; only a MIG roll changes it). The
+            // supervisor consumes the ack's `live_bundles` pin set:
+            // prefetch missing pinned generations, sweep unpinned ones.
+            let bundle_dir = bundles::bundle_dir_from_env();
+            let current_bundles = bundles::read_stamp(&bundle_dir).await;
+            let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
+                bundles::spawn_supervisor(
+                    bundles::BundleStore::new(cs.blob_storage().clone(), bundle_dir.clone()),
+                    current_bundles.clone(),
+                )
+            });
+
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
             // draining, ready_images} every `heartbeat_interval` to
@@ -636,6 +650,7 @@ impl HostAgent {
                         host_addr: host_addr_for_heartbeat.clone(),
                         ready_images: readiness_for_heartbeat.snapshot(),
                         nbd_unhealthy: nbd_health_for_heartbeat.snapshot(),
+                        current_bundles: current_bundles.clone(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
@@ -647,6 +662,18 @@ impl HostAgent {
                                         false
                                     } else {
                                         *cur = resp.enabled_images;
+                                        true
+                                    }
+                                });
+                            }
+                            // ADR 0035 §5: hand the pin set to the
+                            // bundle supervisor (same no-op dedup).
+                            if let Some(tx) = live_bundles_tx.as_ref() {
+                                tx.send_if_modified(|cur| {
+                                    if *cur == resp.live_bundles {
+                                        false
+                                    } else {
+                                        *cur = resp.live_bundles;
                                         true
                                     }
                                 });
