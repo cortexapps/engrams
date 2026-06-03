@@ -1,20 +1,31 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { Controller, useForm } from 'react-hook-form';
+import * as z from 'zod';
 import { createSession } from '../api';
 import { useAuth } from '../auth/AuthProvider';
 import { useEnabledImages } from '../hooks/useEnabledImages';
-import type { SessionMode } from '../types';
 import { Button } from '@/components/ui/button';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
   DialogTitle, DialogTrigger,
 } from '@/components/ui/dialog';
-import { Label } from '@/components/ui/label';
+import {
+  Field, FieldDescription, FieldError, FieldGroup, FieldLabel,
+} from '@/components/ui/field';
 import { Textarea } from '@/components/ui/textarea';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
+
+const newSessionSchema = z.object({
+  image: z.string().min(1, 'Select an image'),
+  mode: z.enum(['agent', 'dev_vm']),
+  prompt: z.string(),
+});
+type NewSessionValues = z.infer<typeof newSessionSchema>;
 
 export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -23,39 +34,42 @@ export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => voi
   const qc = useQueryClient();
   const navigate = useNavigate();
 
-  const [selectedUri, setSelectedUri] = useState('');
-  const [mode, setMode] = useState<SessionMode>('agent');
-  const [prompt, setPrompt] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const form = useForm<NewSessionValues>({
+    resolver: zodResolver(newSessionSchema),
+    defaultValues: { image: '', mode: 'agent', prompt: '' },
+  });
+  const selectedUri = form.watch('image');
+  const mode = form.watch('mode');
 
   const selected = images?.find((i) => i.image_uri === selectedUri);
   useEffect(() => {
-    if (!selectedUri && images && images.length > 0) setSelectedUri(images[0].image_uri);
-  }, [images, selectedUri]);
+    if (!selectedUri && images && images.length > 0) {
+      form.setValue('image', images[0].image_uri);
+    }
+  }, [images, selectedUri, form]);
 
   const harnessName = selected?.harness_name ?? null;
   const hasHarness = harnessName !== null;
   const isClaude = harnessName === 'claude';
   const promptMeaningful = hasHarness && mode === 'agent';
   const needsToken = isClaude && mode === 'agent' && !principal.has_claude_token;
-  const canSubmit = !!selected && !submitting && !needsToken;
+  const canSubmit = !!selected && !form.formState.isSubmitting && !needsToken;
 
-  const submit = async () => {
-    if (!canSubmit || !selected) return;
-    setSubmitting(true); setError(null);
+  const onSubmit = async (data: NewSessionValues) => {
+    if (!selected) return;
     try {
       const res = await createSession({
         image: selected.image_uri,
-        mode: mode === 'dev_vm' ? 'dev_vm' : undefined,
-        prompt: promptMeaningful ? (prompt.trim() || undefined) : undefined,
+        mode: data.mode === 'dev_vm' ? 'dev_vm' : undefined,
+        prompt: promptMeaningful ? (data.prompt.trim() || undefined) : undefined,
       });
       qc.invalidateQueries({ queryKey: ['sessions'] });
-      setOpen(false); setPrompt('');
+      setOpen(false);
+      form.reset();
       onCreated(res.session_id);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally { setSubmitting(false); }
+      form.setError('root', { message: e instanceof Error ? e.message : String(e) });
+    }
   };
 
   return (
@@ -75,64 +89,83 @@ export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => voi
         )}
 
         {images && images.length > 0 && (
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label>Image</Label>
-              <Select value={selectedUri} onValueChange={setSelectedUri}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {images.map((i) => (
-                    <SelectItem key={i.image_uri} value={i.image_uri}>
-                      {i.image_uri}{i.manifest_name ? ` — ${i.manifest_name}` : ''}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {harnessName ? `Baked harness: ${harnessName}` : 'No baked harness — shell-only image'}
-              </p>
-            </div>
+          <form onSubmit={form.handleSubmit(onSubmit)}>
+            <FieldGroup>
+              <Controller
+                name="image"
+                control={form.control}
+                render={({ field }) => (
+                  <Field>
+                    <FieldLabel htmlFor={field.name}>Image</FieldLabel>
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <SelectTrigger id={field.name}><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {images.map((i) => (
+                          <SelectItem key={i.image_uri} value={i.image_uri}>
+                            {i.image_uri}{i.manifest_name ? ` — ${i.manifest_name}` : ''}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FieldDescription>
+                      {harnessName ? `Baked harness: ${harnessName}` : 'No baked harness — shell-only image'}
+                    </FieldDescription>
+                  </Field>
+                )}
+              />
 
-            <div className="space-y-2">
-              <Label>Mode</Label>
-              <Select value={mode} onValueChange={(v) => setMode(v as SessionMode)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="agent">agent — drive the baked harness</SelectItem>
-                  <SelectItem value="dev_vm">dev VM — shell-only</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+              <Controller
+                name="mode"
+                control={form.control}
+                render={({ field }) => (
+                  <Field>
+                    <FieldLabel htmlFor={field.name}>Mode</FieldLabel>
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <SelectTrigger id={field.name}><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="agent">agent — drive the baked harness</SelectItem>
+                        <SelectItem value="dev_vm">dev VM — shell-only</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+              />
 
-            {promptMeaningful && (
-              <div className="space-y-2">
-                <Label htmlFor="ns-prompt">Prompt</Label>
-                <Textarea id="ns-prompt" rows={2} value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="optional opening prompt" />
-              </div>
-            )}
+              {promptMeaningful && (
+                <Controller
+                  name="prompt"
+                  control={form.control}
+                  render={({ field }) => (
+                    <Field>
+                      <FieldLabel htmlFor={field.name}>Prompt</FieldLabel>
+                      <Textarea {...field} id={field.name} rows={2} placeholder="optional opening prompt" />
+                    </Field>
+                  )}
+                />
+              )}
 
-            {needsToken && (
-              <p className="text-sm text-muted-foreground">
-                This image runs built-in Claude, which uses your saved token — you don’t have one yet.
-              </p>
-            )}
-            {error && <p className="text-sm text-destructive">{error}</p>}
-          </div>
+              {needsToken && (
+                <FieldDescription>
+                  This image runs built-in Claude, which uses your saved token — you don’t have one yet.
+                </FieldDescription>
+              )}
+              {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+            </FieldGroup>
+
+            <DialogFooter className="mt-4">
+              {needsToken ? (
+                <Button type="button" variant="secondary"
+                  onClick={() => { setOpen(false); navigate({ to: '/settings/tokens' }); }}>
+                  Save your Claude token
+                </Button>
+              ) : (
+                <Button type="submit" disabled={!canSubmit}>
+                  {form.formState.isSubmitting ? 'Starting…' : 'Start'}
+                </Button>
+              )}
+            </DialogFooter>
+          </form>
         )}
-
-        <DialogFooter>
-          {needsToken ? (
-            <Button variant="secondary" onClick={() => { setOpen(false); navigate({ to: '/settings/tokens' }); }}>
-              Save your Claude token
-            </Button>
-          ) : (
-            <Button onClick={submit} disabled={!canSubmit}>
-              {submitting ? 'Starting…' : 'Start'}
-            </Button>
-          )}
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

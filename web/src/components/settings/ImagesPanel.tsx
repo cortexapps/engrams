@@ -1,4 +1,7 @@
 import { useState } from 'react';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { Controller, useForm } from 'react-hook-form';
+import * as z from 'zod';
 import {
   useDisableImage,
   useEnableImage,
@@ -14,8 +17,8 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
   DialogTitle, DialogTrigger,
 } from '@/components/ui/dialog';
+import { Field, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -126,22 +129,27 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
   );
 }
 
+const enableImageSchema = z.object({
+  imageUri: z.string().trim().min(1, 'image URI is required'),
+});
+type EnableImageValues = z.infer<typeof enableImageSchema>;
+
 function EnableImageDialog() {
   const [open, setOpen] = useState(false);
-  const [imageUri, setImageUri] = useState('');
-  const [submitError, setSubmitError] = useState<string | null>(null);
   const enable = useEnableImage();
   const progress = useEnableProgress(enable.isPending);
+  const form = useForm<EnableImageValues>({
+    resolver: zodResolver(enableImageSchema),
+    defaultValues: { imageUri: '' },
+  });
 
-  const submit = async () => {
-    setSubmitError(null);
-    if (!imageUri.trim()) { setSubmitError('image URI is required'); return; }
+  const onSubmit = async (data: EnableImageValues) => {
     try {
-      await enable.mutateAsync(imageUri.trim());
-      setImageUri('');
+      await enable.mutateAsync(data.imageUri);
+      form.reset();
       setOpen(false);
     } catch (err) {
-      setSubmitError(String(err));
+      form.setError('root', { message: String(err) });
     }
   };
 
@@ -156,23 +164,40 @@ function EnableImageDialog() {
             The coordinator pulls the manifest layer on enable.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2">
-          <Label htmlFor="image-uri">Image URI</Label>
-          <Input id="image-uri" autoFocus value={imageUri}
-            onChange={(e) => setImageUri(e.target.value)}
-            className="font-mono" placeholder="ghcr.io/cortex/api:warm-1"
-            spellCheck={false} autoCapitalize="off" />
-          {submitError && <p className="text-sm text-destructive">{submitError}</p>}
-        </div>
-        <DialogFooter className="sm:items-center">
-          {progress && (
-            <span className="mr-auto text-xs text-muted-foreground">{progress.label}…</span>
-          )}
-          <Button variant="ghost" onClick={() => setOpen(false)} disabled={enable.isPending}>Cancel</Button>
-          <Button onClick={submit} disabled={enable.isPending}>
-            {enable.isPending ? 'Enabling…' : 'Enable'}
-          </Button>
-        </DialogFooter>
+        <form onSubmit={form.handleSubmit(onSubmit)}>
+          <FieldGroup>
+            <Controller
+              name="imageUri"
+              control={form.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor={field.name}>Image URI</FieldLabel>
+                  <Input
+                    {...field}
+                    id={field.name}
+                    autoFocus
+                    className="font-mono"
+                    placeholder="ghcr.io/cortex/api:warm-1"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    aria-invalid={fieldState.invalid}
+                  />
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
+            {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+          </FieldGroup>
+          <DialogFooter className="mt-4 sm:items-center">
+            {progress && (
+              <span className="mr-auto text-xs text-muted-foreground">{progress.label}…</span>
+            )}
+            <Button type="button" variant="ghost" onClick={() => setOpen(false)} disabled={enable.isPending}>Cancel</Button>
+            <Button type="submit" disabled={enable.isPending}>
+              {enable.isPending ? 'Enabling…' : 'Enable'}
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );
