@@ -23,8 +23,13 @@ sha2.workspace = true
 tar.workspace = true
 flate2.workspace = true
 oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+parking_lot.workspace = true
+reqwest.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+axum.workspace = true
+http.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "rt-multi-thread"] }
+uuid.workspace = true

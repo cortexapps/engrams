@@ -308,17 +308,16 @@ async fn fetch_and_seal_manifest(
 /// `Manifest` at the disk `ManifestRef`. Hosts' prefetch loop reads
 /// from BlobStorage; nothing else feeds it.
 ///
-/// Bundle without disk chunks (`disk_bootstrap_json` /
-/// `disk_chunks_blob_digest` both `None`) is silently accepted — that's
-/// the harness-builder pattern (bake produced just a manifest layer).
+/// Bundle without disk chunks (`disk_bootstrap_json` and
+/// `bundle_json` both `None`) is silently accepted — that's the
+/// harness-builder pattern (bake produced just a manifest layer).
 async fn materialize_disk_chunks(
     state: &SharedState,
     image_uri: &str,
     artifacts: &engram_oci::TemplateArtifacts,
 ) -> Result<Option<engram_core::types::manifest::ManifestRef>, ApiError> {
-    let (Some(boot), Some(blob_digest), Some(bundle_json)) = (
+    let (Some(boot), Some(bundle_json)) = (
         artifacts.disk_bootstrap_json.as_deref(),
-        artifacts.disk_chunks_blob_digest.as_deref(),
         artifacts.bundle_json.as_deref(),
     ) else {
         // Harness-only image: no chunked-disk artifact to materialize,
@@ -328,6 +327,15 @@ async fn materialize_disk_chunks(
     };
     let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(boot)
         .map_err(|e| ApiError::Internal(format!("parse disk bootstrap json: {e}")))?;
+    // ADR 0036 clean break: the materializer only speaks the
+    // per-chunk-blob shape. A v1 (monolithic chunks blob) artifact
+    // can't be enabled — its blob layer no longer has a consumer.
+    if !bootstrap.is_per_chunk() {
+        return Err(ApiError::BadRequest(format!(
+            "`{image_uri}` carries a pre-ADR-0036 monolithic chunk-blob artifact; \
+             re-bake the image with a current `engram image build` and push again"
+        )));
+    }
     let manifest = bootstrap.to_manifest();
     // The bake wrote bundle.json with the disk_manifest ref it used
     // against its LOCAL chunk store. Hosts re-read that ref on
@@ -342,10 +350,9 @@ async fn materialize_disk_chunks(
                 .into(),
         )
     })?;
-    let source = ChunkSource::OciRange {
+    let source = ChunkSource::Oci {
         oci: state.services.oci.as_ref(),
         image_uri,
-        blob_digest,
     };
     let (wrote, deduped) = materialize_chunk_blob(
         state.services.blob.as_ref(),
@@ -564,19 +571,18 @@ fn parse_disk_manifest_ref(
 
 /// Where `materialize_chunk_blob` reads each chunk's bytes from.
 ///
-/// `Slice` keeps the whole blob in memory (tests / small artifacts).
-/// `OciRange` Range-GETs each chunk from the registry on demand, so the
+/// `Map` serves chunks from memory (tests only). `Oci` pulls each
+/// chunk's own blob from the registry on demand (ADR 0036), so the
 /// coord never holds more than `CONCURRENCY` chunks at once — the bound
 /// that stops a multi-GiB image from OOM-killing the coord on enable.
 enum ChunkSource<'a> {
-    /// In-memory blob — only the materialize unit test constructs this;
-    /// prod always uses `OciRange`.
+    /// In-memory chunk map — only the materialize unit test constructs
+    /// this; prod always uses `Oci`.
     #[cfg(test)]
-    Slice(&'a [u8]),
-    OciRange {
+    Map(&'a std::collections::HashMap<engram_chunk_store::ChunkHash, bytes::Bytes>),
+    Oci {
         oci: &'a engram_oci::OciClient,
         image_uri: &'a str,
-        blob_digest: &'a str,
     },
 }
 
@@ -586,58 +592,44 @@ impl ChunkSource<'_> {
         entry: &engram_chunk_store::BootstrapEntry,
     ) -> Result<bytes::Bytes, ApiError> {
         // `*self` copies the Copy ref-fields out (they're all `&_`), so
-        // the OciRange arm gets `&str`/`&OciClient` rather than the
+        // the Oci arm gets `&str`/`&OciClient` rather than the
         // double-refs match-ergonomics would bind on `match self`.
         match *self {
             #[cfg(test)]
-            ChunkSource::Slice(blob) => {
-                let start = entry.blob_offset as usize;
-                let end = start
-                    .checked_add(entry.length as usize)
-                    .ok_or_else(|| ApiError::Internal("chunk offset+length overflow".into()))?;
-                if end > blob.len() {
-                    return Err(ApiError::Internal(format!(
-                        "chunks blob too short for entry {}: end={end}, blob_len={}",
-                        entry.sha256,
-                        blob.len()
-                    )));
-                }
-                Ok(bytes::Bytes::copy_from_slice(&blob[start..end]))
-            }
-            ChunkSource::OciRange {
-                oci,
-                image_uri,
-                blob_digest,
-            } => {
-                // Streaming does one Range GET per chunk, so a single
-                // transient registry hiccup (connection reset / partial
-                // body — "error decoding response body") would otherwise
-                // fail the whole enable. Retry with backoff; the old
-                // whole-blob pull only had one request to get wrong.
+            ChunkSource::Map(map) => map.get(&entry.sha256).cloned().ok_or_else(|| {
+                ApiError::Internal(format!("test chunk map missing {}", entry.sha256))
+            }),
+            ChunkSource::Oci { oci, image_uri } => {
+                let digest = entry.blob_digest.as_deref().ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "bootstrap entry {} missing per-chunk blob digest (pre-ADR-0036 \
+                         artifact slipped past the is_per_chunk gate?)",
+                        entry.sha256
+                    ))
+                })?;
+                // One blob GET per chunk; a single transient registry
+                // hiccup (connection reset / partial body) shouldn't
+                // fail the whole enable. Retry with backoff — and back
+                // off much harder on 429s, which want a politer pause
+                // than connection blips (Retry-After is typically
+                // seconds-to-minutes).
                 const MAX_ATTEMPTS: u32 = 5;
                 let mut attempt = 1u32;
                 loop {
-                    match oci
-                        .fetch_blob_range(
-                            image_uri,
-                            blob_digest,
-                            entry.blob_offset,
-                            entry.length as u64,
-                        )
-                        .await
-                    {
+                    match oci.pull_chunk(image_uri, digest, entry.length as u64).await {
                         Ok(b) => break Ok(b),
                         Err(e) if attempt < MAX_ATTEMPTS => {
+                            let rate_limited = e.to_string().contains("429");
+                            let backoff_ms =
+                                if rate_limited { 5_000 } else { 200 } * attempt as u64;
                             tracing::warn!(
                                 chunk = %entry.sha256,
                                 attempt,
+                                rate_limited,
                                 error = %e,
-                                "chunk Range GET failed; retrying with backoff"
+                                "chunk pull failed; retrying with backoff"
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                200 * attempt as u64,
-                            ))
-                            .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                             attempt += 1;
                         }
                         Err(e) => {
@@ -653,12 +645,14 @@ impl ChunkSource<'_> {
     }
 }
 
-/// Push a chunk-blob into BlobStorage at the content-addressed key for
-/// each chunk in `bootstrap`, plus the reconstructed `Manifest` at
+/// Push each chunk in `bootstrap` into BlobStorage at its
+/// content-addressed key, plus the reconstructed `Manifest` at
 /// `manifest_ref`. Content-addressing means chunks already present (a
-/// prior bake / re-enable) are skipped — and with an `OciRange` source
-/// they aren't even fetched. Bounded-parallel exists?-fetch-put keeps
-/// the wire busy without a thousand-deep sequential round-trip.
+/// prior bake / re-enable / deterministic re-bake sharing chunks) are
+/// skipped — and with an `Oci` source they aren't even fetched, so a
+/// delta re-enable moves only delta bytes (ADR 0036). Bounded-parallel
+/// exists?-fetch-put keeps the wire busy without a thousand-deep
+/// sequential round-trip.
 ///
 /// Returns (wrote, deduped) chunk counts.
 async fn materialize_chunk_blob(
@@ -769,10 +763,15 @@ mod tests {
         c1.resize(chunk_size_u32 as usize, 0);
         let h0 = engram_chunk_store::ChunkHash::of(&c0);
         let h1 = engram_chunk_store::ChunkHash::of(&c1);
-        let mut chunks_blob = Vec::new();
-        chunks_blob.extend_from_slice(&c0);
-        chunks_blob.extend_from_slice(&c1);
+        let chunk_map: std::collections::HashMap<_, _> = [
+            (h0, bytes::Bytes::from(c0.clone())),
+            (h1, bytes::Bytes::from(c1.clone())),
+        ]
+        .into_iter()
+        .collect();
 
+        // ADR 0036 per-chunk shape: each entry addresses its own
+        // blob (digest == chunk hash), blob_offset always 0.
         let bootstrap = Bootstrap {
             schema_version: engram_chunk_store::BOOTSTRAP_SCHEMA_VERSION,
             kind: ManifestKind::Memory,
@@ -781,20 +780,21 @@ mod tests {
             entries: vec![
                 BootstrapEntry {
                     file_offset: 0,
-                    blob_digest: None,
+                    blob_digest: Some(format!("sha256:{}", h0.to_hex())),
                     blob_offset: 0,
                     length: c0.len() as u32,
                     sha256: h0,
                 },
                 BootstrapEntry {
                     file_offset: c0.len() as u64,
-                    blob_digest: None,
-                    blob_offset: c0.len() as u64,
+                    blob_digest: Some(format!("sha256:{}", h1.to_hex())),
+                    blob_offset: 0,
                     length: c1.len() as u32,
                     sha256: h1,
                 },
             ],
         };
+        assert!(bootstrap.is_per_chunk());
         let manifest = bootstrap.to_manifest();
         let manifest_ref = ManifestRef::new();
 
@@ -804,7 +804,7 @@ mod tests {
             manifest_ref,
             &bootstrap,
             &manifest,
-            &ChunkSource::Slice(&chunks_blob),
+            &ChunkSource::Map(&chunk_map),
         )
         .await
         .expect("materialize");
@@ -835,7 +835,7 @@ mod tests {
             manifest_ref,
             &bootstrap,
             &manifest,
-            &ChunkSource::Slice(&chunks_blob),
+            &ChunkSource::Map(&chunk_map),
         )
         .await
         .expect("materialize again");

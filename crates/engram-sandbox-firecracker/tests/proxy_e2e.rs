@@ -273,8 +273,6 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            parent_disk_bootstrap_path: None,
-            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("ext4 bake");

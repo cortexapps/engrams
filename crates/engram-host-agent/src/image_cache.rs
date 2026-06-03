@@ -130,22 +130,19 @@ impl ImageCache {
                     } else {
                         None
                     };
-                    // ADR 0008 Phase 3: discover Nydus-shaped
-                    // sidecars from the cache directory. The pull
-                    // path writes them out; cache hits just
-                    // re-probe their presence. Blob digests are
-                    // stored in `chunks_disk.blob.digest` /
-                    // `chunks_memory.blob.digest` (sidecar files
-                    // written at pull time — see below).
+                    // ADR 0008 Phase 3 / ADR 0036: discover the
+                    // chunked-OCI bootstrap sidecar from the cache
+                    // directory. The pull path writes it out; cache
+                    // hits just re-probe its presence. (The
+                    // monolithic chunk-blob digest sidecar is gone —
+                    // per-chunk artifacts address every chunk by its
+                    // own digest, carried inside the bootstrap.)
                     let disk_bootstrap_path = optional_path(&dir.join("bootstrap.disk.json")).await;
-                    let disk_chunks_blob_digest =
-                        read_digest_sidecar(&dir.join("chunks.disk.blob.digest")).await;
                     return Ok(CachedImage {
                         manifest_path,
                         rootfs_path: has_rootfs.then_some(rootfs_path),
                         bundle,
                         disk_bootstrap_path,
-                        disk_chunks_blob_digest,
                         digest,
                     });
                 }
@@ -188,29 +185,21 @@ impl ImageCache {
         let rootfs_path = final_dir.join("rootfs.ext4");
         let rootfs_present = fs::try_exists(&rootfs_path).await.unwrap_or(false);
 
-        // ADR 0008 Phase 3: PulledImage carries the bootstrap layer
-        // paths and chunk-blob digests for Nydus-shaped artifacts.
-        // The bootstrap files are already on disk (`pull_image`
-        // writes them); we additionally persist the blob digests as
-        // small sidecar files so cache-hit reads can recover them
-        // without re-pulling.
+        // ADR 0008 Phase 3 / ADR 0036: PulledImage carries the
+        // bootstrap layer path for chunked artifacts. The bootstrap
+        // file is already on disk (`pull_image` writes it) and
+        // carries every chunk's own blob digest — nothing else to
+        // persist.
         let disk_bootstrap_path = pulled
             .disk_bootstrap_path
             .as_ref()
             .map(|_| final_dir.join("bootstrap.disk.json"))
             .filter(|p| p.exists());
-        let disk_chunks_blob_digest = pulled.disk_chunks_blob_digest.clone();
-        if let Some(d) = &disk_chunks_blob_digest {
-            fs::write(final_dir.join("chunks.disk.blob.digest"), d.as_bytes())
-                .await
-                .map_err(CacheError::Io)?;
-        }
         Ok(CachedImage {
             manifest_path: final_dir.join("manifest.toml"),
             rootfs_path: rootfs_present.then_some(rootfs_path),
             bundle,
             disk_bootstrap_path,
-            disk_chunks_blob_digest,
             digest,
         })
     }
@@ -369,16 +358,14 @@ impl ImageCache {
 }
 
 impl CachedImage {
-    /// Whether this cached image carries Nydus-shaped chunked OCI
-    /// layers — i.e., disk chunks are reachable via Range GET into
-    /// the OCI registry, not just via BlobStorage.
+    /// Whether this cached image carries a chunked-OCI bootstrap —
+    /// i.e., disk chunks are reachable as individual blobs in the
+    /// OCI registry (ADR 0036), not just via BlobStorage.
     ///
-    /// True iff both the disk bootstrap sidecar and the chunk-blob
-    /// layer digest are present. Phase 5 of ADR 0008's rollout uses
-    /// this to dispatch between the legacy BlobStorage-only path
-    /// and the new tiered fault path.
+    /// Phase 5 of ADR 0008's rollout uses this to dispatch between
+    /// the legacy BlobStorage-only path and the tiered fault path.
     pub fn is_disk_chunked_oci(&self) -> bool {
-        self.disk_bootstrap_path.is_some() && self.disk_chunks_blob_digest.is_some()
+        self.disk_bootstrap_path.is_some()
     }
 
     /// Parse the bootstrap sidecar and build an
@@ -387,10 +374,10 @@ impl CachedImage {
     ///
     /// Returns `Ok(None)` if the image isn't chunked-OCI shaped;
     /// otherwise reads the bootstrap and populates the index with
-    /// one entry per chunk. `blob_digest = None` entries (chunks in
-    /// this image's primary blob) resolve to
-    /// `disk_chunks_blob_digest`; `Some(digest)` entries (Phase 4
-    /// base/diff inheritance) keep their cross-blob references.
+    /// one entry per chunk, addressed by the chunk's own blob
+    /// digest (ADR 0036: digest == chunk hash). A v1 bootstrap
+    /// (monolithic chunk blob, entries without per-chunk digests)
+    /// is rejected — those artifacts must be re-baked.
     ///
     /// ADR 0008 Phase 5 wiring: a future `PooledBackend::create`
     /// pass will call this on a chunked image, wrap the result in a
@@ -401,31 +388,26 @@ impl CachedImage {
     pub async fn build_oci_chunk_index(
         &self,
     ) -> Result<Option<engram_oci::OciChunkIndex>, CacheError> {
-        let (Some(bs_path), Some(primary_blob_digest)) = (
-            self.disk_bootstrap_path.as_ref(),
-            self.disk_chunks_blob_digest.as_ref(),
-        ) else {
+        let Some(bs_path) = self.disk_bootstrap_path.as_ref() else {
             return Ok(None);
         };
         let bytes = fs::read(bs_path).await.map_err(CacheError::Io)?;
         let bs: engram_chunk_store::Bootstrap = serde_json::from_slice(&bytes).map_err(|e| {
             CacheError::Bundle(format!("{}: bootstrap parse: {e}", bs_path.display()))
         })?;
+        if !bs.is_per_chunk() {
+            return Err(CacheError::Bundle(format!(
+                "{}: pre-ADR-0036 monolithic chunk-blob bootstrap; re-bake the image",
+                bs_path.display()
+            )));
+        }
         let mut index = engram_oci::OciChunkIndex::new();
         for entry in &bs.entries {
-            // Resolve `blob_digest = None` (self-blob) to this
-            // image's primary chunks-blob layer digest. Phase 4
-            // entries with `Some(parent_digest)` keep their
-            // cross-blob reference unchanged.
-            let blob_digest = entry
-                .blob_digest
-                .clone()
-                .unwrap_or_else(|| primary_blob_digest.clone());
+            let blob_digest = entry.blob_digest.clone().expect("is_per_chunk checked");
             index.insert(
                 entry.sha256,
                 engram_oci::OciBlobLocator {
                     blob_digest,
-                    offset: entry.blob_offset,
                     length: entry.length as u64,
                 },
             );
@@ -449,17 +431,13 @@ pub struct CachedImage {
     /// adapters; today it's plumbed through so adopters can find
     /// the chunk-store reference without re-reading the file.
     pub bundle: Option<ImageBundle>,
-    /// ADR 0008 Phase 3: path to the disk-side bootstrap layer when
-    /// the artifact is Nydus-shaped. `Some` enables the
-    /// `TieredChunkResolver` (cache → OCI) fault path; `None` means
-    /// the artifact predates ADR 0008 and consumers fall back to
-    /// BlobStorage-only resolution via `bundle.disk_manifest`.
+    /// ADR 0008 Phase 3 / ADR 0036: path to the disk-side bootstrap
+    /// layer when the artifact is chunked-OCI shaped. `Some` enables
+    /// the `TieredChunkResolver` (cache → OCI) fault path — each
+    /// bootstrap entry carries its chunk's own blob digest; `None`
+    /// means the artifact predates ADR 0008 and consumers fall back
+    /// to BlobStorage-only resolution via `bundle.disk_manifest`.
     pub disk_bootstrap_path: Option<PathBuf>,
-    /// ADR 0008 Phase 3: OCI layer digest of the disk chunk blob.
-    /// Paired with `disk_bootstrap_path`; required to Range-GET
-    /// chunks. Not the per-chunk sha256 — that's per-entry in the
-    /// bootstrap.
-    pub disk_chunks_blob_digest: Option<String>,
     pub digest: String,
 }
 
@@ -568,17 +546,6 @@ async fn optional_path(path: &Path) -> Option<PathBuf> {
     } else {
         None
     }
-}
-
-/// Read a digest sidecar file written by `ensure_image` at pull
-/// time — a single line containing the `sha256:<hex>` digest of an
-/// OCI chunk-blob layer. Returns `None` if the sidecar is absent
-/// (the cache entry predates ADR 0008 Phase 3 or the artifact
-/// wasn't Nydus-shaped).
-async fn read_digest_sidecar(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).await.ok()?;
-    let s = std::str::from_utf8(&bytes).ok()?.trim().to_string();
-    (!s.is_empty()).then_some(s)
 }
 
 #[derive(Debug)]
@@ -812,29 +779,20 @@ mod tests {
             rootfs_path: None,
             bundle: None,
             disk_bootstrap_path: None,
-            disk_chunks_blob_digest: None,
             digest: "sha256:test".into(),
         }
     }
 
     #[test]
-    fn is_disk_chunked_oci_requires_both_bootstrap_and_digest() {
+    fn is_disk_chunked_oci_requires_bootstrap() {
         let mut c = cached_image_skeleton();
-        assert!(!c.is_disk_chunked_oci(), "skeleton: neither field set");
+        assert!(!c.is_disk_chunked_oci(), "skeleton: no bootstrap");
 
         c.disk_bootstrap_path = Some(PathBuf::from("/x/bootstrap.disk.json"));
         assert!(
-            !c.is_disk_chunked_oci(),
-            "bootstrap alone is insufficient — need digest"
-        );
-
-        c.disk_chunks_blob_digest = Some("sha256:abc".into());
-        assert!(c.is_disk_chunked_oci(), "both set — chunked-OCI capable");
-
-        c.disk_bootstrap_path = None;
-        assert!(
-            !c.is_disk_chunked_oci(),
-            "digest alone is insufficient — need bootstrap"
+            c.is_disk_chunked_oci(),
+            "ADR 0036: the bootstrap alone is the chunked-OCI marker \
+             (every entry carries its own blob digest)"
         );
     }
 
@@ -845,14 +803,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_oci_chunk_index_resolves_self_blob_entries_to_primary_digest() {
-        // Write a bootstrap with two entries: one with `blob_digest =
-        // None` (resolves to the primary digest) and one with
-        // `Some(parent_digest)` (stays cross-blob).
+    async fn build_oci_chunk_index_addresses_each_chunk_by_its_own_digest() {
+        // ADR 0036: every bootstrap entry carries its chunk's own
+        // blob digest; the index maps hash → (that digest, length).
         let tmp = tempfile::tempdir().unwrap();
         let bs_path = tmp.path().join("bootstrap.disk.json");
-        let self_hash = engram_chunk_store::ChunkHash::of(b"chunk-self");
-        let parent_hash = engram_chunk_store::ChunkHash::of(b"chunk-parent");
+        let h0 = engram_chunk_store::ChunkHash::of(b"chunk-zero");
+        let h1 = engram_chunk_store::ChunkHash::of(b"chunk-one");
         let bootstrap = engram_chunk_store::Bootstrap {
             schema_version: engram_chunk_store::BOOTSTRAP_SCHEMA_VERSION,
             kind: engram_chunk_store::ManifestKind::Disk,
@@ -861,17 +818,17 @@ mod tests {
             entries: vec![
                 engram_chunk_store::BootstrapEntry {
                     file_offset: 0,
-                    blob_digest: None,
+                    blob_digest: Some(format!("sha256:{}", h0.to_hex())),
                     blob_offset: 0,
                     length: 16,
-                    sha256: self_hash,
+                    sha256: h0,
                 },
                 engram_chunk_store::BootstrapEntry {
                     file_offset: 16,
-                    blob_digest: Some("sha256:parent_digest_xx".into()),
-                    blob_offset: 4096, // arbitrary parent offset
+                    blob_digest: Some(format!("sha256:{}", h1.to_hex())),
+                    blob_offset: 0,
                     length: 16,
-                    sha256: parent_hash,
+                    sha256: h1,
                 },
             ],
         };
@@ -881,7 +838,6 @@ mod tests {
 
         let mut c = cached_image_skeleton();
         c.disk_bootstrap_path = Some(bs_path);
-        c.disk_chunks_blob_digest = Some("sha256:self_digest_yy".into());
 
         let index = c
             .build_oci_chunk_index()
@@ -890,16 +846,48 @@ mod tests {
             .expect("chunked image yields an index");
         assert_eq!(index.len(), 2);
 
-        // Self-blob entry resolved to the primary digest.
-        let loc_self = index.get(&self_hash).expect("self chunk in index");
-        assert_eq!(loc_self.blob_digest, "sha256:self_digest_yy");
-        assert_eq!(loc_self.offset, 0);
-        assert_eq!(loc_self.length, 16);
+        for h in [h0, h1] {
+            let loc = index.get(&h).expect("chunk in index");
+            assert_eq!(loc.blob_digest, format!("sha256:{}", h.to_hex()));
+            assert_eq!(loc.length, 16);
+        }
+    }
 
-        // Cross-blob entry kept its parent digest.
-        let loc_parent = index.get(&parent_hash).expect("parent chunk in index");
-        assert_eq!(loc_parent.blob_digest, "sha256:parent_digest_xx");
-        assert_eq!(loc_parent.offset, 4096);
+    #[tokio::test]
+    async fn build_oci_chunk_index_rejects_v1_monolithic_bootstrap() {
+        // Pre-ADR-0036 bootstraps (entries without per-chunk
+        // digests) must be rejected with a "re-bake" error, not
+        // silently mis-indexed.
+        let tmp = tempfile::tempdir().unwrap();
+        let bs_path = tmp.path().join("bootstrap.disk.json");
+        let h = engram_chunk_store::ChunkHash::of(b"legacy");
+        let bootstrap = engram_chunk_store::Bootstrap {
+            schema_version: 1,
+            kind: engram_chunk_store::ManifestKind::Disk,
+            total_bytes: 16,
+            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(16),
+            entries: vec![engram_chunk_store::BootstrapEntry {
+                file_offset: 0,
+                blob_digest: None,
+                blob_offset: 0,
+                length: 16,
+                sha256: h,
+            }],
+        };
+        fs::write(&bs_path, serde_json::to_vec(&bootstrap).unwrap())
+            .await
+            .unwrap();
+
+        let mut c = cached_image_skeleton();
+        c.disk_bootstrap_path = Some(bs_path);
+
+        let err = c.build_oci_chunk_index().await.unwrap_err();
+        match err {
+            CacheError::Bundle(msg) => {
+                assert!(msg.contains("re-bake"), "got: {msg}");
+            }
+            other => panic!("expected Bundle error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

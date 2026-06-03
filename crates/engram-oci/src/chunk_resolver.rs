@@ -1,10 +1,10 @@
-//! `OciChunkResolver` — fetches chunks via Range GET against an OCI
-//! registry.
+//! `OciChunkResolver` — fetches chunks as individual OCI blobs.
 //!
-//! ADR 0008 Phase 2: the origin tier in the `NVMe → BlobStorage →
-//! OCI` fault path. Built from a Nydus-shaped OCI artifact's
-//! bootstrap layer: a precomputed index from `ChunkHash` to
-//! `(blob_digest, byte_offset, length)`.
+//! ADR 0008 Phase 2 / ADR 0036: the origin tier in the `NVMe →
+//! BlobStorage → OCI` fault path. Built from a chunked OCI
+//! artifact's bootstrap layer: a precomputed index from `ChunkHash`
+//! to `(blob_digest, length)` — where `blob_digest` is
+//! `sha256:<chunk-hash>` (ADR 0036: one OCI blob per chunk).
 //!
 //! Construction is one-shot per (image, host). The bootstrap is
 //! pulled at `image_cache::ensure_image` time (Phase 5 wiring) and
@@ -14,21 +14,19 @@
 //! # Verification contract
 //!
 //! Per the `ChunkResolver` trait, `fetch_chunk` returns bytes that
-//! hash to the requested `ChunkHash`. The Range response from the
-//! registry is unverified at the OCI layer (only the whole blob is
-//! covered by the layer digest), so this resolver verifies each
-//! fetched range against the per-chunk `sha256` recorded in the
-//! bootstrap. A mismatch surfaces as
-//! `ChunkStoreError::HashMismatch`.
+//! hash to the requested `ChunkHash`. `pull_chunk` already verifies
+//! the response body against the blob digest (which *is* the chunk
+//! hash); this resolver re-verifies against the bootstrap's
+//! per-chunk `sha256` as cheap belt-and-braces. A mismatch surfaces
+//! as `ChunkStoreError::HashMismatch`.
 //!
 //! # Errors
 //!
 //! - `ChunkStoreError::Origin(...)` — registry-side failure
 //!   (network, 5xx, missing chunk in the index).
 //! - `ChunkStoreError::HashMismatch` — fetched bytes don't hash to
-//!   the requested chunk hash. Likely the bootstrap is stale
-//!   relative to the chunk blob (image was re-baked but
-//!   bootstrap got cached) — caller should invalidate.
+//!   the requested chunk hash. Likely a stale bootstrap relative to
+//!   the registry contents — caller should invalidate.
 
 use std::collections::HashMap;
 
@@ -38,20 +36,17 @@ use engram_chunk_store::{ChunkHash, ChunkResolver, ChunkStoreError, Result};
 
 use crate::OciClient;
 
-/// Locator for a single chunk inside a chunked OCI blob layer.
+/// Locator for a single chunk blob (ADR 0036: one OCI blob per
+/// chunk, digest = `sha256:<chunk-hash>`).
 ///
 /// Built at bootstrap-parse time. Cheap to clone; held by value
 /// inside the [`OciChunkIndex`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OciBlobLocator {
-    /// OCI layer digest (`sha256:<hex>`) of the chunk blob this
-    /// chunk lives inside. The Nydus base/diff design (ADR 0008
-    /// Phase 4) means one image's bootstrap may reference chunks
-    /// across multiple blob digests.
+    /// OCI blob digest (`sha256:<hex>`) of this chunk's blob.
     pub blob_digest: String,
-    /// Byte offset within the chunk blob.
-    pub offset: u64,
-    /// Chunk length (16 MiB for disk, 512 KB for memory).
+    /// Chunk length (16 MiB for disk; the image's final chunk may
+    /// be shorter).
     pub length: u64,
 }
 
@@ -94,8 +89,8 @@ impl OciChunkIndex {
     }
 }
 
-/// `ChunkResolver` impl that fetches chunks from an OCI registry
-/// via Range GET against a chunked blob layer.
+/// `ChunkResolver` impl that fetches chunks from an OCI registry,
+/// one blob GET per chunk (ADR 0036).
 ///
 /// One instance per OCI image (the index is image-specific). For
 /// the multi-image case, wrap several `OciChunkResolver`s in a
@@ -138,12 +133,14 @@ impl ChunkResolver for OciChunkResolver {
         })?;
         let bytes = self
             .client
-            .fetch_blob_range(&self.image_uri, &loc.blob_digest, loc.offset, loc.length)
+            .pull_chunk(&self.image_uri, &loc.blob_digest, loc.length)
             .await
             .map_err(|e| ChunkStoreError::Origin(format!("{e}")))?;
-        // Verify the partial response — the OCI layer digest covers
-        // the whole blob, not arbitrary ranges, so registry corruption
-        // or a stale bootstrap will surface here as a hash mismatch.
+        // `pull_chunk` already verified the body against the blob
+        // digest (== the chunk hash); re-verify against the
+        // bootstrap's expectation as cheap belt-and-braces — a stale
+        // bootstrap surfaces here as a mismatch, not as corruption
+        // downstream.
         let actual = ChunkHash::of(&bytes);
         if actual != hash {
             return Err(ChunkStoreError::HashMismatch {
@@ -173,7 +170,6 @@ mod tests {
         let hash = ChunkHash::of(b"abc");
         let loc = OciBlobLocator {
             blob_digest: "sha256:deadbeef".to_string(),
-            offset: 0,
             length: 16 * 1024 * 1024,
         };
         let mut idx = OciChunkIndex::new();
@@ -197,7 +193,6 @@ mod tests {
         let missing = ChunkHash::of(b"absent");
         let loc = OciBlobLocator {
             blob_digest: "sha256:abc".to_string(),
-            offset: 0,
             length: 4,
         };
         let mut idx = OciChunkIndex::new();

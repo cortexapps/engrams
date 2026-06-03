@@ -190,8 +190,6 @@ fn req(source: &Path, images_dir: &Path, repo: &str, tag: &str) -> BuildRequest 
         images_dir: images_dir.to_path_buf(),
         format: Format::Directory,
         agent_injection: None,
-        parent_disk_bootstrap_path: None,
-        parent_disk_chunks_blob_digest: None,
     }
 }
 
@@ -863,11 +861,11 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     // so downstream consumers (host-agent image cache, NBD daemon,
     // VZ materialize) can resolve content through the chunk store.
     //
-    // ADR 0008 Phase 3: bake also emits Nydus-shaped sidecars
-    // (bootstrap.disk.json + chunks.disk.blob) and bumps the
+    // ADR 0008 Phase 3 / ADR 0036: bake also emits the per-chunk
+    // bootstrap sidecar (bootstrap.disk.json) and bumps the
     // bundle schema to v2. v1 readers still see `disk_manifest`
     // and work; v2 readers additionally consult the bootstrap
-    // file for Range-GET-on-fault.
+    // file for chunk-on-fault.
     let manifest_ref = outcome
         .disk_manifest
         .expect("ext4 bake must produce a disk manifest");
@@ -880,26 +878,33 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     assert_eq!(bundle["disk_manifest"], serialized);
     assert_eq!(bundle["bootstrap_disk_available"], true);
 
-    // ADR 0008: the disk-side bootstrap + chunk blob must be on
-    // disk and reachable via BuildOutcome.
+    // ADR 0036: the disk-side per-chunk bootstrap must be on disk
+    // and reachable via BuildOutcome. No concatenated chunk blob is
+    // produced — every entry addresses its chunk by its own digest
+    // (the contract the delta push relies on).
     let bs_path = outcome
         .disk_bootstrap_path
         .as_ref()
         .expect("disk bootstrap path");
-    let blob_path = outcome
-        .disk_chunks_blob_path
-        .as_ref()
-        .expect("disk chunks blob path");
     assert!(bs_path.is_file(), "bootstrap.disk.json must exist");
-    assert!(blob_path.is_file(), "chunks.disk.blob must exist");
-    // The bootstrap's chunk_blob_len must equal the actual blob
-    // file size — the contract the OCI push relies on.
+    assert!(
+        !outcome.image_dir.join("chunks.disk.blob").exists(),
+        "ADR 0036: no monolithic chunk blob may be written"
+    );
     let bs_bytes = std::fs::read(bs_path).unwrap();
     let parsed: engram_chunk_store::Bootstrap = serde_json::from_slice(&bs_bytes).unwrap();
-    assert_eq!(
-        parsed.chunk_blob_len(),
-        std::fs::metadata(blob_path).unwrap().len()
+    assert!(
+        parsed.is_per_chunk(),
+        "bootstrap must be the ADR 0036 per-chunk shape"
     );
+    for entry in &parsed.entries {
+        assert_eq!(
+            entry.blob_digest.as_deref(),
+            Some(format!("sha256:{}", entry.sha256.to_hex()).as_str()),
+            "each chunk's blob digest must be its own hash"
+        );
+        assert_eq!(entry.blob_offset, 0);
+    }
 
     // Docker orchestration unchanged: build → create → export → rm → rmi.
     let calls = docker.calls();
