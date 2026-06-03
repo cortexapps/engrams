@@ -1,6 +1,18 @@
 # ADR 0035: Content-addressed bundle generations, pinned by GC
 
-Status: 2026-06-03 — **Proposed.**
+Status: 2026-06-03 — **Accepted.** Implemented on PR #72; CI-validated
+end-to-end: the e2e stack job runs the full enable → capture → session
+chain against content-addressed staging (resolve via stamp → attach →
+init-shim mount → agentd activate → in-session assert), and the FC
+integration suite pins the pinned-generation reopen, the **incident
+reproduction**, and the §3 load-paused `patch_drive` swap on real
+FC/KVM. Remaining validation (tracked, non-blocking): a dev-vm e2e of
+the swap + agentd squashfs-remount combination (the e2e runs with
+`pinned == current`, so the swap path's guest-mount half is pinned at
+the block layer only), plus the prod rollout itself — merge auto-rolls
+coord + host MIG, then the active images must be **re-enabled** to
+capture generation-pinned base snapshots (prod sessions stay
+bundle-broken from the incident until that step).
 
 ADR 0027's RO-mount bundle engine ships the fleet-wide `skills` /
 `playwright` squashfs bundles at a **fixed canonical path**
@@ -250,4 +262,33 @@ can't be collected in the window between MIG roll and first capture.
 
 ## Commit chain
 
-(To be filled at acceptance.)
+All on PR #72 (`adr-0035-content-addressed-bundles`):
+
+- `e3b3202` — ADR authored (Proposed): incident root-cause, the two
+  invariants, GC-pinned retention design.
+- `d11d0d6` — core + FC: `AuxRoDrive` drops `path_on_host` (path
+  derives from `drive_id` + `sha256`; symbolic vs resolved),
+  `SnapshotMetadata.aux_bundles`, FC resolve-at-capture /
+  pin-assert-at-restore / `restore_fresh` load-paused swap.
+- `70a720d` — host: agentd bind-time umount/remount (EBUSY = resume,
+  kept), `BundleStore` publish/materialize/sweep, pooled
+  resume-vs-fresh restore split, heartbeat stamp + `live_bundles`
+  supervisor (hard-decode anti-sweep contract).
+- `4401f55` — coord: migration 0051 (`snapshots.aux_bundles` +
+  `bundle_gc_candidates`), pin stamping on every snapshot flavor,
+  pin-set heartbeat acks (PG failure fails the heartbeat), bundle GC
+  riding the chunk-GC loop/barrier/grace, admin
+  `/admin/bundle-gc/{dry-run,sweep}`.
+- `f44491f` — staging: packer bakes `<name>-<sha>.squashfs` +
+  `current.json` (engrams-internal workflow untouched);
+  `just bundles-squashfs` dev mirror; README/init-shim docs.
+- `90df3c9` — tests: `aux_ro_drive.rs` rewrite (the old symlink-roll
+  variant had pinned the incident as a feature; replaced by pinned
+  reopen + incident negative control + §3 swap, newly wired into
+  ci.yml), `bundle_gc_live_pg`, `BundleStore` units, heartbeat wire
+  contract, FC stamp-resolution units.
+- `8c72579` — divergences recorded (this section's sibling above).
+- `aeddad8` — the e2e job's own bundle staging migrated to the
+  content-addressed shape — its 500 on the first CI run was the new
+  resolve step refusing a stamp-less host, i.e. the loud-failure
+  behavior working as specified.
