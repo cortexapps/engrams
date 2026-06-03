@@ -6,11 +6,14 @@ import { OwnerCell } from './Identity';
 import type { SessionListItem, SessionState } from '../types';
 
 // A single session manifest row: status glyph · short id · image ·
-// status · (owner) · age, laid out on the `.session-row` grid.
+// status · (owner) · age, laid out on the `.session-row` grid (which
+// the responsive rules collapse to a stacked record on phones).
 //
-// ADR 0031: the grid bug fix — adding a 6th child (owner) to a 5-column grid
-// caused the age cell to wrap onto a second line. The `has-owner` class switches
-// in an explicit 17rem owner track between status and age.
+// ADR 0031: the grid bug fix — adding a 6th child (owner) to a 5-column
+// grid caused the age cell to wrap onto a second line. The `has-owner`
+// class switches in an explicit fixed owner track between status and
+// age, and every cell is grid-area-addressed so a conditionally-present
+// owner can't shift its neighbors.
 //
 // While a session is transitioning toward Active (created / pending /
 // guest_ready) the status glyph is replaced by the inline trace loader.
@@ -45,32 +48,34 @@ export function SessionRow({
         to={`/sessions/${session.id}`}
         className={`session-row${showOwner ? ' has-owner' : ''}`}
       >
-        {booting ? (
-          <span className="row-loader" aria-label={session.status}>
-            <EngramMark
-              size={15}
-              mode="loop"
-              period={1600}
-              title={session.status}
-            />
-          </span>
-        ) : (
-          <StatusGlyph status={session.status} />
-        )}
+        <span className="sr-glyph">
+          {booting ? (
+            <span className="row-loader" aria-label={session.status}>
+              <EngramMark
+                size={15}
+                mode="loop"
+                period={1600}
+                title={session.status}
+              />
+            </span>
+          ) : (
+            <StatusGlyph status={session.status} />
+          )}
+        </span>
         <span
-          className="font-mono text-[0.85rem]"
+          className="sr-id font-mono text-[0.85rem]"
           style={{ color: 'var(--color-ink)' }}
         >
           {short(session.id)}
         </span>
         <span
-          className="font-display"
+          className="sr-img font-display"
           style={{ color: 'var(--color-ink-faded)' }}
         >
           {imageLabel}
         </span>
         <span
-          className="font-mono smallcaps text-[0.7rem]"
+          className="sr-status font-mono smallcaps text-[0.7rem]"
           style={{ color: 'var(--color-ink-quiet)' }}
         >
           {session.status}
@@ -83,8 +88,8 @@ export function SessionRow({
           />
         )}
         <span
-          className="font-mono text-[0.78rem]"
-          style={{ color: 'var(--color-ink-quiet)', minWidth: '6ch', textAlign: 'right' }}
+          className="sr-age font-mono text-[0.78rem]"
+          style={{ color: 'var(--color-ink-quiet)' }}
           data-tabular
         >
           {since}

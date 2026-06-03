@@ -495,17 +495,58 @@ select.ledger-input {
 }
 .session-row {
   display: grid;
-  /* glyph · id · image · status · age */
-  grid-template-columns: 1ch 13ch 1fr 5rem 4ch;
-  align-items: baseline;
+  /* glyph · id · image · status · age. The admin "all sessions" view
+   * adds a fixed owner track via `.has-owner` (defined with the owner
+   * cell below) so badges align column-to-column and the age never
+   * wraps. Cells are grid-area-addressed — a conditionally-present
+   * owner can't shift its neighbors — and the id track is fixed and
+   * clipped so a long id can't push the flexible image column out of
+   * alignment. */
+  grid-template-columns: 1ch 9ch 1fr 5rem 3.5rem;
+  grid-template-areas: 'g id img st age';
+  align-items: center;
   gap: 1rem;
-  padding: 0.25rem 0.5rem;
+  padding: 0.4rem 0.5rem;
   margin: 0 -0.5rem;
   text-decoration: none;
   transition: background-color var(--dur-fast) ease-out;
 }
 .session-row:hover {
   background-color: var(--bg-raised);
+}
+/* Session row with owner column — the bug fix. Admin "all sessions" adds
+ * an owner cell (see the ADR 0031 identity section for `.owner-cell`);
+ * without an explicit column for it the age wraps onto line 2. The
+ * `has-owner` class switches in a fixed owner track (and the
+ * area-addressed cells mean the extra child can't shift its neighbors).
+ * Defined here, before the responsive blocks, so the phone fold wins
+ * the cascade. */
+.session-row.has-owner {
+  grid-template-columns: 1ch 9ch 1fr 5rem 15rem 3.5rem;
+  grid-template-areas: 'g id img st own age';
+}
+.sr-glyph {
+  grid-area: g;
+  text-align: center;
+}
+.sr-id {
+  grid-area: id;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sr-img {
+  grid-area: img;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sr-status {
+  grid-area: st;
+}
+.sr-age {
+  grid-area: age;
+  text-align: right;
 }
 /* inline trace loader that replaces the status glyph while booting */
 .row-loader {
@@ -802,8 +843,10 @@ select.ledger-input {
     row-gap: 0.2rem;
   }
 
-  /* session rows: glyph + id + age on top, image + status beneath */
-  .session-row {
+  /* session rows: glyph + id + age on top, image + status beneath,
+   * and the owner token (when present) folded onto its own line */
+  .session-row,
+  .session-row.has-owner {
     grid-template-columns: min-content 1fr auto;
     grid-template-areas:
       'g id age'
@@ -811,22 +854,18 @@ select.ledger-input {
     gap: 0.2rem 0.8rem;
     padding: 0.5rem;
   }
-  .session-row > :nth-child(1) {
-    grid-area: g;
+  .session-row.has-owner {
+    grid-template-areas:
+      'g id age'
+      'g img st'
+      'g own own';
   }
-  .session-row > :nth-child(2) {
-    grid-area: id;
-  }
-  .session-row > :nth-child(3) {
-    grid-area: img;
-  }
-  .session-row > :nth-child(4) {
-    grid-area: st;
+  .session-row .sr-status,
+  .session-row .sr-age {
     justify-self: end;
   }
-  .session-row > :nth-child(5) {
-    grid-area: age;
-    justify-self: end;
+  .session-row .owner-cell {
+    margin-top: 0.2rem;
   }
 
   /* storage rollups: 2-up, smaller figures */
@@ -1077,7 +1116,7 @@ h6.md-h {
   flex: none;
 }
 .person-mark > span { font-style: italic; transform: translateY(-1px); }
-.person-mark.pm-xs { width: 1.6rem; height: 1.6rem; font-size: 0.82rem; }
+.person-mark.pm-xs { width: 1.5rem; height: 1.5rem; font-size: 0.76rem; }
 .person-mark.pm-sm { width: 2.1rem; height: 2.1rem; font-size: 1.05rem; }
 .person-mark.pm-md { width: 3rem;   height: 3rem;   font-size: 1.25rem; }
 .person-mark.pm-off { color: var(--fg-quiet); border-color: var(--border-faint); }
@@ -1119,11 +1158,13 @@ h6.md-h {
 }
 .member-status .x { margin-right: 0.35rem; }
 
-/* Owner cell in session rows — badge + label */
+/* Owner cell in session rows — badge leads, label follows, so badges
+ * align row to row */
 .owner-cell {
+  grid-area: own;
   display: flex;
   align-items: center;
-  gap: 0.45rem;
+  gap: 0.5rem;
   min-width: 0;
   overflow: hidden;
 }
@@ -1137,20 +1178,15 @@ h6.md-h {
 }
 .owner-email {
   font-family: var(--font-mono);
-  font-size: 0.74rem;
+  font-size: 0.72rem;
   color: var(--fg-quiet);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 22ch;
 }
 
-/* Session row with owner column — the bug fix. Admin "all sessions" adds a
- * 6th child; without an explicit column the owner wraps the age onto line 2.
- * The `has-owner` class switches in a fixed 17rem owner track. */
-.session-row.has-owner {
-  grid-template-columns: 1ch 13ch 1fr 5rem 17rem 4ch;
-}
+/* (`.session-row.has-owner` — the owner-track grid variant — is defined
+ * with the session manifest rules, before the responsive blocks.) */
 
 /* ===== grouped Settings tabs (You · Deployment) ========================= */
 .settings-groups {
@@ -1480,15 +1516,6 @@ h6.md-h {
 
   /* Profile rows: label above value */
   .profile-row { grid-template-columns: 1fr; gap: 0.15rem; padding: 0.5rem 0; }
-}
-
-/* Phone: owner row in session rows (has-owner variant) */
-@media (max-width: 600px) {
-  .session-row.has-owner {
-    grid-template-areas: 'g id age' 'g img st' 'g own own';
-  }
-  .session-row.has-owner > .owner-cell { grid-area: own; justify-self: start; margin-top: 0.15rem; }
-  .session-row.has-owner > :nth-child(6) { grid-area: age; justify-self: end; }
 }
 
 /* harness-waiting indicator — looping mark + context-aware gerund, where the
