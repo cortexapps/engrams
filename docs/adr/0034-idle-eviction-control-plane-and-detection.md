@@ -1,6 +1,11 @@
 # ADR 0034: Idle eviction rides a state machine, not a request future
 
-Status: 2026-06-03 — **Proposed.**
+Status: 2026-06-03 — **Accepted.** CI-validated on PR #71 (full workspace +
+live-PG lane + real-FC and e2e-stack jobs green). The remaining
+incident-shaped validation runs in prod post-merge: stuck session
+`0782bea5` should be backstop-nominated and evicted within the 30-min
+hard TTL of the first deploy (`engram_eviction_nominated_total
+{source="backstop"}`).
 
 ## Context: a session that finished and never went idle
 
@@ -211,8 +216,13 @@ amnesia, hub bookkeeping bugs — not just the incident's specific hole.
 - fix: engram-postgres row parser learns `'evicting'` (caught by the
   live-PG round-trip)
 
-Validation: workspace `just check` + 135 coordinator lib tests + 26
-live-PG tests green. Pending before Accepted: dev-vm/FC end-to-end
-(idle → nominate → Evicting → Idle → /resume; forced-detach →
-backstop fires) and the prod watch (pipeline-seconds completions,
-nominated{source} split, budget-exhausted ≈ 0).
+Validation: workspace `just check`, 135 coordinator lib tests, 26
+live-PG tests, and PR #71 CI (incl. the real-Firecracker and
+e2e-stack jobs) all green. The dev-vm manual e2e was blocked by a
+pre-existing `build_base_snapshot` fc_error on the box (upstream of
+any 0034 code path); the incident-shaped end-to-end runs in prod
+post-merge instead — the still-stuck session `0782bea5` is the test:
+backstop nomination + eviction within one 30-min hard TTL. Prod
+watch: pipeline-seconds completions present, nominated{source}
+split, budget-exhausted ≈ 0, no Evicting row older than a few
+ticks.
