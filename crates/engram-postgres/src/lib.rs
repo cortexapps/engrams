@@ -348,15 +348,17 @@ impl MetadataStore for PostgresStore {
         // ADR 0018 commit 12b: entering Evacuating resets
         // `evac_attempts` to 0 so a fresh drain (operator or
         // dead-host detector) starts the scanner's retry budget
-        // clean. Folded into the same UPDATE that commits the state
-        // flip so the counter and the state are always consistent.
+        // clean. ADR 0034 mirrors this for Evicting/`evict_attempts`.
+        // Folded into the same UPDATE that commits the state flip so
+        // the counters and the state are always consistent.
         sqlx::query(
             r#"
             UPDATE sessions
                SET status = $2,
                    last_active_at = NOW(),
                    updated_at = NOW(),
-                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END
+                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
              WHERE id = $1
             "#,
         )
@@ -420,6 +422,101 @@ impl MetadataStore for PostgresStore {
             .try_get("evac_attempts")
             .map_err(|e| MetaError::Serialization(format!("bump_evac_attempts: {e}")))?;
         Ok(attempts.max(0) as u32)
+    }
+
+    /// ADR 0034: eviction-scanner sweep query. Indexed via the
+    /// partial `idx_sessions_evicting` from migration 0050 so the
+    /// cost stays flat as the global session row count grows.
+    async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, status, host_id, sandbox_id,
+                   image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   evict_attempts
+            FROM sessions
+            WHERE status = 'evicting'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let session = row::session_from_row(r)?;
+            let attempts: i32 = r
+                .try_get("evict_attempts")
+                .map_err(|e| MetaError::Serialization(format!("evict_attempts: {e}")))?;
+            out.push((session, attempts.max(0) as u32));
+        }
+        Ok(out)
+    }
+
+    /// ADR 0034: atomic `+= 1 RETURNING`. The eviction scanner calls
+    /// this before each pipeline attempt; when the returned count
+    /// crosses the budget it falls back to HostLost.
+    async fn bump_evict_attempts(&self, session_id: SessionId) -> Result<u32, MetaError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET evict_attempts = evict_attempts + 1
+             WHERE id = $1
+             RETURNING evict_attempts
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let attempts: i32 = row
+            .try_get("evict_attempts")
+            .map_err(|e| MetaError::Serialization(format!("bump_evict_attempts: {e}")))?;
+        Ok(attempts.max(0) as u32)
+    }
+
+    /// ADR 0034 L3 backstop: Active sessions whose newest
+    /// session_events row is older than `idle_for_secs`. COALESCE to
+    /// the session's own `created_at` covers a freshly-created Active
+    /// session that has not emitted events yet (it still gets the
+    /// full TTL before the backstop will touch it). The per-session
+    /// MAX is served by `idx_session_events_session_created`
+    /// (migration 0050).
+    async fn list_active_sessions_idle_past(
+        &self,
+        idle_for_secs: i64,
+    ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT s.id, s.sandbox_id,
+                   COALESCE(MAX(e.created_at), s.created_at) AS last_event_at
+            FROM sessions s
+            LEFT JOIN session_events e ON e.session_id = s.id
+            WHERE s.status = 'active' AND s.sandbox_id IS NOT NULL
+            GROUP BY s.id, s.sandbox_id, s.created_at
+            HAVING COALESCE(MAX(e.created_at), s.created_at)
+                   < NOW() - ($1::bigint * INTERVAL '1 second')
+            "#,
+        )
+        .bind(idle_for_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: uuid::Uuid = r
+                .try_get("id")
+                .map_err(|e| MetaError::Serialization(format!("backstop id: {e}")))?;
+            let sandbox: uuid::Uuid = r
+                .try_get("sandbox_id")
+                .map_err(|e| MetaError::Serialization(format!("backstop sandbox_id: {e}")))?;
+            let last_event_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("last_event_at")
+                .map_err(|e| MetaError::Serialization(format!("backstop last_event_at: {e}")))?;
+            out.push((SessionId::from(id), SandboxId::from(sandbox), last_event_at));
+        }
+        Ok(out)
     }
 
     async fn assign_session_host(

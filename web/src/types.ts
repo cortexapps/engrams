@@ -24,6 +24,12 @@
  *   host_lost   — heartbeat-loss against the bound host. The
  *                 reconciler resolves this to `idle` (if a
  *                 recoverable snapshot exists) or `dead`.
+ *   evacuating  — mid-relocation to a peer host (ADR 0018); the
+ *                 evac_resumer scanner drives it back to active.
+ *   evicting    — idle-eviction in flight (ADR 0034); the eviction
+ *                 scanner snapshots + suspends it to `idle` within
+ *                 a couple of minutes. /prompt and /resume 409
+ *                 (retryable) while here.
  *   completed   — terminal (user-deleted)
  *   failed      — terminal (create failed mid-flight)
  *   dead        — terminal (chunked manifests gone or never were)
@@ -35,6 +41,8 @@ export type SessionState =
   | 'active'
   | 'idle'
   | 'host_lost'
+  | 'evacuating'
+  | 'evicting'
   | 'completed'
   | 'failed'
   | 'dead';

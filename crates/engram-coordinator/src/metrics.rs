@@ -44,8 +44,23 @@ pub fn init(addr: SocketAddr) {
         0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0,
     ];
 
+    // ADR 0034: the eviction pipeline is a different latency regime —
+    // a fat session's snapshot+upload legitimately runs 60-90s+. The
+    // default `_seconds` buckets top out at 30s and would flatten
+    // every interesting eviction into the +Inf bucket, so this metric
+    // gets its own spread. Precedence is by Matcher kind, not
+    // insertion order: the exporter sorts overrides by `Matcher`'s
+    // derived Ord (Full < Prefix < Suffix) and takes the first match,
+    // so this Full() rule beats the Suffix("_seconds") default.
+    let eviction_buckets = &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(EVICTION_PIPELINE_SECONDS.to_string()),
+            eviction_buckets,
+        )
+        .expect("install eviction histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -105,3 +120,32 @@ pub const SESSIONS_ACTIVE: &str = "engram_sessions_active";
 /// `host_registry`). Should equal the count of `ready` rows in
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
+
+/// Histogram (ADR 0034). Wall-clock of one successful
+/// `evict_session_to_state` pipeline run as driven by the eviction
+/// scanner — pause + snapshot + upload + record + destroy. Custom
+/// buckets to 300s (see `init`): the pre-0034 bug was precisely that
+/// these runs exceed request-timeout scales, so the histogram must
+/// resolve the 60-180s band. The original failure mode — pipelines
+/// silently cancelled mid-run — would reappear here as nominations
+/// without matching pipeline completions.
+pub const EVICTION_PIPELINE_SECONDS: &str = "engram_eviction_pipeline_seconds";
+
+/// Counter (ADR 0034). Sessions nominated into the Evicting lane.
+/// Labels: `source` = `host` (the host's soft/hard-TTL idle driver
+/// via POST idle-eviction-candidates) or `backstop` (the coord's
+/// PG-derived L3 detector — should be ~0; a sustained nonzero rate
+/// means hosts are going blind to running sandboxes).
+pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
+
+/// Counter (ADR 0034). Eviction scanner gave up after the retry
+/// budget (20 attempts ≈ 3 min) and fell the session back to
+/// HostLost. Should be ~0 — alarm-worthy if rising: it means the
+/// snapshot pipeline is persistently failing for some session.
+pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
+
+/// Gauge (ADR 0034). Rows in `status='evicting'` observed by the
+/// eviction scanner at the top of each tick — its queue depth.
+/// Healthy steady-state drains to 0 between ticks; a climbing value
+/// means evictions are arriving faster than pipelines complete.
+pub const EVICTION_SCANNER_QUEUE: &str = "engram_eviction_scanner_queue";

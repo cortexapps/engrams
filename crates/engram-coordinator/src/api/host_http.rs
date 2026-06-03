@@ -14,20 +14,21 @@
 //!   - `POST /api/sessions/:session_id/harness-events` — host
 //!     forwards adapter events one POST at a time
 //!   - `POST /api/hosts/:id/idle-eviction-candidates` — host pushes
-//!     idle-eviction candidates (ADR 0011 follow-up #2)
+//!     idle-eviction candidates (ADR 0011 follow-up #2; since
+//!     ADR 0034 a fast Active→Evicting nomination — the eviction
+//!     scanner runs the pipeline, never this handler)
 //!
 //! Each handler is a thin shim over existing logic — the WS path's
-//! supervisor loop, the existing `AuthRequestHandler::handle` body,
-//! and `idle_evictor::evict_idle_session` stay authoritative.
-
-use std::sync::Arc;
+//! supervisor loop and the existing `AuthRequestHandler::handle`
+//! body stay authoritative.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::host::{HostCapacity, HostMetadata, HostRecord, HostStatus};
-use engram_core::{HostId, SandboxId, SessionId};
+use engram_core::types::SessionState;
+use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{
     EnabledImageRef, HostCapacityReport, LocalSnapshotReport, ManifestDigest,
@@ -36,8 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::host_registry::HostState;
-use crate::idle_evictor;
-use crate::state::SharedState;
+use crate::state::{SessionEvent, SharedState};
 
 // ---- POST /api/hosts/register ----
 
@@ -602,36 +602,31 @@ pub async fn live_manifest_publish(
     }
 }
 
+/// ADR 0034: fast control-plane nomination. The pre-0034 handler ran
+/// the full snapshot pipeline inline here; a fat session's eviction
+/// (60-90s+) outlived the host's POST timeout, the connection drop
+/// cancelled the handler future mid-pipeline, and the eviction died
+/// silently (prod session 0782bea5 sat Active for 8+ hours). Now the
+/// handler only flips `Active → Evicting` — a single PG UPDATE — and
+/// the eviction scanner (`idle_evictor::spawn_eviction_scanner`)
+/// drives the pipeline outside any request lifetime.
+///
+/// Response semantics: `accepted` = "the candidate is in (or already
+/// past) the Evicting lane" — including the no-op cases below;
+/// `failed` = "couldn't read or transition the row." The host
+/// re-nominates a still-Evicting sandbox on every 10s tick until the
+/// pipeline destroys it; counting those re-nominations as accepted
+/// no-ops is what keeps that loop silent and cheap.
 pub async fn idle_eviction_candidates(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,
     Json(req): Json<IdleEvictionCandidatesRequest>,
 ) -> Result<Json<IdleEvictionCandidatesResponse>, ApiError> {
-    // Run each candidate through the canonical pipeline. The
-    // pipeline is idempotent: if another coord pod or another
-    // candidate batch already evicted this sandbox, the registry
-    // guard at the top of `evict_idle_session` short-circuits.
-    let state_for_loop = Arc::clone(&state);
     let mut accepted = 0usize;
     let mut failed = 0usize;
     for candidate in req.candidates {
-        match idle_evictor::evict_idle_session(
-            &state_for_loop,
-            candidate.session_id,
-            candidate.sandbox_id,
-        )
-        .await
-        {
-            Ok(()) => {
-                accepted += 1;
-                tracing::info!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    idle_since = ?candidate.idle_since,
-                    "idle session evicted via host-pushed candidate",
-                );
-            }
+        let session = match state.services.meta.get_session(candidate.session_id).await {
+            Ok(s) => s,
             Err(e) => {
                 failed += 1;
                 tracing::warn!(
@@ -639,10 +634,294 @@ pub async fn idle_eviction_candidates(
                     session_id = %candidate.session_id,
                     sandbox_id = %candidate.sandbox_id,
                     error = %e,
-                    "host-pushed idle eviction failed",
+                    "idle-eviction candidate: session lookup failed",
+                );
+                continue;
+            }
+        };
+        if session.status != SessionState::Active {
+            // Already Evicting (the common re-nomination case) or
+            // moved on entirely (deleted, host-lost). Either way the
+            // work is queued or moot — accepted no-op.
+            accepted += 1;
+            continue;
+        }
+        match state
+            .services
+            .meta
+            .transition_session(candidate.session_id, SessionState::Evicting)
+            .await
+        {
+            Ok(prev) => {
+                accepted += 1;
+                ::metrics::counter!(crate::metrics::EVICTION_NOMINATED_TOTAL, "source" => "host")
+                    .increment(1);
+                tracing::info!(
+                    host_id = %host_id,
+                    session_id = %candidate.session_id,
+                    sandbox_id = %candidate.sandbox_id,
+                    idle_since = ?candidate.idle_since,
+                    "idle session nominated for eviction (scanner drives the pipeline)",
+                );
+                if let Err(e) = state
+                    .emit(
+                        candidate.session_id,
+                        SessionEvent::StatusChanged {
+                            from: prev,
+                            to: SessionState::Evicting,
+                            at: Utc::now(),
+                        },
+                    )
+                    .await
+                {
+                    // Status is committed; a lost event is timeline
+                    // cosmetics, not lifecycle state. Don't fail the
+                    // candidate over it.
+                    tracing::warn!(
+                        session_id = %candidate.session_id,
+                        error = %e,
+                        "idle-eviction nomination: StatusChanged emit failed",
+                    );
+                }
+            }
+            // Lost the Active-check race (another pod's nomination,
+            // a concurrent delete): the row is wherever the winner
+            // put it — accepted no-op, same as the pre-check path.
+            Err(MetaError::Conflict(_)) => accepted += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    host_id = %host_id,
+                    session_id = %candidate.session_id,
+                    sandbox_id = %candidate.sandbox_id,
+                    error = %e,
+                    "idle-eviction candidate: transition to Evicting failed",
                 );
             }
         }
     }
     Ok(Json(IdleEvictionCandidatesResponse { accepted, failed }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CoordinatorConfig;
+    use crate::host_registry::HostRegistry;
+    use crate::state::tests::MiniMeta;
+    use crate::state::AppState;
+    use crate::Services;
+    use engram_cloud_mock::MockCloud;
+    use engram_core::traits::SandboxBackend;
+    use engram_core::types::session::SessionMode;
+    use engram_core::types::Session;
+    use engram_sandbox_process::ProcessBackend;
+    use engram_secrets_dev::InMemorySecretStore;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
+        let local = TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(engram_core::HostId::new(), local_host);
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
+            blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-blobs-test"),
+                ),
+            )),
+            host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: local.path().to_path_buf(),
+            ..CoordinatorConfig::default()
+        };
+        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        (state, local)
+    }
+
+    fn session_with_status(
+        id: engram_core::SessionId,
+        sandbox: SandboxId,
+        status: SessionState,
+    ) -> Session {
+        Session {
+            id,
+            user_id: None,
+            status,
+            host_id: None,
+            sandbox_id: Some(sandbox),
+            image: "test/repo:evict".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        }
+    }
+
+    fn candidates_req(
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+    ) -> IdleEvictionCandidatesRequest {
+        IdleEvictionCandidatesRequest {
+            candidates: vec![IdleCandidate {
+                session_id,
+                sandbox_id,
+                idle_since: None,
+            }],
+        }
+    }
+
+    /// ADR 0034 happy path: the handler flips Active → Evicting,
+    /// emits StatusChanged, and returns — it does NOT run the
+    /// pipeline (status is Evicting, not Idle; the sandbox binding
+    /// is untouched for the scanner to use).
+    #[tokio::test]
+    async fn handler_nominates_active_session_and_returns() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, _local) = build_state_for_session(session_with_status(
+            session_id,
+            sandbox_id,
+            SessionState::Active,
+        ));
+
+        let resp = idle_eviction_candidates(
+            State(state.clone()),
+            Path(HostId::new()),
+            Json(candidates_req(session_id, sandbox_id)),
+        )
+        .await
+        .expect("handler");
+        assert_eq!(resp.0.accepted, 1);
+        assert_eq!(resp.0.failed, 0);
+
+        let session = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(session.status, SessionState::Evicting);
+        assert_eq!(
+            session.sandbox_id,
+            Some(sandbox_id),
+            "nomination must not unbind the sandbox — the scanner's pipeline needs it"
+        );
+
+        // StatusChanged(Active → Evicting) landed on the event log.
+        let events = state
+            .services
+            .meta
+            .list_session_events_since(session_id, -1, -1)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "status_changed"
+                    && e.payload["to"] == serde_json::json!("evicting")),
+            "expected a status_changed→evicting event, got {events:?}"
+        );
+    }
+
+    /// Re-nomination of an already-Evicting sandbox (the host's 10s
+    /// tick while the pipeline runs) is an accepted no-op: no second
+    /// transition, no second event.
+    #[tokio::test]
+    async fn handler_renomination_of_evicting_is_accepted_noop() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, _local) = build_state_for_session(session_with_status(
+            session_id,
+            sandbox_id,
+            SessionState::Evicting,
+        ));
+
+        let resp = idle_eviction_candidates(
+            State(state.clone()),
+            Path(HostId::new()),
+            Json(candidates_req(session_id, sandbox_id)),
+        )
+        .await
+        .expect("handler");
+        assert_eq!(resp.0.accepted, 1, "re-nomination is accepted");
+        assert_eq!(resp.0.failed, 0);
+
+        let session = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(session.status, SessionState::Evicting, "unchanged");
+        let events = state
+            .services
+            .meta
+            .list_session_events_since(session_id, -1, -1)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "no event for a no-op, got {events:?}");
+    }
+
+    /// A candidate whose session moved on entirely (terminal) is an
+    /// accepted no-op — the host must not see it as a failure and
+    /// retry-storm it.
+    #[tokio::test]
+    async fn handler_nonactive_candidate_is_accepted_noop() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, _local) = build_state_for_session(session_with_status(
+            session_id,
+            sandbox_id,
+            SessionState::Completed,
+        ));
+
+        let resp = idle_eviction_candidates(
+            State(state.clone()),
+            Path(HostId::new()),
+            Json(candidates_req(session_id, sandbox_id)),
+        )
+        .await
+        .expect("handler");
+        assert_eq!(resp.0.accepted, 1);
+        assert_eq!(resp.0.failed, 0);
+        let session = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(session.status, SessionState::Completed, "untouched");
+    }
+
+    /// An unknown session is the one genuine failure shape.
+    #[tokio::test]
+    async fn handler_unknown_session_counts_failed() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, _local) = build_state_for_session(session_with_status(
+            engram_core::SessionId::new(), // different id than nominated
+            sandbox_id,
+            SessionState::Active,
+        ));
+
+        let resp = idle_eviction_candidates(
+            State(state),
+            Path(HostId::new()),
+            Json(candidates_req(session_id, sandbox_id)),
+        )
+        .await
+        .expect("handler");
+        assert_eq!(resp.0.accepted, 0);
+        assert_eq!(resp.0.failed, 1);
+    }
 }

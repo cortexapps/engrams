@@ -745,13 +745,14 @@ impl HostAgent {
                         eviction_hub.mark_eviction_inflight(*sb);
                     }
                     // Fire-and-forget: don't block the tick loop on
-                    // the POST. Coord-side `evict_idle_session` can
-                    // legitimately take 60-90s for a fat session
-                    // (FC memory dump + state.bin upload + chunked
-                    // memory upload). Waiting inline made the host
-                    // retry-stormy when the POST hit its old 30s
-                    // timeout (ADR 0016 §A.1.5a, prod incident
-                    // 2026-05-24).
+                    // the POST. Since ADR 0034 the POST is a fast
+                    // nomination (coord flips Active→Evicting and
+                    // returns; its eviction scanner runs the
+                    // pipeline), so the marker clears in seconds and
+                    // re-nomination dedup comes from the coord side
+                    // (non-Active candidate → accepted no-op). The
+                    // marker + 180s stale sweep stay as the
+                    // within-tick guard (ADR 0016 §A.1.5a).
                     //
                     // Shutdown caveat: `eviction_task.abort()` on
                     // process exit will not wait for these spawned

@@ -370,6 +370,7 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
         "idle" => SessionState::Idle,
         "host_lost" => SessionState::HostLost,
         "evacuating" => SessionState::Evacuating,
+        "evicting" => SessionState::Evicting,
         "dead" => SessionState::Dead,
         "completed" => SessionState::Completed,
         "failed" => SessionState::Failed,
