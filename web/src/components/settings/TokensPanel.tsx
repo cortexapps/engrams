@@ -1,15 +1,20 @@
 // ADR 0031 redesign: a per-service token ledger (not a single-service form).
 // Each row: service name + italic "what it's for" left; status + actions right.
-// Saved rows → replace / remove. Unsaved → "add →" reveals an inline password
-// field + hint + save / cancel. Tokens are sealed on save and never shown again.
+// Saved rows → replace. Unsaved → "add →" reveals an inline password field +
+// hint + save / cancel. Tokens are sealed on save and never shown again.
+//
+// Today the ledger has a single row (Claude Code). Git credentials are
+// brokered by the platform's installation-scoped GitHub App (ADR 0023) —
+// users never paste git tokens here. New services land as their own row
+// once the backend grows a `/me/<service>-token` route for them.
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
-import { saveClaudeToken, saveGithubToken, deleteToken } from '../../api';
+import { saveClaudeToken } from '../../api';
 import { useAuth } from '../../auth/AuthProvider';
 
 interface Service {
-  id: 'claude' | 'github';
+  id: 'claude';
   name: string;
   use: string;
   hint: string;
@@ -24,13 +29,6 @@ const SERVICES: Service[] = [
     hint: 'from `claude setup-token` — stored encrypted, never shown again',
     placeholder: 'sk-ant-oat…',
   },
-  {
-    id: 'github',
-    name: 'GitHub',
-    use: 'clone private repositories into a session',
-    hint: 'a fine-grained PAT with repo scope',
-    placeholder: 'github_pat_…',
-  },
 ];
 
 export function TokensPanel() {
@@ -38,45 +36,20 @@ export function TokensPanel() {
   const queryClient = useQueryClient();
 
   // Which service row is in the editing state.
-  const [editing, setEditing] = useState<'claude' | 'github' | null>(null);
-
-  // Local "github saved" state (server doesn't surface it on /me yet).
-  const [githubSaved, setGithubSaved] = useState(false);
+  const [editing, setEditing] = useState<'claude' | null>(null);
 
   const savedState: Record<string, boolean> = {
     claude: principal.has_claude_token,
-    github: githubSaved,
   };
 
   const saveMutation = useMutation({
-    mutationFn: async ({ id, token }: { id: 'claude' | 'github'; token: string }) => {
-      if (id === 'claude') {
-        await saveClaudeToken(token);
-      } else {
-        await saveGithubToken(token);
-      }
-      return id;
+    mutationFn: async ({ token }: { id: 'claude'; token: string }) => {
+      await saveClaudeToken(token);
     },
-    onSuccess: (id) => {
+    onSuccess: () => {
       setEditing(null);
-      if (id === 'claude') {
-        void queryClient.invalidateQueries({ queryKey: ['me'] });
-        refresh();
-      } else {
-        setGithubSaved(true);
-      }
-    },
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: (id: 'claude' | 'github') => deleteToken(id),
-    onSuccess: (_, id) => {
-      if (id === 'claude') {
-        void queryClient.invalidateQueries({ queryKey: ['me'] });
-        refresh();
-      } else {
-        setGithubSaved(false);
-      }
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
+      refresh();
     },
   });
 
@@ -96,11 +69,10 @@ export function TokensPanel() {
             svc={svc}
             isSaved={savedState[svc.id] ?? false}
             isEditing={editing === svc.id}
-            isMutating={saveMutation.isPending || deleteMutation.isPending}
+            isMutating={saveMutation.isPending}
             onEdit={() => setEditing(svc.id)}
             onCancel={() => setEditing(null)}
             onSave={(token) => saveMutation.mutate({ id: svc.id, token })}
-            onRemove={() => deleteMutation.mutate(svc.id)}
           />
         ))}
       </div>
@@ -108,7 +80,9 @@ export function TokensPanel() {
       <p className="ledger-note">
         every token is sealed under the deployment key the moment you save it —
         the plaintext never touches Postgres, and it's used automatically so
-        you're never prompted per session. new services land here as their own row.
+        you're never prompted per session. git access is brokered by the
+        platform, so there's no git token to paste. new services land here as
+        their own row.
       </p>
     </section>
   );
@@ -122,7 +96,6 @@ function ServiceRow({
   onEdit,
   onCancel,
   onSave,
-  onRemove,
 }: {
   svc: Service;
   isSaved: boolean;
@@ -131,7 +104,6 @@ function ServiceRow({
   onEdit: () => void;
   onCancel: () => void;
   onSave: (token: string) => void;
-  onRemove: () => void;
 }) {
   const [token, setToken] = useState('');
   const trimmed = token.trim();
@@ -196,14 +168,9 @@ function ServiceRow({
 
       <div className="token-row-actions">
         {isSaved ? (
-          <>
-            <button type="button" className="members-act" onClick={onEdit}>
-              replace
-            </button>
-            <button type="button" className="members-act act-quiet" onClick={onRemove}>
-              remove
-            </button>
-          </>
+          <button type="button" className="members-act" onClick={onEdit}>
+            replace
+          </button>
         ) : (
           <button type="button" className="members-act act-primary" onClick={onEdit}>
             add →

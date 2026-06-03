@@ -132,12 +132,6 @@ export const fetchMe = async (): Promise<Principal> => {
 export const saveClaudeToken = (token: string) =>
   postJSON<void>('/me/claude-token', { token });
 
-export const saveGithubToken = (token: string) =>
-  postJSON<void>('/me/github-token', { token });
-
-export const deleteToken = (service: 'claude' | 'github') =>
-  deleteEmpty(`/me/${service}-token`);
-
 /** Revoke the session cookie, then hard-navigate home (which 401s → login). */
 export const logout = async (): Promise<void> => {
   await postJSON<void>('/auth/logout', {});
