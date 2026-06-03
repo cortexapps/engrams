@@ -6,10 +6,9 @@ import '@fontsource-variable/jetbrains-mono/wght-italic.css';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { ThemeProvider } from './components/theme-provider';
+// index.css pulls in Tailwind once and @imports theme.css (the Lab-Notebook
+// partial kept for the not-yet-migrated SessionDetail transcript subtree).
 import './index.css';
-// theme.css is kept for the not-yet-migrated SessionDetail transcript subtree
-// (an accepted "old-paper island" until the later assistant-ui migration).
-import './theme.css';
 
 // StrictMode intentionally double-mounts effects in dev. Useful in
 // general, but it interacts badly with ghostty-web's WASM Terminal:

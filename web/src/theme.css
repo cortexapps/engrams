@@ -1,4 +1,8 @@
-@import "tailwindcss";
+/* NOTE: this file is a PARTIAL, imported by index.css *after* it pulls in
+ * Tailwind — it must NOT re-import "tailwindcss" (that emitted the whole
+ * framework + preflight a second time and leaked these base rules into the
+ * shadcn shell). It supplies the Lab-Notebook tokens + component classes the
+ * still-old SessionDetail transcript subtree depends on. */
 
 /* ------------------------------------------------------------------
  * Design tokens — "Lab Notebook"
@@ -30,8 +34,6 @@
 
 @layer base {
   :root {
-    color-scheme: light;
-
     /* Semantic aliases — the four-surface redesign's component CSS
      * (ported from the design handoff) is written against role tokens
      * so the palette stays swappable. They map onto the `--color-*`
@@ -79,17 +81,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  ::selection {
-    background-color: var(--color-amber);
-    color: var(--color-paper);
-  }
-
-  /* Hairline rule reused everywhere. */
-  hr {
-    border: 0;
-    border-top: 1px solid var(--color-rule);
-    margin: 0;
-  }
 }
 
 /* ------------------------------------------------------------------

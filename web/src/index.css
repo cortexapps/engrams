@@ -1,5 +1,9 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+/* Lab-Notebook partial — tokens + component classes for the still-old
+   SessionDetail transcript subtree. Imported here so Tailwind is pulled in
+   exactly once (theme.css must not re-import it). */
+@import "./theme.css";
 
 @custom-variant dark (&:is(.dark *));
 
