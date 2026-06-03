@@ -800,50 +800,63 @@ git commit -m "feat(web): RootLayout shadcn shell (SidebarProvider + inset)"
 
 These render a **second** sidebar via a scoped `SidebarProvider`, then their own `<Outlet/>`.
 
+**Responsive rule for both section layouts:** the vertical second sidebar shows only at `md+` (`hidden md:flex`); below `md` it is replaced by a horizontal, scrollable nav strip above the content. The primary rail keeps its native off-canvas behaviour (its `SidebarTrigger` is in the RootLayout header). Content padding steps down on mobile (`p-4 md:p-6`).
+
 - [ ] **Step 1: Implement `sessions/SessionsLayout.tsx`**
 
 ```tsx
 import { Layers, ListChecks } from 'lucide-react';
-import { Link, Outlet, useRouterState } from '@tanstack/react-router';
+import { Link, Outlet, useRouterState, type LinkProps } from '@tanstack/react-router';
 import { useIsAdmin } from '../../auth/AuthProvider';
 import {
   Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
   SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
 } from '@/components/ui/sidebar';
+import { cn } from '@/lib/utils';
 
 export function SessionsLayout() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const onAll = pathname.startsWith('/sessions/all');
-  const onMine = pathname === '/sessions' || pathname === '/sessions/';
+  const items: { to: LinkProps['to']; label: string; icon: typeof Layers; active: boolean }[] = [
+    { to: '/sessions', label: 'My sessions', icon: Layers, active: pathname === '/sessions' || pathname === '/sessions/' },
+    ...(isAdmin
+      ? [{ to: '/sessions/all' as LinkProps['to'], label: 'All sessions', icon: ListChecks, active: pathname.startsWith('/sessions/all') }]
+      : []),
+  ];
 
   return (
     <SidebarProvider className="min-h-0 flex-1">
-      <Sidebar collapsible="none" className="border-r">
+      {/* desktop (md+): vertical second sidebar */}
+      <Sidebar collapsible="none" className="hidden border-r md:flex">
         <SidebarContent>
           <SidebarGroup>
             <SidebarGroupLabel>Sessions</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                <SidebarMenuItem>
-                  <SidebarMenuButton asChild isActive={onMine}>
-                    <Link to="/sessions"><Layers /><span>My sessions</span></Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                {isAdmin && (
-                  <SidebarMenuItem>
-                    <SidebarMenuButton asChild isActive={onAll}>
-                      <Link to="/sessions/all"><ListChecks /><span>All sessions</span></Link>
+                {items.map((it) => (
+                  <SidebarMenuItem key={it.label}>
+                    <SidebarMenuButton asChild isActive={it.active}>
+                      <Link to={it.to}><it.icon /><span>{it.label}</span></Link>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
-                )}
+                ))}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </SidebarContent>
       </Sidebar>
-      <div className="flex flex-1 flex-col overflow-auto p-6">
-        <Outlet />
+      <div className="flex flex-1 flex-col overflow-auto">
+        {/* mobile (<md): horizontal nav strip */}
+        <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
+          {items.map((it) => (
+            <Link key={it.label} to={it.to}
+              className={cn('inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm',
+                it.active ? 'bg-accent text-accent-foreground' : 'text-muted-foreground')}>
+              <it.icon className="size-4" />{it.label}
+            </Link>
+          ))}
+        </nav>
+        <div className="flex-1 p-4 md:p-6"><Outlet /></div>
       </div>
     </SidebarProvider>
   );
@@ -893,21 +906,36 @@ export function SettingsLayout() {
     </SidebarGroup>
   );
 
+  const items = [...YOU, ...(isAdmin ? DEPLOYMENT : [])];
+
   return (
     <SidebarProvider className="min-h-0 flex-1">
-      <Sidebar collapsible="none" className="border-r">
+      {/* desktop (md+): vertical second sidebar */}
+      <Sidebar collapsible="none" className="hidden border-r md:flex">
         <SidebarContent>
           {group('You', YOU)}
           {isAdmin && group('Deployment', DEPLOYMENT)}
         </SidebarContent>
       </Sidebar>
-      <div className="flex flex-1 flex-col overflow-auto p-6">
-        <Outlet />
+      <div className="flex flex-1 flex-col overflow-auto">
+        {/* mobile (<md): horizontal nav strip */}
+        <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
+          {items.map((it) => (
+            <Link key={it.label} to={it.to}
+              className={cn('inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm',
+                pathname.startsWith(it.to as string) ? 'bg-accent text-accent-foreground' : 'text-muted-foreground')}>
+              <it.icon className="size-4" />{it.label}
+            </Link>
+          ))}
+        </nav>
+        <div className="flex-1 p-4 md:p-6"><Outlet /></div>
       </div>
     </SidebarProvider>
   );
 }
 ```
+
+Add `import { cn } from '@/lib/utils';` to `SettingsLayout.tsx`.
 
 - [ ] **Step 3: Verify compile** — `pnpm exec tsc -b --noEmit` → PASS.
 
@@ -1556,7 +1584,7 @@ export function Fleet() {
     s.filter((x: Session) => x.host_id === id && x.status === 'active').length;
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6 p-4 md:p-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Fleet</h1>
         <p className="text-sm text-muted-foreground">Firecracker hosts and capacity.</p>
@@ -1692,7 +1720,7 @@ export function Storage() {
   ];
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6 p-4 md:p-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Storage</h1>
         <p className="text-sm text-muted-foreground">
@@ -2191,7 +2219,30 @@ git commit -m "chore(web): remove bespoke components; let shadcn own app backgro
 
 ---
 
-### Task 22: Update the redesign memory
+### Task 22: Mobile responsiveness pass & verification
+
+**Files:** touch-ups only, across the surfaces built above.
+
+shadcn's primary `Sidebar` handles mobile natively (off-canvas sheet + the `SidebarTrigger` in the RootLayout header). The section sidebars are already `hidden md:flex` with a mobile nav strip (Task 8). This task confirms the rest holds up at phone width.
+
+- [ ] **Step 1: Confirm table overflow.** shadcn `Table` renders inside a `div.overflow-x-auto`, so the Sessions/Storage/Members tables scroll horizontally rather than overflow the viewport. Verify in DevTools at 375px — no horizontal page scroll, only the table scrolls. If any page added its own wrapper that clips this, remove it.
+
+- [ ] **Step 2: Confirm stat-card grids reflow.** `MySessions` (`grid-cols-2 sm:grid-cols-4`), `Storage` (`grid-cols-2 sm:grid-cols-3 lg:grid-cols-6`), `Fleet` (`grid-cols-3`) all hold at 375px. If `Fleet`'s three rollup cards feel cramped, change to `grid-cols-1 sm:grid-cols-3`.
+
+- [ ] **Step 3: Confirm dialogs/headers.** `NewSessionDialog`, drain `AlertDialog`, and the page headers (`flex items-start justify-between`) don't overflow at 375px — the New-session button wraps below the title if needed (`flex-wrap` on the header row if it clips).
+
+- [ ] **Step 4: Manual sweep.** Run `pnpm dev`, open DevTools device toolbar at iPhone SE (375×667). Walk: open the primary rail via the header trigger; `/sessions` (strip nav + table scroll); `/sessions/all`; `/fleet`; `/storage`; `/settings/*` (strip nav); open a session (`/sessions/$id`); toggle dark mode. No element should cause horizontal page scroll.
+
+- [ ] **Step 5: Commit any fixes.**
+```bash
+pnpm exec tsc -b --noEmit && pnpm test
+git add -A web
+git commit -m "fix(web): mobile responsiveness pass"
+```
+
+---
+
+### Task 23: Update the redesign memory
 
 **Files:** none in repo — update the assistant memory.
 
@@ -2210,8 +2261,9 @@ git commit -m "chore(web): remove bespoke components; let shadcn own app backgro
 - UserChip → user menu → Task 5 ✓
 - Excluded SessionDetail + theme.css coexistence (old-paper island) → Task 21 Step 3 ✓
 - Auth screens → Task 20 ✓
+- Mobile responsiveness (section sidebars → mobile nav strip; table overflow; grid reflow; verification sweep) → Tasks 8, 22 ✓
 - Testing (matchMedia/ResizeObserver setup, updated component tests) → Tasks 3, 12, 18, 19 ✓
-- Memory correction → Task 22 ✓
+- Memory correction → Task 23 ✓
 
 **Placeholder scan:** Tasks 18 & 19 intentionally describe the rewrite at a higher level ("mirror the data wiring exactly, swap presentation") rather than transcribing every line, because their data/hook wiring is already complete in the existing files and must be preserved verbatim — the instruction is to read the current file and keep its logic. Every other task has complete code.
 

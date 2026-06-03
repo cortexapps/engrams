@@ -38,6 +38,11 @@ migrates to assistant-ui later and is left untouched here.
    Mono mapped to `--font-mono` for IDs/code/telemetry only.
 7. **Icons:** Lucide (shadcn default) everywhere. No Phosphor — lucide already
    ships inside the generated primitives, so one library, no double-bundle.
+8. **Mobile responsive.** The primary `Sidebar` uses shadcn's native off-canvas
+   mobile behaviour. The section (second) sidebars are NOT collapsible natively,
+   so they show only at `md+` and collapse to a horizontal scrollable nav strip
+   below `md`. Tables rely on shadcn's `overflow-x-auto` wrapper; stat grids
+   reflow via responsive `grid-cols`. Verified at 375px width.
 
 ## Current state (for reference)
 
