@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link } from '@tanstack/react-router';
 import { logout } from '../api';
 import { useAuth } from '../auth/AuthProvider';
 import { RoleTag } from './Identity';

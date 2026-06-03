@@ -10,7 +10,7 @@
 // it here.
 
 import { afterEach, describe, expect, test } from 'vitest';
-import { cleanup, screen } from '@testing-library/react';
+import { cleanup, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '../test-utils';
 import {
   Transcript,
@@ -228,16 +228,22 @@ describe('contextVerb', () => {
 // ---- render smoke checks (non-busy states only) ----------------------
 
 /** Render a transcript that ends idle (so the EngramMark-backed
- * harness-waiting line never mounts). */
-function renderIdle(events: SessionEvent[]) {
-  return renderWithProviders(
+ * harness-waiting line never mounts).
+ *
+ * Async because TanStack Router defers the initial render to a microtask —
+ * we wait for the transcript to actually mount before the caller queries the
+ * DOM (with MemoryRouter this render was synchronous). */
+async function renderIdle(events: SessionEvent[]) {
+  const result = renderWithProviders(
     <Transcript events={indexed([...events, { type: 'harness_idle', at: AT2 }])} sessionId="s1" />,
   );
+  await waitFor(() => expect(result.container.childElementCount).toBeGreaterThan(0));
+  return result;
 }
 
 describe('Transcript rendering', () => {
-  test('user turn renders the § you block with the prompt text', () => {
-    const { container } = renderIdle([
+  test('user turn renders the § you block with the prompt text', async () => {
+    const { container } = await renderIdle([
       {
         type: 'agent_message',
         run_id: '',
@@ -255,8 +261,8 @@ describe('Transcript rendering', () => {
     expect(turn?.textContent).toContain('§');
   });
 
-  test('a process renders $ command and exit status', () => {
-    const { container } = renderIdle([
+  test('a process renders $ command and exit status', async () => {
+    const { container } = await renderIdle([
       { type: 'exec_started', exec_id: 'x1', command: ['cargo', 'nextest', 'run'], at: AT },
       {
         type: 'exec_completed',
@@ -270,15 +276,15 @@ describe('Transcript rendering', () => {
     expect(container.querySelector('.process-meta')?.textContent).toContain('exit 0');
   });
 
-  test('a snapshot renders a durability marker', () => {
-    const { container } = renderIdle([
+  test('a snapshot renders a durability marker', async () => {
+    const { container } = await renderIdle([
       { type: 'snapshot_taken', snapshot_id: 's', size_bytes: 1_287_000_000, at: AT },
     ]);
     expect(container.querySelector('.durability-label')?.textContent).toContain('snapshotted');
   });
 
-  test('a completed run renders a receipt with the tally', () => {
-    const { container } = renderIdle([
+  test('a completed run renders a receipt with the tally', async () => {
+    const { container } = await renderIdle([
       { type: 'run_started', run_id: 'r1', prompt_summary: null, at: AT },
       {
         type: 'tool_call_started',
@@ -303,8 +309,8 @@ describe('Transcript rendering', () => {
     expect(container.querySelector('.run-summary-text')?.textContent).toContain('read 1');
   });
 
-  test('an interrupted run renders an "interrupted" receipt', () => {
-    const { container } = renderIdle([
+  test('an interrupted run renders an "interrupted" receipt', async () => {
+    const { container } = await renderIdle([
       { type: 'run_started', run_id: 'r1', prompt_summary: null, at: AT },
       { type: 'exec_started', exec_id: 'x1', command: ['cargo', 'test'], at: AT },
       { type: 'run_interrupted', run_id: 'r1', at: AT2 },
@@ -314,8 +320,8 @@ describe('Transcript rendering', () => {
     );
   });
 
-  test('assistant message renders Markdown in-system', () => {
-    const { container } = renderIdle([
+  test('assistant message renders Markdown in-system', async () => {
+    const { container } = await renderIdle([
       {
         type: 'agent_message',
         run_id: 'r1',
@@ -329,8 +335,8 @@ describe('Transcript rendering', () => {
     expect(container.querySelector('code.md-code')?.textContent).toBe('cargo check');
   });
 
-  test('raw HTML in assistant Markdown is inert (no injection)', () => {
-    const { container } = renderIdle([
+  test('raw HTML in assistant Markdown is inert (no injection)', async () => {
+    const { container } = await renderIdle([
       {
         type: 'agent_message',
         run_id: 'r1',

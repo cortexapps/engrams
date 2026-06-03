@@ -1,6 +1,6 @@
 import { AnimatePresence } from 'framer-motion';
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from '@tanstack/react-router';
 import { useHosts } from '../hooks/useHosts';
 import { useSessions } from '../hooks/useSessions';
 import { useAuth, useIsAdmin } from '../auth/AuthProvider';
@@ -108,7 +108,7 @@ export function Sessions() {
           <button
             type="button"
             className="nudge-act"
-            onClick={() => navigate('/settings/tokens')}
+            onClick={() => navigate({ to: '/settings/tokens' })}
           >
             add token →
           </button>
@@ -124,7 +124,7 @@ export function Sessions() {
             onCancel={() => setCreating(false)}
             onCreated={(id) => {
               setCreating(false);
-              navigate(`/sessions/${id}`);
+              navigate({ to: '/sessions/$id', params: { id } });
             }}
           />
         )}

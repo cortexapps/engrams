@@ -1,4 +1,4 @@
-import { Outlet } from 'react-router-dom';
+import { Outlet } from '@tanstack/react-router';
 import { NavSpine } from '../components/NavSpine';
 
 // The shell shared by every surface: the sticky nav spine on top, the

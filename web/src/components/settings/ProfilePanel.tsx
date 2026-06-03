@@ -3,7 +3,7 @@
 // RoleTag + Provenance in the definition list, and an access legend that
 // makes the role model legible at a glance.
 
-import { Link } from 'react-router-dom';
+import { Link } from '@tanstack/react-router';
 import { useAuth } from '../../auth/AuthProvider';
 import { PersonMark, RoleTag, Provenance } from '../Identity';
 

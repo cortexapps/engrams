@@ -1,18 +1,29 @@
-// Render-with-providers helper for component tests. Each test gets
-// its own QueryClient so React-Query cache state doesn't leak across
-// tests (default `gcTime` would otherwise keep entries warm long
-// enough to interfere with the next test).
+// Render-with-providers helper for component tests. Each test gets its own
+// QueryClient so React-Query cache state doesn't leak across tests.
 //
-// MemoryRouter is the default because the components we test call
-// useLocation / Link / NavLink — without a router context they
-// throw at render time.
+// Components under test call TanStack Router's <Link> / useParams / useRouterState,
+// which require a RouterProvider context. We build a throwaway memory-history
+// router whose root route renders the test `ui`, plus a splat child so any
+// <Link to="..."> the component renders resolves without erroring. The router
+// context carries `auth` (mirrors src/router.tsx's RouterContext) seeded from a
+// test principal, bypassing the /me query.
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  createMemoryHistory,
+  createRootRouteWithContext,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router';
 import { render, type RenderOptions } from '@testing-library/react';
-import { type ReactElement, type ReactNode } from 'react';
-import { MemoryRouter, type MemoryRouterProps } from 'react-router-dom';
-import { AuthContextProvider } from './auth/AuthProvider';
+import { type ReactElement } from 'react';
+import { AuthContextProvider, type AuthState } from './auth/AuthProvider';
 import type { Principal } from './types';
+
+interface TestRouterContext {
+  auth: AuthState;
+}
 
 /** Default test principal: a local admin with a saved token, matching the
  * dev synthetic admin. Override via `renderWithProviders({ principal })`. */
@@ -26,27 +37,22 @@ const DEFAULT_PRINCIPAL: Principal = {
 };
 
 export interface RenderWithProvidersOptions extends Omit<RenderOptions, 'wrapper'> {
-  /** Initial URL stack for the router. Defaults to ["/"]. */
-  initialEntries?: MemoryRouterProps['initialEntries'];
-  /** Reuse a caller-supplied client (rare — for multi-step tests
-   * that need cache continuity). Default: a fresh client per call. */
+  /** Reuse a caller-supplied client (rare — for multi-step tests that need
+   * cache continuity). Default: a fresh client per call. */
   queryClient?: QueryClient;
-  /** ADR 0031: principal injected into the auth context (bypasses the /me
-   * query so tests don't each need a fetch mock). Defaults to a local admin. */
+  /** Principal injected into the auth context (bypasses the /me query so tests
+   * don't each need a fetch mock). Defaults to a local admin. */
   principal?: Principal;
 }
 
 export function renderWithProviders(
   ui: ReactElement,
   {
-    initialEntries = ['/'],
     queryClient,
     principal = DEFAULT_PRINCIPAL,
     ...renderOptions
   }: RenderWithProvidersOptions = {},
 ) {
-  // Disable retries + caching in tests. Real failures should fail
-  // tests immediately, not retry-storm.
   const client =
     queryClient ??
     new QueryClient({
@@ -56,21 +62,39 @@ export function renderWithProviders(
       },
     });
 
-  const authValue = {
+  const authValue: AuthState = {
     principal,
     isAdmin: principal.is_admin,
     refresh: () => {},
   };
 
-  function Wrapper({ children }: { children: ReactNode }) {
-    return (
+  const rootRoute = createRootRouteWithContext<TestRouterContext>()({
+    // Wrap in AuthContextProvider + QueryClientProvider so components that read
+    // those contexts (most of them) work, while the router supplies Link/params.
+    component: () => (
       <QueryClientProvider client={client}>
-        <AuthContextProvider value={authValue}>
-          <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
-        </AuthContextProvider>
+        <AuthContextProvider value={authValue}>{ui}</AuthContextProvider>
       </QueryClientProvider>
-    );
-  }
+    ),
+  });
 
-  return { ...render(ui, { wrapper: Wrapper, ...renderOptions }), queryClient: client };
+  // Splat child: any <Link to="..."> resolves to a real match during
+  // buildLocation, so rendering links to app paths we aren't exercising
+  // doesn't throw.
+  const splatRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '$',
+    component: () => null,
+  });
+
+  const router = createRouter({
+    routeTree: rootRoute.addChildren([splatRoute]),
+    history: createMemoryHistory({ initialEntries: ['/'] }),
+    context: { auth: authValue },
+  });
+
+  return {
+    ...render(<RouterProvider router={router} />, renderOptions),
+    queryClient: client,
+  };
 }

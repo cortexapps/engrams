@@ -1,4 +1,4 @@
-import { Link, useLocation, useParams } from 'react-router-dom';
+import { Link, useParams, useRouterState, type LinkProps } from '@tanstack/react-router';
 import { EngramMark } from './EngramMark';
 import { UserChip } from './UserChip';
 import { useIsAdmin } from '../auth/AuthProvider';
@@ -20,7 +20,7 @@ import { useIsAdmin } from '../auth/AuthProvider';
 // visible to everyone — it holds the user's own Profile + Tokens; admin-only
 // config (Members, Images, Registries) is filtered inside the Settings page.
 // Tab-hiding is UX only; the coordinator's require_admin is the real gate.
-const SURFACES = [
+const SURFACES: { to: LinkProps['to']; label: string; adminOnly: boolean; match: (p: string) => boolean }[] = [
   { to: '/', label: 'Sessions', adminOnly: false, match: (p: string) => p === '/' || p.startsWith('/sessions') },
   { to: '/fleet', label: 'Fleet', adminOnly: true, match: (p: string) => p.startsWith('/fleet') },
   { to: '/storage', label: 'Storage', adminOnly: true, match: (p: string) => p.startsWith('/storage') },
@@ -32,8 +32,8 @@ function shortId(id: string): string {
 }
 
 export function NavSpine() {
-  const { pathname } = useLocation();
-  const params = useParams();
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const params = useParams({ strict: false });
   const isAdmin = useIsAdmin();
   const surfaces = SURFACES.filter((s) => !s.adminOnly || isAdmin);
   // Sub-crumb only on the session-detail route (a child of Sessions).
