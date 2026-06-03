@@ -224,7 +224,23 @@ pub trait SandboxBackend: Send + Sync {
     /// refs + snapshot id) rather than a host-local path — the
     /// backend looks up its own staging dir for `metadata.id` and
     /// rehydrates from chunks if local files are missing.
+    ///
+    /// ADR 0035: this is the *resume* flavor — aux RO bundles stay on
+    /// the generation the snapshot pinned (live guest processes may
+    /// hold fds into them). Fresh session creates go through
+    /// [`Self::restore_fresh`].
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+
+    /// ADR 0035: restore for a *fresh* session (the base-snapshot
+    /// path, incl. warm-pool refill) — identical to [`Self::restore`]
+    /// except aux RO bundles are swapped to the host's current
+    /// generation while the VM is load-paused, so new sessions always
+    /// run the latest fleet bundles (skills) without re-enabling the
+    /// image. Default delegates to `restore` for backends without
+    /// aux-drive support (VZ, Process, mocks); the FC backend overrides.
+    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        self.restore(metadata).await
+    }
 
     /// ADR 0020 P1: block until the guest's agentd has dialled its
     /// ready port — i.e. the kernel booted, the rootfs mounted, and

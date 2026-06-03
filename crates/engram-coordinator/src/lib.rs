@@ -13,6 +13,7 @@ use engram_core::traits::{
 
 pub mod api;
 pub mod blob;
+pub mod bundle_gc;
 pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;

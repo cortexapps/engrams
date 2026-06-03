@@ -114,6 +114,9 @@ pub async fn snapshot(
         disk_manifest: metadata.disk_manifest,
         memory_manifest: metadata.memory_manifest,
         recoverable,
+        // ADR 0035: pin the generations this snapshot's device model
+        // references (host-reported; reflects any fresh-create swap).
+        aux_bundles: metadata.aux_bundles.clone(),
     };
     state.services.meta.record_snapshot(record).await?;
 
@@ -660,6 +663,9 @@ async fn resume_from_fc_snapshot(
         sidecar_blob_key: None,
         rootfs_blob_key: None,
         working_set_blob_key: None,
+        // ADR 0035: resume keeps the pinned generations (no swap); the
+        // host materializes any the receiving host is missing.
+        aux_bundles: record.aux_bundles.clone(),
     };
     let (host_id, new_sandbox_id) = match state
         .host_registry

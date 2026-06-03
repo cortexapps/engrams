@@ -127,6 +127,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/admin/hosts/:id/drain", post(admin::drain_host))
         .route("/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
         .route("/admin/chunk-gc/sweep", post(admin::chunk_gc_sweep))
+        .route("/admin/bundle-gc/dry-run", post(admin::bundle_gc_dry_run))
+        .route("/admin/bundle-gc/sweep", post(admin::bundle_gc_sweep))
         .route(
             "/admin/chunk-gc/candidates",
             get(admin::chunk_gc_candidates),

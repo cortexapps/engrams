@@ -299,9 +299,11 @@ mark ca_staged
 # each bundle by a content marker rather than hard-coding a letter —
 # order-independent and robust across snapshot/restore. squashfs-only,
 # so a probe never accidentally mounts the ext4 CA drive. The mounts are
-# captured in the base snapshot's VFS and resume unchanged (same bytes,
-# same fleet-canonical path). Best-effort: a missing/absent bundle just
-# leaves the mount point empty; agentd degrades gracefully.
+# captured in the base snapshot's VFS; on a fresh-create restore the
+# host may patch_drive a bundle to a newer generation, and agentd
+# umount/remounts at session bind so the superblock re-parses the
+# swapped device (ADR 0035 §3). Best-effort: a missing/absent bundle
+# just leaves the mount point empty; agentd degrades gracefully.
 for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde; do
     [ -b "$dev" ] || continue
     mkdir -p /opt/engram/.probe 2>/dev/null || true

@@ -288,6 +288,7 @@ jobs:
             --test ha_listener \
             --test snapshot_disk_manifest_persistence \
             --test chunk_gc_helpers_live_pg \
+            --test bundle_gc_live_pg \
             --test admin_chunk_gc_live_pg \
             --test admin_evac_live_pg \
             --test users_live_pg \
@@ -579,6 +580,7 @@ jobs:
             --test multi_restore \
             --test cross_host_restore \
             --test restore_chain \
+            --test aux_ro_drive \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1322,21 +1324,24 @@ jobs:
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux"
           bash deploy/dev/tilt-up-ci.sh
 
-      # ADR 0027: stage the skills RO bundle at the fleet-canonical path the
-      # FC backend attaches at base-snapshot capture. Without this the capture
-      # would skip it (attach-if-present), the session would come up with NO
-      # skills (baked skills are retired), and the e2e would never exercise the
-      # RO-mount chain. With it, capture attaches the drive, the init shim
-      # mounts it (the owned 6.1 kernel has squashfs), agentd wires share-file,
-      # and `e2e_session_has_mounted_skills_bundle` asserts the whole path.
-      # (Only `skills` — the demo image isn't `[browser]`-enabled, so coord
-      # doesn't declare the heavy playwright drive.)
-      - name: Stage RO skills bundle (ADR 0027)
+      # ADR 0027 → 0035: stage the skills RO bundle CONTENT-ADDRESSED
+      # (<name>-<sha256>.squashfs + current.json stamp) — the same shape the
+      # FC-host image bake produces. The FC backend resolves the symbolic
+      # `skills` drive against the stamp at base-snapshot capture; without the
+      # stamp the enable 500s (loudly, by design — a host that can't satisfy a
+      # requested aux drive must not capture a skills-less snapshot). The init
+      # shim mounts it (the owned 6.1 kernel has squashfs), agentd wires
+      # share-file, and `e2e_session_has_mounted_skills_bundle` asserts the
+      # whole path. (Only `skills` — the demo image isn't `[browser]`-enabled,
+      # so coord doesn't declare the heavy playwright drive.)
+      - name: Stage RO skills bundle (ADR 0035)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
           deploy/bundles/skills/build.sh /tmp/skills.squashfs
           sudo mkdir -p /var/lib/engram/shared
-          sudo install -m 0644 /tmp/skills.squashfs /var/lib/engram/shared/skills.squashfs
+          SKILLS_SHA=$(sha256sum /tmp/skills.squashfs | cut -d' ' -f1)
+          sudo install -m 0644 /tmp/skills.squashfs "/var/lib/engram/shared/skills-$SKILLS_SHA.squashfs"
+          printf '{"skills": "%s"}\n' "$SKILLS_SHA" | sudo tee /var/lib/engram/shared/current.json >/dev/null
           ls -l /var/lib/engram/shared/
 
       # ADR 0013: host-agent doesn't read docker config; it asks

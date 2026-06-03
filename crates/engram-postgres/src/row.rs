@@ -133,6 +133,11 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         _ => None,
     };
     let recoverable: bool = row.try_get("recoverable").map_err(col_err)?;
+    // ADR 0035: jsonb [{"drive_id", "sha256"}] — the bundle-GC pin
+    // entries this snapshot contributes.
+    let aux_bundles_json: serde_json::Value = row.try_get("aux_bundles").map_err(col_err)?;
+    let aux_bundles = serde_json::from_value(aux_bundles_json)
+        .map_err(|e| MetaError::Serialization(format!("snapshots.aux_bundles decode: {e}")))?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: session_id.map(SessionId),
@@ -144,6 +149,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         disk_manifest,
         memory_manifest,
         recoverable,
+        aux_bundles,
     })
 }
 

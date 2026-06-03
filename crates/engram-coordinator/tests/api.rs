@@ -831,6 +831,7 @@ fn seed_enabled(
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,
+            aux_bundles: vec![],
         },
     );
     store.enabled.lock().insert(

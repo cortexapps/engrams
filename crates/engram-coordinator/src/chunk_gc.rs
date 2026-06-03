@@ -338,6 +338,32 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
                 tracing::warn!(error = %e, "chunk-gc sweep failed; will retry on next interval");
             }
         }
+        // ADR 0035 §5: the bundle-generation sweep rides the same tick,
+        // barrier, and grace config. Tiny key space (handfuls of
+        // generations), so no separate cadence.
+        match crate::bundle_gc::run_one_bundle_sweep(
+            state.services.meta.clone(),
+            state.services.blob.clone(),
+            &cfg,
+            SweepMode::Full,
+        )
+        .await
+        {
+            Ok(report) => {
+                tracing::info!(
+                    listed = report.listed,
+                    pinned = report.pin_set_size,
+                    candidates = report.candidates_marked,
+                    promoted = report.promoted_deletes,
+                    promote_errors = report.promote_delete_errors,
+                    restart_count = report.restart_count,
+                    "bundle-gc sweep done"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bundle-gc sweep failed; will retry on next interval");
+            }
+        }
     }
 }
 

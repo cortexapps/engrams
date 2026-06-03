@@ -179,6 +179,8 @@ pub async fn evict_session_to_state(
             metadata.memory_manifest.as_ref(),
         )
         .await,
+        // ADR 0035: pin the generations this snapshot references.
+        aux_bundles: metadata.aux_bundles.clone(),
     };
     if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
         abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;

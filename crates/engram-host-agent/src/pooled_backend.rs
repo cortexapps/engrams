@@ -121,6 +121,11 @@ pub struct PooledBackend {
     /// manifest share the materialized file (and VZ's per-sandbox
     /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
     materialize_dir: Option<PathBuf>,
+    /// ADR 0035: fleet-canonical staged-bundle dir
+    /// (`<drive_id>-<sha256>.squashfs` + the bake's `current.json`).
+    /// Defaults to `AuxRoDrive::SHARED_DIR`; tests inject a tempdir
+    /// via `with_bundle_dir`.
+    bundle_dir: PathBuf,
     /// Optional NVMe-backed LRU cache fronting the chunk store.
     /// When wired, chunk reads during materialization go through
     /// the cache — chunks shared across manifests (canonical-base
@@ -195,6 +200,223 @@ pub struct PooledBackend {
 }
 
 impl PooledBackend {
+    /// Shared body of `restore` (resume flavor) and `restore_fresh`
+    /// (fresh-create flavor) — see ADR 0035 §3 for the split.
+    async fn restore_with(
+        &self,
+        metadata: SnapshotMetadata,
+        fresh: bool,
+    ) -> Result<SandboxId, SandboxError> {
+        // ADR 0014 M1.13: eager parallel prefetch of memory chunks
+        // into local NVMe BEFORE we hand off to materialize +
+        // inner.restore. Without this, materialize_to_file_cached's
+        // serial chunk iteration pays N×GCS-RTT (~300 ms each) on
+        // a cold-cache host — a 512 MiB template's 32 chunks come
+        // out as ~10 s of serial fetch. Parallel prefetch with
+        // bounded concurrency reduces that to roughly ~2 s.
+        // Subsequent restores against the same template hit NVMe
+        // and the prefetch is a no-op.
+        // ADR 0020 P3: span the pre-`restore_in_jail` prep legs (memory
+        // prefetch / state materialize / NBD attach) alongside the
+        // `fc.restore_in_jail` legs, so one trace shows where the whole
+        // `host.restore_base_for_session` window goes. Pure observability.
+        let prefetch_start = std::time::Instant::now();
+        let prefetched_chunks = tracing::Instrument::instrument(
+            self.prefetch_memory_chunks(&metadata),
+            tracing::info_span!("restore.prefetch_memory"),
+        )
+        .await;
+        if let Err(e) = prefetched_chunks.as_ref() {
+            tracing::warn!(
+                error = %e,
+                snapshot_id = %metadata.id,
+                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
+            );
+        }
+        let _ = (prefetched_chunks, prefetch_start);
+
+        // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
+        // The backend owns its staging dir layout (Phase 6); we ask
+        // it where this snapshot would live, then ensure the
+        // memory.bin file is present before delegating to inner —
+        // either because we're on the same host where it was
+        // written, or because we need to rebuild it from chunks
+        // (cross-host migration). With M1.13's prefetch above, the
+        // serial materialize loop now hits the NVMe-warm cache for
+        // every chunk.
+        let src = self.inner.snapshot_path_for(metadata.id);
+
+        // ADR 0014: cross-host materialization is order-sensitive.
+        // `materialize_memory_if_missing` reads the local FC sidecar
+        // (`manifest.json`) to find the memory_manifest ref before
+        // it can rebuild memory.bin from chunks. On a cross-host
+        // restore that sidecar is in BlobStorage, not on disk, so
+        // the sidecar download (`materialize_state_if_missing`)
+        // MUST run first — otherwise memory.bin materialization
+        // silently no-ops and FC restore then errors with
+        // "snapshot memory.bin missing".
+        if let Some(chunk_store) = self.chunk_store.as_ref() {
+            let blob = chunk_store.blob_storage();
+            if let Err(e) = tracing::Instrument::instrument(
+                materialize_state_if_missing(
+                    blob.as_ref(),
+                    &src,
+                    metadata.state_blob_key.as_deref(),
+                    metadata.sidecar_blob_key.as_deref(),
+                ),
+                tracing::info_span!("restore.materialize_state"),
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    src = %src.display(),
+                    "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
+                );
+            }
+        }
+
+        // ADR 0016 Phase B commit 5: rebuild chunked-disk tracking
+        // for the resumed sandbox.
+        //
+        // Branching mirrors the cold-create path's `resolve_rootfs`:
+        //
+        // - Linux + nbd_pool + chunk_store + chunk_cache + a
+        //   chunked `disk_manifest` on the snapshot row → take the
+        //   NBD attach path. ChunkedDiskBackend is rebased on the
+        //   manifest, an NBD daemon serves it at /dev/nbdN, and FC's
+        //   restore reads its rootfs through that block device. The
+        //   resumed sandbox enters `nbd_sandboxes` after
+        //   `inner.restore` returns the new sandbox_id; the
+        //   FlushScheduler spawns immediately. Closes ADR 0016 §
+        //   "Phase B failure mode to close" — both the COW-diagnostic-
+        //   silent symptom and the second-eviction-can't-snapshot
+        //   symptom.
+        //
+        // - Other configurations (macOS dev, hosts without NBD wired,
+        //   legacy snapshots whose `disk_manifest` is None) → fall
+        //   back to `materialize_disk_if_missing`, which writes the
+        //   bytes to a flat file and patches the sidecar. This path
+        //   doesn't enter `nbd_sandboxes` and doesn't get a
+        //   scheduler; it's the pre-Phase-B behaviour kept for
+        //   backwards compatibility on non-NBD configurations.
+        //
+        // The pending state is captured here (pre-restore) so the
+        // sidecar's `spec.rootfs_source` is patched to /dev/nbdN
+        // BEFORE `inner.restore` reads the sidecar to install the
+        // canonical-rootfs symlinks.
+        #[cfg(target_os = "linux")]
+        let pending_nbd_state = tracing::Instrument::instrument(
+            self.prepare_resume_nbd_attach(&metadata, &src),
+            tracing::info_span!("restore.prepare_nbd"),
+        )
+        .await?;
+
+        // Non-NBD fallback runs only when the NBD path didn't take.
+        // On macOS this is the only path; on Linux it covers hosts
+        // without nbd_pool/chunk_store/chunk_cache wired or
+        // snapshots with disk_manifest=None.
+        let took_nbd_path: bool;
+        #[cfg(target_os = "linux")]
+        {
+            took_nbd_path = pending_nbd_state.is_some();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            took_nbd_path = false;
+        }
+        if !took_nbd_path {
+            if let Some(chunk_store) = self.chunk_store.as_ref() {
+                if let Err(e) = materialize_disk_if_missing(
+                    chunk_store,
+                    self.chunk_cache.as_ref(),
+                    &src,
+                    metadata.disk_manifest,
+                    &self.materialize_lock,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        src = %src.display(),
+                        "rootfs materialization failed; inner.restore will see whatever's there",
+                    );
+                }
+            }
+        }
+
+        // ADR 0020 Route B: when the backend serves memory lazily from
+        // chunks (UFFD), there is no memory.bin to rebuild — the handler
+        // faults chunks straight from the cache the prefetch above just
+        // warmed. Materializing the contiguous file would be pure
+        // overhead (the dominant restore cost we're removing). The
+        // prefetch still ran, so the cache is warm for the fault path.
+        if self.inner.restore_memory_is_lazy() {
+            tracing::debug!(
+                snapshot_id = %metadata.id,
+                "lazy memory restore (UFFD); skipping memory.bin materialization",
+            );
+        } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
+            tracing::warn!(
+                error = %e,
+                src = %src.display(),
+                "memory.bin materialization failed; inner.restore will see whatever's there",
+            );
+        }
+
+        // ADR 0035 §4: every generation the snapshot pins must be staged
+        // before FC's `load_snapshot` opens the embedded path. Cross-host
+        // (post-roll) restores materialize from BlobStorage here; the
+        // common case is a no-op (baked or prefetched).
+        if !metadata.aux_bundles.is_empty() {
+            if let Some(cs) = self.chunk_store.as_ref() {
+                crate::bundles::BundleStore::new(
+                    cs.blob_storage().clone(),
+                    self.bundle_dir.clone(),
+                )
+                .materialize_if_missing(&metadata.aux_bundles)
+                .await?;
+            } else {
+                tracing::debug!(
+                    "snapshot pins aux bundles but no chunk store is wired; \
+                     relying on locally staged generations"
+                );
+            }
+        }
+        // ADR 0035 §3: fresh creates swap aux bundles to the host's
+        // current generation inside the backend; resumes keep the pin.
+        let new_id = if fresh {
+            self.inner.restore_fresh(metadata).await?
+        } else {
+            self.inner.restore(metadata).await?
+        };
+
+        // ADR 0016 Phase B commit 5: post-restore wiring. The new
+        // sandbox_id is only known here; install it into
+        // `nbd_sandboxes` together with the FlushScheduler so the
+        // resumed sandbox is first-class in the COW diagnostic and
+        // in the continuous-flush pipeline. Field-ordered Drop
+        // ensures scheduler-cancel → NBD-disconnect → slot-release
+        // on subsequent destroy.
+        #[cfg(target_os = "linux")]
+        if let Some(mut state) = pending_nbd_state {
+            state.install_flush_scheduler(
+                new_id,
+                self.live_manifest_publisher.clone(),
+                self.flush_config.clone(),
+            );
+            // ADR 0019: open the resume operation window — restore-time disk
+            // reads (load_snapshot + the resumed guest's working set) attach
+            // `chunk.fetch` spans to this trace. Covers idle→resume AND
+            // evac-dest; the coord parent trace distinguishes them. Closed by
+            // `start_agent` (finish_resume_to_active calls it). Memory page-in
+            // is the UFFD side, on the spawn-TRACEPARENT path.
+            state.backend.operation_scope().begin("resume");
+            self.nbd_sandboxes.insert(new_id, state);
+        }
+        Ok(new_id)
+    }
+
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
         Self {
             inner,
@@ -203,6 +425,7 @@ impl PooledBackend {
             session_bindings: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
+            bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
             oci_client: None,
@@ -295,6 +518,13 @@ impl PooledBackend {
     pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
         self.chunk_store = Some(chunk_store);
         self.materialize_dir = Some(materialize_dir);
+        self
+    }
+
+    /// ADR 0035: override the staged-bundle dir (tests). Production
+    /// keeps the fleet-canonical default.
+    pub fn with_bundle_dir(mut self, dir: PathBuf) -> Self {
+        self.bundle_dir = dir;
         self
     }
 
@@ -1617,6 +1847,16 @@ impl SandboxBackend for PooledBackend {
                     "portable snapshot artifacts uploaded to BlobStorage",
                 );
             }
+            // ADR 0035 §2: idempotently publish the pinned bundle
+            // generations. Runs on every snapshot flavor — an eviction
+            // snapshot can pin a swapped-in generation no base capture
+            // ever published. Failure fails the snapshot (a pin nothing
+            // can satisfy is worse than a retried eviction).
+            if !metadata.aux_bundles.is_empty() {
+                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
+                    .publish(&metadata.aux_bundles)
+                    .await?;
+            }
             Ok::<_, SandboxError>(metadata)
         }
         .await;
@@ -1717,189 +1957,11 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        // ADR 0014 M1.13: eager parallel prefetch of memory chunks
-        // into local NVMe BEFORE we hand off to materialize +
-        // inner.restore. Without this, materialize_to_file_cached's
-        // serial chunk iteration pays N×GCS-RTT (~300 ms each) on
-        // a cold-cache host — a 512 MiB template's 32 chunks come
-        // out as ~10 s of serial fetch. Parallel prefetch with
-        // bounded concurrency reduces that to roughly ~2 s.
-        // Subsequent restores against the same template hit NVMe
-        // and the prefetch is a no-op.
-        // ADR 0020 P3: span the pre-`restore_in_jail` prep legs (memory
-        // prefetch / state materialize / NBD attach) alongside the
-        // `fc.restore_in_jail` legs, so one trace shows where the whole
-        // `host.restore_base_for_session` window goes. Pure observability.
-        let prefetch_start = std::time::Instant::now();
-        let prefetched_chunks = tracing::Instrument::instrument(
-            self.prefetch_memory_chunks(&metadata),
-            tracing::info_span!("restore.prefetch_memory"),
-        )
-        .await;
-        if let Err(e) = prefetched_chunks.as_ref() {
-            tracing::warn!(
-                error = %e,
-                snapshot_id = %metadata.id,
-                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
-            );
-        }
-        let _ = (prefetched_chunks, prefetch_start);
+        self.restore_with(metadata, /*fresh=*/ false).await
+    }
 
-        // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
-        // The backend owns its staging dir layout (Phase 6); we ask
-        // it where this snapshot would live, then ensure the
-        // memory.bin file is present before delegating to inner —
-        // either because we're on the same host where it was
-        // written, or because we need to rebuild it from chunks
-        // (cross-host migration). With M1.13's prefetch above, the
-        // serial materialize loop now hits the NVMe-warm cache for
-        // every chunk.
-        let src = self.inner.snapshot_path_for(metadata.id);
-
-        // ADR 0014: cross-host materialization is order-sensitive.
-        // `materialize_memory_if_missing` reads the local FC sidecar
-        // (`manifest.json`) to find the memory_manifest ref before
-        // it can rebuild memory.bin from chunks. On a cross-host
-        // restore that sidecar is in BlobStorage, not on disk, so
-        // the sidecar download (`materialize_state_if_missing`)
-        // MUST run first — otherwise memory.bin materialization
-        // silently no-ops and FC restore then errors with
-        // "snapshot memory.bin missing".
-        if let Some(chunk_store) = self.chunk_store.as_ref() {
-            let blob = chunk_store.blob_storage();
-            if let Err(e) = tracing::Instrument::instrument(
-                materialize_state_if_missing(
-                    blob.as_ref(),
-                    &src,
-                    metadata.state_blob_key.as_deref(),
-                    metadata.sidecar_blob_key.as_deref(),
-                ),
-                tracing::info_span!("restore.materialize_state"),
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    src = %src.display(),
-                    "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
-                );
-            }
-        }
-
-        // ADR 0016 Phase B commit 5: rebuild chunked-disk tracking
-        // for the resumed sandbox.
-        //
-        // Branching mirrors the cold-create path's `resolve_rootfs`:
-        //
-        // - Linux + nbd_pool + chunk_store + chunk_cache + a
-        //   chunked `disk_manifest` on the snapshot row → take the
-        //   NBD attach path. ChunkedDiskBackend is rebased on the
-        //   manifest, an NBD daemon serves it at /dev/nbdN, and FC's
-        //   restore reads its rootfs through that block device. The
-        //   resumed sandbox enters `nbd_sandboxes` after
-        //   `inner.restore` returns the new sandbox_id; the
-        //   FlushScheduler spawns immediately. Closes ADR 0016 §
-        //   "Phase B failure mode to close" — both the COW-diagnostic-
-        //   silent symptom and the second-eviction-can't-snapshot
-        //   symptom.
-        //
-        // - Other configurations (macOS dev, hosts without NBD wired,
-        //   legacy snapshots whose `disk_manifest` is None) → fall
-        //   back to `materialize_disk_if_missing`, which writes the
-        //   bytes to a flat file and patches the sidecar. This path
-        //   doesn't enter `nbd_sandboxes` and doesn't get a
-        //   scheduler; it's the pre-Phase-B behaviour kept for
-        //   backwards compatibility on non-NBD configurations.
-        //
-        // The pending state is captured here (pre-restore) so the
-        // sidecar's `spec.rootfs_source` is patched to /dev/nbdN
-        // BEFORE `inner.restore` reads the sidecar to install the
-        // canonical-rootfs symlinks.
-        #[cfg(target_os = "linux")]
-        let pending_nbd_state = tracing::Instrument::instrument(
-            self.prepare_resume_nbd_attach(&metadata, &src),
-            tracing::info_span!("restore.prepare_nbd"),
-        )
-        .await?;
-
-        // Non-NBD fallback runs only when the NBD path didn't take.
-        // On macOS this is the only path; on Linux it covers hosts
-        // without nbd_pool/chunk_store/chunk_cache wired or
-        // snapshots with disk_manifest=None.
-        let took_nbd_path: bool;
-        #[cfg(target_os = "linux")]
-        {
-            took_nbd_path = pending_nbd_state.is_some();
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            took_nbd_path = false;
-        }
-        if !took_nbd_path {
-            if let Some(chunk_store) = self.chunk_store.as_ref() {
-                if let Err(e) = materialize_disk_if_missing(
-                    chunk_store,
-                    self.chunk_cache.as_ref(),
-                    &src,
-                    metadata.disk_manifest,
-                    &self.materialize_lock,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        src = %src.display(),
-                        "rootfs materialization failed; inner.restore will see whatever's there",
-                    );
-                }
-            }
-        }
-
-        // ADR 0020 Route B: when the backend serves memory lazily from
-        // chunks (UFFD), there is no memory.bin to rebuild — the handler
-        // faults chunks straight from the cache the prefetch above just
-        // warmed. Materializing the contiguous file would be pure
-        // overhead (the dominant restore cost we're removing). The
-        // prefetch still ran, so the cache is warm for the fault path.
-        if self.inner.restore_memory_is_lazy() {
-            tracing::debug!(
-                snapshot_id = %metadata.id,
-                "lazy memory restore (UFFD); skipping memory.bin materialization",
-            );
-        } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
-            tracing::warn!(
-                error = %e,
-                src = %src.display(),
-                "memory.bin materialization failed; inner.restore will see whatever's there",
-            );
-        }
-
-        let new_id = self.inner.restore(metadata).await?;
-
-        // ADR 0016 Phase B commit 5: post-restore wiring. The new
-        // sandbox_id is only known here; install it into
-        // `nbd_sandboxes` together with the FlushScheduler so the
-        // resumed sandbox is first-class in the COW diagnostic and
-        // in the continuous-flush pipeline. Field-ordered Drop
-        // ensures scheduler-cancel → NBD-disconnect → slot-release
-        // on subsequent destroy.
-        #[cfg(target_os = "linux")]
-        if let Some(mut state) = pending_nbd_state {
-            state.install_flush_scheduler(
-                new_id,
-                self.live_manifest_publisher.clone(),
-                self.flush_config.clone(),
-            );
-            // ADR 0019: open the resume operation window — restore-time disk
-            // reads (load_snapshot + the resumed guest's working set) attach
-            // `chunk.fetch` spans to this trace. Covers idle→resume AND
-            // evac-dest; the coord parent trace distinguishes them. Closed by
-            // `start_agent` (finish_resume_to_active calls it). Memory page-in
-            // is the UFFD side, on the spawn-TRACEPARENT path.
-            state.backend.operation_scope().begin("resume");
-            self.nbd_sandboxes.insert(new_id, state);
-        }
-        Ok(new_id)
+    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        self.restore_with(metadata, /*fresh=*/ true).await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -2024,7 +2086,9 @@ impl SandboxBackend for PooledBackend {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
         //    harness baked into the rootfs at /opt/engram/harness/.
-        let id = self.restore(metadata).await?;
+        //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
+        //    current generation so new sessions run the latest skills.
+        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
 
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
@@ -2657,6 +2721,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -2793,6 +2858,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -2929,6 +2995,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -3158,6 +3225,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -3284,6 +3352,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -3768,6 +3837,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {

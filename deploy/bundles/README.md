@@ -31,8 +31,13 @@ deploy/bundles/playwright/build.sh  out/playwright.squashfs    # needs Docker
 ## Distribution
 
 CI builds + publishes each bundle as an OCI artifact to GHCR. The FC-host
-image bake (engrams-internal) pulls them and stages each at a fleet-canonical
-**stable symlink** — `/var/lib/engram/shared/<name>.squashfs` →
-`<name>-<sha>.squashfs`. The base snapshot embeds the stable symlink path, so
-restore re-anchors by presence and a version roll (repoint the symlink) needs
-no session-image re-bake. See ADR 0027.
+image bake (engrams-internal) pulls them and stages each **content-addressed**
+— `/var/lib/engram/shared/<name>-<sha256>.squashfs` — plus a `current.json`
+stamp (`drive_id` → sha). There is deliberately no fixed/mutable path: base
+snapshots pin the exact generation they captured against, missing generations
+materialize from BlobStorage (`bundles/sha256/<sha>`), and fresh session
+creates swap to the host's current generation while load-paused — so a skill
+edit still ships fleet-wide on the next host roll with no session-image
+re-bake. Retention is the GC pin set (referenced-by-any-snapshot), not a
+keep-N policy. See ADR 0035 (which supersedes ADR 0027's stable-symlink
+distribution after the 2026-06-03 bundle-skew incident).

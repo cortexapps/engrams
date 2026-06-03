@@ -742,6 +742,44 @@ pub async fn chunk_gc_sweep(
     Ok(Json((report, grace_secs).into()))
 }
 
+/// `POST /api/admin/bundle-gc/dry-run` + `/sweep` — ADR 0035 §5:
+/// the bundle-generation flavor of the chunk-GC endpoints. Same
+/// primitive the background loop fires (explicit admin trigger for
+/// testability); `grace_secs=0` lets an operator drain immediately.
+pub async fn bundle_gc_dry_run(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
+) -> Result<Json<crate::bundle_gc::BundleSweepReport>, ApiError> {
+    bundle_gc_run(state, params, crate::chunk_gc::SweepMode::DryRun).await
+}
+
+pub async fn bundle_gc_sweep(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
+) -> Result<Json<crate::bundle_gc::BundleSweepReport>, ApiError> {
+    bundle_gc_run(state, params, crate::chunk_gc::SweepMode::Full).await
+}
+
+async fn bundle_gc_run(
+    state: SharedState,
+    params: ChunkGcSweepParams,
+    mode: crate::chunk_gc::SweepMode,
+) -> Result<Json<crate::bundle_gc::BundleSweepReport>, ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = params.grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let report = crate::bundle_gc::run_one_bundle_sweep(
+        state.services.meta.clone(),
+        state.services.blob.clone(),
+        &cfg,
+        mode,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("bundle-gc: {e}")))?;
+    Ok(Json(report))
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct ChunkGcCandidatesParams {
     /// Max rows to return. Default 100, cap 10_000.

@@ -261,6 +261,11 @@ pub struct HeartbeatRequest {
     /// `#[serde(default)]` for back-compat with pre-Phase-B hosts.
     #[serde(default)]
     pub nbd_unhealthy: Vec<SandboxId>,
+    /// ADR 0035: the host's bake-stamp bundle set (`drive_id` →
+    /// sha256 as refs). `#[serde(default)]` — coord rolls before the
+    /// host MIG, so old hosts mid-roll simply report none.
+    #[serde(default)]
+    pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
 }
 
 #[derive(Serialize)]
@@ -276,6 +281,13 @@ pub struct HeartbeatResponse {
     /// `ready_images` and pulls missing chunks.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
+    /// ADR 0035 §5: the bundle pin set (every generation some
+    /// snapshot row references). Drives the host's bundle
+    /// prefetch + sweep supervisor. Always present — the host side
+    /// deliberately hard-fails decode when it's missing rather than
+    /// treating "absent" as "empty pin set" (which would sweep
+    /// generations resumes still need).
+    pub live_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
 }
 
 pub async fn heartbeat(
@@ -350,6 +362,7 @@ pub async fn heartbeat(
             local_snapshots: hb.local_snapshots.clone(),
             draining: hb.draining,
             ready_images: hb.ready_images.iter().cloned().collect(),
+            current_bundles: hb.current_bundles.clone(),
         },
     );
 
@@ -390,10 +403,21 @@ pub async fn heartbeat(
         }
     };
 
+    // ADR 0035 §5: the bundle pin set. NOT best-effort — an empty set
+    // is an instruction to sweep, so a PG failure here must fail the
+    // heartbeat (the host retries next tick) rather than degrade to
+    // "nothing is pinned".
+    let live_bundles = state.services.meta.bundle_pin_set().await.map_err(|e| {
+        ApiError::Internal(format!(
+            "bundle_pin_set failed; heartbeat ack withheld: {e}"
+        ))
+    })?;
+
     Ok(Json(HeartbeatResponse {
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
         enabled_images,
+        live_bundles,
     }))
 }
 

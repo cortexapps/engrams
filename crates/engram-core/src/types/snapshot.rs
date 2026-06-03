@@ -75,6 +75,14 @@ pub struct SnapshotMetadata {
     /// pre-seed.)
     #[serde(default)]
     pub working_set_blob_key: Option<String>,
+    /// ADR 0035: bundle generations this snapshot's device model
+    /// references (resolved `aux_ro_drives`), filled by the host at
+    /// snapshot time — base captures AND eviction snapshots, since a
+    /// chained restore reopens the same generation. The coord persists
+    /// this in `snapshots.aux_bundles`; the union across all rows is the
+    /// bundle-GC pin set. Empty for snapshots without aux drives.
+    #[serde(default)]
+    pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
 }
 
 /// Persisted row in the `snapshots` table.
@@ -130,4 +138,9 @@ pub struct SnapshotRecord {
     /// promising an Idle/resume path that can't be delivered.
     #[serde(default)]
     pub recoverable: bool,
+    /// ADR 0035: bundle generations this snapshot's device model
+    /// references (from `SnapshotMetadata::aux_bundles`). Persisted as
+    /// jsonb; the union across all rows is the bundle-GC pin set.
+    #[serde(default)]
+    pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
 }

@@ -694,6 +694,39 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ----------------------------------------------------------------
+    // ADR 0035 — bundle-generation GC (mirrors the chunk GC trio).
+
+    /// ADR 0035 §5: the bundle pin set — every `(drive_id, sha256)`
+    /// some `snapshots.aux_bundles` row references. The union (plus
+    /// the hosts' reported current generations) is what the GC keeps
+    /// and what heartbeat acks advertise as `live_bundles`.
+    async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0035 §5: idempotent candidate upsert; `first_seen_at`
+    /// sticky, same grace semantics as the chunk variant. `sha256`
+    /// is the 64-hex digest (text — bundle counts are tiny).
+    async fn upsert_bundle_gc_candidate(&self, _sha256: &str) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// ADR 0035 §5 promote-pass query (oldest first, batched).
+    async fn list_expired_bundle_gc_candidates(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> Result<Vec<String>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0035 §5: batch-delete candidate rows after the blob
+    /// delete succeeded. Idempotent.
+    async fn delete_bundle_gc_candidates(&self, _sha256s: &[String]) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
     // ADR 0018 commit 12b — evac_resumer scanner support.
     //
     // The scanner polls `Evacuating` sessions, picks a peer host,

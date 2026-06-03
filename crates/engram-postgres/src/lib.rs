@@ -860,8 +860,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 recoverable, aux_bundles)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -869,6 +869,7 @@ impl MetadataStore for PostgresStore {
                 memory_manifest_id      = EXCLUDED.memory_manifest_id,
                 memory_manifest_version = EXCLUDED.memory_manifest_version,
                 recoverable             = EXCLUDED.recoverable,
+                aux_bundles             = EXCLUDED.aux_bundles,
                 updated_at              = NOW()
             "#,
         )
@@ -884,6 +885,10 @@ impl MetadataStore for PostgresStore {
         .bind(snap.memory_manifest.map(|m| m.manifest_id))
         .bind(snap.memory_manifest.map(|m| m.version as i64))
         .bind(snap.recoverable)
+        .bind(
+            serde_json::to_value(&snap.aux_bundles)
+                .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
+        )
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -906,7 +911,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable
+                   recoverable, aux_bundles
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -928,7 +933,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable
+                   recoverable, aux_bundles
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -951,7 +956,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable
+                   recoverable, aux_bundles
             FROM snapshots WHERE id = $1
             "#,
         )
@@ -1944,6 +1949,77 @@ impl MetadataStore for PostgresStore {
         let as_vecs: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
         sqlx::query("DELETE FROM chunk_gc_candidates WHERE content_hash = ANY($1::bytea[])")
             .bind(&as_vecs)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0035 §5: distinct bundle generations referenced by any
+    /// snapshot row. jsonb unnest in SQL so the coord never pages the
+    /// whole table; the result is at most a handful of refs.
+    async fn bundle_pin_set(
+        &self,
+    ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT DISTINCT b->>'drive_id', b->>'sha256'
+               FROM snapshots, jsonb_array_elements(aux_bundles) AS b",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out: Vec<_> = rows
+            .into_iter()
+            .map(
+                |(drive_id, sha256)| engram_core::types::sandbox::AuxBundleRef { drive_id, sha256 },
+            )
+            .collect();
+        out.sort_by(|a, b| (&a.drive_id, &a.sha256).cmp(&(&b.drive_id, &b.sha256)));
+        Ok(out)
+    }
+
+    /// ADR 0035 §5: sticky-first-seen candidate upsert (bundle
+    /// flavor of `upsert_chunk_gc_candidate`).
+    async fn upsert_bundle_gc_candidate(&self, sha256: &str) -> Result<(), MetaError> {
+        sqlx::query(
+            "INSERT INTO bundle_gc_candidates (sha256)
+             VALUES ($1)
+             ON CONFLICT (sha256) DO UPDATE SET last_seen_at = now()",
+        )
+        .bind(sha256)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0035 §5 promote-pass query.
+    async fn list_expired_bundle_gc_candidates(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<String>, MetaError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT sha256
+               FROM bundle_gc_candidates
+              WHERE first_seen_at < $1
+              ORDER BY first_seen_at
+              LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    /// ADR 0035 §5: batch-delete candidate rows.
+    async fn delete_bundle_gc_candidates(&self, sha256s: &[String]) -> Result<(), MetaError> {
+        if sha256s.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM bundle_gc_candidates WHERE sha256 = ANY($1::text[])")
+            .bind(sha256s)
             .execute(&self.pool)
             .await
             .map_err(db_err)?;

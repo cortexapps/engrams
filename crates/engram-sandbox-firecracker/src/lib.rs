@@ -81,7 +81,9 @@ use dashmap::DashMap;
 use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::{SandboxId, SnapshotId};
-use engram_core::types::sandbox::{ExecEvent, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
@@ -289,6 +291,11 @@ pub struct FirecrackerConfig {
     /// available) opt-out by default — only the prod call sites
     /// in `engram-coordinator` and `engram-image-builder` set it.
     pub cpu_template: Option<String>,
+    /// ADR 0035: directory where content-addressed bundle generations
+    /// (`<drive_id>-<sha256>.squashfs`) and the bake-time
+    /// `current.json` stamp live. Production hosts use the fleet
+    /// canonical [`AuxRoDrive::SHARED_DIR`]; tests inject a tempdir.
+    pub bundle_dir: PathBuf,
 }
 
 /// Resolve the FC CPU template from `ENGRAM_FC_CPU_TEMPLATE`.
@@ -448,6 +455,9 @@ impl FirecrackerConfig {
             // out so `cargo test` on heterogeneous CI runners doesn't
             // wedge if the runner CPU doesn't satisfy the template.
             cpu_template: None,
+            // ADR 0035: fleet-canonical staging dir; tests override
+            // with a tempdir.
+            bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
         }
     }
 }
@@ -635,6 +645,11 @@ pub struct FirecrackerBackend {
     /// `None` until the coord/host-agent calls `set_upload_sink` (the
     /// per-sandbox upload accept loop then closes connections).
     upload_sink: Arc<parking_lot::RwLock<Option<engram_core::traits::UploadSink>>>,
+    /// ADR 0035: the bake-time bundle stamp (`current.json` under
+    /// `config.bundle_dir`), read once and cached — hosts are immutable
+    /// (a MIG roll replaces them), so the stamp can't change under a
+    /// running host-agent. `drive_id` → sha256.
+    bundle_stamp: tokio::sync::OnceCell<std::collections::HashMap<String, String>>,
 }
 
 impl FirecrackerBackend {
@@ -676,7 +691,57 @@ impl FirecrackerBackend {
             harness_sink: Arc::new(parking_lot::RwLock::new(None)),
             forge_sink: Arc::new(parking_lot::RwLock::new(None)),
             upload_sink: Arc::new(parking_lot::RwLock::new(None)),
+            bundle_stamp: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// ADR 0035: the host's bake-time bundle stamp (`drive_id` → sha256),
+    /// read from `<bundle_dir>/current.json` on first use and cached for
+    /// the host-agent's lifetime (hosts are immutable; only a MIG roll
+    /// changes the stamp, and that replaces the host). Errors if the stamp
+    /// is missing or malformed — callers only reach here when a spec
+    /// actually requests aux drives, and a bundle-less host can't satisfy
+    /// that correctly, so loud is right.
+    async fn read_bundle_stamp(
+        &self,
+    ) -> Result<&std::collections::HashMap<String, String>, SandboxError> {
+        let stamp_path = self.config.bundle_dir.join(AuxRoDrive::CURRENT_STAMP);
+        self.bundle_stamp
+            .get_or_try_init(|| async {
+                let bytes = tokio::fs::read(&stamp_path).await.map_err(|e| {
+                    SandboxError::InvalidSpec(format!(
+                        "read bundle stamp {}: {e} — this host stages no \
+                         bundles; it can't attach aux RO drives",
+                        stamp_path.display()
+                    ))
+                })?;
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    SandboxError::InvalidSpec(format!(
+                        "parse bundle stamp {}: {e}",
+                        stamp_path.display()
+                    ))
+                })
+            })
+            .await
+    }
+
+    /// ADR 0035: host path of a *resolved* aux drive's staged generation.
+    /// Errors on a symbolic drive — reaching attach/restore with
+    /// `sha256 = None` means the resolve step was skipped (or the manifest
+    /// predates ADR 0035, which the incident remediation re-captures away).
+    fn staged_bundle_path(&self, aux: &AuxRoDrive) -> Result<PathBuf, SandboxError> {
+        let sha = aux.sha256.as_deref().ok_or_else(|| {
+            SandboxError::InvalidSpec(format!(
+                "aux RO drive `{}` is unresolved (no sha256) — pre-ADR-0035 \
+                 snapshot or a skipped resolve step; re-capture the image's \
+                 base snapshot",
+                aux.drive_id
+            ))
+        })?;
+        Ok(self
+            .config
+            .bundle_dir
+            .join(AuxRoDrive::staged_file_name(&aux.drive_id, sha)))
     }
 
     /// Apply once-per-host networking setup: enable IP forwarding,
@@ -742,8 +807,70 @@ impl FirecrackerBackend {
             )));
         }
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
-        self.restore_in_jail(sandbox_id, &jail_dir, &src, &manifest)
+        // Same-id reattach after a graceful host reboot: resume
+        // semantics — the session keeps its pinned bundle generations.
+        self.restore_in_jail(
+            sandbox_id, &jail_dir, &src, &manifest, /*swap_aux_to_current=*/ false,
+        )
+        .await
+    }
+
+    /// Shared body of [`SandboxBackend::restore`] (resume flavor,
+    /// `swap_aux_to_current = false`) and
+    /// [`SandboxBackend::restore_fresh`] (fresh-create flavor, `true`).
+    /// See ADR 0035 §3 for why the flavors attach aux bundles
+    /// differently.
+    async fn restore_with(
+        &self,
+        metadata: SnapshotMetadata,
+        swap_aux_to_current: bool,
+    ) -> Result<SandboxId, SandboxError> {
+        // ADR 0007 Phase 6: backend looks up its own staging dir.
+        let src = self.snapshot_dir_for(metadata.id);
+        let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
             .await
+            .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
+        let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
+
+        // Reject cross-VMM restores fast: a VZ blob (`format == "vz"`)
+        // would otherwise reach load_snapshot and fail with a
+        // confusing FC parse error on state.bin. Empty string accepted
+        // for snapshots written before the format field landed; once
+        // those have rotated out a future cleanup can drop the empty
+        // case.
+        if !matches!(manifest.format.as_str(), MANIFEST_FORMAT_FC | "") {
+            return Err(SandboxError::Snapshot(format!(
+                "manifest format {:?} is not 'fc' — cross-VMM restore not supported",
+                manifest.format,
+            )));
+        }
+
+        // Always allocate a *fresh* sandbox id — same on-disk state,
+        // different lifecycle handle.
+        let sandbox_id = SandboxId::new();
+        let jail_dir = self.work_dir.join(sandbox_id.to_string());
+
+        match self
+            .restore_in_jail(sandbox_id, &jail_dir, &src, &manifest, swap_aux_to_current)
+            .await
+        {
+            Ok(()) => Ok(sandbox_id),
+            Err(e) => {
+                // Set ENGRAM_FC_KEEP_JAIL_ON_FAILURE=1 to keep the
+                // jail dir for post-mortem of firecracker.log /
+                // uffd-handler.log. Default is to clean up.
+                if std::env::var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE").is_err() {
+                    let _ = tokio::fs::remove_dir_all(&jail_dir).await;
+                } else {
+                    tracing::warn!(
+                        jail = %jail_dir.display(),
+                        "preserving jail dir for diagnostics (ENGRAM_FC_KEEP_JAIL_ON_FAILURE)",
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// ADR 0009 §6: live-VM reattach (path 1). Called from the
@@ -1329,9 +1456,31 @@ impl FirecrackerBackend {
         &self,
         sandbox_id: SandboxId,
         jail_dir: &Path,
-        spec: SandboxSpec,
+        mut spec: SandboxSpec,
         net_setup: Option<&net::NetSetup>,
     ) -> Result<(), SandboxError> {
+        // ADR 0035: resolve symbolic aux drives ("attach whatever generation
+        // this host currently stages") against the bake stamp BEFORE anything
+        // embeds the spec — the manifest written below and FC's state.bin
+        // must both carry the resolved, content-addressed form.
+        if spec.aux_ro_drives.iter().any(|d| d.sha256.is_none()) {
+            let stamp = self.read_bundle_stamp().await?;
+            for drive in &mut spec.aux_ro_drives {
+                if drive.sha256.is_none() {
+                    let sha = stamp.get(&drive.drive_id).ok_or_else(|| {
+                        SandboxError::InvalidSpec(format!(
+                            "aux RO drive `{}` requested but this host's bundle \
+                             stamp ({}/{}) doesn't carry it",
+                            drive.drive_id,
+                            self.config.bundle_dir.display(),
+                            AuxRoDrive::CURRENT_STAMP,
+                        ))
+                    })?;
+                    drive.sha256 = Some(sha.clone());
+                }
+            }
+        }
+
         let rootfs = spec
             .rootfs_source
             .clone()
@@ -1430,34 +1579,30 @@ impl FirecrackerBackend {
         // harness binary travels in the rootfs at the manifest-
         // declared `[harness] exec` path.
 
-        // ADR 0027: extra read-only host-mounted bundles (the skills /
-        // playwright squashfs). Unlike the rootfs there is NO canonical
-        // symlink dance — each `path_on_host` is already the fleet-wide
-        // canonical path (present identically on every host once the FC-host
-        // image bakes it), so `state.bin` embeds it directly and restore
-        // re-anchors by mere presence.
+        // ADR 0027 + 0035: extra read-only host-mounted bundles (the skills /
+        // playwright squashfs), attached at their content-addressed staged
+        // paths (`<drive_id>-<sha256>.squashfs`). The drives arrived symbolic
+        // from the coord and were resolved against this host's bake stamp at
+        // the top of create — `state.bin` therefore embeds an immutable
+        // generation, never a path whose bytes a host roll can swap.
         //
-        // HARD-FAIL on a missing bundle (no skip-if-absent hedge). This
-        // cold-create path is base-snapshot capture (ADR 0020), which is an
-        // operator-controlled, manual step (POST /api/enabled-images). The
-        // FC-host image bake auto-fires on merge and stages these bundles, so
-        // the correct order is: roll the host image first, THEN enable. If a
-        // bundle is missing here we'd rather 500 the enable loudly — telling
-        // the operator the host fleet isn't ready — than silently capture a
+        // HARD-FAIL on a missing staged file (no skip-if-absent hedge). This
+        // cold-create path is base-snapshot capture (ADR 0020), an operator-
+        // controlled step (POST /api/enabled-images). The stamp said this
+        // generation is staged; if the file is absent the host image is
+        // corrupt — 500 the enable loudly rather than silently capture a
         // skills-less snapshot every session would then inherit. A snapshot
-        // therefore only ever exists with ALL its declared bundles present,
-        // which is exactly what the restore-side assert relies on.
+        // therefore only ever exists with ALL its declared bundles resolved
+        // and present, which is what the restore-side materialize relies on.
         for aux in &spec.aux_ro_drives {
-            if !tokio::fs::try_exists(&aux.path_on_host)
-                .await
-                .unwrap_or(false)
-            {
+            let staged = self.staged_bundle_path(aux)?;
+            if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
                 return Err(SandboxError::Vm(
                     format!(
-                        "aux RO bundle {:?} ({}) not present on this host — the \
-                         FC-host image hasn't staged it; roll the host image \
-                         before enabling this image",
-                        aux.path_on_host.display(),
+                        "aux RO bundle {:?} ({}) is in this host's bundle stamp \
+                         but not staged — the FC-host image is corrupt; re-bake \
+                         or roll the host image before enabling this image",
+                        staged.display(),
                         aux.drive_id
                     )
                     .into(),
@@ -1465,7 +1610,7 @@ impl FirecrackerBackend {
             }
             api.put_drive(&DriveConfig {
                 drive_id: aux.drive_id.clone(),
-                path_on_host: aux.path_on_host.to_string_lossy().into_owned(),
+                path_on_host: staged.to_string_lossy().into_owned(),
                 is_root_device: false,
                 is_read_only: true,
             })
@@ -1851,9 +1996,90 @@ impl FirecrackerBackend {
         jail_dir: &Path,
         snapshot_dir: &Path,
         manifest: &FcSnapshotManifest,
+        swap_aux_to_current: bool,
     ) -> Result<(), SandboxError> {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
+
+        // ADR 0035 §3/§4: aux RO bundles.
+        //
+        // The PINNED generation must be present regardless of flavor —
+        // `load_snapshot` opens the `state.bin`-embedded path before any
+        // `patch_drive` is possible. `PooledBackend::restore` materializes
+        // missing generations from BlobStorage before calling here; this
+        // assert is the backstop that turns a miss into a clear error
+        // instead of an opaque FC virtio "No such file".
+        //
+        // On the fresh-create flavor (`swap_aux_to_current`) we also plan a
+        // post-load, pre-resume `patch_drive` to this host's CURRENT
+        // generation for any drive whose pin is stale — that's how a skill
+        // edit reaches new sessions without re-enabling images (Invariant 2).
+        // Resumes never swap: live guest processes may hold fds into the
+        // pinned bundle, and an in-flight session keeps the world it was
+        // working in. Missing stamp / missing current file degrade to the
+        // pinned generation with a warning — staler skills beat a failed
+        // create.
+        let mut live_spec = manifest.spec.clone();
+        let mut aux_swap_plan: Vec<(String, PathBuf)> = Vec::new();
+        if !live_spec.aux_ro_drives.is_empty() {
+            for aux in &live_spec.aux_ro_drives {
+                let pinned = self.staged_bundle_path(aux)?;
+                if !tokio::fs::try_exists(&pinned).await.unwrap_or(false) {
+                    return Err(SandboxError::Snapshot(format!(
+                        "aux RO bundle {} ({}) pinned by the snapshot is not \
+                         staged on this host and wasn't materialized from \
+                         BlobStorage — restore can't proceed",
+                        pinned.display(),
+                        aux.drive_id
+                    )));
+                }
+            }
+            if swap_aux_to_current {
+                match self.read_bundle_stamp().await {
+                    Ok(stamp) => {
+                        for aux in &mut live_spec.aux_ro_drives {
+                            let Some(current_sha) = stamp.get(&aux.drive_id) else {
+                                tracing::warn!(
+                                    drive_id = %aux.drive_id,
+                                    "bundle stamp carries no entry for pinned aux \
+                                     drive; keeping the pinned generation",
+                                );
+                                continue;
+                            };
+                            if aux.sha256.as_deref() == Some(current_sha.as_str()) {
+                                continue; // pin is already current
+                            }
+                            let current_path = self
+                                .config
+                                .bundle_dir
+                                .join(AuxRoDrive::staged_file_name(&aux.drive_id, current_sha));
+                            if !tokio::fs::try_exists(&current_path).await.unwrap_or(false) {
+                                tracing::warn!(
+                                    drive_id = %aux.drive_id,
+                                    current = %current_path.display(),
+                                    "stamp's current bundle generation is not \
+                                     staged (corrupt host image?); keeping the \
+                                     pinned generation",
+                                );
+                                continue;
+                            }
+                            aux_swap_plan.push((aux.drive_id.clone(), current_path));
+                            // The live VM's device now points at the current
+                            // generation — record that on the live spec so a
+                            // later `snapshot()` pins what's actually attached.
+                            aux.sha256 = Some(current_sha.clone());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "no bundle stamp on this host; fresh create keeps \
+                             the snapshot's pinned bundle generations",
+                        );
+                    }
+                }
+            }
+        }
         if !state_path.exists() {
             return Err(SandboxError::Snapshot(format!(
                 "snapshot state.bin missing at {}",
@@ -2059,23 +2285,68 @@ impl FirecrackerBackend {
         // (`uffd_leg`); the gate just dials it. File mode loads memory.bin
         // synchronously; Uffd returns immediately and pages fault lazily.
         // Either way the VM is running once `load_snapshot*` returns.
-        let load_result: Result<(), SandboxError> = match &uffd_leg {
-            None => tracing::Instrument::instrument(
-                api.load_snapshot(&SnapshotPaths {
-                    state_path: state_path.clone(),
-                    mem_path: mem_path.clone(),
-                }),
-                tracing::info_span!("fc.load_snapshot", mode = "file"),
-            )
-            .await
-            .map(|_| ()),
-            Some((_handler, uffd_uds)) => tracing::Instrument::instrument(
-                api.load_snapshot_uffd(&state_path, uffd_uds),
-                tracing::info_span!("fc.load_snapshot", mode = "uffd"),
-            )
-            .await
-            .map(|_| ()),
-        };
+        // ADR 0035 §3: with a pending aux-bundle swap, load PAUSED, patch
+        // each stale drive to the host's current generation (FC reopens the
+        // backing file on PATCH /drives), then resume — the same load-paused
+        // → patch → resume sequence ADR 0014's warm-lease harness swap used
+        // (pinned by `tests/patch_drive_swap.rs`). agentd umount/remounts the
+        // bundle mounts at session bind so the guest's squashfs superblock
+        // re-parses the swapped device. With no swap pending, keep the
+        // single-call load-and-resume.
+        let load_result: Result<(), SandboxError> = async {
+            match &uffd_leg {
+                None => {
+                    let paths = SnapshotPaths {
+                        state_path: state_path.clone(),
+                        mem_path: mem_path.clone(),
+                    };
+                    tracing::Instrument::instrument(
+                        async {
+                            if aux_swap_plan.is_empty() {
+                                api.load_snapshot(&paths).await
+                            } else {
+                                api.load_snapshot_paused(&paths).await
+                            }
+                        },
+                        tracing::info_span!("fc.load_snapshot", mode = "file"),
+                    )
+                    .await?;
+                }
+                Some((_handler, uffd_uds)) => {
+                    tracing::Instrument::instrument(
+                        async {
+                            if aux_swap_plan.is_empty() {
+                                api.load_snapshot_uffd(&state_path, uffd_uds).await
+                            } else {
+                                api.load_snapshot_uffd_paused(&state_path, uffd_uds).await
+                            }
+                        },
+                        tracing::info_span!("fc.load_snapshot", mode = "uffd"),
+                    )
+                    .await?;
+                }
+            }
+            if !aux_swap_plan.is_empty() {
+                let span = tracing::info_span!("fc.swap_aux_bundles");
+                tracing::Instrument::instrument(
+                    async {
+                        for (drive_id, current_path) in &aux_swap_plan {
+                            api.patch_drive(drive_id, current_path).await?;
+                            tracing::info!(
+                                %drive_id,
+                                to = %current_path.display(),
+                                "aux bundle swapped to host's current generation",
+                            );
+                        }
+                        api.resume().await
+                    },
+                    span,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
 
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
@@ -2148,7 +2419,10 @@ impl FirecrackerBackend {
         self.spawn_upload_listener(sandbox_id, &vsock_uds_path)
             .await?;
         let state = SandboxState {
-            spec: manifest.spec.clone(),
+            // ADR 0035: `live_spec` reflects any aux-bundle swap above, so a
+            // later `snapshot()` of this sandbox pins the generation that's
+            // actually attached.
+            spec: live_spec,
             firecracker_socket: socket,
             rootfs_path,
             vsock_cid,
@@ -2381,28 +2655,6 @@ async fn restore_canonical_symlinks(
     // re-point.
     let _ = (stub_harness_override, new_sandbox_id, work_dir);
 
-    // ADR 0027: aux RO bundles re-anchor by presence — `state.bin` embedded
-    // each bundle's fleet-canonical path and FC's `load_snapshot` reopens the
-    // drive there, so the path MUST exist on this receiver. Capture hard-fails
-    // unless every declared bundle is present (above), so a snapshot only ever
-    // exists with ALL its `spec.aux_ro_drives` attached — meaning this list is
-    // exactly what `load_snapshot` will open, no false-positives. Assert
-    // presence up front for a clear `SandboxError::Snapshot` instead of an
-    // opaque FC virtio "No such file" on a host the MIG roll hasn't reached.
-    for aux in &manifest.spec.aux_ro_drives {
-        if !tokio::fs::try_exists(&aux.path_on_host)
-            .await
-            .unwrap_or(false)
-        {
-            return Err(SandboxError::Snapshot(format!(
-                "aux RO bundle {:?} ({}) embedded in the snapshot is not \
-                 present on this host — the FC-host image hasn't staged it \
-                 (wait for the MIG roll to finish)",
-                aux.path_on_host.display(),
-                aux.drive_id
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -2910,6 +3162,22 @@ impl SandboxBackend for FirecrackerBackend {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            // ADR 0035: pin the bundle generations this VM's device
+            // model references — the live spec reflects any fresh-create
+            // swap, so this is what `load_snapshot` will reopen on the
+            // next restore. The coord persists it to
+            // `snapshots.aux_bundles` (the GC pin set); PooledBackend
+            // publishes the bytes to BlobStorage.
+            aux_bundles: spec
+                .aux_ro_drives
+                .iter()
+                .filter_map(|d| {
+                    d.sha256.as_ref().map(|sha| AuxBundleRef {
+                        drive_id: d.drive_id.clone(),
+                        sha256: sha.clone(),
+                    })
+                })
+                .collect(),
         })
     }
 
@@ -2951,52 +3219,15 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        // ADR 0007 Phase 6: backend looks up its own staging dir.
-        let src = self.snapshot_dir_for(metadata.id);
-        let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
+        self.restore_with(metadata, /*swap_aux_to_current=*/ false)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
-        let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
+    }
 
-        // Reject cross-VMM restores fast: a VZ blob (`format == "vz"`)
-        // would otherwise reach load_snapshot and fail with a
-        // confusing FC parse error on state.bin. Empty string accepted
-        // for snapshots written before the format field landed; once
-        // those have rotated out a future cleanup can drop the empty
-        // case.
-        if !matches!(manifest.format.as_str(), MANIFEST_FORMAT_FC | "") {
-            return Err(SandboxError::Snapshot(format!(
-                "manifest format {:?} is not 'fc' — cross-VMM restore not supported",
-                manifest.format,
-            )));
-        }
-
-        // Always allocate a *fresh* sandbox id — same on-disk state,
-        // different lifecycle handle.
-        let sandbox_id = SandboxId::new();
-        let jail_dir = self.work_dir.join(sandbox_id.to_string());
-
-        match self
-            .restore_in_jail(sandbox_id, &jail_dir, &src, &manifest)
+    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        // ADR 0035 §3: fresh creates track the host's current bundle
+        // generations; the swap happens load-paused inside restore_in_jail.
+        self.restore_with(metadata, /*swap_aux_to_current=*/ true)
             .await
-        {
-            Ok(()) => Ok(sandbox_id),
-            Err(e) => {
-                // Set ENGRAM_FC_KEEP_JAIL_ON_FAILURE=1 to keep the
-                // jail dir for post-mortem of firecracker.log /
-                // uffd-handler.log. Default is to clean up.
-                if std::env::var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE").is_err() {
-                    let _ = tokio::fs::remove_dir_all(&jail_dir).await;
-                } else {
-                    tracing::warn!(
-                        jail = %jail_dir.display(),
-                        "preserving jail dir for diagnostics (ENGRAM_FC_KEEP_JAIL_ON_FAILURE)",
-                    );
-                }
-                Err(e)
-            }
-        }
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -3597,6 +3828,7 @@ mod tests {
             working_set_trace_output: None,
             uffd_blob_root: None,
             cpu_template: None,
+            bundle_dir: dir.path().join("bundles"),
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }
@@ -3614,6 +3846,90 @@ mod tests {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+        }
+    }
+
+    /// ADR 0035: a spec requesting aux drives on a host without a
+    /// bundle stamp must fail loudly at the resolve step — capturing a
+    /// skills-less snapshot silently is the incident's setup.
+    #[tokio::test]
+    async fn create_with_aux_drives_requires_bundle_stamp() {
+        let (b, d) = backend();
+        // Satisfy the kernel + rootfs existence checks (they precede
+        // the resolve step) so create reaches aux-drive resolution.
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs);
+        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                assert!(msg.contains("bundle stamp"), "{msg}");
+            }
+            other => panic!("expected InvalidSpec(bundle stamp), got {other:?}"),
+        }
+    }
+
+    /// ADR 0035: a stamp that doesn't carry the requested drive_id is
+    /// equally loud (host image staged playwright but not skills, say).
+    #[tokio::test]
+    async fn create_with_aux_drive_missing_from_stamp_errors() {
+        let (b, d) = backend();
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let bundle_dir = d.path().join("bundles");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
+            br#"{"playwright": "aaaa"}"#,
+        )
+        .unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs);
+        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                assert!(msg.contains("doesn't carry it"), "{msg}");
+            }
+            other => panic!("expected InvalidSpec(missing entry), got {other:?}"),
+        }
+    }
+
+    /// ADR 0035: with a valid stamp entry the resolve step passes —
+    /// create proceeds past it (and fails much later on the
+    /// nonexistent firecracker binary, which is the negative-path
+    /// fixture's expected terminal error). Distinguishing the error
+    /// kind proves resolution consumed the stamp.
+    #[tokio::test]
+    async fn create_with_resolvable_aux_drive_passes_resolution() {
+        let (b, d) = backend();
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let bundle_dir = d.path().join("bundles");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let sha = "a".repeat(64);
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
+            format!("{{\"skills\": \"{sha}\"}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::staged_file_name("skills", &sha)),
+            b"squashfs-bytes",
+        )
+        .unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs);
+        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                panic!("resolution should have passed, got InvalidSpec: {msg}")
+            }
+            Err(_) => {} // FC spawn failure — past the resolve step.
+            Ok(_) => panic!("create can't succeed without a real firecracker"),
         }
     }
 
@@ -3710,6 +4026,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
@@ -3821,6 +4138,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
