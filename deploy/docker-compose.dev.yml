@@ -73,8 +73,16 @@ services:
   # collide with docker's port-publishing DNAT; there,
   # `docker-compose.linux.yml` overrides this service back to
   # `network_mode: host`. See that file for the full rationale.
+  # Profile-gated (`local-gcs`) so the Tiltfile can opt out of starting
+  # its own emulator. The Tiltfile probes STORAGE_EMULATOR_HOST at parse
+  # time: if an external fake-gcs-server is already up (e.g. shared from
+  # another env), it leaves this profile inactive — starting a second
+  # emulator would only collide on :4443 and cascade the whole stack to
+  # failure. With no external one found, it activates the profile and
+  # this service comes up as usual.
   fake-gcs-server:
     image: fsouza/fake-gcs-server:1.54.0
+    profiles: ["local-gcs"]
     restart: unless-stopped
     ports:
       - "4443:4443"

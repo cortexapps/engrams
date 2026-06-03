@@ -125,6 +125,31 @@ if kernel_key:
         )
 
 # ----------------------------------------------------------------
+# GCS emulator: reuse an external one if it's already up.
+#
+# `just dev` normally brings up its own fake-gcs-server (compose,
+# profile `local-gcs`). But if another environment already has a
+# fake-gcs-server bound at STORAGE_EMULATOR_HOST, starting a second one
+# just collides on :4443 and the whole stack cascades to failure —
+# seed-buckets and the coordinator both resource_dep on it. So probe
+# the endpoint at parse time: if something answers, treat it as
+# external — skip our own container and point everything at the
+# existing one. Set ENGRAM_USE_EXTERNAL_GCS=1 to force this without the
+# probe (e.g. if the probe gives a false negative).
+# ----------------------------------------------------------------
+storage_emulator_host = env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443')
+gcs_external = env_or('ENGRAM_USE_EXTERNAL_GCS', '') in ('1', 'true', 'yes')
+if not gcs_external:
+    gcs_probe = str(local(
+        'curl -sf -o /dev/null --max-time 2 "' +
+        storage_emulator_host + '/storage/v1/b" && echo up || echo down',
+        echo_off=True, quiet=True)).strip()
+    gcs_external = gcs_probe == 'up'
+if gcs_external:
+    print('engram dev: reusing external fake-gcs-server at %s (not starting our own)'
+          % storage_emulator_host)
+
+# ----------------------------------------------------------------
 # Infra: postgres + registry via docker-compose.
 # The compose file's `coordinator` service is profile-gated to
 # `docker-only`, so this call brings up just the two infra services.
@@ -137,7 +162,10 @@ if kernel_key:
 compose_files = ['deploy/docker-compose.dev.yml']
 if 'Linux' in uname_str:
     compose_files.append('deploy/docker-compose.linux.yml')
-docker_compose(compose_files)
+# fake-gcs-server lives behind the `local-gcs` profile (see the compose
+# file). Activate it only when no external emulator was found.
+compose_profiles = [] if gcs_external else ['local-gcs']
+docker_compose(compose_files, profiles=compose_profiles)
 dc_resource('postgres',
     labels=['infra'],
     links=['postgres://engram:engram@localhost:5435/engram'])
@@ -147,9 +175,11 @@ dc_resource('registry',
 # GCS emulator for cold-tier blob durability (ADR 0005 / Stage 4).
 # The Rust SDK rewrites endpoints to `STORAGE_EMULATOR_HOST` whenever
 # that env var is set; the coordinator + host-agent both honor it.
-dc_resource('fake-gcs-server',
-    labels=['infra'],
-    links=['http://localhost:4443/storage/v1/b'])
+# Only registered when we're running our own (no external one found).
+if not gcs_external:
+    dc_resource('fake-gcs-server',
+        labels=['infra'],
+        links=[storage_emulator_host + '/storage/v1/b'])
 # Jaeger — OTLP trace collector + UI for ADR 0019 cold-boot tracing.
 # coord (+ host-agent in split mode) export here via
 # OTEL_EXPORTER_OTLP_ENDPOINT, defaulted below.
@@ -171,10 +201,18 @@ dc_resource('jaeger',
 
 # Seed the cold-tier blob bucket in fake-gcs-server. Idempotent: the
 # script POSTs the bucket and treats 200, 409, and "already exists"
-# as success. Re-runs on each `tilt up`; cheap.
+# as success. Re-runs on each `tilt up`; cheap. Runs against an external
+# emulator too (the script honors STORAGE_EMULATOR_HOST) — harmless if
+# the bucket already exists, and ensures it does if it doesn't. When the
+# emulator is external it has no Tilt resource to gate on, so the dep is
+# dropped; otherwise it waits on our own container.
 local_resource('seed-buckets',
-    cmd='bash deploy/dev/seed-buckets.sh',
-    resource_deps=['fake-gcs-server'],
+    cmd=(
+        'STORAGE_EMULATOR_HOST=' + storage_emulator_host + ' ' +
+        'ENGRAM_GCS_BUCKET=' + env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test') + ' ' +
+        'bash deploy/dev/seed-buckets.sh'
+    ),
+    resource_deps=[] if gcs_external else ['fake-gcs-server'],
     labels=['setup'])
 
 # ----------------------------------------------------------------
@@ -272,7 +310,10 @@ else:
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    resource_deps=['postgres', 'registry', 'fake-gcs-server', 'jaeger', 'seed-buckets'],
+    # fake-gcs-server is only a Tilt resource when we run our own; when
+    # it's external, seed-buckets (also gated below) carries the GCS dep.
+    resource_deps=(['postgres', 'registry', 'jaeger', 'seed-buckets'] +
+        ([] if gcs_external else ['fake-gcs-server'])),
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
