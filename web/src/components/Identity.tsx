@@ -99,7 +99,7 @@ export function RoleTag({ role }: { role: string }) {
 // A faint Newsreader-italic note for role_source.
 
 const PROVENANCE_LABELS: Record<string, string> = {
-  claim: 'via okta claim',
+  claim: 'via auth claim',
   scim: 'via scim sync',
   manual: 'set by an admin',
 };
