@@ -64,7 +64,10 @@ fn vz_preflight() -> Option<VzEnv> {
             PathBuf::from(home).join(".cache/engram-vz-test/vmlinux-arm64")
         });
     if !kernel.exists() {
-        eprintln!("SKIP: VZ kernel not found at {} (run `just pull-kernel`)", kernel.display());
+        eprintln!(
+            "SKIP: VZ kernel not found at {} (run `just pull-kernel`)",
+            kernel.display()
+        );
         return None;
     }
     let rootfs = match std::env::var("ENGRAM_VZ_ROOTFS") {
@@ -146,9 +149,12 @@ async fn e2e_vz_lifecycle() {
         work.path().join("blob"),
     ));
     let cs = engram_chunk_store::ChunkStore::new(blob);
-    let backend = VzBackend::new(work.path().join("sb"), VzConfig::with_kernel(env.kernel.clone()))
-        .expect("VzBackend::new")
-        .with_chunk_store(cs);
+    let backend = VzBackend::new(
+        work.path().join("sb"),
+        VzConfig::with_kernel(env.kernel.clone()),
+    )
+    .expect("VzBackend::new")
+    .with_chunk_store(cs);
 
     // 1. Boot + exec over the console transport (ADR 0032 #3: no ready-port
     //    stall — exec must answer promptly, not 90s later).
@@ -160,7 +166,10 @@ async fn e2e_vz_lifecycle() {
 
     // 2. SHELL tab (ADR 0032 #5): start_shell must spawn ttyd and return its
     //    port, not the trait-default-7681-without-a-listener.
-    let port = backend.start_shell(id).await.expect("start_shell spawns ttyd");
+    let port = backend
+        .start_shell(id)
+        .await
+        .expect("start_shell spawns ttyd");
     assert_eq!(port, 7681, "ttyd default port");
 
     // 3. Durable snapshot (ADR 0032 #4): write with NO sync, snapshot, restore,
@@ -168,7 +177,10 @@ async fn e2e_vz_lifecycle() {
     let (_, code) = exec(&backend, id, "echo durable-payload > /root/z.txt").await;
     assert_eq!(code, Some(0));
     let meta = backend.snapshot(id).await.expect("snapshot");
-    assert!(meta.disk_manifest.is_some(), "VZ snapshot must chunk a disk manifest");
+    assert!(
+        meta.disk_manifest.is_some(),
+        "VZ snapshot must chunk a disk manifest"
+    );
     backend.destroy(id).await.expect("destroy");
 
     let id2 = backend.restore(meta).await.expect("restore (cold-boot)");
