@@ -435,6 +435,14 @@ async fn drive_harness(
         "CLAUDE_CODE_OAUTH_TOKEN".into(),
         "sk-bogus-e2e-test-token-not-real".into(),
     );
+    // The CLI treats 401 as retryable (it clears cached auth and
+    // re-attempts, default 10 tries with exponential backoff) — but
+    // our 401 is INTENTIONAL, so when that path engages the run
+    // takes minutes and blows the 90s deadline below with only
+    // RunStarted captured (the historical flake shape of this
+    // test). Zero retries makes the first response surface
+    // immediately: deterministic, and still proves the full chain.
+    env.insert("CLAUDE_CODE_MAX_RETRIES".into(), "0".into());
     // PATH so the harness's invocation of curl/etc. finds the
     // bundled `claude` CLI sitting alongside `harness` in the
     // baked dir.
@@ -508,12 +516,36 @@ async fn drive_harness(
         }
         sleep(Duration::from_millis(500)).await;
     }
+    // Timed out. Pull the in-VM harness log (wrapper tracing + the
+    // claude CLI's stderr both land there) before panicking so the
+    // failure is diagnosable from CI output alone — without this the
+    // only artifact is "RunStarted then silence".
+    let harness_log = match pooled
+        .exec(
+            sandbox_id,
+            engram_core::types::sandbox::ExecRequest {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "tail -c 16384 /var/log/engram/harness.log 2>&1".into(),
+                ],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: None,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .await
+    {
+        Ok(h) => String::from_utf8_lossy(&h.stdout).into_owned(),
+        Err(e) => format!("<harness.log fetch failed: {e}>"),
+    };
     let evs = captured.lock().clone();
     panic!(
         "harness didn't emit a terminal event (RunCompleted + AgentMessage) within 90s. \
          Got {} events total: {evs:?}. \
-         Likely the API call never ran or never got a response — check the proxy logs \
-         and the in-VM harness logs.",
+         Likely the API call never ran or never got a response. \
+         In-VM harness.log tail:\n{harness_log}",
         evs.len()
     );
 }
