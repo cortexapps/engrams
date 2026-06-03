@@ -210,8 +210,28 @@ pub fn recommended_size(dir_size_bytes: u64) -> u64 {
     let twice = dir_size_bytes.saturating_mul(2);
     let plus_128 = dir_size_bytes.saturating_add(128 * 1024 * 1024);
     let raw = twice.max(plus_128);
-    const ALIGN: u64 = 4096;
-    raw.saturating_add(ALIGN - 1) & !(ALIGN - 1)
+    // ADR 0036: quantize COARSELY so the filesystem geometry is
+    // stable under small source-tree drift. mke2fs derives block
+    // groups, bitmaps, and inode-table placement from the total
+    // block count — with fine-grained (4 KiB) rounding, an 8 KB
+    // change in a multi-GB tree changes the fs size, which shifts
+    // every structure on the disk and re-rolls ~100% of the 16 MiB
+    // chunk hashes (observed in prod: two bakes of the same source
+    // deduped 1% purely from apt-index churn). Snapping to 256 MiB
+    // bands keeps geometry identical until the tree grows past a
+    // band edge; the padding is zero-filled and zero chunks are
+    // elided from manifests, so the cost is a few extra inode-table
+    // chunks, not storage. Small images (< 1 GiB raw) keep 4 KiB
+    // alignment — dev/test fixtures stay tight, and VZ's
+    // sector-alignment requirement is satisfied by both branches.
+    const FINE: u64 = 4096;
+    const COARSE: u64 = 256 * 1024 * 1024;
+    let align = if raw > 1024 * 1024 * 1024 {
+        COARSE
+    } else {
+        FINE
+    };
+    raw.saturating_add(align - 1) & !(align - 1)
 }
 
 #[cfg(test)]
@@ -242,6 +262,22 @@ mod tests {
     fn recommended_size_does_not_overflow() {
         // Adversarial input doesn't panic.
         assert!(recommended_size(u64::MAX) > 0);
+    }
+
+    /// ADR 0036: sizes past 1 GiB snap to 256 MiB bands, so small
+    /// source-tree drift (the apt-churn class) maps to the SAME
+    /// filesystem geometry and cross-bake chunk dedup survives.
+    #[test]
+    fn recommended_size_quantizes_large_images_to_256mib_bands() {
+        const MIB: u64 = 1024 * 1024;
+        let a = recommended_size(4800 * MIB);
+        let b = recommended_size(4800 * MIB + 8 * 1024); // +8 KB tree drift
+        assert_eq!(a, b, "small drift must not change the fs size");
+        assert_eq!(a % (256 * MIB), 0, "large sizes snap to 256 MiB");
+        // Still never smaller than the raw requirement.
+        assert!(a >= 2 * 4800 * MIB);
+        // And a genuinely larger tree eventually crosses a band edge.
+        assert!(recommended_size(5200 * MIB) > a);
     }
 
     #[test]
