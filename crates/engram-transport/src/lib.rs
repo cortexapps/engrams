@@ -95,6 +95,24 @@ pub trait Transport: Send + Sync {
 
     /// Bind a listener on `port`. Used by `engram-agentd` (1024).
     async fn listen(&self, port: u32) -> io::Result<Box<dyn Listener>>;
+
+    /// Whether this transport supports the agentd readiness handshake —
+    /// the guest→host dial on `ENGRAM_AGENTD_READY_PORT` that unblocks the
+    /// host's `wait_agent_ready` (FC's per-sandbox `agent_ready` watch).
+    ///
+    /// `true` for vsock (the host listens on the ready port and FC gates
+    /// snapshot/start on it). `false` for virtio-console: the bridge
+    /// configures exactly the data ports it needs (agentd/bootstrap/harness)
+    /// and there is no ready-port device, so a dial can never connect. On
+    /// console the host's `wait_agent_ready` is FC-only (returns
+    /// `InvalidSpec`, caught upstream), so the handshake is pure waste —
+    /// worse, agentd would spin ~90s retrying the impossible dial before it
+    /// ever `accept()`s, leaving early host requests to pile up on the
+    /// single console byte stream and desync. Skipping it lets agentd serve
+    /// RPCs immediately.
+    fn supports_ready_port(&self) -> bool {
+        true
+    }
 }
 
 /// Build a [`Transport`] from the `ENGRAM_TRANSPORT` env var.

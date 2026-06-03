@@ -103,6 +103,13 @@ impl Transport for ConsoleTransport {
         Ok(Box::pin(stream))
     }
 
+    // virtio-console has no ready-port device — the bridge configures only
+    // the agentd/bootstrap/harness data ports. See the trait default for why
+    // the readiness handshake must be skipped on console.
+    fn supports_ready_port(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, port: u32) -> io::Result<Box<dyn Listener>> {
         // Validate the port maps to a known device path now, so a
         // bad port number fails at bind time rather than on first

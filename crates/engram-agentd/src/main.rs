@@ -338,9 +338,15 @@ async fn run_transport(
     // listener cover this window. On a fast boot the first dial succeeds, so this
     // costs nothing; restored sandboxes don't re-run this path at all (the host
     // pre-sets agent_ready), so the restore tail is untouched.
+    // Skip the readiness handshake on transports without a ready port
+    // (virtio-console / VZ). There's no ready-port device to dial, the host's
+    // `wait_agent_ready` is FC-only, and spinning ~90s on the impossible dial
+    // before `accept()` lets early host requests pile up on the single console
+    // byte stream and desync (host reads a GuestIp reply for its SpawnHarness).
+    // Going straight to the accept loop lets agentd serve RPCs immediately.
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let mut attempt: u32 = 0;
-    loop {
+    while transport.supports_ready_port() {
         attempt += 1;
         match transport
             .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)
