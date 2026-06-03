@@ -1,4 +1,4 @@
-import { useParams } from 'react-router-dom';
+import { useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { interruptSession } from '../api';
 import { useSession } from '../hooks/useSessions';
@@ -21,7 +21,7 @@ const TABS = [
 ];
 
 export function SessionDetail() {
-  const { id } = useParams<{ id: string }>();
+  const { id } = useParams({ from: '/sessions/$id' });
   const { data: session } = useSession(id);
   const events = useSessionEvents(id);
   const [tab, setTab] = useState<ViewTab>('transcript');

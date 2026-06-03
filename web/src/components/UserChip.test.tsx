@@ -21,6 +21,13 @@ afterEach(() => {
   cleanup();
 });
 
+// TanStack Router defers the initial render to a microtask, so the chip
+// trigger isn't in the DOM synchronously after render — findBy* polls until
+// it mounts. Every dismiss test starts by opening the menu, so they share this.
+function openMenuTrigger() {
+  return screen.findByRole('button', { name: /open user menu/i });
+}
+
 describe('UserChip dismiss behaviors', () => {
   test('clicking the chip toggles the popover open', async () => {
     const user = userEvent.setup();
@@ -30,7 +37,7 @@ describe('UserChip dismiss behaviors', () => {
     // (AnimatePresence unmounts the popover entirely on close).
     expect(screen.queryByRole('menu')).toBeNull();
 
-    await user.click(screen.getByRole('button', { name: /open user menu/i }));
+    await user.click(await openMenuTrigger());
     expect(screen.queryByRole('menu')).not.toBeNull();
     // Settings link is reachable.
     expect(screen.queryByRole('link', { name: /settings/i })).not.toBeNull();
@@ -40,7 +47,7 @@ describe('UserChip dismiss behaviors', () => {
     const user = userEvent.setup();
     renderWithProviders(<UserChip />);
 
-    await user.click(screen.getByRole('button', { name: /open user menu/i }));
+    await user.click(await openMenuTrigger());
     expect(screen.queryByRole('menu')).not.toBeNull();
 
     await user.keyboard('{Escape}');
@@ -65,7 +72,7 @@ describe('UserChip dismiss behaviors', () => {
       </div>,
     );
 
-    await user.click(screen.getByRole('button', { name: /open user menu/i }));
+    await user.click(await openMenuTrigger());
     expect(screen.queryByRole('menu')).not.toBeNull();
 
     await user.click(screen.getByTestId('outside'));
@@ -83,7 +90,7 @@ describe('UserChip dismiss behaviors', () => {
     const user = userEvent.setup();
     renderWithProviders(<UserChip />);
 
-    await user.click(screen.getByRole('button', { name: /open user menu/i }));
+    await user.click(await openMenuTrigger());
     const settingsLink = screen.getByRole('link', { name: /settings/i });
     await user.click(settingsLink);
 

@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Link } from 'react-router-dom';
+import { Link } from '@tanstack/react-router';
 import { StatusGlyph } from './Glyph';
 import { EngramMark } from './EngramMark';
 import { OwnerCell } from './Identity';
@@ -45,7 +45,8 @@ export function SessionRow({
       transition={{ duration: 0.35 }}
     >
       <Link
-        to={`/sessions/${session.id}`}
+        to="/sessions/$id"
+        params={{ id: session.id }}
         className={`session-row${showOwner ? ' has-owner' : ''}`}
       >
         <span className="sr-glyph">
