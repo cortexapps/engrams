@@ -18,12 +18,8 @@ export function Layout() {
 
 function Footer() {
   return (
-    <footer
-      className="book-wide mt-20 mb-4 font-mono text-[0.7rem] smallcaps"
-      style={{ color: 'var(--color-ink-quiet)' }}
-    >
-      <hr className="mb-6" />
-      coordinator at 127.0.0.1:8090 · vite proxy
+    <footer className="book-wide mt-20 mb-4">
+      <hr />
     </footer>
   );
 }
