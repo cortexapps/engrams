@@ -1,21 +1,25 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { Controller, useForm } from 'react-hook-form';
+import * as z from 'zod';
 import { saveClaudeToken } from '../../api';
 import { useAuth } from '../../auth/AuthProvider';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Field, FieldDescription, FieldError, FieldGroup } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+
+const tokenSchema = z.object({
+  token: z.string().trim().min(1, 'Token is required'),
+});
+type TokenValues = z.infer<typeof tokenSchema>;
 
 export function TokensPanel() {
   const { principal, refresh } = useAuth();
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
-  const [token, setToken] = useState('');
-  const save = useMutation({
-    mutationFn: (t: string) => saveClaudeToken(t),
-    onSuccess: () => { setEditing(false); setToken(''); void qc.invalidateQueries({ queryKey: ['me'] }); refresh(); },
-  });
   const saved = principal.has_claude_token;
 
   return (
@@ -29,22 +33,16 @@ export function TokensPanel() {
           </div>
           <Badge variant={saved ? 'secondary' : 'outline'}>{saved ? 'saved · sealed' : 'not connected'}</Badge>
         </CardHeader>
-        <CardContent className="space-y-3">
+        <CardContent>
           {editing ? (
-            <div className="space-y-2">
-              <Input type="password" autoFocus placeholder="sk-ant-oat…" value={token}
-                onChange={(e) => setToken(e.target.value)} className="font-mono" />
-              <p className="text-xs text-muted-foreground">
-                From <code className="font-mono">claude setup-token</code> — stored encrypted, never shown again.
-              </p>
-              <div className="flex gap-2">
-                <Button size="sm" disabled={!token.trim() || save.isPending} onClick={() => save.mutate(token.trim())}>
-                  {save.isPending ? 'Saving…' : 'Save'}
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => { setEditing(false); setToken(''); }}>Cancel</Button>
-              </div>
-              {save.error && <p className="text-sm text-destructive">{String(save.error)}</p>}
-            </div>
+            <TokenForm
+              onCancel={() => setEditing(false)}
+              onSaved={() => {
+                setEditing(false);
+                void qc.invalidateQueries({ queryKey: ['me'] });
+                refresh();
+              }}
+            />
           ) : (
             <Button size="sm" variant={saved ? 'outline' : 'default'} onClick={() => setEditing(true)}>
               {saved ? 'Replace' : 'Add token'}
@@ -57,5 +55,56 @@ export function TokensPanel() {
         Postgres, and it's used automatically so you're never prompted per session.
       </p>
     </div>
+  );
+}
+
+function TokenForm({ onCancel, onSaved }: { onCancel: () => void; onSaved: () => void }) {
+  const form = useForm<TokenValues>({
+    resolver: zodResolver(tokenSchema),
+    defaultValues: { token: '' },
+  });
+  const save = useMutation({
+    mutationFn: (t: string) => saveClaudeToken(t),
+    onSuccess: onSaved,
+    onError: (e) => form.setError('root', { message: String(e) }),
+  });
+
+  const onSubmit = (data: TokenValues) => save.mutate(data.token);
+
+  return (
+    <form onSubmit={form.handleSubmit(onSubmit)}>
+      <FieldGroup>
+        <Controller
+          name="token"
+          control={form.control}
+          render={({ field, fieldState }) => (
+            <Field data-invalid={fieldState.invalid}>
+              <Input
+                {...field}
+                id={field.name}
+                type="password"
+                autoFocus
+                placeholder="sk-ant-oat…"
+                className="font-mono"
+                aria-invalid={fieldState.invalid}
+              />
+              <FieldDescription>
+                From <code className="font-mono">claude setup-token</code> — stored encrypted, never shown again.
+              </FieldDescription>
+              {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+            </Field>
+          )}
+        />
+        <Field orientation="horizontal">
+          <Button type="submit" size="sm" disabled={save.isPending}>
+            {save.isPending ? 'Saving…' : 'Save'}
+          </Button>
+          <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+        </Field>
+        {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+      </FieldGroup>
+    </form>
   );
 }

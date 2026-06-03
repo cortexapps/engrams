@@ -1,4 +1,7 @@
 import { useState } from 'react';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { Controller, useForm } from 'react-hook-form';
+import * as z from 'zod';
 import {
   useAddRegistry,
   useDeleteRegistry,
@@ -16,8 +19,12 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
   DialogTitle, DialogTrigger,
 } from '@/components/ui/dialog';
+import {
+  Field, FieldContent, FieldDescription, FieldError, FieldGroup, FieldLabel,
+  FieldLegend, FieldSet, FieldTitle,
+} from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -26,7 +33,6 @@ import {
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table';
-import { cn } from '@/lib/utils';
 
 // Registries panel — operators register Docker registries with either a static
 // credential (sealed under the deployment KEK) or ambient GCP Workload
@@ -141,33 +147,48 @@ const KIND_CARDS: AuthKindCardSpec[] = [
   },
 ];
 
+const registrySchema = z
+  .object({
+    host: z.string().trim().min(1, 'host is required'),
+    authKind: z.enum(['static', 'gcp_workload_identity']),
+    username: z.string(),
+    password: z.string(),
+    impersonateSa: z.string(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.authKind === 'static') {
+      if (!val.username.trim()) {
+        ctx.addIssue({ code: 'custom', path: ['username'], message: 'username is required' });
+      }
+      if (!val.password) {
+        ctx.addIssue({ code: 'custom', path: ['password'], message: 'password is required' });
+      }
+    }
+  });
+type RegistryValues = z.infer<typeof registrySchema>;
+
 function AddRegistryDialog() {
   const [open, setOpen] = useState(false);
-  const [host, setHost] = useState('');
-  const [authKind, setAuthKind] = useState<RegistryAuthKind>('static');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [impersonateSa, setImpersonateSa] = useState('');
-  const [submitError, setSubmitError] = useState<string | null>(null);
   const add = useAddRegistry();
+  const form = useForm<RegistryValues>({
+    resolver: zodResolver(registrySchema),
+    defaultValues: { host: '', authKind: 'static', username: '', password: '', impersonateSa: '' },
+  });
+  const authKind = form.watch('authKind');
 
-  const submit = async () => {
-    setSubmitError(null);
-    if (!host.trim()) { setSubmitError('host is required'); return; }
+  const onSubmit = async (data: RegistryValues) => {
     let auth: AddRegistryAuth;
-    if (authKind === 'static') {
-      if (!username.trim()) { setSubmitError('username is required'); return; }
-      if (!password) { setSubmitError('password is required'); return; }
-      auth = { kind: 'static', username: username.trim(), password };
+    if (data.authKind === 'static') {
+      auth = { kind: 'static', username: data.username.trim(), password: data.password };
     } else {
-      auth = { kind: 'gcp_workload_identity', impersonate_sa: impersonateSa.trim() || undefined };
+      auth = { kind: 'gcp_workload_identity', impersonate_sa: data.impersonateSa.trim() || undefined };
     }
     try {
-      await add.mutateAsync({ host: host.trim(), auth });
+      await add.mutateAsync({ host: data.host.trim(), auth });
+      form.reset();
       setOpen(false);
-      setHost(''); setUsername(''); setPassword(''); setImpersonateSa('');
     } catch (e) {
-      setSubmitError(String(e));
+      form.setError('root', { message: String(e) });
     }
   };
 
@@ -182,92 +203,153 @@ function AddRegistryDialog() {
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-5">
-          <div className="space-y-2">
-            <Label htmlFor="reg-host">Host</Label>
-            <Input id="reg-host" autoFocus value={host} onChange={(e) => setHost(e.target.value)}
-              className="font-mono" placeholder="ghcr.io" spellCheck={false} autoCapitalize="off" />
-            <p className="text-xs text-muted-foreground">
-              e.g. ghcr.io · gcr.io · us-east1-docker.pkg.dev · localhost:5001
-            </p>
-          </div>
+        <form onSubmit={form.handleSubmit(onSubmit)}>
+          <FieldGroup>
+            <Controller
+              name="host"
+              control={form.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor={field.name}>Host</FieldLabel>
+                  <Input
+                    {...field}
+                    id={field.name}
+                    autoFocus
+                    className="font-mono"
+                    placeholder="ghcr.io"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    aria-invalid={fieldState.invalid}
+                  />
+                  <FieldDescription>
+                    e.g. ghcr.io · gcr.io · us-east1-docker.pkg.dev · localhost:5001
+                  </FieldDescription>
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
 
-          <div className="space-y-2">
-            <Label>Auth model</Label>
-            <div role="radiogroup" aria-label="Authentication model" className="grid gap-2">
-              {KIND_CARDS.map((card) => {
-                const selected = !card.disabled && card.kind === authKind;
-                return (
-                  <button
-                    key={card.kind}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    disabled={card.disabled}
-                    onClick={() => { if (!card.disabled) setAuthKind(card.kind as RegistryAuthKind); }}
-                    className={cn(
-                      'rounded-md border p-3 text-left transition-colors',
-                      selected ? 'border-primary bg-accent' : 'border-border',
-                      card.disabled ? 'cursor-not-allowed opacity-55' : 'cursor-pointer hover:bg-accent/50',
-                    )}
+            <Controller
+              name="authKind"
+              control={form.control}
+              render={({ field }) => (
+                <FieldSet>
+                  <FieldLegend variant="label">Auth model</FieldLegend>
+                  <RadioGroup
+                    value={field.value}
+                    onValueChange={field.onChange}
+                    aria-label="Authentication model"
+                    className="gap-2"
                   >
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium">{card.label}</span>
-                      {card.hint && (
-                        <Badge variant="secondary" className="ml-auto text-[0.62rem] uppercase">{card.hint}</Badge>
-                      )}
-                    </div>
-                    <p className="mt-1 text-xs text-muted-foreground">{card.blurb}</p>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+                    {KIND_CARDS.map((card) => (
+                      <FieldLabel key={card.kind} htmlFor={`reg-auth-${card.kind}`}>
+                        <Field orientation="horizontal" data-disabled={card.disabled || undefined}>
+                          <FieldContent>
+                            <FieldTitle>
+                              {card.label}
+                              {card.hint && (
+                                <Badge variant="secondary" className="text-[0.62rem] uppercase">{card.hint}</Badge>
+                              )}
+                            </FieldTitle>
+                            <FieldDescription>{card.blurb}</FieldDescription>
+                          </FieldContent>
+                          <RadioGroupItem
+                            value={card.kind}
+                            id={`reg-auth-${card.kind}`}
+                            disabled={card.disabled}
+                          />
+                        </Field>
+                      </FieldLabel>
+                    ))}
+                  </RadioGroup>
+                </FieldSet>
+              )}
+            />
 
-          {authKind === 'static' ? (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="reg-username">Username</Label>
-                <Input id="reg-username" value={username} onChange={(e) => setUsername(e.target.value)}
-                  className="font-mono" spellCheck={false} autoCapitalize="off" autoComplete="username"
-                  placeholder="username or _json_key" />
-                <p className="text-xs text-muted-foreground">
-                  For GCP service-account JSON keys, the literal string <code className="font-mono">_json_key</code>.
-                </p>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="reg-password">Password</Label>
-                <Input id="reg-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                  className="font-mono" autoComplete="new-password" placeholder="•••••" />
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <p className="text-sm text-muted-foreground">
-                No password required. The host-agent's ambient GCP identity is exchanged for a short-lived
-                OAuth token on every pull.
-              </p>
-              <div className="space-y-2">
-                <Label htmlFor="reg-impersonate">Impersonate (optional)</Label>
-                <Input id="reg-impersonate" value={impersonateSa} onChange={(e) => setImpersonateSa(e.target.value)}
-                  className="font-mono" placeholder="engram@my-project.iam.gserviceaccount.com"
-                  spellCheck={false} autoCapitalize="off" />
-                <p className="text-xs text-muted-foreground">
-                  Pull as a different service account via the IAM Credentials API. Leave empty to use the ambient identity.
-                </p>
-              </div>
-            </div>
-          )}
+            {authKind === 'static' ? (
+              <>
+                <Controller
+                  name="username"
+                  control={form.control}
+                  render={({ field, fieldState }) => (
+                    <Field data-invalid={fieldState.invalid}>
+                      <FieldLabel htmlFor={field.name}>Username</FieldLabel>
+                      <Input
+                        {...field}
+                        id={field.name}
+                        className="font-mono"
+                        spellCheck={false}
+                        autoCapitalize="off"
+                        autoComplete="username"
+                        placeholder="username or _json_key"
+                        aria-invalid={fieldState.invalid}
+                      />
+                      <FieldDescription>
+                        For GCP service-account JSON keys, the literal string <code className="font-mono">_json_key</code>.
+                      </FieldDescription>
+                      {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    </Field>
+                  )}
+                />
+                <Controller
+                  name="password"
+                  control={form.control}
+                  render={({ field, fieldState }) => (
+                    <Field data-invalid={fieldState.invalid}>
+                      <FieldLabel htmlFor={field.name}>Password</FieldLabel>
+                      <Input
+                        {...field}
+                        id={field.name}
+                        type="password"
+                        className="font-mono"
+                        autoComplete="new-password"
+                        placeholder="•••••"
+                        aria-invalid={fieldState.invalid}
+                      />
+                      {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    </Field>
+                  )}
+                />
+              </>
+            ) : (
+              <>
+                <FieldDescription>
+                  No password required. The host-agent's ambient GCP identity is exchanged for a short-lived
+                  OAuth token on every pull.
+                </FieldDescription>
+                <Controller
+                  name="impersonateSa"
+                  control={form.control}
+                  render={({ field }) => (
+                    <Field>
+                      <FieldLabel htmlFor={field.name}>Impersonate (optional)</FieldLabel>
+                      <Input
+                        {...field}
+                        id={field.name}
+                        className="font-mono"
+                        placeholder="engram@my-project.iam.gserviceaccount.com"
+                        spellCheck={false}
+                        autoCapitalize="off"
+                      />
+                      <FieldDescription>
+                        Pull as a different service account via the IAM Credentials API. Leave empty to use the ambient identity.
+                      </FieldDescription>
+                    </Field>
+                  )}
+                />
+              </>
+            )}
 
-          {submitError && <p className="text-sm text-destructive">{submitError}</p>}
-        </div>
+            {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+          </FieldGroup>
 
-        <DialogFooter>
-          <Button variant="ghost" onClick={() => setOpen(false)} disabled={add.isPending}>Cancel</Button>
-          <Button onClick={submit} disabled={add.isPending}>
-            {add.isPending ? 'Sealing & saving…' : 'Register'}
-          </Button>
-        </DialogFooter>
+          <DialogFooter className="mt-5">
+            <Button type="button" variant="ghost" onClick={() => setOpen(false)} disabled={add.isPending}>Cancel</Button>
+            <Button type="submit" disabled={add.isPending}>
+              {add.isPending ? 'Sealing & saving…' : 'Register'}
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );
