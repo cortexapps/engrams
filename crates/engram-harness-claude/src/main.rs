@@ -188,14 +188,18 @@ mod adapter {
         // user message), so this is the warm-but-quiescent state a base
         // snapshot wants to capture (ADR 0037). A spawn failure here is
         // non-fatal — `ensure_claude` retries on the first prompt.
-        let mut claude: Option<ClaudeChild> =
-            match spawn_persistent_claude(&cli, read_claude_session_id().await).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::error!(error = %e, "initial claude spawn failed; will retry on first prompt");
-                    None
-                }
-            };
+        let mut claude: Option<ClaudeChild> = match spawn_persistent_claude(
+            &cli,
+            read_claude_session_id().await,
+        )
+        .await
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!(error = %e, "initial claude spawn failed; will retry on first prompt");
+                None
+            }
+        };
 
         // Outer loop: dial → run one connection → if the connection
         // dropped (FC snapshot/restore round-trip is the canonical

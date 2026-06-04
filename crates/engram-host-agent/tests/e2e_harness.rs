@@ -1285,10 +1285,11 @@ async fn e2e_harness_multiturn_across_resume() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
-    let guest_ip: std::net::Ipv4Addr = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30))
-        .await
-        .parse()
-        .unwrap();
+    let guest_ip: std::net::Ipv4Addr =
+        wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30))
+            .await
+            .parse()
+            .unwrap();
 
     let session_id = engram_core::SessionId::new();
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
