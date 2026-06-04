@@ -6,21 +6,35 @@
 //! supervisor after the host pushes a `SpawnHarness` request
 //! describing this binary.
 //!
-//! Strategy: child-per-prompt. Per `Prompt` command, spawn `claude
-//! --print --output-format stream-json --dangerously-skip-permissions
-//! [--resume <claude_id>] "<text>"`, parse stdout JSONL line-by-line,
-//! translate to `HarnessEvent`s, child exits, await next prompt.
+//! Strategy (ADR 0037): **persistent process**. We spawn ONE `claude
+//! --input-format stream-json --output-format stream-json
+//! --dangerously-skip-permissions [--resume <claude_id>]` child and
+//! hold it for the adapter's lifetime. Each `Prompt` command is fed as
+//! one stream-json user message into the child's kept-open stdin; the
+//! per-turn boundary is the `{"type":"result"}` frame (NOT process
+//! exit). The child stays warm between turns — no Bun boot / V8-heap
+//! rebuild per prompt — which is also what lets a warm, idle harness be
+//! captured into the base memory snapshot (ADR 0022 File-restore).
+//!
+//! The child lives in `entry()`, OUTSIDE the per-connection loop, so it
+//! survives a vsock reconnect — the canonical case being an FC
+//! snapshot/restore, where the whole guest (this adapter + its `claude`
+//! child) is frozen and thawed while only the host-side connection
+//! drops. EOF on the child's stdout therefore means the child
+//! **crashed** (OOM / panic / signal), not a turn-end: we surface a
+//! diagnostic System message and respawn with `--resume` to recover the
+//! conversation. `Interrupt` SIGINTs the in-flight turn but keeps the
+//! process alive.
 //!
 //! `--dangerously-skip-permissions` is mandatory: there's no human in
-//! the VM to answer permission prompts, and `--print` mode aborts
-//! with exit 1 the first time a tool needs approval otherwise. The
-//! sandbox is the safety boundary, not Claude's per-tool consent.
+//! the VM to answer permission prompts. `IS_SANDBOX=1` is the
+//! documented escape hatch for Claude's root-check. The sandbox is the
+//! safety boundary, not Claude's per-tool consent.
 //!
-//! The first run captures Claude's auto-generated session id and
-//! stashes it in `/workspace/.engram/claude-session-id` so
-//! follow-ups can `--resume` into the same conversation. Lost on
-//! cold death (Dead status); a forked session gets a fresh
-//! Claude conversation.
+//! The first turn captures Claude's auto-generated session id and
+//! stashes it in `/workspace/.engram/claude-session-id` so a respawn
+//! (crash recovery / reconnect) can `--resume` into the same
+//! conversation. The file is per-session writable disk, not shared.
 
 // Cross-platform stub — vsock dialing is Linux-only, and the
 // adapter only ships inside FC rootfs / Linux ProcessBackend.
@@ -32,9 +46,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
-    use std::collections::VecDeque;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::{ExitCode, ExitStatus, Stdio};
+    use std::process::{ExitCode, Stdio};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -47,25 +59,24 @@ mod adapter {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
-    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
-    use tokio::process::Command;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+    use tokio::process::{ChildStdin, ChildStdout, Command};
     use tokio::sync::{mpsc, Mutex};
     use tokio::time::{timeout, Instant};
 
     pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engram/claude-session-id";
+
+    /// Grace window after a SIGINT (operator interrupt or per-turn
+    /// deadline) before we escalate to SIGKILL. Claude flushes its
+    /// transcript per message, so a clean turn-cancel lands well within
+    /// this; the escalation only fires if the child wedges.
+    const SIGINT_GRACE: Duration = Duration::from_secs(5);
 
     /// Truncation budgets used when building summary fields. Adapter-
     /// local enforcement of the wire docs.
     pub const MAX_ARGS_SUMMARY_BYTES: usize = 1024;
     pub const MAX_RESULT_SUMMARY_BYTES: usize = 4096;
     pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
-
-    /// Abnormal-exit diagnostics: how much of `claude`'s stderr to retain
-    /// for the crash artifact. Bounded so a chatty child can't grow the
-    /// tail without limit — the drain task always reads the pipe, so it
-    /// never wedges (the reason stderr was historically `inherit`ed).
-    pub const MAX_STDERR_TAIL_LINES: usize = 64;
-    pub const MAX_STDERR_TAIL_BYTES: usize = 4096;
 
     #[derive(Parser, Debug)]
     #[command(
@@ -104,12 +115,12 @@ mod adapter {
         #[arg(long, default_value_t = 600)]
         pub max_tool_call_secs: u64,
 
-        /// Whole-run wall-clock cap (seconds). After this the
-        /// adapter SIGTERMs `claude` and emits
-        /// `RunCompleted{ok:false}`. Default is 24h: an autonomous
-        /// agent in an isolated VM is expected to be able to grind
-        /// on a task for many hours without the wrapper killing it
-        /// out from under it. Tighten per-deployment if needed.
+        /// Per-turn wall-clock cap (seconds). After this the adapter
+        /// SIGINTs the in-flight turn (and SIGKILLs if it wedges) and
+        /// closes the turn `RunCompleted{ok:false}` — the persistent
+        /// process stays alive for the next prompt. Default is 24h: an
+        /// autonomous agent in an isolated VM is expected to grind on a
+        /// task for many hours. Tighten per-deployment if needed.
         #[arg(long, default_value_t = 86_400)]
         pub max_run_secs: u64,
 
@@ -172,15 +183,31 @@ mod adapter {
             return ExitCode::from(2);
         }
 
+        // Spawn the persistent `claude` child up front, before the dial
+        // loop. It comes up idle (claude only dials the API on the first
+        // user message), so this is the warm-but-quiescent state a base
+        // snapshot wants to capture (ADR 0037). A spawn failure here is
+        // non-fatal — `ensure_claude` retries on the first prompt.
+        let mut claude: Option<ClaudeChild> =
+            match spawn_persistent_claude(&cli, read_claude_session_id().await).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!(error = %e, "initial claude spawn failed; will retry on first prompt");
+                    None
+                }
+            };
+
         // Outer loop: dial → run one connection → if the connection
         // dropped (FC snapshot/restore round-trip is the canonical
-        // case), back off briefly and re-dial. State that needs to
-        // survive a reconnect lives here:
+        // case), back off briefly and re-dial. State that survives a
+        // reconnect lives here:
+        //   - `claude`: the persistent child. A reconnect re-establishes
+        //     the host channel only; the child (and its warm heap +
+        //     conversation) keeps running across the freeze.
         //   - `next_prompt`: a queued user prompt the previous
-        //     connection died before we could ack/run. We carry it
-        //     forward so the user doesn't have to re-issue.
-        //   - `/workspace/.engram/claude-session-id`: persisted by
-        //     `run_one_claude_prompt`; survives because it's on disk.
+        //     connection died before we could ack/run. Carried forward.
+        //   - `/workspace/.engram/claude-session-id`: persisted on disk;
+        //     used to `--resume` on a crash respawn.
         let mut next_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
         let mut consecutive_failures: u32 = 0;
         const MAX_BACKOFF_SECS: u64 = 30;
@@ -206,7 +233,7 @@ mod adapter {
                     continue;
                 }
             };
-            match run_one_connection(stream, &cli, &mut next_prompt).await {
+            match run_one_connection(stream, &cli, &mut next_prompt, &mut claude).await {
                 Outcome::Exit(code) => return code,
                 Outcome::Reconnect { reason } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -272,16 +299,126 @@ mod adapter {
         Reconnect { reason: &'static str },
     }
 
+    /// The persistent `claude` child: the process, its kept-open stdin
+    /// (we write one stream-json user message per turn), and its stdout
+    /// line reader (must persist across turns — rebuilding it would
+    /// discard buffered partial JSONL).
+    struct ClaudeChild {
+        child: tokio::process::Child,
+        stdin: ChildStdin,
+        lines: tokio::io::Lines<BufReader<ChildStdout>>,
+    }
+
+    /// Spawn the persistent `claude` child in stream-json I/O mode.
+    /// stdin is piped (we feed turns); stdout is piped (we parse
+    /// events); stderr is inherited (lands in the in-guest harness log —
+    /// piping it risks a write(2) deadlock once the 64KiB buffer fills).
+    /// `resume_id` is passed as `--resume` only when recovering an
+    /// existing conversation (crash respawn / reconnect).
+    async fn spawn_persistent_claude(
+        cli: &Cli,
+        resume_id: Option<String>,
+    ) -> std::io::Result<ClaudeChild> {
+        let argv = build_persistent_argv(&resume_id);
+        tracing::info!(?argv, "spawning persistent claude");
+        let claude_bin: &str = cli
+            .claude_bin
+            .as_deref()
+            .expect("claude_bin resolved at entry()");
+        let mut child = Command::new(claude_bin)
+            .args(&argv)
+            // Long-run knobs for unattended Claude inside a VM (Bash
+            // defaults would silently kill long builds), the
+            // nonessential-traffic toggle (no autoupdater/telemetry),
+            // and IS_SANDBOX=1 (root-check escape hatch — the VM is the
+            // boundary).
+            .env("BASH_DEFAULT_TIMEOUT_MS", "1800000")
+            .env("BASH_MAX_TIMEOUT_MS", "7200000")
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("IS_SANDBOX", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let lines = BufReader::new(stdout).lines();
+        Ok(ClaudeChild {
+            child,
+            stdin,
+            lines,
+        })
+    }
+
+    fn build_persistent_argv(resume_id: &Option<String>) -> Vec<String> {
+        let mut argv = vec![
+            "--input-format".to_string(),
+            "stream-json".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
+            // No human in the VM to approve tool calls. The VM itself is
+            // the safety boundary.
+            "--dangerously-skip-permissions".into(),
+        ];
+        if let Some(id) = resume_id {
+            argv.push("--resume".into());
+            argv.push(id.clone());
+        }
+        argv
+    }
+
+    /// Feed one user turn into the persistent child's stdin as a
+    /// stream-json user message. Built with `serde_json` (NOT string
+    /// interpolation) so prompts containing quotes / newlines /
+    /// backslashes serialize correctly.
+    async fn write_user_turn(stdin: &mut ChildStdin, text: &str) -> std::io::Result<()> {
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": text },
+        });
+        let mut line = serde_json::to_string(&msg).unwrap_or_default();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await
+    }
+
+    /// Render a non-success `ExitStatus` into a diagnostic string.
+    /// Distinguishes a plain non-zero exit from a fatal signal, and
+    /// calls out `SIGKILL` (commonly the OOM-killer inside the guest).
+    pub fn describe_exit(status: std::process::ExitStatus) -> String {
+        if let Some(code) = status.code() {
+            return format!("claude exited with code {code}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                let hint = match sig {
+                    9 => " (SIGKILL — likely the guest OOM-killer; check dmesg / cgroup memory)",
+                    11 => " (SIGSEGV — claude crashed)",
+                    6 => " (SIGABRT — claude panicked/aborted)",
+                    _ => "",
+                };
+                return format!("claude killed by signal {sig}{hint}");
+            }
+        }
+        "claude exited abnormally (no exit code)".to_string()
+    }
+
     async fn run_one_connection(
         stream: (BoxedReader, BoxedWriter),
         cli: &Cli,
         next_prompt: &mut Option<String>,
+        claude: &mut Option<ClaudeChild>,
     ) -> Outcome {
-        let (mut reader, mut writer) = stream;
+        let (mut reader, writer) = stream;
 
         // Handshake.
+        let mut writer_unlocked = writer;
         if let Err(e) = write_msg(
-            &mut writer,
+            &mut writer_unlocked,
             &HarnessAttach {
                 session_id: cli.session_id,
                 harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
@@ -308,11 +445,10 @@ mod adapter {
             return Outcome::Exit(ExitCode::from(1));
         }
 
-        // Reader task: shovel HarnessCommands onto an mpsc; the
-        // writer side stays single-threaded so event writes are
-        // serial and ordered. Channel-close (sender dropped) is the
-        // signal that the reader task hit EOF — i.e. the connection
-        // is dead.
+        // Reader task: shovel HarnessCommands onto an mpsc; the writer
+        // side stays single-threaded so event writes are serial and
+        // ordered. Channel-close (sender dropped) signals the reader hit
+        // EOF — the connection is dead.
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<HarnessCommand>(8);
         let reader_task = tokio::spawn(async move {
             loop {
@@ -328,12 +464,12 @@ mod adapter {
             }
         });
 
-        let writer = Arc::new(Mutex::new(writer));
+        let writer = Arc::new(Mutex::new(writer_unlocked));
 
         // If we have a pending prompt (initial $ENGRAM_INITIAL_PROMPT,
-        // or a queued one rolled over from a dropped connection),
-        // we'll run it on this turn. Otherwise emit Idle so the host
-        // knows we're waiting.
+        // or a queued one rolled over from a dropped connection), run it
+        // on this turn. Otherwise emit Idle so the host knows we're
+        // waiting.
         if next_prompt.is_none() && write_event(&writer, HarnessEvent::Idle).await.is_err() {
             reader_task.abort();
             return Outcome::Reconnect {
@@ -348,7 +484,8 @@ mod adapter {
                     match cmd_rx.recv().await {
                         Some(HarnessCommand::Prompt { text }) => break text,
                         Some(HarnessCommand::Shutdown { .. }) => {
-                            tracing::info!("shutdown received; exiting");
+                            tracing::info!("shutdown received; killing claude + exiting");
+                            kill_claude(claude).await;
                             reader_task.abort();
                             return Outcome::Exit(ExitCode::SUCCESS);
                         }
@@ -358,14 +495,15 @@ mod adapter {
                             // flush.
                         }
                         Some(HarnessCommand::Interrupt) => {
-                            // Idle between runs — there's no child to
-                            // SIGINT. Operator stop with nothing in
-                            // flight is a no-op; keep waiting.
+                            // Idle between turns — no in-flight turn to
+                            // SIGINT. Operator stop with nothing running
+                            // is a no-op; keep waiting.
                             tracing::debug!("interrupt while idle; nothing to stop");
                         }
                         None => {
                             // Reader task ended → connection died.
-                            // Reconnect rather than exit.
+                            // Reconnect rather than exit; the persistent
+                            // claude child keeps running.
                             reader_task.abort();
                             return Outcome::Reconnect {
                                 reason: "cmd_chan_closed",
@@ -375,25 +513,101 @@ mod adapter {
                 },
             };
 
-            // Stash the prompt back into next_prompt so a mid-run
-            // disconnect re-runs it on the next connection. We clear
-            // it on successful RunCompleted+Idle below.
+            // Stash the prompt back into next_prompt so a mid-turn
+            // disconnect or crash re-runs it on the next attempt. Cleared
+            // on a delivered turn below.
             *next_prompt = Some(text.clone());
 
-            let outcome = run_one_claude_prompt(cli, &writer, &text, &mut cmd_rx).await;
+            // Ensure the persistent child is alive (the eager spawn at
+            // entry may have failed, or a prior crash left it None).
+            if claude.is_none() {
+                match spawn_persistent_claude(cli, read_claude_session_id().await).await {
+                    Ok(c) => *claude = Some(c),
+                    Err(e) => {
+                        tracing::error!(error = %e, "spawn claude failed");
+                        let _ = write_event(
+                            &writer,
+                            HarnessEvent::AgentMessage {
+                                run_id: "spawn-failed".into(),
+                                message_id: format!("spawn-{}", uuid::Uuid::new_v4()),
+                                role: AgentRole::System,
+                                text: format!("failed to spawn claude: {e}"),
+                            },
+                        )
+                        .await;
+                        let _ = write_event(
+                            &writer,
+                            HarnessEvent::RunCompleted {
+                                run_id: "spawn-failed".into(),
+                                ok: false,
+                            },
+                        )
+                        .await;
+                        let _ = write_event(&writer, HarnessEvent::Idle).await;
+                        *next_prompt = None;
+                        continue;
+                    }
+                }
+            }
 
-            // Successful (or at least delivered) run — clear the
-            // pending prompt so we don't re-run it on the next turn.
-            // This also covers the interrupt case: an operator stop
-            // must NOT auto-re-run the interrupted prompt.
+            let outcome = {
+                let child = claude.as_mut().expect("ensured above");
+                run_one_turn(child, cli, &writer, &text, &mut cmd_rx).await
+            };
+
+            // Turn delivered — clear the pending prompt so we don't
+            // re-run it (covers interrupt: an operator stop must NOT
+            // auto-re-run the interrupted prompt).
             *next_prompt = None;
 
-            // An operator interrupt closes the run with RunInterrupted
-            // (distinct marker in the transcript); everything else with
-            // RunCompleted. Both are followed by the mandatory Idle, and
-            // the loop continues to await the next prompt either way —
-            // the session stays alive.
+            // A crashed child must be replaced before the next turn.
+            // Respawn with --resume to recover the conversation from the
+            // persisted session id. Do this even on the reconnect path so
+            // the child is ready when we re-attach.
+            if outcome.crashed {
+                *claude = spawn_persistent_claude(cli, read_claude_session_id().await)
+                    .await
+                    .ok();
+            }
+
+            // Mid-turn vsock drop: the turn was drained to its boundary
+            // (claude isn't wedged), but its events / RunCompleted are
+            // lost on the dead connection. Reconnect; the next connection
+            // emits Idle.
+            if let Some(reason) = outcome.reconnect {
+                reader_task.abort();
+                return Outcome::Reconnect { reason };
+            }
+
+            if outcome.shutdown {
+                kill_claude(claude).await;
+                reader_task.abort();
+                return Outcome::Exit(ExitCode::SUCCESS);
+            }
+
             let run_id = outcome.run_id.clone().unwrap_or_else(|| "unknown".into());
+            // Surface an abnormal child exit into the transcript as a
+            // System message — it persists as a session_event in PG, so
+            // "the agent crashed mid-turn" stays diagnosable even after
+            // the VM is gone. Emitted before RunCompleted so the ordering
+            // reads cause-then-close.
+            if let Some(reason) = &outcome.abnormal_exit {
+                let _ = write_event(
+                    &writer,
+                    HarnessEvent::AgentMessage {
+                        run_id: run_id.clone(),
+                        message_id: format!("crash-{}", uuid::Uuid::new_v4()),
+                        role: AgentRole::System,
+                        text: format!("agent process ended unexpectedly: {reason}"),
+                    },
+                )
+                .await;
+            }
+
+            // An operator interrupt closes the turn with RunInterrupted
+            // (distinct marker); everything else with RunCompleted. Both
+            // are followed by the mandatory Idle, and the loop awaits the
+            // next prompt either way — the session stays alive.
             let end_event = if outcome.interrupted {
                 HarnessEvent::RunInterrupted { run_id }
             } else {
@@ -421,22 +635,45 @@ mod adapter {
         }
     }
 
+    /// SIGTERM/SIGKILL + reap the persistent child (shutdown path).
+    /// `kill_on_drop` is a backstop, but an explicit reap avoids leaving
+    /// a zombie during the grace window.
+    async fn kill_claude(claude: &mut Option<ClaudeChild>) {
+        if let Some(mut c) = claude.take() {
+            let _ = c.child.start_kill();
+            let _ = timeout(SIGINT_GRACE, c.child.wait()).await;
+        }
+    }
+
     #[derive(Default)]
-    struct RunOutcome {
+    struct TurnOutcome {
         ok: bool,
         run_id: Option<String>,
+        /// A prompt that arrived mid-turn; the caller runs it next.
         queued_prompt: Option<String>,
-        /// The run was stopped by an operator `HarnessCommand::Interrupt`
-        /// (we SIGINT'd the child). The caller emits `RunInterrupted`
-        /// rather than `RunCompleted` for this.
+        /// Stopped by an operator `Interrupt` — caller emits
+        /// `RunInterrupted` rather than `RunCompleted`.
         interrupted: bool,
+        /// The child died (EOF / read error / SIGKILL escalation) and
+        /// must be respawned with `--resume` before the next turn.
+        crashed: bool,
+        /// Diagnostic for an *unsolicited* abnormal exit (a crash we
+        /// didn't cause). `None` when we initiated the exit
+        /// (interrupt / shutdown / deadline) or the turn ended cleanly.
+        abnormal_exit: Option<String>,
+        /// `Shutdown` arrived mid-turn — caller kills the child + exits.
+        shutdown: bool,
+        /// The host connection dropped mid-turn (event write failed or
+        /// the command channel closed). The turn is drained to its
+        /// boundary first; then the caller reconnects.
+        reconnect: Option<&'static str>,
     }
 
     /// SIGINT a running `claude` child — the graceful "stop the current
     /// turn" signal (mirrors a Ctrl-C / ESC). Claude flushes its
     /// conversation file per message synchronously, so the session stays
-    /// cleanly `--resume`-able after this. We escalate to SIGKILL only as
-    /// a grace-timeout fallback in the reap below.
+    /// cleanly `--resume`-able. We escalate to SIGKILL only as a
+    /// grace-timeout fallback.
     fn sigint_child(child: &tokio::process::Child) {
         if let Some(pid) = child.id() {
             if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGINT) {
@@ -445,283 +682,190 @@ mod adapter {
         }
     }
 
-    async fn run_one_claude_prompt<W>(
+    /// Drive one turn against the persistent child: feed the prompt as a
+    /// stream-json user message, then read stdout until the `result`
+    /// frame (turn done), EOF (child crashed), or a control event. The
+    /// child stays alive across a clean turn.
+    async fn run_one_turn<W>(
+        claude: &mut ClaudeChild,
         cli: &Cli,
         writer: &Arc<Mutex<W>>,
         text: &str,
         cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
-    ) -> RunOutcome
+    ) -> TurnOutcome
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let resume_id = read_claude_session_id().await;
-        let argv = build_claude_argv(&resume_id, text);
-        tracing::info!(?argv, "spawning claude");
-
-        let claude_bin: &str = cli
-            .claude_bin
-            .as_deref()
-            .expect("claude_bin resolved at entry()");
-        let mut child = match Command::new(claude_bin)
-            .args(&argv)
-            // Long-run knobs for unattended Claude inside a VM.
-            // Bash defaults (2min default / 10min cap) silently
-            // kill long builds and tests; bump to 30min/2h. The
-            // nonessential-traffic toggle disables the autoupdater,
-            // bug-command, and telemetry background calls — the VM
-            // typically has no outbound to those endpoints anyway,
-            // and they cause spurious failures on long runs.
-            // `IS_SANDBOX=1` is the documented escape hatch for
-            // Claude's root-check: with --dangerously-skip-permissions
-            // the CLI otherwise refuses to start as root, which is
-            // exactly how it runs inside our VM. The VM itself is
-            // the security boundary.
-            .env("BASH_DEFAULT_TIMEOUT_MS", "1800000")
-            .env("BASH_MAX_TIMEOUT_MS", "7200000")
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            .env("IS_SANDBOX", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            // Pipe stderr (was `inherit`) so we can retain a tail for the
-            // abnormal-exit diagnostic below. The historical wedge risk —
-            // a chatty child blocking on write(2) once the 64KiB pipe
-            // buffer fills because nobody reads it — is avoided by the
-            // dedicated drain task that ALWAYS reads the pipe. That task
-            // re-echoes each line to our own stderr, which agentd still
-            // points at the in-guest harness log
-            // (`/var/log/engram/harness.log`), so the prior `/exec`-
-            // visible behavior is preserved.
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, bin = %claude_bin, "spawn claude failed");
-                let _ = write_event(
-                    writer,
-                    HarnessEvent::AgentMessage {
-                        run_id: "spawn-failed".into(),
-                        message_id: format!("spawn-{}", uuid::Uuid::new_v4()),
-                        role: AgentRole::System,
-                        text: format!("failed to spawn `{claude_bin}`: {e}"),
-                    },
-                )
-                .await;
-                return RunOutcome::default();
-            }
-        };
-
-        let stdout = child.stdout.take().unwrap();
-        let mut lines = BufReader::new(stdout).lines();
-
-        // Drain claude's stderr into a bounded rolling tail. The task
-        // always reads the pipe (no wedge) and re-echoes each line to our
-        // own stderr so it still lands in the in-guest harness log. On an
-        // abnormal exit we attach this tail to a System message so the
-        // failure cause survives VM teardown (the harness log does not).
-        let stderr = child.stderr.take().unwrap();
-        let stderr_task: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
-            let mut tail: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_TAIL_LINES + 1);
-            let mut elines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = elines.next_line().await {
-                eprintln!("{line}");
-                if tail.len() >= MAX_STDERR_TAIL_LINES {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
-            }
-            tail.into_iter().collect()
-        });
+        // Feed the prompt. A broken pipe means the child died between
+        // turns → crashed; the caller respawns + re-runs.
+        if let Err(e) = write_user_turn(&mut claude.stdin, text).await {
+            tracing::warn!(error = %e, "writing prompt to claude stdin failed");
+            return TurnOutcome {
+                ok: false,
+                crashed: true,
+                abnormal_exit: Some(format!("could not deliver prompt to claude: {e}")),
+                ..Default::default()
+            };
+        }
 
         let deadline = Instant::now() + Duration::from_secs(cli.max_run_secs);
         let mut tool_calls = 0u32;
         let mut run_id: Option<String> = None;
-        let mut queued_prompt: Option<String> = None;
-        let mut ok = true;
-        let mut interrupted = false;
-        // The terminal `result` line claude emits at the end of every
-        // completed turn (success OR a handled error like our e2e 401).
-        // Its ABSENCE at stdout EOF is the crash signature — claude died
-        // mid-turn before reporting a result.
-        let mut result_marker: Option<ResultMarker> = None;
+        let mut out = TurnOutcome {
+            ok: true,
+            ..Default::default()
+        };
+        // True once WE signalled the child (interrupt / deadline) — gates
+        // abnormal-exit diagnosis and arms the SIGKILL grace.
+        let mut solicited = false;
+        // Set when we SIGINT the turn; once past it without a clean turn
+        // boundary, escalate to SIGKILL.
+        let mut kill_at: Option<Instant> = None;
+        // Once the host channel is gone we stop writing events / reading
+        // commands, but keep draining stdout so claude doesn't wedge on a
+        // full pipe.
+        let mut vsock_alive = true;
 
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
-                ok = false;
-                let _ = child.start_kill();
-                break;
+            let now = Instant::now();
+            // Per-turn deadline → SIGINT the turn (keep the process) and
+            // arm the SIGKILL grace.
+            if kill_at.is_none() && now >= deadline {
+                tracing::warn!("max_run_secs elapsed; SIGINT-ing turn");
+                sigint_child(&claude.child);
+                out.ok = false;
+                solicited = true;
+                kill_at = Some(now + SIGINT_GRACE);
             }
+            // Grace expired after a SIGINT → SIGKILL; the child is gone,
+            // so the caller respawns.
+            if let Some(k) = kill_at {
+                if now >= k {
+                    tracing::warn!("claude didn't end the turn after SIGINT; SIGKILL");
+                    let _ = claude.child.start_kill();
+                    out.crashed = true;
+                    break;
+                }
+            }
+            let read_deadline = kill_at.unwrap_or(deadline);
+            let remaining = read_deadline.saturating_duration_since(now);
 
             tokio::select! {
-                res = timeout(remaining, lines.next_line()) => {
+                res = timeout(remaining, claude.lines.next_line()) => {
                     match res {
                         Ok(Ok(Some(line))) => {
-                            if result_marker.is_none() {
-                                result_marker = detect_result_marker(&line);
+                            let v: Value = match serde_json::from_str(&line) {
+                                Ok(v) => v,
+                                Err(_) => continue, // non-JSON noise
+                            };
+                            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            if ty == "result" {
+                                // End of turn. The process stays alive.
+                                let is_err = v
+                                    .get("is_error")
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(false);
+                                out.ok = out.ok && !is_err;
+                                break;
                             }
-                            if let Some(translated) = translate_jsonl(
-                                &line,
+                            for ev in translate_value(
+                                &v,
                                 &mut run_id,
                                 &mut tool_calls,
                                 cli.max_tool_calls,
                             ) {
-                                for ev in translated {
-                                    let _ = write_event(writer, ev).await;
+                                if vsock_alive && write_event(writer, ev).await.is_err() {
+                                    vsock_alive = false;
+                                    out.reconnect = Some("event_write");
                                 }
                             }
                         }
-                        Ok(Ok(None)) => break, // EOF
+                        // EOF with no terminal `result` ⇒ the child died.
+                        Ok(Ok(None)) => {
+                            out.crashed = true;
+                            break;
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!(error = %e, "stdout read error");
-                            ok = false;
+                            out.crashed = true;
                             break;
                         }
-                        Err(_) => {
-                            tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
-                            ok = false;
-                            let _ = child.start_kill();
-                            break;
-                        }
+                        // Read timed out: re-loop so the deadline / grace
+                        // checks at the top fire.
+                        Err(_) => {}
                     }
                 }
-                cmd = cmd_rx.recv() => {
+                cmd = cmd_rx.recv(), if vsock_alive => {
                     match cmd {
                         Some(HarnessCommand::Prompt { text }) => {
-                            if queued_prompt.is_none() {
-                                queued_prompt = Some(text);
+                            if out.queued_prompt.is_none() {
+                                out.queued_prompt = Some(text);
                             } else {
                                 tracing::warn!("dropping prompt — one already queued");
                             }
                         }
                         Some(HarnessCommand::Shutdown { .. }) => {
-                            tracing::info!("shutdown mid-run; SIGTERM-ing claude");
-                            let _ = child.start_kill();
-                            ok = false;
+                            out.shutdown = true;
                             break;
                         }
                         Some(HarnessCommand::Interrupt) => {
-                            // Operator stop: SIGINT the current claude
-                            // child (graceful — it flushes its
-                            // conversation file per message, so the
-                            // session stays cleanly --resume-able). We
-                            // break and let the bounded reap below
-                            // escalate to SIGKILL if it doesn't go. The
-                            // run closes as RunInterrupted, NOT a kill —
-                            // the adapter stays attached for the next
-                            // prompt.
-                            tracing::info!("interrupt mid-run; SIGINT-ing claude");
-                            sigint_child(&child);
-                            ok = false;
-                            interrupted = true;
-                            break;
+                            // Operator stop: SIGINT the turn but keep the
+                            // process. Claude should end the turn with a
+                            // `result` (clean RunInterrupted); if it dies
+                            // instead, the EOF arm flags crashed and the
+                            // caller respawns. Arm the SIGKILL grace in
+                            // case it wedges.
+                            tracing::info!("interrupt mid-turn; SIGINT-ing claude");
+                            sigint_child(&claude.child);
+                            out.ok = false;
+                            out.interrupted = true;
+                            solicited = true;
+                            if kill_at.is_none() {
+                                kill_at = Some(Instant::now() + SIGINT_GRACE);
+                            }
                         }
                         Some(HarnessCommand::Checkpoint { .. }) => {}
-                        None => break,
+                        None => {
+                            // Host channel closed mid-turn. Stop reading
+                            // commands + writing events, but keep draining
+                            // stdout to the turn boundary so claude isn't
+                            // wedged; then reconnect.
+                            vsock_alive = false;
+                            out.reconnect = Some("cmd_chan_closed");
+                        }
                     }
                 }
             }
         }
 
-        // Bounded reap. Capture the child's ExitStatus (the signal/code
-        // is the crash signal — SIGKILL ≈ OOM-killer, SIGSEGV ≈ crash)
-        // instead of discarding it. The SIGINT (interrupt), SIGKILL
-        // (shutdown / max_run_secs), or EOF paths should all let the
-        // child exit promptly. If a signalled child doesn't go within the
-        // grace window, escalate to SIGKILL so we never wedge the loop.
-        let exit_status: Option<ExitStatus> =
-            match timeout(Duration::from_secs(5), child.wait()).await {
-                Ok(Ok(status)) => Some(status),
+        // If the child crashed, reap it and (when the exit was
+        // unsolicited) classify it for the transcript. A clean turn-end
+        // leaves the process running — nothing to reap.
+        if out.crashed {
+            let status = match timeout(SIGINT_GRACE, claude.child.wait()).await {
+                Ok(Ok(s)) => Some(s),
                 Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "reaping claude child failed");
+                    tracing::warn!(error = %e, "wait(claude) failed; exit status unknown");
                     None
                 }
                 Err(_) => {
-                    tracing::warn!("claude didn't exit within grace window; SIGKILL");
-                    let _ = child.start_kill();
-                    child.wait().await.ok()
+                    let _ = claude.child.start_kill();
+                    claude.child.wait().await.ok()
                 }
             };
-
-        // Collect the stderr tail. The drain task ends when the child
-        // closes stderr (the reap above just ensured that for a normal
-        // exit); bound the wait so a still-running child on the grace
-        // path can't hang us.
-        let stderr_tail: Vec<String> = match timeout(Duration::from_secs(2), stderr_task).await {
-            Ok(Ok(tail)) => tail,
-            _ => Vec::new(),
-        };
-
-        // Abnormal exit detection. `ok` is still true ONLY on the clean
-        // stdout-EOF path — every path where WE stopped the child
-        // (shutdown / max_run_secs / interrupt / read error) set
-        // ok=false. So `ok && result_marker.is_none()` means claude
-        // EOF'd on its own WITHOUT emitting its terminal `result` line:
-        // it died mid-turn. Surface the cause (exit signal + stderr tail)
-        // as a System message so it persists into session_events, which
-        // outlives the VM (and its in-guest harness log) on eviction.
-        //
-        // Gating on the missing `result` line — NOT on a non-zero exit
-        // code — is deliberate: the e2e bogus-token test makes claude
-        // 401 and exit non-zero, but claude DOES emit a `result` line
-        // first, so this stays silent there and the test's terminal
-        // AgentMessage remains the 401.
-        if ok && result_marker.is_none() {
-            ok = false;
-            let detail = describe_abnormal_exit(exit_status, &stderr_tail);
-            tracing::error!(detail, "claude exited abnormally mid-turn");
-            let _ = write_event(
-                writer,
-                HarnessEvent::AgentMessage {
-                    run_id: run_id.clone().unwrap_or_else(|| "abnormal-exit".into()),
-                    message_id: format!("abnormal-{}", uuid::Uuid::new_v4()),
-                    role: AgentRole::System,
-                    text: detail,
-                },
-            )
-            .await;
-        } else {
-            // Read the result fields explicitly (not via Debug) so they
-            // count as live for the dead_code lint, and so the log
-            // distinguishes a clean `success` from a handled-error result
-            // (`error_max_turns`, an API error claude surfaced, …).
-            tracing::info!(
-                status = ?exit_status,
-                result_subtype = result_marker.as_ref().map(|m| m.subtype.as_str()),
-                result_is_error = result_marker.as_ref().map(|m| m.is_error),
-                ok,
-                "claude run ended",
-            );
+            if !solicited {
+                out.abnormal_exit = match status {
+                    Some(s) if s.success() => None,
+                    Some(s) => Some(describe_exit(s)),
+                    None => Some("claude exited but its status could not be read".to_string()),
+                };
+                if out.abnormal_exit.is_some() {
+                    tracing::error!(reason = ?out.abnormal_exit, "claude exited abnormally mid-turn");
+                }
+            }
         }
 
-        RunOutcome {
-            ok,
-            run_id,
-            queued_prompt,
-            interrupted,
-        }
-    }
-
-    fn build_claude_argv(resume_id: &Option<String>, text: &str) -> Vec<String> {
-        let mut argv = vec![
-            "--print".to_string(),
-            "--output-format".into(),
-            "stream-json".into(),
-            "--verbose".into(),
-            // No human in the VM to approve tool calls; `--print`
-            // aborts with exit 1 the first time a tool needs
-            // approval otherwise. The VM itself is the safety
-            // boundary.
-            "--dangerously-skip-permissions".into(),
-        ];
-        if let Some(id) = resume_id {
-            argv.push("--resume".into());
-            argv.push(id.clone());
-        }
-        argv.push(text.to_string());
-        argv
+        out
     }
 
     async fn read_claude_session_id() -> Option<String> {
@@ -753,87 +897,10 @@ mod adapter {
         write_msg(&mut *w, &HarnessFrame::Event(ev)).await
     }
 
-    /// The terminal `result` line claude emits at the end of every
-    /// completed turn. `subtype` is `success` or a handled-error variant
-    /// (`error_max_turns`, an API error it surfaced, …); `is_error`
-    /// distinguishes the two. We retain only that we saw it (plus those
-    /// fields, for the diagnostic) — its presence means the turn ended in
-    /// an orderly way, even if unhappily.
-    #[derive(Debug, Clone)]
-    pub struct ResultMarker {
-        pub subtype: String,
-        pub is_error: bool,
-    }
-
-    /// Detect claude's terminal `result` line. Substring-gated so we
-    /// don't double-parse every JSONL line — claude's stream-json is
-    /// compact, so `"type":"result"` appears verbatim only on the result
-    /// line (a `tool_result` block lives inside a `type":"user"` line and
-    /// does not match).
-    pub fn detect_result_marker(line: &str) -> Option<ResultMarker> {
-        if !line.contains("\"type\":\"result\"") {
-            return None;
-        }
-        let v: Value = serde_json::from_str(line).ok()?;
-        if v.get("type")?.as_str()? != "result" {
-            return None;
-        }
-        Some(ResultMarker {
-            subtype: v
-                .get("subtype")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string(),
-            is_error: v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false),
-        })
-    }
-
-    /// Human-readable hint for the common fatal signals, so an operator
-    /// reading session_events doesn't have to remember signal numbers.
-    fn signal_hint(sig: i32) -> &'static str {
-        match sig {
-            9 => " (SIGKILL — typically the in-guest OOM-killer or an external kill)",
-            11 => " (SIGSEGV — segfault)",
-            6 => " (SIGABRT — abort, e.g. a panic or assertion)",
-            15 => " (SIGTERM)",
-            _ => "",
-        }
-    }
-
-    /// Build the System-message body for an abnormal claude exit: the
-    /// exit code/signal plus the tail of claude's stderr. This is the
-    /// durable crash artifact — it rides the event stream into
-    /// `session_events`, surviving the VM teardown that erases the
-    /// in-guest harness log. SIGKILL here is the OOM-killer signature.
-    pub fn describe_abnormal_exit(status: Option<ExitStatus>, stderr_tail: &[String]) -> String {
-        let exit = match status {
-            None => "could not be reaped (status unavailable)".to_string(),
-            Some(s) => {
-                if let Some(code) = s.code() {
-                    format!("exited with code {code}")
-                } else if let Some(sig) = s.signal() {
-                    format!("was killed by signal {sig}{}", signal_hint(sig))
-                } else {
-                    "exited (status unavailable)".to_string()
-                }
-            }
-        };
-        let tail = if stderr_tail.is_empty() {
-            "(no stderr captured)".to_string()
-        } else {
-            truncate_str(&stderr_tail.join("\n"), MAX_STDERR_TAIL_BYTES)
-        };
-        format!(
-            "engram-harness: claude exited abnormally mid-turn — it {exit} without emitting a \
-             terminal `result`, so the turn did not complete. This is a harness/agent crash, \
-             not an engram platform error. claude stderr tail:\n{tail}"
-        )
-    }
-
-    /// Translate one JSONL line from Claude's `--output-format
-    /// stream-json` into zero or more HarnessEvents. Tracks the
-    /// run_id captured from `system.init` and the per-run
-    /// tool-call count.
+    /// Parse one JSONL line from Claude's stream-json output, then
+    /// translate. Returns `None` only when the line isn't JSON. Thin
+    /// wrapper over [`translate_value`] so the hot path (which already
+    /// parsed the line to detect the `result` frame) doesn't re-parse.
     pub fn translate_jsonl(
         line: &str,
         run_id: &mut Option<String>,
@@ -841,8 +908,23 @@ mod adapter {
         max_tool_calls: u32,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
-        let ty = v.get("type")?.as_str()?;
+        Some(translate_value(&v, run_id, tool_calls, max_tool_calls))
+    }
+
+    /// Translate one parsed stream-json frame into zero or more
+    /// HarnessEvents. Tracks the run_id captured from `system.init` and
+    /// the per-turn tool-call count. The `result` frame is handled by the
+    /// turn loop (it's the turn boundary) and yields no events here.
+    pub fn translate_value(
+        v: &Value,
+        run_id: &mut Option<String>,
+        tool_calls: &mut u32,
+        max_tool_calls: u32,
+    ) -> Vec<HarnessEvent> {
         let mut out: Vec<HarnessEvent> = Vec::new();
+        let Some(ty) = v.get("type").and_then(|t| t.as_str()) else {
+            return out;
+        };
         match ty {
             "system" => {
                 let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
@@ -856,13 +938,11 @@ mod adapter {
                         .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
                     *run_id = Some(rid.clone());
                     if let Some(sid) = session_id {
-                        // `translate_jsonl` is sync and is called from
+                        // `translate_value` is sync and is called from
                         // unit tests outside any tokio runtime. Only
                         // fire-and-forget the disk write when a runtime
-                        // is actually available; in tests this becomes
-                        // a no-op rather than panicking, and we don't
-                        // accidentally write to `/workspace/.engram` on
-                        // the test host.
+                        // is available; in tests this becomes a no-op
+                        // rather than panicking.
                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
                             handle.spawn(async move { write_claude_session_id(&sid).await });
                         }
@@ -875,7 +955,9 @@ mod adapter {
             }
             "assistant" => {
                 let rid = run_id.clone().unwrap_or_default();
-                let msg = v.get("message")?;
+                let Some(msg) = v.get("message") else {
+                    return out;
+                };
                 let msg_id = msg
                     .get("id")
                     .and_then(|s| s.as_str())
@@ -935,7 +1017,9 @@ mod adapter {
             }
             "user" => {
                 let rid = run_id.clone().unwrap_or_default();
-                let msg = v.get("message")?;
+                let Some(msg) = v.get("message") else {
+                    return out;
+                };
                 if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
                     for b in blocks {
                         let bt = b.get("type").and_then(|s| s.as_str()).unwrap_or("");
@@ -973,13 +1057,10 @@ mod adapter {
                     }
                 }
             }
-            "result" => {
-                // Outer loop emits RunCompleted from claude's exit
-                // status; the result event is informational.
-            }
+            // "result" is the turn boundary, handled by run_one_turn.
             _ => {}
         }
-        Some(out)
+        out
     }
 
     pub fn truncate_str(s: &str, max_bytes: usize) -> String {
@@ -1057,6 +1138,17 @@ mod tests {
         }
     }
 
+    /// The `result` frame is the turn boundary, not an event — it
+    /// translates to zero events (run_one_turn consumes it directly).
+    #[test]
+    fn result_frame_yields_no_events() {
+        let result = r#"{"type":"result","subtype":"success","is_error":false}"#;
+        let mut run_id = Some("r".to_string());
+        let mut tc = 0u32;
+        let evs = translate_jsonl(result, &mut run_id, &mut tc, 50).unwrap();
+        assert!(evs.is_empty(), "result should yield no events: {evs:?}");
+    }
+
     #[test]
     fn truncate_respects_utf8_boundaries() {
         let s = "🦀".repeat(100);
@@ -1065,53 +1157,24 @@ mod tests {
     }
 
     #[test]
-    fn detects_terminal_result_line() {
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
-        let m = detect_result_marker(line).expect("should detect terminal result");
-        assert_eq!(m.subtype, "success");
-        assert!(!m.is_error);
-
-        // A handled error (e.g. the e2e 401) still emits a result line —
-        // it must be detected so we DON'T flag it as an abnormal exit.
-        let err = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
-        let m = detect_result_marker(err).expect("error result still detected");
-        assert!(m.is_error);
-    }
-
-    #[test]
-    fn non_result_lines_are_not_markers() {
-        // assistant text, and a tool_result nested in a `user` line, must
-        // NOT be mistaken for the terminal result marker.
-        let asst =
-            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"hi"}]}}"#;
-        let tool = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"out","is_error":false}]}}"#;
-        assert!(detect_result_marker(asst).is_none());
-        assert!(detect_result_marker(tool).is_none());
-    }
-
-    #[test]
-    fn abnormal_exit_detail_flags_oom_signal() {
+    fn describe_exit_classifies_code_and_signal() {
         use std::os::unix::process::ExitStatusExt;
-        // raw wait-status `9` == terminated by signal 9 (SIGKILL).
-        let killed = std::process::ExitStatus::from_raw(9);
-        let detail =
-            describe_abnormal_exit(Some(killed), &["fatal: JS heap out of memory".to_string()]);
-        assert!(detail.contains("signal 9"), "got: {detail}");
+        // Raw wait status encoding: a plain exit code N is (N << 8).
+        let code1 = std::process::ExitStatus::from_raw(1 << 8);
         assert!(
-            detail.contains("OOM"),
-            "should hint OOM for SIGKILL: {detail}"
+            describe_exit(code1).contains("code 1"),
+            "a non-zero exit code should be reported",
         );
-        assert!(detail.contains("out of memory"), "should carry stderr tail");
-        assert!(detail.contains("did not complete"));
-    }
-
-    #[test]
-    fn abnormal_exit_detail_reports_nonzero_code() {
-        use std::os::unix::process::ExitStatusExt;
-        // raw status `1 << 8` == exited with code 1.
-        let exited = std::process::ExitStatus::from_raw(1 << 8);
-        let detail = describe_abnormal_exit(Some(exited), &[]);
-        assert!(detail.contains("code 1"), "got: {detail}");
-        assert!(detail.contains("no stderr captured"));
+        // ...and a fatal signal N is the low 7 bits.
+        let killed = std::process::ExitStatus::from_raw(9);
+        let d = describe_exit(killed);
+        assert!(
+            d.contains("signal 9"),
+            "fatal signal should be reported: {d}"
+        );
+        assert!(
+            d.contains("OOM"),
+            "SIGKILL should hint at the OOM-killer (the most common guest cause): {d}",
+        );
     }
 }
