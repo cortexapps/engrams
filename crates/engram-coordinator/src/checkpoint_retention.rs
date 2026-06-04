@@ -13,7 +13,10 @@
 //!   (default 24) are kept — restorable / forkable history;
 //! - older-than-window rows are deleted; chunks they exclusively
 //!   referenced become GC candidates under the existing pin-set
-//!   machinery (ADR 0016 Phase C) and its 24 h grace.
+//!   machinery (ADR 0016 Phase C) and its 24 h grace. Their portable
+//!   `snapshots/<id>/` blobs (state.bin / sidecar) likewise become
+//!   unpinned and are reaped by the snapshot-blob GC sweep (ADR 0028
+//!   addendum) — this sweeper no longer deletes them inline.
 //! - template snapshots (`session_id IS NULL`, the enabled-image base
 //!   captures) are exempt — their lifecycle belongs to
 //!   `enabled_images`.
@@ -67,38 +70,19 @@ pub fn spawn(cfg: CheckpointRetentionConfig, state: SharedState) -> tokio::task:
             {
                 Ok(deleted) if deleted.is_empty() => {}
                 Ok(deleted) => {
-                    // The generation bump above makes the chunks/manifests
-                    // these rows exclusively referenced GC candidates, but
-                    // the per-snapshot portable blobs (`snapshots/<id>/`
-                    // state.bin + sidecar) live outside the chunk-GC
-                    // namespace and would otherwise orphan forever. Delete
-                    // them here, now that the rows (and thus any resume
-                    // that could reference them) are gone. Best-effort: a
-                    // missing object (memory-less snapshot never uploaded
-                    // one, or abort already removed it) is a harmless 404.
-                    let mut blobs_deleted = 0usize;
-                    for sid in &deleted {
-                        for key in [
-                            engram_chunk_store::snapshot_blob::state_blob_key(*sid),
-                            engram_chunk_store::snapshot_blob::sidecar_blob_key(*sid),
-                        ] {
-                            match state.services.blob.delete(&key).await {
-                                Ok(()) => blobs_deleted += 1,
-                                Err(e) => tracing::debug!(
-                                    snapshot_id = %sid,
-                                    key = %key,
-                                    error = %e,
-                                    "checkpoint retention: portable blob delete failed \
-                                     (best-effort; object may not exist)",
-                                ),
-                            }
-                        }
-                    }
+                    // The generation bump inside `prune_session_snapshots`
+                    // re-classifies the chunks/manifests these rows
+                    // exclusively referenced. The per-snapshot portable
+                    // blobs (`snapshots/<id>/`) are now unpinned (no row)
+                    // and reaped by the snapshot-blob GC sweep on its next
+                    // tick — we no longer delete them inline here (ADR 0028
+                    // addendum: portable blobs are pin-set-governed, so
+                    // nothing but the sweep deletes a durable snapshot
+                    // blob).
                     tracing::info!(
                         deleted = deleted.len(),
-                        blobs_deleted,
                         retention_secs = cfg.retention.as_secs(),
-                        "checkpoint retention sweep pruned aged-out session snapshots + portable blobs",
+                        "checkpoint retention sweep pruned aged-out session snapshots",
                     );
                 }
                 Err(e) => {

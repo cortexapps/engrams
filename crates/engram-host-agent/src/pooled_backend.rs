@@ -1258,29 +1258,30 @@ impl PooledBackend {
         Ok(())
     }
 
-    /// ADR 0014 issue #1/#2: tear down a snapshot whose downstream
-    /// pipeline failed (or whose successor snapshot() call is about
-    /// to overwrite it). Removes:
+    /// ADR 0014 issue #1/#2 + ADR 0028 addendum: tear down the LOCAL
+    /// artifacts of a snapshot whose downstream pipeline failed (or
+    /// whose successor `snapshot()` call is about to overwrite it).
+    /// Removes only the per-snapshot local dir at
+    /// `<work_dir>/sandboxes/snapshots/<snapshot_id>/` (4+ GiB on FC;
+    /// the 99 GB `engrams-fc-xngk` host filled in ~12 min by leaking 25
+    /// of these in 13 min) — host-disk hygiene, and rebuildable from
+    /// BlobStorage on the next restore.
     ///
-    /// - the per-snapshot local dir at
-    ///   `<work_dir>/sandboxes/snapshots/<snapshot_id>/` (4+ GiB on FC;
-    ///   the 99 GB `engrams-fc-xngk` host filled in ~12 min by leaking
-    ///   25 of these in 13 min).
-    /// - the per-snapshot opaque blobs in BlobStorage (state.bin,
-    ///   sidecar.json, working_set.json). Each is small (KiB-MiB) but
-    ///   leaving them around per failed attempt accumulates.
+    /// It does NOT delete the per-snapshot BlobStorage objects
+    /// (state.bin / sidecar.json / working_set.json) or the chunked
+    /// manifests. Those are governed by the pin-set GC model
+    /// (`coordinator::snapshot_blob_gc` for the portable blobs, the
+    /// chunk GC for manifests): a blob is deleted only when no
+    /// `snapshots` row references it, after a grace period. Deleting
+    /// them inline here was the engine of the recurring
+    /// "recoverable=true but blobs gone" brick — a concurrent producer
+    /// (a periodic checkpoint vs an eviction sharing this one
+    /// per-sandbox inflight slot) would abort a snapshot whose row was
+    /// already recorded, deleting its durable blobs out from under a
+    /// resume. Now no producer ever deletes a durable blob.
     ///
-    /// Chunks (memory + disk content-addressed manifests) are NOT
-    /// deleted here: they're shared across snapshots by content
-    /// hash. Cross-host lifecycle is currently no-op (chunk-store
-    /// GC was removed 2026-05-23 — see ADR 0015 M5). Same reason
-    /// we don't bother deleting from the chunk-cache LRU.
-    ///
-    /// Best-effort: every step's error is logged but never propagated
-    /// beyond the WARN level. The caller (snapshot retry or
-    /// `abort_snapshot` RPC) can't act on partial failure usefully —
-    /// the only useful retry is calling this function again, which is
-    /// idempotent. Clears the inflight tracking entry on entry so a
+    /// Best-effort: a local-dir removal error is logged, never
+    /// propagated. Clears the inflight tracking entry on entry so a
     /// double-call doesn't try to clean twice.
     async fn abort_prior_inflight_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         let Some((_, snapshot_id)) = self.inflight_snapshots.remove(&id) else {
@@ -1292,7 +1293,7 @@ impl PooledBackend {
                 sandbox_id = %id,
                 snapshot_id = %snapshot_id,
                 dest = %dest.display(),
-                "abort_snapshot: removed local snapshot dir",
+                "abort_snapshot: removed local snapshot dir (blobs are GC-governed)",
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(
@@ -1302,24 +1303,6 @@ impl PooledBackend {
                 error = %e,
                 "abort_snapshot: rm -rf of snapshot dir failed (best-effort)",
             ),
-        }
-        if let Some(chunk_store) = self.chunk_store.as_ref() {
-            let blob = chunk_store.blob_storage();
-            for key in [
-                engram_chunk_store::snapshot_blob::state_blob_key(snapshot_id),
-                engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot_id),
-                engram_chunk_store::snapshot_blob::working_set_blob_key(snapshot_id),
-            ] {
-                if let Err(e) = blob.delete(&key).await {
-                    tracing::warn!(
-                        sandbox_id = %id,
-                        snapshot_id = %snapshot_id,
-                        key = %key,
-                        error = %e,
-                        "abort_snapshot: blob delete failed (best-effort)",
-                    );
-                }
-            }
         }
         Ok(())
     }
@@ -4330,12 +4313,15 @@ mod tests {
             assert!(!pooled.inflight_snapshots.contains_key(&sandbox_id));
         }
 
-        /// abort_snapshot tears down the local dir and the per-snapshot
-        /// opaque blobs. This is the bandage on coord-side pipeline
-        /// failures — the prod incident leaked 4 GiB per failed retry
-        /// because we lacked this RPC.
+        /// ADR 0028 addendum: abort_snapshot tears down the LOCAL dir
+        /// (host-disk hygiene — the 4 GiB-per-retry leak) but NO LONGER
+        /// deletes the per-snapshot blobs. Those are governed by the
+        /// snapshot-blob GC sweep now, pinned by the `snapshots` row;
+        /// deleting them inline here was the engine of the recurring
+        /// "recoverable=true but blobs gone" brick (a concurrent producer
+        /// aborting another's already-recorded snapshot).
         #[tokio::test]
-        async fn abort_snapshot_removes_dir_and_blobs() {
+        async fn abort_snapshot_removes_dir_keeps_blobs() {
             let tmp = tempfile::tempdir().unwrap();
             let (pooled, blob) = build_pooled(&tmp);
 
@@ -4347,14 +4333,14 @@ mod tests {
 
             pooled.abort_snapshot(sandbox_id).await.unwrap();
 
-            assert!(!dir.exists(), "abort must rm -rf the snapshot dir");
+            assert!(!dir.exists(), "abort must rm -rf the local snapshot dir");
             assert!(
-                !blob.exists(&state_key).await.unwrap(),
-                "abort must delete the state.bin blob",
+                blob.exists(&state_key).await.unwrap(),
+                "abort must NOT delete the state.bin blob — it's GC-governed now",
             );
             assert!(
-                !blob.exists(&sidecar_key).await.unwrap(),
-                "abort must delete the sidecar.json blob",
+                blob.exists(&sidecar_key).await.unwrap(),
+                "abort must NOT delete the sidecar.json blob — it's GC-governed now",
             );
             assert!(!pooled.inflight_snapshots.contains_key(&sandbox_id));
         }
@@ -4380,10 +4366,12 @@ mod tests {
         }
 
         /// The retry case: a second snapshot() for the same sandbox
-        /// tears down the first attempt's artifacts BEFORE producing
-        /// the new one. Closes the prod incident's leak class entirely
-        /// — even if the coord pod crashes between snapshot and
-        /// commit/abort, the next retry self-cleans.
+        /// tears down the first attempt's LOCAL dir BEFORE producing the
+        /// new one (host-disk hygiene — the 4 GiB-per-retry leak). ADR
+        /// 0028 addendum: it no longer deletes the prior's durable blobs
+        /// inline — those are reaped by the snapshot-blob GC sweep (the
+        /// prior is orphaned, no row, so it's swept after grace).
+        /// Deleting them inline was the engine of the recurring brick.
         #[tokio::test]
         async fn retry_snapshot_overwrites_prior_attempt() {
             let tmp = tempfile::tempdir().unwrap();
@@ -4407,14 +4395,18 @@ mod tests {
             assert!(second_dir.exists());
             assert!(blob.exists(&second_state_key).await.unwrap());
 
-            // First attempt's artifacts are GONE — overwrite-in-place.
+            // First attempt's LOCAL dir is GONE — overwrite-in-place.
             assert!(
                 !first_dir.exists(),
-                "retry must rm the prior attempt's snapshot dir",
+                "retry must rm the prior attempt's local snapshot dir",
             );
+            // ...but its BLOB stays — durable-blob deletion is the GC
+            // sweep's job now (the prior is orphaned with no row, so the
+            // sweep reaps it after grace). Deleting it inline here was
+            // the brick race.
             assert!(
-                !blob.exists(&first_state_key).await.unwrap(),
-                "retry must delete the prior attempt's state.bin blob",
+                blob.exists(&first_state_key).await.unwrap(),
+                "retry must NOT delete the prior attempt's blob — GC-governed now",
             );
         }
     }
