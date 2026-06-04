@@ -313,6 +313,19 @@ pub trait SandboxBackend: Send + Sync {
         false
     }
 
+    /// ADR 0022 Option A: per-restore-flavor variant of
+    /// [`Self::restore_memory_is_lazy`]. `fresh == true` is a base
+    /// `session.create` (the `restore_fresh` flavor), which can use the
+    /// File backend against the resident per-template memfile even when
+    /// idle-resume (`fresh == false`) serves memory lazily via UFFD. The
+    /// `PooledBackend` calls this so it materializes the contiguous
+    /// `memory.bin` for base-create (File) and skips it for resume
+    /// (UFFD). Default delegates to the flavor-agnostic method so
+    /// backends that don't bifurcate (VZ, Process) need not implement it.
+    fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
+        self.restore_memory_is_lazy()
+    }
+
     /// ADR 0020 P1: boot `spec` to agentd-ready with the stub harness
     /// attached (harness unmounted — the option-D capture point), take
     /// a portable FC snapshot (chunked memory + uploaded state/sidecar),

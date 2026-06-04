@@ -3486,8 +3486,17 @@ impl SandboxBackend for FirecrackerBackend {
 
     fn restore_memory_is_lazy(&self) -> bool {
         // ADR 0020 Route B: Uffd serves memory from chunks on fault,
-        // so no materialized memory.bin is needed on restore.
+        // so no materialized memory.bin is needed on restore. This is
+        // the resume-flavor answer (`fresh == false`).
         matches!(self.config.restore_mode, RestoreMode::Uffd)
+    }
+
+    fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
+        // ADR 0022 Option A: mirror `effective_restore_mode` exactly so
+        // the materialize decision can't drift from the load decision —
+        // base-create under File materializes the (shared) memfile;
+        // resume under UFFD stays lazy.
+        matches!(self.effective_restore_mode(fresh), RestoreMode::Uffd)
     }
 
     /// ADR 0020 P1: block until agentd dials its ready port. Extracted
