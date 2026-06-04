@@ -158,7 +158,6 @@
     "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
   --font-display:
     "Saira Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-serif: Georgia, "Iowan Old Style", "Source Serif 4", serif;
   --font-mono:
     "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 
@@ -167,6 +166,10 @@
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
 }
+
+/* The instrument-label voice now lives in the Text component's `label`
+   variant (components/ui/text.tsx) — Saira tracked caps, the single source of
+   truth for every label across the app. */
 
 @layer base {
   * { @apply border-border outline-ring/50; }

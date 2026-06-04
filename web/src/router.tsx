@@ -1,8 +1,9 @@
 // Code-based TanStack Router tree for engrams-web. The shell is RootLayout (the
 // primary destinations rail + inset). `/sessions` and `/settings` are nested
 // LAYOUT routes that each render their own second sidebar + <Outlet/>;
-// Fleet/Storage render full-bleed in the inset. SessionDetail lives OUTSIDE the
-// sessions layout (full-bleed, keeps its old transcript styling).
+// Fleet/Storage render full-bleed in the inset. SessionDetail is a CHILD of the
+// sessions layout, so the persistent sessions rail stays mounted across the
+// list views and the transcript (the highlight moves; the rail doesn't remount).
 //
 // Admin surfaces guard via a shared `requireAdmin` beforeLoad reading `isAdmin`
 // from typed router context; the context's `auth` is populated at
@@ -71,11 +72,12 @@ const allSessionsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: AllSessions,
 });
-// Session detail is OUTSIDE the sessions layout (full-bleed, no 2nd sidebar,
-// keeps its old styling). It is a child of root at /sessions/$id.
+// Session detail is a CHILD of the sessions layout at /sessions/$id, so the
+// persistent sessions rail wraps it too. Static `all` outranks the dynamic
+// `$id`, so /sessions/all still resolves to the fleet list.
 const sessionDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/sessions/$id',
+  getParentRoute: () => sessionsLayoutRoute,
+  path: '$id',
   component: SessionDetail,
 });
 
@@ -113,8 +115,7 @@ const registriesRoute = createRoute({ getParentRoute: () => settingsLayoutRoute,
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
-  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute]),
-  sessionDetailRoute,
+  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
   fleetRoute,
   storageRoute,
   settingsLayoutRoute.addChildren([

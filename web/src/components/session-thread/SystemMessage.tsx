@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Text } from '@/components/ui/text';
 import { Button } from '@/components/ui/button';
 import { API_BASE } from '../../api';
 import { fmtBytes, hms } from '../transcriptFmt';
@@ -58,9 +59,9 @@ function Recovery({
       <CardContent className="flex flex-col gap-1.5 p-4">
         <div className="flex items-center gap-2 text-xs text-primary">
           <RotateCcwIcon className="size-3.5" />
-          <span className="uppercase tracking-wide">
+          <Text as="span" variant="label">
             recovered from a checkpoint after a host failure
-          </span>
+          </Text>
           <span className="ml-auto font-mono tabular-nums text-muted-foreground">
             {hms(marker.at)}
           </span>
@@ -91,7 +92,7 @@ function Durability({
   return (
     <div className="flex items-center justify-center gap-2 py-1 text-xs text-muted-foreground">
       <Icon className="size-3.5" />
-      <span className="uppercase tracking-wide">{label}</span>
+      <Text as="span" variant="label">{label}</Text>
       {marker.sizeBytes != null && (
         <>
           <span aria-hidden>·</span>
@@ -114,7 +115,7 @@ function PullRequest({
       <CardContent className="flex flex-col gap-1.5 p-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <GitPullRequestIcon className="size-3.5 text-primary" />
-          <span className="uppercase tracking-wide">pull request</span>
+          <Text as="span" variant="label">pull request</Text>
           <span aria-hidden>·</span>
           <span className="font-mono">
             {marker.repo} #{marker.number}
@@ -160,7 +161,7 @@ function Artifact({
       <CardContent className="flex flex-col gap-2 p-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <DownloadIcon className="size-3.5 text-primary" />
-          <span className="uppercase tracking-wide">shared file</span>
+          <Text as="span" variant="label">shared file</Text>
           <span aria-hidden>·</span>
           <span className="font-mono">{marker.mediaType}</span>
           <span aria-hidden>·</span>

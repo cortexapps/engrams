@@ -25,7 +25,7 @@ export function MySessions() {
   ];
 
   return (
-    <div className="space-y-6">
+    <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
       <PageHeading
         title="Sessions"
         description="Bounded units of agent work — launch, watch, resume."

@@ -5,11 +5,13 @@ import { useSessionEvents } from '../hooks/useSessionEvents';
 import { StatusGlyph } from '../components/Glyph';
 import { SessionThread } from '../components/session-thread/SessionThread';
 import { TabRow } from '../components/TabRow';
+import { PageHeading } from '../components/page-heading';
 import { TerminalPane } from '../components/TerminalPane';
 import { SessionCowState } from '../components/CowState';
 import { DurabilityTimeline } from '../components/DurabilityTimeline';
 import { relativeTime } from './sessions/session-format';
 import { Sidebar, SidebarContent, SidebarProvider } from '@/components/ui/sidebar';
+import { Text } from '@/components/ui/text';
 import type { Session } from '../types';
 
 type ViewTab = 'transcript' | 'shell' | 'raw';
@@ -44,28 +46,22 @@ export function SessionDetail() {
   // wide screens; collapsible="none" means no toggle (and so no cmd+B clash
   // with the primary spine's provider).
   return (
+    // Nested inside SessionsLayout's provider (the persistent sessions rail),
+    // so we fill the section's height rather than the viewport — `min-h-0
+    // flex-1` overrides the provider's built-in `min-h-svh`. `--sidebar-width`
+    // here scopes the RIGHT metadata rail; the left rail uses the layout's.
     <SidebarProvider
       defaultOpen
-      className="h-[100svh] min-h-0 overflow-hidden"
+      className="min-h-0 flex-1 overflow-hidden"
       style={{ '--sidebar-width': '18rem' } as CSSProperties}
     >
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="shrink-0 px-6 pt-6">
-          {/* No `← back` link — the nav spine carries the `↳ <short id>`
-              sub-crumb and keeps the Sessions tab active (ADR 0029). The lime
-              index-bar on the rule mirrors the PageHeading masthead. */}
-          <div className="relative border-b pb-3">
-            <span
-              aria-hidden
-              className="absolute -bottom-px left-0 h-0.5 w-10 bg-primary"
-            />
-            <div className="font-mono text-[0.7rem] uppercase tracking-[0.18em] text-muted-foreground">
-              session
-            </div>
-            <h1 className="mt-0.5 font-mono text-2xl leading-tight tracking-tight text-foreground">
-              {id}
-            </h1>
-          </div>
+          {/* No `← back` link — the persistent sessions rail (left) keeps the
+              full list in view and highlights this session, so location is
+              never lost (ADR 0029). The masthead is the shared PageHeading:
+              `session` eyebrow over the mono session id. */}
+          <PageHeading eyebrow="session" title={id} titleVariant="mono" />
 
           <div className="mt-4">
             <TabRow tabs={TABS} active={tab} onChange={setTab} />
@@ -149,9 +145,9 @@ function SessionMeta({
           work durable yet" (CowState) and "what coherent points can I
           recover/fork to" (the checkpoint chain), visible across every tab. */}
       <div className="border-t pt-4">
-        <div className="mb-2.5 font-mono text-[0.65rem] uppercase tracking-[0.14em] text-muted-foreground">
+        <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
           durability
-        </div>
+        </Text>
         <SessionCowState sessionId={sessionId} />
         <div className="mt-3">
           <DurabilityTimeline sessionId={sessionId} />

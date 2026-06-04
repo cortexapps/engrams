@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { type ComponentProps, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -27,7 +27,17 @@ const newSessionSchema = z.object({
 });
 type NewSessionValues = z.infer<typeof newSessionSchema>;
 
-export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => void }) {
+export function NewSessionDialog({
+  onCreated,
+  variant,
+  className,
+}: {
+  onCreated: (id: string) => void;
+  /** Trigger styling. Defaults to the primary (lime) button; the sessions rail
+   * passes `secondary` + `w-full` so it reads quietly beside the active row. */
+  variant?: ComponentProps<typeof Button>['variant'];
+  className?: string;
+}) {
   const [open, setOpen] = useState(false);
   const { data: images, isLoading } = useEnabledImages(true);
   const { principal } = useAuth();
@@ -74,7 +84,7 @@ export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => voi
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild><Button>New session</Button></DialogTrigger>
+      <DialogTrigger asChild><Button variant={variant} className={className}>New session</Button></DialogTrigger>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>

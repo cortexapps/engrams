@@ -20,9 +20,6 @@ importers:
       '@fontsource-variable/saira':
         specifier: ^5.2.11
         version: 5.2.11
-      '@fontsource/ibm-plex-serif':
-        specifier: ^5.2.7
-        version: 5.2.7
       '@hookform/resolvers':
         specifier: ^5.4.0
         version: 5.4.0(react-hook-form@7.77.0(react@19.2.7))
@@ -522,9 +519,6 @@ packages:
 
   '@fontsource-variable/saira@5.2.11':
     resolution: {integrity: sha512-egM+A5PWt5fcf4w/V+GT/TLKaEoVngx7ENCUM7JyAgqLX8oJ/FyB/NvUVJHamazg55rUytEMxDiyXjhoDruRJw==}
-
-  '@fontsource/ibm-plex-serif@5.2.7':
-    resolution: {integrity: sha512-04owmc2OQQ/DAMjXjEMJc+7V4dBVmR01aIFOg4cuqS8pQ4HbvtlYs/u6+O0vCt21EMx5M/azIbgx43iKyisEOA==}
 
   '@hookform/resolvers@5.4.0':
     resolution: {integrity: sha512-EIsqr/t/qbinPIhGjMdtvutIN1Kk4uwbROE9/UQ93CAVGR7GkA7Y92+fX80OzXi/OB67jVFYwKGO1WzkxmkFZw==}
@@ -3045,8 +3039,6 @@ snapshots:
   '@fontsource-variable/jetbrains-mono@5.2.8': {}
 
   '@fontsource-variable/saira@5.2.11': {}
-
-  '@fontsource/ibm-plex-serif@5.2.7': {}
 
   '@hookform/resolvers@5.4.0(react-hook-form@7.77.0(react@19.2.7))':
     dependencies:

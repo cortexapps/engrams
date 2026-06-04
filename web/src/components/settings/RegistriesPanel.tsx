@@ -14,6 +14,8 @@ import type {
 } from '../../types';
 import { PageHeading } from '../page-heading';
 import { Badge } from '@/components/ui/badge';
+import { textVariants } from '@/components/ui/text';
+import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import {
@@ -245,7 +247,7 @@ function AddRegistryDialog() {
                             <FieldTitle>
                               {card.label}
                               {card.hint && (
-                                <Badge variant="secondary" className="text-[0.62rem] uppercase">{card.hint}</Badge>
+                                <Badge variant="secondary" className={cn(textVariants({ variant: 'label' }), 'text-[0.62rem]')}>{card.hint}</Badge>
                               )}
                             </FieldTitle>
                             <FieldDescription>{card.blurb}</FieldDescription>

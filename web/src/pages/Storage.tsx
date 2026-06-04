@@ -2,6 +2,7 @@ import { useStorageSummary } from '../hooks/useStorageSummary';
 import { fmtAgo, fmtBytes, secondsSince, shortId } from '../format';
 import { PageHeading } from '../components/page-heading';
 import { StatReadout } from '../components/stat-readout';
+import { Text } from '@/components/ui/text';
 import { Progress } from '@/components/ui/progress';
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
@@ -31,9 +32,9 @@ export function Storage() {
 
       <div>
         <div className="mb-2 flex items-baseline justify-between">
-          <h2 className="font-mono text-[0.7rem] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+          <Text as="h2" variant="label" tone="muted">
             Durability ledger · per-sandbox copy-on-write
-          </h2>
+          </Text>
           <span className="font-mono text-xs tabular-nums text-muted-foreground">{rows.length}</span>
         </div>
         <Table>

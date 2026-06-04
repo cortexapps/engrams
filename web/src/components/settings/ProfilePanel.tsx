@@ -5,6 +5,7 @@ import { useAuth } from '../../auth/AuthProvider';
 import { PageHeading } from '../page-heading';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
+import { Text } from '@/components/ui/text';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
 export function ProfilePanel() {
@@ -74,7 +75,7 @@ export function ProfilePanel() {
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="grid grid-cols-[8rem_1fr] items-baseline gap-2">
-      <span className="text-xs uppercase tracking-wide text-muted-foreground">{label}</span>
+      <Text as="span" variant="label" tone="muted">{label}</Text>
       <span className="flex flex-wrap items-baseline gap-2">{children}</span>
     </div>
   );
