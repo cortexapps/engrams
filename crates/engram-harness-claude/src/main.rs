@@ -683,9 +683,14 @@ mod adapter {
             )
             .await;
         } else {
+            // Read the result fields explicitly (not via Debug) so they
+            // count as live for the dead_code lint, and so the log
+            // distinguishes a clean `success` from a handled-error result
+            // (`error_max_turns`, an API error claude surfaced, …).
             tracing::info!(
                 status = ?exit_status,
-                result = ?result_marker,
+                result_subtype = result_marker.as_ref().map(|m| m.subtype.as_str()),
+                result_is_error = result_marker.as_ref().map(|m| m.is_error),
                 ok,
                 "claude run ended",
             );
