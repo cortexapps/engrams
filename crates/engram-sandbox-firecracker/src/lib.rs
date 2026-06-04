@@ -211,6 +211,20 @@ pub struct FirecrackerConfig {
     /// spawns engram-uffd-handler and serves pages on demand (fast,
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
+    /// ADR 0022 Option A: memory backend for *base `session.create`*
+    /// restores specifically (the `restore_fresh` flavor), independent
+    /// of [`Self::restore_mode`] which governs idle-resume. `None` ⇒
+    /// inherit `restore_mode` (so the default is behaviour-preserving:
+    /// base-create uses whatever the host is configured for). `Some(File)`
+    /// flips base-create to the File backend against the per-template
+    /// resident memfile — N same-template siblings `MAP_PRIVATE` one
+    /// inode (density) and the restore skips the UFFD handler spawn +
+    /// per-page fault round-trips (faster boot). `Some(Uffd)` is the
+    /// kill-switch forcing base-create back to UFFD. Resolved at startup
+    /// from `ENGRAM_FC_BASE_RESTORE_MODE` ([`base_restore_mode_from_env`]);
+    /// changing it is an env edit + host-agent restart, exactly like
+    /// `restore_mode`.
+    pub base_restore_mode: Option<RestoreMode>,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -351,6 +365,28 @@ pub fn restore_mode_from_env() -> RestoreMode {
     }
 }
 
+/// ADR 0022 Option A: pick the *base `session.create`* memory backend
+/// from `ENGRAM_FC_BASE_RESTORE_MODE` (`file` | `uffd`). Unset (or empty)
+/// ⇒ `None`, meaning base-create inherits [`restore_mode_from_env`] — so
+/// shipping the bifurcation is behaviour-preserving until prod opts in.
+/// `file` turns on Option A density + faster base-restore; `uffd` is the
+/// kill-switch. Governs only the `restore_fresh` (base-create) path;
+/// idle-resume always follows `restore_mode`.
+pub fn base_restore_mode_from_env() -> Option<RestoreMode> {
+    match std::env::var("ENGRAM_FC_BASE_RESTORE_MODE") {
+        Ok(s) if s.eq_ignore_ascii_case("file") => Some(RestoreMode::File),
+        Ok(s) if s.eq_ignore_ascii_case("uffd") => Some(RestoreMode::Uffd),
+        Ok(s) if !s.is_empty() => {
+            tracing::warn!(
+                value = %s,
+                "unrecognised ENGRAM_FC_BASE_RESTORE_MODE; inheriting restore_mode for base-create",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 /// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
 /// Distinct from `SandboxError` so the live-attach driver can
 /// distinguish "FC truly gone, fall through to path 2" from "operator
@@ -453,6 +489,9 @@ impl FirecrackerConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            // ADR 0022: inherit `restore_mode` for base-create until prod
+            // opts in via ENGRAM_FC_BASE_RESTORE_MODE.
+            base_restore_mode: None,
             track_dirty_pages: false,
             host_id: None,
             uffd_cache_root: None,
@@ -818,11 +857,35 @@ impl FirecrackerBackend {
         }
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
         // Same-id reattach after a graceful host reboot: resume
-        // semantics — the session keeps its pinned bundle generations.
+        // semantics — the session keeps its pinned bundle generations,
+        // and the memory backend follows `restore_mode` (resume).
         self.restore_in_jail(
-            sandbox_id, &jail_dir, &src, &manifest, /*swap_aux_to_current=*/ false,
+            sandbox_id,
+            &jail_dir,
+            &src,
+            &manifest,
+            /*swap_aux_to_current=*/ false,
+            self.effective_restore_mode(/*fresh=*/ false),
         )
         .await
+    }
+
+    /// ADR 0022 Option A: the effective memory backend for one restore.
+    /// `fresh` (the `swap_aux_to_current` flavor) is a base
+    /// `session.create`: it uses `base_restore_mode` when set, else
+    /// inherits `restore_mode`. Idle-resume (`fresh == false`) always
+    /// follows `restore_mode`. The two axes are kept separate on purpose
+    /// — aux-bundle freshness and memory backing are independent, so a
+    /// future resume-that-swaps or create-that-doesn't won't silently
+    /// pick the wrong backend.
+    fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
+        if fresh {
+            self.config
+                .base_restore_mode
+                .unwrap_or(self.config.restore_mode)
+        } else {
+            self.config.restore_mode
+        }
     }
 
     /// Shared body of [`SandboxBackend::restore`] (resume flavor,
@@ -860,9 +923,19 @@ impl FirecrackerBackend {
         // different lifecycle handle.
         let sandbox_id = SandboxId::new();
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
+        // ADR 0022: base-create (swap_aux_to_current) may use File; resume
+        // follows restore_mode.
+        let restore_mode = self.effective_restore_mode(swap_aux_to_current);
 
         match self
-            .restore_in_jail(sandbox_id, &jail_dir, &src, &manifest, swap_aux_to_current)
+            .restore_in_jail(
+                sandbox_id,
+                &jail_dir,
+                &src,
+                &manifest,
+                swap_aux_to_current,
+                restore_mode,
+            )
             .await
         {
             Ok(()) => Ok(sandbox_id),
@@ -2008,6 +2081,11 @@ impl FirecrackerBackend {
         snapshot_dir: &Path,
         manifest: &FcSnapshotManifest,
         swap_aux_to_current: bool,
+        // ADR 0022: the effective memory backend for THIS restore
+        // (base-create may be File while resume is UFFD). Computed by the
+        // caller via `effective_restore_mode` rather than read from
+        // `self.config.restore_mode`, which is now resume-only.
+        restore_mode: RestoreMode,
     ) -> Result<(), SandboxError> {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
@@ -2109,7 +2187,7 @@ impl FirecrackerBackend {
         // load branch could run. Same-host UFFD restore passed only
         // because `PooledBackend::snapshot` had already written
         // memory.bin during capture on the same host.
-        if matches!(self.config.restore_mode, RestoreMode::File) && !mem_path.exists() {
+        if matches!(restore_mode, RestoreMode::File) && !mem_path.exists() {
             return Err(SandboxError::Snapshot(format!(
                 "snapshot memory.bin missing at {}",
                 mem_path.display()
@@ -2208,7 +2286,7 @@ impl FirecrackerBackend {
         // spawn_uffd_handler sets kill_on_drop, so dropping the Child on a
         // cleanup path SIGKILLs it. Returns (handler, the UDS the gate dials).
         let leg_uffd = async {
-            match self.config.restore_mode {
+            match restore_mode {
                 RestoreMode::File => Ok::<_, SandboxError>(None),
                 RestoreMode::Uffd => {
                     // ADR 0007: the handler reads its memory manifest from the
@@ -2492,7 +2570,7 @@ impl FirecrackerBackend {
             %sandbox_id,
             jail = %jail_dir.display(),
             from = %snapshot_dir.display(),
-            mode = ?self.config.restore_mode,
+            mode = ?restore_mode,
             "firecracker microVM restored from snapshot",
         );
         Ok(())
@@ -3878,6 +3956,7 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            base_restore_mode: None,
             track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
@@ -4382,5 +4461,96 @@ mod tests {
             g.set(v);
             assert_eq!(cpu_template_from_env(), Some((*v).into()), "input={v}");
         }
+    }
+
+    // ---- ADR 0022: base_restore_mode_from_env + effective_restore_mode ----
+
+    fn base_mode_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct BaseRestoreModeEnvGuard {
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl BaseRestoreModeEnvGuard {
+        fn new() -> Self {
+            let lock = base_mode_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var("ENGRAM_FC_BASE_RESTORE_MODE").ok();
+            // SAFETY: serialized via `lock`.
+            unsafe { std::env::remove_var("ENGRAM_FC_BASE_RESTORE_MODE") };
+            Self { prev, _lock: lock }
+        }
+        fn set(&self, value: &str) {
+            unsafe { std::env::set_var("ENGRAM_FC_BASE_RESTORE_MODE", value) };
+        }
+    }
+    impl Drop for BaseRestoreModeEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.as_deref() {
+                    Some(v) => std::env::set_var("ENGRAM_FC_BASE_RESTORE_MODE", v),
+                    None => std::env::remove_var("ENGRAM_FC_BASE_RESTORE_MODE"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn base_restore_mode_from_env_unset_inherits_restore_mode() {
+        // None ⇒ base-create inherits `restore_mode`, so shipping the
+        // bifurcation is behaviour-preserving until prod opts in.
+        let _g = BaseRestoreModeEnvGuard::new();
+        assert_eq!(base_restore_mode_from_env(), None);
+    }
+
+    #[test]
+    fn base_restore_mode_from_env_parses_file_and_uffd_case_insensitively() {
+        let g = BaseRestoreModeEnvGuard::new();
+        for v in &["file", "File", "FILE"] {
+            g.set(v);
+            assert_eq!(base_restore_mode_from_env(), Some(RestoreMode::File), "input={v}");
+        }
+        for v in &["uffd", "Uffd", "UFFD"] {
+            g.set(v);
+            assert_eq!(base_restore_mode_from_env(), Some(RestoreMode::Uffd), "input={v}");
+        }
+    }
+
+    #[test]
+    fn base_restore_mode_from_env_garbage_and_empty_inherit() {
+        let g = BaseRestoreModeEnvGuard::new();
+        for v in &["", "lazy", "nonsense"] {
+            g.set(v);
+            assert_eq!(base_restore_mode_from_env(), None, "input={v}");
+        }
+    }
+
+    #[test]
+    fn effective_restore_mode_bifurcates_create_vs_resume() {
+        let (mut be, _dir) = backend();
+        // Prod-shaped config: resume on UFFD, base-create flipped to File.
+        be.config.restore_mode = RestoreMode::Uffd;
+        be.config.base_restore_mode = Some(RestoreMode::File);
+        assert_eq!(
+            be.effective_restore_mode(/*fresh=*/ true),
+            RestoreMode::File,
+            "base session.create uses base_restore_mode",
+        );
+        assert_eq!(
+            be.effective_restore_mode(/*fresh=*/ false),
+            RestoreMode::Uffd,
+            "idle-resume always follows restore_mode",
+        );
+
+        // Kill-switch: force base-create back to UFFD.
+        be.config.base_restore_mode = Some(RestoreMode::Uffd);
+        assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
+
+        // Inert default: None inherits restore_mode for BOTH flavors.
+        be.config.base_restore_mode = None;
+        assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
+        assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
     }
 }

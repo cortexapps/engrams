@@ -290,6 +290,12 @@ async fn main() -> Result<(), HostAgentError> {
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
             fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
+            // ADR 0022 Option A: ENGRAM_FC_BASE_RESTORE_MODE=file flips
+            // *base session.create* restores to the File backend against
+            // the per-template resident memfile (density + faster boot),
+            // leaving idle-resume on `restore_mode`. Unset ⇒ base-create
+            // inherits `restore_mode` (behaviour-preserving).
+            fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
             // Point the UFFD handler at the SAME chunk cache the
             // PooledBackend's restore-prefetch warms (`chunk-cache`,
             // see below) — not the FC backend's separate default — so
