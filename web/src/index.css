@@ -30,23 +30,23 @@
 :root {
   --radius: 0.5rem; /* gently rounded — precise, not hard-cornered, not pill */
 
-  --background: oklch(0.897 0.051 128);         /* celadon ledger paper (#d3e4c0) */
+  --background: oklch(0.972 0.014 128);         /* lab paper — a whisper of green, not celadon */
   --foreground: oklch(0.301 0.020 206);         /* petrol ink (#223133) */
-  --card: oklch(0.935 0.040 128);               /* a cleaner sheet laid on the paper */
+  --card: oklch(0.992 0.006 128);               /* a clean sheet raised off the paper */
   --card-foreground: oklch(0.301 0.020 206);
-  --popover: oklch(0.935 0.040 128);
+  --popover: oklch(0.992 0.006 128);
   --popover-foreground: oklch(0.301 0.020 206);
   --primary: oklch(0.878 0.181 121);            /* Aston-F1 lime — a FILL only */
   --primary-foreground: oklch(0.22 0.040 150);  /* deep racing-green ink on lime */
-  --secondary: oklch(0.855 0.050 128);          /* sage, raised */
+  --secondary: oklch(0.945 0.018 128);          /* soft sage fill, recessed from the paper */
   --secondary-foreground: oklch(0.33 0.018 206);
-  --muted: oklch(0.855 0.050 128);
+  --muted: oklch(0.945 0.018 128);
   --muted-foreground: oklch(0.44 0.028 200);    /* ink-faded — AA on paper */
-  --accent: oklch(0.865 0.055 128);             /* faint hover wash */
+  --accent: oklch(0.955 0.022 128);             /* faint hover wash */
   --accent-foreground: oklch(0.33 0.018 206);
   --destructive: oklch(0.52 0.20 27);           /* signal red — now the only red */
-  --border: oklch(0.80 0.045 128);              /* hairline rule */
-  --input: oklch(0.80 0.045 128);
+  --border: oklch(0.885 0.018 128);             /* hairline rule */
+  --input: oklch(0.885 0.018 128);
   --ring: oklch(0.55 0.15 132);                 /* racing green — lime is invisible on paper */
 
   /* The cover is the drama: a deep bottle-green spine against the celadon
@@ -187,6 +187,26 @@
   /* The claret ribbon shows up on selection too — a wash of the accent,
      text keeps its own ink so it stays readable. Adapts per theme. */
   ::selection { background-color: color-mix(in oklch, var(--primary) 24%, transparent); }
+
+  /* Scrollbars: transparent track, lime thumb. Firefox first, then WebKit. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--primary) transparent;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--primary);
+    /* Inset the thumb with a transparent padding-box border so it reads as a
+       floating lime pill on the transparent track. */
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in oklch, var(--primary) 80%, var(--foreground));
+  }
 }
 
 @utility bg-carbon-fade {

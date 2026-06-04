@@ -8,14 +8,12 @@ import type { SessionState } from '../types';
 //   ◌  idle              ○  pending
 //   ⚠  host_lost         ✓  completed
 //   ✕  dead              !  failed
-//   ◑  evicting / evacuating (transitional: suspend/relocate in
-//      flight — the half-moon mirrors the starting states' ◐)
 //
-// Active sessions get a slow opacity heartbeat (see .glyph-heartbeat
-// in theme.css). Idle sessions render in verdigris to mark them as
-// archival, never amber. Dead sessions fade into ink-quiet. Host-
-// lost sessions render in amber to flag that they need attention
-// (snapshot exists → /resume; no snapshot → going Dead shortly).
+// Active sessions get a slow opacity heartbeat. Active renders in the
+// theme ring (racing green on paper, lime on the dark ground) to read as
+// live; idle/booting/done fade into muted ink as archival; host_lost and
+// failed render destructive to flag that they need attention (snapshot
+// exists → /resume; no snapshot → going Dead shortly).
 
 export interface GlyphProps {
   status: SessionState;
@@ -35,7 +33,7 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.35, ease: 'easeOut' }}
-      className={`glyph ${isLive ? 'glyph-heartbeat' : ''}`}
+      className={`inline-block leading-none ${isLive ? 'animate-pulse motion-reduce:animate-none' : ''}`}
       style={{ color: tone }}
       aria-label={status}
     >
@@ -55,9 +53,6 @@ function glyphFor(status: SessionState): string {
       return '●';
     case 'idle':
       return '◌';
-    case 'evicting':
-    case 'evacuating':
-      return '◑';
     case 'host_lost':
       return '⚠';
     case 'completed':
@@ -72,25 +67,16 @@ function glyphFor(status: SessionState): string {
 function toneFor(status: SessionState): string {
   switch (status) {
     case 'active':
-      return 'var(--color-amber)';
+      return 'var(--ring)'; // racing green on paper, lime on the dark ground
     case 'idle':
-      return 'var(--color-verdigris)';
     case 'pending':
     case 'created':
     case 'guest_ready':
-      return 'var(--color-ink-faded)';
-    // Transitional suspend/relocate: verdigris like idle — they're
-    // on their way there (or back to active), not in trouble.
-    case 'evicting':
-    case 'evacuating':
-      return 'var(--color-verdigris)';
-    case 'host_lost':
-      return 'var(--color-amber)';
     case 'completed':
-      return 'var(--color-ink-faded)';
-    case 'failed':
-      return 'var(--color-amber)';
     case 'dead':
-      return 'var(--color-ink-quiet)';
+      return 'var(--muted-foreground)';
+    case 'host_lost':
+    case 'failed':
+      return 'var(--destructive)';
   }
 }
