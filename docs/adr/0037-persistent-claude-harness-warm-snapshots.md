@@ -197,9 +197,23 @@ SHAs are current-as-of-rebase onto `main` #82.)
   `warm_bind = ENGRAM_WARM_HARNESS_BIND && snapshot.warm_harness` ⇒ `apply_egress_policy` +
   `late_bind_harness` (constant-placeholder policy entry) instead of `start_agent`. dev-vm check +
   clippy green. **All of P4 is gated OFF by default (both kill-switches) ⇒ inert in prod.**
-- _P5 (FC e2e + measurement), P6 (Accepted)_ pending — need a real-FC warm-capture→restore→bind→
-  first-prompt run (the existing `e2e_harness.rs` uses a custom sink, not a `HarnessHub`, so the warm
-  path needs new hub-based e2e scaffolding) + a prod canary for the Accept-gate latency/density numbers.
+- P5a — sandbox-keyed `HarnessSink` (`Fn(SandboxId, stream)`): FC/VZ route the harness re-attach by the
+  connection's sandbox, not the harness's self-reported session id, so a warm-restored harness (which
+  re-dials under the sentinel session id baked at capture) routes correctly without a colliding
+  per-session sentinel registration. **Validated on real FC**: `e2e_warm_capture_via_pooled_backend`
+  passes (warm claude boots + attaches + Idle → snapshot `warm_harness=true`, ~73s).
+- **P5b OPEN (the new load-bearing risk the spikes missed):** the full warm loop —
+  `e2e_warm_restore_bind_via_pooled_backend` — gets through capture + restore but the **restored warm
+  harness never re-attaches**: after a full snapshot→destroy→restore (a NEW VM / vsock backend, *unlike*
+  the pause/resume Phase A/B validated), its idle vsock connection doesn't cleanly error, so the
+  reconnect loop never fires and the late-bind finds no harness (`NotAttached`, then no re-attach within
+  60s). The Phase A/B spikes proved socket-recovery across *pause/resume* (held connection → RST →
+  reconnect); they did NOT cover restore-into-a-new-VM, where the connection appears to hang rather than
+  RST. **Fix (focused follow-up):** a harness-side liveness probe (carefully not tripping the idle-evict
+  soft TTL) or an agentd restore-nudge to force the reconnect. Test is committed but gated off CI
+  (`ENGRAM_WARM_RESTORE_E2E`).
+- _P5 measurement, P6 (Accepted)_ pending — blocked on P5b (no warm first-prompt number until the
+  restored harness re-attaches) + a prod canary.
   **Known follow-up (pitfall #4):** on the warm path agentd's `/exec` + ttyd shell keep the capture-time
   (sentinel) session env — FC `merge_session_env` is a documented no-op for the guest env; the agent
   loop is correct (forge/upload via the P4b file; OAuth via the baked constant placeholder), but
