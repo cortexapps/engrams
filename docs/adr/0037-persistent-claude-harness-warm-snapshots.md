@@ -186,7 +186,24 @@ SHAs are current-as-of-rebase onto `main` #82.)
   (`snapshots.warm_harness`, `serde(default)=false`); persisted via `record_snapshot`, read by
   `snapshot_from_row`, wired into the base-capture record from the host's metadata. Inert (nothing sets
   it true until P4c). dev-vm `--workspace --all-targets` check + clippy green.
-- _P4b…P6_ pending
+- P4b — no-respawn bind + file-delivered vsock tokens (`SESSION_ENV_FILE` + `read_session_var`; forge/
+  share helpers file-first/env-fallback). dev-vm clippy + tests green.
+- P4c — warm capture: `build_base_snapshot` gains `Option<AgentSpec>` (threaded trait→proto→coord);
+  `build_warm_capture_agent_spec` (constant OAuth placeholder + sentinel id); `PooledBackend` gets the
+  hub injected + `maybe_warm_capture` (sentinel-bind → start_agent → `wait_harness_warm` → snapshot
+  `warm_harness=true`), gated `ENGRAM_WARM_HARNESS_CAPTURE`, fallback-cold. dev-vm check + clippy + 3
+  `wait_harness_warm` unit tests green.
+- P4d — restore-fork: `LateBindHarness` RPC + `HostClient::late_bind_harness`; coord create-flow
+  `warm_bind = ENGRAM_WARM_HARNESS_BIND && snapshot.warm_harness` ⇒ `apply_egress_policy` +
+  `late_bind_harness` (constant-placeholder policy entry) instead of `start_agent`. dev-vm check +
+  clippy green. **All of P4 is gated OFF by default (both kill-switches) ⇒ inert in prod.**
+- _P5 (FC e2e + measurement), P6 (Accepted)_ pending — need a real-FC warm-capture→restore→bind→
+  first-prompt run (the existing `e2e_harness.rs` uses a custom sink, not a `HarnessHub`, so the warm
+  path needs new hub-based e2e scaffolding) + a prod canary for the Accept-gate latency/density numbers.
+  **Known follow-up (pitfall #4):** on the warm path agentd's `/exec` + ttyd shell keep the capture-time
+  (sentinel) session env — FC `merge_session_env` is a documented no-op for the guest env; the agent
+  loop is correct (forge/upload via the P4b file; OAuth via the baked constant placeholder), but
+  shell/exec attribution needs a warm-path agentd env-merge RPC.
 
 ### Per-session identity delivery to a warm (no-respawn) harness — the P4 mechanism
 
