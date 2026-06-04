@@ -1,11 +1,15 @@
 # ADR 0022: Runtime guest-memory sharing & forking — File backend vs direct-mem
 
-Status: 2026-06-03 — **Proposed (parked); Option A confirmed as the direction, Option B
-rejected-for-now.** ADR 0021 took the substrate to FC-floor-bound (~516 ms warm / ~618 ms
-cold) and made each enabled template's base memory **resident on NVMe**. This ADR scopes the
-*next* lever it deliberately deferred: sharing that resident base memory **across live
-sessions of the same template** (density) and the closely-related ability to **fork**
-sessions. Still parked (no Option A implementation yet) — but [ADR 0028](0028-eviction-durability-under-host-roll.md)
+Status: 2026-06-03 — **Proposed; Option A implementation arc IN PROGRESS** (branch
+`worktree-adr-0022-file-backend-density`); Option B rejected-for-now. ADR 0021 took the
+substrate to FC-floor-bound (~516 ms warm / ~618 ms cold) and made each enabled template's
+base memory **resident on NVMe**. This ADR scopes the *next* lever it deliberately deferred:
+sharing that resident base memory **across live sessions of the same template** — for
+**density** (more microVMs/host) **and faster session boot** (File-backend restore against a
+resident, page-cache-warm memfile skips the UFFD handler spawn and the per-page userspace
+fault round-trips) — plus the closely-related ability to **fork** sessions. The Option A
+density+boot arc is now being implemented; **fork stays a later ADR** (needs session
+re-identity, below). [ADR 0028](0028-eviction-durability-under-host-roll.md)
 shipped the diff-first checkpoint substrate and its dev-vm spike measured this ADR's
 load-bearing assumptions, which **settles the Option-A-vs-B decision** (below) and builds
 several of Option A's prerequisites. The remaining Option A work and the fork API are sized
@@ -41,11 +45,25 @@ in "Decision (updated 2026-06-03)".
     forkable-history window (ADR 0028 A.log + `checkpoint_retention`);
   - GC that already pins the latest checkpoint per live session — memfile-granularity pinning
     is the same pin-set extended.
-- **Remaining Option A scope** (a follow-on arc, when density pressure is real): flip base
-  `session.create` restores to `RestoreMode::File` against a **per-template** memfile
-  materialized at prefetch (today each session restores its own); extend the chunk-GC pin set
-  to that template memfile; measure prod shared-RSS + restore latency. Density only — no fork
-  API in this arc.
+- **Remaining Option A scope** (this arc — density + boot latency, no fork API):
+  1. **Per-restore `RestoreMode` bifurcation** — base `session.create` (the `restore_fresh`
+     flavor) restores `RestoreMode::File`; idle-resume keeps UFFD/chunked (per-session
+     divergent, content-dedup at rest). Today a host is statically all-File or all-UFFD
+     (`FirecrackerConfig.restore_mode`); the choice becomes per-restore, behind a per-restore
+     env kill-switch (`ENGRAM_FC_BASE_RESTORE_MODE`).
+  2. **Per-template base memfile materialized at residency** — the prefetch supervisor
+     assembles the contiguous `memory.bin` once per enabled image per host (at
+     `snapshot_path_for(base_snapshot_id)/memory.bin`, the path restore already reads) and
+     gates readiness on it, so siblings `MAP_PRIVATE` one warm inode. Today the contiguous
+     file is built lazily on first restore (and not at all under UFFD).
+  3. **GC pin to memfile granularity** — an explicit pin source over every enabled image's
+     base-snapshot memory manifest, so the shared memfile's backing chunks stay pinned for the
+     template's enabled lifetime independent of the base snapshot row's `recoverable` flag.
+  4. **Measure prod density AND boot latency** — Σpss/Σrss across same-template siblings (via a
+     new productized `engram_sandbox_guest_pss_bytes` gauge + dev-vm smaps) and File-vs-UFFD
+     `session.create` latency. **Both** a density win and a measured boot-latency reduction
+     gate the Accepted flip. (Surfacing density in the web UI is a deliberate *later*-ADR
+     follow-up; this arc lands only the metric substrate.)
 - **Fork is its own later ADR.** The substrate is ready (checkpoint chain + cut-point + memfile),
   but a user-facing fork needs **session re-identity** — agentd bind / `session_env` re-stamp
   so the child wakes as a *different* session, per-child network identity, and the mid-run
@@ -211,6 +229,28 @@ measure **shared RSS across siblings** (the density number) + restore latency vs
    `direct-mem` branch; the per-release rebase burden; build-from-source pipeline.
 4. Interaction with P3 warm snapshots (ADR 0021): a warm per-template snapshot is the
    ideal shared base memfile — these compose.
+
+## Status / commit chain (Option A density + boot-latency arc)
+
+To be filled as commits land (per the ADR-bookend norm); flip Status → **Accepted** at the
+end with the measured density + boot-latency numbers.
+
+- [ ] **1** — per-restore `RestoreMode` bifurcation in the FC backend (`base_restore_mode` +
+      `ENGRAM_FC_BASE_RESTORE_MODE` kill-switch; `restore_in_jail` honors a per-call mode;
+      base-create→File, resume→config/UFFD).
+- [ ] **2** — `PooledBackend` materializes the contiguous memfile per-restore-mode-aware
+      (`restore_memory_is_lazy_for(fresh)`), idempotent no-op once residency wrote it.
+- [ ] **3** — per-template base memfile materialized at residency (`base_snapshot_id` on the
+      `EnabledImageRef` heartbeat wire + `image_prefetch` assembles `memory.bin` once per
+      template per host; readiness gated on it; VZ no-ops; disk-floor + reclaim-on-disable).
+- [ ] **4** — GC pin to memfile granularity (`list_enabled_image_base_snapshot_memory_manifests`
+      pin source; no migration; live-PG regression with `recoverable=false`).
+- [ ] **5** — productized `engram_sandbox_guest_pss_bytes` gauge (heartbeat-sampled smaps;
+      telemetry-must-not-gate-workload; web UI surfacing deferred to a later ADR).
+- [ ] **6** — FC density + latency test (extend `file_restore_shared_rss.rs`: residency
+      materialize → File-mode base-create siblings share + latency; resume stays UFFD).
+- [ ] **Measure + Accept** — dev-vm + prod-canary density (Σpss/Σrss) AND boot-latency
+      reduction (File vs UFFD); flip Status to Accepted.
 
 ## References
 
