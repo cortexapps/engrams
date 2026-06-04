@@ -42,41 +42,59 @@ const SERVER_OUTPUT = 0x30;
 const SERVER_TITLE = 0x31;
 const SERVER_PREFERENCES = 0x32;
 
-// Solarized Light, lightly retuned to match the dashboard's warmer
-// cream background. Solarized's accent colors are designed by Ethan
-// Schoonover to read well on a base3 paper-like surface, so they sit
-// comfortably on our `--color-paper` without the saturation feeling
-// off. Cursor stays the dashboard's amber so the "now" semantics
-// match the rest of the page (heartbeat, fresh-message tint).
-const THEME = {
-  background: '#f4eedf', // var(--color-paper)
-  foreground: '#586e75', // solarized base01 — content default
-  cursor: '#b85c0a', // var(--color-amber)
-  cursorAccent: '#f4eedf',
-  selectionBackground: '#eee8d5', // solarized base2
-
-  // Standard 8 (used by `ls --color`, `grep --color`, most CLIs)
-  black: '#073642', // base02
-  red: '#dc322f',
-  green: '#859900',
-  yellow: '#b58900',
-  blue: '#268bd2',
-  magenta: '#d33682',
-  cyan: '#2aa198',
-  white: '#eee8d5', // base2
-
-  // Bright 8 — solarized maps these to the secondary base/accent set,
-  // not just "saturated" variants. Keeps directories / keywords
-  // readable when programs reach for bright colors.
-  brightBlack: '#002b36', // base03
-  brightRed: '#cb4b16', // orange
-  brightGreen: '#586e75', // base01
-  brightYellow: '#657b83', // base00
-  brightBlue: '#839496', // base0
-  brightMagenta: '#6c71c4', // violet
-  brightCyan: '#93a1a1', // base1
-  brightWhite: '#fdf6e3', // base3
+// The terminal base (surface, ink, cursor, selection) tracks the
+// Aston-racing theme so the shell reads as part of the page, not a
+// pasted-in cream box. Cursor is the theme's "live" accent: racing green
+// on the celadon paper (lime would be invisible on paper — same reason
+// --ring is green in light mode), lime on the green-black ground.
+//
+// The ANSI 16 are program colors (`ls --color`, `grep`, prompts), not
+// brand tokens — kept legible against both grounds. xterm needs literal
+// hex, so these are resolved here rather than from CSS vars; a theme
+// toggle while the shell is open re-colors on the next mount.
+const ANSI = {
+  black: '#1c2b29',
+  red: '#d9544d',
+  green: '#7faa3f',
+  yellow: '#c7a83c',
+  blue: '#4f93c9',
+  magenta: '#c56aa6',
+  cyan: '#3fa79b',
+  white: '#cdd9c4',
+  brightBlack: '#5a6b63',
+  brightRed: '#e8736b',
+  brightGreen: '#9bc457',
+  brightYellow: '#dcc24f',
+  brightBlue: '#6fb0e0',
+  brightMagenta: '#d98cc0',
+  brightCyan: '#5fc4b6',
+  brightWhite: '#eef3e8',
 };
+
+const LIGHT_THEME = {
+  background: '#eef3e7', // lab-paper sheet (--background, light)
+  foreground: '#223133', // petrol ink (--foreground, light)
+  cursor: '#5f8f3a', // racing green — visible on paper
+  cursorAccent: '#eef3e7',
+  selectionBackground: '#dae7c8',
+  ...ANSI,
+};
+
+const DARK_THEME = {
+  background: '#11201d', // racing green-black (--background, dark)
+  foreground: '#d7e4cf', // pale sage ink
+  cursor: '#b6e84a', // Aston-F1 lime — pops on the dark ground
+  cursorAccent: '#11201d',
+  selectionBackground: '#21332f',
+  ...ANSI,
+};
+
+function pickTheme() {
+  const dark =
+    typeof document !== 'undefined' &&
+    document.documentElement.classList.contains('dark');
+  return dark ? DARK_THEME : LIGHT_THEME;
+}
 
 // Module-level memoization of ghostty-web's WASM init. React's
 // StrictMode runs effects twice in dev; without this, we'd call
@@ -135,7 +153,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
         fontSize: 13,
         fontFamily:
           '"JetBrains Mono Variable", "Berkeley Mono", "SF Mono", ui-monospace, monospace',
-        theme: THEME,
+        theme: pickTheme(),
         cursorBlink: true,
         scrollback: 5000,
       });
@@ -295,50 +313,31 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
   }, [sessionId]);
 
   return (
-    <section className="mb-12">
+    <section className="flex h-full flex-col px-6 py-4">
       {status === 'loading' && (
-        <p
-          className="font-display italic text-[0.92rem] mb-3"
-          style={{ color: 'var(--color-ink-quiet)' }}
-        >
+        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
           loading terminal renderer…
         </p>
       )}
       {status === 'connecting' && (
-        <p
-          className="font-display italic text-[0.92rem] mb-3"
-          style={{ color: 'var(--color-ink-quiet)' }}
-        >
+        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
           opening shell…
         </p>
       )}
       {status === 'closed' && (
-        <p
-          className="font-display italic text-[0.92rem] mb-3"
-          style={{ color: 'var(--color-ink-quiet)' }}
-        >
+        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
           shell connection closed{errorMessage ? ` — ${errorMessage}` : ''} —
           switch tabs and back to reconnect.
         </p>
       )}
       {status === 'error' && (
-        <p
-          className="font-mono text-[0.78rem] mb-3"
-          style={{ color: 'var(--color-amber)' }}
-        >
+        <p className="mb-3 font-mono text-[0.78rem] text-destructive">
           {errorMessage ?? 'shell unavailable'}
         </p>
       )}
       <div
         ref={containerRef}
-        className="terminal-host"
-        style={{
-          minHeight: '420px',
-          padding: '0.6rem 0.8rem',
-          backgroundColor: 'var(--color-paper)',
-          border: '1px solid var(--color-rule)',
-          height: '60vh',
-        }}
+        className="min-h-0 flex-1 rounded-md border bg-card px-3 py-2"
       />
     </section>
   );
