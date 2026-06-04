@@ -71,6 +71,7 @@ async fn seed_snapshot_row(
 ) -> SnapshotId {
     let id = SnapshotId::new();
     meta.record_snapshot(SnapshotRecord {
+        warm_harness: false,
         id,
         session_id,
         host_id: None,
@@ -263,6 +264,7 @@ async fn seed_snapshot_row_with_id(
     session_id: Option<SessionId>,
 ) {
     meta.record_snapshot(SnapshotRecord {
+        warm_harness: false,
         id,
         session_id,
         host_id: None,

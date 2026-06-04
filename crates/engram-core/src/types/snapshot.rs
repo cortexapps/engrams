@@ -166,7 +166,7 @@ pub struct SnapshotRecord {
     pub events_cursor: Option<i64>,
     /// ADR 0037: TRUE iff a warm persistent harness was captured into
     /// this (base) snapshot — see [`SnapshotMetadata::warm_harness`].
-    /// Persisted in `snapshots.warm_harness` (migration 0055,
+    /// Persisted in `snapshots.warm_harness` (migration 0056,
     /// `DEFAULT FALSE`). Read by the restore-fork to decide late-`Bind`
     /// vs `SpawnHarness`. Always `false` for session captures.
     #[serde(default)]

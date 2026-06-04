@@ -141,8 +141,8 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     // ADR 0028 A.log (migration 0053): the event-log leg of the
     // coherence triple. NULL on pre-0053 rows + template snapshots.
     let events_cursor: Option<i64> = row.try_get("events_cursor").map_err(col_err)?;
-    // ADR 0037 (migration 0055): warm-harness base-capture flag. NOT NULL
-    // DEFAULT FALSE, so pre-0055 rows and every session capture read cold.
+    // ADR 0037 (migration 0056): warm-harness base-capture flag. NOT NULL
+    // DEFAULT FALSE, so pre-0056 rows and every session capture read cold.
     let warm_harness: bool = row.try_get("warm_harness").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),

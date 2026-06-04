@@ -123,7 +123,7 @@ dials only on the first user message), so the base capture is connection-clean.
 - **P4 Warm-capture + restore fork.** In `build_base_snapshot`, gated on
   `ENGRAM_WARM_HARNESS_CAPTURE`, spawn a generic harness + a new `wait_harness_warm` readiness
   gate before `snapshot`; on any warming failure, fall back to a cold (today's) capture. Persist
-  `warm_harness: bool` on `SnapshotMetadata` (migration 0055; `serde(default)=false` ⇒ old
+  `warm_harness: bool` on `SnapshotMetadata` (migration 0056; `serde(default)=false` ⇒ old
   snapshots are cold → automatic fallback). On restore, if `warm_harness` → deliver `Bind`
   instead of `SpawnHarness` (the restored agentd already references the running warm child, so it
   must not respawn); else the unchanged cold path (always a correct fallback).
@@ -182,7 +182,7 @@ SHAs are current-as-of-rebase onto `main` #82.)
 - P3 — late-bind protocol: `HarnessCommand::Bind` + harness handler (adopt id, layer env, run first
   prompt) + `HarnessHub::bind()`; proto round-trip + 2 hub unit tests; dev-vm clippy + 5 adapter
   unit tests green. Inert until P4.
-- P4a — `warm_harness` flag on `SnapshotMetadata` + `SnapshotRecord` + migration 0055
+- P4a — `warm_harness` flag on `SnapshotMetadata` + `SnapshotRecord` + migration 0056
   (`snapshots.warm_harness`, `serde(default)=false`); persisted via `record_snapshot`, read by
   `snapshot_from_row`, wired into the base-capture record from the host's metadata. Inert (nothing sets
   it true until P4c). dev-vm `--workspace --all-targets` check + clippy green.
