@@ -704,6 +704,124 @@ async fn e2e_harness_warm_via_pooled_backend() {
     cleanup_host_state();
 }
 
+/// ADR 0037 P5: warm-CAPTURE smoke test. Drives the novel host-side
+/// orchestration on a real microVM: boot a capture VM, spawn a generic
+/// prompt-less harness into it via a real `HarnessHub`, wait for it to go
+/// warm+idle (claude's Bun/V8 booted, no live socket), then snapshot —
+/// asserting the metadata is stamped `warm_harness = true` and that the
+/// harness actually attached + emitted `Idle` during capture. This is the
+/// sentinel-`bind_session` → `start_agent` → `wait_harness_warm` → snapshot
+/// path in `PooledBackend::build_base_snapshot`/`maybe_warm_capture`. The
+/// restore-side late-bind fork is exercised separately (coord create-flow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + FC + Docker + sudo"]
+async fn e2e_warm_capture_via_pooled_backend() {
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_root() {
+        return;
+    }
+    cleanup_host_state();
+
+    let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
+    let (proxy_port, _ca_pem, _registry) = spawn_real_proxy().await;
+    let rootfs_path =
+        bake_harness_rootfs("engram-e2e-warm-capture", &harness_bin, &claude_bin).await;
+
+    let work = tempfile::tempdir().expect("work");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = Some("10.201.0.0".parse().unwrap());
+    cfg.egress_proxy_port = Some(proxy_port);
+    let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    fc.host_startup().await.expect("host_startup");
+    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+
+    // Wire a real HarnessHub — the warm-capture path needs it for the
+    // sentinel attach (`bind_session`) + the warm-idle wait. Capture every
+    // event into a Vec so we can assert the harness reached Idle.
+    let captured: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let cap_for_sink = captured.clone();
+    let hub = Arc::new(engram_host_agent::harness::HarnessHub::new(
+        engram_host_agent::harness::event_sink_to(move |_sid, _sbid, ev| {
+            let cap = cap_for_sink.clone();
+            async move {
+                cap.lock().push(ev);
+            }
+        }),
+    ));
+    let sink_hub = hub.clone();
+    let sink: engram_core::traits::HarnessSink =
+        Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
+    fc.set_harness_sink(sink);
+    pooled.set_warm_capture_hub(hub.clone());
+
+    let spec = SandboxSpec {
+        image: "engram-e2e-warm-capture".into(),
+        rootfs_source: Some(rootfs_path),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 2 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+
+    // Generic, prompt-less warm harness: it comes up idle (claude only
+    // dials the API on the first user message), the connection-clean state
+    // warm-capture wants. The sentinel session id (in session_env) is what
+    // `maybe_warm_capture` binds so the capture-time HarnessAttach is
+    // accepted. NO ENGRAM_INITIAL_PROMPT — we want it idle, not running.
+    let sentinel = engram_core::SessionId::new();
+    let mut warm_env: HashMap<String, String> = HashMap::new();
+    warm_env.insert(
+        "PATH".into(),
+        "/opt/engram/harness:/usr/local/bin:/usr/bin:/bin".into(),
+    );
+    let mut warm_session_env: HashMap<String, String> = HashMap::new();
+    warm_session_env.insert("ENGRAM_SESSION_ID".into(), sentinel.to_string());
+    let warm_agent = AgentSpec {
+        argv: vec![
+            "/opt/engram/harness/harness".into(),
+            "--vsock-host".into(),
+            engram_harness_proto::HARNESS_VSOCK_PORT.to_string(),
+            "--session-id".into(),
+            sentinel.to_string(),
+        ],
+        env: warm_env,
+        session_env: warm_session_env,
+        host_ca_pem: None,
+    };
+
+    // Opt into warm capture (host-side kill-switch). --test-threads=1 for
+    // the FC suite keeps this process-global var from racing other tests.
+    std::env::set_var("ENGRAM_WARM_HARNESS_CAPTURE", "1");
+    let metadata = pooled
+        .build_base_snapshot(spec, Some(warm_agent))
+        .await
+        .expect("build_base_snapshot");
+    std::env::remove_var("ENGRAM_WARM_HARNESS_CAPTURE");
+
+    assert!(
+        metadata.warm_harness,
+        "warm capture must stamp warm_harness=true (the harness reached warm+idle)",
+    );
+    let evs = captured.lock().clone();
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, engram_harness_proto::HarnessEvent::Idle)),
+        "expected an Idle event from the warm harness during capture; saw {evs:?}",
+    );
+
+    cleanup_host_state();
+}
+
 /// ADR 0021 P1.6: `SessionMode::DevVm` against a HARNESSED image. The
 /// `/opt/engram/harness/harness` binary (+ `claude` CLI) is baked into
 /// the rootfs exactly like `e2e_harness_cold`, but the coord
