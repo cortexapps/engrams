@@ -171,6 +171,19 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    async fn late_bind_harness(
+        &self,
+        sandbox_id: SandboxId,
+        session_id: SessionId,
+        session_env: std::collections::HashMap<String, String>,
+        first_prompt: Option<String>,
+    ) -> Result<(), SandboxError> {
+        self.harness_hub
+            .bind(sandbox_id, session_id, session_env, first_prompt)
+            .await
+            .map_err(harness_err_to_sandbox)
+    }
+
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub.acquire_shell(sandbox_id);
         Ok(())

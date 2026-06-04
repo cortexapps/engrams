@@ -31,10 +31,10 @@ use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    LateBindHarnessRequest, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen,
+    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    StartAgentRequest, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -301,6 +301,27 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .interrupt_harness(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    pub async fn late_bind_harness(
+        &self,
+        sandbox_id: SandboxId,
+        session_id: SessionId,
+        session_env: std::collections::HashMap<String, String>,
+        first_prompt: Option<String>,
+    ) -> Result<(), SandboxError> {
+        let req = LateBindHarnessRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            session_id: session_id.as_uuid().as_bytes().to_vec(),
+            session_env,
+            first_prompt,
+        };
+        self.inner
+            .clone()
+            .late_bind_harness(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -801,6 +822,16 @@ impl HostClient for GrpcHostClient {
 
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.interrupt_harness(sandbox_id).await
+    }
+
+    async fn late_bind_harness(
+        &self,
+        sandbox_id: SandboxId,
+        session_id: SessionId,
+        session_env: std::collections::HashMap<String, String>,
+        first_prompt: Option<String>,
+    ) -> Result<(), SandboxError> {
+        Self::late_bind_harness(self, sandbox_id, session_id, session_env, first_prompt).await
     }
 
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {

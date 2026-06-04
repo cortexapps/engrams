@@ -172,6 +172,25 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0037: late-bind per-session identity onto an already-running
+    /// *warm* harness (File-restored from a warm base snapshot) instead of
+    /// `start_agent`. Delivers `(session_id, session_env, first_prompt)`
+    /// over the existing harness vsock channel — no respawn, so the warm
+    /// V8 heap survives. `SandboxError::NotFound` if no harness is bound.
+    /// Default errors so impls without a real harness opt out; the gRPC
+    /// client + `LocalHostClient` override it.
+    async fn late_bind_harness(
+        &self,
+        _sandbox_id: SandboxId,
+        _session_id: SessionId,
+        _session_env: std::collections::HashMap<String, String>,
+        _first_prompt: Option<String>,
+    ) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support late_bind_harness".into(),
+        ))
+    }
+
     /// ADR 0013 + ADR 0011 follow-up #3: pin a sandbox against idle
     /// eviction while a shell WebSocket is open. The local hub is the
     /// only source of truth for "is a shell attached to this sandbox?"

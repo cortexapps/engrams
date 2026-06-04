@@ -796,6 +796,19 @@ impl HostClient for HostRegistry {
         backend.interrupt(sandbox_id).await
     }
 
+    async fn late_bind_harness(
+        &self,
+        sandbox_id: SandboxId,
+        session_id: SessionId,
+        session_env: std::collections::HashMap<String, String>,
+        first_prompt: Option<String>,
+    ) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend
+            .late_bind_harness(sandbox_id, session_id, session_env, first_prompt)
+            .await
+    }
+
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.acquire_shell(sandbox_id).await

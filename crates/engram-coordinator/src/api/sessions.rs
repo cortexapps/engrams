@@ -910,6 +910,32 @@ async fn create_session_inner(
     }
 
     state.registry.bind(session_id, sandbox_id);
+
+    // ADR 0037 restore-fork: if the base snapshot was captured with a warm
+    // harness AND warm-bind is enabled coord-side, we late-Bind the running
+    // warm child instead of SpawnHarness (preserving its V8 heap). The warm
+    // claude carries the CONSTANT OAuth placeholder baked at capture, so the
+    // egress policy must map THAT (not the per-session placeholder) → real;
+    // we reuse the resolved token from `harness_broker_secret`, swapping only
+    // the placeholder. Any non-warm snapshot or disabled gate ⇒ cold start.
+    let warm_bind = warm_bind_enabled()
+        && matches!(
+            state.services.meta.get_snapshot(base_snapshot_id).await,
+            Ok(Some(rec)) if rec.warm_harness
+        );
+    let policy_harness_secret = if warm_bind {
+        harness_broker_secret
+            .as_ref()
+            .map(|s| engram_core::types::egress::EgressSecretEntry {
+                placeholder: WARM_CLAUDE_OAUTH_PLACEHOLDER.to_string(),
+                real_value: s.real_value.clone(),
+                allow_hosts: s.allow_hosts.clone(),
+                allow_host_patterns: s.allow_host_patterns.clone(),
+            })
+    } else {
+        harness_broker_secret.clone()
+    };
+
     // ADR 0006: ship per-session egress policy to the host-agent
     // that owns this sandbox. The host-agent applies it to its
     // local proxy registry; the WS frame and any subsequent
@@ -934,10 +960,12 @@ async fn create_session_inner(
                     allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
                 });
             }
-            // ADR 0037: fold in the brokered harness credential (its
-            // placeholder is what `inject_harness_broker_secret` put in
-            // session_env) so the proxy substitutes the real value.
-            if let Some(s) = &harness_broker_secret {
+            // ADR 0037: fold in the brokered harness credential so the
+            // proxy substitutes the real value. Cold: the per-session
+            // placeholder `inject_harness_broker_secret` put in session_env.
+            // Warm-bind: the constant placeholder baked into the warm
+            // capture (see `policy_harness_secret`).
+            if let Some(s) = &policy_harness_secret {
                 secrets.push(s.clone());
             }
             Some(engram_core::types::egress::SessionEgressPolicy {
@@ -999,7 +1027,7 @@ async fn create_session_inner(
             network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
             // Keep the brokered harness credential even in the no-guest-IP
             // fallback policy (refined later via apply_egress_policy).
-            secrets: harness_broker_secret.clone().into_iter().collect(),
+            secrets: policy_harness_secret.clone().into_iter().collect(),
             secret_mode: manifest.secret_mode,
         }
     });
@@ -1020,18 +1048,42 @@ async fn create_session_inner(
             },
         )
         .await?;
-    if let Err(e) = state
-        .services
-        .host
-        .start_agent(sandbox_id, agent, policy)
-        .await
-    {
+    // ADR 0037 restore-fork. Cold (default): `start_agent` spawns the
+    // harness (kill+respawn cleanly replaces any warm child captured in the
+    // snapshot). Warm-bind: the harness is already running from the warm
+    // base — apply the egress policy, then late-`Bind` per-session identity
+    // over the existing channel (no respawn ⇒ the warm V8 heap survives),
+    // delivering the real session env (merged harness extras: forge/upload
+    // tokens, owner) + the first prompt.
+    let start_result = if warm_bind {
+        let mut bind_env = agent.session_env.clone();
+        bind_env.extend(agent.env.clone());
+        tracing::info!(%session_id, %sandbox_id, "warm restore: late-binding the warm harness");
+        match state.services.host.apply_egress_policy(policy).await {
+            Ok(()) => {
+                state
+                    .services
+                    .host
+                    .late_bind_harness(sandbox_id, session_id, bind_env, req.prompt.clone())
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        state
+            .services
+            .host
+            .start_agent(sandbox_id, agent, policy)
+            .await
+    };
+    if let Err(e) = start_result {
         tracing::error!(
             %session_id,
             %sandbox_id,
             %host_id,
+            warm_bind,
             error = %e,
-            "start_agent failed; marking session Failed",
+            "agent start (start_agent / warm late-bind) failed; marking session Failed",
         );
         let _ = state
             .services
@@ -1679,6 +1731,18 @@ pub(crate) fn resolve_harness(
 /// guest IP on the wire (the warm `claude` is never re-env'd — no respawn).
 /// Currently only the Claude OAuth token.
 pub(crate) const WARM_CLAUDE_OAUTH_PLACEHOLDER: &str = "engram_warm_ph_claude_oauth";
+
+/// ADR 0037: coord-side kill-switch for warm-bind on restore. Default off ⇒
+/// every restore takes the cold `start_agent` path (today's behavior), even
+/// for a snapshot captured warm (its harness is cleanly replaced by
+/// SpawnHarness). Operators flip this — alongside the host's
+/// `ENGRAM_WARM_HARNESS_CAPTURE` — to reap warm restores.
+pub(crate) fn warm_bind_enabled() -> bool {
+    matches!(
+        std::env::var("ENGRAM_WARM_HARNESS_BIND").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
 
 /// ADR 0037: build the generic, prompt-less, secret-free `AgentSpec` the
 /// host spawns to capture a *warm* harness into a base snapshot. `None`

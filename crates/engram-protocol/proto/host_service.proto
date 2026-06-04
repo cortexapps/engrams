@@ -60,6 +60,12 @@ service HostService {
   // attached harness (it SIGINTs its current `claude` child and
   // returns to Idle); the session stays alive and resumable.
   rpc InterruptHarness(InterruptHarnessRequest) returns (Empty);
+  // ADR 0037: late-bind per-session identity onto an already-running
+  // *warm* harness (File-restored from a warm base snapshot) instead of
+  // spawning one. Delivers the real session id + env + first prompt over
+  // the existing harness vsock channel; no respawn (preserves the warm
+  // V8 heap).
+  rpc LateBindHarness(LateBindHarnessRequest) returns (Empty);
 
   // StartAgent bundles SessionEgressPolicy inline so the host
   // applies the policy to its egress proxy registry *before*
@@ -233,6 +239,17 @@ message SendHarnessPromptRequest {
 
 message InterruptHarnessRequest {
   bytes sandbox_id = 1; // 16-byte UUID
+}
+
+message LateBindHarnessRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  bytes session_id = 2; // 16-byte UUID — the real (post-bind) session id
+  // Per-session env the warm harness materializes for its in-guest helpers
+  // (forge/upload tokens, real session id, …) and layers onto a respawn.
+  map<string, string> session_env = 3;
+  // The session's first prompt, if any (absent ⇒ the warm harness stays
+  // idle awaiting a later SendHarnessPrompt).
+  optional string first_prompt = 4;
 }
 
 message StartAgentRequest {
