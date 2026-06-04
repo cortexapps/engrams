@@ -148,6 +148,12 @@ where
                     // to interrupt. A real adapter stops its current
                     // run and emits RunInterrupted + Idle.
                 }
+                Ok(HarnessFrame::Command(HarnessCommand::Bind { .. })) => {
+                    // ADR 0037 late-bind targets a warm-captured real
+                    // harness adopting a session's identity. Noop's run
+                    // shape is fixed by config and it has no agent child
+                    // to re-env, so there's nothing to bind — ignore.
+                }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.
                 }

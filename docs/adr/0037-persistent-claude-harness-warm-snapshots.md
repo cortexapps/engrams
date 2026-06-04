@@ -109,9 +109,17 @@ dials only on the first user message), so the base capture is connection-clean.
   `secret_mode` — so this is independent of the image's declared-secret mode and brokers
   unconditionally for builtin-claude sessions. (The substitution chain was already wired via
   ADR 0006; the prior "broker not wired" comments were stale.)
-- **P3 Late-bind.** New `HarnessCommand::Bind { session_env, first_prompt, claude_session_id }`;
-  the harness stores `session_env` and layers it onto each `claude` child's env, and sets the
-  first prompt. `HarnessHub::bind()` sends it over the existing vsock channel.
+- **P3 Late-bind.** New `HarnessCommand::Bind { session_id, session_env, first_prompt }` (kept
+  harness-agnostic — `session_id` is the engram identity already in `HarnessAttach`, no
+  `claude_session_id`: a prompt-less warm capture never ran a turn, so `claude` auto-assigns + persists
+  its own id on the first real turn). The harness adopts the bound `session_id` for subsequent
+  `HarnessAttach`es, stores `session_env` and layers it onto each `claude` spawn (the warm child booted
+  with placeholder/template env only — `.envs(bound_env)` before the fixed invariants), and runs
+  `first_prompt` as the first turn (else stays idle). `HarnessHub::bind()` sends it over the existing
+  vsock channel, mirroring `send_prompt`'s attach-wait. **Inert until P4** wires warm-capture to call
+  it; the cold path keeps `SpawnHarness` (which already seeds the full per-session env into the harness
+  process) + `Prompt`. NOTE for P5: a respawn-on-bind rebuilds the V8 heap — if measurement shows that
+  erases the warm-heap win, deliver the env without a full respawn.
 - **P4 Warm-capture + restore fork.** In `build_base_snapshot`, gated on
   `ENGRAM_WARM_HARNESS_CAPTURE`, spawn a generic harness + a new `wait_harness_warm` readiness
   gate before `snapshot`; on any warming failure, fall back to a cold (today's) capture. Persist
@@ -169,4 +177,9 @@ SHAs are current-as-of-rebase onto `main` #82.)
 - P0a — carry over the Phase A/B spike tests as reference/regression
 - P0b — this ADR (Proposed)
 - P1 — persistent harness rewrite (`engram-harness-claude`): compiles + 5 unit tests + clippy green
-- _P2…P6_ pending
+- P2 — broker the harness credential (`broker_secret` + `inject_harness_broker_secret`); coord units +
+  `intercept_e2e.rs` substitution tests (commit 1a34093)
+- P3 — late-bind protocol: `HarnessCommand::Bind` + harness handler (adopt id, layer env, run first
+  prompt) + `HarnessHub::bind()`; proto round-trip + 2 hub unit tests; dev-vm clippy + 5 adapter
+  unit tests green. Inert until P4.
+- _P4…P6_ pending

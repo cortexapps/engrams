@@ -32,6 +32,8 @@
 //! length prefix + bincode body. Reusing the shape keeps the agent
 //! image small (one codec).
 
+use std::collections::HashMap;
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -240,6 +242,26 @@ pub enum HarnessCommand {
     /// if no run is in flight. NOT a process kill — unlike `Shutdown`,
     /// the adapter does not exit.
     Interrupt,
+    /// ADR 0037 late-bind: deliver per-session identity to an
+    /// already-running **warm** harness — one that was captured generic
+    /// (no session, no prompt, only template/placeholder env) into a base
+    /// snapshot and File-restored for this session. The adapter adopts
+    /// `session_id` as its attach identity (subsequent reconnects carry
+    /// it), layers `session_env` onto the agent child's environment
+    /// (replacing the capture-time placeholders with this session's forge/
+    /// upload tokens, real session id, …), and runs `first_prompt` as the
+    /// first turn if present (else stays idle awaiting a `Prompt`).
+    ///
+    /// Only ever sent to a fresh warm harness we baked, so appending it as
+    /// the last bincode variant is safe — no older peer ever receives it.
+    /// Inert until ADR 0037 P4 wires warm-capture to send it; the cold
+    /// path keeps using `SpawnHarness` (which seeds the full per-session
+    /// env into the harness process) + `Prompt`.
+    Bind {
+        session_id: SessionId,
+        session_env: HashMap<String, String>,
+        first_prompt: Option<String>,
+    },
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`
@@ -553,6 +575,20 @@ mod tests {
             text: "do the thing".into(),
         }));
         round_trip(HarnessFrame::Command(HarnessCommand::Interrupt));
+        let mut session_env = HashMap::new();
+        session_env.insert("ENGRAM_SESSION_ID".to_string(), "sess-123".to_string());
+        session_env.insert("ENGRAM_FORGE_TOKEN".to_string(), "tok-abc".to_string());
+        round_trip(HarnessFrame::Command(HarnessCommand::Bind {
+            session_id: SessionId::new(),
+            session_env: session_env.clone(),
+            first_prompt: Some("review the diff".into()),
+        }));
+        // first_prompt is optional (warm harness may bind, then idle).
+        round_trip(HarnessFrame::Command(HarnessCommand::Bind {
+            session_id: SessionId::new(),
+            session_env,
+            first_prompt: None,
+        }));
     }
 
     #[test]

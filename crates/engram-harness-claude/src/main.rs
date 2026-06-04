@@ -46,6 +46,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
+    use std::collections::HashMap;
     use std::process::{ExitCode, Stdio};
     use std::sync::Arc;
     use std::time::Duration;
@@ -183,6 +184,19 @@ mod adapter {
             return ExitCode::from(2);
         }
 
+        // Per-session identity delivered by a late `Bind` (ADR 0037 P4).
+        // Both live in `entry()` so they survive a vsock reconnect (the
+        // FC pause/resume case): once a warm harness is bound, the bound
+        // session id + env persist across reconnects.
+        //   - `bound_env`: the per-session env layered onto every `claude`
+        //     spawn. Empty on the cold path (agentd seeded the process env
+        //     already); populated by `Bind` for a warm-captured harness.
+        //   - `bound_session_id`: overrides the (sentinel) `cli.session_id`
+        //     in `HarnessAttach` once bound, so reconnects re-attach under
+        //     the real session.
+        let mut bound_env: HashMap<String, String> = HashMap::new();
+        let mut bound_session_id: Option<SessionId> = None;
+
         // Spawn the persistent `claude` child up front, before the dial
         // loop. It comes up idle (claude only dials the API on the first
         // user message), so this is the warm-but-quiescent state a base
@@ -190,6 +204,7 @@ mod adapter {
         // non-fatal — `ensure_claude` retries on the first prompt.
         let mut claude: Option<ClaudeChild> = match spawn_persistent_claude(
             &cli,
+            &bound_env,
             read_claude_session_id().await,
         )
         .await
@@ -237,7 +252,16 @@ mod adapter {
                     continue;
                 }
             };
-            match run_one_connection(stream, &cli, &mut next_prompt, &mut claude).await {
+            match run_one_connection(
+                stream,
+                &cli,
+                &mut next_prompt,
+                &mut claude,
+                &mut bound_env,
+                &mut bound_session_id,
+            )
+            .await
+            {
                 Outcome::Exit(code) => return code,
                 Outcome::Reconnect { reason } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -319,18 +343,35 @@ mod adapter {
     /// piping it risks a write(2) deadlock once the 64KiB buffer fills).
     /// `resume_id` is passed as `--resume` only when recovering an
     /// existing conversation (crash respawn / reconnect).
+    ///
+    /// `bound_env` is the per-session environment delivered by a late
+    /// `Bind` (ADR 0037 P4); it is empty on the cold path (agentd already
+    /// seeded the harness *process* env with the session env, which the
+    /// child inherits) and populated only for a warm-captured harness that
+    /// booted with placeholder env and must adopt this session's forge/
+    /// upload tokens + real session id. It is layered on **before** our
+    /// fixed invariants below so a session env can't clobber `IS_SANDBOX` /
+    /// the Bash timeouts.
     async fn spawn_persistent_claude(
         cli: &Cli,
+        bound_env: &HashMap<String, String>,
         resume_id: Option<String>,
     ) -> std::io::Result<ClaudeChild> {
         let argv = build_persistent_argv(&resume_id);
-        tracing::info!(?argv, "spawning persistent claude");
+        tracing::info!(
+            ?argv,
+            bound_env_keys = bound_env.len(),
+            "spawning persistent claude"
+        );
         let claude_bin: &str = cli
             .claude_bin
             .as_deref()
             .expect("claude_bin resolved at entry()");
         let mut child = Command::new(claude_bin)
             .args(&argv)
+            // Per-session env from a late Bind (empty on the cold path).
+            // Applied first so the fixed invariants below always win.
+            .envs(bound_env)
             // Long-run knobs for unattended Claude inside a VM (Bash
             // defaults would silently kill long builds), the
             // nonessential-traffic toggle (no autoupdater/telemetry),
@@ -416,15 +457,19 @@ mod adapter {
         cli: &Cli,
         next_prompt: &mut Option<String>,
         claude: &mut Option<ClaudeChild>,
+        bound_env: &mut HashMap<String, String>,
+        bound_session_id: &mut Option<SessionId>,
     ) -> Outcome {
         let (mut reader, writer) = stream;
 
-        // Handshake.
+        // Handshake. Attach under the bound session id once a `Bind` has
+        // arrived (warm-captured harness adopting its session); until then
+        // the sentinel `cli.session_id` from spawn.
         let mut writer_unlocked = writer;
         if let Err(e) = write_msg(
             &mut writer_unlocked,
             &HarnessAttach {
-                session_id: cli.session_id,
+                session_id: bound_session_id.unwrap_or(cli.session_id),
                 harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
             },
         )
@@ -504,6 +549,48 @@ mod adapter {
                             // is a no-op; keep waiting.
                             tracing::debug!("interrupt while idle; nothing to stop");
                         }
+                        Some(HarnessCommand::Bind {
+                            session_id,
+                            session_env,
+                            first_prompt,
+                        }) => {
+                            tracing::info!(
+                                %session_id,
+                                env_keys = session_env.len(),
+                                has_prompt = first_prompt.is_some(),
+                                "late-bind: adopting per-session identity",
+                            );
+                            *bound_session_id = Some(session_id);
+                            *bound_env = session_env;
+                            // The warm child booted with only placeholder /
+                            // template env. Respawn it so the per-session
+                            // env (forge + upload tokens, real session id,
+                            // …) is in the agent's process environment.
+                            // NOTE (ADR 0037 P5): a respawn rebuilds the V8
+                            // heap; if measurement shows that erases the
+                            // warm-heap win, deliver the env without a full
+                            // respawn (e.g. claude-side setenv at turn time).
+                            kill_claude(claude).await;
+                            match spawn_persistent_claude(
+                                cli,
+                                bound_env,
+                                read_claude_session_id().await,
+                            )
+                            .await
+                            {
+                                Ok(c) => *claude = Some(c),
+                                Err(e) => tracing::error!(
+                                    error = %e,
+                                    "respawn after bind failed; will retry on first prompt",
+                                ),
+                            }
+                            // Run the bound first prompt now; otherwise stay
+                            // idle and await a later `Prompt`.
+                            match first_prompt {
+                                Some(t) => break t,
+                                None => continue,
+                            }
+                        }
                         None => {
                             // Reader task ended → connection died.
                             // Reconnect rather than exit; the persistent
@@ -525,7 +612,8 @@ mod adapter {
             // Ensure the persistent child is alive (the eager spawn at
             // entry may have failed, or a prior crash left it None).
             if claude.is_none() {
-                match spawn_persistent_claude(cli, read_claude_session_id().await).await {
+                match spawn_persistent_claude(cli, bound_env, read_claude_session_id().await).await
+                {
                     Ok(c) => *claude = Some(c),
                     Err(e) => {
                         tracing::error!(error = %e, "spawn claude failed");
@@ -569,7 +657,7 @@ mod adapter {
             // persisted session id. Do this even on the reconnect path so
             // the child is ready when we re-attach.
             if outcome.crashed {
-                *claude = spawn_persistent_claude(cli, read_claude_session_id().await)
+                *claude = spawn_persistent_claude(cli, bound_env, read_claude_session_id().await)
                     .await
                     .ok();
             }
@@ -829,6 +917,15 @@ mod adapter {
                             }
                         }
                         Some(HarnessCommand::Checkpoint { .. }) => {}
+                        Some(HarnessCommand::Bind { .. }) => {
+                            // Late-bind targets an idle warm harness (no
+                            // turn running). Mid-turn it would mean
+                            // re-identifying a session under an in-flight
+                            // run — undefined; ignore and keep the turn.
+                            tracing::warn!(
+                                "Bind received mid-turn; ignoring (warm-bind happens at idle)",
+                            );
+                        }
                         None => {
                             // Host channel closed mid-turn. Stop reading
                             // commands + writing events, but keep draining

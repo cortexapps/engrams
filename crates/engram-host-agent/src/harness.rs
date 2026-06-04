@@ -385,6 +385,50 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// ADR 0037 late-bind: deliver per-session identity (`session_id`,
+    /// `session_env`, optional `first_prompt`) to an already-running
+    /// **warm** harness that was File-restored from a generic base
+    /// snapshot. Mirrors `send_prompt`'s attach-wait — the warm harness
+    /// re-attaches under its sentinel session right after restore, so we
+    /// briefly retry until its connection appears. Clears `last_idle_at`
+    /// so the soft idle-eviction TTL doesn't fire while the session is
+    /// being bound. `NotAttached` if the warm harness never re-attaches.
+    ///
+    /// Inert until P4 wires the warm-capture/restore path to call it; the
+    /// cold path keeps spawning a fresh harness (with the full per-session
+    /// env already seeded) and uses `send_prompt`.
+    pub async fn bind(
+        &self,
+        sandbox_id: SandboxId,
+        session_id: SessionId,
+        session_env: HashMap<String, String>,
+        first_prompt: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let cmd_tx = {
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);
+            loop {
+                if let Some(handle) = self.inner.connections.lock().get(&sandbox_id) {
+                    self.inner.last_idle_at.lock().remove(&sandbox_id);
+                    break handle.cmd_tx.clone();
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(HarnessError::NotAttached);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        cmd_tx
+            .send(HarnessFrame::Command(HarnessCommand::Bind {
+                session_id,
+                session_env,
+                first_prompt,
+            }))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
     /// Number of currently-attached harnesses. Diagnostic / test helper.
     pub fn attached_count(&self) -> usize {
         self.inner.connections.lock().len()
@@ -1037,6 +1081,83 @@ mod tests {
         let (sink, _) = collecting_sink();
         let hub = HarnessHub::new(sink);
         let err = hub.interrupt(SandboxId::new()).await.unwrap_err();
+        assert!(matches!(err, HarnessError::NotAttached));
+    }
+
+    #[tokio::test]
+    async fn bind_command_reaches_harness() {
+        // ADR 0037: hub.bind() must deliver a HarnessCommand::Bind carrying
+        // the per-session id + env + first prompt to the attached (warm)
+        // harness. Mirrors interrupt/shutdown_command_reaches_harness; the
+        // harness-side adoption (respawn claude with the env, attach under
+        // the bound id) is covered by the e2e harness tests.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let bound_session = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
+            match frame {
+                HarnessFrame::Command(HarnessCommand::Bind {
+                    session_id,
+                    session_env,
+                    first_prompt,
+                }) => {
+                    session_id == bound_session
+                        && session_env.get("ENGRAM_FORGE_TOKEN").map(String::as_str)
+                            == Some("tok-xyz")
+                        && first_prompt.as_deref() == Some("ship it")
+                }
+                _ => false,
+            }
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach within the 1s deadline"
+        );
+
+        let mut session_env = HashMap::new();
+        session_env.insert("ENGRAM_FORGE_TOKEN".to_string(), "tok-xyz".to_string());
+        hub.bind(
+            sandbox_id,
+            bound_session,
+            session_env,
+            Some("ship it".to_string()),
+        )
+        .await
+        .expect("bind");
+        let received = harness_task.await.unwrap();
+        assert!(
+            received,
+            "harness should receive a Bind frame with the bound id, env, and prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_returns_not_attached_for_unknown_sandbox() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let err = hub
+            .bind(SandboxId::new(), SessionId::new(), HashMap::new(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, HarnessError::NotAttached));
     }
 
