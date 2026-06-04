@@ -15,13 +15,13 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! `sudo chmod 666 /dev/nbd0` is the lightweight alternative to
-//! running the whole test under root — the daemon needs to `open(2)`
-//! the device + issue NBD ioctls, both of which only require the
-//! file's permission bits (no capabilities). Production hosts grant
-//! the `engram-host-agent` system user `chown root:engram /dev/nbd*
-//! && chmod 660 /dev/nbd*` via a udev rule the Packer manifest
-//! installs.
+//! `sudo chmod 666 /dev/nbd0` used to suffice; newer Ubuntu kernels
+//! (observed on the dev-vm's 6.x, 2026-06) gate the NBD setup ioctls
+//! (`NBD_SET_SOCK` et al.) behind CAP_SYS_ADMIN regardless of the
+//! device's permission bits, so these tests now need to run under
+//! `sudo -E` (mirroring the root-required FC tests in
+//! `run-boot-test.sh`). Production is unaffected — the host-agent
+//! runs as root.
 //!
 //! What this test covers that the pure-Rust e2e suite
 //! (`adr_0007_e2e.rs`) doesn't:
@@ -203,6 +203,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         image: "fc-nbd-test".into(),
         rootfs_source: Some(nbd_device.clone()),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },
@@ -278,6 +279,158 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         .expect("destroy NBD-backed sandbox");
     drop(nbd_state);
     eprintln!("TEARDOWN: VM destroyed + NBD daemon disconnected");
+}
+
+/// ADR 0028 Fix B end-to-end (host half of the `cf4d4afd` shape):
+/// a session's EVOLVED rootfs lineage exists only as a chunked
+/// manifest in blob storage (the continuous-sync `live_disk_manifest`)
+/// — no memory snapshot, no sidecar, no image bundle on this "peer"
+/// host. Recovery = `PooledBackend::create` with
+/// `spec.rootfs_manifest = Some(manifest)`:
+///
+///   - the pooled backend NBD-attaches THAT manifest (not an image's),
+///   - FC fresh-boots a kernel that mounts the evolved rootfs,
+///   - the guest proves it's the evolved disk (not a base) via a
+///     marker-conditional init: it reads back the marker file only
+///     the "session" wrote and stays alive iff the content matches —
+///     a mismatch exits init, which panics the kernel (`panic=1
+///     reboot=k`) and kills the VM. Host-side liveness after a grace
+///     period IS the content assertion. (No exec: the raw test rootfs
+///     carries no agentd, so vsock exec can't work here.)
+///   - `destroy()` tears the daemon down cleanly.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + modprobe nbd + writeable /dev/nbd0 + debugfs"]
+async fn disk_only_cold_boot_via_rootfs_manifest_override() {
+    let (kernel, rootfs_src, nbd_path) = match preflight() {
+        Some(v) => v,
+        None => return,
+    };
+    // The marker injection needs debugfs (e2fsprogs).
+    if !std::process::Command::new("debugfs")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: debugfs not available");
+        return;
+    }
+
+    let work = tempfile::tempdir().expect("tempdir");
+
+    // 1. Build the "session's evolved disk": copy the base test
+    //    rootfs and plant a marker file in it — the stand-in for the
+    //    work a real session wrote before its host died.
+    let evolved = work.path().join("evolved-rootfs.ext4");
+    std::fs::copy(&rootfs_src, &evolved).expect("copy rootfs");
+    let marker = work.path().join("marker.txt");
+    std::fs::write(&marker, "survived-the-host-roll\n").expect("write marker");
+    // The verify-init: alive iff the marker reads back byte-identical.
+    // A mismatch (or a base disk without the marker) exits pid 1 →
+    // kernel panic (`panic=1 reboot=k`) → FC exits → the host-side
+    // liveness assertion fails. PATH is explicit because the kernel
+    // execs init with an empty environment.
+    let verify_init = work.path().join("verify-init.sh");
+    std::fs::write(
+        &verify_init,
+        "#!/bin/bash\n\
+         export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
+         if [ \"$(cat /session-work.txt 2>/dev/null)\" = \"survived-the-host-roll\" ]; then\n\
+         \twhile true; do sleep 60; done\n\
+         fi\n\
+         exit 1\n",
+    )
+    .expect("write verify-init");
+    for cmd in [
+        format!("write {} /session-work.txt", marker.display()),
+        format!("write {} /verify-init.sh", verify_init.display()),
+        "sif /verify-init.sh mode 0100755".to_string(),
+    ] {
+        let out = std::process::Command::new("debugfs")
+            .args(["-w", "-R", &cmd])
+            .arg(&evolved)
+            .output()
+            .expect("debugfs");
+        assert!(out.status.success(), "debugfs `{cmd}` failed");
+    }
+
+    // 2. Chunk the evolved disk — this manifest IS the
+    //    live_disk_manifest a coord would hand the recovery.
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = ChunkStore::new(blob);
+    let manifest = store
+        .chunk_file(&evolved, ManifestKind::Disk, None)
+        .await
+        .expect("chunk evolved rootfs");
+    let manifest_ref = ManifestRef::new();
+    store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .expect("put evolved manifest");
+    // The evolved file itself never travels — only its chunks. Remove
+    // it so nothing can accidentally read it directly.
+    std::fs::remove_file(&evolved).expect("rm evolved rootfs");
+
+    // 3. Stand up the "peer host": PooledBackend over FC with the NBD
+    //    pool + chunk store + cache wired, but NO image cache — the
+    //    recovery must not need the image's bytes at all.
+    let mut cfg = FirecrackerConfig::with_kernel(kernel);
+    cfg.net_pool = None;
+    cfg.restore_mode = RestoreMode::File;
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/verify-init.sh".into();
+    let inner = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path]).expect("slot pool");
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
+    cache_cfg.budget_bytes = 256 * 1024 * 1024;
+    let pooled = engram_host_agent::pooled_backend::PooledBackend::new(inner)
+        .with_nbd_pool(pool)
+        .with_chunk_store(store, work.path().join("materialize"))
+        .with_chunk_cache(ChunkCache::new(cache_cfg));
+
+    // 4. The cold-boot recovery spec — what
+    //    `coordinator::evacuation::evacuate_dead_source` builds via
+    //    `cold_boot_spec(...)` + the rootfs_manifest override.
+    let spec = SandboxSpec {
+        image: "fc-disk-only-recovery-test".into(),
+        rootfs_source: None,
+        image_uri: None,
+        rootfs_manifest: Some(manifest_ref),
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 128 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
+    let sandbox_id = pooled
+        .create(spec)
+        .await
+        .expect("disk-only cold boot via rootfs_manifest override");
+    eprintln!("BOOTED: fresh kernel on the evolved rootfs lineage, sandbox {sandbox_id}");
+
+    // 5. The marker only exists on the EVOLVED disk, and the
+    //    verify-init keeps the guest alive only on a byte-identical
+    //    read-back. Surviving the grace period IS the content
+    //    assertion: a base disk (no marker), a corrupted chunk, or a
+    //    failed mount all panic the guest and empty `list()`.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let live = pooled.list().await.expect("list");
+    assert!(
+        live.contains(&sandbox_id),
+        "recovered VM died within the grace period — the guest's \
+         verify-init found no byte-identical /session-work.txt \
+         (wrong disk, corrupted chunks, or mount failure)",
+    );
+    eprintln!("VERIFIED: guest alive at +6s — marker read back byte-identical");
+
+    pooled
+        .destroy(sandbox_id)
+        .await
+        .expect("destroy recovered sandbox");
+    eprintln!("TEARDOWN: recovered VM destroyed + NBD daemon disconnected");
 }
 
 /// Mirror of `common::drain` from the FC test scaffold. Drains an

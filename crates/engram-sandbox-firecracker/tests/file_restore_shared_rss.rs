@@ -92,6 +92,7 @@ async fn file_backend_siblings_share_clean_pages() {
         image: "fc-shared-rss-test".into(),
         rootfs_source: Some(rootfs),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 2 },

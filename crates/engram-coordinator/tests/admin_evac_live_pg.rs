@@ -265,6 +265,25 @@ fn proto_to_core_manifest(r: ChunkManifestRef) -> ManifestRef {
     }
 }
 
+/// ADR 0028 Fix B: the cold-boot spec a disk-only recovery rides (in
+/// prod, derived from the enabled image via `resolve_cold_boot_spec`).
+fn test_cold_boot_spec() -> SandboxSpec {
+    SandboxSpec {
+        image: "ghcr.io/test/img:t".into(),
+        rootfs_source: None,
+        image_uri: Some("ghcr.io/test/img:t".into()),
+        rootfs_manifest: None,
+        cpu: engram_core::types::sandbox::CpuLimit { vcpus: 2 },
+        memory: engram_core::types::sandbox::MemoryLimit { max_mib: 4096 },
+        disk: engram_core::types::sandbox::DiskLimit { max_gib: 20 },
+        ttl: None,
+        env: Default::default(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
@@ -312,7 +331,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         .expect("latest_snapshot lookup")
         .expect("snapshot present");
 
-    let receipt = evacuate_dead_source(&registry, &meta, session, Some(snapshot))
+    let receipt = evacuate_dead_source(&registry, &meta, session, Some(snapshot), None)
         .await
         .expect("dead-source evac succeeds");
     assert_eq!(receipt.new_host_id, target_host);
@@ -354,9 +373,13 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
         .expect("Active → HostLost");
 
     let session = meta.get_session(session_id).await.expect("get session");
-    let receipt = evacuate_dead_source(&registry, &meta, session, None)
-        .await
-        .expect("disk-only evac succeeds");
+    // ADR 0028 Fix B: disk-only recovery is a cold boot — the caller
+    // supplies the boot spec (in prod, derived from the enabled image
+    // via `resolve_cold_boot_spec`).
+    let receipt =
+        evacuate_dead_source(&registry, &meta, session, None, Some(test_cold_boot_spec()))
+            .await
+            .expect("disk-only evac succeeds");
     match &receipt.loss {
         EvacLoss::Memory { reason } => {
             assert_eq!(reason, "source-dead-no-snapshot");
@@ -385,7 +408,7 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
         .expect("Active → HostLost");
 
     let session = meta.get_session(session_id).await.expect("get session");
-    let result = evacuate_dead_source(&registry, &meta, session, None).await;
+    let result = evacuate_dead_source(&registry, &meta, session, None, None).await;
     assert!(matches!(result, Err(EvacError::NoRecoverableState)));
 
     // PG row sits at HostLost — the caller routes it to Dead next.

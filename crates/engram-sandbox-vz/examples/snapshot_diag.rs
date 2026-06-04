@@ -114,6 +114,7 @@ async fn run_scenario(
         image: "diag".into(),
         rootfs_source: Some(PathBuf::from(rootfs)),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 512 },
         disk: DiskLimit { max_gib: 10 },

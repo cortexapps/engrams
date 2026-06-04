@@ -71,6 +71,7 @@ async fn serial_restore_from_one_canonical_n_times() {
         image: "multi-restore-source".into(),
         rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },

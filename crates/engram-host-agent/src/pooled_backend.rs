@@ -28,7 +28,7 @@ use tokio::fs;
 use tokio::sync::Mutex;
 
 use crate::egress::HostEgress;
-use crate::image_cache::{CachedImage, ImageBundle, ImageCache};
+use crate::image_cache::{CachedImage, ImageCache};
 
 /// Cross-platform optional NBD state slot. Linux carries the real
 /// state; non-Linux is `()` so the `resolve_rootfs` return signature
@@ -671,7 +671,71 @@ impl PooledBackend {
             self.chunk_cache.as_ref(),
             materialize_dir,
             uri,
-            bundle,
+            bundle.disk_manifest,
+            &self.materialize_lock,
+        )
+        .await?;
+        Ok((path, nbd_state_none()))
+    }
+
+    /// ADR 0028 Fix B: resolve the root disk from an explicit chunked
+    /// manifest (`spec.rootfs_manifest`) instead of an image — the
+    /// disk-only cold-boot recovery shape, where a fresh kernel mounts
+    /// a session's evolved `live_disk_manifest`. NBD-attached when the
+    /// host has the prereqs (prod FC hosts always do), so the
+    /// continuous-flush scheduler continues the SAME manifest lineage
+    /// the recovery booted from; materialize-to-file otherwise
+    /// (dev/VZ parity — those hosts don't track flushes for any
+    /// sandbox, so the recovered session degrades identically).
+    async fn resolve_rootfs_from_manifest(
+        &self,
+        manifest_ref: engram_core::types::manifest::ManifestRef,
+    ) -> Result<(PathBuf, NbdStateSlot), SandboxError> {
+        #[cfg(target_os = "linux")]
+        if let (Some(pool), Some(store), Some(cache)) = (
+            self.nbd_pool.as_ref(),
+            self.chunk_store.as_ref(),
+            self.chunk_cache.as_ref(),
+        ) {
+            let store_arc = Arc::new(store.clone());
+            let state = crate::disk_daemon::attach_manifest(
+                manifest_ref,
+                cache.clone(),
+                store_arc,
+                pool,
+                self.flush_config.dirty_threshold_bytes,
+            )
+            .await
+            .map_err(|e| SandboxError::Vm(format!("rootfs-manifest NBD attach: {e}").into()))?;
+            tracing::info!(
+                manifest = %manifest_ref,
+                device = %state.device_path().display(),
+                "rootfs branch: NBD daemon (explicit manifest override)",
+            );
+            return Ok((state.device_path().to_path_buf(), Some(state)));
+        }
+
+        let (chunk_store, materialize_dir) =
+            match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
+                (Some(cs), Some(dir)) => (cs, dir),
+                _ => {
+                    return Err(SandboxError::InvalidSpec(
+                        "spec.rootfs_manifest is set but this host has neither an NBD \
+                     pool nor a chunk store + materialize dir wired"
+                            .into(),
+                    ));
+                }
+            };
+        tracing::info!(
+            manifest = %manifest_ref,
+            "rootfs branch: materialize-to-file (explicit manifest override)",
+        );
+        let path = materialize_chunked_rootfs(
+            chunk_store,
+            self.chunk_cache.as_ref(),
+            materialize_dir,
+            "rootfs-manifest-override",
+            manifest_ref,
             &self.materialize_lock,
         )
         .await?;
@@ -1341,7 +1405,7 @@ async fn materialize_chunked_rootfs(
     chunk_cache: Option<&ChunkCache>,
     materialize_dir: &std::path::Path,
     uri: &str,
-    bundle: &ImageBundle,
+    manifest_ref: engram_core::types::manifest::ManifestRef,
     materialize_lock: &Mutex<()>,
 ) -> Result<PathBuf, SandboxError> {
     fs::create_dir_all(materialize_dir).await.map_err(|e| {
@@ -1352,7 +1416,6 @@ async fn materialize_chunked_rootfs(
         );
         SandboxError::Vm(format!("materialize dir: {e}").into())
     })?;
-    let manifest_ref = bundle.disk_manifest;
     let dest = materialize_dir.join(format!(
         "{}-v{}.ext4",
         manifest_ref.manifest_id, manifest_ref.version,
@@ -1550,7 +1613,21 @@ impl SandboxBackend for PooledBackend {
         let mut image_resolve = std::time::Duration::ZERO;
         let mut materialize = std::time::Duration::ZERO;
         let result: Result<SandboxId, SandboxError> = async {
-            if let Some(cache) = &self.image_cache {
+            // ADR 0028 Fix B: explicit rootfs-manifest override wins
+            // over image resolution — the disk-only cold-boot recovery
+            // boots a fresh kernel against a session's evolved rootfs
+            // lineage, so the image's own disk (and its pull) is
+            // irrelevant; `spec.image_uri` stays as record-keeping.
+            if let Some(manifest_ref) = spec.rootfs_manifest {
+                let t = std::time::Instant::now();
+                let (path, _state) = self.resolve_rootfs_from_manifest(manifest_ref).await?;
+                materialize += t.elapsed();
+                spec.rootfs_source = Some(path);
+                #[cfg(target_os = "linux")]
+                {
+                    pending_nbd_state = _state;
+                }
+            } else if let Some(cache) = &self.image_cache {
                 if let Some(uri) = spec.image_uri.clone() {
                     let t = std::time::Instant::now();
                     let cached = cache.ensure_image(&uri).await.map_err(|e| {
@@ -2543,6 +2620,7 @@ impl PooledBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
@@ -2551,6 +2629,7 @@ mod tests {
             image: image.into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },
@@ -2597,10 +2676,16 @@ mod tests {
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());
 
-        let path1 =
-            materialize_chunked_rootfs(&cs, None, &materialize_dir, "img:1", &bundle, &lock)
-                .await
-                .unwrap();
+        let path1 = materialize_chunked_rootfs(
+            &cs,
+            None,
+            &materialize_dir,
+            "img:1",
+            bundle.disk_manifest,
+            &lock,
+        )
+        .await
+        .unwrap();
         let restored = tokio::fs::read(&path1).await.unwrap();
         assert_eq!(restored, bytes, "byte-for-byte mismatch");
 
@@ -2608,10 +2693,16 @@ mod tests {
         // no rewrite.
         let mtime_before = std::fs::metadata(&path1).unwrap().modified().unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let path2 =
-            materialize_chunked_rootfs(&cs, None, &materialize_dir, "img:1", &bundle, &lock)
-                .await
-                .unwrap();
+        let path2 = materialize_chunked_rootfs(
+            &cs,
+            None,
+            &materialize_dir,
+            "img:1",
+            bundle.disk_manifest,
+            &lock,
+        )
+        .await
+        .unwrap();
         assert_eq!(path1, path2);
         let mtime_after = std::fs::metadata(&path2).unwrap().modified().unwrap();
         assert_eq!(
@@ -3400,7 +3491,7 @@ mod tests {
             Some(&cache),
             &materialize_dir,
             "img:cached",
-            &bundle,
+            bundle.disk_manifest,
             &lock,
         )
         .await
@@ -3421,7 +3512,7 @@ mod tests {
             Some(&cache),
             &materialize_dir,
             "img:cached",
-            &bundle,
+            bundle.disk_manifest,
             &lock,
         )
         .await
@@ -3570,6 +3661,7 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: Some("test:1".into()),
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },

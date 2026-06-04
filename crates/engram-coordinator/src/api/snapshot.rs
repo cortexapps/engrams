@@ -319,24 +319,106 @@ async fn resume_from_idle(
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
-    let record = state
-        .services
-        .meta
-        .latest_snapshot_for_session(id)
-        .await?
-        .ok_or_else(|| {
-            tracing::warn!(
-                session_id = %id,
-                "resume requested but no snapshot row found — marking Dead",
-            );
-            ApiError::Gone(
-                "snapshot_invalidated: session can't be revived; \
-                 use `engram session fork <id>` to continue"
-                    .into(),
-            )
-        })?;
-    let _ = transition_to_dead_if_no_snapshot(&state, id).await;
+    let Some(record) = state.services.meta.latest_snapshot_for_session(id).await? else {
+        // ADR 0028 Fix B: no snapshot row, but a continuous-sync disk
+        // manifest → recover via the disk-only cold boot (rung 2)
+        // instead of declaring the session dead. This is also the
+        // documented recovery path for `ColdBootUnavailable` Idle
+        // fallbacks: re-enable the image, then /resume lands here.
+        if session.live_disk_manifest.is_some() {
+            return resume_disk_only_cold_boot(state, session).await;
+        }
+        tracing::warn!(
+            session_id = %id,
+            "resume requested but no snapshot row found — marking Dead",
+        );
+        let _ = transition_to_dead_if_no_snapshot(&state, id).await;
+        return Err(ApiError::Gone(
+            "snapshot_invalidated: session can't be revived; \
+             use `engram session fork <id>` to continue"
+                .into(),
+        ));
+    };
     resume_from_fc_snapshot(state, session, record).await
+}
+
+/// ADR 0028 Fix B — manual-resume flavor of the disk-only cold boot:
+/// fresh kernel boot mounting the session's `live_disk_manifest` on
+/// whichever host can take it, fresh harness. On-disk work survives;
+/// in-RAM context does not (this path only exists because no coherent
+/// memory snapshot was ever recorded).
+async fn resume_disk_only_cold_boot(
+    state: SharedState,
+    session: Session,
+) -> Result<SnapshotResponse, ApiError> {
+    use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
+
+    let id = session.id;
+    let Some(spec) = resolve_cold_boot_spec(&state.services.meta, &session).await else {
+        return Err(ApiError::Conflict(format!(
+            "session {id} has only a live disk manifest and its image `{}` is no \
+             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
+            session.image,
+        )));
+    };
+
+    // The previous host isn't dead here (Idle = the sandbox was
+    // destroyed); clearing host_id disables `exclude_host` so a
+    // single-host deployment can recover onto itself.
+    let mut relocatable = session.clone();
+    relocatable.host_id = None;
+
+    let receipt = evacuate_dead_source(
+        &state.host_registry,
+        &state.services.meta,
+        relocatable,
+        None,
+        Some(spec),
+    )
+    .await
+    .map_err(|e| match &e {
+        EvacError::NoTargetAvailable(_) => ApiError::Unavailable(format!(
+            "no host can take the disk-only cold-boot recovery right now: {e}. \
+             Retry shortly.",
+        )),
+        _ => ApiError::Internal(format!("disk-only cold-boot recovery failed: {e}")),
+    })?;
+
+    tracing::info!(
+        session_id = %id,
+        new_host = %receipt.new_host_id,
+        new_sandbox = %receipt.new_sandbox_id,
+        loss = receipt.loss.as_str(),
+        "resume: disk-only cold boot relocated session to Created — finishing harness rebuild",
+    );
+    let _ = state
+        .emit(
+            id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Idle,
+                to: SessionState::Created,
+                at: Utc::now(),
+            },
+        )
+        .await;
+
+    bind_session_routing(&state, id, receipt.new_sandbox_id).await;
+    let refreshed = state.services.meta.get_session(id).await?;
+    let outcome = finish_resume_to_active(&state, &refreshed, receipt.new_sandbox_id).await?;
+    let note = match outcome {
+        FinishResumeOutcome::Active => {
+            "resumed via disk-only cold boot (fresh kernel on latest disk; in-RAM context lost)"
+        }
+        FinishResumeOutcome::CreatedHarnessFailed => {
+            "disk-only cold boot relocated the session; harness spawn failed — still Created"
+        }
+    };
+    Ok(SnapshotResponse {
+        session_id: id,
+        snapshot_id: None,
+        size_bytes: None,
+        note,
+    })
 }
 
 /// Look up the session's snapshot one more time and, if there's

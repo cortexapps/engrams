@@ -57,7 +57,7 @@ use chrono::Utc;
 use engram_core::types::{Session, SessionState};
 
 use crate::api::snapshot::{bind_session_routing, finish_resume_to_active, FinishResumeOutcome};
-use crate::evacuation::{evacuate_dead_source, EvacError};
+use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
 use crate::state::{SessionEvent, SharedState};
 
 #[derive(Clone, Debug)]
@@ -207,25 +207,69 @@ async fn run_resume_pipeline(
         .latest_snapshot_for_session(session_id)
         .await?;
 
-    let receipt = evacuate_dead_source(
+    // ADR 0028 Fix B: pre-resolve the disk-only cold-boot spec. Only
+    // consulted when no coherent memory snapshot is usable; a `None`
+    // there fails structurally rather than burning the budget.
+    let cold_boot_spec = resolve_cold_boot_spec(&state.services.meta, &session).await;
+
+    let receipt = match evacuate_dead_source(
         &state.host_registry,
         &state.services.meta,
         session.clone(),
         snapshot,
+        cold_boot_spec,
     )
     .await
-    .map_err(|e: EvacError| {
-        // NoRecoverableState is structural — session has neither a
-        // live manifest nor a snapshot. No amount of retrying fixes
-        // this. Surface it as a one-shot fall-through to Dead by
-        // letting the budget loop run; eventually the max-attempts
-        // arm flips to Idle, then /resume sees no snapshot and
-        // transitions to Dead via the existing
-        // `transition_to_dead_if_no_snapshot` path. Could short-
-        // circuit here, but the indirection costs us little and
-        // keeps the scanner's recovery shape uniform.
-        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-    })?;
+    {
+        Ok(r) => r,
+        // ADR 0028 Fix B fail-fast: structural errors can never be
+        // fixed by retrying — the pre-Fix-B behavior of letting the
+        // budget loop burn 20 attempts (~3 min of RestoreFailed churn
+        // in the cf4d4afd incident) just delayed the honest terminal
+        // state. NoRecoverableState (nothing to restore from) → Dead;
+        // ColdBootUnavailable (disk exists, image gone) → Idle, so
+        // re-enabling the image + /resume can still recover the disk.
+        Err(e) if e.is_structural() => {
+            let target = match &e {
+                EvacError::NoRecoverableState => SessionState::Dead,
+                _ => SessionState::Idle,
+            };
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                target = %target.as_str(),
+                "evac-resumer: structural failure — failing fast instead of burning budget",
+            );
+            match state
+                .services
+                .meta
+                .transition_session(session_id, target)
+                .await
+            {
+                Ok(prev) => {
+                    let _ = state
+                        .emit(
+                            session_id,
+                            SessionEvent::StatusChanged {
+                                from: prev,
+                                to: target,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
+                }
+                Err(te) => {
+                    tracing::warn!(
+                        %session_id,
+                        error = %te,
+                        "evac-resumer: structural fail-fast transition failed",
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    };
 
     tracing::info!(
         %session_id,
@@ -292,4 +336,119 @@ mod tests {
     //     simulate 20 failed bumps, observe Evacuating → Idle
     //     fallback.
     //   - dev-vm integration-evac-test.sh: real two-host drain.
+    //
+    // ADR 0028 Fix B adds the structural fail-fast tests below: a
+    // structurally-unrecoverable session must reach its terminal
+    // state on the FIRST attempt, not after burning the 20-attempt
+    // budget (~3 min of churn in the cf4d4afd incident).
+
+    use super::*;
+    use crate::config::CoordinatorConfig;
+    use crate::host_registry::HostRegistry;
+    use crate::state::tests::MiniMeta;
+    use crate::state::AppState;
+    use crate::Services;
+    use engram_cloud_mock::MockCloud;
+    use engram_core::traits::MetadataStore;
+    use engram_core::types::session::SessionMode;
+    use std::sync::Arc;
+
+    fn evacuating_session(live_disk: Option<engram_core::types::manifest::ManifestRef>) -> Session {
+        Session {
+            id: engram_core::SessionId::new(),
+            user_id: None,
+            status: SessionState::Evacuating,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:evac-test".into(),
+            mode: SessionMode::Agent,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            live_disk_manifest: live_disk,
+        }
+    }
+
+    fn build_state(session: Session) -> (SharedState, Arc<MiniMeta>) {
+        let tmp = std::env::temp_dir().join(format!("evac-resumer-test-{}", session.id));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                tmp.join("blobs"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(tmp.join("blobs")),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: tmp,
+            ..CoordinatorConfig::default()
+        };
+        (
+            Arc::new(AppState::new_with_registry(cfg, services, host_registry)),
+            meta,
+        )
+    }
+
+    /// No snapshot + no live disk manifest → NoRecoverableState →
+    /// Dead on attempt 1.
+    #[tokio::test]
+    async fn structural_no_state_fails_fast_to_dead() {
+        let session = evacuating_session(None);
+        let session_id = session.id;
+        let (state, meta) = build_state(session.clone());
+
+        advance_one(&EvacResumerConfig::default(), &state, session, 0)
+            .await
+            .expect("advance_one swallows structural failures");
+
+        let after = meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Dead,
+            "structurally unrecoverable session must fail fast to Dead, not retry",
+        );
+    }
+
+    /// Live disk manifest present but the image is not enabled (no
+    /// cold-boot spec derivable) → ColdBootUnavailable → Idle on
+    /// attempt 1, preserving the re-enable-then-/resume path.
+    #[tokio::test]
+    async fn structural_disk_only_without_image_fails_fast_to_idle() {
+        let live = engram_core::types::manifest::ManifestRef {
+            manifest_id: uuid::Uuid::from_u128(0xD15C),
+            version: 4,
+        };
+        let session = evacuating_session(Some(live));
+        let session_id = session.id;
+        let (state, meta) = build_state(session.clone());
+
+        advance_one(&EvacResumerConfig::default(), &state, session, 0)
+            .await
+            .expect("advance_one swallows structural failures");
+
+        let after = meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Idle,
+            "disk-only session with no enabled image must land at Idle \
+             (re-enable image + /resume recovers), not burn the budget",
+        );
+    }
 }

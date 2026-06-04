@@ -139,6 +139,7 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: Some(PathBuf::from("/tmp/rootfs.ext4")),
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 512 },
             disk: DiskLimit { max_gib: 1 },

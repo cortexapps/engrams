@@ -127,6 +127,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         image: "engram-diff-snapshot-test".into(),
         rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: GUEST_MIB },
         disk: DiskLimit { max_gib: 1 },

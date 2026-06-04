@@ -32,6 +32,17 @@ pub struct SandboxSpec {
     /// dev workflows that pre-bake images into `<local_path>/images/`.
     #[serde(default)]
     pub image_uri: Option<String>,
+    /// ADR 0028 Fix B: chunked-manifest override for the root disk.
+    /// When set, the host serves the rootfs from THIS manifest's
+    /// chunks (NBD-attached, continuous-flush continues the same
+    /// lineage) instead of resolving it from `image_uri` — the
+    /// disk-only cold-boot recovery shape: a fresh kernel boot
+    /// mounting a session's evolved `live_disk_manifest`. Wire note:
+    /// `SandboxSpec` is bincode-framed coord→host, so a mixed-version
+    /// fleet mid-deploy can't decode creates — acceptable per the
+    /// clean-break norm (coord + host MIG roll together on push).
+    #[serde(default)]
+    pub rootfs_manifest: Option<super::manifest::ManifestRef>,
     // ADR 0021 P1.5b retired `harness_pack_uri` + `harness_substrate`.
     // The harness now lives in the image rootfs at the manifest-
     // declared `[harness] exec` path — there's no separate registry
@@ -369,6 +380,7 @@ mod tests {
             image: "warm-1".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 2 },
             memory: MemoryLimit { max_mib: 4096 },
             disk: DiskLimit { max_gib: 8 },

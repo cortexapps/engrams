@@ -371,6 +371,7 @@ mod tests {
             image: "drain-test".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
