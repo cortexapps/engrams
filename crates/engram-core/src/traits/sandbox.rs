@@ -213,6 +213,19 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0028 Fix A: does this backend produce coherent, O(dirty-set)
+    /// memory checkpoints worth running the periodic checkpoint driver
+    /// against? Only Firecracker with `track_dirty_pages` armed does —
+    /// VZ has no working guest-memory snapshot (Apple arm64
+    /// save/restore is broken, ADR 0003; it clone-snapshots disk +
+    /// cold-boots), and Process has no snapshots at all. The driver
+    /// gates on this so a split-mode VZ / Process host never pauses
+    /// its VMs every cadence interval for a memory-less snapshot that
+    /// seeds no chain and writes no record. Default `false`.
+    fn supports_diff_checkpoints(&self) -> bool {
+        false
+    }
+
     /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
     /// Idempotent — calling on an already-paused VM is a no-op
     /// success. Used by [`crate::traits::host_client`]-side

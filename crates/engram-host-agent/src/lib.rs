@@ -293,20 +293,32 @@ impl HostAgent {
                 p = p.with_live_manifest_coord_publisher(publisher_coord, host_id);
                 // ADR 0028 Fix A: checkpoint chains (rolling memory
                 // images + durable records) live under the work dir.
-                // Gated on the chunk store being wired — without one
-                // there's nothing durable to chain.
-                if self.chunk_store.is_some() {
+                // Gated on (a) a chunk store being wired — nothing
+                // durable to chain without it — AND (b) the backend
+                // actually producing coherent memory checkpoints (FC
+                // with dirty tracking). The latter keeps a split-mode
+                // VZ / Process host (which the Tilt local setup runs)
+                // from ever engaging the chain or the periodic driver
+                // below — VZ has no guest-memory snapshot, so a
+                // checkpoint there is just a wasteful VM pause.
+                let checkpoints_supported = self.sandbox.supports_diff_checkpoints();
+                if self.chunk_store.is_some() && checkpoints_supported {
                     p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));
                 }
                 Arc::new(p)
             };
             // ADR 0028 Fix A: the periodic checkpoint driver. No-ops
-            // when ENGRAM_CHECKPOINT_INTERVAL_SECS=0 or the backend
-            // has no checkpoint dir.
-            let _checkpoint_driver = checkpoint::spawn_checkpoint_driver(
-                pooled.clone(),
-                checkpoint::CheckpointConfig::from_env(),
-            );
+            // when ENGRAM_CHECKPOINT_INTERVAL_SECS=0, the backend has
+            // no checkpoint dir, or the backend can't do diff
+            // checkpoints (VZ / Process — never pauses their VMs).
+            let _checkpoint_driver = if self.sandbox.supports_diff_checkpoints() {
+                checkpoint::spawn_checkpoint_driver(
+                    pooled.clone(),
+                    checkpoint::CheckpointConfig::from_env(),
+                )
+            } else {
+                None
+            };
             // ADR 0013: every harness event POSTs to the coord via
             // HTTP. Any coord pod can serve the POST (the
             // `state.emit` path on the receiving pod handles

@@ -3030,6 +3030,13 @@ impl SandboxBackend for FirecrackerBackend {
             .await
     }
 
+    /// ADR 0028 Fix A: FC supports diff checkpoints exactly when KVM
+    /// dirty tracking is armed. Gates the periodic checkpoint driver
+    /// so non-dirty-tracking hosts never run it.
+    fn supports_diff_checkpoints(&self) -> bool {
+        self.config.track_dirty_pages
+    }
+
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
         self.snapshot_dir_for(snapshot_id)
     }

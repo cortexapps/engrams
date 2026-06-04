@@ -2329,6 +2329,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.snapshot_path_for(snapshot_id)
     }
 
+    // ADR 0028 Fix A: defer to the wrapped backend — a PooledBackend
+    // over FC checkpoints, over VZ/Process doesn't.
+    fn supports_diff_checkpoints(&self) -> bool {
+        self.inner.supports_diff_checkpoints()
+    }
+
     /// ADR 0018 commit 12m: forward pause to the wrapped backend.
     /// PooledBackend doesn't have its own pause concept — it just
     /// delegates to whatever VMM is underneath. Used by our own
