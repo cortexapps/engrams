@@ -44,6 +44,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
+use engram_sandbox_firecracker::client::FirecrackerClient;
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use tokio::time::sleep;
@@ -850,6 +851,262 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
     assert!(
         events_after_exec.is_empty(),
         "harness sink received events after dev-VM exec — empty argv probe leaked into a real spawn: {events_after_exec:?}",
+    );
+
+    pooled.destroy(sandbox_id).await.expect("destroy");
+    cleanup_host_state();
+}
+
+// ====================================================================
+// ADR 0022 follow-on spike (Phase B): the REAL claude binary, PERSISTENT
+// across an idle→resume.
+//
+// Phase A (engram-sandbox-firecracker::socket_resume) proved the network
+// primitive: a frozen TCP connection reused after resume fails with an
+// *immediate* RST (not a black-hole). Phase B asks the app-layer
+// question with the real Bun/undici stack: if we keep ONE `claude`
+// process alive (`--input-format stream-json`, the SDK's persistent
+// transport shape) and it holds a pooled connection across a freeze,
+// what does the next turn do?
+//
+// We drive a persistent claude over a /bin/sh FIFO (no python — the bake
+// has no apt network): a `sleep` holds the FIFO's write end open so
+// claude never EOFs between turns; each turn is one user message line
+// `printf`'d into the FIFO. Bogus token + MAX_RETRIES=0 so each turn's
+// 401 round-trip is fast and deterministic (same trick as the harness
+// tests). Egress is the REAL proxy → real api.anthropic.com (REDIRECT
+// sidesteps the dev-vm Docker FORWARD-DROP). We freeze with FC
+// pause/resume on the same VM (cold TAP-in-root path, so the proxy
+// registration stays valid — no SNAT re-register).
+//
+// Turn 1 (pre-freeze) warms a pooled connection. Turn 2 (immediately
+// post-resume) is load-bearing: undici's keepalive timer is on the
+// guest's monotonic clock, which froze during the pause, so undici
+// believes ~0 time passed and WILL try to reuse the now-dead pooled
+// socket. Turn 3 confirms steady state. We print each turn's stream-json
+// output; the test asserts only that claude stays alive and keeps
+// producing terminal results across the freeze (the recovery signal).
+// ====================================================================
+
+/// Exec `sh -c <cmd>` via the pooled backend; return (stdout, stderr, exit).
+async fn exec_sh(
+    pooled: &PooledBackend,
+    id: engram_core::SandboxId,
+    cmd: &str,
+) -> (String, String, Option<i32>) {
+    let h = pooled
+        .exec(
+            id,
+            engram_core::types::sandbox::ExecRequest {
+                command: vec!["/bin/sh".into(), "-c".into(), cmd.into()],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: None,
+                timeout: Some(Duration::from_secs(30)),
+            },
+        )
+        .await
+        .expect("exec_sh");
+    (
+        String::from_utf8_lossy(&h.stdout).into_owned(),
+        String::from_utf8_lossy(&h.stderr).into_owned(),
+        h.exit_status,
+    )
+}
+
+/// Send one stream-json user turn into the persistent claude's FIFO.
+async fn send_turn(pooled: &PooledBackend, id: engram_core::SandboxId, text: &str) {
+    let line = format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#);
+    // single-quote the JSON (no single quotes inside) so the shell passes
+    // it verbatim into the FIFO.
+    let cmd = format!("printf '%s\\n' '{line}' > /tmp/cin");
+    let (_o, e, x) = exec_sh(pooled, id, &cmd).await;
+    eprintln!("PHASEB: send_turn({text}) exit={x:?} err={e:?}");
+}
+
+/// Poll `/tmp/cout` until it holds at least `want` stream-json `result`
+/// events (one per completed turn) or `budget` elapses. Returns the cout
+/// snapshot.
+async fn wait_for_results(
+    pooled: &PooledBackend,
+    id: engram_core::SandboxId,
+    want: usize,
+    budget: Duration,
+) -> String {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let (cout, _, _) = exec_sh(pooled, id, "cat /tmp/cout 2>/dev/null || true").await;
+        let results = cout.matches(r#""type":"result""#).count();
+        if results >= want || std::time::Instant::now() >= deadline {
+            return cout;
+        }
+        sleep(Duration::from_millis(1000)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual spike: requires Linux + KVM + FC + Docker + sudo + egress to api.anthropic.com"]
+async fn e2e_persistent_claude_socket_across_resume() {
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_root() {
+        return;
+    }
+    cleanup_host_state();
+
+    let idle_secs: u64 = std::env::var("ENGRAM_SPIKE_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(75);
+
+    let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
+    let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
+    // Reuse the harness bake — it COPYs the real claude CLI to
+    // /opt/engram/harness/claude (we drive it directly, ignoring the
+    // wrapper).
+    let rootfs_path =
+        bake_harness_rootfs("engram-persistent-claude", &harness_bin, &claude_bin).await;
+
+    let work = tempfile::tempdir().expect("work");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = Some("10.200.0.0".parse().unwrap());
+    cfg.egress_proxy_port = Some(proxy_port);
+    let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    fc.host_startup().await.expect("host_startup");
+    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+
+    let spec = SandboxSpec {
+        image: "engram-persistent-claude".into(),
+        rootfs_source: Some(rootfs_path),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 2 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let sandbox_id = pooled.create(spec).await.expect("create");
+    let guest_ip_str = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+
+    // Empty-argv start_agent: readiness + InstallHostCa (engram proxy CA
+    // into the guest trust store), but NO harness spawn — we drive claude
+    // ourselves.
+    pooled
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv: Vec::new(),
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(ca_pem.clone()),
+            },
+        )
+        .await
+        .expect("start_agent readiness + CA");
+
+    let session_id = engram_core::SessionId::new();
+    let guest_ip: std::net::Ipv4Addr = guest_ip_str.parse().unwrap();
+    let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
+    let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
+    registry.register(engram_egress_proxy::SessionState {
+        session_id,
+        guest_ip,
+        network_allow,
+        secrets: Vec::new(),
+    });
+
+    // Write the CA (Bun's NODE_EXTRA_CA_CERTS) + a clean launcher SCRIPT
+    // (a quoted heredoc keeps `$!` literal so the real claude PID lands in
+    // claude.pid — inline nested-quoting mangled this in an earlier run).
+    // `sleep` holds the FIFO write end open so claude never EOFs between
+    // turns. The host-side probe confirmed this exact invocation: claude
+    // emits system/init → assistant → result and stays alive per turn.
+    // IS_SANDBOX=1 is the documented escape hatch for claude's root-check
+    // — without it, `--dangerously-skip-permissions` refuses to start as
+    // root (which is how the guest runs it). Our real harness sets this;
+    // the host-side probe didn't need it (ran as a normal user).
+    let run_claude = "#!/bin/sh\n\
+        sleep 3600 > /tmp/cin &\n\
+        env NODE_EXTRA_CA_CERTS=/tmp/ca.pem CLAUDE_CODE_OAUTH_TOKEN=sk-bogus-persistent-spike \
+            CLAUDE_CODE_MAX_RETRIES=0 IS_SANDBOX=1 PATH=/opt/engram/harness:/usr/bin:/bin \
+            /opt/engram/harness/claude --input-format stream-json --output-format stream-json \
+            --verbose --dangerously-skip-permissions < /tmp/cin > /tmp/cout 2>&1 &\n\
+        echo $! > /tmp/claude.pid\n\
+        wait\n";
+    let setup = format!(
+        "cat > /tmp/ca.pem <<'CAEOF'\n{ca_pem}\nCAEOF\n\
+         cat > /tmp/run-claude.sh <<'RCEOF'\n{run_claude}RCEOF\n\
+         mkfifo /tmp/cin 2>/dev/null; rm -f /tmp/cout /tmp/claude.pid; \
+         setsid sh /tmp/run-claude.sh </dev/null >/tmp/launch.out 2>&1 & echo LAUNCHED"
+    );
+    let (lo, le, lx) = exec_sh(&pooled, sandbox_id, &setup).await;
+    eprintln!("PHASEB: launch exit={lx:?} out={lo:?} err={le:?}");
+    // Diagnostic: if claude fails to start, launch.out carries its stderr.
+    let (diag, _, _) = exec_sh(
+        &pooled,
+        sandbox_id,
+        "sleep 2; echo '--- launch.out ---'; cat /tmp/launch.out 2>/dev/null; \
+         echo '--- claude.pid ---'; cat /tmp/claude.pid 2>/dev/null",
+    )
+    .await;
+    eprintln!("PHASEB: post-launch diag:\n{diag}");
+
+    async fn alive(pooled: &PooledBackend, id: engram_core::SandboxId) -> String {
+        let (o, _, _) = exec_sh(
+            pooled,
+            id,
+            "kill -0 $(cat /tmp/claude.pid 2>/dev/null) 2>/dev/null && echo ALIVE || echo DEAD",
+        )
+        .await;
+        o.trim().to_string()
+    }
+
+    // ---- Turn 1 (pre-freeze): warm a pooled connection ----
+    send_turn(&pooled, sandbox_id, "ping one").await;
+    let c1 = wait_for_results(&pooled, sandbox_id, 1, Duration::from_secs(75)).await;
+    eprintln!("PHASEB: --- cout after turn 1 ---\n{c1}\n--- end ---");
+    eprintln!(
+        "PHASEB: claude alive after turn1 = {}",
+        alive(&pooled, sandbox_id).await
+    );
+
+    // ---- Freeze: pause / idle / resume (same VM) ----
+    let st = fc.snapshot_state(sandbox_id).expect("snapshot_state");
+    let api = FirecrackerClient::new(&st.firecracker_socket);
+    api.pause().await.expect("pause");
+    eprintln!("PHASEB: paused; idling {idle_secs}s");
+    sleep(Duration::from_secs(idle_secs)).await;
+    api.resume().await.expect("resume");
+    eprintln!(
+        "PHASEB: resumed; claude alive = {}",
+        alive(&pooled, sandbox_id).await
+    );
+
+    // ---- Turn 2 (post-resume): reuses the now-stale pooled socket ----
+    send_turn(&pooled, sandbox_id, "ping two").await;
+    let c2 = wait_for_results(&pooled, sandbox_id, 2, Duration::from_secs(75)).await;
+    eprintln!("PHASEB: --- cout after turn 2 ---\n{c2}\n--- end ---");
+
+    // ---- Turn 3 (post-resume): steady-state recovery ----
+    send_turn(&pooled, sandbox_id, "ping three").await;
+    let c3 = wait_for_results(&pooled, sandbox_id, 3, Duration::from_secs(75)).await;
+    eprintln!("PHASEB: --- cout after turn 3 ---\n{c3}\n--- end ---");
+
+    let results = c3.matches(r#""type":"result""#).count();
+    let alive_final = alive(&pooled, sandbox_id).await;
+    eprintln!(
+        "PHASEB: VERDICT — total result events across 3 turns = {results}; claude alive_final = {alive_final}"
+    );
+    eprintln!(
+        "PHASEB: interpretation — 3 results + ALIVE = persistent claude survived the freeze and \
+         every turn round-tripped (connection recovered transparently). \
+         <3 results or DEAD = claude couldn't continue across resume (note which turn stalled)."
     );
 
     pooled.destroy(sandbox_id).await.expect("destroy");
