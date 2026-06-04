@@ -191,6 +191,28 @@ pub trait SandboxBackend: Send + Sync {
     /// coord persists to the `snapshots` row.
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
+    /// ADR 0028 Fix A: diff-flavored sibling of [`Self::snapshot`].
+    /// Same snapshot-dir + sidecar + vmstate contract, but the memory
+    /// artifact is `memory.diff` — a sparse file holding ONLY the
+    /// pages dirtied since the last capture (KVM dirty bitmap, which
+    /// resets on capture, so successive calls chain). The checkpoint
+    /// pipeline overlays it onto a rolling full memory image and
+    /// re-chunks incrementally; the returned metadata's
+    /// `memory_manifest` is patched by that pipeline, exactly like
+    /// `snapshot()`'s.
+    ///
+    /// Requires dirty tracking armed (`track_dirty_pages` at boot /
+    /// `enable_diff_snapshots` at load). Default impl returns
+    /// `InvalidSpec` for backends with no diff concept (Process, VZ,
+    /// mocks); callers treat that as "diff checkpointing unsupported
+    /// here" and fall back to full captures, mirroring the
+    /// `wait_agent_ready` convention.
+    async fn snapshot_diff(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend has no diff-snapshot support".into(),
+        ))
+    }
+
     /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
     /// Idempotent — calling on an already-paused VM is a no-op
     /// success. Used by [`crate::traits::host_client`]-side

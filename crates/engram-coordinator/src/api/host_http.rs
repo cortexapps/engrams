@@ -266,6 +266,13 @@ pub struct HeartbeatRequest {
     /// host MIG, so old hosts mid-roll simply report none.
     #[serde(default)]
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0028 Fix A: un-acked durable checkpoint records from this
+    /// host. The handler reconciles each into PG (idempotent on
+    /// snapshot_id) and acks the recorded ids — what makes "the
+    /// checkpoint reached GCS" become a PG row regardless of which
+    /// coord (if any) survived the original capture pipeline.
+    #[serde(default)]
+    pub checkpoints: Vec<engram_protocol::heartbeat::CheckpointAdvert>,
 }
 
 #[derive(Serialize)]
@@ -288,6 +295,10 @@ pub struct HeartbeatResponse {
     /// treating "absent" as "empty pin set" (which would sweep
     /// generations resumes still need).
     pub live_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0028 Fix A: adverts from this heartbeat now recorded in
+    /// PG. The host deletes the matching durable record files.
+    #[serde(default)]
+    pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
 }
 
 pub async fn heartbeat(
@@ -413,11 +424,68 @@ pub async fn heartbeat(
         ))
     })?;
 
+    // ADR 0028 Fix A: reconcile the host's un-acked durable checkpoint
+    // records into PG. `record_snapshot` is idempotent on snapshot_id
+    // (the eviction pipeline may already have recorded one of these —
+    // the re-record is a harmless refresh), so a checkpoint that
+    // reached GCS becomes a PG row regardless of which coord (if any)
+    // survived the original capture. Per-advert best-effort: an
+    // un-acked advert just rides the next heartbeat.
+    let mut acked_checkpoints = Vec::new();
+    for adv in &hb.checkpoints {
+        let events_cursor = state
+            .services
+            .meta
+            .latest_event_idx_at_or_before(adv.session_id, adv.paused_at)
+            .await
+            .unwrap_or_default();
+        let recoverable = crate::api::snapshot::verify_snapshot_recoverable(
+            state.services.blob.as_ref(),
+            adv.disk_manifest.as_ref(),
+            adv.memory_manifest.as_ref(),
+        )
+        .await;
+        let record = engram_core::types::snapshot::SnapshotRecord {
+            id: adv.snapshot_id,
+            session_id: Some(adv.session_id),
+            host_id: Some(host_id),
+            image_version: adv.image_version.clone(),
+            size_bytes: adv.size_bytes,
+            created_at: adv.captured_at,
+            last_accessed_at: Utc::now(),
+            disk_manifest: adv.disk_manifest,
+            memory_manifest: adv.memory_manifest,
+            recoverable,
+            aux_bundles: adv.aux_bundles.clone(),
+            events_cursor,
+        };
+        match state.services.meta.record_snapshot(record).await {
+            Ok(()) => acked_checkpoints.push(adv.snapshot_id),
+            Err(e) => {
+                tracing::warn!(
+                    host_id = %host_id,
+                    snapshot_id = %adv.snapshot_id,
+                    session_id = %adv.session_id,
+                    error = %e,
+                    "checkpoint advert reconcile failed; host re-advertises next heartbeat",
+                );
+            }
+        }
+    }
+    if !acked_checkpoints.is_empty() {
+        tracing::info!(
+            host_id = %host_id,
+            count = acked_checkpoints.len(),
+            "reconciled host-advertised checkpoints into PG",
+        );
+    }
+
     Ok(Json(HeartbeatResponse {
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
         enabled_images,
         live_bundles,
+        acked_checkpoints,
     }))
 }
 

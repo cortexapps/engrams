@@ -69,6 +69,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         memory_manifest: None,
         recoverable: false,
         aux_bundles: vec![],
+        events_cursor: None,
     };
     meta.record_snapshot(snap_with.clone())
         .await

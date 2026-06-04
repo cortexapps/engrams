@@ -66,6 +66,7 @@ async fn seed_snapshot_with_bundles(
         memory_manifest: None,
         recoverable: true,
         aux_bundles,
+        events_cursor: None,
     })
     .await
     .expect("seed snapshot");

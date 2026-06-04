@@ -609,6 +609,8 @@ pub(crate) async fn capture_and_record_base_snapshot(
             disk_manifest: meta.disk_manifest,
             memory_manifest: meta.memory_manifest,
             recoverable,
+            // Template artifact — no session, no event log.
+            events_cursor: None,
         })
         .await?;
 

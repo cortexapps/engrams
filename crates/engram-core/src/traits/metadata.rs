@@ -305,6 +305,36 @@ pub trait MetadataStore: Send + Sync {
         &self,
         sid: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError>;
+    /// ADR 0028 A.log: the session's `session_events.idx`
+    /// high-water-mark at or before `at` — the event-log leg of a
+    /// checkpoint's (memory, disk, event-log) coherence triple,
+    /// resolved against the capture's pause instant. `None` when the
+    /// session has no events yet (a cursor of "before everything").
+    ///
+    /// Default `Ok(None)` so mocks without an event log degrade to
+    /// "no rewind information" rather than forcing every test double
+    /// to model events.
+    async fn latest_event_idx_at_or_before(
+        &self,
+        _sid: SessionId,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, MetaError> {
+        Ok(None)
+    }
+    /// ADR 0028 Fix A: delete session-bound snapshot rows older than
+    /// `retention`, EXCEPT each session's latest (the rung-1 recovery
+    /// anchor — never collectible while the session row exists).
+    /// Template snapshots (`session_id IS NULL`) are exempt. Returns
+    /// the number of rows deleted; chunks they exclusively referenced
+    /// become GC candidates via the existing pin-set machinery.
+    ///
+    /// Default `Ok(0)` so mocks without a snapshots table skip it.
+    async fn prune_session_snapshots(
+        &self,
+        _retention: chrono::Duration,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
     /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
     /// the heartbeat-ack template enrichment path to surface the
     /// snapshot's persisted `disk_manifest` + `memory_manifest`

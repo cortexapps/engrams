@@ -822,6 +822,7 @@ mod tests {
             memory_manifest: memory,
             recoverable: true,
             aux_bundles: vec![],
+            events_cursor: None,
         }
     }
 

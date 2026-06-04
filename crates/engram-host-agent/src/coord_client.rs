@@ -458,6 +458,12 @@ pub struct HeartbeatRequest {
     /// coord's bundle-GC pin set.
     #[serde(default)]
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0028 Fix A: un-acked durable checkpoint records — see
+    /// [`engram_protocol::heartbeat::CheckpointAdvert`]. Re-advertised
+    /// every heartbeat until the ack's `acked_checkpoints` clears
+    /// them.
+    #[serde(default)]
+    pub checkpoints: Vec<engram_protocol::heartbeat::CheckpointAdvert>,
 }
 
 #[derive(Deserialize)]
@@ -478,6 +484,10 @@ pub struct HeartbeatResponse {
     /// retries until the coord roll completes) rather than read as an
     /// empty pin set and sweep generations resumes still need.
     pub live_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0028 Fix A: adverts from this heartbeat the coord recorded
+    /// into PG. The host deletes the matching durable record files.
+    #[serde(default)]
+    pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
 }
 
 #[derive(Serialize)]
@@ -623,6 +633,7 @@ mod tests {
             host_addr: None,
             ready_images: vec![],
             nbd_unhealthy: vec![],
+            checkpoints: vec![],
             current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
                 drive_id: "skills".into(),
                 sha256: "ff00".into(),

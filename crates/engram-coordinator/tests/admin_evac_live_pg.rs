@@ -320,6 +320,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         memory_manifest: Some(proto_to_core_manifest(memory)),
         recoverable: true,
         aux_bundles: vec![],
+        events_cursor: None,
     })
     .await
     .expect("record snapshot");

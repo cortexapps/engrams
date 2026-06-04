@@ -81,6 +81,88 @@ impl ChunkStore {
         Ok(manifest)
     }
 
+    /// ADR 0028 Fix A: produce the next full-image manifest after a
+    /// sparse diff was overlaid onto `full_file`. Re-reads, re-hashes
+    /// and uploads ONLY the chunks intersecting `dirty_ranges`
+    /// (`(offset, len)` byte ranges, typically the diff file's data
+    /// extents); every other `ChunkRef` carries over from `prev`
+    /// untouched — that's what makes a checkpoint's at-rest and CPU
+    /// cost O(dirty set) instead of O(guest RAM).
+    ///
+    /// Invariants preserved from [`Self::chunk_file`]:
+    /// - all-zero chunks are elided (a dirty chunk that became zero
+    ///   DROPS out of the manifest; gaps mean zero-filled),
+    /// - offsets stay sorted and chunk-size-aligned,
+    /// - `total_bytes` must match the file (guest RAM never resizes;
+    ///   a mismatch is a caller bug surfaced as `InvalidManifest`).
+    pub async fn update_for_dirty_ranges(
+        &self,
+        prev: &Manifest,
+        full_file: &Path,
+        dirty_ranges: &[(u64, u64)],
+    ) -> Result<Manifest> {
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+
+        prev.validate()?;
+        let chunk_size = prev.chunk_size.as_u64();
+        let mut file = fs::File::open(full_file).await?;
+        let total_bytes = file.metadata().await?.len();
+        if total_bytes != prev.total_bytes {
+            return Err(crate::error::ChunkStoreError::MalformedManifest(format!(
+                "update_for_dirty_ranges: file is {total_bytes} bytes but the previous \
+                 manifest says {} — guest memory images never resize",
+                prev.total_bytes,
+            )));
+        }
+
+        // Which chunk indices does the dirty set touch?
+        let mut dirty_chunks: BTreeSet<u64> = BTreeSet::new();
+        for &(off, len) in dirty_ranges {
+            if len == 0 {
+                continue;
+            }
+            let end = (off + len - 1).min(total_bytes.saturating_sub(1));
+            for idx in (off / chunk_size)..=(end / chunk_size) {
+                dirty_chunks.insert(idx);
+            }
+        }
+
+        // Start from the previous manifest's chunk map; replace /
+        // insert / remove at dirty offsets only.
+        let mut by_offset: BTreeMap<u64, ChunkRef> =
+            prev.chunks.iter().map(|c| (c.offset, c.clone())).collect();
+
+        let mut buf = vec![0u8; chunk_size as usize];
+        for idx in dirty_chunks {
+            let offset = idx * chunk_size;
+            if offset >= total_bytes {
+                continue;
+            }
+            let want = chunk_size.min(total_bytes - offset) as usize;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let slice = &mut buf[..want];
+            file.read_exact(slice).await?;
+            if is_all_zero(slice) {
+                by_offset.remove(&offset);
+                continue;
+            }
+            let hash = self.put_chunk(slice).await?;
+            by_offset.insert(offset, ChunkRef { offset, hash });
+        }
+
+        Ok(Manifest {
+            schema_version: prev.schema_version,
+            kind: prev.kind,
+            chunk_size: prev.chunk_size,
+            total_bytes,
+            chunks: by_offset.into_values().collect(),
+            parent: prev.parent,
+            working_set_trace: prev.working_set_trace,
+            annotations: prev.annotations.clone(),
+        })
+    }
+
     /// Reconstruct a file from a manifest. Creates `dest` (or
     /// truncates if it exists), writes each chunk at its offset,
     /// seeks past zero-filled gaps (producing real filesystem
@@ -449,6 +531,64 @@ mod tests {
         assert!(
             !dest.exists(),
             "errored cached materialize must NOT leave the canonical file behind"
+        );
+    }
+
+    /// ADR 0028 Fix A: the incremental checkpoint re-chunk. Mutate a
+    /// couple of ranges of a chunked image, update via
+    /// `update_for_dirty_ranges`, and assert (a) the new manifest
+    /// materializes byte-identical to the mutated file, (b) untouched
+    /// chunks carry the EXACT same hashes (no re-upload), (c) a chunk
+    /// dirtied to all-zero drops out of the manifest (sparse
+    /// invariant).
+    #[tokio::test]
+    async fn update_for_dirty_ranges_is_incremental_and_byte_faithful() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+
+        // 4 chunks of 4 KiB, distinct non-zero content.
+        let cs: u64 = 4096;
+        let mut content = Vec::new();
+        for b in [0xAAu8, 0xBB, 0xCC, 0xDD] {
+            content.extend(std::iter::repeat_n(b, cs as usize));
+        }
+        let img = work.path().join("mem.bin");
+        tokio::fs::write(&img, &content).await.unwrap();
+        let prev = s
+            .chunk_file(&img, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+        assert_eq!(prev.chunks.len(), 4);
+
+        // Dirty chunk 1 (new content) + chunk 3 (all zeros). Chunk 0
+        // and 2 untouched.
+        let mut mutated = content.clone();
+        mutated[cs as usize..2 * cs as usize].fill(0x11);
+        mutated[3 * cs as usize..].fill(0x00);
+        tokio::fs::write(&img, &mutated).await.unwrap();
+
+        let next = s
+            .update_for_dirty_ranges(&prev, &img, &[(cs, cs), (3 * cs, cs)])
+            .await
+            .unwrap();
+
+        // (b) untouched chunks carry over hash-identical.
+        let hash_at =
+            |m: &Manifest, off: u64| m.chunks.iter().find(|c| c.offset == off).map(|c| c.hash);
+        assert_eq!(hash_at(&next, 0), hash_at(&prev, 0));
+        assert_eq!(hash_at(&next, 2 * cs), hash_at(&prev, 2 * cs));
+        assert_ne!(hash_at(&next, cs), hash_at(&prev, cs));
+        // (c) the zeroed chunk is elided.
+        assert_eq!(hash_at(&next, 3 * cs), None);
+        assert_eq!(next.total_bytes, prev.total_bytes);
+
+        // (a) full byte fidelity through materialize.
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&next, &out).await.unwrap();
+        let round = tokio::fs::read(&out).await.unwrap();
+        assert_eq!(
+            round, mutated,
+            "incremental manifest must reproduce the mutated image"
         );
     }
 }

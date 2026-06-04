@@ -138,6 +138,9 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     let aux_bundles_json: serde_json::Value = row.try_get("aux_bundles").map_err(col_err)?;
     let aux_bundles = serde_json::from_value(aux_bundles_json)
         .map_err(|e| MetaError::Serialization(format!("snapshots.aux_bundles decode: {e}")))?;
+    // ADR 0028 A.log (migration 0053): the event-log leg of the
+    // coherence triple. NULL on pre-0053 rows + template snapshots.
+    let events_cursor: Option<i64> = row.try_get("events_cursor").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: session_id.map(SessionId),
@@ -150,6 +153,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         memory_manifest,
         recoverable,
         aux_bundles,
+        events_cursor,
     })
 }
 

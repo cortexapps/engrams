@@ -14,6 +14,7 @@ use engram_core::traits::{
 pub mod api;
 pub mod blob;
 pub mod bundle_gc;
+pub mod checkpoint_retention;
 pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
@@ -203,6 +204,15 @@ pub async fn run_with_registry_and_local(
     // require its own PgPool — it goes through MetadataStore.
     let _evac_resumer =
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
+
+    // ADR 0028 Fix A: prune aged-out per-session checkpoint rows
+    // (latest-per-session always kept; the window doubles as the
+    // forkable history). Without it, periodic checkpoints grow
+    // `snapshots` one row per session per cadence interval forever.
+    let _checkpoint_retention = checkpoint_retention::spawn(
+        checkpoint_retention::CheckpointRetentionConfig::default(),
+        state.clone(),
+    );
 
     // ADR 0036: the enable-job scanner drives async image enables
     // (pending → materializing → capturing → ready) recorded by

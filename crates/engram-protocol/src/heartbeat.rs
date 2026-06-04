@@ -50,6 +50,37 @@ pub struct Heartbeat {
     /// against this coord.
     #[serde(default)]
     pub nbd_unhealthy: Vec<SandboxId>,
+    /// ADR 0028 Fix A: durable checkpoint records this host holds
+    /// that no coord has acked into PG yet. Re-advertised every
+    /// heartbeat until acked — what makes a checkpoint that reached
+    /// GCS become a PG row regardless of which coord (if any)
+    /// survived the original capture pipeline, and what subsumes the
+    /// coord-died-mid-eviction reconciliation window.
+    /// `#[serde(default)]` for mixed-version interop during the roll.
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointAdvert>,
+}
+
+/// ADR 0028 Fix A: one un-acked durable checkpoint. Carries
+/// everything `record_snapshot` needs — the advertising host may be
+/// the only survivor of the original capture pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckpointAdvert {
+    pub snapshot_id: SnapshotId,
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub image_version: String,
+    pub size_bytes: u64,
+    pub disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    pub memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    /// ADR 0035 pins for this checkpoint's device model.
+    #[serde(default)]
+    pub aux_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// The pause instant — the coord resolves the A.log
+    /// `session_events` cursor as "last event at or before this"
+    /// when it records the row.
+    pub paused_at: DateTime<Utc>,
+    pub captured_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -81,6 +112,12 @@ pub struct HeartbeatAck {
     /// supervisor tick.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
+    /// ADR 0028 Fix A: checkpoint adverts from this heartbeat that
+    /// the coord successfully recorded into PG (idempotently, on
+    /// snapshot_id). The host deletes the matching durable record
+    /// files — the PG rows own the references now.
+    #[serde(default)]
+    pub acked_checkpoints: Vec<SnapshotId>,
 }
 
 /// Identity of one enabled image. Manifest digest is the sha256 of
@@ -163,6 +200,7 @@ mod tests {
             draining: false,
             ready_images: Vec::new(),
             nbd_unhealthy: Vec::new(),
+            checkpoints: Vec::new(),
         }
     }
 
@@ -207,6 +245,7 @@ mod tests {
         let original = HeartbeatAck {
             server_time: Utc::now(),
             revoked_sessions: vec![SessionId::new(), SessionId::new()],
+            acked_checkpoints: vec![],
             enabled_images: vec![EnabledImageRef {
                 image_uri: "localhost:5001/test/demo:warm-1".into(),
                 manifest_digest: ManifestDigest::new("sha256:abc123"),

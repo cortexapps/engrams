@@ -872,8 +872,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 recoverable, aux_bundles, events_cursor)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -882,6 +882,11 @@ impl MetadataStore for PostgresStore {
                 memory_manifest_version = EXCLUDED.memory_manifest_version,
                 recoverable             = EXCLUDED.recoverable,
                 aux_bundles             = EXCLUDED.aux_bundles,
+                -- ADR 0028 A.log: never clobber a resolved cursor with
+                -- NULL on an idempotent re-record (the reconciler may
+                -- re-ingest a checkpoint the eviction pipeline already
+                -- recorded with a cursor, or vice versa).
+                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
                 updated_at              = NOW()
             "#,
         )
@@ -901,6 +906,7 @@ impl MetadataStore for PostgresStore {
             serde_json::to_value(&snap.aux_bundles)
                 .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
         )
+        .bind(snap.events_cursor)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -910,6 +916,63 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn prune_session_snapshots(&self, retention: chrono::Duration) -> Result<u64, MetaError> {
+        // ADR 0028 Fix A retention: keep each session's latest row
+        // unconditionally (DISTINCT ON newest-first); delete the rest
+        // past the window. Same-TX chunk_generation bump keeps the GC
+        // barrier semantics symmetric with record_snapshot — a sweep
+        // that read the pin set mid-prune restarts and re-classifies.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let res = sqlx::query(
+            r#"
+            DELETE FROM snapshots s
+            WHERE s.session_id IS NOT NULL
+              AND s.created_at < NOW() - $1::interval
+              AND s.id NOT IN (
+                  SELECT DISTINCT ON (session_id) id
+                  FROM snapshots
+                  WHERE session_id IS NOT NULL
+                  ORDER BY session_id, created_at DESC
+              )
+            "#,
+        )
+        .bind(sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
+        })
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    async fn latest_event_idx_at_or_before(
+        &self,
+        sid: SessionId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, MetaError> {
+        // ADR 0028 A.log: the checkpoint pause instant freezes the
+        // guest, so events it caused can't land in the captured state
+        // after `at`. (Events emitted just before pause but written
+        // just after are a sub-second edge we accept — they survive a
+        // rewind the agent technically remembers.)
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT MAX(idx) FROM session_events WHERE session_id = $1 AND created_at <= $2",
+        )
+        .bind(sid.as_uuid())
+        .bind(at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.0)
     }
 
     async fn list_snapshots_for_session(
@@ -923,7 +986,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -945,7 +1008,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -968,7 +1031,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE id = $1
             "#,
         )

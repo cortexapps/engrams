@@ -159,6 +159,17 @@ pub async fn evict_session_to_state(
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();
+    // ADR 0028 A.log: the event-log leg of the coherence triple. The
+    // guest paused (then gets destroyed) during the capture, so "the
+    // newest event as of now" is the cursor at the pause instant up
+    // to a sub-second skew. Best-effort: a lookup failure degrades to
+    // NULL ("no rewind information"), never fails the eviction.
+    let events_cursor = state
+        .services
+        .meta
+        .latest_event_idx_at_or_before(session_id, now)
+        .await
+        .unwrap_or_default();
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: Some(session_id),
@@ -181,6 +192,7 @@ pub async fn evict_session_to_state(
         .await,
         // ADR 0035: pin the generations this snapshot references.
         aux_bundles: metadata.aux_bundles.clone(),
+        events_cursor,
     };
     if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
         abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;

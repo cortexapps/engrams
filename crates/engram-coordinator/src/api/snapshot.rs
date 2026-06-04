@@ -117,6 +117,15 @@ pub async fn snapshot(
         // ADR 0035: pin the generations this snapshot's device model
         // references (host-reported; reflects any fresh-create swap).
         aux_bundles: metadata.aux_bundles.clone(),
+        // ADR 0028 A.log: best-effort cursor at the capture instant
+        // (the guest pauses inside the snapshot RPC; sub-second skew
+        // accepted, documented on `latest_event_idx_at_or_before`).
+        events_cursor: state
+            .services
+            .meta
+            .latest_event_idx_at_or_before(id, now)
+            .await
+            .unwrap_or_default(),
     };
     state.services.meta.record_snapshot(record).await?;
 
