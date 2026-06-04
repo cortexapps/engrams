@@ -188,7 +188,10 @@ async fn prune_keeps_latest_and_window_drops_aged_history() {
         .prune_session_snapshots(ChronoDuration::hours(24))
         .await
         .expect("prune");
-    assert!(deleted >= 1, "the ancient mid-chain row must be pruned");
+    assert!(
+        deleted.contains(&ancient.id),
+        "the ancient mid-chain row must be pruned and its id returned for blob cleanup",
+    );
 
     let ids: Vec<_> = meta
         .list_snapshots_for_session(session_id)

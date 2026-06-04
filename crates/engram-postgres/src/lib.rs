@@ -918,14 +918,21 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    async fn prune_session_snapshots(&self, retention: chrono::Duration) -> Result<u64, MetaError> {
+    async fn prune_session_snapshots(
+        &self,
+        retention: chrono::Duration,
+    ) -> Result<Vec<engram_core::types::SnapshotId>, MetaError> {
         // ADR 0028 Fix A retention: keep each session's latest row
         // unconditionally (DISTINCT ON newest-first); delete the rest
         // past the window. Same-TX chunk_generation bump keeps the GC
         // barrier semantics symmetric with record_snapshot — a sweep
         // that read the pin set mid-prune restarts and re-classifies.
+        // RETURNING the deleted ids lets the caller delete each row's
+        // portable `snapshots/<id>/` blobs (state.bin / sidecar), which
+        // the chunk GC doesn't sweep (different namespace) and would
+        // otherwise orphan in BlobStorage.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let res = sqlx::query(
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
             r#"
             DELETE FROM snapshots s
             WHERE s.session_id IS NOT NULL
@@ -936,6 +943,7 @@ impl MetadataStore for PostgresStore {
                   WHERE session_id IS NOT NULL
                   ORDER BY session_id, created_at DESC
               )
+            RETURNING s.id
             "#,
         )
         .bind(sqlx::postgres::types::PgInterval {
@@ -943,7 +951,7 @@ impl MetadataStore for PostgresStore {
             days: 0,
             microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
         })
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
         sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
@@ -951,7 +959,10 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(res.rows_affected())
+        Ok(rows
+            .into_iter()
+            .map(|(id,)| engram_core::types::SnapshotId::from(id))
+            .collect())
     }
 
     async fn latest_event_idx_at_or_before(
