@@ -62,6 +62,25 @@ pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// an in-memory [`ExecHandle`]; it's a convenience for short commands
 /// and unit tests. Backend implementations only need to provide
 /// `exec_stream`.
+/// ADR 0022 Option A: a point-in-time sample of guest memory across a
+/// backend's live sandboxes on one host, summed. `pss_bytes` (proportional
+/// set size) charges each shared clean page to a fraction of the sandboxes
+/// mapping it, so `pss/rss` is the **density ratio**: ≈1.0 when every
+/// sandbox holds a private copy (UFFD `UFFDIO_COPY`), and well below 1.0
+/// when same-template siblings `MAP_PRIVATE`-share one base memfile (File
+/// backend). The productized substrate for the density measurement — and
+/// the metric a later UI ADR reads. Host-aggregate (not per-template) for
+/// now: low cardinality, no stale series, and exact in the common
+/// single-template-per-host case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestMemoryStats {
+    pub pss_bytes: u64,
+    pub rss_bytes: u64,
+    /// How many sandboxes were successfully sampled (a dead/unreadable
+    /// process is skipped, never fatal).
+    pub sampled: u32,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -311,6 +330,30 @@ pub trait SandboxBackend: Send + Sync {
     /// (File mode: memory.bin is required before `load_snapshot`).
     fn restore_memory_is_lazy(&self) -> bool {
         false
+    }
+
+    /// ADR 0022 Option A: per-restore-flavor variant of
+    /// [`Self::restore_memory_is_lazy`]. `fresh == true` is a base
+    /// `session.create` (the `restore_fresh` flavor), which can use the
+    /// File backend against the resident per-template memfile even when
+    /// idle-resume (`fresh == false`) serves memory lazily via UFFD. The
+    /// `PooledBackend` calls this so it materializes the contiguous
+    /// `memory.bin` for base-create (File) and skips it for resume
+    /// (UFFD). Default delegates to the flavor-agnostic method so
+    /// backends that don't bifurcate (VZ, Process) need not implement it.
+    fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
+        self.restore_memory_is_lazy()
+    }
+
+    /// ADR 0022 Option A: sample summed guest memory (PSS/RSS) across this
+    /// backend's live sandboxes — the density signal. `None` for backends
+    /// that can't measure it (VZ/Process, or non-Linux where there's no
+    /// `/proc/<pid>/smaps_rollup`); the host then emits no density gauge.
+    /// Must be cheap + error-tolerant: it runs on the periodic heartbeat
+    /// tick and must never block or fail the workload
+    /// ([reliability_and_latency_first] / telemetry-must-not-gate-workload).
+    async fn guest_memory_stats(&self) -> Option<GuestMemoryStats> {
+        None
     }
 
     /// ADR 0020 P1: boot `spec` to agentd-ready with the stub harness

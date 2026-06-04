@@ -363,13 +363,18 @@ impl PooledBackend {
             }
         }
 
-        // ADR 0020 Route B: when the backend serves memory lazily from
-        // chunks (UFFD), there is no memory.bin to rebuild — the handler
-        // faults chunks straight from the cache the prefetch above just
-        // warmed. Materializing the contiguous file would be pure
-        // overhead (the dominant restore cost we're removing). The
-        // prefetch still ran, so the cache is warm for the fault path.
-        if self.inner.restore_memory_is_lazy() {
+        // ADR 0020 Route B / ADR 0022 Option A: whether to rebuild the
+        // contiguous memory.bin is now a per-restore-flavor decision.
+        // Resume under UFFD (`fresh == false`) serves memory lazily from
+        // chunks — the handler faults straight from the cache the prefetch
+        // above just warmed, so materializing would be pure overhead.
+        // Base-create under File (`fresh == true`) needs the memfile
+        // present for `load_snapshot`; `materialize_memory_if_missing` is
+        // an idempotent no-op once the residency prefetch (image_prefetch)
+        // wrote the *per-template* file at this same snapshot-id-keyed
+        // path — which is exactly what keeps siblings sharing one inode
+        // rather than each rebuilding a divergent copy.
+        if self.inner.restore_memory_is_lazy_for(fresh) {
             tracing::debug!(
                 snapshot_id = %metadata.id,
                 "lazy memory restore (UFFD); skipping memory.bin materialization",
@@ -1817,6 +1822,14 @@ impl SandboxBackend for PooledBackend {
 
     fn restore_memory_is_lazy(&self) -> bool {
         self.inner.restore_memory_is_lazy()
+    }
+
+    fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
+        self.inner.restore_memory_is_lazy_for(fresh)
+    }
+
+    async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
+        self.inner.guest_memory_stats().await
     }
 
     async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {

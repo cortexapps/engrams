@@ -2237,6 +2237,57 @@ impl MetadataStore for PostgresStore {
             .collect())
     }
 
+    /// ADR 0022 Option A: pin-set source #5 — every enabled image's
+    /// base-snapshot MEMORY manifest (the per-template base memfile's
+    /// backing). Pins independent of the base snapshot row's `recoverable`
+    /// flag and of `soft_deleted_at` (mirrors source #1). `enabled_images`
+    /// is tens of rows per deployment, so a plain DISTINCT scan is well
+    /// under a millisecond — no index needed (cf. migration 0041).
+    async fn list_enabled_image_base_snapshot_memory_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version
+               FROM enabled_images
+              WHERE base_snapshot_memory_manifest_id IS NOT NULL
+                AND base_snapshot_memory_manifest_version IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
+    /// ADR 0022 Option A: pin-set source #6 — the disk companion to #5
+    /// (every enabled image's base-snapshot DISK manifest, migration
+    /// 0042). Same recoverable/soft-delete-independent semantics.
+    async fn list_enabled_image_base_snapshot_disk_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version
+               FROM enabled_images
+              WHERE base_snapshot_disk_manifest_id IS NOT NULL
+                AND base_snapshot_disk_manifest_version IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
     /// ADR 0016 Phase C: pin-set source #2 — every session that has
     /// published a live disk manifest. The partial index
     /// `idx_sessions_live_disk_manifest` (migration 0034) covers the

@@ -606,10 +606,29 @@ impl HostAgent {
                 self.chunk_cache.clone(),
             ) {
                 (Some(chunk_store), Some(chunk_cache)) => {
+                    // ADR 0022 Option A: when base-create is on the File
+                    // backend (ENGRAM_FC_BASE_RESTORE_MODE=file), have the
+                    // supervisor materialize each enabled image's contiguous
+                    // per-template base memfile at residency — at the SAME
+                    // path a base session.create restore reads
+                    // (`pooled.snapshot_path_for(base_snapshot_id)`), so they
+                    // agree by construction. One coherent switch: the env
+                    // that flips base-create to File also turns this on.
+                    let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> = matches!(
+                        engram_sandbox_firecracker::base_restore_mode_from_env(),
+                        Some(engram_sandbox_firecracker::RestoreMode::File)
+                    )
+                    .then(|| {
+                        let p = pooled.clone();
+                        let resolver: image_prefetch::SnapshotDirResolver =
+                            std::sync::Arc::new(move |id| p.snapshot_path_for(id));
+                        resolver
+                    });
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
                         chunk_store,
                         chunk_cache,
                         readiness.clone(),
+                        base_memfile_dir,
                     );
                     Some(tx)
                 }
@@ -665,6 +684,20 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
+                    // ADR 0022 Option A: sample summed guest PSS/RSS across
+                    // this host's live FC sandboxes — the density signal
+                    // (Σpss/Σrss → ~1.0 under UFFD private copies, < 1.0 as
+                    // File-backend siblings share one base memfile). Set
+                    // both gauges every tick so a drained host reports 0,
+                    // never a stale value. Error-tolerant + non-blocking
+                    // (telemetry must not gate the workload); absent on
+                    // VZ/non-Linux (guest_memory_stats → None).
+                    if let Some(mem) = pooled_for_heartbeat.guest_memory_stats().await {
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
+                            .set(mem.pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
+                            .set(mem.rss_bytes as f64);
+                    }
                     // ADR 0028 Fix A: re-advertise every un-acked
                     // durable checkpoint record until a coord acks it
                     // into PG. Empty when checkpointing is disabled.

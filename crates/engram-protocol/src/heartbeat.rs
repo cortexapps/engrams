@@ -128,6 +128,14 @@ pub struct HeartbeatAck {
 pub struct EnabledImageRef {
     pub image_uri: String,
     pub manifest_digest: ManifestDigest,
+    /// ADR 0022 Option A: the base snapshot's id. The host materializes the
+    /// per-template contiguous `memory.bin` at `snapshot_path_for(this)/
+    /// memory.bin` during residency prefetch — the exact path a base
+    /// `session.create` restore reads — so same-template siblings
+    /// `MAP_PRIVATE` one resident inode (density + faster boot). Always
+    /// present (`enabled_images.base_snapshot_id` is `NOT NULL`, migration
+    /// 0038); no `serde(default)` — clean break, coord + hosts deploy together.
+    pub base_snapshot_id: SnapshotId,
     /// ADR 0021 P2: the base snapshot's disk manifest, advertised so the host
     /// warms the rootfs working set on NVMe (residency) before sessions
     /// restore. The on-demand serial-from-GCS page-in of these chunks during
@@ -249,6 +257,7 @@ mod tests {
             enabled_images: vec![EnabledImageRef {
                 image_uri: "localhost:5001/test/demo:warm-1".into(),
                 manifest_digest: ManifestDigest::new("sha256:abc123"),
+                base_snapshot_id: SnapshotId::new(),
                 base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef {
                     manifest_id: uuid::Uuid::nil(),
                     version: 1,

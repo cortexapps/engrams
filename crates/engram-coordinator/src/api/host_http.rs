@@ -509,6 +509,16 @@ fn enabled_image_refs_from_rows(
                 );
                 return None;
             };
+            // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038);
+            // same defensive skip — the host needs it to key the per-template
+            // memfile residency path.
+            let Some(base_snapshot_id) = row.base_snapshot_id else {
+                tracing::error!(
+                    image_uri = %row.image_uri,
+                    "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
+                );
+                return None;
+            };
             // ADR 0021 P2 (memory residency): nullable since migration 0049.
             // `None` for cold-boot backends (VZ) that capture a disk-only base
             // snapshot — advertise the row anyway; the host's prefetch warms
@@ -516,6 +526,7 @@ fn enabled_image_refs_from_rows(
             Some(EnabledImageRef {
                 image_uri: row.image_uri,
                 manifest_digest: ManifestDigest(row.manifest_digest),
+                base_snapshot_id,
                 base_snapshot_disk_manifest,
                 base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
             })

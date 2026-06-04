@@ -819,6 +819,39 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// ADR 0022 Option A: pin-set source #5 — every enabled image's
+    /// **base-snapshot memory manifest** (the per-template base memfile's
+    /// backing chunks). The memfile is a shared, immutable artifact that
+    /// every same-template base `session.create` sibling `MAP_PRIVATE`s;
+    /// its chunks must stay pinned for the template's *enabled* lifetime,
+    /// **independent of the base snapshot row's `recoverable` flag** —
+    /// exactly as source #1 pins the rootfs disk manifest independent of
+    /// any snapshot. Reads the existing `enabled_images
+    /// .base_snapshot_memory_manifest_*` columns (migrations 0043/0049);
+    /// `NULL` for cold-boot backends (VZ) drops out via `IS NOT NULL`. No
+    /// `soft_deleted_at` filter (mirrors source #1, ADR 0021 P1.8): a
+    /// disabled-but-present image with live sharers keeps its memfile
+    /// pinned. Default `Ok(vec![])` for non-PG mocks.
+    async fn list_enabled_image_base_snapshot_memory_manifests(
+        &self,
+    ) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0022 Option A: pin-set source #6 — the disk companion to #5.
+    /// Pins every enabled image's **base-snapshot disk manifest** (the
+    /// rootfs a base `session.create` restores from, migration 0042),
+    /// again independent of the base snapshot row's `recoverable` flag, so
+    /// an enabled template is fully self-pinned (memory + disk) without
+    /// relying on the snapshot row's state. Reads
+    /// `enabled_images.base_snapshot_disk_manifest_*`. Default
+    /// `Ok(vec![])` for non-PG mocks.
+    async fn list_enabled_image_base_snapshot_disk_manifests(
+        &self,
+    ) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// ADR 0016 Phase C: enumerate every `(live_disk_manifest_id,
     /// live_disk_manifest_version)` pair currently advertised by a
     /// session row. Pin-set source #2 (the other two are
