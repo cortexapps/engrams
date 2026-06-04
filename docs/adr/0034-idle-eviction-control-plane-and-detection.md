@@ -226,3 +226,60 @@ backstop nomination + eviction within one 30-min hard TTL. Prod
 watch: pipeline-seconds completions present, nominated{source}
 split, budget-exhausted ≈ 0, no Evicting row older than a few
 ticks.
+
+## Addendum 2026-06-04 — prod-found durability defect (incident 89f7984d)
+
+The control plane worked as designed; the **snapshot durability** under
+it did not. Session `89f7984d` was idle-evicted (correctly, 30s after a
+`harness_idle`) but its eviction snapshot came back **unresumable** —
+resume died on `read fc manifest.json … No such file or directory`.
+
+Three compounding bugs, none in the state machine itself:
+
+1. **`commit_snapshot` ran after `destroy()`.** The pipeline order was
+   `snapshot → record_snapshot → unbind → sandbox_id=NULL → destroy →
+   commit_snapshot`. By the time `commit_snapshot` ran, `resolve_owner`
+   returned NotFound (the session's `sandbox_id` was already NULL and the
+   registry unbound), so it could never clear the host's
+   `inflight_snapshots` entry. The failure was logged WARN-only ("let it
+   ride — the PG row still references the durable artifacts") — but the
+   artifacts were **not** durable: the still-running host's periodic
+   checkpoint driver's next `snapshot()` called
+   `abort_prior_inflight_snapshot`, which deletes the per-snapshot
+   `state.bin`/`sidecar.json` from BlobStorage — while the `snapshots`
+   row still said `recoverable = true`. **Fix:** move `commit_snapshot`
+   to immediately after `record_snapshot`, before `unbind`/`destroy`,
+   while the owner still resolves (`idle_evictor.rs`). Regression guard:
+   `evict_idle_session_commits_before_destroy` asserts the call order.
+
+2. **Same defect, deterministically, in the manual snapshot endpoint.**
+   `POST /sessions/:id/snapshot` recorded `recoverable = true`, left the
+   sandbox running, and **never called `commit_snapshot` at all** — so
+   the periodic checkpoint driver was *guaranteed* to abort its artifacts
+   within one interval. **Fix:** the endpoint now commits after
+   `record_snapshot` (`api/snapshot.rs`). (Dead-source evacuation and the
+   SIGTERM/host-roll path are not affected: the former restores from an
+   already-durable checkpoint and takes no new snapshot; the latter's
+   host exits, so no live periodic driver survives to abort the inflight.)
+
+3. **Resume trusted the stored `recoverable` flag and never fell back.**
+   `latest_snapshot_for_session` is `ORDER BY created_at DESC LIMIT 1`
+   with no `recoverable` filter, and resume restored from it
+   unconditionally — so one bricked row doomed the session even though
+   the ADR-0028 periodic checkpoint chain held an intact prior snapshot.
+   **Fix:** resume now walks `list_snapshots_for_session` newest-first,
+   re-verifies each candidate's backing artifacts (chunk manifests **and**
+   the portable `state.bin`/`sidecar` blobs) at the point of use, demotes
+   a verified-missing row to `recoverable = false`, and falls back through
+   the chain to the disk-only cold boot. This is the durable guarantee —
+   it backstops every capture path and self-heals incident `89f7984d`
+   from its prior checkpoint on the next resume.
+
+Separately, the upstream trigger (`harness_idle` while the screenshot
+showed work in flight) was the in-VM `claude` child exiting mid-turn:
+`harness_idle` is emitted only on the child's stdout EOF, and the harness
+discarded the exit status, so a crash was indistinguishable from a clean
+turn-end. The harness now captures the `ExitStatus`, and an unsolicited
+abnormal exit (non-zero / fatal signal — `137` = OOM-kill) is surfaced as
+a `System` transcript message, i.e. a durable `session_event` in PG that
+survives VM teardown (`engram-harness-claude`).
