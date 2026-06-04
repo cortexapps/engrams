@@ -49,17 +49,22 @@ const BLOB_MIB: u64 = 64;
 /// Init injected into the rootfs: build the blob in tmpfs (guest RAM),
 /// then re-read it forever so restored siblings keep faulting the same
 /// guest-physical pages back in from memory.bin.
-const SPIKE_INIT: &str = r#"#!/bin/bash
+///
+/// `/bin/sh` (not bash) for maximal portability across runner rootfs
+/// builds, and — critically — the script can NEVER exit: a pid-1 that
+/// returns triggers `panic=1 reboot=k`, which kills FC and makes the
+/// host-side `snapshot()` hit a dead socket. So every step is
+/// best-effort and the final loop is unconditional; a failed mount/fill
+/// then surfaces as the host-side RSS-floor assertion (the honest
+/// signal), not a dead VM. If the guest dies anyway (e.g. the kernel
+/// can't exec this debugfs-injected script as init), the snapshot path
+/// dumps `firecracker.log` (guest serial console) so the panic reason
+/// is visible rather than a bare ECONNREFUSED.
+const SPIKE_INIT: &str = r#"#!/bin/sh
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-# The minimal FC-CI Ubuntu rootfs has no /mnt and no /dev/shm; /tmp is
-# the one guaranteed tmpfs-able mountpoint (verified via serial console
-# on the dev-vm — "mount point does not exist" otherwise). devtmpfs is
-# kernel-auto-mounted, so /dev/urandom is available. No `|| true`: if
-# the mount fails the blob write fails too and the host-side RSS-floor
-# assertion catches it loudly.
-mount -t tmpfs -o size=128m tmpfs /tmp
-head -c 67108864 /dev/urandom > /tmp/blob
-while true; do cat /tmp/blob > /dev/null; sleep 1; done
+mount -t tmpfs -o size=128m tmpfs /tmp 2>/dev/null || true
+head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true
+while true; do cat /tmp/blob > /dev/null 2>&1 || true; sleep 1; done
 "#;
 
 #[tokio::test]
@@ -102,10 +107,32 @@ async fn file_backend_siblings_share_clean_pages() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
     };
+    // Keep the jail dir on failure so we can read firecracker.log (which
+    // carries the guest serial console — lib.rs funnels console=ttyS0 +
+    // FC's own stderr into jail_dir/firecracker.log). Without this, a
+    // dead guest surfaces only as a bare "Connection refused" on the
+    // snapshot socket with no clue why it died.
+    std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
+
     let source = backend.create(spec).await.expect("create");
     // Boot + 64 MiB urandom fill + at least one read pass.
     tokio::time::sleep(Duration::from_secs(8)).await;
-    let metadata = backend.snapshot(source).await.expect("snapshot");
+    // If the guest didn't survive to be snapshotted, the FC API socket
+    // is gone (panic=1 reboot=k → KVM reset → FC exits) and we'd get a
+    // bare ECONNREFUSED. Surface the guest's own panic reason from
+    // firecracker.log before failing — a dead init/boot is a real
+    // signal, not something to skip past.
+    let metadata = match backend.snapshot(source).await {
+        Ok(m) => m,
+        Err(e) => {
+            dump_fc_logs(work.path());
+            let _ = backend.destroy(source).await;
+            panic!(
+                "snapshot failed — source guest did not survive to be snapshotted: {e}\n\
+                 (see the dumped firecracker.log above for the guest console / kernel panic)"
+            );
+        }
+    };
     backend.destroy(source).await.expect("destroy source");
 
     // ---- 3. Restore N siblings off the same memory.bin ----
@@ -116,10 +143,19 @@ async fn file_backend_siblings_share_clean_pages() {
     let mut vms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
-        let id = backend
-            .restore(metadata.clone())
-            .await
-            .unwrap_or_else(|e| panic!("restore sibling {i}: {e:?}"));
+        let id = match backend.restore(metadata.clone()).await {
+            Ok(id) => id,
+            Err(e) => {
+                dump_fc_logs(work.path());
+                for v in &vms {
+                    let _ = backend.destroy(*v).await;
+                }
+                panic!(
+                    "sibling {i} failed to restore off the shared memory.bin: {e:?}\n\
+                     (see the dumped firecracker.log above for the guest console)"
+                );
+            }
+        };
         eprintln!(
             "SPIKE: restore sibling {i} took {} ms",
             t.elapsed().as_millis()
@@ -176,6 +212,31 @@ async fn file_backend_siblings_share_clean_pages() {
         "File-backend restores show no meaningful page sharing \
          (Σpss/Σrss = {pct}%) — MAP_PRIVATE page-cache sharing broken?",
     );
+}
+
+/// Walk the work dir for every `firecracker.log` and print its tail.
+/// FC funnels the guest serial console (`console=ttyS0`) plus its own
+/// stderr into this file (see `lib.rs` jail setup), so when a guest
+/// panics on boot/init this is the only place the reason appears.
+fn dump_fc_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            dump_fc_logs(&path);
+        } else if path.file_name().is_some_and(|n| n == "firecracker.log") {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => eprintln!(
+                    "--- {} ---\n{}\n--- end ---",
+                    path.display(),
+                    content.trim_end()
+                ),
+                Err(e) => eprintln!("(could not read {}: {e})", path.display()),
+            }
+        }
+    }
 }
 
 /// Run one `debugfs -w -R <cmd>` against `img`, panicking on failure.
