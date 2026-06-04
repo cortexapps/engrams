@@ -2,8 +2,10 @@
 //!
 //! Boots a real Firecracker microVM whose rootfs is `/dev/nbd0`,
 //! served by the chunked NBD daemon. Asserts the guest reads back
-//! byte-identical content (via an in-VM `cat` over vsock-exec) AND
-//! the daemon shuts down cleanly on `destroy()`.
+//! byte-identical content (via the marker-conditional init —
+//! `prepare_verified_rootfs`; the raw test rootfs has no agentd, so
+//! vsock exec is unavailable) AND the daemon shuts down cleanly on
+//! `destroy()`.
 //!
 //! Gating + run (mirrors `snapshot_uffd.rs`):
 //!
@@ -46,11 +48,10 @@ use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::{BlobStorage, SandboxBackend};
 use engram_core::types::manifest::ManifestRef;
-use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
+use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::disk_daemon::{attach_manifest, NbdSlotAllocator};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 use engram_storage_local::LocalBlobStorage;
-use futures::StreamExt;
 
 /// Pre-flight: KVM + firecracker + the test rootfs path. Mirrors
 /// the FC crate's `common::fc_preflight` but inlined here so we
@@ -114,7 +115,74 @@ fn preflight() -> Option<(PathBuf, PathBuf, PathBuf)> {
         }
     };
     let _ = firecracker; // not actually invoked here; FC backend resolves on its own
+                         // Both tests verify guest-side content via a debugfs-injected
+                         // marker-conditional init (see `prepare_verified_rootfs`).
+    if !std::process::Command::new("debugfs")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: debugfs (e2fsprogs) not available");
+        return None;
+    }
     Some((kernel, rootfs, nbd_path))
+}
+
+/// The sentinel only the prepared image carries; the guest's init
+/// keeps the VM alive iff it reads back byte-identical.
+const SENTINEL: &str = "survived-the-host-roll";
+
+/// How long the guest gets to boot + run verify-init before the
+/// host-side liveness assertion. A panicked guest (`panic=1 reboot=k`)
+/// exits FC well inside this.
+const VERIFY_GRACE: Duration = Duration::from_secs(6);
+
+/// Copy `rootfs_src` into `work`, inject the sentinel file + a
+/// marker-conditional init (via debugfs — no mount, no root needed for
+/// the injection itself), and return the prepared image path.
+///
+/// Verification model shared by both tests: the guest's pid-1 script
+/// reads `/session-work.txt`; on a byte-identical match it sleeps
+/// forever, otherwise it exits — and a dying init panics the kernel
+/// (`panic=1 reboot=k`), which exits FC. So "the sandbox is still in
+/// `list()` after [`VERIFY_GRACE`]" IS the content assertion. The raw
+/// FC-CI Ubuntu rootfs ships no agentd, so vsock exec — the previous
+/// verification — structurally can't work here (it rotted unnoticed
+/// because CI's NBD step self-skips on Blacksmith).
+fn prepare_verified_rootfs(work: &std::path::Path, rootfs_src: &std::path::Path) -> PathBuf {
+    let img = work.join("verified-rootfs.ext4");
+    std::fs::copy(rootfs_src, &img).expect("copy rootfs");
+    let marker = work.join("marker.txt");
+    std::fs::write(&marker, format!("{SENTINEL}\n")).expect("write marker");
+    // PATH is explicit because the kernel execs init with an empty
+    // environment.
+    let verify_init = work.join("verify-init.sh");
+    std::fs::write(
+        &verify_init,
+        format!(
+            "#!/bin/bash\n\
+             export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
+             if [ \"$(cat /session-work.txt 2>/dev/null)\" = \"{SENTINEL}\" ]; then\n\
+             \twhile true; do sleep 60; done\n\
+             fi\n\
+             exit 1\n"
+        ),
+    )
+    .expect("write verify-init");
+    for cmd in [
+        format!("write {} /session-work.txt", marker.display()),
+        format!("write {} /verify-init.sh", verify_init.display()),
+        "sif /verify-init.sh mode 0100755".to_string(),
+    ] {
+        let out = std::process::Command::new("debugfs")
+            .args(["-w", "-R", &cmd])
+            .arg(&img)
+            .output()
+            .expect("debugfs");
+        assert!(out.status.success(), "debugfs `{cmd}` failed");
+    }
+    img
 }
 
 #[tokio::test]
@@ -127,8 +195,10 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
 
     let work = tempfile::tempdir().expect("tempdir");
 
-    // 1. Stand up a chunk store + cache + plant the test rootfs as
-    //    a chunked disk manifest.
+    // 1. Stand up a chunk store + cache + plant the verified test
+    //    rootfs (sentinel + marker-conditional init injected) as a
+    //    chunked disk manifest.
+    let rootfs_verified = prepare_verified_rootfs(work.path(), &rootfs_src);
     let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
     let store = Arc::new(ChunkStore::new(blob));
     let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
@@ -136,7 +206,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     let cache = ChunkCache::new(cache_cfg);
 
     let manifest = store
-        .chunk_file(&rootfs_src, ManifestKind::Disk, None)
+        .chunk_file(&rootfs_verified, ManifestKind::Disk, None)
         .await
         .expect("chunk test rootfs");
     let manifest_ref = ManifestRef::new();
@@ -146,7 +216,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         .expect("put rootfs manifest");
     eprintln!(
         "PLANT: chunked {} into {} chunks ({} MiB)",
-        rootfs_src.display(),
+        rootfs_verified.display(),
         manifest.chunks.len(),
         manifest.total_bytes / (1024 * 1024)
     );
@@ -196,7 +266,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
     cfg.net_pool = None;
     cfg.restore_mode = RestoreMode::File;
-    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/verify-init.sh".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -244,30 +314,18 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     };
     eprintln!("BOOTED: FC sandbox {} on NBD-backed rootfs", sandbox_id);
 
-    // 4. Exec a command. If the disk really came up, this works.
-    let req = ExecRequest {
-        command: vec!["/bin/echo".into(), "nbd-rootfs-alive".into()],
-        env: HashMap::new(),
-        stdin: None,
-        workdir: None,
-        timeout: Some(Duration::from_secs(5)),
-    };
-    let stream = backend
-        .exec_stream(sandbox_id, req)
-        .await
-        .expect("exec against NBD-backed sandbox");
-    let (stdout, stderr, exit) = drain(stream.events).await;
-    eprintln!(
-        "EXEC: exit={:?} stdout={:?} stderr={:?}",
-        exit,
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
-    );
-    assert_eq!(exit, Some(0), "echo via NBD-rootfs VM must exit clean");
+    // 4. Liveness-as-content-assertion (see `prepare_verified_rootfs`):
+    //    the guest's verify-init only stays alive on a byte-identical
+    //    sentinel read off the NBD-served disk.
+    tokio::time::sleep(VERIFY_GRACE).await;
+    let live = backend.list().await.expect("list");
     assert!(
-        String::from_utf8_lossy(&stdout).contains("nbd-rootfs-alive"),
-        "echo output must include the sentinel string"
+        live.contains(&sandbox_id),
+        "NBD-backed VM died within the grace period — the guest's \
+         verify-init found no byte-identical /session-work.txt \
+         (chunk corruption, mount failure, or NBD wire fault)",
     );
+    eprintln!("VERIFIED: guest alive at +{VERIFY_GRACE:?} — sentinel read back byte-identical");
 
     // 5. Tear down. destroy() inside FC backend kills the VM;
     //    dropping nbd_state disconnects from the kernel + releases
@@ -305,54 +363,14 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
         Some(v) => v,
         None => return,
     };
-    // The marker injection needs debugfs (e2fsprogs).
-    if !std::process::Command::new("debugfs")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        eprintln!("SKIP: debugfs not available");
-        return;
-    }
 
     let work = tempfile::tempdir().expect("tempdir");
 
-    // 1. Build the "session's evolved disk": copy the base test
-    //    rootfs and plant a marker file in it — the stand-in for the
-    //    work a real session wrote before its host died.
-    let evolved = work.path().join("evolved-rootfs.ext4");
-    std::fs::copy(&rootfs_src, &evolved).expect("copy rootfs");
-    let marker = work.path().join("marker.txt");
-    std::fs::write(&marker, "survived-the-host-roll\n").expect("write marker");
-    // The verify-init: alive iff the marker reads back byte-identical.
-    // A mismatch (or a base disk without the marker) exits pid 1 →
-    // kernel panic (`panic=1 reboot=k`) → FC exits → the host-side
-    // liveness assertion fails. PATH is explicit because the kernel
-    // execs init with an empty environment.
-    let verify_init = work.path().join("verify-init.sh");
-    std::fs::write(
-        &verify_init,
-        "#!/bin/bash\n\
-         export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
-         if [ \"$(cat /session-work.txt 2>/dev/null)\" = \"survived-the-host-roll\" ]; then\n\
-         \twhile true; do sleep 60; done\n\
-         fi\n\
-         exit 1\n",
-    )
-    .expect("write verify-init");
-    for cmd in [
-        format!("write {} /session-work.txt", marker.display()),
-        format!("write {} /verify-init.sh", verify_init.display()),
-        "sif /verify-init.sh mode 0100755".to_string(),
-    ] {
-        let out = std::process::Command::new("debugfs")
-            .args(["-w", "-R", &cmd])
-            .arg(&evolved)
-            .output()
-            .expect("debugfs");
-        assert!(out.status.success(), "debugfs `{cmd}` failed");
-    }
+    // 1. Build the "session's evolved disk": the verified rootfs's
+    //    sentinel file is the stand-in for the work a real session
+    //    wrote before its host died (only the evolved lineage carries
+    //    it — a base image boot would fail verify-init).
+    let evolved = prepare_verified_rootfs(work.path(), &rootfs_src);
 
     // 2. Chunk the evolved disk — this manifest IS the
     //    live_disk_manifest a coord would hand the recovery.
@@ -416,7 +434,7 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
     //    read-back. Surviving the grace period IS the content
     //    assertion: a base disk (no marker), a corrupted chunk, or a
     //    failed mount all panic the guest and empty `list()`.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    tokio::time::sleep(VERIFY_GRACE).await;
     let live = pooled.list().await.expect("list");
     assert!(
         live.contains(&sandbox_id),
@@ -424,34 +442,11 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
          verify-init found no byte-identical /session-work.txt \
          (wrong disk, corrupted chunks, or mount failure)",
     );
-    eprintln!("VERIFIED: guest alive at +6s — marker read back byte-identical");
+    eprintln!("VERIFIED: guest alive at +{VERIFY_GRACE:?} — marker read back byte-identical");
 
     pooled
         .destroy(sandbox_id)
         .await
         .expect("destroy recovered sandbox");
     eprintln!("TEARDOWN: recovered VM destroyed + NBD daemon disconnected");
-}
-
-/// Mirror of `common::drain` from the FC test scaffold. Drains an
-/// `ExecStream` into separated stdout / stderr buffers + the exit
-/// code.
-async fn drain(
-    mut stream: impl StreamExt<Item = engram_core::types::sandbox::ExecEvent> + Unpin,
-) -> (Vec<u8>, Vec<u8>, Option<i32>) {
-    use engram_core::types::sandbox::ExecEvent;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit_code = None;
-    while let Some(ev) = stream.next().await {
-        match ev {
-            ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-            ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-            ExecEvent::Exit(code) => {
-                exit_code = code;
-                break;
-            }
-        }
-    }
-    (stdout, stderr, exit_code)
 }
