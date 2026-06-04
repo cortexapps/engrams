@@ -4485,7 +4485,9 @@ mod tests {
     }
     impl BaseRestoreModeEnvGuard {
         fn new() -> Self {
-            let lock = base_mode_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            let lock = base_mode_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let prev = std::env::var("ENGRAM_FC_BASE_RESTORE_MODE").ok();
             // SAFETY: serialized via `lock`.
             unsafe { std::env::remove_var("ENGRAM_FC_BASE_RESTORE_MODE") };
@@ -4519,11 +4521,19 @@ mod tests {
         let g = BaseRestoreModeEnvGuard::new();
         for v in &["file", "File", "FILE"] {
             g.set(v);
-            assert_eq!(base_restore_mode_from_env(), Some(RestoreMode::File), "input={v}");
+            assert_eq!(
+                base_restore_mode_from_env(),
+                Some(RestoreMode::File),
+                "input={v}"
+            );
         }
         for v in &["uffd", "Uffd", "UFFD"] {
             g.set(v);
-            assert_eq!(base_restore_mode_from_env(), Some(RestoreMode::Uffd), "input={v}");
+            assert_eq!(
+                base_restore_mode_from_env(),
+                Some(RestoreMode::Uffd),
+                "input={v}"
+            );
         }
     }
 

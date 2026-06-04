@@ -577,8 +577,7 @@ async fn main() -> Result<(), CoordinatorError> {
                 // against the per-template resident memfile (density +
                 // faster boot); idle-resume stays on `restore_mode`. Unset
                 // ⇒ inherit `restore_mode` (behaviour-preserving).
-                fc_cfg.base_restore_mode =
-                    engram_sandbox_firecracker::base_restore_mode_from_env();
+                fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
                 // Point the UFFD handler at the SAME chunk cache the
                 // PooledBackend restore-prefetch warms (`local_path/
                 // chunk-cache`, wired below) so on-fault `cache.get`

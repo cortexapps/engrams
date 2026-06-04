@@ -36,13 +36,24 @@
 //! `chunk_store.get_chunk(hash)` walks the tiers and tees on miss, so the
 //! prefetch driver is just an eager loop over the base snapshot's chunk hashes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
+use engram_core::types::SnapshotId;
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
 use parking_lot::RwLock;
 use tokio::sync::{watch, Semaphore};
+
+/// ADR 0022 Option A: resolves a base snapshot's id to its on-disk
+/// snapshot dir (`<work_dir>/snapshots/<id>`). Supplied by the
+/// host-agent as `pooled.snapshot_path_for` so the residency-materialized
+/// memfile lands at the *exact* path a base `session.create` restore
+/// reads — they agree by construction rather than by duplicated layout
+/// logic. `Some` ⇒ density on (materialize the per-template memfile +
+/// gate readiness on it); `None` ⇒ off (behaviour-preserving).
+pub type SnapshotDirResolver = Arc<dyn Fn(SnapshotId) -> PathBuf + Send + Sync>;
 
 /// Shared, mutable view of "which images is this host ready to
 /// serve?" — written by the prefetch supervisor, read by the
@@ -110,6 +121,11 @@ pub fn spawn_supervisor(
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
     readiness: Arc<ImageReadiness>,
+    // ADR 0022 Option A: when `Some`, also materialize each enabled
+    // image's contiguous per-template base memfile at residency (and gate
+    // readiness on it). `None` ⇒ density off; the prefetch warms only
+    // chunks, exactly as before.
+    base_memfile_dir: Option<SnapshotDirResolver>,
 ) -> (
     watch::Sender<Vec<EnabledImageRef>>,
     tokio::task::JoinHandle<()>,
@@ -120,9 +136,14 @@ pub fn spawn_supervisor(
     tracing::info!(
         permits,
         recheck_secs = RECHECK_INTERVAL.as_secs(),
+        base_memfile = base_memfile_dir.is_some(),
         "image prefetch supervisor starting (base-snapshot only; no OCI prefetch)",
     );
     let handle = tokio::spawn(async move {
+        // ADR 0022: digest → materialized base memfile path, so a later
+        // disable can reclaim the (guest-RAM-sized) file. Lives across
+        // ticks. Only populated when `base_memfile_dir` is `Some`.
+        let mut memfiles: HashMap<ManifestDigest, PathBuf> = HashMap::new();
         loop {
             let enabled = rx.borrow_and_update().clone();
             reconcile(
@@ -131,6 +152,8 @@ pub fn spawn_supervisor(
                 chunk_store.clone(),
                 chunk_cache.clone(),
                 semaphore.clone(),
+                base_memfile_dir.as_ref(),
+                &mut memfiles,
             )
             .await;
 
@@ -161,6 +184,8 @@ async fn reconcile(
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
     semaphore: Arc<Semaphore>,
+    base_memfile_dir: Option<&SnapshotDirResolver>,
+    memfiles: &mut HashMap<ManifestDigest, PathBuf>,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -173,6 +198,25 @@ async fn reconcile(
     // disk pressure.
     for digest in current.difference(&enabled_set) {
         readiness.mark_unready(digest);
+        // ADR 0022: reclaim the per-template base memfile (a
+        // guest-RAM-sized file) when its image is disabled. Best-effort
+        // unlink; a live sharer keeps the inode alive via its MAP_PRIVATE
+        // mapping even after the dentry is gone, so this is safe to do
+        // while sessions are still running.
+        if let Some(path) = memfiles.remove(digest) {
+            let p = path.clone();
+            tokio::spawn(async move {
+                match tokio::fs::remove_file(&p).await {
+                    Ok(()) => {
+                        tracing::info!(path = %p.display(), "reclaimed base memfile on image disable")
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(path = %p.display(), error = %e, "base memfile reclaim failed")
+                    }
+                }
+            });
+        }
         tracing::info!(
             digest = digest.as_str(),
             "image disabled; removed from ready set",
@@ -188,6 +232,15 @@ async fn reconcile(
         if current.contains(&image.manifest_digest) {
             continue;
         }
+        // ADR 0022: where this image's contiguous per-template base
+        // memfile must land — the SAME path a base session.create restore
+        // reads (`snapshot_path_for(base_snapshot_id)/memory.bin`). `None`
+        // when density is off. Recorded for disable-time reclaim.
+        let base_memfile =
+            base_memfile_dir.map(|resolver| resolver(image.base_snapshot_id).join("memory.bin"));
+        if let Some(ref path) = base_memfile {
+            memfiles.insert(image.manifest_digest.clone(), path.clone());
+        }
         // Clone the whole ref into the task — it carries everything
         // prefetch_one needs (uri, digest, base-snapshot disk + memory
         // manifests). Two Strings + two Copy refs; cheap per reconcile.
@@ -197,7 +250,7 @@ async fn reconcile(
         let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
-            match prefetch_one(&image, &chunk_store, &chunk_cache, &semaphore).await {
+            match prefetch_one(&image, &chunk_store, &chunk_cache, &semaphore, base_memfile).await {
                 Ok(chunks) => {
                     readiness.mark_ready(image.manifest_digest.clone());
                     tracing::info!(
@@ -235,6 +288,14 @@ async fn prefetch_one(
     chunk_store: &ChunkStore,
     chunk_cache: &ChunkCache,
     semaphore: &Arc<Semaphore>,
+    // ADR 0022 Option A: when `Some`, after warming the memory chunks,
+    // assemble them into the contiguous per-template base memfile at this
+    // path so same-template base `session.create` siblings MAP_PRIVATE one
+    // resident, page-cache-warm inode (density + faster boot, no UFFD
+    // handler). `Some` only for FC images with a memory manifest; gating
+    // readiness on this means an image isn't "ready" until the shared
+    // memfile exists, so the first session restores against a warm file.
+    base_memfile: Option<PathBuf>,
 ) -> Result<usize, PrefetchError> {
     // (1) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
     // the per-image base snapshot, whose disk manifest carries the runtime
@@ -265,8 +326,35 @@ async fn prefetch_one(
             .await
             .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
         total +=
-            prefetch_manifest_chunks(memory_manifest, chunk_store, chunk_cache, semaphore).await?;
+            prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
+                .await?;
+
+        // ADR 0022 Option A: materialize the contiguous per-template base
+        // memfile (density + faster boot). The chunks are now NVMe-warm
+        // from the prefetch above, so this is a local read + sequential
+        // write — no GCS round-trip. Idempotent: skip if the file already
+        // exists (a prior tick, or a base session.create that raced us and
+        // materialized it itself — both write byte-identical content to the
+        // same snapshot-id-keyed path, so siblings still share one inode).
+        if let Some(dest) = base_memfile {
+            if tokio::fs::metadata(&dest).await.is_err() {
+                chunk_store
+                    .materialize_to_file_cached(&memory_manifest, &dest, chunk_cache)
+                    .await
+                    .map_err(|e| {
+                        PrefetchError::MemfileMaterialize(format!("{}: {e}", dest.display()))
+                    })?;
+                tracing::info!(
+                    image_uri = %image.image_uri,
+                    path = %dest.display(),
+                    "per-template base memfile materialized at residency",
+                );
+            }
+        }
     }
+    // VZ / cold-boot images (base_snapshot_memory_manifest == None) have no
+    // memory image — density is FC-only — so no memfile is built and
+    // readiness folds in only the disk working set, exactly as before.
 
     Ok(total)
 }
@@ -320,6 +408,7 @@ enum PrefetchError {
     ChunkFetch(String),
     SemaphoreClosed,
     JoinError(String),
+    MemfileMaterialize(String),
 }
 
 impl std::fmt::Display for PrefetchError {
@@ -329,6 +418,7 @@ impl std::fmt::Display for PrefetchError {
             Self::ChunkFetch(m) => write!(f, "chunk fetch: {m}"),
             Self::SemaphoreClosed => write!(f, "prefetch semaphore closed"),
             Self::JoinError(m) => write!(f, "task join: {m}"),
+            Self::MemfileMaterialize(m) => write!(f, "materialize base memfile: {m}"),
         }
     }
 }
@@ -364,5 +454,137 @@ mod tests {
         unsafe { std::env::set_var("ENGRAM_PREFETCH_CONCURRENCY", "32") };
         assert_eq!(concurrency_from_env(), 32);
         unsafe { std::env::remove_var("ENGRAM_PREFETCH_CONCURRENCY") };
+    }
+
+    // ---- ADR 0022 Option A: residency memfile materialization ----
+
+    use engram_chunk_store::{ChunkCacheConfig, ManifestKind};
+    use engram_core::traits::BlobStorage;
+    use engram_core::types::manifest::ManifestRef;
+    use engram_storage_local::LocalBlobStorage;
+    use std::sync::Arc as StdArc;
+
+    /// Build a real local-backed ChunkStore + ChunkCache and seed a
+    /// disk + memory manifest, returning everything `prefetch_one` needs.
+    async fn seed() -> (
+        ChunkStore,
+        ChunkCache,
+        tempfile::TempDir,
+        ManifestRef,
+        ManifestRef,
+        Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: StdArc<dyn BlobStorage> =
+            StdArc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let store = ChunkStore::new(blob);
+        let cache = ChunkCache::new(ChunkCacheConfig {
+            root: dir.path().join("cache"),
+            budget_bytes: 256 * 1024 * 1024,
+        });
+        // Distinct disk + memory payloads so a mix-up would be caught.
+        let disk_bytes = (0..37u8).cycle().take(2 * 1024 * 1024).collect::<Vec<_>>();
+        let mem_bytes = (3..200u8).cycle().take(3 * 1024 * 1024).collect::<Vec<_>>();
+        let disk_src = dir.path().join("disk.bin");
+        let mem_src = dir.path().join("mem.bin");
+        tokio::fs::write(&disk_src, &disk_bytes).await.unwrap();
+        tokio::fs::write(&mem_src, &mem_bytes).await.unwrap();
+        let disk_m = store
+            .chunk_file(&disk_src, ManifestKind::Disk, Some(512 * 1024))
+            .await
+            .unwrap();
+        let mem_m = store
+            .chunk_file(&mem_src, ManifestKind::Memory, Some(512 * 1024))
+            .await
+            .unwrap();
+        let disk_ref = ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        };
+        let mem_ref = ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        };
+        store.put_manifest(disk_ref, &disk_m).await.unwrap();
+        store.put_manifest(mem_ref, &mem_m).await.unwrap();
+        (store, cache, dir, disk_ref, mem_ref, mem_bytes)
+    }
+
+    fn image_ref(
+        base_snapshot_id: SnapshotId,
+        disk_ref: ManifestRef,
+        mem_ref: Option<ManifestRef>,
+    ) -> EnabledImageRef {
+        EnabledImageRef {
+            image_uri: "localhost:5001/demo:warm".into(),
+            manifest_digest: ManifestDigest::new("sha256:deadbeef"),
+            base_snapshot_id,
+            base_snapshot_disk_manifest: disk_ref,
+            base_snapshot_memory_manifest: mem_ref,
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_materializes_base_memfile_and_is_idempotent() {
+        let (store, cache, dir, disk_ref, mem_ref, mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let base_id = SnapshotId::new();
+        let dest = dir
+            .path()
+            .join("snapshots")
+            .join(base_id.to_string())
+            .join("memory.bin");
+
+        let img = image_ref(base_id, disk_ref, Some(mem_ref));
+        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()))
+            .await
+            .unwrap();
+
+        // The contiguous memfile materialized byte-faithfully at the path
+        // a base session.create restore reads — this is the shared inode.
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), mem_bytes);
+
+        // Idempotent: a second residency pass (or a racing first-create
+        // that already wrote it) is a no-op, not an error or a rewrite.
+        let before = tokio::fs::metadata(&dest)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()))
+            .await
+            .unwrap();
+        let after = tokio::fs::metadata(&dest)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "second prefetch must not rewrite the memfile"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_skips_memfile_for_disk_only_image() {
+        // VZ / cold-boot: base_snapshot_memory_manifest == None. Even with a
+        // dest path supplied, no memfile is built — density is FC-only.
+        let (store, cache, dir, disk_ref, _mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let base_id = SnapshotId::new();
+        let dest = dir
+            .path()
+            .join("snapshots")
+            .join(base_id.to_string())
+            .join("memory.bin");
+
+        let img = image_ref(base_id, disk_ref, None);
+        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::fs::metadata(&dest).await.is_err(),
+            "disk-only image must not materialize a memfile",
+        );
     }
 }
