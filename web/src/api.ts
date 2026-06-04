@@ -12,6 +12,7 @@ import type {
   ListSessionsResponse,
   Principal,
   Role,
+  CheckpointsResponse,
   Session,
   SessionCowStateResponse,
   SessionMode,
@@ -185,6 +186,11 @@ export const fetchSession = (id: string) =>
  * below (ADR 0029) rather than a per-host fan-out from the browser. */
 export const fetchSessionCowState = (sessionId: string) =>
   getJSON<SessionCowStateResponse>(`/sessions/${sessionId}/cow-state`);
+
+// ADR 0028 A.log: the session's checkpoint chain (durability timeline
+// + the future fork-point picker).
+export const fetchSessionCheckpoints = (sessionId: string) =>
+  getJSON<CheckpointsResponse>(`/sessions/${sessionId}/checkpoints`);
 
 // ---- ADR 0029: Storage surface ---------------------------------------
 

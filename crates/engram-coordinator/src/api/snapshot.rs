@@ -538,6 +538,76 @@ pub enum FinishResumeOutcome {
     CreatedHarnessFailed,
 }
 
+/// ADR 0028 A.log: rung-1 recovery rewind. Called after a coherent
+/// (memory, disk) checkpoint was restored — the restored guest has no
+/// memory of events in `(events_cursor, crash]`, so we rewind the
+/// live transcript head to the cursor (tombstoning that span, not
+/// deleting it) and emit an honest, legible boundary the web renders.
+///
+/// No-op when the record carries no `events_cursor` (pre-0053 / never
+/// resolved) or when nothing is past it (the checkpoint was already
+/// the head). Best-effort: a rewind failure logs and leaves the
+/// transcript as-is rather than blocking the resume — the guest is
+/// already coherent; the worst case is a confusing-but-intact log.
+///
+/// Shared by [`resume_from_fc_snapshot`] (manual `/resume`) and
+/// `evac_resumer::run_resume_pipeline` (dead-host warm recovery) — the
+/// two rung-1 entry points.
+pub async fn apply_rung1_rewind(
+    state: &SharedState,
+    session_id: SessionId,
+    events_cursor: Option<i64>,
+) {
+    // Only coherent checkpoints (memory present) rewind; a disk-only
+    // record never reaches here (rung 2 cold-boots fresh, no rewind).
+    // `events_cursor` is the checkpoint's resolved cursor (None =
+    // pre-0053 / unresolved → no rewind information).
+    let Some(cursor) = events_cursor else {
+        return;
+    };
+    let summary = match state
+        .services
+        .meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "rung-1 transcript rewind failed; resume proceeds with the unrewound log",
+            );
+            return;
+        }
+    };
+    if summary.rolled_back == 0 {
+        return; // checkpoint was the head — nothing rolled back.
+    }
+    tracing::info!(
+        %session_id,
+        rolled_back = summary.rolled_back,
+        recovery_epoch = summary.recovery_epoch,
+        surviving_side_effects = summary.surviving_side_effects.len(),
+        "rung-1 recovery rewound the transcript to the checkpoint cursor",
+    );
+    // The boundary event is the first of the new epoch — it appends
+    // AFTER the tombstoned span (higher idx) and carries the new
+    // epoch (append_session_event reads the just-bumped value).
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::RecoveredFromCheckpoint {
+                recovery_epoch: summary.recovery_epoch,
+                through_idx: summary.through_idx,
+                rolled_back: summary.rolled_back,
+                surviving_side_effects: summary.surviving_side_effects,
+                at: Utc::now(),
+            },
+        )
+        .await;
+}
+
 /// ADR 0018 commit 10 — the "session is bound on a new host at
 /// `Created`, finish bringing it back to `Active`" primitive shared
 /// across every code path that drops a session into `Created` with a
@@ -837,6 +907,12 @@ async fn resume_from_fc_snapshot(
             },
         )
         .await?;
+    // ADR 0028 A.log: this is a rung-1 restore (coherent memory
+    // checkpoint) — rewind the transcript to the checkpoint's cursor
+    // before the harness comes back, so the resumed agent's first
+    // events append after an honest recovery boundary, not after
+    // messages it never made. No-op for a checkpoint that was the head.
+    apply_rung1_rewind(&state, id, record.events_cursor).await;
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id (the caller might've raced
     // a concurrent writer between bind_resumed_session and now).

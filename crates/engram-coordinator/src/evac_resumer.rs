@@ -207,6 +207,15 @@ async fn run_resume_pipeline(
         .latest_snapshot_for_session(session_id)
         .await?;
 
+    // ADR 0028 A.log: capture the rung-1 rewind cursor before the
+    // snapshot moves into evacuate_dead_source. Only a coherent
+    // checkpoint (memory present) rewinds; the receipt's
+    // `EvacLoss::None` confirms rung-1 actually happened.
+    let rewind_cursor = snapshot
+        .as_ref()
+        .filter(|s| s.memory_manifest.is_some())
+        .and_then(|s| s.events_cursor);
+
     // ADR 0028 Fix B: pre-resolve the disk-only cold-boot spec. Only
     // consulted when no coherent memory snapshot is usable; a `None`
     // there fails structurally rather than burning the budget.
@@ -294,6 +303,15 @@ async fn run_resume_pipeline(
         .await;
 
     bind_session_routing(state, session_id, receipt.new_sandbox_id).await;
+
+    // ADR 0028 A.log: warm rung-1 recovery — rewind the transcript to
+    // the checkpoint's cursor + emit the recovery boundary. Gated on
+    // EvacLoss::None (memory was actually restored); a rung-2 cold
+    // boot carries no cursor and skips this. No-op if the checkpoint
+    // was the head.
+    if receipt.loss == engram_core::types::evacuation::EvacLoss::None {
+        crate::api::snapshot::apply_rung1_rewind(state, session_id, rewind_cursor).await;
+    }
 
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id.

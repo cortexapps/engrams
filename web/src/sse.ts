@@ -30,17 +30,27 @@ export function subscribeSession(
     const idx = Number(ev.lastEventId);
     if (!Number.isFinite(idx)) return;
     let payload: SessionEvent | null = null;
+    let rewound = false;
+    let recoveryEpoch = 0;
     try {
-      const raw = JSON.parse(ev.data);
+      const raw = JSON.parse(ev.data) as Record<string, unknown>;
+      // ADR 0028 A.log: the coordinator folds `_rewound` +
+      // `_recovery_epoch` into the data object. Lift them onto the
+      // IndexedEvent and strip them so the typed SessionEvent stays
+      // clean.
+      rewound = raw._rewound === true;
+      recoveryEpoch = typeof raw._recovery_epoch === 'number' ? raw._recovery_epoch : 0;
+      delete raw._rewound;
+      delete raw._recovery_epoch;
       // The coordinator emits the SSE `event:` field as the discriminant
       // string and the `data:` body as the SessionEvent JSON. The body
       // already carries `type: <kind>`, but be defensive in case a
       // future shape changes.
-      payload = { ...(raw as Record<string, unknown>), type: kind } as SessionEvent;
+      payload = { ...raw, type: kind } as SessionEvent;
     } catch {
       return;
     }
-    handlers.onEvent({ idx, event: payload });
+    handlers.onEvent({ idx, event: payload, rewound, recoveryEpoch });
   };
 
   // Wire one listener per discriminant so EventSource doesn't deliver
@@ -64,6 +74,7 @@ export function subscribeSession(
     'harness_idle',
     'pull_request_opened',
     'file_shared',
+    'recovered_from_checkpoint',
   ];
   for (const kind of kinds) {
     es.addEventListener(kind, (ev) => dispatch(kind, ev as MessageEvent));

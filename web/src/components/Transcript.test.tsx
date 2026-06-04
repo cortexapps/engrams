@@ -345,3 +345,97 @@ describe('Transcript rendering', () => {
     expect(screen.getByText(/before/).textContent).toContain('after');
   });
 });
+
+// ADR 0028 A.log: rung-1 recovery rendering.
+describe('A.log recovery rewind', () => {
+  test('recovered_from_checkpoint becomes a recovery block', () => {
+    const blocks = buildBlocks(
+      indexed([
+        {
+          type: 'recovered_from_checkpoint',
+          recovery_epoch: 1,
+          through_idx: 4,
+          rolled_back: 3,
+          surviving_side_effects: ['A pull request was opened and still exists: …/pull/7'],
+          at: AT,
+        },
+      ]),
+    );
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      kind: 'recovery',
+      rolledBack: 3,
+      survivingSideEffects: [expect.stringContaining('pull/7')],
+    });
+  });
+
+  test('rewound events tag their blocks; live events do not', () => {
+    const events: IndexedEvent[] = [
+      // A rolled-back assistant message (tombstoned).
+      {
+        idx: 0,
+        rewound: true,
+        event: {
+          type: 'agent_message',
+          run_id: 'r1',
+          message_id: 'a1',
+          role: 'assistant',
+          text: 'work the agent no longer remembers',
+          at: AT,
+        },
+      },
+      // The boundary (live).
+      {
+        idx: 1,
+        event: {
+          type: 'recovered_from_checkpoint',
+          recovery_epoch: 1,
+          through_idx: -1,
+          rolled_back: 1,
+          surviving_side_effects: [],
+          at: AT2,
+        },
+      },
+      // A post-recovery message (live).
+      {
+        idx: 2,
+        event: {
+          type: 'agent_message',
+          run_id: 'r2',
+          message_id: 'a2',
+          role: 'assistant',
+          text: 'resumed work',
+          at: AT2,
+        },
+      },
+    ];
+    const blocks = buildBlocks(events);
+    const rewound = blocks.find((b) => b.kind === 'message' && b.texts.includes('work the agent no longer remembers'));
+    const boundary = blocks.find((b) => b.kind === 'recovery');
+    const resumed = blocks.find((b) => b.kind === 'message' && b.texts.includes('resumed work'));
+    expect(rewound?.rewound).toBe(true);
+    expect(boundary?.rewound).toBeFalsy();
+    expect(resumed?.rewound).toBeFalsy();
+  });
+
+  test('the recovery boundary renders the rolled-back count + surviving side-effects', () => {
+    renderWithProviders(
+      <Transcript
+        sessionId="s1"
+        events={indexed([
+          {
+            type: 'recovered_from_checkpoint',
+            recovery_epoch: 1,
+            through_idx: 4,
+            rolled_back: 5,
+            surviving_side_effects: ['A pull request was opened and still exists: x/y/pull/7'],
+            at: AT,
+          },
+        ])}
+      />,
+    );
+    expect(screen.getByText(/recovered from a checkpoint/i)).toBeTruthy();
+    expect(screen.getByText(/5 events after this point were rolled back/i)).toBeTruthy();
+    expect(screen.getByText(/pull\/7/)).toBeTruthy();
+  });
+});

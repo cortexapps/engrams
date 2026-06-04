@@ -254,6 +254,8 @@ mod tests {
             kind: "harness_idle".into(),
             payload: serde_json::json!({}),
             created_at: chrono::Utc::now() - chrono::Duration::hours(hours),
+            recovery_epoch: 0,
+            rewound_at: None,
         });
         // The COALESCE fallback would otherwise keep the session
         // "fresh" via created_at — rewind it too, as a long-running
@@ -335,6 +337,8 @@ mod tests {
             kind: "harness_run_started".into(),
             payload: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            recovery_epoch: 0,
+            rewound_at: None,
         });
 
         run_once(&BackstopConfig::default(), &state)

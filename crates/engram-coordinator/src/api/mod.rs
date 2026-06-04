@@ -65,6 +65,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
+        .route(
+            "/sessions/:id/checkpoints",
+            get(sessions_inspect::checkpoints),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             principal::require_session_owner,

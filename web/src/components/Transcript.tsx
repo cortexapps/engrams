@@ -93,7 +93,20 @@ type Block =
       sizeBytes: number;
       caption: string | null;
       at: string;
+    }
+  // ADR 0028 A.log: the recovery boundary — everything above it (within
+  // the rolled-back span) renders greyed/collapsed; the resumed thread
+  // continues below.
+  | {
+      kind: 'recovery';
+      key: string;
+      rolledBack: number;
+      survivingSideEffects: string[];
+      at: string;
     };
+
+/** ADR 0028 A.log: blocks built from tombstoned events render greyed. */
+type TaggedBlock = Block & { rewound?: boolean };
 
 export function Transcript({
   events,
@@ -143,7 +156,51 @@ export function Transcript({
   return (
     <div className="space-y-1">
       {blocks.map((b, i) => {
-        switch (b.kind) {
+        const el = renderBlock(b, i, blocks, {
+          sessionId,
+          lastMsgKey,
+          trailingIdleKey,
+        });
+        // ADR 0028 A.log: rolled-back events stay viewable but greyed
+        // (opacity + a left rule), making the recovery honest rather
+        // than a silent deletion.
+        if (b.rewound && el) {
+          return (
+            <div
+              key={b.key}
+              className="rewound-block"
+              style={{
+                opacity: 0.45,
+                borderLeft: '2px solid var(--color-ink-quiet)',
+                paddingLeft: '0.6rem',
+              }}
+              title="Rolled back by a checkpoint recovery"
+            >
+              {el}
+            </div>
+          );
+        }
+        return el;
+      })}
+      {busy && (
+        <HarnessWaiting verb={contextVerb(blocks, busyVerb)} onStop={onStop} />
+      )}
+    </div>
+  );
+}
+
+function renderBlock(
+  b: TaggedBlock,
+  i: number,
+  blocks: TaggedBlock[],
+  ctx: {
+    sessionId: string;
+    lastMsgKey: string | null;
+    trailingIdleKey: string | null;
+  },
+) {
+  const { sessionId, lastMsgKey, trailingIdleKey } = ctx;
+  switch (b.kind) {
           case 'run-start': {
             if (b.prompt) return <UserTurn key={b.key} prompt={b.prompt} at={b.at} />;
             // Our claude harness emits run_started with a null
@@ -234,12 +291,60 @@ export function Transcript({
                 at={b.at}
               />
             );
-        }
-      })}
-      {busy && (
-        <HarnessWaiting verb={contextVerb(blocks, busyVerb)} onStop={onStop} />
+          case 'recovery':
+            return (
+              <RecoveryBoundary
+                key={b.key}
+                rolledBack={b.rolledBack}
+                survivingSideEffects={b.survivingSideEffects}
+                at={b.at}
+              />
+            );
+  }
+}
+
+// ADR 0028 A.log: the honest recovery boundary. Everything above
+// (greyed) was rolled back; the thread resumes below. Surviving
+// outside-world side-effects are called out — the platform can't undo
+// them.
+function RecoveryBoundary({
+  rolledBack,
+  survivingSideEffects,
+  at,
+}: {
+  rolledBack: number;
+  survivingSideEffects: string[];
+  at: string;
+}) {
+  return (
+    <section
+      className="recovery-boundary my-5 rounded border px-3 py-2 font-display"
+      style={{
+        borderColor: 'var(--color-amber)',
+        background: 'color-mix(in srgb, var(--color-amber) 8%, transparent)',
+      }}
+    >
+      <div className="smallcaps" style={{ color: 'var(--color-amber)' }}>
+        ↩ recovered from a checkpoint after a host failure
+        <span className="margin-note margin-right" data-tabular>
+          {hms(at)}
+        </span>
+      </div>
+      <div className="md" style={{ color: 'var(--color-ink-quiet)' }}>
+        ~{rolledBack} {rolledBack === 1 ? 'event' : 'events'} after this point were
+        rolled back; the agent resumed from here.
+      </div>
+      {survivingSideEffects.length > 0 && (
+        <ul
+          className="md mt-1"
+          style={{ color: 'var(--color-ink-quiet)', listStyle: 'disc', paddingLeft: '1.2rem' }}
+        >
+          {survivingSideEffects.map((s, i) => (
+            <li key={i}>{s}</li>
+          ))}
+        </ul>
       )}
-    </div>
+    </section>
   );
 }
 
@@ -289,8 +394,8 @@ function classifyTool(name: string): 'reads' | 'edits' | 'other' {
   return 'other';
 }
 
-export function buildBlocks(events: IndexedEvent[]): Block[] {
-  const out: Block[] = [];
+export function buildBlocks(events: IndexedEvent[]): TaggedBlock[] {
+  const out: TaggedBlock[] = [];
   const openTools = new Map<string, number>(); // tool_call_id → blocks idx
   const openExecs = new Map<string, number>(); // exec_id → blocks idx
   let activeMsg: { role: AgentRole; idx: number } | null = null;
@@ -303,6 +408,7 @@ export function buildBlocks(events: IndexedEvent[]): Block[] {
 
   for (const indexed of events) {
     const ev = indexed.event;
+    const lenBefore = out.length;
     switch (ev.type) {
       case 'run_started':
         run = { reads: 0, edits: 0, ran: 0, other: 0, at: ev.at };
@@ -488,10 +594,31 @@ export function buildBlocks(events: IndexedEvent[]): Block[] {
         activeMsg = null;
         break;
 
+      case 'recovered_from_checkpoint':
+        out.push({
+          kind: 'recovery',
+          key: `rec:${indexed.idx}`,
+          rolledBack: ev.rolled_back,
+          survivingSideEffects: ev.surviving_side_effects,
+          at: ev.at,
+        });
+        activeMsg = null;
+        break;
+
       default:
         // status_changed, evicted, checkpoint_* — not surfaced in the
         // transcript; the raw event sidebar shows them.
         break;
+    }
+
+    // ADR 0028 A.log: tag any block(s) this event produced as rewound
+    // so the render greys/collapses the rolled-back span. (Merged
+    // messages within a span are uniformly rewound, so stamping the
+    // newest block is sufficient; the boundary event itself is live.)
+    if (indexed.rewound && out.length > lenBefore) {
+      for (let i = lenBefore; i < out.length; i++) {
+        (out[i] as TaggedBlock).rewound = true;
+      }
     }
   }
 

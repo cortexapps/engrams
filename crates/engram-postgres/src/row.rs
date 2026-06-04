@@ -162,11 +162,18 @@ pub(crate) fn persisted_event_from_row(row: &PgRow) -> Result<PersistedEvent, Me
     let kind: String = row.try_get("kind").map_err(col_err)?;
     let payload: serde_json::Value = row.try_get("payload").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
+    // ADR 0028 A.log (migration 0054). `recovery_epoch` is NOT NULL
+    // DEFAULT 0; `rewound_at` is nullable (set on tombstone). i32 in
+    // PG → i64 on the wire.
+    let recovery_epoch: i32 = row.try_get("recovery_epoch").map_err(col_err)?;
+    let rewound_at: Option<DateTime<Utc>> = row.try_get("rewound_at").map_err(col_err)?;
     Ok(PersistedEvent {
         idx,
         kind,
         payload,
         created_at,
+        recovery_epoch: recovery_epoch as i64,
+        rewound_at,
     })
 }
 

@@ -18,6 +18,41 @@ pub struct PersistedEvent {
     pub kind: String,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// ADR 0028 A.log: the session recovery epoch this event was
+    /// written in. 0 = the original timeline; bumped on each rung-1
+    /// rewind. Lets consumers segment the transcript across recoveries.
+    /// `#[serde(default)]` keeps pre-0054 rows (and non-PG mocks)
+    /// decoding as epoch 0.
+    #[serde(default)]
+    pub recovery_epoch: i64,
+    /// ADR 0028 A.log: set when this event was tombstoned by a rung-1
+    /// rewind (its idx was past the checkpoint's `events_cursor`). The
+    /// row stays for audit + a collapsed/greyed render, but it's NOT
+    /// part of the live transcript head. `None` = live.
+    #[serde(default)]
+    pub rewound_at: Option<DateTime<Utc>>,
+}
+
+/// ADR 0028 A.log: the outcome of a rung-1 recovery rewind —
+/// returned by `MetadataStore::rewind_session_to_cursor` so the
+/// caller can emit an honest, legible boundary event.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RewindSummary {
+    /// How many live events were tombstoned (the rolled-back span).
+    /// Zero means the checkpoint was already the head — no rewind
+    /// happened and the caller should NOT emit a boundary.
+    pub rolled_back: u64,
+    /// The new session recovery epoch after the bump (events appended
+    /// from here carry this).
+    pub recovery_epoch: i64,
+    /// The `idx` the live head reset to (the checkpoint's
+    /// `events_cursor`); the boundary event renders just after it.
+    pub through_idx: i64,
+    /// Human-readable side-effects detected in the rolled-back span
+    /// that touched the outside world and therefore SURVIVE the
+    /// rewind (`git push` / opened PR / shared file). The platform
+    /// can't undo them — it surfaces them. One line each.
+    pub surviving_side_effects: Vec<String>,
 }
 
 /// ADR 0026: one row from the `artifacts` table — a file shared into a

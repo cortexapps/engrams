@@ -223,3 +223,109 @@ async fn prune_keeps_latest_and_window_drops_aged_history() {
         "template snapshots are exempt from retention"
     );
 }
+
+/// ADR 0028 A.log: rung-1 rewind tombstones the post-cursor span
+/// (kept for audit, flagged), bumps the recovery epoch, extracts
+/// surviving outside-world side-effects, and stamps the new epoch on
+/// subsequent events. A second rewind to the same cursor is a no-op.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    let cursor = meta
+        .append_session_event(
+            session_id,
+            "agent_message",
+            serde_json::json!({"text": "before"}),
+        )
+        .await
+        .expect("append e0");
+    // Post-checkpoint span: a message + a PR (a surviving side-effect).
+    meta.append_session_event(
+        session_id,
+        "agent_message",
+        serde_json::json!({"text": "after"}),
+    )
+    .await
+    .expect("append e1");
+    meta.append_session_event(
+        session_id,
+        "pull_request_opened",
+        serde_json::json!({"url": "https://github.com/x/y/pull/7", "number": 7}),
+    )
+    .await
+    .expect("append PR");
+
+    let summary = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("rewind");
+    assert_eq!(
+        summary.rolled_back, 2,
+        "the two post-cursor events tombstoned"
+    );
+    assert_eq!(summary.recovery_epoch, 1, "epoch bumped 0 → 1");
+    assert_eq!(summary.through_idx, cursor);
+    assert_eq!(
+        summary.surviving_side_effects.len(),
+        1,
+        "the opened PR is a surviving side-effect",
+    );
+    assert!(summary.surviving_side_effects[0].contains("pull/7"));
+
+    // Replay carries the rewind flags, all rows retained (audit).
+    let events = meta
+        .list_session_events_since(session_id, -1, 1000)
+        .await
+        .expect("replay");
+    let e0_row = events.iter().find(|e| e.idx == cursor).expect("e0 present");
+    assert!(e0_row.rewound_at.is_none(), "pre-cursor event stays live");
+    let rolled = events
+        .iter()
+        .filter(|e| e.idx > cursor && e.rewound_at.is_some())
+        .count();
+    assert_eq!(
+        rolled, 2,
+        "both post-cursor events are tombstoned but retained"
+    );
+
+    // A new event after the rewind carries the bumped epoch.
+    let after_idx = meta
+        .append_session_event(
+            session_id,
+            "agent_message",
+            serde_json::json!({"text": "resumed"}),
+        )
+        .await
+        .expect("append post-rewind");
+    let events = meta
+        .list_session_events_since(session_id, -1, 1000)
+        .await
+        .expect("replay 2");
+    let after = events
+        .iter()
+        .find(|e| e.idx == after_idx)
+        .expect("post-rewind present");
+    assert_eq!(
+        after.recovery_epoch, 1,
+        "post-rewind events carry the new epoch"
+    );
+    assert!(after.rewound_at.is_none());
+
+    // Second rewind to the same cursor: the span is already
+    // tombstoned → no-op, no epoch bump.
+    let again = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("second rewind");
+    assert_eq!(
+        again.rolled_back, 0,
+        "already-tombstoned span isn't re-rolled"
+    );
+    assert_eq!(
+        again.recovery_epoch, 0,
+        "no-op rewind returns default (no bump)"
+    );
+}

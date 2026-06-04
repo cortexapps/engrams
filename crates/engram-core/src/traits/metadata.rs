@@ -432,6 +432,24 @@ pub trait MetadataStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError>;
 
+    /// ADR 0028 A.log: rung-1 recovery rewind. Tombstone every live
+    /// event with `idx > events_cursor` (set `rewound_at = now()`),
+    /// bump the session's `recovery_epoch`, and return a
+    /// [`RewindSummary`] (rolled-back count + the surviving
+    /// outside-world side-effects detected in that span). Idempotent
+    /// in spirit: if nothing is past the cursor, returns
+    /// `rolled_back == 0` and the caller emits no boundary.
+    ///
+    /// Default `Ok(RewindSummary::default())` so mocks without an
+    /// event log are a clean no-op.
+    async fn rewind_session_to_cursor(
+        &self,
+        _session_id: SessionId,
+        _events_cursor: i64,
+    ) -> Result<crate::types::event::RewindSummary, MetaError> {
+        Ok(crate::types::event::RewindSummary::default())
+    }
+
     // ---- file artifacts (ADR 0026) ----
 
     /// Record a shared file artifact for a session. `id` is the

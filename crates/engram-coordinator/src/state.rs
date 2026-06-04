@@ -150,6 +150,26 @@ pub enum SessionEvent {
         caption: Option<String>,
         at: DateTime<Utc>,
     },
+    /// ADR 0028 A.log: a rung-1 recovery rewound the live transcript
+    /// to a checkpoint. The boundary the web renders ("↩ Recovered
+    /// from a checkpoint after a host failure; ~N messages after this
+    /// point were rolled back") + the surviving outside-world
+    /// side-effects the platform can't undo (opened PRs, shared
+    /// files). The FIRST event of the post-recovery epoch — everything
+    /// before it with `idx > through_idx` is tombstoned (rendered
+    /// collapsed/greyed), everything after is the resumed thread.
+    RecoveredFromCheckpoint {
+        /// The new recovery epoch (events after this carry it).
+        recovery_epoch: i64,
+        /// The checkpoint's `events_cursor` — the live head reset here.
+        through_idx: i64,
+        /// How many events were rolled back.
+        rolled_back: u64,
+        /// Outside-world side-effects in the rolled-back span that
+        /// survive (one human-readable line each).
+        surviving_side_effects: Vec<String>,
+        at: DateTime<Utc>,
+    },
 }
 
 impl SessionEvent {
@@ -176,6 +196,7 @@ impl SessionEvent {
             Self::HarnessIdle { .. } => "harness_idle",
             Self::PullRequestOpened { .. } => "pull_request_opened",
             Self::FileShared { .. } => "file_shared",
+            Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
         }
     }
 
@@ -1033,6 +1054,8 @@ pub(crate) mod tests {
                 kind: kind.to_string(),
                 payload,
                 created_at: chrono::Utc::now(),
+                recovery_epoch: 0,
+                rewound_at: None,
             });
             Ok(idx)
         }
