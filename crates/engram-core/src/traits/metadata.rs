@@ -325,15 +325,18 @@ pub trait MetadataStore: Send + Sync {
     /// `retention`, EXCEPT each session's latest (the rung-1 recovery
     /// anchor — never collectible while the session row exists).
     /// Template snapshots (`session_id IS NULL`) are exempt. Returns
-    /// the number of rows deleted; chunks they exclusively referenced
-    /// become GC candidates via the existing pin-set machinery.
+    /// the ids of the deleted rows so the caller can also delete their
+    /// portable `snapshots/<id>/` blobs (state.bin / sidecar) — those
+    /// live outside the chunk-GC namespace and are otherwise never
+    /// collected. Chunks the pruned rows exclusively referenced become
+    /// GC candidates via the existing pin-set machinery.
     ///
-    /// Default `Ok(0)` so mocks without a snapshots table skip it.
+    /// Default `Ok(vec![])` so mocks without a snapshots table skip it.
     async fn prune_session_snapshots(
         &self,
         _retention: chrono::Duration,
-    ) -> Result<u64, MetaError> {
-        Ok(0)
+    ) -> Result<Vec<crate::types::SnapshotId>, MetaError> {
+        Ok(Vec::new())
     }
     /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
     /// the heartbeat-ack template enrichment path to surface the

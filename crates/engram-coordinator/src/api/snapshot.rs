@@ -801,6 +801,28 @@ pub async fn finish_resume_to_active(
     Ok(FinishResumeOutcome::Active)
 }
 
+/// Portable FC blob keys (`state.bin` + sidecar) for a snapshot,
+/// derived from its id via the canonical key scheme. Only a
+/// memory-bearing FC snapshot uploads these to BlobStorage, so return
+/// `(None, None)` for anything else — `materialize_state_if_missing`
+/// hard-errors on a missing blob, so a relocated restore must not be
+/// pointed at artifacts that were never uploaded (VZ disk-only /
+/// pre-chunk FC). See ADR 0028 (cross-host recovery) / incident
+/// 89f7984d.
+fn portable_blob_keys(
+    id: engram_core::types::SnapshotId,
+    memory_manifest: Option<&ManifestRef>,
+) -> (Option<String>, Option<String>) {
+    if memory_manifest.is_some() {
+        (
+            Some(engram_chunk_store::snapshot_blob::state_blob_key(id)),
+            Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(id)),
+        )
+    } else {
+        (None, None)
+    }
+}
+
 async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
@@ -886,6 +908,11 @@ async fn resume_from_fc_snapshot(
             "resume: preferred live_disk_manifest over snapshot's stale lineage (memory-less record)",
         );
     }
+    // Derive the portable state/sidecar blob keys (see the field
+    // comment below). Borrow memory_manifest here, before it's moved
+    // into the struct.
+    let (portable_state_key, portable_sidecar_key) =
+        portable_blob_keys(record.id, record.memory_manifest.as_ref());
     // Build the SnapshotMetadata the trait now takes. The record
     // carries every field we need; we just round-trip it back into
     // the engine type the backend expects.
@@ -896,14 +923,21 @@ async fn resume_from_fc_snapshot(
         image_version: record.image_version.clone(),
         disk_manifest: effective_disk_manifest,
         memory_manifest: record.memory_manifest,
-        // ADR 0014: portable-snapshot refs aren't yet plumbed onto
-        // SnapshotRecord — the existing idle-resume path stays
-        // same-host. Warm-pool restore will carry these via gRPC
-        // request fields (M1.5), bypassing the SnapshotRecord
-        // shape.
+        // ADR 0028 cross-host recovery: a memory-bearing FC snapshot
+        // uploads its VMM `state.bin` + FC sidecar to BlobStorage, so
+        // pass the (deterministic, id-derived) blob keys — a resume that
+        // relocates to a host WITHOUT this snapshot's local dir then
+        // materializes them from GCS instead of dying on a missing
+        // `manifest.json`. These were hardcoded `None` on the assumption
+        // that idle-resume stays same-host; prod incident 89f7984d
+        // disproved it (the self-heal fell back to a good checkpoint,
+        // but the resume landed on a non-capturing host and skipped
+        // materialization). `rootfs` is rebuilt from `disk_manifest`
+        // chunks and `working_set` is a warm-pool-only prefetch hint, so
+        // both stay None.
         source_sandbox_id: None,
-        state_blob_key: None,
-        sidecar_blob_key: None,
+        state_blob_key: portable_state_key,
+        sidecar_blob_key: portable_sidecar_key,
         rootfs_blob_key: None,
         working_set_blob_key: None,
         // ADR 0035: resume keeps the pinned generations (no swap); the
@@ -1409,6 +1443,22 @@ mod recoverable_tests {
             snapshot_artifacts_present(blob.as_ref(), &rec).await,
             "disk-only snapshot must not require FC state/sidecar blobs",
         );
+    }
+
+    #[test]
+    fn portable_blob_keys_set_only_for_memory_bearing() {
+        let id = engram_core::types::SnapshotId::new();
+        // Memory-bearing FC snapshot → derive the portable state/sidecar
+        // keys so a relocated resume materializes them from BlobStorage.
+        let m = make_ref();
+        let (s, sc) = portable_blob_keys(id, Some(&m));
+        assert!(s.as_deref().unwrap().ends_with("/state.bin"), "{s:?}");
+        assert!(s.as_deref().unwrap().contains(&id.to_string()), "{s:?}");
+        assert!(sc.as_deref().unwrap().ends_with("/sidecar.json"), "{sc:?}");
+        // Disk-only / non-FC → None, so a relocated restore doesn't chase
+        // state/sidecar artifacts that were never uploaded (materialize
+        // hard-errors on a missing blob).
+        assert_eq!(portable_blob_keys(id, None), (None, None));
     }
 }
 

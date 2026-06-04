@@ -65,12 +65,40 @@ pub fn spawn(cfg: CheckpointRetentionConfig, state: SharedState) -> tokio::task:
                 )
                 .await
             {
-                Ok(0) => {}
-                Ok(n) => {
+                Ok(deleted) if deleted.is_empty() => {}
+                Ok(deleted) => {
+                    // The generation bump above makes the chunks/manifests
+                    // these rows exclusively referenced GC candidates, but
+                    // the per-snapshot portable blobs (`snapshots/<id>/`
+                    // state.bin + sidecar) live outside the chunk-GC
+                    // namespace and would otherwise orphan forever. Delete
+                    // them here, now that the rows (and thus any resume
+                    // that could reference them) are gone. Best-effort: a
+                    // missing object (memory-less snapshot never uploaded
+                    // one, or abort already removed it) is a harmless 404.
+                    let mut blobs_deleted = 0usize;
+                    for sid in &deleted {
+                        for key in [
+                            engram_chunk_store::snapshot_blob::state_blob_key(*sid),
+                            engram_chunk_store::snapshot_blob::sidecar_blob_key(*sid),
+                        ] {
+                            match state.services.blob.delete(&key).await {
+                                Ok(()) => blobs_deleted += 1,
+                                Err(e) => tracing::debug!(
+                                    snapshot_id = %sid,
+                                    key = %key,
+                                    error = %e,
+                                    "checkpoint retention: portable blob delete failed \
+                                     (best-effort; object may not exist)",
+                                ),
+                            }
+                        }
+                    }
                     tracing::info!(
-                        deleted = n,
+                        deleted = deleted.len(),
+                        blobs_deleted,
                         retention_secs = cfg.retention.as_secs(),
-                        "checkpoint retention sweep pruned aged-out session snapshots",
+                        "checkpoint retention sweep pruned aged-out session snapshots + portable blobs",
                     );
                 }
                 Err(e) => {
