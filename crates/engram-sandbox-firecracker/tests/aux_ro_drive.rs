@@ -367,6 +367,7 @@ async fn configure_boot(
             vcpu_count: 1,
             mem_size_mib: 128,
             smt: false,
+            track_dirty_pages: false,
             cpu_template: None,
         })
         .await

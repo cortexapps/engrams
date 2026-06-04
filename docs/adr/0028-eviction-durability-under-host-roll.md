@@ -479,12 +479,30 @@ assumptions in one harness.
 To be checked off as phases land (per the ADR-bookend norm); spike and
 prod-validation numbers recorded here as they arrive:
 
-- [ ] **P0** — this revision (Proposed, diff-first design).
-- [ ] **P1 (spike, dev-vm)** — diff snapshots on our FC version
-      (enable after UFFD- and File-mode restores; bitmap chaining;
-      dirty-tracking overhead; pause vs dirty-set size), File-backend
-      shared-RSS + restore latency (the 0022 go/no-go), memory
-      chunk-size / amplification choice. **Numbers: TBD.**
+- [x] **P0** — this revision (Proposed, diff-first design).
+- [x] **P1 (spike, dev-vm)** — `tests/diff_snapshot.rs` +
+      `tests/file_restore_shared_rss.rs` (now permanent CI gates in the
+      unprivileged FC lane). **Numbers (256 MiB guest, dev-vm):**
+      - Full capture pause **2,090 ms** vs Diff capture **38 ms**
+        (cold-boot `track_dirty_pages`) / **53 ms** (post-restore via
+        `enable_diff_snapshots` at load) — **~40–55× less pause**, and
+        the chain survives restores (the steady-state shape).
+      - Diff is genuinely sparse: **3–4%** of guest RAM allocated for a
+        ~16 MiB dirty set + churn.
+      - Sparse-overlay rebase onto a rolling memory.bin is
+        byte-faithful: sha256-verified markers across full+diff1 and
+        chained full+diff1+diff2 restores.
+      - File-backend page sharing (the ADR 0022 go/no-go): 3 siblings
+        off one memory.bin, each RSS 87.8 MiB with **Shared_Clean
+        84.7 MiB**; **Σpss/Σrss = 35%** vs the perfect-3-way floor of
+        33%. Restores 56–66 ms (unjailed test path).
+      - Memory chunk size: keep the existing **512 KiB** (worst-case
+        4 KiB-page → chunk amplification is 128× but only ~0.5 MiB
+        absolute per stray page; revisit only if prod upload metrics
+        say otherwise).
+      - Dirty-tracking steady-state overhead: not isolatable in a
+        30 s test; watch in prod via the checkpoint pause/CPU metrics
+        before tightening cadence below ~60 s.
 - [ ] **B** — `restore_disk_only_for_session` cold-boot primitive +
       `evacuate_dead_source` rung-2 dispatch + fail-fast classification
       in `evac_resumer`. CI: disk-only recovery e2e (the `cf4d4afd`

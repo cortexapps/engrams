@@ -583,6 +583,8 @@ jobs:
             --test cross_host_restore \
             --test restore_chain \
             --test aux_ro_drive \
+            --test diff_snapshot \
+            --test file_restore_shared_rss \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

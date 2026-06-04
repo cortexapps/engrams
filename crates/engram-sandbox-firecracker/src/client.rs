@@ -179,9 +179,27 @@ impl FirecrackerClient {
     /// with `resume()` if the error originated *after* `pause` but
     /// before the implicit resume below.
     pub async fn create_snapshot(&self, dir: &Path) -> Result<SnapshotPaths, SandboxError> {
-        let state_path = dir.join("state.bin");
-        let mem_path = dir.join("memory.bin");
+        self.create_snapshot_at(
+            dir.join("state.bin"),
+            dir.join("memory.bin"),
+            SnapshotType::Full,
+        )
+        .await
+    }
 
+    /// `create_snapshot` with explicit output paths and snapshot type.
+    /// ADR 0028: `SnapshotType::Diff` writes only pages dirtied since
+    /// the last capture (sparse file) and resets the KVM dirty bitmap —
+    /// requires dirty tracking (`MachineConfig.track_dirty_pages` on a
+    /// cold boot, or `enable_diff_snapshots` at `snapshot/load`).
+    /// Same pause/resume + cancellation-guard contract as
+    /// [`Self::create_snapshot`].
+    pub async fn create_snapshot_at(
+        &self,
+        state_path: PathBuf,
+        mem_path: PathBuf,
+        snapshot_type: SnapshotType,
+    ) -> Result<SnapshotPaths, SandboxError> {
         self.pause().await?;
 
         // ADR 0016 §A.1.2: tokio cancellation between `pause` and the
@@ -197,7 +215,7 @@ impl FirecrackerClient {
         let body = SnapshotCreateBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
             mem_file_path: mem_path.to_string_lossy().into_owned(),
-            snapshot_type: SnapshotType::Full,
+            snapshot_type,
         };
         let create_res = self.put("/snapshot/create", &body).await;
 
@@ -223,7 +241,8 @@ impl FirecrackerClient {
     /// eviction-resume. Use [`Self::load_snapshot_uffd`] in
     /// production-grade resume paths.
     pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
-        self.load_snapshot_inner(paths, /*resume_vm=*/ true).await
+        self.load_snapshot_inner(paths, /*resume_vm=*/ true, /*track=*/ false)
+            .await
     }
 
     /// Load a snapshot into a paused VM. Caller is responsible for
@@ -231,13 +250,30 @@ impl FirecrackerClient {
     /// option-D restore path where a `patch_drive` happens between
     /// load and resume.
     pub async fn load_snapshot_paused(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
-        self.load_snapshot_inner(paths, /*resume_vm=*/ false).await
+        self.load_snapshot_inner(paths, /*resume_vm=*/ false, /*track=*/ false)
+            .await
+    }
+
+    /// File-backed load with explicit `resume_vm` /
+    /// `enable_diff_snapshots` knobs. ADR 0028: restored VMs have no
+    /// `machine-config` PUT, so `enable_diff_snapshots: true` here is
+    /// the only way to (re-)arm KVM dirty tracking for subsequent
+    /// `SnapshotType::Diff` captures.
+    pub async fn load_snapshot_opts(
+        &self,
+        paths: &SnapshotPaths,
+        resume_vm: bool,
+        enable_diff_snapshots: bool,
+    ) -> Result<(), SandboxError> {
+        self.load_snapshot_inner(paths, resume_vm, enable_diff_snapshots)
+            .await
     }
 
     async fn load_snapshot_inner(
         &self,
         paths: &SnapshotPaths,
         resume_vm: bool,
+        enable_diff_snapshots: bool,
     ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: paths.state_path.to_string_lossy().into_owned(),
@@ -245,7 +281,7 @@ impl FirecrackerClient {
                 backend_type: MemBackendType::File,
                 backend_path: paths.mem_path.to_string_lossy().into_owned(),
             },
-            enable_diff_snapshots: false,
+            enable_diff_snapshots,
             resume_vm,
         };
         self.put("/snapshot/load", &body).await
@@ -264,7 +300,7 @@ impl FirecrackerClient {
         state_path: &Path,
         uffd_uds_path: &Path,
     ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ true)
+        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ true, false)
             .await
     }
 
@@ -280,7 +316,21 @@ impl FirecrackerClient {
         state_path: &Path,
         uffd_uds_path: &Path,
     ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ false)
+        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ false, false)
+            .await
+    }
+
+    /// UFFD-backed load with explicit `resume_vm` /
+    /// `enable_diff_snapshots` knobs (ADR 0028; see
+    /// [`Self::load_snapshot_opts`]).
+    pub async fn load_snapshot_uffd_opts(
+        &self,
+        state_path: &Path,
+        uffd_uds_path: &Path,
+        resume_vm: bool,
+        enable_diff_snapshots: bool,
+    ) -> Result<(), SandboxError> {
+        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, resume_vm, enable_diff_snapshots)
             .await
     }
 
@@ -289,6 +339,7 @@ impl FirecrackerClient {
         state_path: &Path,
         uffd_uds_path: &Path,
         resume_vm: bool,
+        enable_diff_snapshots: bool,
     ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
@@ -296,7 +347,7 @@ impl FirecrackerClient {
                 backend_type: MemBackendType::Uffd,
                 backend_path: uffd_uds_path.to_string_lossy().into_owned(),
             },
-            enable_diff_snapshots: false,
+            enable_diff_snapshots,
             resume_vm,
         };
         self.put("/snapshot/load", &body).await
@@ -515,6 +566,12 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     /// Symmetric multi-threading: `false` for the safest default.
     pub smt: bool,
+    /// KVM dirty-page tracking (ADR 0028). Required for
+    /// `SnapshotType::Diff` captures on a cold-created VM (restored
+    /// VMs arm it via `enable_diff_snapshots` at `snapshot/load`).
+    /// Always serialized — `false` matches FC's default, so the
+    /// explicit field is behavior-identical for existing callers.
+    pub track_dirty_pages: bool,
     /// CPUID mask the guest sees. `None` = host passthrough (FC's
     /// default) — guest CPUID echoes the underlying physical CPU,
     /// vendor and all. Snapshots taken under passthrough capture the
@@ -895,12 +952,15 @@ mod tests {
             vcpu_count: 2,
             mem_size_mib: 1024,
             smt: false,
+            track_dirty_pages: false,
             cpu_template: None,
         };
         let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(v["vcpu_count"], 2);
         assert_eq!(v["mem_size_mib"], 1024);
         assert_eq!(v["smt"], false);
+        // ADR 0028: always on the wire; `false` == FC default.
+        assert_eq!(v["track_dirty_pages"], false);
         // Absent cpu_template must NOT appear on the wire (FC treats
         // `null` differently from omitted in some endpoints; we want
         // the host-passthrough default unchanged when the field is
@@ -914,10 +974,12 @@ mod tests {
             vcpu_count: 2,
             mem_size_mib: 1024,
             smt: false,
+            track_dirty_pages: true,
             cpu_template: Some("T2CL".into()),
         };
         let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(v["cpu_template"], "T2CL");
+        assert_eq!(v["track_dirty_pages"], true);
     }
 
     #[test]

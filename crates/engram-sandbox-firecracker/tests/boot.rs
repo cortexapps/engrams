@@ -71,6 +71,7 @@ async fn boot_microvm_and_capture_kernel_banner() {
             vcpu_count: 1,
             mem_size_mib: 128,
             smt: false,
+            track_dirty_pages: false,
             cpu_template: None,
         })
         .await

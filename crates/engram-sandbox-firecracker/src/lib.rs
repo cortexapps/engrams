@@ -211,6 +211,15 @@ pub struct FirecrackerConfig {
     /// spawns engram-uffd-handler and serves pages on demand (fast,
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
+    /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
+    /// creates via `MachineConfig.track_dirty_pages`, restores via
+    /// `enable_diff_snapshots` at `snapshot/load` — so periodic
+    /// checkpoints can use `SnapshotType::Diff` (capture cost
+    /// O(dirty set), not O(guest RAM)). Default `false` until the
+    /// checkpoint pipeline lands; tracking has a steady-state KVM
+    /// write-protect cost that's only worth paying when diffs are
+    /// actually taken.
+    pub track_dirty_pages: bool,
     /// Engram CIDR pool — every sandbox gets a unique /30 carved out
     /// of this. `Some(10.200.0.0)` (the default) provisions per-VM
     /// TAPs + iptables rules; production deployments always want
@@ -444,6 +453,7 @@ impl FirecrackerConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            track_dirty_pages: false,
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
@@ -1501,6 +1511,7 @@ impl FirecrackerBackend {
             })?,
             mem_size_mib: spec.memory.max_mib,
             smt: false,
+            track_dirty_pages: self.config.track_dirty_pages,
             cpu_template: self.config.cpu_template.clone(),
         })
         .await?;
@@ -2302,11 +2313,15 @@ impl FirecrackerBackend {
                     };
                     tracing::Instrument::instrument(
                         async {
-                            if aux_swap_plan.is_empty() {
-                                api.load_snapshot(&paths).await
-                            } else {
-                                api.load_snapshot_paused(&paths).await
-                            }
+                            // ADR 0028: restored VMs re-arm dirty
+                            // tracking here (no machine-config PUT on
+                            // the restore path).
+                            api.load_snapshot_opts(
+                                &paths,
+                                /*resume_vm=*/ aux_swap_plan.is_empty(),
+                                self.config.track_dirty_pages,
+                            )
+                            .await
                         },
                         tracing::info_span!("fc.load_snapshot", mode = "file"),
                     )
@@ -2315,11 +2330,13 @@ impl FirecrackerBackend {
                 Some((_handler, uffd_uds)) => {
                     tracing::Instrument::instrument(
                         async {
-                            if aux_swap_plan.is_empty() {
-                                api.load_snapshot_uffd(&state_path, uffd_uds).await
-                            } else {
-                                api.load_snapshot_uffd_paused(&state_path, uffd_uds).await
-                            }
+                            api.load_snapshot_uffd_opts(
+                                &state_path,
+                                uffd_uds,
+                                /*resume_vm=*/ aux_swap_plan.is_empty(),
+                                self.config.track_dirty_pages,
+                            )
+                            .await
                         },
                         tracing::info_span!("fc.load_snapshot", mode = "uffd"),
                     )
@@ -3819,6 +3836,7 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,

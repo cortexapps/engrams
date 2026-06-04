@@ -269,6 +269,7 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
+            track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
