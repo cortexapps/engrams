@@ -398,6 +398,7 @@ impl SandboxBackend for VzBackend {
         let bridge = ConsoleBridge::start(
             vsock_uds_path.clone(),
             port_fds,
+            id,
             harness_sink,
         )
         .await
@@ -694,7 +695,7 @@ impl SandboxBackend for VzBackend {
         // restored VM. The in-VM agentd is reachable via
         // `<vsock_uds>_1024` just like a fresh VM.
         let harness_sink = self.harness_sink.lock().clone();
-        let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink)
+        let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, new_id, harness_sink)
             .await
             .map_err(SandboxError::from)?;
 

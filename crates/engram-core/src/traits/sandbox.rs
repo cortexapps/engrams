@@ -26,13 +26,22 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> HarnessByteStreamObj for T {}
 pub type HarnessByteStream = Pin<Box<dyn HarnessByteStreamObj + Send + Unpin + 'static>>;
 
 /// Callback registered on a [`SandboxBackend`] that wants to expose
-/// inbound harness connections. The backend invokes the sink with a
-/// fresh `HarnessByteStream` whenever a guest's harness adapter
-/// dials in. The sink — typically `HarnessHub::accept_via_session_lookup`
-/// — drives the post-attach loop from there.
+/// inbound harness connections. The backend invokes the sink with the
+/// `SandboxId` the connection physically came from (per-sandbox vsock UDS
+/// on FC / per-VM console bridge on VZ) plus a fresh `HarnessByteStream`,
+/// whenever a guest's harness adapter dials in. The sink — typically
+/// `HarnessHub::accept_connection(sandbox_id, None, ..)` — drives the
+/// post-attach loop, keyed on that sandbox.
+///
+/// ADR 0037: routing on the connection's *sandbox* (not the harness's
+/// self-reported `session_id`) is what lets a warm-captured harness
+/// re-attach after restore — it dials with the sentinel session id baked
+/// at capture, which no `session_to_sandbox` entry maps. The shared
+/// TCP/Process path (no per-connection sandbox identity) keeps using
+/// `HarnessHub::accept_via_session_lookup` directly, not this sink.
 ///
 /// `Fn` (not `FnOnce`) so a single sink handles many connections.
-pub type HarnessSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
+pub type HarnessSink = Arc<dyn Fn(SandboxId, HarnessByteStream) + Send + Sync>;
 
 /// ADR 0023: handler for inbound in-guest forge connections (one
 /// stream per guest dial on `FORGE_VSOCK_PORT`). Same shape as

@@ -269,6 +269,7 @@ impl ConsoleBridge {
     pub async fn start(
         base_path: PathBuf,
         port_fds: ConsolePortFds,
+        sandbox_id: engram_core::SandboxId,
         harness_sink: Option<HarnessSink>,
     ) -> Result<Self, BridgeError> {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -287,7 +288,11 @@ impl ConsoleBridge {
 
         if let Some(fds) = by_port.remove(&PORT_HARNESS) {
             if let Some(sink) = harness_sink {
-                tasks.push(tokio::spawn(guest_initiated_pump(fds, Arc::new(sink))));
+                tasks.push(tokio::spawn(guest_initiated_pump(
+                    fds,
+                    sandbox_id,
+                    Arc::new(sink),
+                )));
             } else {
                 tracing::warn!("no harness sink registered; dropping port {PORT_HARNESS} pipes");
                 drop(fds);
@@ -401,7 +406,11 @@ async fn pump_uds_pipe(
 /// guest writes to `/dev/vport3p2`, the host reads from
 /// `read_from_guest`, and we deliver bytes to the harness sink via
 /// a duplex stream. Symmetric for the host→guest direction.
-async fn guest_initiated_pump(fds: HostPortFds, sink: Arc<HarnessSink>) {
+async fn guest_initiated_pump(
+    fds: HostPortFds,
+    sandbox_id: engram_core::SandboxId,
+    sink: Arc<HarnessSink>,
+) {
     let HostPortFds {
         read_from_guest,
         write_to_guest,
@@ -422,7 +431,7 @@ async fn guest_initiated_pump(fds: HostPortFds, sink: Arc<HarnessSink>) {
     };
     let (sink_half, vz_half) = tokio::io::duplex(64 * 1024);
     let stream: HarnessByteStream = Box::pin(sink_half);
-    sink(stream);
+    sink(sandbox_id, stream);
 
     let (mut v_r, mut v_w) = tokio::io::split(vz_half);
     let (mut p_r, mut p_w) = (reader, writer);

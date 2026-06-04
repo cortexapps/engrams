@@ -516,22 +516,12 @@ impl PooledBackend {
             tracing::warn!("warm-capture requested but no harness hub wired; capturing cold");
             return false;
         };
-        // The warm harness attaches with the sentinel session id baked into
-        // its env; register sentinel→sandbox so the hub accepts that attach.
-        let Some(sentinel) = agent
-            .session_env
-            .get("ENGRAM_SESSION_ID")
-            .and_then(|s| s.parse::<SessionId>().ok())
-        else {
-            tracing::warn!(
-                "warm-capture: warm spec has no parseable sentinel ENGRAM_SESSION_ID; capturing cold"
-            );
-            return false;
-        };
-        hub.bind_session(sentinel, id);
+        // No sentinel session registration needed: the harness sink keys the
+        // connection on this capture VM's sandbox id (per-sandbox vsock UDS),
+        // not the harness's self-reported (sentinel) session id — so the
+        // attach lands on `id` and `wait_harness_warm(id)` observes it.
         if let Err(e) = self.start_agent(id, agent).await {
             tracing::warn!(error = %e, "warm-capture: start_agent failed; capturing cold");
-            hub.unbind_session(sentinel);
             return false;
         }
         let warm = hub
@@ -540,11 +530,6 @@ impl PooledBackend {
                 std::time::Duration::from_secs(WARM_CAPTURE_TIMEOUT_SECS),
             )
             .await;
-        // The sentinel binding was only needed for the initial attach; drop
-        // it (the captured harness re-attaches under its real id via `Bind`
-        // at restore). The pause/flush below freezes the guest, so nothing
-        // reconnects to race this.
-        hub.unbind_session(sentinel);
         if warm {
             tracing::info!(sandbox_id = %id, "warm-capture: harness warm+idle; capturing warm");
         } else {

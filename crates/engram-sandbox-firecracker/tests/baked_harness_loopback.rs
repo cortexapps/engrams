@@ -154,7 +154,7 @@ exec = "/opt/noop/harness"
         tokio::sync::mpsc::unbounded_channel::<engram_core::traits::HarnessByteStream>();
     let sink: engram_core::traits::HarnessSink = {
         let sink_tx = sink_tx.clone();
-        Arc::new(move |stream| {
+        Arc::new(move |_sandbox_id, stream| {
             let _ = sink_tx.send(stream);
         })
     };

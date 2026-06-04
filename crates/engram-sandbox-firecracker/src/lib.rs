@@ -1960,7 +1960,11 @@ impl FirecrackerBackend {
                 match listener.accept().await {
                     Ok((stream, _peer)) => match sink_slot.read().clone() {
                         Some(sink) => {
-                            sink(Box::pin(stream));
+                            // ADR 0037: route by the sandbox this per-sandbox
+                            // UDS belongs to, not the harness's self-reported
+                            // session id — a warm-restored harness re-attaches
+                            // under its baked sentinel session id.
+                            sink(sandbox_id, Box::pin(stream));
                         }
                         None => {
                             tracing::warn!(

@@ -356,8 +356,15 @@ impl HostAgent {
             // every dial with "no sink registered" — the bug Phase 2
             // closes.
             let sink_hub = harness_hub.clone();
+            // ADR 0037: FC/VZ hand us the connection's sandbox id, so key
+            // the harness connection on it directly (a warm-restored harness
+            // re-attaches under its baked sentinel session id, which no
+            // session_to_sandbox entry maps). `None` expected-session = the
+            // per-sandbox UDS is the identity, so accept any session id.
             let sink: engram_core::traits::HarnessSink =
-                std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
+                std::sync::Arc::new(move |sandbox_id, stream| {
+                    sink_hub.accept_connection(sandbox_id, None, stream)
+                });
             pooled.set_harness_sink(sink);
             // ADR 0037: give the backend the hub so `build_base_snapshot`
             // can wait for a warm-capture harness to reach warm+idle.

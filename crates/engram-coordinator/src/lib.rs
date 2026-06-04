@@ -325,9 +325,13 @@ pub async fn run_with_registry_and_local(
     // is fine — its harness binary dials TCP loopback directly.
     {
         let hub = state.harness_hub.clone();
-        let sink: engram_core::traits::HarnessSink = std::sync::Arc::new(move |stream| {
-            hub.accept_via_session_lookup(stream);
-        });
+        // ADR 0037: key on the connection's sandbox id (FC/VZ supply it),
+        // so a warm-restored harness re-attaching under its baked sentinel
+        // session id still routes correctly.
+        let sink: engram_core::traits::HarnessSink =
+            std::sync::Arc::new(move |sandbox_id, stream| {
+                hub.accept_connection(sandbox_id, None, stream);
+            });
         state.services.host.set_harness_sink(sink);
     }
 
