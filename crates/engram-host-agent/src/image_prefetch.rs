@@ -55,6 +55,97 @@ use tokio::sync::{watch, Semaphore};
 /// gate readiness on it); `None` ⇒ off (behaviour-preserving).
 pub type SnapshotDirResolver = Arc<dyn Fn(SnapshotId) -> PathBuf + Send + Sync>;
 
+/// ADR 0022: a per-template base memfile we're tracking for residency —
+/// its on-disk path (for reclaim on image-disable) plus, once
+/// materialized, an [`MemfilePin`] keeping its pages resident in the page
+/// cache so File-backend siblings always hit a warm shared base.
+struct MemfileState {
+    path: PathBuf,
+    /// `Some` once the memfile is materialized AND successfully pinned.
+    /// Stays `None` if pinning is off (non-Linux) or best-effort-fails.
+    pin: Option<MemfilePin>,
+}
+
+/// ADR 0022 cold-restore mitigation: a `mmap(MAP_SHARED, PROT_READ)` +
+/// `mlock` of a per-template base memfile, pinning its page-cache pages
+/// resident. File-backend siblings `MAP_PRIVATE` the same inode, so this
+/// guarantees their clean base pages can't be LRU-evicted under memory
+/// pressure — which is what turns a warm ~0.6 s restore into a cold
+/// multi-GiB-read ~4.7 s one (measured, ADR 0022 prod canary). `Drop`
+/// `munmap`s, which also releases the `mlock`.
+#[cfg(target_os = "linux")]
+struct MemfilePin {
+    addr: *mut libc::c_void,
+    len: usize,
+}
+
+// SAFETY: the mapping is read-only and owned solely by this guard; the raw
+// pointer is only ever handed back to `munmap` on drop. No aliasing.
+#[cfg(target_os = "linux")]
+unsafe impl Send for MemfilePin {}
+
+#[cfg(target_os = "linux")]
+impl Drop for MemfilePin {
+    fn drop(&mut self) {
+        // SAFETY: addr/len came from the successful `mmap` in
+        // `pin_memfile`; `munmap` releases both the mapping and its mlock.
+        unsafe {
+            libc::munmap(self.addr, self.len);
+        }
+    }
+}
+
+/// `mmap`+`mlock` `path` resident. Best-effort: any failure (mmap, or
+/// `mlock` hitting `RLIMIT_MEMLOCK`/`ENOMEM`) logs a warning and returns
+/// `None`, leaving the memfile evictable — i.e. the pre-mitigation
+/// behaviour, never a hard failure.
+#[cfg(target_os = "linux")]
+fn pin_memfile(path: &std::path::Path) -> Option<MemfilePin> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as usize;
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: a standard read-only file mapping; result checked vs MAP_FAILED.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        tracing::warn!(path = %path.display(), error = %std::io::Error::last_os_error(),
+            "ADR 0022: mmap for base-memfile pin failed; memfile stays evictable");
+        return None;
+    }
+    // SAFETY: addr/len from the successful mmap above.
+    if unsafe { libc::mlock(addr, len) } != 0 {
+        tracing::warn!(path = %path.display(), error = %std::io::Error::last_os_error(),
+            "ADR 0022: mlock for base-memfile pin failed (RLIMIT_MEMLOCK?); memfile stays evictable");
+        // SAFETY: same mapping; release it since we won't return a guard.
+        unsafe {
+            libc::munmap(addr, len);
+        }
+        return None;
+    }
+    tracing::info!(path = %path.display(), bytes = len,
+        "ADR 0022: base memfile pinned resident (mlock) — File restores stay warm");
+    Some(MemfilePin { addr, len })
+}
+
+#[cfg(not(target_os = "linux"))]
+struct MemfilePin;
+
+#[cfg(not(target_os = "linux"))]
+fn pin_memfile(_path: &std::path::Path) -> Option<MemfilePin> {
+    None
+}
+
 /// Shared, mutable view of "which images is this host ready to
 /// serve?" — written by the prefetch supervisor, read by the
 /// heartbeat builder.
@@ -140,10 +231,10 @@ pub fn spawn_supervisor(
         "image prefetch supervisor starting (base-snapshot only; no OCI prefetch)",
     );
     let handle = tokio::spawn(async move {
-        // ADR 0022: digest → materialized base memfile path, so a later
-        // disable can reclaim the (guest-RAM-sized) file. Lives across
-        // ticks. Only populated when `base_memfile_dir` is `Some`.
-        let mut memfiles: HashMap<ManifestDigest, PathBuf> = HashMap::new();
+        // ADR 0022: digest → per-template base memfile (path for reclaim on
+        // disable + the mlock pin once materialized). Lives across ticks.
+        // Only populated when `base_memfile_dir` is `Some`.
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
         loop {
             let enabled = rx.borrow_and_update().clone();
             reconcile(
@@ -185,7 +276,7 @@ async fn reconcile(
     chunk_cache: ChunkCache,
     semaphore: Arc<Semaphore>,
     base_memfile_dir: Option<&SnapshotDirResolver>,
-    memfiles: &mut HashMap<ManifestDigest, PathBuf>,
+    memfiles: &mut HashMap<ManifestDigest, MemfileState>,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -203,8 +294,13 @@ async fn reconcile(
         // unlink; a live sharer keeps the inode alive via its MAP_PRIVATE
         // mapping even after the dentry is gone, so this is safe to do
         // while sessions are still running.
-        if let Some(path) = memfiles.remove(digest) {
-            let p = path.clone();
+        if let Some(state) = memfiles.remove(digest) {
+            // Dropping `state` releases the mlock pin (munmap) before we
+            // unlink. A live sharer keeps the inode alive via its
+            // MAP_PRIVATE mapping even after both the unlink and our
+            // munmap, so this is safe while sessions are still running.
+            let p = state.path.clone();
+            drop(state);
             tokio::spawn(async move {
                 match tokio::fs::remove_file(&p).await {
                     Ok(()) => {
@@ -239,7 +335,12 @@ async fn reconcile(
         let base_memfile =
             base_memfile_dir.map(|resolver| resolver(image.base_snapshot_id).join("memory.bin"));
         if let Some(ref path) = base_memfile {
-            memfiles.insert(image.manifest_digest.clone(), path.clone());
+            memfiles
+                .entry(image.manifest_digest.clone())
+                .or_insert_with(|| MemfileState {
+                    path: path.clone(),
+                    pin: None,
+                });
         }
         // Clone the whole ref into the task — it carries everything
         // prefetch_one needs (uri, digest, base-snapshot disk + memory
@@ -270,6 +371,36 @@ async fn reconcile(
                 }
             }
         });
+    }
+
+    // ADR 0022 cold-restore mitigation: pin each materialized base memfile
+    // resident (mlock) so File-backend siblings never pay a cold multi-GiB
+    // read under page-cache pressure. Runs every tick (including the
+    // LRU-recheck) so it catches a memfile the prefetch above just wrote
+    // and pins it once it exists — a tick after materialization, which is
+    // fine (it's warm from the write; pinning guards against *later*
+    // eviction). Best-effort + idempotent (skips already-pinned entries);
+    // a no-op when density is off (`memfiles` stays empty). `spawn_blocking`
+    // keeps a multi-GiB `mlock` off the supervisor's async reactor.
+    for image in enabled {
+        let digest = &image.manifest_digest;
+        let path = match memfiles.get(digest) {
+            Some(state) if state.pin.is_none() => state.path.clone(),
+            _ => continue, // untracked (density off) or already pinned
+        };
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            continue; // not materialized yet; a later tick will pin it
+        }
+        let p = path.clone();
+        let pin = tokio::task::spawn_blocking(move || pin_memfile(&p))
+            .await
+            .ok()
+            .flatten();
+        if pin.is_some() {
+            if let Some(state) = memfiles.get_mut(digest) {
+                state.pin = pin;
+            }
+        }
     }
 }
 
@@ -428,6 +559,26 @@ impl std::error::Error for PrefetchError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR 0022: pin a small (16 KiB) temp file resident — exercises the
+    // mmap+mlock+drop path on the Linux CI runner (16 KiB fits even a
+    // 64 KiB RLIMIT_MEMLOCK, so it doesn't depend on the host-agent's
+    // setrlimit). Zero-length → None.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_memfile_pins_small_file_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(pin_memfile(&empty).is_none(), "zero-length file → no pin");
+
+        let path = dir.path().join("memory.bin");
+        std::fs::write(&path, vec![7u8; 16 * 1024]).unwrap();
+        let pin = pin_memfile(&path).expect("16 KiB file should mmap+mlock");
+        // Drop releases the mlock+mapping; a second pin then succeeds too.
+        drop(pin);
+        assert!(pin_memfile(&path).is_some(), "re-pin after release works");
+    }
 
     #[test]
     fn readiness_snapshot_round_trips() {

@@ -182,6 +182,14 @@ async fn main() -> Result<(), HostAgentError> {
     // spans on shutdown (ADR 0019).
     let _telemetry = init_tracing();
 
+    // ADR 0022 cold-restore mitigation: raise RLIMIT_MEMLOCK so the image
+    // prefetcher can `mlock` per-template base memfiles resident (the
+    // host-agent runs as root in prod, so it can raise its own hard limit).
+    // Best-effort: a failure just degrades the later mlock attempts to
+    // leaving memfiles evictable.
+    #[cfg(target_os = "linux")]
+    raise_memlock_rlimit();
+
     let cli = Cli::parse();
 
     // Bind the metrics port first. It doubles as the GCE MIG
@@ -648,6 +656,28 @@ async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Op
 ///
 /// The returned guard must be held for the lifetime of `main` so spans
 /// flush on shutdown (`TelemetryGuard` is itself `#[must_use]`).
+/// ADR 0022: raise `RLIMIT_MEMLOCK` to unlimited so the image prefetcher can
+/// pin (`mlock`) per-template base memfiles resident. Root can raise its own
+/// hard limit; best-effort — a failure is logged and the mlock attempts in
+/// `image_prefetch` simply fall back to leaving the memfile evictable.
+#[cfg(target_os = "linux")]
+fn raise_memlock_rlimit() {
+    let lim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: `setrlimit` with a valid, fully-initialized `rlimit`.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "ADR 0022: could not raise RLIMIT_MEMLOCK; base-memfile mlock may hit the cap",
+        );
+    } else {
+        tracing::debug!("ADR 0022: RLIMIT_MEMLOCK raised for base-memfile pinning");
+    }
+}
+
 fn init_tracing() -> engram_telemetry::TelemetryGuard {
     engram_telemetry::init(engram_telemetry::Config {
         service_name: "engram-host-agent",
