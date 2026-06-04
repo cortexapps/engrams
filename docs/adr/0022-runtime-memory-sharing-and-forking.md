@@ -1,6 +1,7 @@
 # ADR 0022: Runtime guest-memory sharing & forking — File backend vs direct-mem
 
-Status: 2026-06-03 — **Proposed; Option A implementation arc IN PROGRESS** (branch
+Status: 2026-06-03 — **Proposed; Option A density+boot arc IMPLEMENTED + dev-vm-validated
+(lab)**; prod-canary measurement + Accepted-flip pending (branch
 `worktree-adr-0022-file-backend-density`); Option B rejected-for-now. ADR 0021 took the
 substrate to FC-floor-bound (~516 ms warm / ~618 ms cold) and made each enabled template's
 base memory **resident on NVMe**. This ADR scopes the *next* lever it deliberately deferred:
@@ -232,25 +233,51 @@ measure **shared RSS across siblings** (the density number) + restore latency vs
 
 ## Status / commit chain (Option A density + boot-latency arc)
 
-To be filled as commits land (per the ADR-bookend norm); flip Status → **Accepted** at the
-end with the measured density + boot-latency numbers.
+Flip Status → **Accepted** once the prod-canary density + boot-latency numbers land (the
+dev-vm lab half is done — see below).
 
-- [ ] **1** — per-restore `RestoreMode` bifurcation in the FC backend (`base_restore_mode` +
+- [x] **1** — per-restore `RestoreMode` bifurcation in the FC backend (`base_restore_mode` +
       `ENGRAM_FC_BASE_RESTORE_MODE` kill-switch; `restore_in_jail` honors a per-call mode;
       base-create→File, resume→config/UFFD).
-- [ ] **2** — `PooledBackend` materializes the contiguous memfile per-restore-mode-aware
+- [x] **2** — `PooledBackend` materializes the contiguous memfile per-restore-mode-aware
       (`restore_memory_is_lazy_for(fresh)`), idempotent no-op once residency wrote it.
-- [ ] **3** — per-template base memfile materialized at residency (`base_snapshot_id` on the
+- [x] **3** — per-template base memfile materialized at residency (`base_snapshot_id` on the
       `EnabledImageRef` heartbeat wire + `image_prefetch` assembles `memory.bin` once per
-      template per host; readiness gated on it; VZ no-ops; disk-floor + reclaim-on-disable).
-- [ ] **4** — GC pin to memfile granularity (`list_enabled_image_base_snapshot_memory_manifests`
-      pin source; no migration; live-PG regression with `recoverable=false`).
-- [ ] **5** — productized `engram_sandbox_guest_pss_bytes` gauge (heartbeat-sampled smaps;
-      telemetry-must-not-gate-workload; web UI surfacing deferred to a later ADR).
-- [ ] **6** — FC density + latency test (extend `file_restore_shared_rss.rs`: residency
-      materialize → File-mode base-create siblings share + latency; resume stays UFFD).
-- [ ] **Measure + Accept** — dev-vm + prod-canary density (Σpss/Σrss) AND boot-latency
-      reduction (File vs UFFD); flip Status to Accepted.
+      template per host; readiness gated on it; VZ no-ops; reclaim-on-disable).
+- [x] **4** — GC pin to memfile granularity (`list_enabled_image_base_snapshot_{memory,disk}_manifests`
+      pin sources #5/#6; no migration; live-PG regression with `recoverable=false`).
+- [x] **5** — productized `engram_sandbox_guest_{pss,rss}_bytes` gauges (heartbeat-sampled
+      smaps; telemetry-must-not-gate-workload; web UI surfacing deferred to a later ADR).
+- [x] **6** — FC density + latency test (extended `file_restore_shared_rss.rs`: residency
+      materialize → File-mode base-create siblings share + latency; resume-stays-UFFD covered
+      by the `effective_restore_mode` unit test + `snapshot_uffd.rs`).
+- [ ] **Measure + Accept** — prod-canary density (Σpss/Σrss) AND boot-latency reduction
+      (File vs UFFD `session.create`); flip Status to Accepted.
+
+#### Lab validation (dev-vm, real KVM/FC) — DONE
+
+`just check` + `clippy --workspace --all-targets -D warnings` (Linux) + the FC integration
+tests all green. `file_restore_shared_rss.rs` (2 tests, real microVMs):
+
+- **Density holds through the production path.** Three siblings restored via the File-mode
+  *base-create* bifurcation (`restore_fresh`, `base_restore_mode=File` while
+  `restore_mode=Uffd`) off a memfile **reconstructed from a chunk manifest** (the residency
+  step) measured **Σpss/Σrss = 35%** (3-way; perfect-share floor 33%) — identical to restoring
+  the snapshot's own `memory.bin` (also 35%). Per sibling: RSS ~86.5 MiB, PSS ~30.8 MiB.
+- **Faster boot.** File base-create restored in **~57–60 ms/sibling** (median 60 ms) off the
+  page-cache-warm resident memfile, with **no UFFD handler spawn and no per-page fault
+  round-trips** — at/under the snapshot-native restore (~59–64 ms).
+- **Residency cost** (off the session hot path): materializing the contiguous 256 MiB memfile
+  from chunks took ~17.9 s once per template per host; it folds into "time to ready".
+- **Finding:** a *freshly* materialized memfile's page-cache pages are `Shared_Dirty` (pending
+  writeback) when the first siblings fault them — density is identical (PSS is the signal), and
+  in prod the memfile is materialized at residency well before the first session, so writeback
+  has run and the pages show as `Shared_Clean` (as the snapshot-native path already does). The
+  test therefore asserts on PSS≪RSS, not the clean/dirty bucket.
+
+Prod-canary (the remaining gate): flip `ENGRAM_FC_BASE_RESTORE_MODE=file` on a canary host,
+compare same-template Σpss/Σrss (via the new `engram_sandbox_guest_*` gauges) and
+`session.create` p50/p95 (File vs the UFFD fleet) before flipping Status to Accepted.
 
 ## References
 
