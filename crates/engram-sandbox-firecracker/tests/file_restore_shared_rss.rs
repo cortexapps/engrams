@@ -4,11 +4,19 @@
 //!
 //! This is the density thesis in miniature:
 //!
-//!   - Bake nothing: copy the cached Ubuntu test rootfs and inject (via
-//!     `debugfs`, no mount/root needed) an init that fills a 64 MiB
-//!     tmpfs blob and re-reads it every second — a guest working set
-//!     that every sibling re-touches after restore, so the shared pages
-//!     actually fault in and become measurable.
+//!   - Bake a tiny rootfs whose init fills a 64 MiB tmpfs blob (guest
+//!     RAM) and re-reads it every second — a guest working set that
+//!     every sibling re-touches after restore, so the shared pages
+//!     actually fault in and become measurable. The init is baked in
+//!     via the image builder (`mke2fs -d` builds the whole tree at FS
+//!     creation, computing correct `metadata_csum` for every block) —
+//!     NOT a post-hoc `debugfs write`, which lands the file's data
+//!     blocks with mismatched checksums on some e2fsprogs versions
+//!     (1.47.0 on ubuntu-24.04 CI runners): the guest kernel then
+//!     fails to `execve` the injected init with `EBADMSG` and panics
+//!     ("Requested init … failed (error -74)") before it can be
+//!     snapshotted. The bake path is the one `exec_real_vm` /
+//!     `diff_snapshot` use, and it boots cleanly on every runner.
 //!   - Snapshot once, destroy the source, then restore **3** VMs from
 //!     the same snapshot dir (File mode — the default `RestoreMode`).
 //!     All 3 mmap the SAME memory.bin inode.
@@ -22,11 +30,11 @@
 //! Numbers print as `SPIKE:` lines — they are ADR 0022's shared-RSS
 //! measurement and ADR 0028 P1's restore-latency datapoint.
 //!
-//! Gating: Linux + KVM + firecracker + `debugfs` (e2fsprogs). Run:
+//! Gating: Linux + KVM + firecracker + Docker + `mke2fs` (e2fsprogs).
+//! Run:
 //!
 //! ```sh
-//! eval "$(bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)"
-//! cargo test -p engram-sandbox-firecracker --test file_restore_shared_rss -- --ignored --nocapture
+//! bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh file_restore_shared_rss
 //! ```
 
 #![cfg(target_os = "linux")]
@@ -39,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
 use common::{fc_preflight, require_bin};
@@ -46,48 +55,85 @@ use common::{fc_preflight, require_bin};
 const SIBLINGS: usize = 3;
 const BLOB_MIB: u64 = 64;
 
-/// Init injected into the rootfs: build the blob in tmpfs (guest RAM),
+/// Init baked into the rootfs: build the blob in tmpfs (guest RAM),
 /// then re-read it forever so restored siblings keep faulting the same
 /// guest-physical pages back in from memory.bin.
 ///
-/// `/bin/sh` (not bash) for maximal portability across runner rootfs
-/// builds, and — critically — the script can NEVER exit: a pid-1 that
-/// returns triggers `panic=1 reboot=k`, which kills FC and makes the
-/// host-side `snapshot()` hit a dead socket. So every step is
-/// best-effort and the final loop is unconditional; a failed mount/fill
-/// then surfaces as the host-side RSS-floor assertion (the honest
-/// signal), not a dead VM. If the guest dies anyway (e.g. the kernel
-/// can't exec this debugfs-injected script as init), the snapshot path
-/// dumps `firecracker.log` (guest serial console) so the panic reason
-/// is visible rather than a bare ECONNREFUSED.
-const SPIKE_INIT: &str = r#"#!/bin/sh
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-mount -t tmpfs -o size=128m tmpfs /tmp 2>/dev/null || true
-head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true
-while true; do cat /tmp/blob > /dev/null 2>&1 || true; sleep 1; done
-"#;
+/// `/bin/sh` (not bash) for maximal portability, and — critically — the
+/// script can NEVER exit: a pid-1 that returns triggers `panic=1
+/// reboot=k`, which kills FC and makes the host-side `snapshot()` hit a
+/// dead socket. So every step is best-effort and the final loop is
+/// unconditional; a failed mount/fill then surfaces as the host-side
+/// RSS-floor assertion (the honest signal), not a dead VM. Baked via
+/// `mke2fs -d` (see the module docs) so the guest kernel can actually
+/// `execve` it.
+const SPIKE_INIT: &str = "#!/bin/sh\n\
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
+mount -t proc proc /proc 2>/dev/null || true\n\
+mount -t devtmpfs dev /dev 2>/dev/null || true\n\
+mount -t tmpfs -o size=128m tmpfs /tmp 2>/dev/null || true\n\
+head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true\n\
+while true; do cat /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + debugfs; boots microVMs"]
+#[ignore = "requires Linux + KVM + firecracker + Docker + mke2fs; bakes a rootfs and boots microVMs"]
 async fn file_backend_siblings_share_clean_pages() {
     let env = match fc_preflight() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("debugfs") {
+    if !require_bin("docker") || !require_bin("mke2fs") {
         return;
     }
 
-    // ---- 1. Copy the cached rootfs (never mutate the cache) + inject init ----
-    let work = tempfile::tempdir().expect("work dir");
-    let rootfs = work.path().join("rootfs.ext4");
-    std::fs::copy(&env.rootfs, &rootfs).expect("copy test rootfs");
-    let init = work.path().join("spike-init.sh");
-    std::fs::write(&init, SPIKE_INIT).expect("write init");
-    debugfs(&rootfs, &format!("write {} /spike-init.sh", init.display()));
-    debugfs(&rootfs, "sif /spike-init.sh mode 0100755");
+    // Keep the jail dir on failure so we can read firecracker.log (which
+    // carries the guest serial console — lib.rs funnels console=ttyS0 +
+    // FC's own stderr into jail_dir/firecracker.log). Without this, a
+    // dead guest surfaces only as a bare "Connection refused" on the
+    // snapshot socket with no clue why it died.
+    std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
+
+    // ---- 1. Bake a self-driving rootfs (init baked in via mke2fs -d) ----
+    // The Dockerfile COPYs the spike init verbatim into the image; the
+    // builder's mke2fs -d turns the image rootfs into ext4 with correct
+    // per-block checksums. No agent injection — the workload is fully
+    // self-driving, so the test never needs host→guest exec.
+    let src = tempfile::tempdir().expect("source dir");
+    std::fs::write(src.path().join("spike-init.sh"), SPIKE_INIT).expect("write init");
+    std::fs::write(
+        src.path().join("Dockerfile"),
+        "FROM debian:bookworm-slim\n\
+         COPY spike-init.sh /spike-init.sh\n\
+         RUN chmod 0755 /spike-init.sh\n",
+    )
+    .expect("write Dockerfile");
+    std::fs::write(
+        src.path().join("engram.toml"),
+        "name = \"fc-shared-rss-test\"\n",
+    )
+    .expect("write engram.toml");
+
+    let images = tempfile::tempdir().expect("images dir");
+    let chunk_root = tempfile::tempdir().expect("chunk store root");
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
+        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let baker = Builder::new(DockerCli::new(), chunk_store);
+    let outcome = baker
+        .build(&BuildRequest {
+            source: src.path().to_path_buf(),
+            repo: "engram-shared-rss-test".into(),
+            tag: "warm-1".into(),
+            images_dir: images.path().to_path_buf(),
+            format: Format::Ext4,
+            agent_injection: None,
+        })
+        .await
+        .expect("ext4 bake");
 
     // ---- 2. Boot, let the blob fill, snapshot, destroy ----
+    let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None; // unprivileged test — see lifecycle.rs
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/spike-init.sh".into();
@@ -95,7 +141,7 @@ async fn file_backend_siblings_share_clean_pages() {
 
     let spec = SandboxSpec {
         image: "fc-shared-rss-test".into(),
-        rootfs_source: Some(rootfs),
+        rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -107,13 +153,6 @@ async fn file_backend_siblings_share_clean_pages() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
     };
-    // Keep the jail dir on failure so we can read firecracker.log (which
-    // carries the guest serial console — lib.rs funnels console=ttyS0 +
-    // FC's own stderr into jail_dir/firecracker.log). Without this, a
-    // dead guest surfaces only as a bare "Connection refused" on the
-    // snapshot socket with no clue why it died.
-    std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-
     let source = backend.create(spec).await.expect("create");
     // Boot + 64 MiB urandom fill + at least one read pass.
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -137,9 +176,10 @@ async fn file_backend_siblings_share_clean_pages() {
 
     // ---- 3. Restore N siblings off the same memory.bin ----
     // Serial restores (the per-snapshot canonical vsock UDS path is
-    // re-bound by each load — last binder owns it; that only breaks
-    // host→guest exec, which this test doesn't use). All siblings stay
-    // alive together: that's the sharing condition.
+    // re-bound by each load — last binder owns it; harmless here since
+    // the workload is self-driving and the test does no host→guest
+    // exec). All siblings stay alive together: that's the sharing
+    // condition.
     let mut vms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
@@ -237,26 +277,6 @@ fn dump_fc_logs(dir: &Path) {
             }
         }
     }
-}
-
-/// Run one `debugfs -w -R <cmd>` against `img`, panicking on failure.
-/// (`debugfs` exits 0 even on some errors; stderr containing
-/// "File not found"/"Operation not permitted" is the real signal.)
-fn debugfs(img: &Path, cmd: &str) {
-    let out = std::process::Command::new("debugfs")
-        .arg("-w")
-        .arg("-R")
-        .arg(cmd)
-        .arg(img)
-        .output()
-        .expect("spawn debugfs");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success()
-            && !stderr.contains("File not found")
-            && !stderr.contains("Operation not permitted"),
-        "debugfs -R {cmd:?} failed: {stderr}",
-    );
 }
 
 /// Find the firecracker process whose cmdline mentions this sandbox's
