@@ -901,6 +901,8 @@ mod adapter {
     /// translate. Returns `None` only when the line isn't JSON. Thin
     /// wrapper over [`translate_value`] so the hot path (which already
     /// parsed the line to detect the `result` frame) doesn't re-parse.
+    /// Test-only: the hot path calls [`translate_value`] directly.
+    #[cfg(test)]
     pub fn translate_jsonl(
         line: &str,
         run_id: &mut Option<String>,
