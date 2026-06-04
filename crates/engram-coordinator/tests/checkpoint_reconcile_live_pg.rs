@@ -314,18 +314,33 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
     );
     assert!(after.rewound_at.is_none());
 
-    // Second rewind to the same cursor: the span is already
-    // tombstoned → no-op, no epoch bump.
-    let again = meta
-        .rewind_session_to_cursor(session_id, cursor)
+    // Rewinding to a cursor with nothing live past it is a no-op
+    // (no epoch bump) — the checkpoint-was-the-head case. Use the
+    // newest live event as the cursor.
+    let noop = meta
+        .rewind_session_to_cursor(session_id, after_idx)
         .await
-        .expect("second rewind");
+        .expect("no-op rewind");
     assert_eq!(
-        again.rolled_back, 0,
-        "already-tombstoned span isn't re-rolled"
+        noop.rolled_back, 0,
+        "rewinding to the head rolls back nothing"
     );
     assert_eq!(
-        again.recovery_epoch, 0,
+        noop.recovery_epoch, 0,
         "no-op rewind returns default (no bump)"
     );
+
+    // But re-rewinding to the ORIGINAL cursor DOES roll back the
+    // post-recovery work appended since (idx after_idx > cursor) and
+    // bumps the epoch again — re-rewinding to an old point is not a
+    // no-op, it discards everything after it.
+    let re = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("re-rewind to old cursor");
+    assert_eq!(
+        re.rolled_back, 1,
+        "the post-recovery event (idx > cursor, still live) is rolled back",
+    );
+    assert_eq!(re.recovery_epoch, 2, "epoch bumps again: 1 → 2");
 }
