@@ -364,6 +364,39 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
                 tracing::warn!(error = %e, "bundle-gc sweep failed; will retry on next interval");
             }
         }
+        // ADR 0028 addendum: portable snapshot blobs (`snapshots/<id>/`)
+        // ride the same tick / barrier / grace config — pinned by a live
+        // `snapshots` row, swept when the row is gone. Replaces the
+        // host's inline abort-delete that could brick a recorded
+        // snapshot.
+        match crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
+            state.services.meta.clone(),
+            state.services.blob.clone(),
+            &cfg,
+            SweepMode::Full,
+        )
+        .await
+        {
+            Ok(report) => {
+                tracing::info!(
+                    listed = report.listed,
+                    malformed = report.malformed,
+                    pinned = report.pin_set_size,
+                    candidates = report.candidates_marked,
+                    promoted = report.promoted_deletes,
+                    repinned_skips = report.promote_repinned_skips,
+                    promote_errors = report.promote_delete_errors,
+                    restart_count = report.restart_count,
+                    "snapshot-blob-gc sweep done"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "snapshot-blob-gc sweep failed; will retry on next interval"
+                );
+            }
+        }
     }
 }
 

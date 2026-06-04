@@ -957,6 +957,55 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ----------------------------------------------------------------
+    // ADR 0028 addendum — portable snapshot-blob GC (mirrors the chunk
+    // + bundle GC trios). Governs `snapshots/<id>/{state.bin,sidecar,
+    // ...}` the same way: pinned by a live `snapshots` row, swept when
+    // unreferenced after the shared grace period. Replaces the host's
+    // inline `abort_prior_inflight_snapshot` blob deletion, which could
+    // delete a recorded `recoverable=true` snapshot out from under a
+    // resume.
+
+    /// The snapshot-blob pin set: every snapshot id with a live row.
+    /// LOAD-BEARING — this MUST be every row (`SELECT id FROM
+    /// snapshots`), with NO `recoverable` filter (the resume self-heal
+    /// transiently demotes rows) and NO `session_id` filter
+    /// (`session_id IS NULL` template/base captures are referenced by
+    /// `enabled_images.base_snapshot_id` and have no self-heal
+    /// backstop). It is complete because base rows are never deleted —
+    /// `prune_session_snapshots` is `session_id IS NOT NULL` only, and
+    /// the `base_snapshot_id` FK has no `ON DELETE`.
+    async fn snapshot_blob_pin_set(&self) -> Result<Vec<crate::types::SnapshotId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Idempotent candidate upsert; `first_seen_at` sticky, same grace
+    /// semantics as the chunk + bundle variants.
+    async fn upsert_snapshot_blob_gc_candidate(
+        &self,
+        _id: crate::types::SnapshotId,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Promote-pass query (oldest first, batched).
+    async fn list_expired_snapshot_blob_gc_candidates(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> Result<Vec<crate::types::SnapshotId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Batch-delete candidate rows after the blob delete succeeded.
+    /// Idempotent.
+    async fn delete_snapshot_blob_gc_candidates(
+        &self,
+        _ids: &[crate::types::SnapshotId],
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
     // ADR 0018 commit 12b — evac_resumer scanner support.
     //
     // The scanner polls `Evacuating` sessions, picks a peer host,

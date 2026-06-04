@@ -145,6 +145,14 @@ pub fn router(state: SharedState) -> Router {
         .route("/admin/bundle-gc/dry-run", post(admin::bundle_gc_dry_run))
         .route("/admin/bundle-gc/sweep", post(admin::bundle_gc_sweep))
         .route(
+            "/admin/snapshot-blob-gc/dry-run",
+            post(admin::snapshot_blob_gc_dry_run),
+        )
+        .route(
+            "/admin/snapshot-blob-gc/sweep",
+            post(admin::snapshot_blob_gc_sweep),
+        )
+        .route(
             "/admin/chunk-gc/candidates",
             get(admin::chunk_gc_candidates),
         )

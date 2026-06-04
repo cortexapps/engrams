@@ -605,3 +605,52 @@ load-bearing regression — an FC test that snapshots, **removes the local
 snapshot dir**, then restores from BlobStorage — is the follow-up to wire
 into the `test-firecracker` CI job (needs KVM; authored/validated on the
 dev-vm).
+
+## Addendum 2026-06-04 (2) — root-cause fix: snapshot blobs under the pin-set GC model
+
+The #82/#84 patches treated symptoms. The recurring signature —
+*a `snapshots` row marked `recoverable=true` whose `snapshots/<id>/`
+blobs were deleted* — has one root cause: **portable snapshot blobs were
+the only durable resource class not governed by the pin-set GC model.**
+Chunks (`chunk_gc`) and bundles (`bundle_gc`) are "pinned by a live PG
+row → swept when unreferenced after a grace period, behind the
+`chunk_generation` barrier." Snapshot blobs instead used a host-local,
+single-slot-per-sandbox `inflight_snapshots` map + `abort_prior_inflight_
+snapshot`, which **blind-deleted the blobs with no PG check**. Because
+every producer (idle eviction, periodic checkpoint, manual snapshot,
+SIGTERM) shares that one slot, a concurrent producer's `snapshot()`
+aborts another's already-recorded snapshot — the prod re-brick of
+`a02afad3` (a periodic checkpoint aborting the eviction snapshot ~350 ms
+before its commit) and the original `89f7984d` incident are the same
+race. #82's commit-before-destroy narrowed the window but couldn't close
+it, because the race is producer-vs-producer on the shared slot, not
+ordering against `destroy`.
+
+**Fix:** govern `snapshots/<id>/{state.bin,sidecar.json,working_set.json}`
+by the same pin-set model (new `coordinator::snapshot_blob_gc`, a mirror
+of `bundle_gc`; `snapshot_blob_gc_candidates`, migration 0055). Liveness
+is **`SELECT id FROM snapshots`** — every row, with NO `recoverable`
+filter (the self-heal transiently demotes rows) and NO `session_id`
+filter (template/base captures are `session_id NULL`, referenced by
+`enabled_images.base_snapshot_id`, and have no resume self-heal
+backstop). This is complete because base rows are never deleted
+(`prune_session_snapshots` is `session_id IS NOT NULL` only; the
+`base_snapshot_id` FK has no `ON DELETE`). The host's
+`abort_prior_inflight_snapshot` now removes only the LOCAL dir (host-disk
+hygiene, rebuildable from GCS); it no longer deletes durable blobs, and
+the inline retention-sweep deletion (the #84 stop-gap) is removed.
+**Net invariant: nothing but the sweep deletes a durable snapshot blob,
+and only when no `snapshots` row references it.** `recoverable=true` is
+true by construction.
+
+One snapshot-specific adaptation vs. the bundle sweep: every capture has
+an upload-before-record window (blob in GCS, row about to be written), so
+the promote pass **re-verifies the pin set at delete time** — a candidate
+whose row has since landed is dropped, never deleted (snapshot ids are
+fresh UUIDs, never recycled, so re-pin can only mean "the row was
+recorded after we marked it"). This makes the sweep strictly safe for
+the normal path, where the across-sweep barrier alone would not be.
+
+This retires code (the inline abort-delete + the #84 retention-sweep
+delete) rather than adding a fourth patch. The cross-host-resume self-heal
+generalization into the evac path (Gap 2) lands separately.

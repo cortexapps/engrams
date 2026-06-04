@@ -2531,6 +2531,84 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    /// ADR 0028 addendum: the snapshot-blob pin set — every snapshot id
+    /// with a live row. NO `recoverable`/`session_id` filter (see the
+    /// trait doc): base/template rows (`session_id IS NULL`) must pin
+    /// their blobs too, and a demoted row's blobs stay pinned until the
+    /// row is pruned. Bounded (rows pruned by checkpoint retention), so
+    /// no pagination — same posture as `bundle_pin_set`.
+    async fn snapshot_blob_pin_set(
+        &self,
+    ) -> Result<Vec<engram_core::types::SnapshotId>, MetaError> {
+        let ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM snapshots")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(ids
+            .into_iter()
+            .map(engram_core::types::SnapshotId::from)
+            .collect())
+    }
+
+    /// ADR 0028 addendum: sticky-first-seen candidate upsert (snapshot
+    /// flavor of `upsert_bundle_gc_candidate`).
+    async fn upsert_snapshot_blob_gc_candidate(
+        &self,
+        id: engram_core::types::SnapshotId,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            "INSERT INTO snapshot_blob_gc_candidates (snapshot_id)
+             VALUES ($1)
+             ON CONFLICT (snapshot_id) DO UPDATE SET last_seen_at = now()",
+        )
+        .bind(id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0028 addendum: promote-pass query (oldest first, batched).
+    async fn list_expired_snapshot_blob_gc_candidates(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<engram_core::types::SnapshotId>, MetaError> {
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT snapshot_id
+               FROM snapshot_blob_gc_candidates
+              WHERE first_seen_at < $1
+              ORDER BY first_seen_at
+              LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(ids
+            .into_iter()
+            .map(engram_core::types::SnapshotId::from)
+            .collect())
+    }
+
+    /// ADR 0028 addendum: batch-delete candidate rows.
+    async fn delete_snapshot_blob_gc_candidates(
+        &self,
+        ids: &[engram_core::types::SnapshotId],
+    ) -> Result<(), MetaError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let uuids: Vec<Uuid> = ids.iter().map(|id| id.as_uuid()).collect();
+        sqlx::query("DELETE FROM snapshot_blob_gc_candidates WHERE snapshot_id = ANY($1::uuid[])")
+            .bind(&uuids)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// ADR 0029: one cheap aggregate over `snapshots` for the Storage
     /// surface's `snapshots` + `snapshot_bytes` rollups.
     async fn snapshot_totals(&self) -> Result<engram_core::traits::SnapshotTotals, MetaError> {
