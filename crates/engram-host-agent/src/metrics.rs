@@ -101,3 +101,17 @@ pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
 /// writer (or some other on-disk leak) is winning the race.
 pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
     "engram_host_idle_evict_disk_pressure_holds_total";
+
+/// ADR 0022 Option A: gauges of summed guest memory across this host's
+/// live FC sandboxes, sampled each heartbeat tick from
+/// `/proc/<pid>/smaps_rollup`. The **density signal**:
+/// `engram_sandbox_guest_pss_bytes / engram_sandbox_guest_rss_bytes` ≈ 1.0
+/// when every sandbox holds a private working-set copy (UFFD), and falls
+/// below 1.0 as same-template siblings `MAP_PRIVATE`-share one resident
+/// base memfile (File backend). PSS charges shared clean pages
+/// proportionally to their mapcount, so Σpss ≈ physical RAM actually used
+/// and Σrss ≈ the naive no-sharing cost. Productized substrate for the
+/// density measurement that gates the ADR 0022 Accepted flip (and the
+/// metric a later UI ADR reads). Absent on VZ/non-Linux backends.
+pub const SANDBOX_GUEST_PSS_BYTES: &str = "engram_sandbox_guest_pss_bytes";
+pub const SANDBOX_GUEST_RSS_BYTES: &str = "engram_sandbox_guest_rss_bytes";

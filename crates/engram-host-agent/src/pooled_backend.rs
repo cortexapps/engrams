@@ -1828,6 +1828,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.restore_memory_is_lazy_for(fresh)
     }
 
+    async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
+        self.inner.guest_memory_stats().await
+    }
+
     async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         // Phase 5+: resolve OCI image_uri / harness_pack_uri to local
         // cached paths before warm-pool key derivation. Both paths

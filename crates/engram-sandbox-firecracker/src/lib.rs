@@ -2824,6 +2824,27 @@ async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> 
     }
 }
 
+/// ADR 0022 Option A: read `(Pss, Rss)` in bytes from one FC process's
+/// `/proc/<pid>/smaps_rollup`. Returns `None` if the file is unreadable
+/// (process exited mid-sample) or the fields are missing — the caller
+/// skips that pid rather than failing the whole density sample. The
+/// kernel pre-aggregates `smaps_rollup`, so this is a single small read,
+/// not a walk of every VMA.
+#[cfg(target_os = "linux")]
+async fn read_smaps_rollup_pss_rss(pid: u32) -> Option<(u64, u64)> {
+    let text = tokio::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .await
+        .ok()?;
+    // Each line is `Field:   <value> kB`. Convert kB → bytes.
+    let field_kb = |name: &str| -> Option<u64> {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    Some((field_kb("Pss:")? * 1024, field_kb("Rss:")? * 1024))
+}
+
 /// ADR 0009 §4: per-VM process supervisor. Spawned at create/restore
 /// time for each FC process (and the UFFD handler when present). Polls
 /// `kill(pid, 0)` every 1s; when the pid disappears (`ESRCH`), prunes
@@ -3497,6 +3518,35 @@ impl SandboxBackend for FirecrackerBackend {
         // base-create under File materializes the (shared) memfile;
         // resume under UFFD stays lazy.
         matches!(self.effective_restore_mode(fresh), RestoreMode::Uffd)
+    }
+
+    async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
+        // ADR 0022 Option A: sum PSS/RSS over every live FC process from
+        // `/proc/<pid>/smaps_rollup`. PSS divides shared clean pages by
+        // their mapcount, so Σpss/Σrss across same-template File-backend
+        // siblings is the density ratio. Error-tolerant: a vanished or
+        // unreadable pid is skipped, never fatal.
+        #[cfg(target_os = "linux")]
+        {
+            let pids: Vec<u32> = self
+                .sandboxes
+                .iter()
+                .filter_map(|e| e.value().fc_pid)
+                .collect();
+            let mut stats = engram_core::traits::sandbox::GuestMemoryStats::default();
+            for pid in pids {
+                if let Some((pss, rss)) = read_smaps_rollup_pss_rss(pid).await {
+                    stats.pss_bytes += pss;
+                    stats.rss_bytes += rss;
+                    stats.sampled += 1;
+                }
+            }
+            Some(stats)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// ADR 0020 P1: block until agentd dials its ready port. Extracted
@@ -4571,5 +4621,23 @@ mod tests {
         be.config.base_restore_mode = None;
         assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
         assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
+    }
+
+    // ADR 0022: the smaps_rollup parser, exercised against the test
+    // process's own /proc entry. Linux-only (no smaps_rollup on macOS);
+    // runs on CI's Linux runner in the normal unit-test job.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_smaps_rollup_parses_own_process() {
+        let pid = std::process::id();
+        let (pss, rss) = super::read_smaps_rollup_pss_rss(pid)
+            .await
+            .expect("own process must have a readable smaps_rollup");
+        // A running process has non-zero resident + proportional set.
+        assert!(rss > 0, "Rss must be > 0");
+        assert!(pss > 0, "Pss must be > 0");
+        assert!(pss <= rss, "Pss ({pss}) can never exceed Rss ({rss})");
+        // A nonexistent pid returns None, not an error.
+        assert!(super::read_smaps_rollup_pss_rss(u32::MAX).await.is_none());
     }
 }
