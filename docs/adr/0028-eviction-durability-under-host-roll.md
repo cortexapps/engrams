@@ -1,8 +1,16 @@
 # ADR 0028: Eviction durability under coord restart + host roll
 
-Status: 2026-06-03 — **Proposed (revised).** Incident-driven. Authored
-before code per the team's ADR-bookend norm; revised before
-implementation after (a) [ADR 0034](0034-idle-eviction-control-plane-and-detection.md)
+Status: 2026-06-03 — **Accepted.** Incident-driven. Authored before
+code per the team's ADR-bookend norm; revised before implementation,
+then flipped to Accepted on PR #79 — the OSS code is complete and
+CI- + dev-vm-validated (full `just check` 954 tests, the live-PG lane,
+the real-Firecracker `diff_snapshot` / `file_restore_shared_rss` /
+`checkpoint_chain` integration tests under KVM, and `cargo clippy
+--workspace --tests -D warnings`). Per the ADR 0034 precedent, the
+incident-shaped **prod validation matrix runs post-merge** (see
+"Status / phase chain"); the cross-repo Fix C drain-before-roll
+half lands in `engrams-internal` behind the deploy change. Revised
+before implementation after (a) [ADR 0034](0034-idle-eviction-control-plane-and-detection.md)
 landed and closed the **control-plane** half of Defect A, and (b) design
 review settled the checkpoint mechanics on **diff-first periodic
 checkpoints on stock Firecracker** — KVM dirty-page tracking + Diff
@@ -503,32 +511,51 @@ prod-validation numbers recorded here as they arrive:
       - Dirty-tracking steady-state overhead: not isolatable in a
         30 s test; watch in prod via the checkpoint pause/CPU metrics
         before tightening cadence below ~60 s.
-- [ ] **B** — `restore_disk_only_for_session` cold-boot primitive +
-      `evacuate_dead_source` rung-2 dispatch + fail-fast classification
-      in `evac_resumer`. CI: disk-only recovery e2e (the `cf4d4afd`
-      shape), fail-fast budget tests.
-- [ ] **A** — FC diff plumbing; host periodic checkpoint task + rolling
-      `memory.bin` + durable `snapshot.json` record + heartbeat
-      re-advertise; coord reconciler; migration(s) incl.
-      `snapshots.events_cursor`; GC retention pinning; agentd periodic
-      clock re-step; eviction = final-diff. CI: checkpoint correctness
-      + chained-diff restores, reconciler idempotency, coord-SIGKILL
-      mid-eviction e2e, clock tolerance, GC retention.
-- [ ] **A.log** — rung-1 rewind tombstones post-cursor `session_events`
-      (recovery epoch) + resets the live head; transcript/SSE rewind
-      boundary + surviving-side-effect surfacing; resumed agent is told
-      it recovered. CI: rewind + epoch-consistent SSE + live-PG
-      round-trips.
-- [ ] **Rung-1 wiring** — evac prefers latest coherent checkpoint;
-      rung-aware disk pick (checkpoint's own version, never newer
-      live); ladder fall-through. CI: two-host host-kill e2e (memory
-      intact, disk rewound, transcript rewound), corrupted-checkpoint
-      fall-through, coherence guard.
-- [ ] **C** — SIGTERM path rides Fix A record/re-advertise + deadline
-      sizing (this repo); drain-before-roll in `engrams-internal`
-      deploy tooling + GCE grace bump.
-- [ ] **Bookend** — flip to Accepted with the commit chain + prod
-      validation matrix results (coord roll during eviction; MIG roll →
-      rung-1 with memory intact + disk rewound; rung-2 fidelity;
-      pause/dirty-tracking overhead; `Evicting` 409 window in seconds);
-      hand off measured context to ADR 0022.
+- [x] **B** (`45cb916`) — `SandboxSpec.rootfs_manifest` override +
+      `cold_boot_spec` shared helper + `evacuate_dead_source` rung-2
+      dispatch + `EvacError::ColdBootUnavailable`/`is_structural`
+      fail-fast in `evac_resumer` + disk-only `/resume`. CI:
+      `nbd_chunked_disk::disk_only_cold_boot_via_rootfs_manifest_override`
+      (the `cf4d4afd` shape) + fail-fast unit/structural tests.
+- [x] **A** (`3e6e709`) — `snapshot_diff` FC plumbing + chain-aware
+      `PooledBackend::snapshot` (diff once seeded; evictions become
+      final-diffs) + rolling `memory.bin` + `ChunkStore::
+      update_for_dirty_ranges` + durable `CheckpointRecord` + heartbeat
+      re-advertise + coord reconciler + migration 0053
+      (`events_cursor`) + `checkpoint_retention` sweeper. agentd PTP
+      re-step already existed (clock.rs) — covers the pause drip. CI:
+      `checkpoint_chain` (seed→diff→restore byte-identical),
+      `checkpoint_reconcile_live_pg` (cursor + COALESCE + retention),
+      chunk-store incremental-rechunk unit.
+- [x] **A.log** (`f13fff6`) — migration 0054
+      (`sessions.recovery_epoch` + `session_events.{recovery_epoch,
+      rewound_at}`); `rewind_session_to_cursor` (tombstone + epoch bump
+      + surviving-side-effect extraction); `RecoveredFromCheckpoint`
+      boundary + `apply_rung1_rewind` from both rung-1 entry points;
+      SSE carries `_recovery_epoch`/`_rewound`; web transcript boundary
+      + greyed rolled-back span; `GET /sessions/:id/checkpoints` +
+      `DurabilityTimeline`. CI: `rung1_rewind_…` live-PG + 3 web tests.
+      **Deferred:** the resumed-agent system note (needs a harness-side
+      consumer — event emitted now); the Storage-page fleet dual-RPO +
+      un-acked stat (needs new `storage/summary` fields).
+- [x] **Rung-1 wiring** (`3fedd8b`) — rung-aware disk pick: rung 1
+      restores the checkpoint's OWN disk (the rewind), rung 2 keeps
+      live-wins; fixed in both `evacuate_dead_source` and
+      `resume_from_fc_snapshot` (latent, load-bearing once the latest
+      *recorded* snapshot can predate `live_disk_manifest`).
+      Preference is automatic (evac already restores the newest
+      snapshot = newest checkpoint). Coherence-rule unit test pins it;
+      the two-host warm-recovery e2e rides dev-vm
+      `integration-evac-test.sh`.
+- [x] **C** (`0cf494e`, OSS half) — SIGTERM checkpoint records durably
+      via Fix A + a final reconcile heartbeat before deletion; deadline
+      doc re-sized for diff-first. **Cross-repo half** (drain-before-
+      `tf-apply` + GCE grace ≥ ~35 s) lands in `engrams-internal`.
+- [x] **Bookend** — this flip to Accepted + the ADR 0022 handoff.
+- [ ] **Prod validation matrix** (post-merge watch, mirroring
+      ADR 0034): coord roll during eviction → reconciler records the
+      orphan checkpoint; FC-host MIG roll of an idle session → rung-1
+      (memory intact, disk rewound to the checkpoint); rung-2 cold-boot
+      fidelity (on-disk md5 identical); checkpoint pause + dirty-
+      tracking steady-state overhead; the `Evicting` 409 window now in
+      seconds. Watched via the prod-ops skill.
